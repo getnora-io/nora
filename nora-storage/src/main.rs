@@ -73,7 +73,7 @@ struct S3Error {
 fn xml_response<T: Serialize>(data: T) -> Response {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-        to_xml(&data).unwrap()
+        to_xml(&data).unwrap_or_default()
     );
     (
         StatusCode::OK,
@@ -90,7 +90,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
     };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-        to_xml(&error).unwrap()
+        to_xml(&error).unwrap_or_default()
     );
     (
         status,
@@ -105,12 +105,12 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nora_storage=info".parse().unwrap()),
+                .add_directive("nora_storage=info".parse().expect("valid directive")),
         )
         .init();
 
     let config = Config::load();
-    fs::create_dir_all(&config.storage.data_dir).unwrap();
+    fs::create_dir_all(&config.storage.data_dir).expect("Failed to create data directory");
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -128,10 +128,14 @@ async fn main() {
         .with_state(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind to address");
 
     info!("nora-storage (S3 compatible) running on http://{}", addr);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .expect("Server error");
 }
 
 async fn list_buckets(State(state): State<Arc<AppState>>) -> Response {
@@ -201,12 +205,14 @@ fn collect_files(dir: &std::path::Path, prefix: &str) -> Vec<ObjectInfo> {
             if path.is_dir() {
                 objects.extend(collect_files(&path, &key));
             } else if let Ok(metadata) = entry.metadata() {
-                let modified: chrono::DateTime<Utc> = metadata.modified().unwrap().into();
-                objects.push(ObjectInfo {
-                    key,
-                    size: metadata.len(),
-                    last_modified: modified.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                });
+                if let Ok(modified) = metadata.modified() {
+                    let datetime: chrono::DateTime<Utc> = modified.into();
+                    objects.push(ObjectInfo {
+                        key,
+                        size: metadata.len(),
+                        last_modified: datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    });
+                }
             }
         }
     }

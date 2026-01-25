@@ -2,7 +2,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, head, put},
     Json, Router,
@@ -67,7 +67,7 @@ async fn start_upload(Path(name): Path<String>) -> Response {
         StatusCode::ACCEPTED,
         [
             (header::LOCATION, location.clone()),
-            ("Docker-Upload-UUID".parse().unwrap(), uuid),
+            (HeaderName::from_static("docker-upload-uuid"), uuid),
         ],
     )
         .into_response()
@@ -127,7 +127,7 @@ async fn put_manifest(
                 StatusCode::CREATED,
                 [
                     (header::LOCATION, location),
-                    ("Docker-Content-Digest".parse().unwrap(), digest),
+                    (HeaderName::from_static("docker-content-digest"), digest),
                 ],
             )
                 .into_response()
