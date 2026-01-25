@@ -1,0 +1,16 @@
+demo.getnora.io {
+    reverse_proxy nora:4000
+
+    encode gzip
+
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
