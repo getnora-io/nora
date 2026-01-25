@@ -1,0 +1,7 @@
+/target
+data/
+*.htpasswd
+.env
+.env.*
+*.log
+CLAUDE.md

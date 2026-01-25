@@ -1,0 +1,40 @@
+[package]
+name = "nora-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cloud-Native Artifact Registry - Fast, lightweight, multi-protocol"
+keywords = ["registry", "docker", "artifacts", "cloud-native", "devops"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+
+[[bin]]
+name = "nora"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+async-trait.workspace = true
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+bcrypt = "0.17"
+base64 = "0.22"
+prometheus = "0.13"
+lazy_static = "1.5"
+httpdate = "1"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+clap = { version = "4", features = ["derive"] }
+tar = "0.4"
+flate2 = "1.0"
+indicatif = "0.17"
+chrono = { version = "0.4", features = ["serde"] }

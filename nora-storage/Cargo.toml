@@ -1,0 +1,28 @@
+[package]
+name = "nora-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "S3-compatible storage server for NORA"
+
+[[bin]]
+name = "nora-storage"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+httpdate = "1"
+chrono = { version = "0.4", features = ["serde"] }
+quick-xml = { version = "0.31", features = ["serialize"] }
