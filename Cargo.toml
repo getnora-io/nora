@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "nora-registry",
+    "nora-storage",
+    "nora-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["DevITWay <devitway@gmail.com>"]
+repository = "https://github.com/getnora-io/nora"
+homepage = "https://getnora.io"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+async-trait = "0.1"

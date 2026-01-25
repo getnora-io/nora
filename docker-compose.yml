@@ -1,0 +1,15 @@
+services:
+  nora:
+    build: .
+    image: getnora/nora:latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - nora-data:/data
+    environment:
+      - RUST_LOG=info
+      - NORA_AUTH_ENABLED=false
+    restart: unless-stopped
+
+volumes:
+  nora-data:

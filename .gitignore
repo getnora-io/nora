@@ -1,0 +1,7 @@
+/target
+data/
+*.htpasswd
+.env
+.env.*
+*.log
+internal config
