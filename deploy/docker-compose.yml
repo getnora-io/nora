@@ -5,6 +5,8 @@ services:
       context: ..
       dockerfile: Dockerfile
     restart: unless-stopped
+    ports:
+      - "4000:4000"
     volumes:
       - nora-data:/data
     environment:
@@ -12,28 +14,6 @@ services:
       - NORA_HOST=0.0.0.0
       - NORA_PORT=4000
       - NORA_AUTH_ENABLED=false
-    networks:
-      - nora-net
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    networks:
-      - nora-net
-    depends_on:
-      - nora
 
 volumes:
   nora-data:
-  caddy-data:
-  caddy-config:
-
-networks:
-  nora-net:
