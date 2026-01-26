@@ -15,7 +15,7 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.1.0",
+        version = "0.2.7",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, and PyPI",
         license(name = "MIT"),
         contact(name = "DevITWay", url = "https://github.com/getnora-io/nora")
@@ -25,6 +25,7 @@ use crate::AppState;
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
+        (name = "dashboard", description = "Dashboard & Metrics API"),
         (name = "docker", description = "Docker Registry v2 API"),
         (name = "maven", description = "Maven Repository API"),
         (name = "npm", description = "npm Registry API"),
@@ -36,6 +37,8 @@ use crate::AppState;
         // Health
         crate::openapi::health_check,
         crate::openapi::readiness_check,
+        // Dashboard
+        crate::openapi::dashboard_metrics,
         // Docker
         crate::openapi::docker_version,
         crate::openapi::docker_catalog,
@@ -59,6 +62,11 @@ use crate::AppState;
             HealthResponse,
             StorageHealth,
             RegistriesHealth,
+            DashboardResponse,
+            GlobalStats,
+            RegistryCardStats,
+            MountPoint,
+            ActivityEntry,
             DockerVersion,
             DockerCatalog,
             DockerTags,
@@ -182,6 +190,72 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct DashboardResponse {
+    /// Global statistics across all registries
+    pub global_stats: GlobalStats,
+    /// Per-registry statistics
+    pub registry_stats: Vec<RegistryCardStats>,
+    /// Registry mount points and proxy configuration
+    pub mount_points: Vec<MountPoint>,
+    /// Recent activity log entries
+    pub activity: Vec<ActivityEntry>,
+    /// Server uptime in seconds
+    pub uptime_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GlobalStats {
+    /// Total downloads across all registries
+    pub downloads: u64,
+    /// Total uploads across all registries
+    pub uploads: u64,
+    /// Total artifact count
+    pub artifacts: u64,
+    /// Cache hit percentage (0-100)
+    pub cache_hit_percent: f64,
+    /// Total storage used in bytes
+    pub storage_bytes: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RegistryCardStats {
+    /// Registry name (docker, maven, npm, cargo, pypi)
+    pub name: String,
+    /// Number of artifacts in this registry
+    pub artifact_count: usize,
+    /// Download count for this registry
+    pub downloads: u64,
+    /// Upload count for this registry
+    pub uploads: u64,
+    /// Storage used by this registry in bytes
+    pub size_bytes: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MountPoint {
+    /// Registry display name
+    pub registry: String,
+    /// URL mount path (e.g., /v2/, /maven2/)
+    pub mount_path: String,
+    /// Upstream proxy URL if configured
+    pub proxy_upstream: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ActivityEntry {
+    /// ISO 8601 timestamp
+    pub timestamp: String,
+    /// Action type (Pull, Push, CacheHit, ProxyFetch)
+    pub action: String,
+    /// Artifact name/identifier
+    pub artifact: String,
+    /// Registry type
+    pub registry: String,
+    /// Source (LOCAL, PROXY, CACHE)
+    pub source: String,
+}
+
 // ============ Path Operations (documentation only) ============
 
 /// Health check endpoint
@@ -207,6 +281,20 @@ pub async fn health_check() {}
     )
 )]
 pub async fn readiness_check() {}
+
+/// Dashboard metrics and activity
+///
+/// Returns comprehensive metrics including downloads, uploads, cache statistics,
+/// per-registry stats, mount points configuration, and recent activity log.
+#[utoipa::path(
+    get,
+    path = "/api/ui/dashboard",
+    tag = "dashboard",
+    responses(
+        (status = 200, description = "Dashboard metrics", body = DashboardResponse)
+    )
+)]
+pub async fn dashboard_metrics() {}
 
 /// Docker Registry version check
 #[utoipa::path(
