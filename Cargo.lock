@@ -1185,7 +1185,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "nora-cli"
-version = "0.1.0"
+version = "0.2.7"
 dependencies = [
  "clap",
  "flate2",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "0.1.0"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "nora-storage"
-version = "0.1.0"
+version = "0.2.7"
 dependencies = [
  "axum",
  "base64",
