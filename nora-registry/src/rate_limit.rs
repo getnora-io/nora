@@ -30,8 +30,8 @@ impl Default for RateLimitConfig {
         Self {
             auth_rps: 1,        // 1 req/sec for auth (strict)
             auth_burst: 5,      // Allow burst of 5
-            upload_rps: 50,     // 50 req/sec for uploads (Docker needs parallel)
-            upload_burst: 100,  // Allow burst of 100
+            upload_rps: 200,    // 200 req/sec for uploads (Docker needs high parallelism)
+            upload_burst: 500,  // Allow burst of 500
             general_rps: 100,   // 100 req/sec general
             general_burst: 200, // Allow burst of 200
         }
@@ -58,16 +58,16 @@ pub fn auth_rate_limiter() -> tower_governor::GovernorLayer<
 
 /// Create rate limiter layer for upload endpoints
 ///
-/// Default: 50 requests per second, burst of 100
-/// Higher limits to accommodate Docker client's parallel layer uploads
+/// Default: 200 requests per second, burst of 500
+/// High limits to accommodate Docker client's aggressive parallel layer uploads
 pub fn upload_rate_limiter() -> tower_governor::GovernorLayer<
     tower_governor::key_extractor::PeerIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
     let config = GovernorConfigBuilder::default()
-        .per_second(50)
-        .burst_size(100)
+        .per_second(200)
+        .burst_size(500)
         .use_headers()
         .finish()
         .unwrap();
@@ -102,7 +102,7 @@ mod tests {
         let config = RateLimitConfig::default();
         assert_eq!(config.auth_rps, 1);
         assert_eq!(config.auth_burst, 5);
-        assert_eq!(config.upload_rps, 50);
+        assert_eq!(config.upload_rps, 200);
         assert_eq!(config.general_rps, 100);
     }
 
