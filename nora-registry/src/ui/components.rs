@@ -1,68 +1,6 @@
 /// Application version from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Main layout wrapper with header and sidebar
-pub fn layout(title: &str, content: &str, active_page: Option<&str>) -> String {
-    format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{} - Nora</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        [x-cloak] {{ display: none !important; }}
-        .sidebar-open {{ overflow: hidden; }}
-    </style>
-</head>
-<body class="bg-slate-100 min-h-screen">
-    <div class="flex h-screen overflow-hidden">
-        <!-- Mobile sidebar overlay -->
-        <div id="sidebar-overlay" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden" onclick="toggleSidebar()"></div>
-
-        <!-- Sidebar -->
-        {}
-
-        <!-- Main content -->
-        <div class="flex-1 flex flex-col overflow-hidden min-w-0">
-            <!-- Header -->
-            {}
-
-            <!-- Content -->
-            <main class="flex-1 overflow-y-auto p-4 md:p-6">
-                {}
-            </main>
-        </div>
-    </div>
-
-    <script>
-        function toggleSidebar() {{
-            const sidebar = document.getElementById('sidebar');
-            const overlay = document.getElementById('sidebar-overlay');
-            const isOpen = !sidebar.classList.contains('-translate-x-full');
-
-            if (isOpen) {{
-                sidebar.classList.add('-translate-x-full');
-                overlay.classList.add('hidden');
-                document.body.classList.remove('sidebar-open');
-            }} else {{
-                sidebar.classList.remove('-translate-x-full');
-                overlay.classList.remove('hidden');
-                document.body.classList.add('sidebar-open');
-            }}
-        }}
-    </script>
-</body>
-</html>"##,
-        html_escape(title),
-        sidebar(active_page),
-        header(),
-        content
-    )
-}
-
 /// Dark theme layout wrapper for dashboard
 pub fn layout_dark(
     title: &str,
@@ -485,7 +423,8 @@ pub fn render_polling_script() -> String {
     "##.to_string()
 }
 
-/// Sidebar navigation component
+/// Sidebar navigation component (light theme, unused)
+#[allow(dead_code)]
 fn sidebar(active_page: Option<&str>) -> String {
     let active = active_page.unwrap_or("");
 
@@ -578,7 +517,8 @@ fn sidebar(active_page: Option<&str>) -> String {
     )
 }
 
-/// Header component
+/// Header component (light theme, unused)
+#[allow(dead_code)]
 fn header() -> String {
     r##"
         <header class="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-4 md:px-6">

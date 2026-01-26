@@ -1,0 +1,15 @@
+[Unit]
+Description=NORA Demo Traffic Simulator
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/nora/demo-traffic.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
