@@ -268,10 +268,13 @@ async fn run_server(config: Config, storage: Storage) {
     );
 
     // Graceful shutdown on SIGTERM/SIGINT
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("Server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("Server error");
 
     info!(
         uptime_seconds = state.start_time.elapsed().as_secs(),
