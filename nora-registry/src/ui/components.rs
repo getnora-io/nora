@@ -73,7 +73,7 @@ pub fn layout_dark(
 </html>"##,
         lang.code(),
         html_escape(title),
-        sidebar_dark(active_page, &t),
+        sidebar_dark(active_page, t),
         header_dark(lang),
         content,
         extra_scripts
@@ -261,6 +261,7 @@ pub fn render_global_stats(
 }
 
 /// Render registry card with extended metrics
+#[allow(clippy::too_many_arguments)]
 pub fn render_registry_card(
     name: &str,
     icon_path: &str,
