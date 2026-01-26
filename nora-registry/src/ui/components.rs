@@ -158,20 +158,25 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations) -> String {
             </div>
         </div>
     "#,
-        nav_html,
-        t.nav_registries,
-        VERSION
+        nav_html, t.nav_registries, VERSION
     )
 }
 
 /// Dark theme header with language switcher
 fn header_dark(lang: Lang) -> String {
     let (en_class, ru_class) = match lang {
-        Lang::En => ("text-white font-semibold", "text-slate-400 hover:text-slate-200"),
-        Lang::Ru => ("text-slate-400 hover:text-slate-200", "text-white font-semibold"),
+        Lang::En => (
+            "text-white font-semibold",
+            "text-slate-400 hover:text-slate-200",
+        ),
+        Lang::Ru => (
+            "text-slate-400 hover:text-slate-200",
+            "text-white font-semibold",
+        ),
     };
 
-    format!(r##"
+    format!(
+        r##"
         <header class="h-16 bg-[#1e293b] border-b border-slate-700 flex items-center justify-between px-4 md:px-6">
             <div class="flex items-center">
                 <button onclick="toggleSidebar()" class="md:hidden p-2 -ml-2 mr-2 rounded-lg hover:bg-slate-700">
@@ -202,7 +207,9 @@ fn header_dark(lang: Lang) -> String {
                 </a>
             </div>
         </header>
-    "##, en_class, ru_class)
+    "##,
+        en_class, ru_class
+    )
 }
 
 /// Render global stats row (5-column grid)
@@ -240,11 +247,16 @@ pub fn render_global_stats(
             </div>
         </div>
         "##,
-        t.stat_downloads, downloads,
-        t.stat_uploads, uploads,
-        t.stat_artifacts, artifacts,
-        t.stat_cache_hit, cache_hit_percent,
-        t.stat_storage, format_size(storage_bytes)
+        t.stat_downloads,
+        downloads,
+        t.stat_uploads,
+        uploads,
+        t.stat_artifacts,
+        artifacts,
+        t.stat_cache_hit,
+        cache_hit_percent,
+        t.stat_storage,
+        format_size(storage_bytes)
     )
 }
 
@@ -294,15 +306,22 @@ pub fn render_registry_card(
         icon_path,
         t.active,
         name,
-        t.artifacts, artifact_count,
-        t.size, format_size(size_bytes),
-        t.downloads, downloads,
-        t.uploads, uploads
+        t.artifacts,
+        artifact_count,
+        t.size,
+        format_size(size_bytes),
+        t.downloads,
+        downloads,
+        t.uploads,
+        uploads
     )
 }
 
 /// Render mount points table
-pub fn render_mount_points_table(mount_points: &[(String, String, Option<String>)], t: &Translations) -> String {
+pub fn render_mount_points_table(
+    mount_points: &[(String, String, Option<String>)],
+    t: &Translations,
+) -> String {
     let rows: String = mount_points
         .iter()
         .map(|(registry, mount_path, proxy)| {
@@ -342,11 +361,7 @@ pub fn render_mount_points_table(mount_points: &[(String, String, Option<String>
             </div>
         </div>
         "##,
-        t.mount_points,
-        t.registry,
-        t.mount_path,
-        t.proxy_upstream,
-        rows
+        t.mount_points, t.registry, t.mount_path, t.proxy_upstream, rows
     )
 }
 
@@ -648,7 +663,8 @@ pub fn html_escape(s: &str) -> String {
 /// Render the "bragging" footer with NORA stats
 pub fn render_bragging_footer(lang: Lang) -> String {
     let t = get_translations(lang);
-    format!(r##"
+    format!(
+        r##"
     <div class="mt-8 bg-gradient-to-r from-slate-800 to-slate-900 rounded-lg border border-slate-700 p-6">
         <div class="text-center mb-4">
             <span class="text-slate-400 text-sm uppercase tracking-wider">{}</span>
