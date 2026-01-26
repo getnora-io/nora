@@ -1,6 +1,8 @@
+mod activity_log;
 mod auth;
 mod backup;
 mod config;
+mod dashboard_metrics;
 mod error;
 mod health;
 mod metrics;
@@ -23,8 +25,10 @@ use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use activity_log::ActivityLog;
 use auth::HtpasswdAuth;
 use config::{Config, StorageMode};
+use dashboard_metrics::DashboardMetrics;
 pub use storage::Storage;
 use tokens::TokenStore;
 
@@ -71,6 +75,8 @@ pub struct AppState {
     pub start_time: Instant,
     pub auth: Option<HtpasswdAuth>,
     pub tokens: Option<TokenStore>,
+    pub metrics: DashboardMetrics,
+    pub activity: ActivityLog,
 }
 
 #[tokio::main]
@@ -205,6 +211,8 @@ async fn run_server(config: Config, storage: Storage) {
         start_time,
         auth,
         tokens,
+        metrics: DashboardMetrics::new(),
+        activity: ActivityLog::new(50),
     });
 
     // Token routes with strict rate limiting (brute-force protection)

@@ -1,3 +1,4 @@
+use crate::activity_log::{ActionType, ActivityEntry};
 use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
 use crate::AppState;
 use axum::{
@@ -75,12 +76,22 @@ async fn download_blob(
 
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.get(&key).await {
-        Ok(data) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            data,
-        )
-            .into_response(),
+        Ok(data) => {
+            state.metrics.record_download("docker");
+            state.metrics.record_cache_hit();
+            state.activity.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                "docker",
+                "LOCAL",
+            ));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                data,
+            )
+                .into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -176,6 +187,13 @@ async fn upload_blob(
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.put(&key, &data).await {
         Ok(()) => {
+            state.metrics.record_upload("docker");
+            state.activity.push(ActivityEntry::new(
+                ActionType::Push,
+                format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                "docker",
+                "LOCAL",
+            ));
             let location = format!("/v2/{}/blobs/{}", name, digest);
             (StatusCode::CREATED, [(header::LOCATION, location)]).into_response()
         }
@@ -197,6 +215,15 @@ async fn get_manifest(
     let key = format!("docker/{}/manifests/{}.json", name, reference);
     match state.storage.get(&key).await {
         Ok(data) => {
+            state.metrics.record_download("docker");
+            state.metrics.record_cache_hit();
+            state.activity.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("{}:{}", name, reference),
+                "docker",
+                "LOCAL",
+            ));
+
             // Calculate digest for Docker-Content-Digest header
             use sha2::Digest;
             let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
@@ -244,6 +271,14 @@ async fn put_manifest(
     if let Err(_) = state.storage.put(&digest_key, &body).await {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+
+    state.metrics.record_upload("docker");
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        format!("{}:{}", name, reference),
+        "docker",
+        "LOCAL",
+    ));
 
     let location = format!("/v2/{}/manifests/{}", name, reference);
     (
