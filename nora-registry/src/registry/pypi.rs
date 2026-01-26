@@ -119,12 +119,7 @@ async fn download_file(
             "application/octet-stream"
         };
 
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type)],
-            data,
-        )
-            .into_response();
+        return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data).into_response();
     }
 
     // Try proxy if configured
@@ -161,11 +156,7 @@ async fn download_file(
                         "application/octet-stream"
                     };
 
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, content_type)],
-                        data,
-                    )
+                    return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
                         .into_response();
                 }
             }
