@@ -28,12 +28,12 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            auth_rps: 1,         // 1 req/sec for auth (strict)
-            auth_burst: 5,       // Allow burst of 5
-            upload_rps: 50,      // 50 req/sec for uploads (Docker needs parallel)
-            upload_burst: 100,   // Allow burst of 100
-            general_rps: 100,    // 100 req/sec general
-            general_burst: 200,  // Allow burst of 200
+            auth_rps: 1,        // 1 req/sec for auth (strict)
+            auth_burst: 5,      // Allow burst of 5
+            upload_rps: 50,     // 50 req/sec for uploads (Docker needs parallel)
+            upload_burst: 100,  // Allow burst of 100
+            general_rps: 100,   // 100 req/sec general
+            general_burst: 200, // Allow burst of 200
         }
     }
 }
