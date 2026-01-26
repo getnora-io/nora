@@ -71,7 +71,10 @@ async fn dashboard(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let response = api_dashboard(State(state)).await.0;
     Html(render_dashboard(&response, lang))
 }
@@ -82,9 +85,17 @@ async fn docker_list(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let repos = get_docker_repos(&state.storage).await;
-    Html(render_registry_list("docker", "Docker Registry", &repos, lang))
+    Html(render_registry_list(
+        "docker",
+        "Docker Registry",
+        &repos,
+        lang,
+    ))
 }
 
 async fn docker_detail(
@@ -93,7 +104,10 @@ async fn docker_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let detail = get_docker_detail(&state.storage, &name).await;
     Html(render_docker_detail(&name, &detail, lang))
 }
@@ -104,9 +118,17 @@ async fn maven_list(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let repos = get_maven_repos(&state.storage).await;
-    Html(render_registry_list("maven", "Maven Repository", &repos, lang))
+    Html(render_registry_list(
+        "maven",
+        "Maven Repository",
+        &repos,
+        lang,
+    ))
 }
 
 async fn maven_detail(
@@ -115,7 +137,10 @@ async fn maven_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let detail = get_maven_detail(&state.storage, &path).await;
     Html(render_maven_detail(&path, &detail, lang))
 }
@@ -126,7 +151,10 @@ async fn npm_list(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let packages = get_npm_packages(&state.storage).await;
     Html(render_registry_list("npm", "npm Registry", &packages, lang))
 }
@@ -137,7 +165,10 @@ async fn npm_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let detail = get_npm_detail(&state.storage, &name).await;
     Html(render_package_detail("npm", &name, &detail, lang))
 }
@@ -148,9 +179,17 @@ async fn cargo_list(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let crates = get_cargo_crates(&state.storage).await;
-    Html(render_registry_list("cargo", "Cargo Registry", &crates, lang))
+    Html(render_registry_list(
+        "cargo",
+        "Cargo Registry",
+        &crates,
+        lang,
+    ))
 }
 
 async fn cargo_detail(
@@ -159,7 +198,10 @@ async fn cargo_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let detail = get_cargo_detail(&state.storage, &name).await;
     Html(render_package_detail("cargo", &name, &detail, lang))
 }
@@ -170,9 +212,17 @@ async fn pypi_list(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let packages = get_pypi_packages(&state.storage).await;
-    Html(render_registry_list("pypi", "PyPI Repository", &packages, lang))
+    Html(render_registry_list(
+        "pypi",
+        "PyPI Repository",
+        &packages,
+        lang,
+    ))
 }
 
 async fn pypi_detail(
@@ -181,7 +231,10 @@ async fn pypi_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(&Query(query), headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
     let detail = get_pypi_detail(&state.storage, &name).await;
     Html(render_package_detail("pypi", &name, &detail, lang))
 }
