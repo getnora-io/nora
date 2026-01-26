@@ -29,11 +29,7 @@ pub use storage::Storage;
 use tokens::TokenStore;
 
 #[derive(Parser)]
-#[command(
-    name = "nora",
-    version,
-    about = "Multi-protocol artifact registry"
-)]
+#[command(name = "nora", version, about = "Multi-protocol artifact registry")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

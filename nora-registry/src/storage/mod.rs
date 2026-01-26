@@ -76,10 +76,8 @@ impl Storage {
 
     pub async fn list(&self, prefix: &str) -> Vec<String> {
         // Empty prefix is valid for listing all
-        if !prefix.is_empty() {
-            if let Err(_) = validate_storage_key(prefix) {
-                return Vec::new();
-            }
+        if !prefix.is_empty() && validate_storage_key(prefix).is_err() {
+            return Vec::new();
         }
         self.inner.list(prefix).await
     }
