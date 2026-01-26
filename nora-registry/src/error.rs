@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Application error handling with HTTP response conversion
 //!
 //! Provides a unified error type that can be converted to HTTP responses
