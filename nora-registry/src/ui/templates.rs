@@ -13,37 +13,49 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
     );
 
     // Render registry cards
-    let registry_cards: String = data.registry_stats.iter().map(|r| {
-        let icon = match r.name.as_str() {
-            "docker" => icons::DOCKER,
-            "maven" => icons::MAVEN,
-            "npm" => icons::NPM,
-            "cargo" => icons::CARGO,
-            "pypi" => icons::PYPI,
-            _ => icons::DOCKER,
-        };
-        let display_name = match r.name.as_str() {
-            "docker" => "Docker",
-            "maven" => "Maven",
-            "npm" => "npm",
-            "cargo" => "Cargo",
-            "pypi" => "PyPI",
-            _ => &r.name,
-        };
-        render_registry_card(
-            display_name,
-            icon,
-            r.artifact_count,
-            r.downloads,
-            r.uploads,
-            r.size_bytes,
-            &format!("/ui/{}", r.name),
-        )
-    }).collect();
+    let registry_cards: String = data
+        .registry_stats
+        .iter()
+        .map(|r| {
+            let icon = match r.name.as_str() {
+                "docker" => icons::DOCKER,
+                "maven" => icons::MAVEN,
+                "npm" => icons::NPM,
+                "cargo" => icons::CARGO,
+                "pypi" => icons::PYPI,
+                _ => icons::DOCKER,
+            };
+            let display_name = match r.name.as_str() {
+                "docker" => "Docker",
+                "maven" => "Maven",
+                "npm" => "npm",
+                "cargo" => "Cargo",
+                "pypi" => "PyPI",
+                _ => &r.name,
+            };
+            render_registry_card(
+                display_name,
+                icon,
+                r.artifact_count,
+                r.downloads,
+                r.uploads,
+                r.size_bytes,
+                &format!("/ui/{}", r.name),
+            )
+        })
+        .collect();
 
     // Render mount points
-    let mount_data: Vec<(String, String, Option<String>)> = data.mount_points.iter()
-        .map(|m| (m.registry.clone(), m.mount_path.clone(), m.proxy_upstream.clone()))
+    let mount_data: Vec<(String, String, Option<String>)> = data
+        .mount_points
+        .iter()
+        .map(|m| {
+            (
+                m.registry.clone(),
+                m.mount_path.clone(),
+                m.proxy_upstream.clone(),
+            )
+        })
         .collect();
     let mount_points = render_mount_points_table(&mount_data);
 
@@ -51,16 +63,19 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
     let activity_rows: String = if data.activity.is_empty() {
         r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">No recent activity</td></tr>"##.to_string()
     } else {
-        data.activity.iter().map(|entry| {
-            let time_ago = format_relative_time(&entry.timestamp);
-            render_activity_row(
-                &time_ago,
-                &entry.action.to_string(),
-                &entry.artifact,
-                &entry.registry,
-                &entry.source,
-            )
-        }).collect()
+        data.activity
+            .iter()
+            .map(|entry| {
+                let time_ago = format_relative_time(&entry.timestamp);
+                render_activity_row(
+                    &time_ago,
+                    &entry.action.to_string(),
+                    &entry.artifact,
+                    &entry.registry,
+                    &entry.source,
+                )
+            })
+            .collect()
     };
     let activity_log = render_activity_log(&activity_rows);
 
@@ -95,11 +110,7 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
             {}
         </div>
     "##,
-        uptime_str,
-        global_stats,
-        registry_cards,
-        mount_points,
-        activity_log,
+        uptime_str, global_stats, registry_cards, mount_points, activity_log,
     );
 
     let polling_script = render_polling_script();

@@ -21,7 +21,15 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
     let key = format!("maven/{}", path);
 
     // Extract artifact name for logging (last 2-3 path components)
-    let artifact_name = path.split('/').rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+    let artifact_name = path
+        .split('/')
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
@@ -76,7 +84,15 @@ async fn upload(
     let key = format!("maven/{}", path);
 
     // Extract artifact name for logging
-    let artifact_name = path.split('/').rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+    let artifact_name = path
+        .split('/')
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
 
     match state.storage.put(&key, &body).await {
         Ok(()) => {
