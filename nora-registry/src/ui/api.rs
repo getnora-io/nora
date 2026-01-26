@@ -139,8 +139,11 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         }
     }
 
-    let total_artifacts = registry_stats.docker + registry_stats.maven +
-                          registry_stats.npm + registry_stats.cargo + registry_stats.pypi;
+    let total_artifacts = registry_stats.docker
+        + registry_stats.maven
+        + registry_stats.npm
+        + registry_stats.cargo
+        + registry_stats.pypi;
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),

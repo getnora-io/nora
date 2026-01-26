@@ -71,12 +71,7 @@ impl ActivityLog {
     /// Get the most recent N entries (newest first)
     pub fn recent(&self, count: usize) -> Vec<ActivityEntry> {
         let entries = self.entries.read();
-        entries
-            .iter()
-            .rev()
-            .take(count)
-            .cloned()
-            .collect()
+        entries.iter().rev().take(count).cloned().collect()
     }
 
     /// Get all entries (newest first)

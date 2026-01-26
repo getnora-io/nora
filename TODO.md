@@ -11,6 +11,69 @@
 
 ---
 
+## v0.2.1 - Dashboard Expansion (2026-01-26) - DONE
+
+### Commit: 93f9655
+
+### New Files
+- `nora-registry/src/dashboard_metrics.rs` - AtomicU64 counters for metrics
+- `nora-registry/src/activity_log.rs` - Bounded activity log (50 entries)
+
+### Modified Files
+- `nora-registry/src/main.rs` - Added modules, updated AppState
+- `nora-registry/src/ui/api.rs` - Added DashboardResponse, api_dashboard()
+- `nora-registry/src/ui/mod.rs` - Added /api/ui/dashboard route
+- `nora-registry/src/ui/components.rs` - Dark theme components
+- `nora-registry/src/ui/templates.rs` - New render_dashboard()
+- `nora-registry/src/registry/docker.rs` - Instrumented handlers
+- `nora-registry/src/registry/npm.rs` - Instrumented with cache tracking
+- `nora-registry/src/registry/maven.rs` - Instrumented download/upload
+- `nora-registry/src/registry/cargo_registry.rs` - Instrumented download
+
+### Features Implemented
+- [x] Global stats panel (downloads, uploads, artifacts, cache hit %, storage)
+- [x] Per-registry metrics (Docker, Maven, npm, Cargo, PyPI)
+- [x] Mount points table with proxy upstreams
+- [x] Activity log (last 20 events)
+- [x] Dark theme (#0f172a background, #1e293b cards)
+- [x] Auto-refresh polling (5 seconds)
+- [x] Cache hit/miss tracking
+
+### API Endpoints
+- `GET /api/ui/dashboard` - Full dashboard data as JSON
+
+### Dark Theme Colors
+```
+Background: #0f172a (slate-950)
+Cards: #1e293b (slate-800)
+Borders: slate-700
+Text primary: slate-200
+Text secondary: slate-400
+Accent: blue-400
+```
+
+### Testing Commands
+```bash
+# Test dashboard API
+curl http://127.0.0.1:4000/api/ui/dashboard
+
+# Test Docker pull (triggers metrics)
+curl http://127.0.0.1:4000/v2/test/manifests/v1
+
+# Test npm proxy (triggers cache miss)
+curl http://127.0.0.1:4000/npm/lodash/-/lodash-4.17.21.tgz -o /dev/null
+```
+
+### Future Improvements (Dashboard)
+- [ ] Add PyPI download instrumentation
+- [ ] Persist metrics to disk (currently reset on restart)
+- [ ] Add WebSocket for real-time updates (instead of polling)
+- [ ] Add graphs/charts for metrics over time
+- [ ] Add user/client tracking in activity log
+- [ ] Dark/light theme toggle
+
+---
+
 ## v0.3.0 - OIDC / Workload Identity Federation
 
 ### Killer Feature: OIDC for CI/CD

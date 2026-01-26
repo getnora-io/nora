@@ -61,7 +61,12 @@ pub fn layout(title: &str, content: &str, active_page: Option<&str>) -> String {
 }
 
 /// Dark theme layout wrapper for dashboard
-pub fn layout_dark(title: &str, content: &str, active_page: Option<&str>, extra_scripts: &str) -> String {
+pub fn layout_dark(
+    title: &str,
+    content: &str,
+    active_page: Option<&str>,
+    extra_scripts: &str,
+) -> String {
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -238,7 +243,13 @@ fn header_dark() -> String {
 }
 
 /// Render global stats row (5-column grid)
-pub fn render_global_stats(downloads: u64, uploads: u64, artifacts: u64, cache_hit_percent: f64, storage_bytes: u64) -> String {
+pub fn render_global_stats(
+    downloads: u64,
+    uploads: u64,
+    artifacts: u64,
+    cache_hit_percent: f64,
+    storage_bytes: u64,
+) -> String {
     format!(
         r##"
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
@@ -273,7 +284,15 @@ pub fn render_global_stats(downloads: u64, uploads: u64, artifacts: u64, cache_h
 }
 
 /// Render registry card with extended metrics
-pub fn render_registry_card(name: &str, icon_path: &str, artifact_count: usize, downloads: u64, uploads: u64, size_bytes: u64, href: &str) -> String {
+pub fn render_registry_card(
+    name: &str,
+    icon_path: &str,
+    artifact_count: usize,
+    downloads: u64,
+    uploads: u64,
+    size_bytes: u64,
+    href: &str,
+) -> String {
     format!(
         r##"
         <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-4 md:p-6 hover:border-blue-400 transition-all">
@@ -359,7 +378,13 @@ pub fn render_mount_points_table(mount_points: &[(String, String, Option<String>
 }
 
 /// Render a single activity log row
-pub fn render_activity_row(timestamp: &str, action: &str, artifact: &str, registry: &str, source: &str) -> String {
+pub fn render_activity_row(
+    timestamp: &str,
+    action: &str,
+    artifact: &str,
+    registry: &str,
+    source: &str,
+) -> String {
     let action_color = match action {
         "PULL" => "text-blue-400",
         "PUSH" => "text-green-400",
@@ -378,7 +403,12 @@ pub fn render_activity_row(timestamp: &str, action: &str, artifact: &str, regist
             <td class="py-2 text-slate-500">{}</td>
         </tr>
         "##,
-        timestamp, action_color, action, html_escape(artifact), registry, source
+        timestamp,
+        action_color,
+        action,
+        html_escape(artifact),
+        registry,
+        source
     )
 }
 
