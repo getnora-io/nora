@@ -1,3 +1,4 @@
+use crate::activity_log::{ActionType, ActivityEntry};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -19,8 +20,19 @@ pub fn routes() -> Router<Arc<AppState>> {
 async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
     let key = format!("maven/{}", path);
 
+    // Extract artifact name for logging (last 2-3 path components)
+    let artifact_name = path.split('/').rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        state.metrics.record_download("maven");
+        state.metrics.record_cache_hit();
+        state.activity.push(ActivityEntry::new(
+            ActionType::CacheHit,
+            artifact_name,
+            "maven",
+            "CACHE",
+        ));
         return with_content_type(&path, data).into_response();
     }
 
@@ -30,6 +42,15 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
 
         match fetch_from_proxy(&url, state.config.maven.proxy_timeout).await {
             Ok(data) => {
+                state.metrics.record_download("maven");
+                state.metrics.record_cache_miss();
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    artifact_name,
+                    "maven",
+                    "PROXY",
+                ));
+
                 // Cache in local storage (fire and forget)
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
@@ -53,8 +74,21 @@ async fn upload(
     body: Bytes,
 ) -> StatusCode {
     let key = format!("maven/{}", path);
+
+    // Extract artifact name for logging
+    let artifact_name = path.split('/').rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+
     match state.storage.put(&key, &body).await {
-        Ok(()) => StatusCode::CREATED,
+        Ok(()) => {
+            state.metrics.record_upload("maven");
+            state.activity.push(ActivityEntry::new(
+                ActionType::Push,
+                artifact_name,
+                "maven",
+                "LOCAL",
+            ));
+            StatusCode::CREATED
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

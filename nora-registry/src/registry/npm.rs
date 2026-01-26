@@ -1,3 +1,4 @@
+use crate::activity_log::{ActionType, ActivityEntry};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -29,8 +30,25 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
         format!("npm/{}/metadata.json", path)
     };
 
+    // Extract package name for logging
+    let package_name = if is_tarball {
+        path.split("/-/").next().unwrap_or(&path).to_string()
+    } else {
+        path.clone()
+    };
+
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        if is_tarball {
+            state.metrics.record_download("npm");
+            state.metrics.record_cache_hit();
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                package_name,
+                "npm",
+                "CACHE",
+            ));
+        }
         return with_content_type(is_tarball, data).into_response();
     }
 
@@ -45,6 +63,17 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
         };
 
         if let Ok(data) = fetch_from_proxy(&url, state.config.npm.proxy_timeout).await {
+            if is_tarball {
+                state.metrics.record_download("npm");
+                state.metrics.record_cache_miss();
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    package_name,
+                    "npm",
+                    "PROXY",
+                ));
+            }
+
             // Cache in local storage (fire and forget)
             let storage = state.storage.clone();
             let key_clone = key.clone();
