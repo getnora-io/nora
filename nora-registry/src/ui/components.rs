@@ -1,3 +1,6 @@
+/// Application version from Cargo.toml
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Main layout wrapper with header and sidebar
 pub fn layout(title: &str, content: &str, active_page: Option<&str>) -> String {
     format!(
@@ -202,13 +205,14 @@ fn sidebar_dark(active_page: Option<&str>) -> String {
             </nav>
             <div class="px-4 py-4 border-t border-slate-700">
                 <div class="text-xs text-slate-400">
-                    Nora v0.2.0
+                    Nora v{}
                 </div>
             </div>
         </div>
     "#,
         super::logo::LOGO_BASE64,
-        nav_html
+        nav_html,
+        VERSION
     )
 }
 
@@ -563,13 +567,14 @@ fn sidebar(active_page: Option<&str>) -> String {
             <!-- Footer -->
             <div class="px-4 py-4 border-t border-slate-700">
                 <div class="text-xs text-slate-400">
-                    Nora v0.2.0
+                    Nora v{}
                 </div>
             </div>
         </div>
     "#,
         super::logo::LOGO_BASE64,
-        nav_html
+        nav_html,
+        VERSION
     )
 }
 
