@@ -11,24 +11,46 @@ pub fn layout(title: &str, content: &str, active_page: Option<&str>) -> String {
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
         [x-cloak] {{ display: none !important; }}
+        .sidebar-open {{ overflow: hidden; }}
     </style>
 </head>
 <body class="bg-slate-100 min-h-screen">
     <div class="flex h-screen overflow-hidden">
+        <!-- Mobile sidebar overlay -->
+        <div id="sidebar-overlay" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden" onclick="toggleSidebar()"></div>
+
         <!-- Sidebar -->
         {}
 
         <!-- Main content -->
-        <div class="flex-1 flex flex-col overflow-hidden">
+        <div class="flex-1 flex flex-col overflow-hidden min-w-0">
             <!-- Header -->
             {}
 
             <!-- Content -->
-            <main class="flex-1 overflow-y-auto p-6">
+            <main class="flex-1 overflow-y-auto p-4 md:p-6">
                 {}
             </main>
         </div>
     </div>
+
+    <script>
+        function toggleSidebar() {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const isOpen = !sidebar.classList.contains('-translate-x-full');
+
+            if (isOpen) {{
+                sidebar.classList.add('-translate-x-full');
+                overlay.classList.add('hidden');
+                document.body.classList.remove('sidebar-open');
+            }} else {{
+                sidebar.classList.remove('-translate-x-full');
+                overlay.classList.remove('hidden');
+                document.body.classList.add('sidebar-open');
+            }}
+        }}
+    </script>
 </body>
 </html>"##,
         html_escape(title),
@@ -91,15 +113,22 @@ fn sidebar(active_page: Option<&str>) -> String {
 
     format!(
         r#"
-        <div class="w-64 bg-slate-800 text-white flex flex-col">
+        <div id="sidebar" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
             <!-- Logo -->
-            <div class="h-16 flex items-center px-6 border-b border-slate-700">
-                <span class="text-2xl mr-2">⚓</span>
-                <span class="text-xl font-bold">Nora</span>
+            <div class="h-16 flex items-center justify-between px-6 border-b border-slate-700">
+                <div class="flex items-center">
+                    <span class="text-xl font-bold tracking-tight">N<span class="inline-block w-5 h-5 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                </div>
+                <!-- Close button (mobile only) -->
+                <button onclick="toggleSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
             </div>
 
             <!-- Navigation -->
-            <nav class="flex-1 px-4 py-6 space-y-1">
+            <nav class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
                 <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mb-3">
                     Navigation
                 </div>
@@ -125,21 +154,30 @@ fn sidebar(active_page: Option<&str>) -> String {
 /// Header component
 fn header() -> String {
     r##"
-        <header class="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-6">
-            <div class="flex-1">
-                <!-- Search removed for simplicity, HTMX search is on list pages -->
+        <header class="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-4 md:px-6">
+            <div class="flex items-center">
+                <!-- Hamburger menu (mobile only) -->
+                <button onclick="toggleSidebar()" class="md:hidden p-2 -ml-2 mr-2 rounded-lg hover:bg-slate-100">
+                    <svg class="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+                    </svg>
+                </button>
+                <!-- Mobile logo -->
+                <div class="md:hidden flex items-center">
+                    <span class="font-bold text-slate-800 tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                </div>
             </div>
-            <div class="flex items-center space-x-4">
-                <a href="https://github.com" target="_blank" class="text-slate-500 hover:text-slate-700">
+            <div class="flex items-center space-x-2 md:space-x-4">
+                <a href="https://github.com/getnora-io/nora" target="_blank" class="p-2 text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg">
                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                         <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
                     </svg>
                 </a>
-                <button class="text-slate-500 hover:text-slate-700">
+                <a href="/api-docs" class="p-2 text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg" title="API Docs">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                     </svg>
-                </button>
+                </a>
             </div>
         </header>
     "##.to_string()
@@ -158,15 +196,15 @@ pub mod icons {
 pub fn stat_card(name: &str, icon_path: &str, count: usize, href: &str, unit: &str) -> String {
     format!(
         r##"
-        <a href="{}" class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 hover:shadow-md hover:border-blue-300 transition-all">
-            <div class="flex items-center justify-between mb-4">
-                <svg class="w-10 h-10 text-slate-600" fill="currentColor" viewBox="0 0 24 24">
+        <a href="{}" class="block bg-white rounded-lg shadow-sm border border-slate-200 p-4 md:p-6 hover:shadow-md hover:border-blue-300 active:bg-slate-50 transition-all touch-manipulation">
+            <div class="flex items-center justify-between mb-3 md:mb-4">
+                <svg class="w-8 h-8 md:w-10 md:h-10 text-slate-600" fill="currentColor" viewBox="0 0 24 24">
                     {}
                 </svg>
                 <span class="text-xs font-medium text-green-600 bg-green-100 px-2 py-1 rounded-full">ACTIVE</span>
             </div>
-            <div class="text-lg font-semibold text-slate-800 mb-1">{}</div>
-            <div class="text-2xl font-bold text-slate-800">{}</div>
+            <div class="text-base md:text-lg font-semibold text-slate-800 mb-1">{}</div>
+            <div class="text-xl md:text-2xl font-bold text-slate-800">{}</div>
             <div class="text-sm text-slate-500">{}</div>
         </a>
     "##,
