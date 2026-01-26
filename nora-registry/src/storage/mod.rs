@@ -4,10 +4,11 @@ mod s3;
 pub use local::LocalStorage;
 pub use s3::S3Storage;
 
+use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
-use std::fmt;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// File metadata
 #[derive(Debug, Clone)]
@@ -16,24 +17,20 @@ pub struct FileMeta {
     pub modified: u64, // Unix timestamp
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("Network error: {0}")]
     Network(String),
+
+    #[error("Object not found")]
     NotFound,
+
+    #[error("IO error: {0}")]
     Io(String),
-}
 
-impl fmt::Display for StorageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Network(msg) => write!(f, "Network error: {}", msg),
-            Self::NotFound => write!(f, "Object not found"),
-            Self::Io(msg) => write!(f, "IO error: {}", msg),
-        }
-    }
+    #[error("Validation error: {0}")]
+    Validation(#[from] ValidationError),
 }
-
-impl std::error::Error for StorageError {}
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -68,18 +65,29 @@ impl Storage {
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        validate_storage_key(key)?;
         self.inner.put(key, data).await
     }
 
     pub async fn get(&self, key: &str) -> Result<Bytes> {
+        validate_storage_key(key)?;
         self.inner.get(key).await
     }
 
     pub async fn list(&self, prefix: &str) -> Vec<String> {
+        // Empty prefix is valid for listing all
+        if !prefix.is_empty() {
+            if let Err(_) = validate_storage_key(prefix) {
+                return Vec::new();
+            }
+        }
         self.inner.list(prefix).await
     }
 
     pub async fn stat(&self, key: &str) -> Option<FileMeta> {
+        if validate_storage_key(key).is_err() {
+            return None;
+        }
         self.inner.stat(key).await
     }
 
