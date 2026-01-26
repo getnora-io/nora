@@ -44,7 +44,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
                 r.uploads,
                 r.size_bytes,
                 &format!("/ui/{}", r.name),
-                &t,
+                t,
             )
         })
         .collect();
@@ -61,7 +61,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
             )
         })
         .collect();
-    let mount_points = render_mount_points_table(&mount_data, &t);
+    let mount_points = render_mount_points_table(&mount_data, t);
 
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {
@@ -84,7 +84,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
             })
             .collect()
     };
-    let activity_log = render_activity_log(&activity_rows, &t);
+    let activity_log = render_activity_log(&activity_rows, t);
 
     // Format uptime
     let hours = data.uptime_seconds / 3600;
