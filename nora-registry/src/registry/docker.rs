@@ -123,7 +123,7 @@ async fn patch_blob(Path((name, uuid)): Path<(String, String)>, body: Bytes) -> 
     // Append data to the upload session and get total size
     let total_size = {
         let mut sessions = UPLOAD_SESSIONS.write();
-        let session = sessions.entry(uuid.clone()).or_insert_with(Vec::new);
+        let session = sessions.entry(uuid.clone()).or_default();
         session.extend_from_slice(&body);
         session.len()
     };
@@ -262,13 +262,13 @@ async fn put_manifest(
 
     // Store by tag/reference
     let key = format!("docker/{}/manifests/{}.json", name, reference);
-    if let Err(_) = state.storage.put(&key, &body).await {
+    if state.storage.put(&key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Also store by digest for direct digest lookups
     let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
-    if let Err(_) = state.storage.put(&digest_key, &body).await {
+    if state.storage.put(&digest_key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
