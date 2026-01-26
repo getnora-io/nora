@@ -11,6 +11,8 @@ pub struct Config {
     #[serde(default)]
     pub npm: NpmConfig,
     #[serde(default)]
+    pub pypi: PypiConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
 }
 
@@ -69,6 +71,14 @@ pub struct NpmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PypiConfig {
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -103,6 +113,15 @@ impl Default for NpmConfig {
     fn default() -> Self {
         Self {
             proxy: Some("https://registry.npmjs.org".to_string()),
+            proxy_timeout: 30,
+        }
+    }
+}
+
+impl Default for PypiConfig {
+    fn default() -> Self {
+        Self {
+            proxy: Some("https://pypi.org/simple/".to_string()),
             proxy_timeout: 30,
         }
     }
@@ -190,6 +209,16 @@ impl Config {
             }
         }
 
+        // PyPI config
+        if let Ok(val) = env::var("NORA_PYPI_PROXY") {
+            self.pypi.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_PYPI_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.pypi.proxy_timeout = timeout;
+            }
+        }
+
         // Token storage
         if let Ok(val) = env::var("NORA_AUTH_TOKEN_STORAGE") {
             self.auth.token_storage = val;
@@ -212,6 +241,7 @@ impl Default for Config {
             },
             maven: MavenConfig::default(),
             npm: NpmConfig::default(),
+            pypi: PypiConfig::default(),
             auth: AuthConfig::default(),
         }
     }

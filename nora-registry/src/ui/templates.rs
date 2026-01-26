@@ -1,8 +1,10 @@
 use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, RepoInfo};
 use super::components::*;
+use super::i18n::{get_translations, Lang};
 
 /// Renders the main dashboard page with dark theme
-pub fn render_dashboard(data: &DashboardResponse) -> String {
+pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
+    let t = get_translations(lang);
     // Render global stats
     let global_stats = render_global_stats(
         data.global_stats.downloads,
@@ -10,6 +12,7 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
         data.global_stats.artifacts,
         data.global_stats.cache_hit_percent,
         data.global_stats.storage_bytes,
+        lang,
     );
 
     // Render registry cards
@@ -41,6 +44,7 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
                 r.uploads,
                 r.size_bytes,
                 &format!("/ui/{}", r.name),
+                &t,
             )
         })
         .collect();
@@ -57,11 +61,11 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
             )
         })
         .collect();
-    let mount_points = render_mount_points_table(&mount_data);
+    let mount_points = render_mount_points_table(&mount_data, &t);
 
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {
-        r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">No recent activity</td></tr>"##.to_string()
+        format!(r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">{}</td></tr>"##, t.no_activity)
     } else {
         data.activity
             .iter()
@@ -77,23 +81,26 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
             })
             .collect()
     };
-    let activity_log = render_activity_log(&activity_rows);
+    let activity_log = render_activity_log(&activity_rows, &t);
 
     // Format uptime
     let hours = data.uptime_seconds / 3600;
     let mins = (data.uptime_seconds % 3600) / 60;
     let uptime_str = format!("{}h {}m", hours, mins);
 
+    // Render bragging footer
+    let bragging_footer = render_bragging_footer(lang);
+
     let content = format!(
         r##"
         <div class="mb-6">
             <div class="flex items-center justify-between">
                 <div>
-                    <h1 class="text-2xl font-bold text-slate-200 mb-1">Dashboard</h1>
-                    <p class="text-slate-400">Overview of all registries</p>
+                    <h1 class="text-2xl font-bold text-slate-200 mb-1">{}</h1>
+                    <p class="text-slate-400">{}</p>
                 </div>
                 <div class="text-right">
-                    <div class="text-sm text-slate-500">Uptime</div>
+                    <div class="text-sm text-slate-500">{}</div>
                     <div id="uptime" class="text-lg font-semibold text-slate-300">{}</div>
                 </div>
             </div>
@@ -105,16 +112,26 @@ pub fn render_dashboard(data: &DashboardResponse) -> String {
             {}
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             {}
             {}
         </div>
+
+        {}
     "##,
-        uptime_str, global_stats, registry_cards, mount_points, activity_log,
+        t.dashboard_title,
+        t.dashboard_subtitle,
+        t.uptime,
+        uptime_str,
+        global_stats,
+        registry_cards,
+        mount_points,
+        activity_log,
+        bragging_footer,
     );
 
     let polling_script = render_polling_script();
-    layout_dark("Dashboard", &content, Some("dashboard"), &polling_script)
+    layout_dark(t.dashboard_title, &content, Some("dashboard"), &polling_script, lang)
 }
 
 /// Format timestamp as relative time (e.g., "2 min ago")
@@ -137,16 +154,16 @@ fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Renders a registry list page (docker, maven, npm, cargo, pypi)
-pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]) -> String {
+pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo], lang: Lang) -> String {
+    let t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
 
     let table_rows = if repos.is_empty() {
-        r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+        format!(r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">📭</div>
-            <div>No repositories found</div>
-            <div class="text-sm mt-1">Push your first artifact to see it here</div>
-        </td></tr>"##
-            .to_string()
+            <div>{}</div>
+            <div class="text-sm mt-1">{}</div>
+        </td></tr>"##, t.no_repos_found, t.push_first_artifact)
     } else {
         repos
             .iter()
@@ -177,9 +194,8 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
     };
 
     let version_label = match registry_type {
-        "docker" => "Tags",
-        "maven" => "Versions",
-        _ => "Versions",
+        "docker" => t.tags,
+        _ => t.versions,
     };
 
     let content = format!(
@@ -189,13 +205,13 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
                 <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
                     <h1 class="text-2xl font-bold text-slate-200">{}</h1>
-                    <p class="text-slate-500">{} repositories</p>
+                    <p class="text-slate-500">{} {}</p>
                 </div>
             </div>
             <div class="flex items-center gap-4">
                 <div class="relative">
                     <input type="text"
-                           placeholder="Search repositories..."
+                           placeholder="{}"
                            class="pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
                            hx-get="/api/ui/{}/search"
                            hx-trigger="keyup changed delay:300ms"
@@ -212,10 +228,10 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Name</th>
                         <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Updated</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
                     </tr>
                 </thead>
                 <tbody id="repo-table-body" class="divide-y divide-slate-700">
@@ -227,16 +243,22 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
         icon,
         title,
         repos.len(),
+        t.repositories,
+        t.search_placeholder,
         registry_type,
+        t.name,
         version_label,
+        t.size,
+        t.updated,
         table_rows
     );
 
-    layout_dark(title, &content, Some(registry_type), "")
+    layout_dark(title, &content, Some(registry_type), "", lang)
 }
 
 /// Renders Docker image detail page
-pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
+pub fn render_docker_detail(name: &str, detail: &DockerDetail, lang: Lang) -> String {
+    let _t = get_translations(lang);
     let tags_rows = if detail.tags.is_empty() {
         r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No tags found</td></tr>"##.to_string()
     } else {
@@ -318,11 +340,12 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
         tags_rows
     );
 
-    layout_dark(&format!("{} - Docker", name), &content, Some("docker"), "")
+    layout_dark(&format!("{} - Docker", name), &content, Some("docker"), "", lang)
 }
 
 /// Renders package detail page (npm, cargo, pypi)
-pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDetail) -> String {
+pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDetail, lang: Lang) -> String {
+    let _t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
 
@@ -422,11 +445,13 @@ pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDe
         &content,
         Some(registry_type),
         "",
+        lang,
     )
 }
 
 /// Renders Maven artifact detail page
-pub fn render_maven_detail(path: &str, detail: &MavenDetail) -> String {
+pub fn render_maven_detail(path: &str, detail: &MavenDetail, lang: Lang) -> String {
+    let _t = get_translations(lang);
     let artifact_rows = if detail.artifacts.is_empty() {
         r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-500">No artifacts found</td></tr>"##.to_string()
     } else {
@@ -506,7 +531,7 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail) -> String {
         artifact_rows
     );
 
-    layout_dark(&format!("{} - Maven", path), &content, Some("maven"), "")
+    layout_dark(&format!("{} - Maven", path), &content, Some("maven"), "", lang)
 }
 
 /// Returns SVG icon path for the registry type
