@@ -1,84 +1,128 @@
-use super::api::{DockerDetail, MavenDetail, PackageDetail, RegistryStats, RepoInfo};
+use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, RepoInfo};
 use super::components::*;
 
-/// Renders the main dashboard page
-pub fn render_dashboard(stats: &RegistryStats) -> String {
-    let content = format!(
-        r##"
-        <div class="mb-8">
-            <h1 class="text-2xl font-bold text-slate-800 mb-2">Dashboard</h1>
-            <p class="text-slate-500">Overview of all registries</p>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6 mb-8">
-            {}
-            {}
-            {}
-            {}
-            {}
-        </div>
-
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-6">
-            <h2 class="text-lg font-semibold text-slate-800 mb-4">Quick Links</h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                <a href="/ui/docker" class="flex items-center p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                    <svg class="w-8 h-8 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                    <div>
-                        <div class="font-medium text-slate-700">Docker Registry</div>
-                        <div class="text-sm text-slate-500">API: /v2/</div>
-                    </div>
-                </a>
-                <a href="/ui/maven" class="flex items-center p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                    <svg class="w-8 h-8 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                    <div>
-                        <div class="font-medium text-slate-700">Maven Repository</div>
-                        <div class="text-sm text-slate-500">API: /maven2/</div>
-                    </div>
-                </a>
-                <a href="/ui/npm" class="flex items-center p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                    <svg class="w-8 h-8 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                    <div>
-                        <div class="font-medium text-slate-700">npm Registry</div>
-                        <div class="text-sm text-slate-500">API: /npm/</div>
-                    </div>
-                </a>
-                <a href="/ui/cargo" class="flex items-center p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                    <svg class="w-8 h-8 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                    <div>
-                        <div class="font-medium text-slate-700">Cargo Registry</div>
-                        <div class="text-sm text-slate-500">API: /cargo/</div>
-                    </div>
-                </a>
-                <a href="/ui/pypi" class="flex items-center p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                    <svg class="w-8 h-8 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                    <div>
-                        <div class="font-medium text-slate-700">PyPI Repository</div>
-                        <div class="text-sm text-slate-500">API: /simple/</div>
-                    </div>
-                </a>
-            </div>
-        </div>
-    "##,
-        stat_card(
-            "Docker",
-            icons::DOCKER,
-            stats.docker,
-            "/ui/docker",
-            "images"
-        ),
-        stat_card("Maven", icons::MAVEN, stats.maven, "/ui/maven", "artifacts"),
-        stat_card("npm", icons::NPM, stats.npm, "/ui/npm", "packages"),
-        stat_card("Cargo", icons::CARGO, stats.cargo, "/ui/cargo", "crates"),
-        stat_card("PyPI", icons::PYPI, stats.pypi, "/ui/pypi", "packages"),
-        // Quick Links icons
-        icons::DOCKER,
-        icons::MAVEN,
-        icons::NPM,
-        icons::CARGO,
-        icons::PYPI,
+/// Renders the main dashboard page with dark theme
+pub fn render_dashboard(data: &DashboardResponse) -> String {
+    // Render global stats
+    let global_stats = render_global_stats(
+        data.global_stats.downloads,
+        data.global_stats.uploads,
+        data.global_stats.artifacts,
+        data.global_stats.cache_hit_percent,
+        data.global_stats.storage_bytes,
     );
 
-    layout("Dashboard", &content, Some("dashboard"))
+    // Render registry cards
+    let registry_cards: String = data.registry_stats.iter().map(|r| {
+        let icon = match r.name.as_str() {
+            "docker" => icons::DOCKER,
+            "maven" => icons::MAVEN,
+            "npm" => icons::NPM,
+            "cargo" => icons::CARGO,
+            "pypi" => icons::PYPI,
+            _ => icons::DOCKER,
+        };
+        let display_name = match r.name.as_str() {
+            "docker" => "Docker",
+            "maven" => "Maven",
+            "npm" => "npm",
+            "cargo" => "Cargo",
+            "pypi" => "PyPI",
+            _ => &r.name,
+        };
+        render_registry_card(
+            display_name,
+            icon,
+            r.artifact_count,
+            r.downloads,
+            r.uploads,
+            r.size_bytes,
+            &format!("/ui/{}", r.name),
+        )
+    }).collect();
+
+    // Render mount points
+    let mount_data: Vec<(String, String, Option<String>)> = data.mount_points.iter()
+        .map(|m| (m.registry.clone(), m.mount_path.clone(), m.proxy_upstream.clone()))
+        .collect();
+    let mount_points = render_mount_points_table(&mount_data);
+
+    // Render activity log
+    let activity_rows: String = if data.activity.is_empty() {
+        r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">No recent activity</td></tr>"##.to_string()
+    } else {
+        data.activity.iter().map(|entry| {
+            let time_ago = format_relative_time(&entry.timestamp);
+            render_activity_row(
+                &time_ago,
+                &entry.action.to_string(),
+                &entry.artifact,
+                &entry.registry,
+                &entry.source,
+            )
+        }).collect()
+    };
+    let activity_log = render_activity_log(&activity_rows);
+
+    // Format uptime
+    let hours = data.uptime_seconds / 3600;
+    let mins = (data.uptime_seconds % 3600) / 60;
+    let uptime_str = format!("{}h {}m", hours, mins);
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-200 mb-1">Dashboard</h1>
+                    <p class="text-slate-400">Overview of all registries</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-slate-500">Uptime</div>
+                    <div id="uptime" class="text-lg font-semibold text-slate-300">{}</div>
+                </div>
+            </div>
+        </div>
+
+        {}
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-6">
+            {}
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {}
+            {}
+        </div>
+    "##,
+        uptime_str,
+        global_stats,
+        registry_cards,
+        mount_points,
+        activity_log,
+    );
+
+    let polling_script = render_polling_script();
+    layout_dark("Dashboard", &content, Some("dashboard"), &polling_script)
+}
+
+/// Format timestamp as relative time (e.g., "2 min ago")
+fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let diff = now.signed_duration_since(*timestamp);
+
+    if diff.num_seconds() < 60 {
+        "just now".to_string()
+    } else if diff.num_minutes() < 60 {
+        let mins = diff.num_minutes();
+        format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
+    } else if diff.num_hours() < 24 {
+        let hours = diff.num_hours();
+        format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else {
+        let days = diff.num_days();
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    }
 }
 
 /// Renders a registry list page (docker, maven, npm, cargo, pypi)
