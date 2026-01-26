@@ -219,14 +219,22 @@ async fn run_server(config: Config, storage: Storage) {
         .merge(registry::pypi_routes())
         .layer(rate_limit::upload_rate_limiter());
 
-    let app = Router::new()
+    // Routes WITHOUT rate limiting (health, metrics, UI)
+    let public_routes = Router::new()
         .merge(health::routes())
         .merge(metrics::routes())
         .merge(ui::routes())
-        .merge(openapi::routes())
+        .merge(openapi::routes());
+
+    // Routes WITH rate limiting
+    let rate_limited_routes = Router::new()
         .merge(auth_routes)
         .merge(registry_routes)
-        .layer(rate_limit::general_rate_limiter()) // General rate limit for all routes
+        .layer(rate_limit::general_rate_limiter());
+
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(rate_limited_routes)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB default body limit
         .layer(middleware::from_fn(request_id::request_id_middleware))
         .layer(middleware::from_fn(metrics::metrics_middleware))
