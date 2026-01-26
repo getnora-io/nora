@@ -178,10 +178,7 @@ async fn put_manifest(
     }
 }
 
-async fn list_tags(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }

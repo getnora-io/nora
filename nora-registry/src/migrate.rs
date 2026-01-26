@@ -8,15 +8,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
 /// Migration options
+#[derive(Default)]
 pub struct MigrateOptions {
     /// If true, show what would be migrated without copying
     pub dry_run: bool,
-}
-
-impl Default for MigrateOptions {
-    fn default() -> Self {
-        Self { dry_run: false }
-    }
 }
 
 /// Migration statistics
@@ -64,7 +59,9 @@ pub async fn migrate(
     let pb = ProgressBar::new(keys.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .expect("Invalid progress bar template")
             .progress_chars("#>-"),
     );
