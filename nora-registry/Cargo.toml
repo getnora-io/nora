@@ -41,6 +41,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tower_governor = "0.8"
 governor = "0.10"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
