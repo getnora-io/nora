@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.4
+
 # Build stage
 FROM rust:1.83-alpine AS builder
 
@@ -17,8 +19,11 @@ RUN mkdir -p nora-registry/src nora-storage/src nora-cli/src && \
     echo "fn main() {}" > nora-storage/src/main.rs && \
     echo "fn main() {}" > nora-cli/src/main.rs
 
-# Build dependencies only
-RUN cargo build --release --package nora-registry && \
+# Build dependencies only (with cache)
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --package nora-registry && \
     rm -rf nora-registry/src nora-storage/src nora-cli/src
 
 # Copy real sources
@@ -26,9 +31,13 @@ COPY nora-registry/src nora-registry/src
 COPY nora-storage/src nora-storage/src
 COPY nora-cli/src nora-cli/src
 
-# Build release binary
-RUN touch nora-registry/src/main.rs && \
-    cargo build --release --package nora-registry
+# Build release binary (with cache)
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    touch nora-registry/src/main.rs && \
+    cargo build --release --package nora-registry && \
+    cp /app/target/release/nora /usr/local/bin/nora
 
 # Runtime stage
 FROM alpine:3.20
@@ -38,7 +47,7 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 
 # Copy binary
-COPY --from=builder /app/target/release/nora /usr/local/bin/nora
+COPY --from=builder /usr/local/bin/nora /usr/local/bin/nora
 
 # Create data directory
 RUN mkdir -p /data
