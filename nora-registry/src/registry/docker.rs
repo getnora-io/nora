@@ -1,3 +1,4 @@
+use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -33,6 +34,13 @@ async fn check_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_digest(&digest) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.get(&key).await {
         Ok(data) => (
@@ -48,6 +56,13 @@ async fn download_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_digest(&digest) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.get(&key).await {
         Ok(data) => (
@@ -61,6 +76,10 @@ async fn download_blob(
 }
 
 async fn start_upload(Path(name): Path<String>) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let uuid = uuid::Uuid::new_v4().to_string();
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
     (
@@ -79,10 +98,19 @@ async fn upload_blob(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let digest = match params.get("digest") {
         Some(d) => d,
-        None => return StatusCode::BAD_REQUEST.into_response(),
+        None => return (StatusCode::BAD_REQUEST, "Missing digest parameter").into_response(),
     };
+
+    if let Err(e) = validate_digest(digest) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.put(&key, &body).await {
         Ok(()) => {
@@ -97,6 +125,13 @@ async fn get_manifest(
     State(state): State<Arc<AppState>>,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_docker_reference(&reference) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let key = format!("docker/{}/manifests/{}.json", name, reference);
     match state.storage.get(&key).await {
         Ok(data) => (
@@ -117,6 +152,13 @@ async fn put_manifest(
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_docker_reference(&reference) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let key = format!("docker/{}/manifests/{}.json", name, reference);
     match state.storage.put(&key, &body).await {
         Ok(()) => {
@@ -139,7 +181,11 @@ async fn put_manifest(
 async fn list_tags(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> (StatusCode, Json<Value>) {
+) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     let prefix = format!("docker/{}/manifests/", name);
     let keys = state.storage.list(&prefix).await;
     let tags: Vec<String> = keys
@@ -150,5 +196,5 @@ async fn list_tags(
                 .map(String::from)
         })
         .collect();
-    (StatusCode::OK, Json(json!({"name": name, "tags": tags})))
+    (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }
