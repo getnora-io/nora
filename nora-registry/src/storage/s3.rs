@@ -127,3 +127,184 @@ impl StorageBackend for S3Storage {
         "s3"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_put_success() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/test-key"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let result = storage.put("test-key", b"data").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_put_failure() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/test-key"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let result = storage.put("test-key", b"data").await;
+        assert!(matches!(result, Err(StorageError::Network(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_success() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"test data".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let data = storage.get("test-key").await.unwrap();
+        assert_eq!(&*data, b"test data");
+    }
+
+    #[tokio::test]
+    async fn test_get_not_found() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let result = storage.get("missing").await;
+        assert!(matches!(result, Err(StorageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_list() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        let xml_response = r#"<?xml version="1.0"?>
+            <ListBucketResult>
+                <Key>docker/image1</Key>
+                <Key>docker/image2</Key>
+                <Key>maven/artifact</Key>
+            </ListBucketResult>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/test-bucket"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(xml_response))
+            .mount(&mock_server)
+            .await;
+
+        let keys = storage.list("docker/").await;
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|k| k.starts_with("docker/")));
+    }
+
+    #[tokio::test]
+    async fn test_stat_success() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "1234")
+                    .insert_header("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let meta = storage.stat("test-key").await.unwrap();
+        assert_eq!(meta.size, 1234);
+        assert!(meta.modified > 0);
+    }
+
+    #[tokio::test]
+    async fn test_stat_not_found() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let meta = storage.stat("missing").await;
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_healthy() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        assert!(storage.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_bucket_not_found_is_ok() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // 404 is OK for health check (bucket may be empty)
+        assert!(storage.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_server_error() {
+        let mock_server = MockServer::start().await;
+        let storage = S3Storage::new(&mock_server.uri(), "test-bucket");
+
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        assert!(!storage.health_check().await);
+    }
+
+    #[test]
+    fn test_backend_name() {
+        let storage = S3Storage::new("http://localhost:9000", "bucket");
+        assert_eq!(storage.backend_name(), "s3");
+    }
+
+    #[test]
+    fn test_parse_s3_keys() {
+        let xml = r#"<Key>docker/a</Key><Key>docker/b</Key><Key>maven/c</Key>"#;
+        let keys = S3Storage::parse_s3_keys(xml, "docker/");
+        assert_eq!(keys, vec!["docker/a", "docker/b"]);
+    }
+}
