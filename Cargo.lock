@@ -1212,6 +1212,7 @@ dependencies = [
  "httpdate",
  "indicatif",
  "lazy_static",
+ "parking_lot",
  "prometheus",
  "reqwest",
  "serde",
