@@ -1,15 +1,20 @@
 mod auth;
 mod backup;
 mod config;
+mod error;
 mod health;
 mod metrics;
+mod migrate;
 mod openapi;
+mod rate_limit;
 mod registry;
+mod request_id;
 mod storage;
 mod tokens;
 mod ui;
+mod validation;
 
-use axum::{middleware, Router};
+use axum::{extract::DefaultBodyLimit, middleware, Router};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -120,9 +125,35 @@ async fn main() {
             }
         }
         Some(Commands::Migrate { from, to, dry_run }) => {
-            eprintln!("Migration from '{}' to '{}' (dry_run: {})", from, to, dry_run);
-            eprintln!("TODO: Migration not yet implemented");
-            std::process::exit(1);
+            let source = match from.as_str() {
+                "local" => Storage::new_local(&config.storage.path),
+                "s3" => Storage::new_s3(&config.storage.s3_url, &config.storage.bucket),
+                _ => {
+                    error!("Invalid source: '{}'. Use 'local' or 's3'", from);
+                    std::process::exit(1);
+                }
+            };
+
+            let dest = match to.as_str() {
+                "local" => Storage::new_local(&config.storage.path),
+                "s3" => Storage::new_s3(&config.storage.s3_url, &config.storage.bucket),
+                _ => {
+                    error!("Invalid destination: '{}'. Use 'local' or 's3'", to);
+                    std::process::exit(1);
+                }
+            };
+
+            if from == to {
+                error!("Source and destination cannot be the same");
+                std::process::exit(1);
+            }
+
+            let options = migrate::MigrateOptions { dry_run };
+
+            if let Err(e) = migrate::migrate(&source, &dest, options).await {
+                error!("Migration failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -180,17 +211,28 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
     });
 
-    let app = Router::new()
-        .merge(health::routes())
-        .merge(metrics::routes())
-        .merge(ui::routes())
-        .merge(openapi::routes())
-        .merge(auth::token_routes())
+    // Token routes with strict rate limiting (brute-force protection)
+    let auth_routes = auth::token_routes().layer(rate_limit::auth_rate_limiter());
+
+    // Registry routes with upload rate limiting
+    let registry_routes = Router::new()
         .merge(registry::docker_routes())
         .merge(registry::maven_routes())
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
+        .layer(rate_limit::upload_rate_limiter());
+
+    let app = Router::new()
+        .merge(health::routes())
+        .merge(metrics::routes())
+        .merge(ui::routes())
+        .merge(openapi::routes())
+        .merge(auth_routes)
+        .merge(registry_routes)
+        .layer(rate_limit::general_rate_limiter()) // General rate limit for all routes
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB default body limit
+        .layer(middleware::from_fn(request_id::request_id_middleware))
         .layer(middleware::from_fn(metrics::metrics_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
