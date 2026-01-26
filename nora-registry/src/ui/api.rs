@@ -1,5 +1,6 @@
 use super::components::{format_size, format_timestamp, html_escape};
 use super::templates::encode_uri_component;
+use crate::activity_log::ActivityEntry;
 use crate::AppState;
 use crate::Storage;
 use axum::{
@@ -8,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Serialize)]
@@ -67,11 +69,163 @@ pub struct SearchQuery {
     pub q: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct DashboardResponse {
+    pub global_stats: GlobalStats,
+    pub registry_stats: Vec<RegistryCardStats>,
+    pub mount_points: Vec<MountPoint>,
+    pub activity: Vec<ActivityEntry>,
+    pub uptime_seconds: u64,
+}
+
+#[derive(Serialize)]
+pub struct GlobalStats {
+    pub downloads: u64,
+    pub uploads: u64,
+    pub artifacts: u64,
+    pub cache_hit_percent: f64,
+    pub storage_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct RegistryCardStats {
+    pub name: String,
+    pub artifact_count: usize,
+    pub downloads: u64,
+    pub uploads: u64,
+    pub size_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct MountPoint {
+    pub registry: String,
+    pub mount_path: String,
+    pub proxy_upstream: Option<String>,
+}
+
 // ============ API Handlers ============
 
 pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats> {
     let stats = get_registry_stats(&state.storage).await;
     Json(stats)
+}
+
+pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
+    let registry_stats = get_registry_stats(&state.storage).await;
+
+    // Calculate total storage size
+    let all_keys = state.storage.list("").await;
+    let mut total_storage: u64 = 0;
+    let mut docker_size: u64 = 0;
+    let mut maven_size: u64 = 0;
+    let mut npm_size: u64 = 0;
+    let mut cargo_size: u64 = 0;
+    let mut pypi_size: u64 = 0;
+
+    for key in &all_keys {
+        if let Some(meta) = state.storage.stat(key).await {
+            total_storage += meta.size;
+            if key.starts_with("docker/") {
+                docker_size += meta.size;
+            } else if key.starts_with("maven/") {
+                maven_size += meta.size;
+            } else if key.starts_with("npm/") {
+                npm_size += meta.size;
+            } else if key.starts_with("cargo/") {
+                cargo_size += meta.size;
+            } else if key.starts_with("pypi/") {
+                pypi_size += meta.size;
+            }
+        }
+    }
+
+    let total_artifacts = registry_stats.docker + registry_stats.maven +
+                          registry_stats.npm + registry_stats.cargo + registry_stats.pypi;
+
+    let global_stats = GlobalStats {
+        downloads: state.metrics.downloads.load(Ordering::Relaxed),
+        uploads: state.metrics.uploads.load(Ordering::Relaxed),
+        artifacts: total_artifacts as u64,
+        cache_hit_percent: state.metrics.cache_hit_rate(),
+        storage_bytes: total_storage,
+    };
+
+    let registry_card_stats = vec![
+        RegistryCardStats {
+            name: "docker".to_string(),
+            artifact_count: registry_stats.docker,
+            downloads: state.metrics.get_registry_downloads("docker"),
+            uploads: state.metrics.get_registry_uploads("docker"),
+            size_bytes: docker_size,
+        },
+        RegistryCardStats {
+            name: "maven".to_string(),
+            artifact_count: registry_stats.maven,
+            downloads: state.metrics.get_registry_downloads("maven"),
+            uploads: state.metrics.get_registry_uploads("maven"),
+            size_bytes: maven_size,
+        },
+        RegistryCardStats {
+            name: "npm".to_string(),
+            artifact_count: registry_stats.npm,
+            downloads: state.metrics.get_registry_downloads("npm"),
+            uploads: 0,
+            size_bytes: npm_size,
+        },
+        RegistryCardStats {
+            name: "cargo".to_string(),
+            artifact_count: registry_stats.cargo,
+            downloads: state.metrics.get_registry_downloads("cargo"),
+            uploads: 0,
+            size_bytes: cargo_size,
+        },
+        RegistryCardStats {
+            name: "pypi".to_string(),
+            artifact_count: registry_stats.pypi,
+            downloads: state.metrics.get_registry_downloads("pypi"),
+            uploads: 0,
+            size_bytes: pypi_size,
+        },
+    ];
+
+    let mount_points = vec![
+        MountPoint {
+            registry: "Docker".to_string(),
+            mount_path: "/v2/".to_string(),
+            proxy_upstream: None,
+        },
+        MountPoint {
+            registry: "Maven".to_string(),
+            mount_path: "/maven2/".to_string(),
+            proxy_upstream: state.config.maven.proxies.first().cloned(),
+        },
+        MountPoint {
+            registry: "npm".to_string(),
+            mount_path: "/npm/".to_string(),
+            proxy_upstream: state.config.npm.proxy.clone(),
+        },
+        MountPoint {
+            registry: "Cargo".to_string(),
+            mount_path: "/cargo/".to_string(),
+            proxy_upstream: None,
+        },
+        MountPoint {
+            registry: "PyPI".to_string(),
+            mount_path: "/simple/".to_string(),
+            proxy_upstream: None,
+        },
+    ];
+
+    let activity = state.activity.recent(20);
+    let uptime_seconds = state.start_time.elapsed().as_secs();
+
+    Json(DashboardResponse {
+        global_stats,
+        registry_stats: registry_card_stats,
+        mount_points,
+        activity,
+        uptime_seconds,
+    })
 }
 
 pub async fn api_list(

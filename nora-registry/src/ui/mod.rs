@@ -33,6 +33,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/pypi/{name}", get(pypi_detail))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
+        .route("/api/ui/dashboard", get(api_dashboard))
         .route("/api/ui/{registry_type}/list", get(api_list))
         .route("/api/ui/{registry_type}/{name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
@@ -40,8 +41,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 // Dashboard page
 async fn dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = get_registry_stats(&state.storage).await;
-    Html(render_dashboard(&stats))
+    let response = api_dashboard(State(state)).await.0;
+    Html(render_dashboard(&response))
 }
 
 // Docker pages

@@ -1,3 +1,4 @@
+use crate::activity_log::{ActionType, ActivityEntry};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -37,7 +38,17 @@ async fn download(
         crate_name, version, crate_name, version
     );
     match state.storage.get(&key).await {
-        Ok(data) => (StatusCode::OK, data).into_response(),
+        Ok(data) => {
+            state.metrics.record_download("cargo");
+            state.metrics.record_cache_hit();
+            state.activity.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("{}@{}", crate_name, version),
+                "cargo",
+                "LOCAL",
+            ));
+            (StatusCode::OK, data).into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
