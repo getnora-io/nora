@@ -313,3 +313,106 @@ pub fn token_routes() -> Router<Arc<AppState>> {
         .route("/api/tokens/list", post(list_tokens))
         .route("/api/tokens/revoke", post(revoke_token))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn create_test_htpasswd(entries: &[(&str, &str)]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        for (username, password) in entries {
+            let hash = bcrypt::hash(password, 4).unwrap(); // cost=4 for speed in tests
+            writeln!(file, "{}:{}", username, hash).unwrap();
+        }
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn test_htpasswd_loading() {
+        let file = create_test_htpasswd(&[("admin", "secret"), ("user", "password")]);
+
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        let users = auth.list_users();
+        assert_eq!(users.len(), 2);
+        assert!(users.contains(&"admin"));
+        assert!(users.contains(&"user"));
+    }
+
+    #[test]
+    fn test_htpasswd_loading_empty_file() {
+        let file = NamedTempFile::new().unwrap();
+        let auth = HtpasswdAuth::from_file(file.path());
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn test_htpasswd_loading_with_comments() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# This is a comment").unwrap();
+        writeln!(file, "").unwrap();
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        writeln!(file, "admin:{}", hash).unwrap();
+        file.flush().unwrap();
+
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        assert_eq!(auth.list_users().len(), 1);
+    }
+
+    #[test]
+    fn test_authenticate_valid() {
+        let file = create_test_htpasswd(&[("test", "secret")]);
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+
+        assert!(auth.authenticate("test", "secret"));
+    }
+
+    #[test]
+    fn test_authenticate_invalid_password() {
+        let file = create_test_htpasswd(&[("test", "secret")]);
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+
+        assert!(!auth.authenticate("test", "wrong"));
+    }
+
+    #[test]
+    fn test_authenticate_unknown_user() {
+        let file = create_test_htpasswd(&[("test", "secret")]);
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+
+        assert!(!auth.authenticate("unknown", "secret"));
+    }
+
+    #[test]
+    fn test_is_public_path() {
+        // Public paths
+        assert!(is_public_path("/"));
+        assert!(is_public_path("/health"));
+        assert!(is_public_path("/ready"));
+        assert!(is_public_path("/metrics"));
+        assert!(is_public_path("/v2/"));
+        assert!(is_public_path("/v2"));
+        assert!(is_public_path("/ui"));
+        assert!(is_public_path("/ui/dashboard"));
+        assert!(is_public_path("/api-docs"));
+        assert!(is_public_path("/api-docs/openapi.json"));
+        assert!(is_public_path("/api/ui/stats"));
+        assert!(is_public_path("/api/tokens"));
+        assert!(is_public_path("/api/tokens/list"));
+
+        // Protected paths
+        assert!(!is_public_path("/v2/myimage/blobs/sha256:abc"));
+        assert!(!is_public_path("/v2/library/nginx/manifests/latest"));
+        assert!(!is_public_path("/maven2/com/example/artifact/1.0/artifact.jar"));
+        assert!(!is_public_path("/npm/lodash"));
+    }
+
+    #[test]
+    fn test_hash_password() {
+        let hash = hash_password("test123").unwrap();
+        assert!(hash.starts_with("$2"));
+        assert!(bcrypt::verify("test123", &hash).unwrap());
+    }
+}

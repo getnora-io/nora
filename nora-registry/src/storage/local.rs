@@ -129,3 +129,112 @@ impl StorageBackend for LocalStorage {
         "local"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_put_and_get() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("test/key", b"test data").await.unwrap();
+        let data = storage.get("test/key").await.unwrap();
+        assert_eq!(&*data, b"test data");
+    }
+
+    #[tokio::test]
+    async fn test_get_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        let result = storage.get("nonexistent").await;
+        assert!(matches!(result, Err(StorageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_list_with_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("docker/image/blob1", b"data1").await.unwrap();
+        storage.put("docker/image/blob2", b"data2").await.unwrap();
+        storage.put("maven/artifact", b"data3").await.unwrap();
+
+        let docker_keys = storage.list("docker/").await;
+        assert_eq!(docker_keys.len(), 2);
+        assert!(docker_keys.iter().all(|k| k.starts_with("docker/")));
+
+        let all_keys = storage.list("").await;
+        assert_eq!(all_keys.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_stat() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("test", b"12345").await.unwrap();
+        let meta = storage.stat("test").await.unwrap();
+        assert_eq!(meta.size, 5);
+        assert!(meta.modified > 0);
+    }
+
+    #[tokio::test]
+    async fn test_stat_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        let meta = storage.stat("nonexistent").await;
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert!(storage.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_creates_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let new_path = temp_dir.path().join("new_storage");
+        let storage = LocalStorage::new(new_path.to_str().unwrap());
+
+        assert!(!new_path.exists());
+        assert!(storage.health_check().await);
+        assert!(new_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_nested_directory_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("a/b/c/d/e/file", b"deep").await.unwrap();
+        let data = storage.get("a/b/c/d/e/file").await.unwrap();
+        assert_eq!(&*data, b"deep");
+    }
+
+    #[tokio::test]
+    async fn test_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("key", b"original").await.unwrap();
+        storage.put("key", b"updated").await.unwrap();
+
+        let data = storage.get("key").await.unwrap();
+        assert_eq!(&*data, b"updated");
+    }
+
+    #[test]
+    fn test_backend_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert_eq!(storage.backend_name(), "local");
+    }
+}

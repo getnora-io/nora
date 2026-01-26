@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use uuid::Uuid;
 
 const TOKEN_PREFIX: &str = "nra_";
@@ -180,23 +181,178 @@ fn hash_token(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TokenError {
+    #[error("Invalid token format")]
     InvalidFormat,
+
+    #[error("Token not found")]
     NotFound,
+
+    #[error("Token expired")]
     Expired,
+
+    #[error("Storage error: {0}")]
     Storage(String),
 }
 
-impl std::fmt::Display for TokenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidFormat => write!(f, "Invalid token format"),
-            Self::NotFound => write!(f, "Token not found"),
-            Self::Expired => write!(f, "Token expired"),
-            Self::Storage(msg) => write!(f, "Storage error: {}", msg),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_create_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store
+            .create_token("testuser", 30, Some("Test token".to_string()))
+            .unwrap();
+
+        assert!(token.starts_with("nra_"));
+        assert_eq!(token.len(), 4 + 32); // prefix + uuid without dashes
+    }
+
+    #[test]
+    fn test_verify_valid_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store.create_token("testuser", 30, None).unwrap();
+        let user = store.verify_token(&token).unwrap();
+
+        assert_eq!(user, "testuser");
+    }
+
+    #[test]
+    fn test_verify_invalid_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let result = store.verify_token("invalid_token");
+        assert!(matches!(result, Err(TokenError::InvalidFormat)));
+    }
+
+    #[test]
+    fn test_verify_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let result = store.verify_token("nra_00000000000000000000000000000000");
+        assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    #[test]
+    fn test_verify_expired_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        // Create token and manually set it as expired
+        let token = store.create_token("testuser", 1, None).unwrap();
+        let token_hash = hash_token(&token);
+        let file_path = temp_dir.path().join(format!("{}.json", &token_hash[..16]));
+
+        // Read and modify the token to be expired
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut info: TokenInfo = serde_json::from_str(&content).unwrap();
+        info.expires_at = 0; // Set to epoch (definitely expired)
+        std::fs::write(&file_path, serde_json::to_string(&info).unwrap()).unwrap();
+
+        // Token should now be expired
+        let result = store.verify_token(&token);
+        assert!(matches!(result, Err(TokenError::Expired)));
+    }
+
+    #[test]
+    fn test_list_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        store.create_token("user1", 30, None).unwrap();
+        store.create_token("user1", 30, None).unwrap();
+        store.create_token("user2", 30, None).unwrap();
+
+        let user1_tokens = store.list_tokens("user1");
+        assert_eq!(user1_tokens.len(), 2);
+
+        let user2_tokens = store.list_tokens("user2");
+        assert_eq!(user2_tokens.len(), 1);
+
+        let unknown_tokens = store.list_tokens("unknown");
+        assert_eq!(unknown_tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_revoke_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store.create_token("testuser", 30, None).unwrap();
+        let token_hash = hash_token(&token);
+        let hash_prefix = &token_hash[..16];
+
+        // Verify token works
+        assert!(store.verify_token(&token).is_ok());
+
+        // Revoke
+        store.revoke_token(hash_prefix).unwrap();
+
+        // Verify token no longer works
+        let result = store.verify_token(&token);
+        assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    #[test]
+    fn test_revoke_nonexistent_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let result = store.revoke_token("nonexistent12345");
+        assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    #[test]
+    fn test_revoke_all_for_user() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        store.create_token("user1", 30, None).unwrap();
+        store.create_token("user1", 30, None).unwrap();
+        store.create_token("user2", 30, None).unwrap();
+
+        let revoked = store.revoke_all_for_user("user1");
+        assert_eq!(revoked, 2);
+
+        assert_eq!(store.list_tokens("user1").len(), 0);
+        assert_eq!(store.list_tokens("user2").len(), 1);
+    }
+
+    #[test]
+    fn test_token_updates_last_used() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store.create_token("testuser", 30, None).unwrap();
+
+        // First verification
+        store.verify_token(&token).unwrap();
+
+        // Check last_used is set
+        let tokens = store.list_tokens("testuser");
+        assert!(tokens[0].last_used.is_some());
+    }
+
+    #[test]
+    fn test_token_with_description() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        store
+            .create_token("testuser", 30, Some("CI/CD Pipeline".to_string()))
+            .unwrap();
+
+        let tokens = store.list_tokens("testuser");
+        assert_eq!(tokens[0].description, Some("CI/CD Pipeline".to_string()));
     }
 }
-
-impl std::error::Error for TokenError {}
