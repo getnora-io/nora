@@ -117,7 +117,7 @@ fn sidebar(active_page: Option<&str>) -> String {
             <!-- Logo -->
             <div class="h-16 flex items-center justify-between px-6 border-b border-slate-700">
                 <div class="flex items-center">
-                    <span class="text-xl font-bold tracking-tight">N<span class="inline-block w-5 h-5 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                    <img src="{}" alt="NORA" class="h-8" />
                 </div>
                 <!-- Close button (mobile only) -->
                 <button onclick="toggleSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
@@ -147,6 +147,7 @@ fn sidebar(active_page: Option<&str>) -> String {
             </div>
         </div>
     "#,
+        super::logo::LOGO_BASE64,
         nav_html
     )
 }

@@ -1,5 +1,6 @@
 mod api;
 mod components;
+mod logo;
 mod templates;
 
 use crate::AppState;
