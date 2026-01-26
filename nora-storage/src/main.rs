@@ -133,9 +133,7 @@ async fn main() {
         .expect("Failed to bind to address");
 
     info!("nora-storage (S3 compatible) running on http://{}", addr);
-    axum::serve(listener, app)
-        .await
-        .expect("Server error");
+    axum::serve(listener, app).await.expect("Server error");
 }
 
 async fn list_buckets(State(state): State<Arc<AppState>>) -> Response {

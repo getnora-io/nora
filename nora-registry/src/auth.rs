@@ -405,7 +405,9 @@ mod tests {
         // Protected paths
         assert!(!is_public_path("/v2/myimage/blobs/sha256:abc"));
         assert!(!is_public_path("/v2/library/nginx/manifests/latest"));
-        assert!(!is_public_path("/maven2/com/example/artifact/1.0/artifact.jar"));
+        assert!(!is_public_path(
+            "/maven2/com/example/artifact/1.0/artifact.jar"
+        ));
         assert!(!is_public_path("/npm/lodash"));
     }
 

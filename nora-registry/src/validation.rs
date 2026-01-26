@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Input validation for artifact registry paths and identifiers
 //!
 //! Provides security validation to prevent path traversal attacks and
@@ -92,7 +93,7 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
 
     // Check each segment
     for segment in key.split('/') {
-        if segment.is_empty() && key != "" {
+        if segment.is_empty() && !key.is_empty() {
             // Allow trailing slash but not double slashes
             continue;
         }

@@ -59,7 +59,13 @@ pub fn render_dashboard(stats: &RegistryStats) -> String {
             </div>
         </div>
     "##,
-        stat_card("Docker", icons::DOCKER, stats.docker, "/ui/docker", "images"),
+        stat_card(
+            "Docker",
+            icons::DOCKER,
+            stats.docker,
+            "/ui/docker",
+            "images"
+        ),
         stat_card("Maven", icons::MAVEN, stats.maven, "/ui/maven", "artifacts"),
         stat_card("npm", icons::NPM, stats.npm, "/ui/npm", "packages"),
         stat_card("Cargo", icons::CARGO, stats.cargo, "/ui/cargo", "crates"),
@@ -455,7 +461,9 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "npm" => icons::NPM,
         "cargo" => icons::CARGO,
         "pypi" => icons::PYPI,
-        _ => r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#,
+        _ => {
+            r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
+        }
     }
 }
 
