@@ -155,12 +155,12 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
                 format!(
                     r##"
-                <tr class="hover:bg-slate-50 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
                     <td class="px-6 py-4">
-                        <a href="{}" class="text-blue-600 hover:text-blue-800 font-medium">{}</a>
+                        <a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a>
                     </td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
                     <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
                 </tr>
             "##,
@@ -186,9 +186,9 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
         r##"
         <div class="mb-6 flex items-center justify-between">
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
-                    <h1 class="text-2xl font-bold text-slate-800">{}</h1>
+                    <h1 class="text-2xl font-bold text-slate-200">{}</h1>
                     <p class="text-slate-500">{} repositories</p>
                 </div>
             </div>
@@ -196,29 +196,29 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
                 <div class="relative">
                     <input type="text"
                            placeholder="Search repositories..."
-                           class="pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                           class="pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
                            hx-get="/api/ui/{}/search"
                            hx-trigger="keyup changed delay:300ms"
                            hx-target="#repo-table-body"
                            name="q">
-                    <svg class="absolute left-3 top-2.5 h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg class="absolute left-3 top-2.5 h-5 w-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
                     </svg>
                 </div>
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
             <table class="w-full">
-                <thead class="bg-slate-50 border-b border-slate-200">
+                <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Name</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Updated</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Name</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Updated</th>
                     </tr>
                 </thead>
-                <tbody id="repo-table-body" class="divide-y divide-slate-200">
+                <tbody id="repo-table-body" class="divide-y divide-slate-700">
                     {}
                 </tbody>
             </table>
@@ -232,7 +232,7 @@ pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo]
         table_rows
     );
 
-    layout(title, &content, Some(registry_type))
+    layout_dark(title, &content, Some(registry_type), "")
 }
 
 /// Renders Docker image detail page
@@ -246,11 +246,11 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
             .map(|tag| {
                 format!(
                     r##"
-                <tr class="hover:bg-slate-50">
+                <tr class="hover:bg-slate-700">
                     <td class="px-6 py-4">
-                        <span class="font-mono text-sm bg-slate-100 px-2 py-1 rounded">{}</span>
+                        <span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>
                     </td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
                     <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
                 </tr>
             "##,
@@ -269,18 +269,18 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
         r##"
         <div class="mb-6">
             <div class="flex items-center mb-2">
-                <a href="/ui/docker" class="text-blue-600 hover:text-blue-800">Docker Registry</a>
-                <span class="mx-2 text-slate-400">/</span>
-                <span class="text-slate-800 font-medium">{}</span>
+                <a href="/ui/docker" class="text-blue-400 hover:text-blue-300">Docker Registry</a>
+                <span class="mx-2 text-slate-500">/</span>
+                <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-800">{}</h1>
+                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-800 mb-3">Pull Command</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">Pull Command</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm">
                 <code class="flex-1">{}</code>
                 <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors" title="Copy to clipboard">
@@ -291,19 +291,19 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-200">
-                <h2 class="text-lg font-semibold text-slate-800">Tags ({} total)</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-700">
+                <h2 class="text-lg font-semibold text-slate-200">Tags ({} total)</h2>
             </div>
             <table class="w-full">
-                <thead class="bg-slate-50 border-b border-slate-200">
+                <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Tag</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Created</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Tag</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Created</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-200">
+                <tbody class="divide-y divide-slate-700">
                     {}
                 </tbody>
             </table>
@@ -318,7 +318,7 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail) -> String {
         tags_rows
     );
 
-    layout(&format!("{} - Docker", name), &content, Some("docker"))
+    layout_dark(&format!("{} - Docker", name), &content, Some("docker"), "")
 }
 
 /// Renders package detail page (npm, cargo, pypi)
@@ -335,11 +335,11 @@ pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDe
             .map(|v| {
                 format!(
                     r##"
-                <tr class="hover:bg-slate-50">
+                <tr class="hover:bg-slate-700">
                     <td class="px-6 py-4">
-                        <span class="font-mono text-sm bg-slate-100 px-2 py-1 rounded">{}</span>
+                        <span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>
                     </td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
                     <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
                 </tr>
             "##,
@@ -366,18 +366,18 @@ pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDe
         r##"
         <div class="mb-6">
             <div class="flex items-center mb-2">
-                <a href="/ui/{}" class="text-blue-600 hover:text-blue-800">{}</a>
-                <span class="mx-2 text-slate-400">/</span>
-                <span class="text-slate-800 font-medium">{}</span>
+                <a href="/ui/{}" class="text-blue-400 hover:text-blue-300">{}</a>
+                <span class="mx-2 text-slate-500">/</span>
+                <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-800">{}</h1>
+                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-800 mb-3">Install Command</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">Install Command</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm">
                 <code class="flex-1">{}</code>
                 <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors" title="Copy to clipboard">
@@ -388,19 +388,19 @@ pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDe
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-200">
-                <h2 class="text-lg font-semibold text-slate-800">Versions ({} total)</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-700">
+                <h2 class="text-lg font-semibold text-slate-200">Versions ({} total)</h2>
             </div>
             <table class="w-full">
-                <thead class="bg-slate-50 border-b border-slate-200">
+                <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Version</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Published</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Version</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Published</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-200">
+                <tbody class="divide-y divide-slate-700">
                     {}
                 </tbody>
             </table>
@@ -417,10 +417,11 @@ pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDe
         versions_rows
     );
 
-    layout(
+    layout_dark(
         &format!("{} - {}", name, registry_title),
         &content,
         Some(registry_type),
+        "",
     )
 }
 
@@ -432,11 +433,11 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail) -> String {
         detail.artifacts.iter().map(|a| {
             let download_url = format!("/maven2/{}/{}", path, a.filename);
             format!(r##"
-                <tr class="hover:bg-slate-50">
+                <tr class="hover:bg-slate-700">
                     <td class="px-6 py-4">
-                        <a href="{}" class="text-blue-600 hover:text-blue-800 font-mono text-sm">{}</a>
+                        <a href="{}" class="text-blue-400 hover:text-blue-300 font-mono text-sm">{}</a>
                     </td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
                 </tr>
             "##, download_url, html_escape(&a.filename), format_size(a.size))
         }).collect::<Vec<_>>().join("")
@@ -465,33 +466,33 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail) -> String {
         r##"
         <div class="mb-6">
             <div class="flex items-center mb-2">
-                <a href="/ui/maven" class="text-blue-600 hover:text-blue-800">Maven Repository</a>
-                <span class="mx-2 text-slate-400">/</span>
-                <span class="text-slate-800 font-medium">{}</span>
+                <a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven Repository</a>
+                <span class="mx-2 text-slate-500">/</span>
+                <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-600" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-800">{}</h1>
+                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-800 mb-3">Maven Dependency</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">Maven Dependency</h2>
             <pre class="bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm overflow-x-auto">{}</pre>
         </div>
 
-        <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-200">
-                <h2 class="text-lg font-semibold text-slate-800">Artifacts ({} files)</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-700">
+                <h2 class="text-lg font-semibold text-slate-200">Artifacts ({} files)</h2>
             </div>
             <table class="w-full">
-                <thead class="bg-slate-50 border-b border-slate-200">
+                <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Filename</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Filename</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-200">
+                <tbody class="divide-y divide-slate-700">
                     {}
                 </tbody>
             </table>
@@ -505,7 +506,7 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail) -> String {
         artifact_rows
     );
 
-    layout(&format!("{} - Maven", path), &content, Some("maven"))
+    layout_dark(&format!("{} - Maven", path), &content, Some("maven"), "")
 }
 
 /// Returns SVG icon path for the registry type
