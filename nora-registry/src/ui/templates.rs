@@ -65,7 +65,10 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
 
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {
-        format!(r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">{}</td></tr>"##, t.no_activity)
+        format!(
+            r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">{}</td></tr>"##,
+            t.no_activity
+        )
     } else {
         data.activity
             .iter()
@@ -131,7 +134,13 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
     );
 
     let polling_script = render_polling_script();
-    layout_dark(t.dashboard_title, &content, Some("dashboard"), &polling_script, lang)
+    layout_dark(
+        t.dashboard_title,
+        &content,
+        Some("dashboard"),
+        &polling_script,
+        lang,
+    )
 }
 
 /// Format timestamp as relative time (e.g., "2 min ago")
@@ -154,16 +163,24 @@ fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Renders a registry list page (docker, maven, npm, cargo, pypi)
-pub fn render_registry_list(registry_type: &str, title: &str, repos: &[RepoInfo], lang: Lang) -> String {
+pub fn render_registry_list(
+    registry_type: &str,
+    title: &str,
+    repos: &[RepoInfo],
+    lang: Lang,
+) -> String {
     let t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
 
     let table_rows = if repos.is_empty() {
-        format!(r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">📭</div>
             <div>{}</div>
             <div class="text-sm mt-1">{}</div>
-        </td></tr>"##, t.no_repos_found, t.push_first_artifact)
+        </td></tr>"##,
+            t.no_repos_found, t.push_first_artifact
+        )
     } else {
         repos
             .iter()
@@ -340,11 +357,22 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail, lang: Lang) -> St
         tags_rows
     );
 
-    layout_dark(&format!("{} - Docker", name), &content, Some("docker"), "", lang)
+    layout_dark(
+        &format!("{} - Docker", name),
+        &content,
+        Some("docker"),
+        "",
+        lang,
+    )
 }
 
 /// Renders package detail page (npm, cargo, pypi)
-pub fn render_package_detail(registry_type: &str, name: &str, detail: &PackageDetail, lang: Lang) -> String {
+pub fn render_package_detail(
+    registry_type: &str,
+    name: &str,
+    detail: &PackageDetail,
+    lang: Lang,
+) -> String {
     let _t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
@@ -531,7 +559,13 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail, lang: Lang) -> Stri
         artifact_rows
     );
 
-    layout_dark(&format!("{} - Maven", path), &content, Some("maven"), "", lang)
+    layout_dark(
+        &format!("{} - Maven", path),
+        &content,
+        Some("maven"),
+        "",
+        lang,
+    )
 }
 
 /// Returns SVG icon path for the registry type
