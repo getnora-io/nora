@@ -17,6 +17,14 @@ All notable changes to NORA will be documented in this file.
 - Environment variables: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
 - Rate limit configuration logged at startup
 
+#### Secrets Provider Architecture
+- Trait-based secrets management (`SecretsProvider` trait)
+- ENV provider as default (12-Factor App pattern)
+- Protected secrets with `zeroize` (memory zeroed on drop)
+- Redacted Debug impl prevents secret leakage in logs
+- New config section `[secrets]` with `provider` and `clear_env` options
+- Foundation for future AWS Secrets Manager, Vault, K8s integration
+
 ### Changed
 - Rate limiting functions now accept `&RateLimitConfig` parameter
 - Improved error messages with `.expect()` instead of `.unwrap()`
