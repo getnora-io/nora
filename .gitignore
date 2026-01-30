@@ -5,3 +5,10 @@ data/
 .env.*
 *.log
 CLAUDE.md
+
+# Internal files
+SESSION*.md
+TODO.md
+ROADMAP*.md
+docs-site/
+docs/
