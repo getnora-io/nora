@@ -5,3 +5,10 @@ data/
 .env.*
 *.log
 internal config
+
+# Internal files
+SESSION*.md
+TODO.md
+ROADMAP*.md
+docs-site/
+docs/
