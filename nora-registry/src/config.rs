@@ -53,6 +53,19 @@ pub struct StorageConfig {
     pub s3_url: String,
     #[serde(default = "default_bucket")]
     pub bucket: String,
+    /// S3 access key (optional, uses anonymous access if not set)
+    #[serde(default)]
+    pub s3_access_key: Option<String>,
+    /// S3 secret key (optional, uses anonymous access if not set)
+    #[serde(default)]
+    pub s3_secret_key: Option<String>,
+    /// S3 region (default: us-east-1)
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_storage_path() -> String {
@@ -325,6 +338,15 @@ impl Config {
         if let Ok(val) = env::var("NORA_STORAGE_BUCKET") {
             self.storage.bucket = val;
         }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_ACCESS_KEY") {
+            self.storage.s3_access_key = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_SECRET_KEY") {
+            self.storage.s3_secret_key = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_REGION") {
+            self.storage.s3_region = val;
+        }
 
         // Auth config
         if let Ok(val) = env::var("NORA_AUTH_ENABLED") {
@@ -455,6 +477,9 @@ impl Default for Config {
                 path: String::from("data/storage"),
                 s3_url: String::from("http://127.0.0.1:3000"),
                 bucket: String::from("registry"),
+                s3_access_key: None,
+                s3_secret_key: None,
+                s3_region: String::from("us-east-1"),
             },
             maven: MavenConfig::default(),
             npm: NpmConfig::default(),

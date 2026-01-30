@@ -77,9 +77,12 @@ impl DockerAuth {
         let scope = format!("repository:{}:pull", name);
         let url = format!("{}?service={}&scope={}", realm, service, scope);
 
+        tracing::debug!(url = %url, "Fetching auth token");
+
         let response = self.client.get(&url).send().await.ok()?;
 
         if !response.status().is_success() {
+            tracing::warn!(status = %response.status(), "Token request failed");
             return None;
         }
 

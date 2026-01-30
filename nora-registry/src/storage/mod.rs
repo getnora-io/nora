@@ -59,9 +59,15 @@ impl Storage {
         }
     }
 
-    pub fn new_s3(s3_url: &str, bucket: &str) -> Self {
+    pub fn new_s3(
+        s3_url: &str,
+        bucket: &str,
+        region: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+    ) -> Self {
         Self {
-            inner: Arc::new(S3Storage::new(s3_url, bucket)),
+            inner: Arc::new(S3Storage::new(s3_url, bucket, region, access_key, secret_key)),
         }
     }
 
