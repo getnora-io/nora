@@ -179,6 +179,17 @@ fn init_logging(json_format: bool) {
 async fn run_server(config: Config, storage: Storage) {
     let start_time = Instant::now();
 
+    // Log rate limiting configuration
+    info!(
+        auth_rps = config.rate_limit.auth_rps,
+        auth_burst = config.rate_limit.auth_burst,
+        upload_rps = config.rate_limit.upload_rps,
+        upload_burst = config.rate_limit.upload_burst,
+        general_rps = config.rate_limit.general_rps,
+        general_burst = config.rate_limit.general_burst,
+        "Rate limiting configured"
+    );
+
     // Load auth if enabled
     let auth = if config.auth.enabled {
         let path = Path::new(&config.auth.htpasswd_file);
@@ -205,6 +216,11 @@ async fn run_server(config: Config, storage: Storage) {
         None
     };
 
+    // Create rate limiters before moving config to state
+    let auth_limiter = rate_limit::auth_rate_limiter(&config.rate_limit);
+    let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
+    let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -216,7 +232,7 @@ async fn run_server(config: Config, storage: Storage) {
     });
 
     // Token routes with strict rate limiting (brute-force protection)
-    let auth_routes = auth::token_routes().layer(rate_limit::auth_rate_limiter());
+    let auth_routes = auth::token_routes().layer(auth_limiter);
 
     // Registry routes with upload rate limiting
     let registry_routes = Router::new()
@@ -225,7 +241,7 @@ async fn run_server(config: Config, storage: Storage) {
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
-        .layer(rate_limit::upload_rate_limiter());
+        .layer(upload_limiter);
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
@@ -238,7 +254,7 @@ async fn run_server(config: Config, storage: Storage) {
     let rate_limited_routes = Router::new()
         .merge(auth_routes)
         .merge(registry_routes)
-        .layer(rate_limit::general_rate_limiter());
+        .layer(general_limiter);
 
     let app = Router::new()
         .merge(public_routes)

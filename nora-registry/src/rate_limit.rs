@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Rate limiting configuration and middleware
 //!
 //! Provides rate limiting to protect against:
@@ -6,96 +5,69 @@
 //! - DoS attacks on upload endpoints
 //! - General API abuse
 
+use crate::config::RateLimitConfig;
 use tower_governor::governor::GovernorConfigBuilder;
 
-/// Rate limit configuration
-#[derive(Debug, Clone)]
-pub struct RateLimitConfig {
-    /// Requests per second for auth endpoints (strict)
-    pub auth_rps: u32,
-    /// Burst size for auth endpoints
-    pub auth_burst: u32,
-    /// Requests per second for upload endpoints
-    pub upload_rps: u32,
-    /// Burst size for upload endpoints
-    pub upload_burst: u32,
-    /// Requests per second for general endpoints (lenient)
-    pub general_rps: u32,
-    /// Burst size for general endpoints
-    pub general_burst: u32,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            auth_rps: 1,        // 1 req/sec for auth (strict)
-            auth_burst: 5,      // Allow burst of 5
-            upload_rps: 200,    // 200 req/sec for uploads (Docker needs high parallelism)
-            upload_burst: 500,  // Allow burst of 500
-            general_rps: 100,   // 100 req/sec general
-            general_burst: 200, // Allow burst of 200
-        }
-    }
-}
-
 /// Create rate limiter layer for auth endpoints (strict protection against brute-force)
-///
-/// Default: 1 request per second, burst of 5
-pub fn auth_rate_limiter() -> tower_governor::GovernorLayer<
+pub fn auth_rate_limiter(
+    config: &RateLimitConfig,
+) -> tower_governor::GovernorLayer<
     tower_governor::key_extractor::PeerIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
-    let config = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(5)
+    let gov_config = GovernorConfigBuilder::default()
+        .per_second(config.auth_rps)
+        .burst_size(config.auth_burst)
         .use_headers()
         .finish()
-        .unwrap();
+        .expect("Failed to build auth rate limiter");
 
-    tower_governor::GovernorLayer::new(config)
+    tower_governor::GovernorLayer::new(gov_config)
 }
 
 /// Create rate limiter layer for upload endpoints
 ///
-/// Default: 200 requests per second, burst of 500
 /// High limits to accommodate Docker client's aggressive parallel layer uploads
-pub fn upload_rate_limiter() -> tower_governor::GovernorLayer<
+pub fn upload_rate_limiter(
+    config: &RateLimitConfig,
+) -> tower_governor::GovernorLayer<
     tower_governor::key_extractor::PeerIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
-    let config = GovernorConfigBuilder::default()
-        .per_second(200)
-        .burst_size(500)
+    let gov_config = GovernorConfigBuilder::default()
+        .per_second(config.upload_rps)
+        .burst_size(config.upload_burst)
         .use_headers()
         .finish()
-        .unwrap();
+        .expect("Failed to build upload rate limiter");
 
-    tower_governor::GovernorLayer::new(config)
+    tower_governor::GovernorLayer::new(gov_config)
 }
 
 /// Create rate limiter layer for general endpoints (lenient)
-///
-/// Default: 100 requests per second, burst of 200
-pub fn general_rate_limiter() -> tower_governor::GovernorLayer<
+pub fn general_rate_limiter(
+    config: &RateLimitConfig,
+) -> tower_governor::GovernorLayer<
     tower_governor::key_extractor::PeerIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
-    let config = GovernorConfigBuilder::default()
-        .per_second(100)
-        .burst_size(200)
+    let gov_config = GovernorConfigBuilder::default()
+        .per_second(config.general_rps)
+        .burst_size(config.general_burst)
         .use_headers()
         .finish()
-        .unwrap();
+        .expect("Failed to build general rate limiter");
 
-    tower_governor::GovernorLayer::new(config)
+    tower_governor::GovernorLayer::new(gov_config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RateLimitConfig;
 
     #[test]
     fn test_default_config() {
@@ -108,16 +80,34 @@ mod tests {
 
     #[test]
     fn test_auth_rate_limiter_creation() {
-        let _limiter = auth_rate_limiter();
+        let config = RateLimitConfig::default();
+        let _limiter = auth_rate_limiter(&config);
     }
 
     #[test]
     fn test_upload_rate_limiter_creation() {
-        let _limiter = upload_rate_limiter();
+        let config = RateLimitConfig::default();
+        let _limiter = upload_rate_limiter(&config);
     }
 
     #[test]
     fn test_general_rate_limiter_creation() {
-        let _limiter = general_rate_limiter();
+        let config = RateLimitConfig::default();
+        let _limiter = general_rate_limiter(&config);
+    }
+
+    #[test]
+    fn test_custom_config() {
+        let config = RateLimitConfig {
+            auth_rps: 10,
+            auth_burst: 20,
+            upload_rps: 500,
+            upload_burst: 1000,
+            general_rps: 200,
+            general_burst: 400,
+        };
+        let _auth = auth_rate_limiter(&config);
+        let _upload = upload_rate_limiter(&config);
+        let _general = general_rate_limiter(&config);
     }
 }
