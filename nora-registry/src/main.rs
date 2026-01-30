@@ -78,6 +78,7 @@ pub struct AppState {
     pub tokens: Option<TokenStore>,
     pub metrics: DashboardMetrics,
     pub activity: ActivityLog,
+    pub docker_auth: registry::DockerAuth,
 }
 
 #[tokio::main]
@@ -241,6 +242,9 @@ async fn run_server(config: Config, storage: Storage) {
     let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
     let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
 
+    // Initialize Docker auth with proxy timeout
+    let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -249,6 +253,7 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
+        docker_auth,
     });
 
     // Token routes with strict rate limiting (brute-force protection)
@@ -261,6 +266,7 @@ async fn run_server(config: Config, storage: Storage) {
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
+        .merge(registry::raw_routes())
         .layer(upload_limiter);
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
@@ -312,6 +318,7 @@ async fn run_server(config: Config, storage: Storage) {
         npm = "/npm/",
         cargo = "/cargo/",
         pypi = "/simple/",
+        raw = "/raw/",
         "Available endpoints"
     );
 
