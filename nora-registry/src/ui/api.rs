@@ -436,12 +436,10 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     let keys = state.storage.list(&prefix).await;
 
     // Build public URL for pull commands
-    let registry_host = state
-        .config
-        .server
-        .public_url
-        .clone()
-        .unwrap_or_else(|| format!("{}:{}", state.config.server.host, state.config.server.port));
+    let registry_host =
+        state.config.server.public_url.clone().unwrap_or_else(|| {
+            format!("{}:{}", state.config.server.host, state.config.server.port)
+        });
 
     let mut tags = Vec::new();
     for key in &keys {
@@ -476,12 +474,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
             let size = if metadata.size_bytes > 0 {
                 metadata.size_bytes
             } else {
-                state
-                    .storage
-                    .stat(key)
-                    .await
-                    .map(|m| m.size)
-                    .unwrap_or(0)
+                state.storage.stat(key).await.map(|m| m.size).unwrap_or(0)
             };
 
             // Format last_pulled
