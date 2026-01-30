@@ -4,6 +4,28 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.3.0] - 2026-01-30
+
+### Added
+
+#### Configurable Rate Limiting
+- Rate limits now configurable via `config.toml` and environment variables
+- New config section `[rate_limit]` with 6 parameters:
+  - `auth_rps` / `auth_burst` - Authentication endpoints (brute-force protection)
+  - `upload_rps` / `upload_burst` - Upload endpoints (Docker push, etc.)
+  - `general_rps` / `general_burst` - General API endpoints
+- Environment variables: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
+- Rate limit configuration logged at startup
+
+### Changed
+- Rate limiting functions now accept `&RateLimitConfig` parameter
+- Improved error messages with `.expect()` instead of `.unwrap()`
+
+### Fixed
+- Rate limiting was hardcoded in v0.2.0, now user-configurable
+
+---
+
 ## [0.2.0] - 2026-01-25
 
 ### Added
