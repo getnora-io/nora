@@ -108,7 +108,7 @@ async fn docker_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
-    let detail = get_docker_detail(&state.storage, &name).await;
+    let detail = get_docker_detail(&state, &name).await;
     Html(render_docker_detail(&name, &detail, lang))
 }
 

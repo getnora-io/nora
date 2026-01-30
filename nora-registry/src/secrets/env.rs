@@ -101,7 +101,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_secret_optional_not_found() {
         let provider = EnvProvider::new();
-        let secret = provider.get_secret_optional("NONEXISTENT_OPTIONAL_XYZ").await;
+        let secret = provider
+            .get_secret_optional("NONEXISTENT_OPTIONAL_XYZ")
+            .await;
         assert!(secret.is_none());
     }
 
