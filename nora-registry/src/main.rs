@@ -11,6 +11,7 @@ mod openapi;
 mod rate_limit;
 mod registry;
 mod request_id;
+mod secrets;
 mod storage;
 mod tokens;
 mod ui;
@@ -189,6 +190,25 @@ async fn run_server(config: Config, storage: Storage) {
         general_burst = config.rate_limit.general_burst,
         "Rate limiting configured"
     );
+
+    // Initialize secrets provider
+    let secrets_provider = match secrets::create_secrets_provider(&config.secrets) {
+        Ok(provider) => {
+            info!(
+                provider = provider.provider_name(),
+                clear_env = config.secrets.clear_env,
+                "Secrets provider initialized"
+            );
+            Some(provider)
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to initialize secrets provider, using defaults");
+            None
+        }
+    };
+
+    // Store secrets provider for future use (S3 credentials, etc.)
+    let _secrets = secrets_provider;
 
     // Load auth if enabled
     let auth = if config.auth.enabled {

@@ -111,6 +111,8 @@ nora migrate --from local --to s3
 | `NORA_RATE_LIMIT_UPLOAD_BURST` | 500 | Upload burst size |
 | `NORA_RATE_LIMIT_GENERAL_RPS` | 100 | General requests per second |
 | `NORA_RATE_LIMIT_GENERAL_BURST` | 200 | General burst size |
+| `NORA_SECRETS_PROVIDER` | env | Secrets provider (`env`) |
+| `NORA_SECRETS_CLEAR_ENV` | false | Clear env vars after reading |
 
 ### config.toml
 
@@ -137,6 +139,12 @@ upload_burst = 500
 # Balanced limits for general API endpoints
 general_rps = 100
 general_burst = 200
+
+[secrets]
+# Provider: env (default), aws-secrets, vault, k8s (coming soon)
+provider = "env"
+# Clear environment variables after reading (security hardening)
+clear_env = false
 ```
 
 ## Endpoints
