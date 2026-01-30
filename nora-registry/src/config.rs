@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 
+pub use crate::secrets::SecretsConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -16,6 +18,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +319,14 @@ impl Config {
                 self.rate_limit.general_burst = v;
             }
         }
+
+        // Secrets config
+        if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
+            self.secrets.provider = val;
+        }
+        if let Ok(val) = env::var("NORA_SECRETS_CLEAR_ENV") {
+            self.secrets.clear_env = val.to_lowercase() == "true" || val == "1";
+        }
     }
 }
 
@@ -336,6 +348,7 @@ impl Default for Config {
             pypi: PypiConfig::default(),
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            secrets: SecretsConfig::default(),
         }
     }
 }
