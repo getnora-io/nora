@@ -15,6 +15,10 @@ pub struct Config {
     #[serde(default)]
     pub pypi: PypiConfig,
     #[serde(default)]
+    pub docker: DockerConfig,
+    #[serde(default)]
+    pub raw: RawConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -26,6 +30,9 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Public URL for generating pull commands (e.g., "registry.example.com")
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -84,6 +91,44 @@ pub struct PypiConfig {
     pub proxy_timeout: u64,
 }
 
+/// Docker registry configuration with upstream proxy support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerConfig {
+    #[serde(default = "default_docker_timeout")]
+    pub proxy_timeout: u64,
+    #[serde(default)]
+    pub upstreams: Vec<DockerUpstream>,
+}
+
+/// Docker upstream registry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerUpstream {
+    pub url: String,
+    #[serde(default)]
+    pub auth: Option<String>, // "user:pass" for basic auth
+}
+
+/// Raw repository configuration for simple file storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawConfig {
+    #[serde(default = "default_raw_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64, // in bytes
+}
+
+fn default_docker_timeout() -> u64 {
+    60
+}
+
+fn default_raw_enabled() -> bool {
+    true
+}
+
+fn default_max_file_size() -> u64 {
+    104_857_600 // 100MB
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
@@ -129,6 +174,27 @@ impl Default for PypiConfig {
         Self {
             proxy: Some("https://pypi.org/simple/".to_string()),
             proxy_timeout: 30,
+        }
+    }
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self {
+            proxy_timeout: 60,
+            upstreams: vec![DockerUpstream {
+                url: "https://registry-1.docker.io".to_string(),
+                auth: None,
+            }],
+        }
+    }
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_file_size: 104_857_600, // 100MB
         }
     }
 }
@@ -181,12 +247,24 @@ pub struct RateLimitConfig {
     pub general_burst: u32,
 }
 
-fn default_auth_rps() -> u64 { 1 }
-fn default_auth_burst() -> u32 { 5 }
-fn default_upload_rps() -> u64 { 200 }
-fn default_upload_burst() -> u32 { 500 }
-fn default_general_rps() -> u64 { 100 }
-fn default_general_burst() -> u32 { 200 }
+fn default_auth_rps() -> u64 {
+    1
+}
+fn default_auth_burst() -> u32 {
+    5
+}
+fn default_upload_rps() -> u64 {
+    200
+}
+fn default_upload_burst() -> u32 {
+    500
+}
+fn default_general_rps() -> u64 {
+    100
+}
+fn default_general_burst() -> u32 {
+    200
+}
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
@@ -226,6 +304,9 @@ impl Config {
             if let Ok(port) = val.parse() {
                 self.server.port = port;
             }
+        }
+        if let Ok(val) = env::var("NORA_PUBLIC_URL") {
+            self.server.public_url = if val.is_empty() { None } else { Some(val) };
         }
 
         // Storage config
@@ -283,6 +364,37 @@ impl Config {
             }
         }
 
+        // Docker config
+        if let Ok(val) = env::var("NORA_DOCKER_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.docker.proxy_timeout = timeout;
+            }
+        }
+        // NORA_DOCKER_UPSTREAMS format: "url1,url2" or "url1|auth1,url2|auth2"
+        if let Ok(val) = env::var("NORA_DOCKER_UPSTREAMS") {
+            self.docker.upstreams = val
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let parts: Vec<&str> = s.trim().splitn(2, '|').collect();
+                    DockerUpstream {
+                        url: parts[0].to_string(),
+                        auth: parts.get(1).map(|a| a.to_string()),
+                    }
+                })
+                .collect();
+        }
+
+        // Raw config
+        if let Ok(val) = env::var("NORA_RAW_ENABLED") {
+            self.raw.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_RAW_MAX_FILE_SIZE") {
+            if let Ok(size) = val.parse() {
+                self.raw.max_file_size = size;
+            }
+        }
+
         // Token storage
         if let Ok(val) = env::var("NORA_AUTH_TOKEN_STORAGE") {
             self.auth.token_storage = val;
@@ -336,6 +448,7 @@ impl Default for Config {
             server: ServerConfig {
                 host: String::from("127.0.0.1"),
                 port: 4000,
+                public_url: None,
             },
             storage: StorageConfig {
                 mode: StorageMode::Local,
@@ -346,6 +459,8 @@ impl Default for Config {
             maven: MavenConfig::default(),
             npm: NpmConfig::default(),
             pypi: PypiConfig::default(),
+            docker: DockerConfig::default(),
+            raw: RawConfig::default(),
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             secrets: SecretsConfig::default(),

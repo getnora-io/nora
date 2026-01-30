@@ -18,6 +18,8 @@ pub struct DashboardMetrics {
     pub maven_uploads: AtomicU64,
     pub cargo_downloads: AtomicU64,
     pub pypi_downloads: AtomicU64,
+    pub raw_downloads: AtomicU64,
+    pub raw_uploads: AtomicU64,
 
     pub start_time: Instant,
 }
@@ -36,6 +38,8 @@ impl DashboardMetrics {
             maven_uploads: AtomicU64::new(0),
             cargo_downloads: AtomicU64::new(0),
             pypi_downloads: AtomicU64::new(0),
+            raw_downloads: AtomicU64::new(0),
+            raw_uploads: AtomicU64::new(0),
             start_time: Instant::now(),
         }
     }
@@ -49,6 +53,7 @@ impl DashboardMetrics {
             "maven" => self.maven_downloads.fetch_add(1, Ordering::Relaxed),
             "cargo" => self.cargo_downloads.fetch_add(1, Ordering::Relaxed),
             "pypi" => self.pypi_downloads.fetch_add(1, Ordering::Relaxed),
+            "raw" => self.raw_downloads.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
@@ -59,6 +64,7 @@ impl DashboardMetrics {
         match registry {
             "docker" => self.docker_uploads.fetch_add(1, Ordering::Relaxed),
             "maven" => self.maven_uploads.fetch_add(1, Ordering::Relaxed),
+            "raw" => self.raw_uploads.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
@@ -93,6 +99,7 @@ impl DashboardMetrics {
             "maven" => self.maven_downloads.load(Ordering::Relaxed),
             "cargo" => self.cargo_downloads.load(Ordering::Relaxed),
             "pypi" => self.pypi_downloads.load(Ordering::Relaxed),
+            "raw" => self.raw_downloads.load(Ordering::Relaxed),
             _ => 0,
         }
     }
@@ -102,6 +109,7 @@ impl DashboardMetrics {
         match registry {
             "docker" => self.docker_uploads.load(Ordering::Relaxed),
             "maven" => self.maven_uploads.load(Ordering::Relaxed),
+            "raw" => self.raw_uploads.load(Ordering::Relaxed),
             _ => 0,
         }
     }

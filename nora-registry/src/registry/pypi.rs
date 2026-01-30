@@ -80,7 +80,7 @@ async fn package_versions(
 
     // Try proxy if configured
     if let Some(proxy_url) = &state.config.pypi.proxy {
-        let url = format!("{}{}/", proxy_url.trim_end_matches('/'), normalized);
+        let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
         if let Ok(html) = fetch_package_page(&url, state.config.pypi.proxy_timeout).await {
             // Rewrite URLs in the HTML to point to our registry
@@ -125,7 +125,7 @@ async fn download_file(
     // Try proxy if configured
     if let Some(proxy_url) = &state.config.pypi.proxy {
         // First, fetch the package page to find the actual download URL
-        let page_url = format!("{}{}/", proxy_url.trim_end_matches('/'), normalized);
+        let page_url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
         if let Ok(html) = fetch_package_page(&page_url, state.config.pypi.proxy_timeout).await {
             // Find the URL for this specific file
@@ -230,6 +230,30 @@ fn rewrite_pypi_links(html: &str, package_name: &str) -> String {
             }
 
             remaining = &remaining[href_end..];
+        }
+    }
+    result.push_str(remaining);
+
+    // Remove data-core-metadata and data-dist-info-metadata attributes
+    // as we don't serve .metadata files (PEP 658)
+    let result = remove_attribute(&result, "data-core-metadata");
+    let result = remove_attribute(&result, "data-dist-info-metadata");
+    result
+}
+
+/// Remove an HTML attribute from all tags
+fn remove_attribute(html: &str, attr_name: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut remaining = html;
+    let pattern = format!(" {}=\"", attr_name);
+
+    while let Some(attr_start) = remaining.find(&pattern) {
+        result.push_str(&remaining[..attr_start]);
+        remaining = &remaining[attr_start + pattern.len()..];
+
+        // Skip the attribute value
+        if let Some(attr_end) = remaining.find('"') {
+            remaining = &remaining[attr_end + 1..];
         }
     }
     result.push_str(remaining);

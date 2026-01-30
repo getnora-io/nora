@@ -74,6 +74,27 @@ impl StorageBackend for S3Storage {
         }
     }
 
+    async fn delete(&self, key: &str) -> Result<()> {
+        let url = format!("{}/{}/{}", self.s3_url, self.bucket, key);
+        let response = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| StorageError::Network(e.to_string()))?;
+
+        if response.status().is_success() || response.status().as_u16() == 204 {
+            Ok(())
+        } else if response.status().as_u16() == 404 {
+            Err(StorageError::NotFound)
+        } else {
+            Err(StorageError::Network(format!(
+                "DELETE failed: {}",
+                response.status()
+            )))
+        }
+    }
+
     async fn list(&self, prefix: &str) -> Vec<String> {
         let url = format!("{}/{}", self.s3_url, self.bucket);
         match self.client.get(&url).send().await {
