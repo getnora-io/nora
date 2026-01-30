@@ -39,6 +39,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait StorageBackend: Send + Sync {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Bytes>;
+    async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Vec<String>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
     async fn health_check(&self) -> bool;
@@ -72,6 +73,11 @@ impl Storage {
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         validate_storage_key(key)?;
         self.inner.get(key).await
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        validate_storage_key(key)?;
+        self.inner.delete(key).await
     }
 
     pub async fn list(&self, prefix: &str) -> Vec<String> {

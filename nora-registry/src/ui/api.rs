@@ -34,6 +34,12 @@ pub struct TagInfo {
     pub name: String,
     pub size: u64,
     pub created: String,
+    pub downloads: u64,
+    pub last_pulled: Option<String>,
+    pub os: String,
+    pub arch: String,
+    pub layers_count: usize,
+    pub pull_command: String,
 }
 
 #[derive(Serialize)]
@@ -252,7 +258,7 @@ pub async fn api_detail(
 ) -> Json<serde_json::Value> {
     match registry_type.as_str() {
         "docker" => {
-            let detail = get_docker_detail(&state.storage, &name).await;
+            let detail = get_docker_detail(&state, &name).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         "npm" => {
@@ -425,25 +431,87 @@ pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
     result
 }
 
-pub async fn get_docker_detail(storage: &Storage, name: &str) -> DockerDetail {
+pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     let prefix = format!("docker/{}/manifests/", name);
-    let keys = storage.list(&prefix).await;
+    let keys = state.storage.list(&prefix).await;
+
+    // Build public URL for pull commands
+    let registry_host = state
+        .config
+        .server
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", state.config.server.host, state.config.server.port));
 
     let mut tags = Vec::new();
     for key in &keys {
+        // Skip .meta.json files
+        if key.ends_with(".meta.json") {
+            continue;
+        }
+
         if let Some(tag_name) = key
             .strip_prefix(&prefix)
             .and_then(|s| s.strip_suffix(".json"))
         {
-            let (size, created) = if let Some(meta) = storage.stat(key).await {
-                (meta.size, format_timestamp(meta.modified))
+            // Load metadata from .meta.json file
+            let meta_key = format!("{}.meta.json", key.trim_end_matches(".json"));
+            let metadata = if let Ok(meta_data) = state.storage.get(&meta_key).await {
+                serde_json::from_slice::<crate::registry::docker::ImageMetadata>(&meta_data)
+                    .unwrap_or_default()
             } else {
-                (0, "N/A".to_string())
+                crate::registry::docker::ImageMetadata::default()
             };
+
+            // Get file stats for created timestamp if metadata doesn't have push_timestamp
+            let created = if metadata.push_timestamp > 0 {
+                format_timestamp(metadata.push_timestamp)
+            } else if let Some(file_meta) = state.storage.stat(key).await {
+                format_timestamp(file_meta.modified)
+            } else {
+                "N/A".to_string()
+            };
+
+            // Use size from metadata if available, otherwise from file
+            let size = if metadata.size_bytes > 0 {
+                metadata.size_bytes
+            } else {
+                state
+                    .storage
+                    .stat(key)
+                    .await
+                    .map(|m| m.size)
+                    .unwrap_or(0)
+            };
+
+            // Format last_pulled
+            let last_pulled = if metadata.last_pulled > 0 {
+                Some(format_timestamp(metadata.last_pulled))
+            } else {
+                None
+            };
+
+            // Build pull command
+            let pull_command = format!("docker pull {}/{}:{}", registry_host, name, tag_name);
+
             tags.push(TagInfo {
                 name: tag_name.to_string(),
                 size,
                 created,
+                downloads: metadata.downloads,
+                last_pulled,
+                os: if metadata.os.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    metadata.os
+                },
+                arch: if metadata.arch.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    metadata.arch
+                },
+                layers_count: metadata.layers.len(),
+                pull_command,
             });
         }
     }

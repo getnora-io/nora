@@ -85,6 +85,20 @@ impl StorageBackend for LocalStorage {
         Ok(Bytes::from(buffer))
     }
 
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = self.key_to_path(key);
+
+        if !path.exists() {
+            return Err(StorageError::NotFound);
+        }
+
+        fs::remove_file(&path)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn list(&self, prefix: &str) -> Vec<String> {
         let base = self.base_path.clone();
         let prefix = prefix.to_string();
