@@ -50,18 +50,36 @@ pub fn routes() -> Router<Arc<AppState>> {
         // Single-segment name routes (e.g., /v2/alpine/...)
         .route("/v2/{name}/blobs/{digest}", head(check_blob))
         .route("/v2/{name}/blobs/{digest}", get(download_blob))
-        .route("/v2/{name}/blobs/uploads/", axum::routing::post(start_upload))
-        .route("/v2/{name}/blobs/uploads/{uuid}", patch(patch_blob).put(upload_blob))
+        .route(
+            "/v2/{name}/blobs/uploads/",
+            axum::routing::post(start_upload),
+        )
+        .route(
+            "/v2/{name}/blobs/uploads/{uuid}",
+            patch(patch_blob).put(upload_blob),
+        )
         .route("/v2/{name}/manifests/{reference}", get(get_manifest))
         .route("/v2/{name}/manifests/{reference}", put(put_manifest))
         .route("/v2/{name}/tags/list", get(list_tags))
         // Two-segment name routes (e.g., /v2/library/alpine/...)
         .route("/v2/{ns}/{name}/blobs/{digest}", head(check_blob_ns))
         .route("/v2/{ns}/{name}/blobs/{digest}", get(download_blob_ns))
-        .route("/v2/{ns}/{name}/blobs/uploads/", axum::routing::post(start_upload_ns))
-        .route("/v2/{ns}/{name}/blobs/uploads/{uuid}", patch(patch_blob_ns).put(upload_blob_ns))
-        .route("/v2/{ns}/{name}/manifests/{reference}", get(get_manifest_ns))
-        .route("/v2/{ns}/{name}/manifests/{reference}", put(put_manifest_ns))
+        .route(
+            "/v2/{ns}/{name}/blobs/uploads/",
+            axum::routing::post(start_upload_ns),
+        )
+        .route(
+            "/v2/{ns}/{name}/blobs/uploads/{uuid}",
+            patch(patch_blob_ns).put(upload_blob_ns),
+        )
+        .route(
+            "/v2/{ns}/{name}/manifests/{reference}",
+            get(get_manifest_ns),
+        )
+        .route(
+            "/v2/{ns}/{name}/manifests/{reference}",
+            put(put_manifest_ns),
+        )
         .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
 }
 

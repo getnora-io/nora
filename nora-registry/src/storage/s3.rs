@@ -122,7 +122,8 @@ impl S3Storage {
             .header("x-amz-date", &timestamp)
             .header("x-amz-content-sha256", &payload_hash);
 
-        if let Some(auth) = self.sign_request(method.as_str(), key, &payload_hash, &timestamp, &date)
+        if let Some(auth) =
+            self.sign_request(method.as_str(), key, &payload_hash, &timestamp, &date)
         {
             request = request.header("Authorization", auth);
         }
@@ -186,9 +187,7 @@ impl StorageBackend for S3Storage {
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
-        let response = self
-            .signed_request(reqwest::Method::GET, key, None)
-            .await?;
+        let response = self.signed_request(reqwest::Method::GET, key, None).await?;
 
         if response.status().is_success() {
             response

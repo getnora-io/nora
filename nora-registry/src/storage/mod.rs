@@ -67,7 +67,9 @@ impl Storage {
         secret_key: Option<&str>,
     ) -> Self {
         Self {
-            inner: Arc::new(S3Storage::new(s3_url, bucket, region, access_key, secret_key)),
+            inner: Arc::new(S3Storage::new(
+                s3_url, bucket, region, access_key, secret_key,
+            )),
         }
     }
 
