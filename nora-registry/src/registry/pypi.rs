@@ -237,8 +237,7 @@ fn rewrite_pypi_links(html: &str, package_name: &str) -> String {
     // Remove data-core-metadata and data-dist-info-metadata attributes
     // as we don't serve .metadata files (PEP 658)
     let result = remove_attribute(&result, "data-core-metadata");
-    let result = remove_attribute(&result, "data-dist-info-metadata");
-    result
+    remove_attribute(&result, "data-dist-info-metadata")
 }
 
 /// Remove an HTML attribute from all tags
