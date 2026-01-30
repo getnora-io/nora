@@ -24,6 +24,8 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
+hmac.workspace = true
+hex.workspace = true
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.17"

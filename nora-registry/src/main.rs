@@ -104,10 +104,18 @@ async fn main() {
                 info!(
                     s3_url = %config.storage.s3_url,
                     bucket = %config.storage.bucket,
+                    region = %config.storage.s3_region,
+                    has_credentials = config.storage.s3_access_key.is_some(),
                     "Using S3 storage"
                 );
             }
-            Storage::new_s3(&config.storage.s3_url, &config.storage.bucket)
+            Storage::new_s3(
+                &config.storage.s3_url,
+                &config.storage.bucket,
+                &config.storage.s3_region,
+                config.storage.s3_access_key.as_deref(),
+                config.storage.s3_secret_key.as_deref(),
+            )
         }
     };
 
@@ -131,7 +139,13 @@ async fn main() {
         Some(Commands::Migrate { from, to, dry_run }) => {
             let source = match from.as_str() {
                 "local" => Storage::new_local(&config.storage.path),
-                "s3" => Storage::new_s3(&config.storage.s3_url, &config.storage.bucket),
+                "s3" => Storage::new_s3(
+                    &config.storage.s3_url,
+                    &config.storage.bucket,
+                    &config.storage.s3_region,
+                    config.storage.s3_access_key.as_deref(),
+                    config.storage.s3_secret_key.as_deref(),
+                ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local' or 's3'", from);
                     std::process::exit(1);
@@ -140,7 +154,13 @@ async fn main() {
 
             let dest = match to.as_str() {
                 "local" => Storage::new_local(&config.storage.path),
-                "s3" => Storage::new_s3(&config.storage.s3_url, &config.storage.bucket),
+                "s3" => Storage::new_s3(
+                    &config.storage.s3_url,
+                    &config.storage.bucket,
+                    &config.storage.s3_region,
+                    config.storage.s3_access_key.as_deref(),
+                    config.storage.s3_secret_key.as_deref(),
+                ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local' or 's3'", to);
                     std::process::exit(1);

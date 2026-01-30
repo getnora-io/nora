@@ -47,19 +47,22 @@ static UPLOAD_SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, Vec<u8>>>> =
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v2/", get(check))
+        // Single-segment name routes (e.g., /v2/alpine/...)
         .route("/v2/{name}/blobs/{digest}", head(check_blob))
         .route("/v2/{name}/blobs/{digest}", get(download_blob))
-        .route(
-            "/v2/{name}/blobs/uploads/",
-            axum::routing::post(start_upload),
-        )
-        .route(
-            "/v2/{name}/blobs/uploads/{uuid}",
-            patch(patch_blob).put(upload_blob),
-        )
+        .route("/v2/{name}/blobs/uploads/", axum::routing::post(start_upload))
+        .route("/v2/{name}/blobs/uploads/{uuid}", patch(patch_blob).put(upload_blob))
         .route("/v2/{name}/manifests/{reference}", get(get_manifest))
         .route("/v2/{name}/manifests/{reference}", put(put_manifest))
         .route("/v2/{name}/tags/list", get(list_tags))
+        // Two-segment name routes (e.g., /v2/library/alpine/...)
+        .route("/v2/{ns}/{name}/blobs/{digest}", head(check_blob_ns))
+        .route("/v2/{ns}/{name}/blobs/{digest}", get(download_blob_ns))
+        .route("/v2/{ns}/{name}/blobs/uploads/", axum::routing::post(start_upload_ns))
+        .route("/v2/{ns}/{name}/blobs/uploads/{uuid}", patch(patch_blob_ns).put(upload_blob_ns))
+        .route("/v2/{ns}/{name}/manifests/{reference}", get(get_manifest_ns))
+        .route("/v2/{ns}/{name}/manifests/{reference}", put(put_manifest_ns))
+        .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
 }
 
 async fn check() -> (StatusCode, Json<Value>) {
@@ -312,7 +315,12 @@ async fn get_manifest(
     }
 
     // Try upstream proxies
+    tracing::debug!(
+        upstreams_count = state.config.docker.upstreams.len(),
+        "Trying upstream proxies"
+    );
     for upstream in &state.config.docker.upstreams {
+        tracing::debug!(upstream_url = %upstream.url, "Trying upstream");
         if let Ok((data, content_type)) = fetch_manifest_from_upstream(
             &upstream.url,
             &name,
@@ -454,6 +462,75 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }
 
+// ============================================================================
+// Namespace handlers (for two-segment names like library/alpine)
+// These combine ns/name into a single name and delegate to the main handlers
+// ============================================================================
+
+async fn check_blob_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, digest)): Path<(String, String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    check_blob(state, Path((full_name, digest))).await
+}
+
+async fn download_blob_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, digest)): Path<(String, String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    download_blob(state, Path((full_name, digest))).await
+}
+
+async fn start_upload_ns(Path((ns, name)): Path<(String, String)>) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    start_upload(Path(full_name)).await
+}
+
+async fn patch_blob_ns(
+    Path((ns, name, uuid)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    patch_blob(Path((full_name, uuid)), body).await
+}
+
+async fn upload_blob_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, uuid)): Path<(String, String, String)>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    upload_blob(state, Path((full_name, uuid)), query, body).await
+}
+
+async fn get_manifest_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, reference)): Path<(String, String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    get_manifest(state, Path((full_name, reference))).await
+}
+
+async fn put_manifest_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, reference)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    put_manifest(state, Path((full_name, reference)), body).await
+}
+
+async fn list_tags_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    list_tags(state, Path(full_name)).await
+}
+
 /// Fetch a blob from an upstream Docker registry
 async fn fetch_blob_from_upstream(
     upstream_url: &str,
@@ -525,10 +602,14 @@ async fn fetch_manifest_from_upstream(
         reference
     );
 
+    tracing::debug!(url = %url, "Fetching manifest from upstream");
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout))
         .build()
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to build HTTP client");
+        })?;
 
     // Request with Accept header for manifest types
     let accept_header = "application/vnd.docker.distribution.manifest.v2+json, \
@@ -542,7 +623,11 @@ async fn fetch_manifest_from_upstream(
         .header("Accept", accept_header)
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
+        })?;
+
+    tracing::debug!(status = %response.status(), "Initial upstream response");
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Get Www-Authenticate header and fetch token
@@ -552,25 +637,34 @@ async fn fetch_manifest_from_upstream(
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        tracing::debug!(www_auth = ?www_auth, "Got 401, fetching token");
+
         if let Some(token) = docker_auth
             .get_token(upstream_url, name, www_auth.as_deref())
             .await
         {
+            tracing::debug!("Token acquired, retrying with auth");
             client
                 .get(&url)
                 .header("Accept", accept_header)
                 .header("Authorization", format!("Bearer {}", token))
                 .send()
                 .await
-                .map_err(|_| ())?
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to send authenticated request");
+                })?
         } else {
+            tracing::error!("Failed to acquire token");
             return Err(());
         }
     } else {
         response
     };
 
+    tracing::debug!(status = %response.status(), "Final upstream response");
+
     if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "Upstream returned non-success status");
         return Err(());
     }
 
