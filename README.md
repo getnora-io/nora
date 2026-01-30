@@ -105,6 +105,12 @@ nora migrate --from local --to s3
 | `NORA_STORAGE_S3_URL` | - | S3 endpoint URL |
 | `NORA_STORAGE_BUCKET` | registry | S3 bucket name |
 | `NORA_AUTH_ENABLED` | false | Enable authentication |
+| `NORA_RATE_LIMIT_AUTH_RPS` | 1 | Auth requests per second |
+| `NORA_RATE_LIMIT_AUTH_BURST` | 5 | Auth burst size |
+| `NORA_RATE_LIMIT_UPLOAD_RPS` | 200 | Upload requests per second |
+| `NORA_RATE_LIMIT_UPLOAD_BURST` | 500 | Upload burst size |
+| `NORA_RATE_LIMIT_GENERAL_RPS` | 100 | General requests per second |
+| `NORA_RATE_LIMIT_GENERAL_BURST` | 200 | General burst size |
 
 ### config.toml
 
@@ -120,6 +126,17 @@ path = "data/storage"
 [auth]
 enabled = false
 htpasswd_file = "users.htpasswd"
+
+[rate_limit]
+# Strict limits for authentication (brute-force protection)
+auth_rps = 1
+auth_burst = 5
+# High limits for CI/CD upload workloads
+upload_rps = 200
+upload_burst = 500
+# Balanced limits for general API endpoints
+general_rps = 100
+general_burst = 200
 ```
 
 ## Endpoints
