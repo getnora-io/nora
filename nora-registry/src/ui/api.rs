@@ -116,7 +116,13 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
     let _ = state.repo_index.get("pypi", &state.storage).await;
 
     let (docker, maven, npm, cargo, pypi) = state.repo_index.counts();
-    Json(RegistryStats { docker, maven, npm, cargo, pypi })
+    Json(RegistryStats {
+        docker,
+        maven,
+        npm,
+        cargo,
+        pypi,
+    })
 }
 
 pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
@@ -135,8 +141,11 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
     let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size;
 
-    let total_artifacts = docker_repos.len() + maven_repos.len() + npm_repos.len()
-        + cargo_repos.len() + pypi_repos.len();
+    let total_artifacts = docker_repos.len()
+        + maven_repos.len()
+        + npm_repos.len()
+        + cargo_repos.len()
+        + pypi_repos.len();
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),

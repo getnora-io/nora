@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail};
-use crate::repo_index::RepoInfo;
 use super::components::*;
 use super::i18n::{get_translations, Lang};
+use crate::repo_index::RepoInfo;
 
 /// Renders the main dashboard page with dark theme
 pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
@@ -304,7 +304,8 @@ pub fn render_registry_list_paginated(
         r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">📭</div>
             <div>No more items on this page</div>
-        </td></tr>"##.to_string()
+        </td></tr>"##
+            .to_string()
     } else {
         repos
             .iter()
@@ -341,7 +342,11 @@ pub fn render_registry_list_paginated(
 
     // Pagination
     let total_pages = (total + limit - 1) / limit;
-    let start_item = if total == 0 { 0 } else { (page - 1) * limit + 1 };
+    let start_item = if total == 0 {
+        0
+    } else {
+        (page - 1) * limit + 1
+    };
     let end_item = (start_item + repos.len()).saturating_sub(1);
 
     let pagination = if total_pages > 1 {
