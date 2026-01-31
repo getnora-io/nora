@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
 use std::sync::Arc;

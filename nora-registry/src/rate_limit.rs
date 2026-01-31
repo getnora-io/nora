@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! Rate limiting configuration and middleware
 //!
 //! Provides rate limiting to protect against:

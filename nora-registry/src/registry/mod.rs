@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 mod cargo_registry;
 pub mod docker;
 pub mod docker_auth;

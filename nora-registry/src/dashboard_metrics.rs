@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 

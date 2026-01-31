@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use super::i18n::{get_translations, Lang, Translations};
 
 /// Application version from Cargo.toml

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 #![allow(dead_code)]
 //! Application error handling with HTTP response conversion
 //!
