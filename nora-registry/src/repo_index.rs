@@ -181,9 +181,19 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
 
                 if let Ok(data) = storage.get(key).await {
                     if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let cfg = m.get("config").and_then(|c| c.get("size")).and_then(|s| s.as_u64()).unwrap_or(0);
-                        let layers: u64 = m.get("layers").and_then(|l| l.as_array())
-                            .map(|arr| arr.iter().filter_map(|l| l.get("size").and_then(|s| s.as_u64())).sum())
+                        let cfg = m
+                            .get("config")
+                            .and_then(|c| c.get("size"))
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0);
+                        let layers: u64 = m
+                            .get("layers")
+                            .and_then(|l| l.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                                    .sum()
+                            })
                             .unwrap_or(0);
                         entry.1 += cfg + layers;
                     }
