@@ -1,4 +1,4 @@
-# NORA
+# 🐿️ N○RA
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-DevITWay-blue?logo=telegram)](https://t.me/DevITWay)
@@ -191,4 +191,4 @@ Copyright (c) 2026 DevITWay
 
 ---
 
-**NORA** - Organized like a chipmunk's stash | Built with Rust by [DevITWay](https://t.me/DevITWay)
+**🐿️ N○RA** - Organized like a chipmunk's stash | Built with Rust by [DevITWay](https://t.me/DevITWay)
