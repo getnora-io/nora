@@ -40,7 +40,7 @@ Fast. Organized. Feel at Home.
 ### Docker (Recommended)
 
 ```bash
-docker run -d -p 4000:4000 -v nora-data:/data getnora/nora
+docker run -d -p 4000:4000 -v nora-data:/data ghcr.io/getnora-io/nora:latest
 ```
 
 ### From Source
