@@ -574,68 +574,108 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
 pub async fn get_npm_packages(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("npm/").await;
 
-    let mut packages: HashMap<String, (RepoInfo, u64)> = HashMap::new();
+    let mut packages: HashMap<String, RepoInfo> = HashMap::new();
 
+    // Find all metadata.json files
     for key in &keys {
-        if let Some(rest) = key.strip_prefix("npm/") {
-            let parts: Vec<_> = rest.split('/').collect();
-            if !parts.is_empty() {
-                let name = parts[0].to_string();
-                let entry = packages.entry(name.clone()).or_insert_with(|| {
-                    (
-                        RepoInfo {
-                            name,
-                            versions: 0,
-                            size: 0,
-                            updated: "N/A".to_string(),
-                        },
-                        0,
-                    )
-                });
+        if key.ends_with("/metadata.json") {
+            if let Some(name) = key
+                .strip_prefix("npm/")
+                .and_then(|s| s.strip_suffix("/metadata.json"))
+            {
+                // Parse metadata to get version count and info
+                if let Ok(data) = storage.get(key).await {
+                    if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        let versions_count = metadata
+                            .get("versions")
+                            .and_then(|v| v.as_object())
+                            .map(|v| v.len())
+                            .unwrap_or(0);
 
-                if parts.len() >= 3 && parts[1] == "tarballs" {
-                    entry.0.versions += 1;
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.0.size += meta.size;
-                        if meta.modified > entry.1 {
-                            entry.1 = meta.modified;
-                            entry.0.updated = format_timestamp(meta.modified);
-                        }
+                        // Calculate total size from dist.unpackedSize or estimate
+                        let total_size: u64 = metadata
+                            .get("versions")
+                            .and_then(|v| v.as_object())
+                            .map(|versions| {
+                                versions
+                                    .values()
+                                    .filter_map(|v| {
+                                        v.get("dist")
+                                            .and_then(|d| d.get("unpackedSize"))
+                                            .and_then(|s| s.as_u64())
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+
+                        // Get latest version time for "updated"
+                        let updated = metadata
+                            .get("time")
+                            .and_then(|t| t.get("modified"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s[..10].to_string()) // Take just date part
+                            .unwrap_or_else(|| "N/A".to_string());
+
+                        packages.insert(
+                            name.to_string(),
+                            RepoInfo {
+                                name: name.to_string(),
+                                versions: versions_count,
+                                size: total_size,
+                                updated,
+                            },
+                        );
                     }
                 }
             }
         }
     }
 
-    let mut result: Vec<_> = packages.into_values().map(|(r, _)| r).collect();
+    let mut result: Vec<_> = packages.into_values().collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
 }
 
 pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
-    let prefix = format!("npm/{}/tarballs/", name);
-    let keys = storage.list(&prefix).await;
+    let metadata_key = format!("npm/{}/metadata.json", name);
 
     let mut versions = Vec::new();
-    for key in &keys {
-        if let Some(tarball) = key.strip_prefix(&prefix) {
-            if let Some(version) = tarball
-                .strip_prefix(&format!("{}-", name))
-                .and_then(|s| s.strip_suffix(".tgz"))
-            {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
-                versions.push(VersionInfo {
-                    version: version.to_string(),
-                    size,
-                    published,
-                });
+
+    // Parse metadata.json for version info
+    if let Ok(data) = storage.get(&metadata_key).await {
+        if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(versions_obj) = metadata.get("versions").and_then(|v| v.as_object()) {
+                let time_obj = metadata.get("time").and_then(|t| t.as_object());
+
+                for (version, info) in versions_obj {
+                    let size = info
+                        .get("dist")
+                        .and_then(|d| d.get("unpackedSize"))
+                        .and_then(|s| s.as_u64())
+                        .unwrap_or(0);
+
+                    let published = time_obj
+                        .and_then(|t| t.get(version))
+                        .and_then(|p| p.as_str())
+                        .map(|s| s[..10].to_string())
+                        .unwrap_or_else(|| "N/A".to_string());
+
+                    versions.push(VersionInfo {
+                        version: version.clone(),
+                        size,
+                        published,
+                    });
+                }
             }
         }
     }
+
+    // Sort by version (semver-like, newest first)
+    versions.sort_by(|a, b| {
+        let a_parts: Vec<u32> = a.version.split('.').filter_map(|s| s.parse().ok()).collect();
+        let b_parts: Vec<u32> = b.version.split('.').filter_map(|s| s.parse().ok()).collect();
+        b_parts.cmp(&a_parts)
+    });
 
     PackageDetail { versions }
 }
