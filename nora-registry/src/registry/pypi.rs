@@ -151,6 +151,8 @@ async fn download_file(
                         let _ = storage.put(&key_clone, &data_clone).await;
                     });
 
+                    state.repo_index.invalidate("pypi");
+
                     let content_type = if filename.ends_with(".whl") {
                         "application/zip"
                     } else if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {

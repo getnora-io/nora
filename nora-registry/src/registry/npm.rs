@@ -85,6 +85,11 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
                 let _ = storage.put(&key_clone, &data_clone).await;
             });
 
+            // Invalidate index when caching new tarball
+            if is_tarball {
+                state.repo_index.invalidate("npm");
+            }
+
             return with_content_type(is_tarball, data.into()).into_response();
         }
     }

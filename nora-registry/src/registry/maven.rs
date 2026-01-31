@@ -70,6 +70,8 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
                     let _ = storage.put(&key_clone, &data_clone).await;
                 });
 
+                state.repo_index.invalidate("maven");
+
                 return with_content_type(&path, data.into()).into_response();
             }
             Err(_) => continue,
@@ -106,6 +108,7 @@ async fn upload(
                 "maven",
                 "LOCAL",
             ));
+            state.repo_index.invalidate("maven");
             StatusCode::CREATED
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
