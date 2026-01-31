@@ -1,6 +1,9 @@
 # 🐿️ N○RA
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/getnora-io/nora/ci.yml?label=CI)](https://github.com/getnora-io/nora/actions)
+[![Rust](https://img.shields.io/badge/rust-%23000000.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Telegram](https://img.shields.io/badge/Telegram-DevITWay-blue?logo=telegram)](https://t.me/DevITWay)
 
 > **Your Cloud-Native Artifact Registry**
