@@ -13,3 +13,7 @@ ROADMAP*.md
 docs-site/
 docs/
 *.txt
+
+## Internal files
+.internal/
+examples/
