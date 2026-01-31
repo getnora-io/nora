@@ -396,6 +396,11 @@ pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
     let mut repos: HashMap<String, (RepoInfo, u64)> = HashMap::new(); // (info, latest_modified)
 
     for key in &keys {
+        // Skip .meta.json files
+        if key.ends_with(".meta.json") {
+            continue;
+        }
+
         if let Some(rest) = key.strip_prefix("docker/") {
             let parts: Vec<_> = rest.split('/').collect();
             if parts.len() >= 3 {
@@ -412,10 +417,35 @@ pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
                     )
                 });
 
-                if parts[1] == "manifests" {
+                if parts[1] == "manifests" && key.ends_with(".json") {
                     entry.0.versions += 1;
+
+                    // Parse manifest to get actual image size (config + layers)
+                    if let Ok(manifest_data) = storage.get(key).await {
+                        if let Ok(manifest) =
+                            serde_json::from_slice::<serde_json::Value>(&manifest_data)
+                        {
+                            let config_size = manifest
+                                .get("config")
+                                .and_then(|c| c.get("size"))
+                                .and_then(|s| s.as_u64())
+                                .unwrap_or(0);
+                            let layers_size: u64 = manifest
+                                .get("layers")
+                                .and_then(|l| l.as_array())
+                                .map(|layers| {
+                                    layers
+                                        .iter()
+                                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                                        .sum()
+                                })
+                                .unwrap_or(0);
+                            entry.0.size += config_size + layers_size;
+                        }
+                    }
+
+                    // Update timestamp
                     if let Some(meta) = storage.stat(key).await {
-                        entry.0.size += meta.size;
                         if meta.modified > entry.1 {
                             entry.1 = meta.modified;
                             entry.0.updated = format_timestamp(meta.modified);
@@ -470,11 +500,37 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
                 "N/A".to_string()
             };
 
-            // Use size from metadata if available, otherwise from file
+            // Calculate size from manifest layers (config + layers)
             let size = if metadata.size_bytes > 0 {
                 metadata.size_bytes
             } else {
-                state.storage.stat(key).await.map(|m| m.size).unwrap_or(0)
+                // Parse manifest to get actual image size
+                if let Ok(manifest_data) = state.storage.get(key).await {
+                    if let Ok(manifest) =
+                        serde_json::from_slice::<serde_json::Value>(&manifest_data)
+                    {
+                        let config_size = manifest
+                            .get("config")
+                            .and_then(|c| c.get("size"))
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0);
+                        let layers_size: u64 = manifest
+                            .get("layers")
+                            .and_then(|l| l.as_array())
+                            .map(|layers| {
+                                layers
+                                    .iter()
+                                    .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        config_size + layers_size
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
             };
 
             // Format last_pulled
