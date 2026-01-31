@@ -1,100 +1,68 @@
 # Contributing to NORA
 
-Thanks for your interest in contributing to NORA!
+Thank you for your interest in contributing to NORA!
 
 ## Getting Started
 
-1. **Fork** the repository
-2. **Clone** your fork:
-   ```bash
-   git clone https://github.com/your-username/nora.git
-   cd nora
-   ```
-3. **Create a branch**:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
+1. Fork the repository
+2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/nora.git`
+3. Create a branch: `git checkout -b feature/your-feature`
 
 ## Development Setup
 
-### Prerequisites
-
-- Rust 1.75+ (`rustup update`)
-- Docker (for testing)
-- Git
-
-### Build
-
 ```bash
+# Install Rust (if needed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build
 cargo build
-```
 
-### Run
-
-```bash
-cargo run --bin nora
-```
-
-### Test
-
-```bash
+# Run tests
 cargo test
-cargo clippy
-cargo fmt --check
+
+# Run locally
+cargo run --bin nora -- serve
 ```
-
-## Making Changes
-
-1. **Write code** following Rust conventions
-2. **Add tests** for new features
-3. **Update docs** if needed
-4. **Run checks**:
-   ```bash
-   cargo fmt
-   cargo clippy -- -D warnings
-   cargo test
-   ```
-
-## Commit Messages
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-- `feat:` - New feature
-- `fix:` - Bug fix
-- `docs:` - Documentation
-- `test:` - Tests
-- `refactor:` - Code refactoring
-- `chore:` - Maintenance
-
-Example:
-```bash
-git commit -m "feat: add S3 storage migration"
-```
-
-## Pull Request Process
-
-1. **Push** to your fork:
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-2. **Open a Pull Request** on GitHub
-
-3. **Wait for review** - maintainers will review your PR
 
 ## Code Style
 
-- Follow Rust conventions
-- Use `cargo fmt` for formatting
-- Pass `cargo clippy` with no warnings
-- Write meaningful commit messages
+- Run `cargo fmt` before committing
+- Run `cargo clippy` and fix warnings
+- Follow Rust naming conventions
 
-## Questions?
+## Pull Request Process
 
-- Open an [Issue](https://github.com/getnora-io/nora/issues)
-- Ask in [Discussions](https://github.com/getnora-io/nora/discussions)
-- Reach out on [Telegram](https://t.me/DevITWay)
+1. Update documentation if needed
+2. Add tests for new features
+3. Ensure all tests pass: `cargo test`
+4. Ensure code is formatted: `cargo fmt --check`
+5. Ensure no clippy warnings: `cargo clippy`
 
----
+## Commit Messages
 
-Built with love by the NORA community
+Use conventional commits:
+
+- `feat:` - new feature
+- `fix:` - bug fix
+- `docs:` - documentation
+- `style:` - formatting
+- `refactor:` - code refactoring
+- `test:` - adding tests
+- `chore:` - maintenance
+
+Example: `feat: add OAuth2 authentication`
+
+## Reporting Issues
+
+- Use GitHub Issues
+- Include steps to reproduce
+- Include NORA version and OS
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT License.
+
+## Contact
+
+- Telegram: [@DevITWay](https://t.me/DevITWay)
+- GitHub Issues: [getnora-io/nora](https://github.com/getnora-io/nora/issues)
