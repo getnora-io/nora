@@ -15,7 +15,7 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.2.10",
+        version = "0.2.12",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, and PyPI",
         license(name = "MIT"),
         contact(name = "DevITWay", url = "https://github.com/getnora-io/nora")
@@ -25,6 +25,7 @@ use crate::AppState;
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
+        (name = "metrics", description = "Prometheus metrics"),
         (name = "dashboard", description = "Dashboard & Metrics API"),
         (name = "docker", description = "Docker Registry v2 API"),
         (name = "maven", description = "Maven Repository API"),
@@ -37,18 +38,30 @@ use crate::AppState;
         // Health
         crate::openapi::health_check,
         crate::openapi::readiness_check,
+        // Metrics
+        crate::openapi::prometheus_metrics,
         // Dashboard
         crate::openapi::dashboard_metrics,
-        // Docker
+        // Docker - Read
         crate::openapi::docker_version,
         crate::openapi::docker_catalog,
         crate::openapi::docker_tags,
-        crate::openapi::docker_manifest,
-        crate::openapi::docker_blob,
+        crate::openapi::docker_manifest_get,
+        crate::openapi::docker_blob_head,
+        crate::openapi::docker_blob_get,
+        // Docker - Write
+        crate::openapi::docker_manifest_put,
+        crate::openapi::docker_blob_upload_start,
+        crate::openapi::docker_blob_upload_patch,
+        crate::openapi::docker_blob_upload_put,
         // Maven
-        crate::openapi::maven_artifact,
+        crate::openapi::maven_artifact_get,
+        crate::openapi::maven_artifact_put,
         // npm
         crate::openapi::npm_package,
+        // Cargo
+        crate::openapi::cargo_metadata,
+        crate::openapi::cargo_download,
         // PyPI
         crate::openapi::pypi_simple,
         crate::openapi::pypi_package,
@@ -258,6 +271,8 @@ pub struct ActivityEntry {
 
 // ============ Path Operations (documentation only) ============
 
+// -------------------- Health --------------------
+
 /// Health check endpoint
 #[utoipa::path(
     get,
@@ -282,6 +297,23 @@ pub async fn health_check() {}
 )]
 pub async fn readiness_check() {}
 
+// -------------------- Metrics --------------------
+
+/// Prometheus metrics endpoint
+///
+/// Returns metrics in Prometheus text format for scraping.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "metrics",
+    responses(
+        (status = 200, description = "Prometheus metrics", content_type = "text/plain")
+    )
+)]
+pub async fn prometheus_metrics() {}
+
+// -------------------- Dashboard --------------------
+
 /// Dashboard metrics and activity
 ///
 /// Returns comprehensive metrics including downloads, uploads, cache statistics,
@@ -295,6 +327,8 @@ pub async fn readiness_check() {}
     )
 )]
 pub async fn dashboard_metrics() {}
+
+// -------------------- Docker Registry v2 - Read Operations --------------------
 
 /// Docker Registry version check
 #[utoipa::path(
@@ -325,7 +359,7 @@ pub async fn docker_catalog() {}
     path = "/v2/{name}/tags/list",
     tag = "docker",
     params(
-        ("name" = String, Path, description = "Repository name")
+        ("name" = String, Path, description = "Repository name (e.g., 'alpine' or 'library/nginx')")
     ),
     responses(
         (status = 200, description = "Tag list", body = DockerTags),
@@ -341,14 +375,30 @@ pub async fn docker_tags() {}
     tag = "docker",
     params(
         ("name" = String, Path, description = "Repository name"),
-        ("reference" = String, Path, description = "Tag or digest")
+        ("reference" = String, Path, description = "Tag or digest (sha256:...)")
     ),
     responses(
         (status = 200, description = "Manifest content"),
         (status = 404, description = "Manifest not found")
     )
 )]
-pub async fn docker_manifest() {}
+pub async fn docker_manifest_get() {}
+
+/// Check if blob exists
+#[utoipa::path(
+    head,
+    path = "/v2/{name}/blobs/{digest}",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+        ("digest" = String, Path, description = "Blob digest (sha256:...)")
+    ),
+    responses(
+        (status = 200, description = "Blob exists, Content-Length header contains size"),
+        (status = 404, description = "Blob not found")
+    )
+)]
+pub async fn docker_blob_head() {}
 
 /// Get blob
 #[utoipa::path(
@@ -364,7 +414,79 @@ pub async fn docker_manifest() {}
         (status = 404, description = "Blob not found")
     )
 )]
-pub async fn docker_blob() {}
+pub async fn docker_blob_get() {}
+
+// -------------------- Docker Registry v2 - Write Operations --------------------
+
+/// Push manifest
+#[utoipa::path(
+    put,
+    path = "/v2/{name}/manifests/{reference}",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+        ("reference" = String, Path, description = "Tag or digest")
+    ),
+    responses(
+        (status = 201, description = "Manifest created, Docker-Content-Digest header contains digest"),
+        (status = 400, description = "Invalid manifest")
+    )
+)]
+pub async fn docker_manifest_put() {}
+
+/// Start blob upload
+///
+/// Initiates a resumable blob upload. Returns a Location header with the upload URL.
+#[utoipa::path(
+    post,
+    path = "/v2/{name}/blobs/uploads/",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 202, description = "Upload started, Location header contains upload URL")
+    )
+)]
+pub async fn docker_blob_upload_start() {}
+
+/// Upload blob chunk (chunked upload)
+///
+/// Uploads a chunk of data to an in-progress upload session.
+#[utoipa::path(
+    patch,
+    path = "/v2/{name}/blobs/uploads/{uuid}",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+        ("uuid" = String, Path, description = "Upload session UUID")
+    ),
+    responses(
+        (status = 202, description = "Chunk accepted, Range header indicates bytes received")
+    )
+)]
+pub async fn docker_blob_upload_patch() {}
+
+/// Complete blob upload
+///
+/// Finalizes the blob upload. Can include final chunk data in the body.
+#[utoipa::path(
+    put,
+    path = "/v2/{name}/blobs/uploads/{uuid}",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+        ("uuid" = String, Path, description = "Upload session UUID"),
+        ("digest" = String, Query, description = "Expected blob digest (sha256:...)")
+    ),
+    responses(
+        (status = 201, description = "Blob created"),
+        (status = 400, description = "Digest mismatch or missing")
+    )
+)]
+pub async fn docker_blob_upload_put() {}
+
+// -------------------- Maven --------------------
 
 /// Get Maven artifact
 #[utoipa::path(
@@ -379,7 +501,24 @@ pub async fn docker_blob() {}
         (status = 404, description = "Artifact not found, trying upstream proxies")
     )
 )]
-pub async fn maven_artifact() {}
+pub async fn maven_artifact_get() {}
+
+/// Upload Maven artifact
+#[utoipa::path(
+    put,
+    path = "/maven2/{path}",
+    tag = "maven",
+    params(
+        ("path" = String, Path, description = "Artifact path")
+    ),
+    responses(
+        (status = 201, description = "Artifact uploaded"),
+        (status = 500, description = "Storage error")
+    )
+)]
+pub async fn maven_artifact_put() {}
+
+// -------------------- npm --------------------
 
 /// Get npm package metadata
 #[utoipa::path(
@@ -387,7 +526,7 @@ pub async fn maven_artifact() {}
     path = "/npm/{name}",
     tag = "npm",
     params(
-        ("name" = String, Path, description = "Package name")
+        ("name" = String, Path, description = "Package name (e.g., 'lodash' or '@scope/package')")
     ),
     responses(
         (status = 200, description = "Package metadata (JSON)"),
@@ -395,6 +534,41 @@ pub async fn maven_artifact() {}
     )
 )]
 pub async fn npm_package() {}
+
+// -------------------- Cargo --------------------
+
+/// Get Cargo crate metadata
+#[utoipa::path(
+    get,
+    path = "/cargo/api/v1/crates/{crate_name}",
+    tag = "cargo",
+    params(
+        ("crate_name" = String, Path, description = "Crate name")
+    ),
+    responses(
+        (status = 200, description = "Crate metadata (JSON)"),
+        (status = 404, description = "Crate not found")
+    )
+)]
+pub async fn cargo_metadata() {}
+
+/// Download Cargo crate
+#[utoipa::path(
+    get,
+    path = "/cargo/api/v1/crates/{crate_name}/{version}/download",
+    tag = "cargo",
+    params(
+        ("crate_name" = String, Path, description = "Crate name"),
+        ("version" = String, Path, description = "Crate version")
+    ),
+    responses(
+        (status = 200, description = "Crate file (.crate)"),
+        (status = 404, description = "Crate version not found")
+    )
+)]
+pub async fn cargo_download() {}
+
+// -------------------- PyPI --------------------
 
 /// PyPI Simple index
 #[utoipa::path(
@@ -421,6 +595,8 @@ pub async fn pypi_simple() {}
     )
 )]
 pub async fn pypi_package() {}
+
+// -------------------- Auth / Tokens --------------------
 
 /// Create API token
 #[utoipa::path(

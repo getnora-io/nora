@@ -47,6 +47,7 @@ static UPLOAD_SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, Vec<u8>>>> =
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v2/", get(check))
+        .route("/v2/_catalog", get(catalog))
         // Single-segment name routes (e.g., /v2/alpine/...)
         .route("/v2/{name}/blobs/{digest}", head(check_blob))
         .route("/v2/{name}/blobs/{digest}", get(download_blob))
@@ -85,6 +86,26 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 async fn check() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({})))
+}
+
+/// List all repositories in the registry
+async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let keys = state.storage.list("docker/").await;
+
+    // Extract unique repository names from paths like "docker/{name}/manifests/..."
+    let mut repos: Vec<String> = keys
+        .iter()
+        .filter_map(|k| {
+            k.strip_prefix("docker/")
+                .and_then(|rest| rest.split('/').next())
+                .map(String::from)
+        })
+        .collect();
+
+    repos.sort();
+    repos.dedup();
+
+    Json(json!({ "repositories": repos }))
 }
 
 async fn check_blob(

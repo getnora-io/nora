@@ -4,18 +4,14 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
-## [0.3.0] - 2026-01-30
+## [0.2.12] - 2026-01-30
 
 ### Added
 
 #### Configurable Rate Limiting
 - Rate limits now configurable via `config.toml` and environment variables
-- New config section `[rate_limit]` with 6 parameters:
-  - `auth_rps` / `auth_burst` - Authentication endpoints (brute-force protection)
-  - `upload_rps` / `upload_burst` - Upload endpoints (Docker push, etc.)
-  - `general_rps` / `general_burst` - General API endpoints
+- New config section `[rate_limit]` with parameters: `auth_rps`, `auth_burst`, `upload_rps`, `upload_burst`, `general_rps`, `general_burst`
 - Environment variables: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
-- Rate limit configuration logged at startup
 
 #### Secrets Provider Architecture
 - Trait-based secrets management (`SecretsProvider` trait)
@@ -23,14 +19,78 @@ All notable changes to NORA will be documented in this file.
 - Protected secrets with `zeroize` (memory zeroed on drop)
 - Redacted Debug impl prevents secret leakage in logs
 - New config section `[secrets]` with `provider` and `clear_env` options
-- Foundation for future AWS Secrets Manager, Vault, K8s integration
+
+#### Docker Image Metadata
+- Support for image metadata retrieval
+
+#### Documentation
+- Bilingual onboarding guide (EN/RU)
+
+---
+
+## [0.2.11] - 2026-01-26
+
+### Added
+- Internationalization (i18n) support
+- PyPI registry proxy
+- UI improvements
+
+---
+
+## [0.2.10] - 2026-01-26
 
 ### Changed
-- Rate limiting functions now accept `&RateLimitConfig` parameter
-- Improved error messages with `.expect()` instead of `.unwrap()`
+- Dark theme applied to all UI pages
+
+---
+
+## [0.2.9] - 2026-01-26
+
+### Changed
+- Version bump release
+
+---
+
+## [0.2.8] - 2026-01-26
+
+### Added
+- Dashboard endpoint added to OpenAPI documentation
+
+---
+
+## [0.2.7] - 2026-01-26
+
+### Added
+- Dynamic version display in UI sidebar
+
+---
+
+## [0.2.6] - 2026-01-26
+
+### Added
+
+#### Dashboard Metrics
+- Global stats panel: downloads, uploads, artifacts, cache hit rate, storage
+- Extended registry cards with artifact count, size, counters
+- Activity log (last 20 events)
+
+#### UI
+- Dark theme (bg: #0f172a, cards: #1e293b)
+
+---
+
+## [0.2.5] - 2026-01-26
 
 ### Fixed
-- Rate limiting was hardcoded in v0.2.0, now user-configurable
+- Docker push/pull: added PATCH endpoint for chunked uploads
+
+---
+
+## [0.2.4] - 2026-01-26
+
+### Fixed
+- Rate limiting: health/metrics endpoints now exempt
+- Increased upload rate limits for Docker parallel requests
 
 ---
 
@@ -82,7 +142,6 @@ All notable changes to NORA will be documented in this file.
 - JSON error responses with request_id support
 
 ### Changed
-
 - `StorageError` now uses `thiserror` derive macro
 - `TokenError` now uses `thiserror` derive macro
 - Storage wrapper validates keys before delegating to backend
@@ -90,7 +149,6 @@ All notable changes to NORA will be documented in this file.
 - Body size limit set to 100MB default via `DefaultBodyLimit`
 
 ### Dependencies Added
-
 - `thiserror = "2"` - typed error handling
 - `tower_governor = "0.8"` - rate limiting
 - `governor = "0.10"` - rate limiting backend
@@ -98,7 +156,6 @@ All notable changes to NORA will be documented in this file.
 - `wiremock = "0.6"` (dev) - HTTP mocking for S3 tests
 
 ### Files Added
-
 - `src/validation.rs` - input validation module
 - `src/migrate.rs` - storage migration module
 - `src/error.rs` - application error types
@@ -110,7 +167,6 @@ All notable changes to NORA will be documented in this file.
 ## [0.1.0] - 2026-01-24
 
 ### Added
-
 - Multi-protocol support: Docker Registry v2, Maven, npm, Cargo, PyPI
 - Web UI dashboard
 - Swagger UI (`/api-docs`)
@@ -126,11 +182,100 @@ All notable changes to NORA will be documented in this file.
 - Backup/restore commands
 
 ---
----
 
 # Журнал изменений (RU)
 
 Все значимые изменения NORA документируются в этом файле.
+
+---
+
+## [0.2.12] - 2026-01-30
+
+### Добавлено
+
+#### Настраиваемый Rate Limiting
+- Rate limits настраиваются через `config.toml` и переменные окружения
+- Новая секция `[rate_limit]` с параметрами: `auth_rps`, `auth_burst`, `upload_rps`, `upload_burst`, `general_rps`, `general_burst`
+- Переменные окружения: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
+
+#### Архитектура Secrets Provider
+- Trait-based управление секретами (`SecretsProvider` trait)
+- ENV provider по умолчанию (12-Factor App паттерн)
+- Защищённые секреты с `zeroize` (память обнуляется при drop)
+- Redacted Debug impl предотвращает утечку секретов в логи
+- Новая секция `[secrets]` с опциями `provider` и `clear_env`
+
+#### Docker Image Metadata
+- Поддержка получения метаданных образов
+
+#### Документация
+- Двуязычный onboarding guide (EN/RU)
+
+---
+
+## [0.2.11] - 2026-01-26
+
+### Добавлено
+- Поддержка интернационализации (i18n)
+- PyPI registry proxy
+- Улучшения UI
+
+---
+
+## [0.2.10] - 2026-01-26
+
+### Изменено
+- Тёмная тема применена ко всем страницам UI
+
+---
+
+## [0.2.9] - 2026-01-26
+
+### Изменено
+- Релиз с обновлением версии
+
+---
+
+## [0.2.8] - 2026-01-26
+
+### Добавлено
+- Dashboard endpoint добавлен в OpenAPI документацию
+
+---
+
+## [0.2.7] - 2026-01-26
+
+### Добавлено
+- Динамическое отображение версии в сайдбаре UI
+
+---
+
+## [0.2.6] - 2026-01-26
+
+### Добавлено
+
+#### Dashboard Metrics
+- Глобальная панель статистики: downloads, uploads, artifacts, cache hit rate, storage
+- Расширенные карточки реестров с количеством артефактов, размером, счётчиками
+- Лог активности (последние 20 событий)
+
+#### UI
+- Тёмная тема (bg: #0f172a, cards: #1e293b)
+
+---
+
+## [0.2.5] - 2026-01-26
+
+### Исправлено
+- Docker push/pull: добавлен PATCH endpoint для chunked uploads
+
+---
+
+## [0.2.4] - 2026-01-26
+
+### Исправлено
+- Rate limiting: health/metrics endpoints теперь исключены
+- Увеличены лимиты upload для параллельных Docker запросов
 
 ---
 
@@ -182,7 +327,6 @@ All notable changes to NORA will be documented in this file.
 - JSON-ответы об ошибках с поддержкой request_id
 
 ### Изменено
-
 - `StorageError` теперь использует макрос `thiserror`
 - `TokenError` теперь использует макрос `thiserror`
 - Storage wrapper валидирует ключи перед делегированием backend
@@ -190,7 +334,6 @@ All notable changes to NORA will be documented in this file.
 - Лимит размера body установлен в 100MB через `DefaultBodyLimit`
 
 ### Добавлены зависимости
-
 - `thiserror = "2"` - типизированная обработка ошибок
 - `tower_governor = "0.8"` - rate limiting
 - `governor = "0.10"` - backend для rate limiting
@@ -198,7 +341,6 @@ All notable changes to NORA will be documented in this file.
 - `wiremock = "0.6"` (dev) - HTTP-мокирование для S3 тестов
 
 ### Добавлены файлы
-
 - `src/validation.rs` - модуль валидации ввода
 - `src/migrate.rs` - модуль миграции хранилища
 - `src/error.rs` - типы ошибок приложения
@@ -210,7 +352,6 @@ All notable changes to NORA will be documented in this file.
 ## [0.1.0] - 2026-01-24
 
 ### Добавлено
-
 - Мульти-протокольная поддержка: Docker Registry v2, Maven, npm, Cargo, PyPI
 - Web UI дашборд
 - Swagger UI (`/api-docs`)
