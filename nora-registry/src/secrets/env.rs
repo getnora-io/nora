@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! Environment variables secrets provider
 //!
 //! Reads secrets from environment variables. This is the default provider

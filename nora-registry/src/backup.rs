@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! Backup and restore functionality for Nora
 //!
 //! Exports all artifacts to a tar.gz file and restores from backups.

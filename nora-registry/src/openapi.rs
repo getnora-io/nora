@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! OpenAPI documentation and Swagger UI
 //!
 //! Functions in this module are stubs used only for generating OpenAPI documentation.

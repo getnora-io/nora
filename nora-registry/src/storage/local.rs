@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use async_trait::async_trait;
 use axum::body::Bytes;
 use std::path::PathBuf;
