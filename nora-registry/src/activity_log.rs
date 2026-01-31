@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! Protected secret types with memory safety
 //!
 //! Secrets are automatically zeroed on drop and redacted in Debug output.

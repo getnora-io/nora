@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::registry::docker_auth::DockerAuth;
 use crate::storage::Storage;
