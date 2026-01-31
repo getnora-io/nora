@@ -4,6 +4,7 @@
 use super::components::{format_size, format_timestamp, html_escape};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
+use crate::repo_index::RepoInfo;
 use crate::AppState;
 use crate::Storage;
 use axum::{
@@ -22,14 +23,6 @@ pub struct RegistryStats {
     pub npm: usize,
     pub cargo: usize,
     pub pypi: usize,
-}
-
-#[derive(Serialize, Clone)]
-pub struct RepoInfo {
-    pub name: String,
-    pub versions: usize,
-    pub size: u64,
-    pub updated: String,
 }
 
 #[derive(Serialize)]
@@ -115,44 +108,35 @@ pub struct MountPoint {
 // ============ API Handlers ============
 
 pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats> {
-    let stats = get_registry_stats(&state.storage).await;
-    Json(stats)
+    // Trigger index rebuild if needed, then get counts
+    let _ = state.repo_index.get("docker", &state.storage).await;
+    let _ = state.repo_index.get("maven", &state.storage).await;
+    let _ = state.repo_index.get("npm", &state.storage).await;
+    let _ = state.repo_index.get("cargo", &state.storage).await;
+    let _ = state.repo_index.get("pypi", &state.storage).await;
+
+    let (docker, maven, npm, cargo, pypi) = state.repo_index.counts();
+    Json(RegistryStats { docker, maven, npm, cargo, pypi })
 }
 
 pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
-    let registry_stats = get_registry_stats(&state.storage).await;
+    // Get indexes (will rebuild if dirty)
+    let docker_repos = state.repo_index.get("docker", &state.storage).await;
+    let maven_repos = state.repo_index.get("maven", &state.storage).await;
+    let npm_repos = state.repo_index.get("npm", &state.storage).await;
+    let cargo_repos = state.repo_index.get("cargo", &state.storage).await;
+    let pypi_repos = state.repo_index.get("pypi", &state.storage).await;
 
-    // Calculate total storage size
-    let all_keys = state.storage.list("").await;
-    let mut total_storage: u64 = 0;
-    let mut docker_size: u64 = 0;
-    let mut maven_size: u64 = 0;
-    let mut npm_size: u64 = 0;
-    let mut cargo_size: u64 = 0;
-    let mut pypi_size: u64 = 0;
+    // Calculate sizes from cached index
+    let docker_size: u64 = docker_repos.iter().map(|r| r.size).sum();
+    let maven_size: u64 = maven_repos.iter().map(|r| r.size).sum();
+    let npm_size: u64 = npm_repos.iter().map(|r| r.size).sum();
+    let cargo_size: u64 = cargo_repos.iter().map(|r| r.size).sum();
+    let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
+    let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size;
 
-    for key in &all_keys {
-        if let Some(meta) = state.storage.stat(key).await {
-            total_storage += meta.size;
-            if key.starts_with("docker/") {
-                docker_size += meta.size;
-            } else if key.starts_with("maven/") {
-                maven_size += meta.size;
-            } else if key.starts_with("npm/") {
-                npm_size += meta.size;
-            } else if key.starts_with("cargo/") {
-                cargo_size += meta.size;
-            } else if key.starts_with("pypi/") {
-                pypi_size += meta.size;
-            }
-        }
-    }
-
-    let total_artifacts = registry_stats.docker
-        + registry_stats.maven
-        + registry_stats.npm
-        + registry_stats.cargo
-        + registry_stats.pypi;
+    let total_artifacts = docker_repos.len() + maven_repos.len() + npm_repos.len()
+        + cargo_repos.len() + pypi_repos.len();
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),
@@ -165,35 +149,35 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let registry_card_stats = vec![
         RegistryCardStats {
             name: "docker".to_string(),
-            artifact_count: registry_stats.docker,
+            artifact_count: docker_repos.len(),
             downloads: state.metrics.get_registry_downloads("docker"),
             uploads: state.metrics.get_registry_uploads("docker"),
             size_bytes: docker_size,
         },
         RegistryCardStats {
             name: "maven".to_string(),
-            artifact_count: registry_stats.maven,
+            artifact_count: maven_repos.len(),
             downloads: state.metrics.get_registry_downloads("maven"),
             uploads: state.metrics.get_registry_uploads("maven"),
             size_bytes: maven_size,
         },
         RegistryCardStats {
             name: "npm".to_string(),
-            artifact_count: registry_stats.npm,
+            artifact_count: npm_repos.len(),
             downloads: state.metrics.get_registry_downloads("npm"),
             uploads: 0,
             size_bytes: npm_size,
         },
         RegistryCardStats {
             name: "cargo".to_string(),
-            artifact_count: registry_stats.cargo,
+            artifact_count: cargo_repos.len(),
             downloads: state.metrics.get_registry_downloads("cargo"),
             uploads: 0,
             size_bytes: cargo_size,
         },
         RegistryCardStats {
             name: "pypi".to_string(),
-            artifact_count: registry_stats.pypi,
+            artifact_count: pypi_repos.len(),
             downloads: state.metrics.get_registry_downloads("pypi"),
             uploads: 0,
             size_bytes: pypi_size,
@@ -244,15 +228,8 @@ pub async fn api_list(
     State(state): State<Arc<AppState>>,
     Path(registry_type): Path<String>,
 ) -> Json<Vec<RepoInfo>> {
-    let repos = match registry_type.as_str() {
-        "docker" => get_docker_repos(&state.storage).await,
-        "maven" => get_maven_repos(&state.storage).await,
-        "npm" => get_npm_packages(&state.storage).await,
-        "cargo" => get_cargo_crates(&state.storage).await,
-        "pypi" => get_pypi_packages(&state.storage).await,
-        _ => vec![],
-    };
-    Json(repos)
+    let repos = state.repo_index.get(&registry_type, &state.storage).await;
+    Json((*repos).clone())
 }
 
 pub async fn api_detail(
@@ -283,20 +260,13 @@ pub async fn api_search(
 ) -> axum::response::Html<String> {
     let query = params.q.unwrap_or_default().to_lowercase();
 
-    let repos = match registry_type.as_str() {
-        "docker" => get_docker_repos(&state.storage).await,
-        "maven" => get_maven_repos(&state.storage).await,
-        "npm" => get_npm_packages(&state.storage).await,
-        "cargo" => get_cargo_crates(&state.storage).await,
-        "pypi" => get_pypi_packages(&state.storage).await,
-        _ => vec![],
-    };
+    let repos = state.repo_index.get(&registry_type, &state.storage).await;
 
-    let filtered: Vec<_> = if query.is_empty() {
-        repos
+    let filtered: Vec<&RepoInfo> = if query.is_empty() {
+        repos.iter().collect()
     } else {
         repos
-            .into_iter()
+            .iter()
             .filter(|r| r.name.to_lowercase().contains(&query))
             .collect()
     };
@@ -341,7 +311,9 @@ pub async fn api_search(
 }
 
 // ============ Data Fetching Functions ============
+// NOTE: Legacy functions below - kept for reference, will be removed in future cleanup
 
+#[allow(dead_code)]
 pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
     let all_keys = storage.list("").await;
 
@@ -393,6 +365,7 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
     }
 }
 
+#[allow(dead_code)]
 pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("docker/").await;
 
@@ -571,6 +544,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
+#[allow(dead_code)]
 pub async fn get_maven_repos(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("maven/").await;
 
@@ -630,6 +604,7 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
+#[allow(dead_code)]
 pub async fn get_npm_packages(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("npm/").await;
 
@@ -747,6 +722,7 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail { versions }
 }
 
+#[allow(dead_code)]
 pub async fn get_cargo_crates(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("cargo/").await;
 
@@ -814,6 +790,7 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail { versions }
 }
 
+#[allow(dead_code)]
 pub async fn get_pypi_packages(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("pypi/").await;
 

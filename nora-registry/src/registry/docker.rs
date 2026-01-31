@@ -192,6 +192,8 @@ async fn download_blob(
                 let _ = storage.put(&key_clone, &data_clone).await;
             });
 
+            state.repo_index.invalidate("docker");
+
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -302,6 +304,7 @@ async fn upload_blob(
                 "docker",
                 "LOCAL",
             ));
+            state.repo_index.invalidate("docker");
             let location = format!("/v2/{}/blobs/{}", name, digest);
             (StatusCode::CREATED, [(header::LOCATION, location)]).into_response()
         }
@@ -413,6 +416,8 @@ async fn get_manifest(
                 }
             });
 
+            state.repo_index.invalidate("docker");
+
             return (
                 StatusCode::OK,
                 [
@@ -474,6 +479,7 @@ async fn put_manifest(
         "docker",
         "LOCAL",
     ));
+    state.repo_index.invalidate("docker");
 
     let location = format!("/v2/{}/manifests/{}", name, reference);
     (

@@ -13,6 +13,7 @@ mod migrate;
 mod openapi;
 mod rate_limit;
 mod registry;
+mod repo_index;
 mod request_id;
 mod secrets;
 mod storage;
@@ -33,6 +34,7 @@ use activity_log::ActivityLog;
 use auth::HtpasswdAuth;
 use config::{Config, StorageMode};
 use dashboard_metrics::DashboardMetrics;
+use repo_index::RepoIndex;
 pub use storage::Storage;
 use tokens::TokenStore;
 
@@ -82,6 +84,7 @@ pub struct AppState {
     pub metrics: DashboardMetrics,
     pub activity: ActivityLog,
     pub docker_auth: registry::DockerAuth,
+    pub repo_index: RepoIndex,
 }
 
 #[tokio::main]
@@ -277,6 +280,7 @@ async fn run_server(config: Config, storage: Storage) {
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
         docker_auth,
+        repo_index: RepoIndex::new(),
     });
 
     // Token routes with strict rate limiting (brute-force protection)
