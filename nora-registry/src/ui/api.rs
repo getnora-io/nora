@@ -728,8 +728,16 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
 
     // Sort by version (semver-like, newest first)
     versions.sort_by(|a, b| {
-        let a_parts: Vec<u32> = a.version.split('.').filter_map(|s| s.parse().ok()).collect();
-        let b_parts: Vec<u32> = b.version.split('.').filter_map(|s| s.parse().ok()).collect();
+        let a_parts: Vec<u32> = a
+            .version
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let b_parts: Vec<u32> = b
+            .version
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
         b_parts.cmp(&a_parts)
     });
 
