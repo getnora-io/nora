@@ -137,7 +137,7 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations) -> String {
         <div id="sidebar" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
             <div class="h-16 flex items-center justify-between px-6 border-b border-slate-700">
                 <div class="flex items-center">
-                    <span class="text-2xl font-bold tracking-tight">N<span class="inline-block w-5 h-5 rounded-full border-2 border-current align-middle relative -top-0.5 mx-0.5"></span>RA</span>
+                    <span class="text-2xl font-bold tracking-tight">N<span class="inline-block w-4 h-5 rounded-[45%] border-[1.5px] border-current align-middle mx-0.5"></span>RA</span>
                 </div>
                 <button onclick="toggleSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -185,7 +185,7 @@ fn header_dark(lang: Lang) -> String {
                     </svg>
                 </button>
                 <div class="md:hidden flex items-center">
-                    <span class="font-bold text-slate-200 tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                    <span class="font-bold text-slate-200 tracking-tight">N<span class="inline-block w-3 h-4 rounded-[45%] border-[1.5px] border-current align-middle mx-px"></span>RA</span>
                 </div>
             </div>
             <div class="flex items-center space-x-2 md:space-x-4">
@@ -586,7 +586,7 @@ fn header() -> String {
                 </button>
                 <!-- Mobile logo -->
                 <div class="md:hidden flex items-center">
-                    <span class="font-bold text-slate-800 tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                    <span class="font-bold text-slate-800 tracking-tight">N<span class="inline-block w-3 h-4 rounded-[45%] border-[1.5px] border-current align-middle mx-px"></span>RA</span>
                 </div>
             </div>
             <div class="flex items-center space-x-2 md:space-x-4">
