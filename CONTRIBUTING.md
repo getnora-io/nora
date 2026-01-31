@@ -14,6 +14,9 @@ Thank you for your interest in contributing to NORA!
 # Install Rust (if needed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
+# Enable pre-commit hooks (important!)
+git config core.hooksPath .githooks
+
 # Build
 cargo build
 
