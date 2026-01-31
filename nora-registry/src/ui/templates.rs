@@ -341,7 +341,7 @@ pub fn render_registry_list_paginated(
     };
 
     // Pagination
-    let total_pages = (total + limit - 1) / limit;
+    let total_pages = total.div_ceil(limit);
     let start_item = if total == 0 {
         0
     } else {
