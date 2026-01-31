@@ -13,3 +13,7 @@ ROADMAP*.md
 docs-site/
 docs/
 *.txt
+
+# Claude AI local files
+.claude/
+examples/
