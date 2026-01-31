@@ -4,6 +4,53 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.2.18] - 2026-01-31
+
+### Changed
+- Logo styling refinements
+
+---
+
+## [0.2.17] - 2026-01-31
+
+### Added
+- Copyright headers to all source files (Volkov Pavel | DevITWay)
+- SPDX-License-Identifier: MIT in all .rs files
+
+---
+
+## [0.2.16] - 2026-01-31
+
+### Changed
+- N○RA branding: stylized O logo across dashboard
+- Fixed O letter alignment in logo
+
+---
+
+## [0.2.15] - 2026-01-31
+
+### Fixed
+- Code formatting (cargo fmt)
+
+---
+
+## [0.2.14] - 2026-01-31
+
+### Fixed
+- Docker dashboard now shows actual image size from manifest layers (config + layers sum)
+- Previously showed only manifest file size (~500 B instead of actual image size)
+
+---
+
+## [0.2.13] - 2026-01-31
+
+### Fixed
+- npm dashboard now shows correct version count and package sizes
+- Parses metadata.json for versions, dist.unpackedSize, and time.modified
+- Previously showed 0 versions / 0 B for all packages
+
+---
+
 ## [0.2.12] - 2026-01-30
 
 ### Added
