@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use super::components::{format_size, format_timestamp, html_escape};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;

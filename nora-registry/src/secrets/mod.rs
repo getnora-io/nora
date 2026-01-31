@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 #![allow(dead_code)] // Foundational code for future S3/Vault integration
 
 //! Secrets management for NORA

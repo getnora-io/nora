@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Volkov Pavel | DevITWay
+// SPDX-License-Identifier: MIT
+
 //! Migration between storage backends
 //!
 //! Supports migrating artifacts from one storage backend to another
