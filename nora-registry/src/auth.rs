@@ -63,11 +63,17 @@ impl HtpasswdAuth {
 fn is_public_path(path: &str) -> bool {
     matches!(
         path,
-        "/" | "/health" | "/ready" | "/metrics" | "/v2/" | "/v2"
+        "/" | "/health"
+            | "/ready"
+            | "/metrics"
+            | "/v2/"
+            | "/v2"
+            | "/api/tokens"
+            | "/api/tokens/list"
+            | "/api/tokens/revoke"
     ) || path.starts_with("/ui")
         || path.starts_with("/api-docs")
         || path.starts_with("/api/ui")
-        || path.starts_with("/api/tokens")
 }
 
 /// Auth middleware - supports Basic auth and Bearer tokens
@@ -404,8 +410,12 @@ mod tests {
         assert!(is_public_path("/api/ui/stats"));
         assert!(is_public_path("/api/tokens"));
         assert!(is_public_path("/api/tokens/list"));
+        assert!(is_public_path("/api/tokens/revoke"));
 
         // Protected paths
+        assert!(!is_public_path("/api/tokens/unknown"));
+        assert!(!is_public_path("/api/tokens/admin"));
+        assert!(!is_public_path("/api/tokens/extra/path"));
         assert!(!is_public_path("/v2/myimage/blobs/sha256:abc"));
         assert!(!is_public_path("/v2/library/nginx/manifests/latest"));
         assert!(!is_public_path(
