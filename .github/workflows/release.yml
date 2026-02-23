@@ -110,6 +110,9 @@ jobs:
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
           exit-code: 0  # warn only; change to 1 to block on vulnerabilities
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
