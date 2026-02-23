@@ -110,7 +110,11 @@ async fn upload(
     }
 }
 
-async fn fetch_from_proxy(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
+async fn fetch_from_proxy(
+    client: &reqwest::Client,
+    url: &str,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, ()> {
     let response = client
         .get(url)
         .timeout(Duration::from_secs(timeout_secs))
