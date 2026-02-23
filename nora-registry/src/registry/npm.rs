@@ -19,7 +19,6 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
-    // Determine if this is a tarball request or metadata request
     let is_tarball = path.contains("/-/");
 
     let key = if is_tarball {
@@ -33,14 +32,12 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
         format!("npm/{}/metadata.json", path)
     };
 
-    // Extract package name for logging
     let package_name = if is_tarball {
         path.split("/-/").next().unwrap_or(&path).to_string()
     } else {
         path.clone()
     };
 
-    // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
         if is_tarball {
             state.metrics.record_download("npm");
@@ -55,17 +52,10 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
         return with_content_type(is_tarball, data).into_response();
     }
 
-    // Try proxy if configured
     if let Some(proxy_url) = &state.config.npm.proxy {
-        let url = if is_tarball {
-            // Tarball URL: https://registry.npmjs.org/package/-/package-version.tgz
-            format!("{}/{}", proxy_url.trim_end_matches('/'), path)
-        } else {
-            // Metadata URL: https://registry.npmjs.org/package
-            format!("{}/{}", proxy_url.trim_end_matches('/'), path)
-        };
+        let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        if let Ok(data) = fetch_from_proxy(&url, state.config.npm.proxy_timeout).await {
+        if let Ok(data) = fetch_from_proxy(&state.http_client, &url, state.config.npm.proxy_timeout).await {
             if is_tarball {
                 state.metrics.record_download("npm");
                 state.metrics.record_cache_miss();
@@ -77,7 +67,6 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
                 ));
             }
 
-            // Cache in local storage (fire and forget)
             let storage = state.storage.clone();
             let key_clone = key.clone();
             let data_clone = data.clone();
@@ -85,7 +74,6 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
                 let _ = storage.put(&key_clone, &data_clone).await;
             });
 
-            // Invalidate index when caching new tarball
             if is_tarball {
                 state.repo_index.invalidate("npm");
             }
@@ -97,13 +85,13 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn fetch_from_proxy(url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
-    let client = reqwest::Client::builder()
+async fn fetch_from_proxy(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
+    let response = client
+        .get(url)
         .timeout(Duration::from_secs(timeout_secs))
-        .build()
+        .send()
+        .await
         .map_err(|_| ())?;
-
-    let response = client.get(url).send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());

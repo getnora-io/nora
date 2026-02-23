@@ -167,6 +167,7 @@ async fn download_blob(
     // Try upstream proxies
     for upstream in &state.config.docker.upstreams {
         if let Ok(data) = fetch_blob_from_upstream(
+            &state.http_client,
             &upstream.url,
             &name,
             &digest,
@@ -367,6 +368,7 @@ async fn get_manifest(
     for upstream in &state.config.docker.upstreams {
         tracing::debug!(upstream_url = %upstream.url, "Trying upstream");
         if let Ok((data, content_type)) = fetch_manifest_from_upstream(
+            &state.http_client,
             &upstream.url,
             &name,
             &reference,
@@ -581,6 +583,7 @@ async fn list_tags_ns(
 
 /// Fetch a blob from an upstream Docker registry
 async fn fetch_blob_from_upstream(
+    client: &reqwest::Client,
     upstream_url: &str,
     name: &str,
     digest: &str,
@@ -594,13 +597,13 @@ async fn fetch_blob_from_upstream(
         digest
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout))
-        .build()
-        .map_err(|_| ())?;
-
     // First try without auth
-    let response = client.get(&url).send().await.map_err(|_| ())?;
+    let response = client
+        .get(&url)
+        .timeout(Duration::from_secs(timeout))
+        .send()
+        .await
+        .map_err(|_| ())?;
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Get Www-Authenticate header and fetch token
@@ -637,6 +640,7 @@ async fn fetch_blob_from_upstream(
 /// Fetch a manifest from an upstream Docker registry
 /// Returns (manifest_bytes, content_type)
 async fn fetch_manifest_from_upstream(
+    client: &reqwest::Client,
     upstream_url: &str,
     name: &str,
     reference: &str,
@@ -652,13 +656,6 @@ async fn fetch_manifest_from_upstream(
 
     tracing::debug!(url = %url, "Fetching manifest from upstream");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout))
-        .build()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to build HTTP client");
-        })?;
-
     // Request with Accept header for manifest types
     let accept_header = "application/vnd.docker.distribution.manifest.v2+json, \
                          application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -668,6 +665,7 @@ async fn fetch_manifest_from_upstream(
     // First try without auth
     let response = client
         .get(&url)
+        .timeout(Duration::from_secs(timeout))
         .header("Accept", accept_header)
         .send()
         .await
