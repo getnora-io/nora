@@ -23,7 +23,6 @@ pub fn routes() -> Router<Arc<AppState>> {
 async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
     let key = format!("maven/{}", path);
 
-    // Extract artifact name for logging (last 2-3 path components)
     let artifact_name = path
         .split('/')
         .rev()
@@ -34,7 +33,6 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
         .collect::<Vec<_>>()
         .join("/");
 
-    // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
         state.metrics.record_download("maven");
         state.metrics.record_cache_hit();
@@ -47,11 +45,10 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
         return with_content_type(&path, data).into_response();
     }
 
-    // Try proxy servers
     for proxy_url in &state.config.maven.proxies {
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        match fetch_from_proxy(&url, state.config.maven.proxy_timeout).await {
+        match fetch_from_proxy(&state.http_client, &url, state.config.maven.proxy_timeout).await {
             Ok(data) => {
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_miss();
@@ -62,7 +59,6 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
                     "PROXY",
                 ));
 
-                // Cache in local storage (fire and forget)
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
@@ -88,7 +84,6 @@ async fn upload(
 ) -> StatusCode {
     let key = format!("maven/{}", path);
 
-    // Extract artifact name for logging
     let artifact_name = path
         .split('/')
         .rev()
@@ -115,13 +110,13 @@ async fn upload(
     }
 }
 
-async fn fetch_from_proxy(url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
-    let client = reqwest::Client::builder()
+async fn fetch_from_proxy(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
+    let response = client
+        .get(url)
         .timeout(Duration::from_secs(timeout_secs))
-        .build()
+        .send()
+        .await
         .map_err(|_| ())?;
-
-    let response = client.get(url).send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());

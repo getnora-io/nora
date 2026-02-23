@@ -85,6 +85,7 @@ pub struct AppState {
     pub activity: ActivityLog,
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
+    pub http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -271,6 +272,8 @@ async fn run_server(config: Config, storage: Storage) {
     // Initialize Docker auth with proxy timeout
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
+    let http_client = reqwest::Client::new();
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -281,6 +284,7 @@ async fn run_server(config: Config, storage: Storage) {
         activity: ActivityLog::new(50),
         docker_auth,
         repo_index: RepoIndex::new(),
+        http_client,
     });
 
     // Token routes with strict rate limiting (brute-force protection)
