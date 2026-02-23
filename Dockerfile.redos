@@ -39,12 +39,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package nora-registry && \
     cp /app/target/release/nora /usr/local/bin/nora
 
-# Runtime stage — RED OS (certified FSTEC OS)
-FROM redos/redos:8
+# Runtime stage — scratch (compatible with RED OS, no foreign OS components)
+# Switch FROM to registry.red-soft.ru/redos once registry access is configured
+FROM scratch
 
-RUN dnf install -y ca-certificates && \
-    dnf clean all && \
-    mkdir -p /data
+# CA certificates for TLS
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=builder /usr/local/bin/nora /usr/local/bin/nora
 
