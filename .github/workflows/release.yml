@@ -25,14 +25,10 @@ jobs:
       - name: Build release binary (musl static)
         run: |
           cargo build --release --target x86_64-unknown-linux-musl --package nora-registry
-          cp target/x86_64-unknown-linux-musl/release/nora ./nora
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: nora-binary
-          path: nora
-          retention-days: 1
+          # Save to shared runner path — all build-docker jobs run on the same self-hosted runner
+          mkdir -p /tmp/nora-artifacts
+          cp target/x86_64-unknown-linux-musl/release/nora /tmp/nora-artifacts/nora-${{ github.run_id }}
+          chmod +x /tmp/nora-artifacts/nora-${{ github.run_id }}
 
   build-docker:
     name: Build & Push (${{ matrix.name }})
@@ -59,13 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download binary
-        uses: actions/download-artifact@v4
-        with:
-          name: nora-binary
-
-      - name: Make binary executable
-        run: chmod +x nora
+      - name: Copy binary from shared runner storage
+        run: cp /tmp/nora-artifacts/nora-${{ github.run_id }} ./nora
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
