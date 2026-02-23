@@ -55,7 +55,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
     if let Some(proxy_url) = &state.config.npm.proxy {
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        if let Ok(data) = fetch_from_proxy(&state.http_client, &url, state.config.npm.proxy_timeout).await {
+        if let Ok(data) =
+            fetch_from_proxy(&state.http_client, &url, state.config.npm.proxy_timeout).await
+        {
             if is_tarball {
                 state.metrics.record_download("npm");
                 state.metrics.record_cache_miss();
@@ -85,7 +87,11 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn fetch_from_proxy(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
+async fn fetch_from_proxy(
+    client: &reqwest::Client,
+    url: &str,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, ()> {
     let response = client
         .get(url)
         .timeout(Duration::from_secs(timeout_secs))

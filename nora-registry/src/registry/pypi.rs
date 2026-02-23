@@ -85,7 +85,9 @@ async fn package_versions(
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = fetch_package_page(&state.http_client, &url, state.config.pypi.proxy_timeout).await {
+        if let Ok(html) =
+            fetch_package_page(&state.http_client, &url, state.config.pypi.proxy_timeout).await
+        {
             // Rewrite URLs in the HTML to point to our registry
             let rewritten = rewrite_pypi_links(&html, &normalized);
             return (StatusCode::OK, Html(rewritten)).into_response();
@@ -130,10 +132,22 @@ async fn download_file(
         // First, fetch the package page to find the actual download URL
         let page_url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = fetch_package_page(&state.http_client, &page_url, state.config.pypi.proxy_timeout).await {
+        if let Ok(html) = fetch_package_page(
+            &state.http_client,
+            &page_url,
+            state.config.pypi.proxy_timeout,
+        )
+        .await
+        {
             // Find the URL for this specific file
             if let Some(file_url) = find_file_url(&html, &filename) {
-                if let Ok(data) = fetch_file(&state.http_client, &file_url, state.config.pypi.proxy_timeout).await {
+                if let Ok(data) = fetch_file(
+                    &state.http_client,
+                    &file_url,
+                    state.config.pypi.proxy_timeout,
+                )
+                .await
+                {
                     state.metrics.record_download("pypi");
                     state.metrics.record_cache_miss();
                     state.activity.push(ActivityEntry::new(
@@ -177,7 +191,11 @@ fn normalize_name(name: &str) -> String {
 }
 
 /// Fetch package page from upstream
-async fn fetch_package_page(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<String, ()> {
+async fn fetch_package_page(
+    client: &reqwest::Client,
+    url: &str,
+    timeout_secs: u64,
+) -> Result<String, ()> {
     let response = client
         .get(url)
         .timeout(Duration::from_secs(timeout_secs))
