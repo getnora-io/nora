@@ -130,12 +130,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set version tag (strip leading v)
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       # ── CVE scan of the pushed image ────────────────────────────────────────
+      # Images are FROM scratch — no OS packages, only binary CVE scan
       - name: Trivy — image scan (${{ matrix.name }})
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: image
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}${{ matrix.suffix }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
