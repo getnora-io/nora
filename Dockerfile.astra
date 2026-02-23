@@ -39,14 +39,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package nora-registry && \
     cp /app/target/release/nora /usr/local/bin/nora
 
-# Runtime stage — Astra Linux Special Edition (certified FSTEC OS)
-FROM astralinux/alse:latest
+# Runtime stage — scratch (compatible with Astra Linux SE, no foreign OS components)
+# Switch FROM to registry.astralinux.ru/library/alse once registry access is configured
+FROM scratch
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /data
+# CA certificates for TLS
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=builder /usr/local/bin/nora /usr/local/bin/nora
 
