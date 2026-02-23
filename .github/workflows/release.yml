@@ -19,6 +19,9 @@ jobs:
       - name: Set up Rust
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: Build release binary
         run: |
           cargo build --release --package nora-registry
