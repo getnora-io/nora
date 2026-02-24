@@ -1,4 +1,4 @@
-<img src="logo.svg" alt="NORA" height="72" />
+<img src="logo.jpg" alt="NORA" height="120" />
 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
