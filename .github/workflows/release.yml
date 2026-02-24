@@ -163,7 +163,7 @@ jobs:
         run: |
           docker create --name nora-extract \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
-          docker cp nora-extract:/nora ./nora-linux-amd64
+          docker cp nora-extract:/usr/local/bin/nora ./nora-linux-amd64
           docker rm nora-extract
           chmod +x ./nora-linux-amd64
           sha256sum ./nora-linux-amd64 > nora-linux-amd64.sha256
