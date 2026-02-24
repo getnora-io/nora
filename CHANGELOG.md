@@ -10,6 +10,10 @@ All notable changes to NORA will be documented in this file.
 - `install.sh` installer script live at <https://getnora.io/install.sh> — `curl -fsSL https://getnora.io/install.sh | sh`
 - Скрипт установки `install.sh` доступен на <https://getnora.io/install.sh>
 
+### CI/CD
+- Restore Astra Linux SE Docker image build, Trivy scan, and release artifact (`-astra` tag)
+- Восстановлена сборка Docker-образа для Astra Linux SE, сканирование Trivy и артефакт релиза (тег `-astra`)
+
 ---
 
 ## [0.2.23] - 2026-02-24
