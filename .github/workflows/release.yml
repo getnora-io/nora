@@ -127,7 +127,7 @@ jobs:
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
-          exit-code: 0  # warn only; change to 1 to block on vulnerabilities
+          exit-code: 1  # block release on HIGH/CRITICAL vulnerabilities
 
       - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
@@ -139,7 +139,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, scan]
     permissions:
       contents: write
       packages: read  # to pull image for SBOM generation
