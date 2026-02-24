@@ -4,7 +4,9 @@
 [advisories]
 # Vulnerability database (RustSec)
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    "RUSTSEC-2025-0119",  # number_prefix unmaintained, transitive via indicatif; no fix available
+]
 
 [licenses]
 # Allowed open-source licenses
