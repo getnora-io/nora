@@ -72,7 +72,7 @@ jobs:
       # ── CVE scan of source tree and Cargo.lock ──────────────────────────────
       - name: Trivy — filesystem scan (Cargo.lock + source)
         if: always()
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.30.0
         with:
           scan-type: fs
           scan-ref: .
