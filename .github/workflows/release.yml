@@ -17,7 +17,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Rust
         run: |
@@ -145,7 +145,7 @@ jobs:
       packages: read  # to pull image for SBOM generation
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
