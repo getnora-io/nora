@@ -20,4 +20,4 @@ serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 tar = "0.4"
-flate2 = "1.0"
+flate2 = "1.1"
