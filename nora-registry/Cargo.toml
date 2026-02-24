@@ -37,7 +37,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
-flate2 = "1.0"
+flate2 = "1.1"
 indicatif = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
