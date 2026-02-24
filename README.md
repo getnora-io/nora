@@ -1,4 +1,5 @@
-# 🐿️ N○RA
+<img src="logo.svg" alt="NORA" height="72" />
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
