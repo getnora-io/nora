@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 72" width="300" height="72">
+  <text font-family="'SF Mono', 'Fira Code', 'Cascadia Code', monospace" font-weight="800" fill="#0f172a" letter-spacing="1">
+    <tspan x="8" y="58" font-size="52">N</tspan><tspan font-size="68" dy="-10" fill="#2563EB">O</tspan><tspan font-size="52" dy="10">RA</tspan>
+  </text>
+</svg>
