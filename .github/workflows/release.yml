@@ -63,30 +63,6 @@ jobs:
           cache-from: type=gha,scope=alpine
           cache-to: type=gha,mode=max,scope=alpine
 
-      # ── Astra Linux SE ───────────────────────────────────────────────────────
-      - name: Extract metadata (astra)
-        id: meta-astra
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: suffix=-astra,onlatest=true
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=astra
-
-      - name: Build and push (astra)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.astra
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta-astra.outputs.tags }}
-          labels: ${{ steps.meta-astra.outputs.labels }}
-          cache-from: type=gha,scope=astra
-          cache-to: type=gha,mode=max,scope=astra
-
       # ── RED OS ───────────────────────────────────────────────────────────────
       - name: Extract metadata (redos)
         id: meta-redos
@@ -126,8 +102,6 @@ jobs:
         include:
           - name: alpine
             suffix: ""
-          - name: astra
-            suffix: "-astra"
           - name: redos
             suffix: "-redos"
 
@@ -216,11 +190,6 @@ jobs:
             **Alpine (standard):**
             ```bash
             docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ```
-
-            **Astra Linux SE:**
-            ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-astra
             ```
 
             **RED OS:**
