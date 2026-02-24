@@ -87,6 +87,30 @@ jobs:
           cache-from: type=gha,scope=redos
           cache-to: type=gha,mode=max,scope=redos
 
+      # ── Astra Linux SE ───────────────────────────────────────────────────────
+      - name: Extract metadata (astra)
+        id: meta-astra
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=-astra,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=astra
+
+      - name: Build and push (astra)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.astra
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-astra.outputs.tags }}
+          labels: ${{ steps.meta-astra.outputs.labels }}
+          cache-from: type=gha,scope=astra
+          cache-to: type=gha,mode=max,scope=astra
+
   scan:
     name: Scan (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -104,6 +128,8 @@ jobs:
             suffix: ""
           - name: redos
             suffix: "-redos"
+          - name: astra
+            suffix: "-astra"
 
     steps:
       - name: Log in to Container Registry
@@ -223,6 +249,11 @@ jobs:
             **RED OS:**
             ```bash
             docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-redos
+            ```
+
+            **Astra Linux SE:**
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-astra
             ```
 
             ## Changelog
