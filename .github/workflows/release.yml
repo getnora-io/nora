@@ -9,9 +9,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-binary:
-    name: Build Binary
+  build:
+    name: Build & Push
     runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -25,38 +28,7 @@ jobs:
       - name: Build release binary (musl static)
         run: |
           cargo build --release --target x86_64-unknown-linux-musl --package nora-registry
-          # Save to shared runner path — all build-docker jobs run on the same self-hosted runner
-          mkdir -p /tmp/nora-artifacts
-          cp target/x86_64-unknown-linux-musl/release/nora /tmp/nora-artifacts/nora-${{ github.run_id }}
-          chmod +x /tmp/nora-artifacts/nora-${{ github.run_id }}
-
-  build-docker:
-    name: Build & Push (${{ matrix.name }})
-    runs-on: self-hosted
-    needs: build-binary
-    permissions:
-      contents: read
-      packages: write
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: alpine
-            dockerfile: Dockerfile
-            suffix: ""
-          - name: astra
-            dockerfile: Dockerfile.astra
-            suffix: "-astra"
-          - name: redos
-            dockerfile: Dockerfile.redos
-            suffix: "-redos"
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Copy binary from shared runner storage
-        run: cp /tmp/nora-artifacts/nora-${{ github.run_id }} ./nora
+          cp target/x86_64-unknown-linux-musl/release/nora ./nora
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -68,35 +40,81 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      # ── Alpine (standard) ────────────────────────────────────────────────────
+      - name: Extract metadata (alpine)
+        id: meta-alpine
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=${{ matrix.suffix }},onlatest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ matrix.suffix == '' }}
-            type=raw,value=${{ matrix.name }},enable=${{ matrix.suffix != '' }}
+            type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and push (alpine)
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          tags: ${{ steps.meta-alpine.outputs.tags }}
+          labels: ${{ steps.meta-alpine.outputs.labels }}
+          cache-from: type=gha,scope=alpine
+          cache-to: type=gha,mode=max,scope=alpine
+
+      # ── Astra Linux SE ───────────────────────────────────────────────────────
+      - name: Extract metadata (astra)
+        id: meta-astra
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=-astra,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=astra
+
+      - name: Build and push (astra)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.astra
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-astra.outputs.tags }}
+          labels: ${{ steps.meta-astra.outputs.labels }}
+          cache-from: type=gha,scope=astra
+          cache-to: type=gha,mode=max,scope=astra
+
+      # ── RED OS ───────────────────────────────────────────────────────────────
+      - name: Extract metadata (redos)
+        id: meta-redos
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=-redos,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=redos
+
+      - name: Build and push (redos)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.redos
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-redos.outputs.tags }}
+          labels: ${{ steps.meta-redos.outputs.labels }}
+          cache-from: type=gha,scope=redos
+          cache-to: type=gha,mode=max,scope=redos
 
   scan:
     name: Scan (${{ matrix.name }})
     runs-on: ubuntu-latest
-    needs: build-docker
+    needs: build
     permissions:
       contents: read
       packages: read
@@ -147,7 +165,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-docker, scan]
+    needs: [build, scan]
     permissions:
       contents: write
       packages: read  # to pull image for SBOM generation
