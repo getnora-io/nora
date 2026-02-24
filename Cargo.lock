@@ -495,9 +495,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flate2"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -1201,7 +1201,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "nora-cli"
-version = "0.2.20"
+version = "0.2.22"
 dependencies = [
  "clap",
  "flate2",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "0.2.20"
+version = "0.2.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "nora-storage"
-version = "0.2.20"
+version = "0.2.22"
 dependencies = [
  "axum",
  "base64",
@@ -3038,9 +3038,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.5"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40990edd51aae2c2b6907af74ffb635029d5788228222c4bb811e9351c0caad3"
+checksum = "c745c48e1007337ed136dc99df34128b9faa6ed542d80a1c673cf55a6d7236c8"
 
 [[package]]
 name = "zmij"
