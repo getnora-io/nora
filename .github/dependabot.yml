@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # GitHub Actions — обновляет версии actions в workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
+
+  # Cargo — только security-апдейты, без шума от minor/patch
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, rust]
