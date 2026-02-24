@@ -20,6 +20,7 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
     "Zlib",
+    "CDLA-Permissive-2.0",   # webpki-roots (CA certificates bundle)
     "MPL-2.0",
 ]
 
