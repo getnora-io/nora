@@ -120,7 +120,7 @@ jobs:
       # ── CVE scan of the pushed image ────────────────────────────────────────
       # Images are FROM scratch — no OS packages, only binary CVE scan
       - name: Trivy — image scan (${{ matrix.name }})
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@0.34.1
         with:
           scan-type: image
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
