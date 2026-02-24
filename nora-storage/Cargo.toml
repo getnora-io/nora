@@ -25,4 +25,4 @@ sha2 = "0.10"
 base64 = "0.22"
 httpdate = "1"
 chrono = { version = "0.4", features = ["serde"] }
-quick-xml = { version = "0.31", features = ["serialize"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
