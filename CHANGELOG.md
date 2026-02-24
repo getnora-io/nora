@@ -4,7 +4,7 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
-## [Unreleased]
+## [0.2.24] - 2026-02-24
 
 ### Added / Добавлено
 - `install.sh` installer script live at <https://getnora.io/install.sh> — `curl -fsSL https://getnora.io/install.sh | sh`
