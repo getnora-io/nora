@@ -6,6 +6,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  NORA: localhost:5000
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -30,22 +31,33 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl --package nora-registry
           cp target/x86_64-unknown-linux-musl/release/nora ./nora
 
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: ./nora
+          retention-days: 1
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
 
-      - name: Log in to Container Registry
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Alpine (standard) ────────────────────────────────────────────────────
+      # ── Alpine ───────────────────────────────────────────────────────────────
       - name: Extract metadata (alpine)
         id: meta-alpine
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -60,15 +72,17 @@ jobs:
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
           labels: ${{ steps.meta-alpine.outputs.labels }}
-          cache-from: type=gha,scope=alpine
-          cache-to: type=gha,mode=max,scope=alpine
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,mode=max
 
       # ── RED OS ───────────────────────────────────────────────────────────────
       - name: Extract metadata (redos)
         id: meta-redos
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-redos,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -84,15 +98,17 @@ jobs:
           push: true
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
-          cache-from: type=gha,scope=redos
-          cache-to: type=gha,mode=max,scope=redos
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,mode=max
 
       # ── Astra Linux SE ───────────────────────────────────────────────────────
       - name: Extract metadata (astra)
         id: meta-astra
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-astra,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -108,12 +124,12 @@ jobs:
           push: true
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
-          cache-from: type=gha,scope=astra
-          cache-to: type=gha,mode=max,scope=astra
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max
 
   scan:
     name: Scan (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nora]
     needs: build
     permissions:
       contents: read
@@ -132,28 +148,19 @@ jobs:
             suffix: "-astra"
 
     steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Set version tag (strip leading v)
         id: ver
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      # ── CVE scan of the pushed image ────────────────────────────────────────
-      # Images are FROM scratch — no OS packages, only binary CVE scan
       - name: Trivy — image scan (${{ matrix.name }})
         uses: aquasecurity/trivy-action@0.30.0
         with:
           scan-type: image
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
+          image-ref: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
-          exit-code: 1  # block release on HIGH/CRITICAL vulnerabilities
+          exit-code: 1
 
       - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
@@ -164,56 +171,46 @@ jobs:
 
   release:
     name: GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nora]
     needs: [build, scan]
     permissions:
       contents: write
-      packages: read  # to pull image for SBOM generation
+      packages: read
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set version tag (strip leading v)
         id: ver
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      # ── Binary — extract from Docker image ──────────────────────────────────
-      - name: Extract binary from image
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: ./artifacts
+
+      - name: Prepare binary
         run: |
-          docker create --name nora-extract \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
-          docker cp nora-extract:/usr/local/bin/nora ./nora-linux-amd64
-          docker rm nora-extract
+          cp ./artifacts/nora ./nora-linux-amd64
           chmod +x ./nora-linux-amd64
           sha256sum ./nora-linux-amd64 > nora-linux-amd64.sha256
           echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
           cat nora-linux-amd64.sha256
 
-      # ── SBOM — Software Bill of Materials ───────────────────────────────────
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
+          image: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
           format: spdx-json
           output-file: nora-${{ github.ref_name }}.sbom.spdx.json
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate SBOM (CycloneDX)
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
+          image: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
           format: cyclonedx-json
           output-file: nora-${{ github.ref_name }}.sbom.cdx.json
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
