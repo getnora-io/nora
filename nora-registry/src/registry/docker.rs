@@ -312,7 +312,10 @@ async fn upload_blob(
                 StatusCode::CREATED,
                 [
                     (header::LOCATION, location),
-                    (HeaderName::from_static("docker-content-digest"), digest.to_string()),
+                    (
+                        HeaderName::from_static("docker-content-digest"),
+                        digest.to_string(),
+                    ),
                 ],
             )
                 .into_response()
@@ -489,7 +492,13 @@ async fn put_manifest(
         "docker",
         "LOCAL",
     ));
-    state.audit.log(AuditEntry::new("push", "api", &format!("{}:{}", name, reference), "docker", "manifest"));
+    state.audit.log(AuditEntry::new(
+        "push",
+        "api",
+        &format!("{}:{}", name, reference),
+        "docker",
+        "manifest",
+    ));
     state.repo_index.invalidate("docker");
 
     let location = format!("/v2/{}/manifests/{}", name, reference);

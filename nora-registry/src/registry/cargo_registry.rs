@@ -51,7 +51,9 @@ async fn download(
                 "cargo",
                 "LOCAL",
             ));
-            state.audit.log(AuditEntry::new("pull", "api", "", "cargo", ""));
+            state
+                .audit
+                .log(AuditEntry::new("pull", "api", "", "cargo", ""));
             (StatusCode::OK, data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),

@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::tokens::Role;
+use crate::AppState;
 
 /// Htpasswd-based authentication
 #[derive(Clone)]
@@ -247,12 +247,18 @@ async fn create_token(
     };
 
     let role = match req.role.as_str() {
-            "read" => Role::Read,
-            "write" => Role::Write,
-            "admin" => Role::Admin,
-            _ => return (StatusCode::BAD_REQUEST, "Invalid role. Use: read, write, admin").into_response(),
-        };
-        match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
+        "read" => Role::Read,
+        "write" => Role::Write,
+        "admin" => Role::Admin,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid role. Use: read, write, admin",
+            )
+                .into_response()
+        }
+    };
+    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
         Ok(token) => Json(CreateTokenResponse {
             token,
             expires_in_days: req.ttl_days,
