@@ -38,7 +38,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
 flate2 = "1.1"
-indicatif = "0.17"
+indicatif = "0.18"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tower_governor = "0.8"
