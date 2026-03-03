@@ -748,8 +748,16 @@ fn detect_manifest_media_type(data: &[u8]) -> String {
             if schema_version == 1 {
                 return "application/vnd.docker.distribution.manifest.v1+json".to_string();
             }
-            // schemaVersion 2 without mediaType is likely docker manifest v2
-            if json.get("config").is_some() {
+            // schemaVersion 2 without mediaType - check config.mediaType to distinguish OCI vs Docker
+            if let Some(config) = json.get("config") {
+                if let Some(config_mt) = config.get("mediaType").and_then(|v| v.as_str()) {
+                    if config_mt.starts_with("application/vnd.docker.") {
+                        return "application/vnd.docker.distribution.manifest.v2+json".to_string();
+                    }
+                    // OCI or Helm or any non-docker config mediaType
+                    return "application/vnd.oci.image.manifest.v1+json".to_string();
+                }
+                // No config.mediaType - assume docker v2
                 return "application/vnd.docker.distribution.manifest.v2+json".to_string();
             }
             // If it has "manifests" array, it's an index/list
