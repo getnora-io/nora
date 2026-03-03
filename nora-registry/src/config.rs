@@ -249,6 +249,8 @@ impl Default for AuthConfig {
 /// - `NORA_RATE_LIMIT_GENERAL_BURST` - General burst size
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_auth_rps")]
     pub auth_rps: u64,
     #[serde(default = "default_auth_burst")]
@@ -263,6 +265,9 @@ pub struct RateLimitConfig {
     pub general_burst: u32,
 }
 
+fn default_rate_limit_enabled() -> bool {
+    true
+}
 fn default_auth_rps() -> u64 {
     1
 }
@@ -285,6 +290,7 @@ fn default_general_burst() -> u32 {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
+            enabled: default_rate_limit_enabled(),
             auth_rps: default_auth_rps(),
             auth_burst: default_auth_burst(),
             upload_rps: default_upload_rps(),
@@ -426,6 +432,9 @@ impl Config {
         }
 
         // Rate limit config
+        if let Ok(val) = env::var("NORA_RATE_LIMIT_ENABLED") {
+            self.rate_limit.enabled = val.to_lowercase() == "true" || val == "1";
+        }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_AUTH_RPS") {
             if let Ok(v) = val.parse::<u64>() {
                 self.rate_limit.auth_rps = v;
