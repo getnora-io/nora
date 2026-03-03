@@ -4,6 +4,22 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.2.27] - 2026-03-03
+
+### Added / Добавлено
+- **Configurable body limit**: `NORA_BODY_LIMIT_MB` env var (default: `2048` = 2GB) — replaces hardcoded 100MB limit that caused `413 Payload Too Large` on large Docker image push
+- **Настраиваемый лимит тела запроса**: переменная `NORA_BODY_LIMIT_MB` (по умолчанию: `2048` = 2GB) — заменяет захардкоженный лимит 100MB, вызывавший `413 Payload Too Large` при push больших Docker-образов
+- **Docker Delete API**: `DELETE /v2/{name}/manifests/{reference}` and `DELETE /v2/{name}/blobs/{digest}` per Docker Registry V2 spec (returns 202 Accepted)
+- **Docker Delete API**: `DELETE /v2/{name}/manifests/{reference}` и `DELETE /v2/{name}/blobs/{digest}` по спецификации Docker Registry V2 (возвращает 202 Accepted)
+- Namespace-qualified DELETE variants (`/v2/{ns}/{name}/...`)
+- Audit log integration for delete operations
+
+### Fixed / Исправлено
+- Docker push of images >100MB no longer fails with 413 error
+- Push Docker-образов >100MB больше не падает с ошибкой 413
+
+---
+
 ## [0.2.26] - 2026-03-03
 
 ### Added / Добавлено
