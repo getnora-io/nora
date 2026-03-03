@@ -10,6 +10,7 @@
 
 use crate::config::RateLimitConfig;
 use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::SmartIpKeyExtractor;
 
 /// Create rate limiter layer for auth endpoints (strict protection against brute-force)
 pub fn auth_rate_limiter(
@@ -35,11 +36,12 @@ pub fn auth_rate_limiter(
 pub fn upload_rate_limiter(
     config: &RateLimitConfig,
 ) -> tower_governor::GovernorLayer<
-    tower_governor::key_extractor::PeerIpKeyExtractor,
+    SmartIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
     let gov_config = GovernorConfigBuilder::default()
+        .key_extractor(SmartIpKeyExtractor)
         .per_second(config.upload_rps)
         .burst_size(config.upload_burst)
         .use_headers()
@@ -53,11 +55,12 @@ pub fn upload_rate_limiter(
 pub fn general_rate_limiter(
     config: &RateLimitConfig,
 ) -> tower_governor::GovernorLayer<
-    tower_governor::key_extractor::PeerIpKeyExtractor,
+    SmartIpKeyExtractor,
     governor::middleware::StateInformationMiddleware,
     axum::body::Body,
 > {
     let gov_config = GovernorConfigBuilder::default()
+        .key_extractor(SmartIpKeyExtractor)
         .per_second(config.general_rps)
         .burst_size(config.general_burst)
         .use_headers()
@@ -102,6 +105,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         let config = RateLimitConfig {
+            enabled: true,
             auth_rps: 10,
             auth_burst: 20,
             upload_rps: 500,

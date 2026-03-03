@@ -210,6 +210,7 @@ async fn run_server(config: Config, storage: Storage) {
 
     // Log rate limiting configuration
     info!(
+        enabled = config.rate_limit.enabled,
         auth_rps = config.rate_limit.auth_rps,
         auth_burst = config.rate_limit.auth_burst,
         upload_rps = config.rate_limit.upload_rps,
@@ -264,15 +265,48 @@ async fn run_server(config: Config, storage: Storage) {
         None
     };
 
-    // Create rate limiters before moving config to state
-    let auth_limiter = rate_limit::auth_rate_limiter(&config.rate_limit);
-    let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
-    let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
+    let rate_limit_enabled = config.rate_limit.enabled;
 
     // Initialize Docker auth with proxy timeout
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
     let http_client = reqwest::Client::new();
+
+    // Registry routes (shared between rate-limited and non-limited paths)
+    let registry_routes = Router::new()
+        .merge(registry::docker_routes())
+        .merge(registry::maven_routes())
+        .merge(registry::npm_routes())
+        .merge(registry::cargo_routes())
+        .merge(registry::pypi_routes())
+        .merge(registry::raw_routes());
+
+    // Routes WITHOUT rate limiting (health, metrics, UI)
+    let public_routes = Router::new()
+        .merge(health::routes())
+        .merge(metrics::routes())
+        .merge(ui::routes())
+        .merge(openapi::routes());
+
+    let app_routes = if rate_limit_enabled {
+        // Create rate limiters before moving config to state
+        let auth_limiter = rate_limit::auth_rate_limiter(&config.rate_limit);
+        let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
+        let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
+
+        let auth_routes = auth::token_routes().layer(auth_limiter);
+        let limited_registry = registry_routes.layer(upload_limiter);
+
+        Router::new()
+            .merge(auth_routes)
+            .merge(limited_registry)
+            .layer(general_limiter)
+    } else {
+        info!("Rate limiting DISABLED");
+        Router::new()
+            .merge(auth::token_routes())
+            .merge(registry_routes)
+    };
 
     let state = Arc::new(AppState {
         storage,
@@ -287,35 +321,9 @@ async fn run_server(config: Config, storage: Storage) {
         http_client,
     });
 
-    // Token routes with strict rate limiting (brute-force protection)
-    let auth_routes = auth::token_routes().layer(auth_limiter);
-
-    // Registry routes with upload rate limiting
-    let registry_routes = Router::new()
-        .merge(registry::docker_routes())
-        .merge(registry::maven_routes())
-        .merge(registry::npm_routes())
-        .merge(registry::cargo_routes())
-        .merge(registry::pypi_routes())
-        .merge(registry::raw_routes())
-        .layer(upload_limiter);
-
-    // Routes WITHOUT rate limiting (health, metrics, UI)
-    let public_routes = Router::new()
-        .merge(health::routes())
-        .merge(metrics::routes())
-        .merge(ui::routes())
-        .merge(openapi::routes());
-
-    // Routes WITH rate limiting
-    let rate_limited_routes = Router::new()
-        .merge(auth_routes)
-        .merge(registry_routes)
-        .layer(general_limiter);
-
     let app = Router::new()
         .merge(public_routes)
-        .merge(rate_limited_routes)
+        .merge(app_routes)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB default body limit
         .layer(middleware::from_fn(request_id::request_id_middleware))
         .layer(middleware::from_fn(metrics::metrics_middleware))
