@@ -29,7 +29,10 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
 
     // 2. Collect all referenced digests from manifests
     let referenced = collect_referenced_digests(storage).await;
-    info!("Found {} referenced digests from manifests", referenced.len());
+    info!(
+        "Found {} referenced digests from manifests",
+        referenced.len()
+    );
 
     // 3. Find orphans
     let mut orphan_keys: Vec<String> = Vec::new();

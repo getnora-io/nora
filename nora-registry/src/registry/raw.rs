@@ -36,7 +36,9 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
             state
                 .activity
                 .push(ActivityEntry::new(ActionType::Pull, path, "raw", "LOCAL"));
-                state.audit.log(AuditEntry::new("pull", "api", "", "raw", ""));
+            state
+                .audit
+                .log(AuditEntry::new("pull", "api", "", "raw", ""));
 
             // Guess content type from extension
             let content_type = guess_content_type(&key);
@@ -74,7 +76,9 @@ async fn upload(
             state
                 .activity
                 .push(ActivityEntry::new(ActionType::Push, path, "raw", "LOCAL"));
-                state.audit.log(AuditEntry::new("push", "api", "", "raw", ""));
+            state
+                .audit
+                .log(AuditEntry::new("push", "api", "", "raw", ""));
             StatusCode::CREATED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

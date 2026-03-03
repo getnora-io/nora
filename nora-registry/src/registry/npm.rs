@@ -49,7 +49,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
                 "npm",
                 "CACHE",
             ));
-            state.audit.log(AuditEntry::new("cache_hit", "api", "", "npm", ""));
+            state
+                .audit
+                .log(AuditEntry::new("cache_hit", "api", "", "npm", ""));
         }
         return with_content_type(is_tarball, data).into_response();
     }
@@ -69,7 +71,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
                     "npm",
                     "PROXY",
                 ));
-                state.audit.log(AuditEntry::new("proxy_fetch", "api", "", "npm", ""));
+                state
+                    .audit
+                    .log(AuditEntry::new("proxy_fetch", "api", "", "npm", ""));
             }
 
             let storage = state.storage.clone();

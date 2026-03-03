@@ -40,7 +40,6 @@ impl Role {
     }
 }
 
-
 /// API Token metadata stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
@@ -260,7 +259,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
         let (user, role) = store.verify_token(&token).unwrap();
 
         assert_eq!(user, "testuser");
@@ -291,7 +292,9 @@ mod tests {
         let store = TokenStore::new(temp_dir.path());
 
         // Create token and manually set it as expired
-        let token = store.create_token("testuser", 1, None, Role::Write).unwrap();
+        let token = store
+            .create_token("testuser", 1, None, Role::Write)
+            .unwrap();
         let token_hash = hash_token(&token);
         let file_path = temp_dir.path().join(format!("{}.json", &token_hash[..16]));
 
@@ -330,7 +333,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
         let token_hash = hash_token(&token);
         let hash_prefix = &token_hash[..16];
 
@@ -375,7 +380,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
 
         // First verification
         store.verify_token(&token).unwrap();
@@ -391,7 +398,12 @@ mod tests {
         let store = TokenStore::new(temp_dir.path());
 
         store
-            .create_token("testuser", 30, Some("CI/CD Pipeline".to_string()), Role::Admin)
+            .create_token(
+                "testuser",
+                30,
+                Some("CI/CD Pipeline".to_string()),
+                Role::Admin,
+            )
             .unwrap();
 
         let tokens = store.list_tokens("testuser");

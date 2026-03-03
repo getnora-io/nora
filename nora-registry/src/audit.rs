@@ -45,11 +45,7 @@ pub struct AuditLog {
 impl AuditLog {
     pub fn new(storage_path: &str) -> Self {
         let path = PathBuf::from(storage_path).join("audit.jsonl");
-        let writer = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        let writer = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => {
                 info!(path = %path.display(), "Audit log initialized");
                 Mutex::new(Some(f))
