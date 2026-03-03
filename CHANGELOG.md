@@ -4,6 +4,56 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.2.26] - 2026-03-03
+
+### Added / Добавлено
+- **Helm OCI support**: `helm push` / `helm pull` now works out of the box via OCI protocol
+- **Поддержка Helm OCI**: `helm push` / `helm pull` теперь работают из коробки через OCI протокол
+- **RBAC**: Token-based role system with three roles — `read`, `write`, `admin` (default: `read`)
+- **RBAC**: Ролевая система на основе токенов — `read`, `write`, `admin` (по умолчанию: `read`)
+- **Audit log**: Persistent append-only JSONL audit trail for all registry operations (`{storage}/audit.jsonl`)
+- **Аудит**: Персистентный append-only JSONL лог всех операций реестра (`{storage}/audit.jsonl`)
+- **GC command**: `nora gc --dry-run` — garbage collection for orphaned blobs (mark-and-sweep)
+- **Команда GC**: `nora gc --dry-run` — сборка мусора для осиротевших блобов (mark-and-sweep)
+
+### Fixed / Исправлено
+- **Helm OCI pull**: Fixed OCI manifest media type detection — manifests with non-Docker `config.mediaType` now correctly return `application/vnd.oci.image.manifest.v1+json`
+- **Helm OCI pull**: Исправлено определение media type OCI манифестов — манифесты с не-Docker `config.mediaType` теперь корректно возвращают `application/vnd.oci.image.manifest.v1+json`
+- **Docker-Content-Digest**: Added missing header in blob upload response (required by Helm OCI client)
+- **Docker-Content-Digest**: Добавлен отсутствующий заголовок в ответе на загрузку blob (требуется клиентом Helm OCI)
+
+### Security / Безопасность
+- Read-only tokens (`role: read`) are now blocked from PUT/POST/DELETE/PATCH operations with HTTP 403
+- Токены только для чтения (`role: read`) теперь блокируются при PUT/POST/DELETE/PATCH с HTTP 403
+
+---
+
+## [0.2.25] - 2026-03-03
+
+### Fixed / Исправлено
+- **Rate limiter fix**: Added `NORA_RATE_LIMIT_ENABLED` env var (default: `true`) to disable rate limiting on internal deployments
+- **Исправление rate limiter**: Добавлена переменная `NORA_RATE_LIMIT_ENABLED` (по умолчанию: `true`) для отключения rate limiting на внутренних инсталляциях
+- **SmartIpKeyExtractor**: Upload and general routes now use `SmartIpKeyExtractor` (reads `X-Forwarded-For`) instead of `PeerIpKeyExtractor` — fixes 429 errors behind reverse proxy / Docker bridge
+- **SmartIpKeyExtractor**: Маршруты upload и general теперь используют `SmartIpKeyExtractor` (читает `X-Forwarded-For`) вместо `PeerIpKeyExtractor` — устраняет ошибки 429 за reverse proxy / Docker bridge
+
+### Dependencies / Зависимости
+- `clap` 4.5.56 → 4.5.60
+- `uuid` 1.20.0 → 1.21.0
+- `tempfile` 3.24.0 → 3.26.0
+- `bcrypt` 0.17.1 → 0.18.0
+- `indicatif` 0.17.11 → 0.18.4
+
+### CI/CD
+- `actions/checkout` 4 → 6
+- `actions/upload-artifact` 4 → 7
+- `softprops/action-gh-release` 1 → 2
+- `aquasecurity/trivy-action` 0.30.0 → 0.34.2
+- `docker/build-push-action` 5 → 6
+- Move scan/release to self-hosted runner with NORA cache
+- Сканирование/релиз перенесены на self-hosted runner с кэшем через NORA
+
+---
+
 ## [0.2.24] - 2026-02-24
 
 ### Added / Добавлено
