@@ -64,7 +64,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push (alpine)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
@@ -90,7 +90,7 @@ jobs:
             type=raw,value=redos
 
       - name: Build and push (redos)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.redos
@@ -116,7 +116,7 @@ jobs:
             type=raw,value=astra
 
       - name: Build and push (astra)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.astra
