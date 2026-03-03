@@ -11,6 +11,7 @@ mod health;
 mod metrics;
 mod migrate;
 mod openapi;
+mod gc;
 mod rate_limit;
 mod registry;
 mod repo_index;
@@ -60,6 +61,12 @@ enum Commands {
         /// Input backup file path
         #[arg(short, long)]
         input: PathBuf,
+    },
+    /// Garbage collect orphaned blobs
+    Gc {
+        /// Dry run - show what would be deleted without deleting
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
     },
     /// Migrate artifacts between storage backends
     Migrate {
@@ -141,6 +148,17 @@ async fn main() {
             if let Err(e) = backup::restore_backup(&storage, &input).await {
                 error!("Restore failed: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Some(Commands::Gc { dry_run }) => {
+            let result = gc::run_gc(&storage, dry_run).await;
+            println!("GC Summary:");
+            println!("  Total blobs:      {}", result.total_blobs);
+            println!("  Referenced:        {}", result.referenced_blobs);
+            println!("  Orphaned:          {}", result.orphaned_blobs);
+            println!("  Deleted:           {}", result.deleted_blobs);
+            if dry_run && !result.orphan_keys.is_empty() {
+                println!("\nRun without --dry-run to delete orphaned blobs.");
             }
         }
         Some(Commands::Migrate { from, to, dry_run }) => {
