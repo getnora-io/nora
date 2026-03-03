@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::activity_log::{ActionType, ActivityEntry};
+use crate::audit::AuditEntry;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -50,6 +51,7 @@ async fn download(
                 "cargo",
                 "LOCAL",
             ));
+            state.audit.log(AuditEntry::new("pull", "api", "", "cargo", ""));
             (StatusCode::OK, data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),

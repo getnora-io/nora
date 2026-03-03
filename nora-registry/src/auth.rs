@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::tokens::Role;
 
 /// Htpasswd-based authentication
 #[derive(Clone)]
@@ -108,7 +109,18 @@ pub async fn auth_middleware(
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
-                Ok(_user) => return next.run(request).await,
+                Ok((_user, role)) => {
+                    let method = request.method().clone();
+                    if (method == axum::http::Method::PUT
+                        || method == axum::http::Method::POST
+                        || method == axum::http::Method::DELETE
+                        || method == axum::http::Method::PATCH)
+                        && !role.can_write()
+                    {
+                        return (StatusCode::FORBIDDEN, "Read-only token").into_response();
+                    }
+                    return next.run(request).await;
+                }
                 Err(_) => return unauthorized_response("Invalid or expired token"),
             }
         } else {
@@ -175,6 +187,12 @@ pub struct CreateTokenRequest {
     #[serde(default = "default_ttl")]
     pub ttl_days: u64,
     pub description: Option<String>,
+    #[serde(default = "default_role_str")]
+    pub role: String,
+}
+
+fn default_role_str() -> String {
+    "read".to_string()
 }
 
 fn default_ttl() -> u64 {
@@ -194,6 +212,7 @@ pub struct TokenListItem {
     pub expires_at: u64,
     pub last_used: Option<u64>,
     pub description: Option<String>,
+    pub role: String,
 }
 
 #[derive(Serialize)]
@@ -227,7 +246,13 @@ async fn create_token(
         }
     };
 
-    match token_store.create_token(&req.username, req.ttl_days, req.description) {
+    let role = match req.role.as_str() {
+            "read" => Role::Read,
+            "write" => Role::Write,
+            "admin" => Role::Admin,
+            _ => return (StatusCode::BAD_REQUEST, "Invalid role. Use: read, write, admin").into_response(),
+        };
+        match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
         Ok(token) => Json(CreateTokenResponse {
             token,
             expires_in_days: req.ttl_days,
@@ -271,6 +296,7 @@ async fn list_tokens(
             expires_at: t.expires_at,
             last_used: t.last_used,
             description: t.description,
+            role: t.role.to_string(),
         })
         .collect();
 

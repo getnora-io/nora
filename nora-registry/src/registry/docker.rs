@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::activity_log::{ActionType, ActivityEntry};
+use crate::audit::AuditEntry;
 use crate::registry::docker_auth::DockerAuth;
 use crate::storage::Storage;
 use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
@@ -488,6 +489,7 @@ async fn put_manifest(
         "docker",
         "LOCAL",
     ));
+    state.audit.log(AuditEntry::new("push", "api", &format!("{}:{}", name, reference), "docker", "manifest"));
     state.repo_index.invalidate("docker");
 
     let location = format!("/v2/{}/manifests/{}", name, reference);

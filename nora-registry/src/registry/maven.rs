@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::activity_log::{ActionType, ActivityEntry};
+use crate::audit::AuditEntry;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -42,6 +43,7 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
             "maven",
             "CACHE",
         ));
+        state.audit.log(AuditEntry::new("cache_hit", "api", "", "maven", ""));
         return with_content_type(&path, data).into_response();
     }
 
@@ -58,6 +60,7 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
                     "maven",
                     "PROXY",
                 ));
+                state.audit.log(AuditEntry::new("proxy_fetch", "api", "", "maven", ""));
 
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
@@ -103,6 +106,7 @@ async fn upload(
                 "maven",
                 "LOCAL",
             ));
+            state.audit.log(AuditEntry::new("push", "api", "", "maven", ""));
             state.repo_index.invalidate("maven");
             StatusCode::CREATED
         }
