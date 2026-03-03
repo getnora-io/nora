@@ -307,7 +307,14 @@ async fn upload_blob(
             ));
             state.repo_index.invalidate("docker");
             let location = format!("/v2/{}/blobs/{}", name, digest);
-            (StatusCode::CREATED, [(header::LOCATION, location)]).into_response()
+            (
+                StatusCode::CREATED,
+                [
+                    (header::LOCATION, location),
+                    (HeaderName::from_static("docker-content-digest"), digest.to_string()),
+                ],
+            )
+                .into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
