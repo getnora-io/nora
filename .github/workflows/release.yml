@@ -153,7 +153,7 @@ jobs:
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Trivy — image scan (${{ matrix.name }})
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@0.34.2
         with:
           scan-type: image
           image-ref: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
