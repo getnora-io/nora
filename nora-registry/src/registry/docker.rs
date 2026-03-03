@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderName, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, head, patch, put},
+    routing::{delete, get, head, patch, put},
     Json, Router,
 };
 use parking_lot::RwLock;
@@ -65,6 +65,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/v2/{name}/manifests/{reference}", get(get_manifest))
         .route("/v2/{name}/manifests/{reference}", put(put_manifest))
+        .route("/v2/{name}/manifests/{reference}", delete(delete_manifest))
+        .route("/v2/{name}/blobs/{digest}", delete(delete_blob))
         .route("/v2/{name}/tags/list", get(list_tags))
         // Two-segment name routes (e.g., /v2/library/alpine/...)
         .route("/v2/{ns}/{name}/blobs/{digest}", head(check_blob_ns))
@@ -85,6 +87,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/v2/{ns}/{name}/manifests/{reference}",
             put(put_manifest_ns),
         )
+        .route(
+            "/v2/{ns}/{name}/manifests/{reference}",
+            delete(delete_manifest_ns),
+        )
+        .route("/v2/{ns}/{name}/blobs/{digest}", delete(delete_blob_ns))
         .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
 }
 
@@ -531,6 +538,109 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
 }
 
 // ============================================================================
+// Delete handlers (Docker Registry V2 spec)
+// ============================================================================
+
+async fn delete_manifest(
+    State(state): State<Arc<AppState>>,
+    Path((name, reference)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_docker_reference(&reference) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    let key = format!("docker/{}/manifests/{}.json", name, reference);
+
+    // If reference is a tag, also delete digest-keyed copy
+    let is_tag = !reference.starts_with("sha256:");
+    if is_tag {
+        if let Ok(data) = state.storage.get(&key).await {
+            use sha2::Digest;
+            let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+            let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
+            let _ = state.storage.delete(&digest_key).await;
+            let digest_meta = format!("docker/{}/manifests/{}.meta.json", name, digest);
+            let _ = state.storage.delete(&digest_meta).await;
+        }
+    }
+
+    // Delete manifest
+    match state.storage.delete(&key).await {
+        Ok(()) => {
+            // Delete associated metadata
+            let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
+            let _ = state.storage.delete(&meta_key).await;
+
+            state.audit.log(AuditEntry::new(
+                "delete",
+                "api",
+                &format!("{}:{}", name, reference),
+                "docker",
+                "manifest",
+            ));
+            state.repo_index.invalidate("docker");
+            tracing::info!(name = %name, reference = %reference, "Docker manifest deleted");
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(crate::storage::StorageError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "errors": [{
+                    "code": "MANIFEST_UNKNOWN",
+                    "message": "manifest unknown",
+                    "detail": { "name": name, "reference": reference }
+                }]
+            })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn delete_blob(
+    State(state): State<Arc<AppState>>,
+    Path((name, digest)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_digest(&digest) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    let key = format!("docker/{}/blobs/{}", name, digest);
+    match state.storage.delete(&key).await {
+        Ok(()) => {
+            state.audit.log(AuditEntry::new(
+                "delete",
+                "api",
+                &format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                "docker",
+                "blob",
+            ));
+            state.repo_index.invalidate("docker");
+            tracing::info!(name = %name, digest = %digest, "Docker blob deleted");
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(crate::storage::StorageError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "errors": [{
+                    "code": "BLOB_UNKNOWN",
+                    "message": "blob unknown to registry",
+                    "detail": { "digest": digest }
+                }]
+            })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ============================================================================
 // Namespace handlers (for two-segment names like library/alpine)
 // These combine ns/name into a single name and delegate to the main handlers
 // ============================================================================
@@ -597,6 +707,22 @@ async fn list_tags_ns(
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
     list_tags(state, Path(full_name)).await
+}
+
+async fn delete_manifest_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, reference)): Path<(String, String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    delete_manifest(state, Path((full_name, reference))).await
+}
+
+async fn delete_blob_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name, digest)): Path<(String, String, String)>,
+) -> Response {
+    let full_name = format!("{}/{}", ns, name);
+    delete_blob(state, Path((full_name, digest))).await
 }
 
 /// Fetch a blob from an upstream Docker registry

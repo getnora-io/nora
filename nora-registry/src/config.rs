@@ -36,6 +36,13 @@ pub struct ServerConfig {
     /// Public URL for generating pull commands (e.g., "registry.example.com")
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Maximum request body size in MB (default: 2048 = 2GB)
+    #[serde(default = "default_body_limit_mb")]
+    pub body_limit_mb: usize,
+}
+
+fn default_body_limit_mb() -> usize {
+    2048 // 2GB - enough for any Docker image
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -330,6 +337,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_PUBLIC_URL") {
             self.server.public_url = if val.is_empty() { None } else { Some(val) };
         }
+        if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
+            if let Ok(mb) = val.parse() {
+                self.server.body_limit_mb = mb;
+            }
+        }
 
         // Storage config
         if let Ok(val) = env::var("NORA_STORAGE_MODE") {
@@ -483,6 +495,7 @@ impl Default for Config {
                 host: String::from("127.0.0.1"),
                 port: 4000,
                 public_url: None,
+                body_limit_mb: 2048,
             },
             storage: StorageConfig {
                 mode: StorageMode::Local,

@@ -347,7 +347,9 @@ async fn run_server(config: Config, storage: Storage) {
     let app = Router::new()
         .merge(public_routes)
         .merge(app_routes)
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB default body limit
+        .layer(DefaultBodyLimit::max(
+            state.config.server.body_limit_mb * 1024 * 1024,
+        ))
         .layer(middleware::from_fn(request_id::request_id_middleware))
         .layer(middleware::from_fn(metrics::metrics_middleware))
         .layer(middleware::from_fn_with_state(
@@ -366,6 +368,7 @@ async fn run_server(config: Config, storage: Storage) {
         version = env!("CARGO_PKG_VERSION"),
         storage = state.storage.backend_name(),
         auth_enabled = state.auth.is_some(),
+        body_limit_mb = state.config.server.body_limit_mb,
         "Nora started"
     );
 
