@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 mod activity_log;
+mod audit;
 mod auth;
 mod backup;
 mod config;
@@ -32,6 +33,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use activity_log::ActivityLog;
+use audit::AuditLog;
 use auth::HtpasswdAuth;
 use config::{Config, StorageMode};
 use dashboard_metrics::DashboardMetrics;
@@ -90,6 +92,7 @@ pub struct AppState {
     pub tokens: Option<TokenStore>,
     pub metrics: DashboardMetrics,
     pub activity: ActivityLog,
+    pub audit: AuditLog,
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
@@ -283,6 +286,7 @@ async fn run_server(config: Config, storage: Storage) {
         None
     };
 
+    let storage_path = config.storage.path.clone();
     let rate_limit_enabled = config.rate_limit.enabled;
 
     // Initialize Docker auth with proxy timeout
@@ -334,6 +338,7 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
+        audit: AuditLog::new(&storage_path),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,

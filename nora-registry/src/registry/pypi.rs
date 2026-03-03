@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::activity_log::{ActionType, ActivityEntry};
+use crate::audit::AuditEntry;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -115,6 +116,7 @@ async fn download_file(
             "pypi",
             "CACHE",
         ));
+        state.audit.log(AuditEntry::new("cache_hit", "api", "", "pypi", ""));
 
         let content_type = if filename.ends_with(".whl") {
             "application/zip"
@@ -156,6 +158,7 @@ async fn download_file(
                         "pypi",
                         "PROXY",
                     ));
+                    state.audit.log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
 
                     // Cache in local storage
                     let storage = state.storage.clone();

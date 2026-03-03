@@ -11,6 +11,36 @@ use uuid::Uuid;
 
 const TOKEN_PREFIX: &str = "nra_";
 
+/// Access role for API tokens
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Read,
+    Write,
+    Admin,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Read => write!(f, "read"),
+            Role::Write => write!(f, "write"),
+            Role::Admin => write!(f, "admin"),
+        }
+    }
+}
+
+impl Role {
+    pub fn can_write(&self) -> bool {
+        matches!(self, Role::Write | Role::Admin)
+    }
+
+    pub fn can_admin(&self) -> bool {
+        matches!(self, Role::Admin)
+    }
+}
+
+
 /// API Token metadata stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
@@ -20,6 +50,12 @@ pub struct TokenInfo {
     pub expires_at: u64,
     pub last_used: Option<u64>,
     pub description: Option<String>,
+    #[serde(default = "default_role")]
+    pub role: Role,
+}
+
+fn default_role() -> Role {
+    Role::Read
 }
 
 /// Token store for managing API tokens
@@ -44,6 +80,7 @@ impl TokenStore {
         user: &str,
         ttl_days: u64,
         description: Option<String>,
+        role: Role,
     ) -> Result<String, TokenError> {
         // Generate random token
         let raw_token = format!(
@@ -67,6 +104,7 @@ impl TokenStore {
             expires_at,
             last_used: None,
             description,
+            role,
         };
 
         // Save to file
@@ -81,7 +119,7 @@ impl TokenStore {
     }
 
     /// Verify a token and return user info if valid
-    pub fn verify_token(&self, token: &str) -> Result<String, TokenError> {
+    pub fn verify_token(&self, token: &str) -> Result<(String, Role), TokenError> {
         if !token.starts_with(TOKEN_PREFIX) {
             return Err(TokenError::InvalidFormat);
         }
@@ -121,7 +159,7 @@ impl TokenStore {
             let _ = fs::write(&file_path, json);
         }
 
-        Ok(info.user)
+        Ok((info.user, info.role))
     }
 
     /// List all tokens for a user
@@ -210,7 +248,7 @@ mod tests {
         let store = TokenStore::new(temp_dir.path());
 
         let token = store
-            .create_token("testuser", 30, Some("Test token".to_string()))
+            .create_token("testuser", 30, Some("Test token".to_string()), Role::Write)
             .unwrap();
 
         assert!(token.starts_with("nra_"));
@@ -222,10 +260,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None).unwrap();
-        let user = store.verify_token(&token).unwrap();
+        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
+        let (user, role) = store.verify_token(&token).unwrap();
 
         assert_eq!(user, "testuser");
+        assert_eq!(role, Role::Write);
     }
 
     #[test]
@@ -252,7 +291,7 @@ mod tests {
         let store = TokenStore::new(temp_dir.path());
 
         // Create token and manually set it as expired
-        let token = store.create_token("testuser", 1, None).unwrap();
+        let token = store.create_token("testuser", 1, None, Role::Write).unwrap();
         let token_hash = hash_token(&token);
         let file_path = temp_dir.path().join(format!("{}.json", &token_hash[..16]));
 
@@ -272,9 +311,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        store.create_token("user1", 30, None).unwrap();
-        store.create_token("user1", 30, None).unwrap();
-        store.create_token("user2", 30, None).unwrap();
+        store.create_token("user1", 30, None, Role::Write).unwrap();
+        store.create_token("user1", 30, None, Role::Write).unwrap();
+        store.create_token("user2", 30, None, Role::Read).unwrap();
 
         let user1_tokens = store.list_tokens("user1");
         assert_eq!(user1_tokens.len(), 2);
@@ -291,7 +330,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None).unwrap();
+        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
         let token_hash = hash_token(&token);
         let hash_prefix = &token_hash[..16];
 
@@ -320,9 +359,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        store.create_token("user1", 30, None).unwrap();
-        store.create_token("user1", 30, None).unwrap();
-        store.create_token("user2", 30, None).unwrap();
+        store.create_token("user1", 30, None, Role::Write).unwrap();
+        store.create_token("user1", 30, None, Role::Write).unwrap();
+        store.create_token("user2", 30, None, Role::Read).unwrap();
 
         let revoked = store.revoke_all_for_user("user1");
         assert_eq!(revoked, 2);
@@ -336,7 +375,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store.create_token("testuser", 30, None).unwrap();
+        let token = store.create_token("testuser", 30, None, Role::Write).unwrap();
 
         // First verification
         store.verify_token(&token).unwrap();
@@ -352,7 +391,7 @@ mod tests {
         let store = TokenStore::new(temp_dir.path());
 
         store
-            .create_token("testuser", 30, Some("CI/CD Pipeline".to_string()))
+            .create_token("testuser", 30, Some("CI/CD Pipeline".to_string()), Role::Admin)
             .unwrap();
 
         let tokens = store.list_tokens("testuser");
