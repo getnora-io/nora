@@ -53,7 +53,7 @@ jobs:
       # ── Alpine ───────────────────────────────────────────────────────────────
       - name: Extract metadata (alpine)
         id: meta-alpine
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ${{ env.NORA }}/${{ env.IMAGE_NAME }}
@@ -78,7 +78,7 @@ jobs:
       # ── RED OS ───────────────────────────────────────────────────────────────
       - name: Extract metadata (redos)
         id: meta-redos
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ${{ env.NORA }}/${{ env.IMAGE_NAME }}
@@ -104,7 +104,7 @@ jobs:
       # ── Astra Linux SE ───────────────────────────────────────────────────────
       - name: Extract metadata (astra)
         id: meta-astra
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ${{ env.NORA }}/${{ env.IMAGE_NAME }}
