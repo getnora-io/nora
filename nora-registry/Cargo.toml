@@ -28,7 +28,7 @@ hmac.workspace = true
 hex.workspace = true
 toml = "1.0"
 uuid = { version = "1", features = ["v4"] }
-bcrypt = "0.18"
+bcrypt = "0.19"
 base64 = "0.22"
 prometheus = "0.14"
 lazy_static = "1.5"
