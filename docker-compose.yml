@@ -1,7 +1,7 @@
 services:
   nora:
     build: .
-    image: getnora/nora:latest
+    image: ghcr.io/getnora-io/nora:latest
     ports:
       - "4000:4000"
     volumes:

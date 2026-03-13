@@ -6,6 +6,9 @@ data/
 *.log
 CLAUDE.md
 
+# Backup files
+*.bak
+
 # Internal files
 SESSION*.md
 TODO.md

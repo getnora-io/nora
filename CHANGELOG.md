@@ -4,6 +4,26 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.2.28] - 2026-03-13
+
+### Fixed / Исправлено
+- **docker-compose.yml**: Fixed image reference from `getnora/nora:latest` to `ghcr.io/getnora-io/nora:latest`
+- **docker-compose.yml**: Исправлена ссылка на образ с `getnora/nora:latest` на `ghcr.io/getnora-io/nora:latest`
+
+### Documentation / Документация
+- **Authentication Guide**: Added complete auth setup guide in README — htpasswd, API tokens, RBAC roles, curl examples
+- **Руководство по аутентификации**: Добавлено полное руководство по настройке auth в README — htpasswd, API-токены, RBAC-роли, примеры curl
+- **FSTEC builds**: Documented `Dockerfile.astra` and `Dockerfile.redos` purpose in README
+- **Сборки ФСТЭК**: Документировано назначение `Dockerfile.astra` и `Dockerfile.redos` в README
+- **TLS / HTTPS**: Added reverse proxy setup guide (Caddy, Nginx) and `insecure-registries` Docker config for internal deployments
+- **TLS / HTTPS**: Добавлено руководство по настройке reverse proxy (Caddy, Nginx) и конфигурация `insecure-registries` Docker для внутренних инсталляций
+
+### Removed / Удалено
+- Removed stale `CHANGELOG.md.bak` from repository
+- Удалён устаревший `CHANGELOG.md.bak` из репозитория
+
+---
+
 ## [0.2.27] - 2026-03-03
 
 ### Added / Добавлено
