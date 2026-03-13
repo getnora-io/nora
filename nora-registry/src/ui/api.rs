@@ -141,11 +141,13 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
     let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size;
 
-    let total_artifacts = docker_repos.len()
-        + maven_repos.len()
-        + npm_repos.len()
-        + cargo_repos.len()
-        + pypi_repos.len();
+    // Count total versions/tags, not just repositories
+    let docker_versions: usize = docker_repos.iter().map(|r| r.versions).sum();
+    let maven_versions: usize = maven_repos.iter().map(|r| r.versions).sum();
+    let npm_versions: usize = npm_repos.iter().map(|r| r.versions).sum();
+    let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
+    let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
+    let total_artifacts = docker_versions + maven_versions + npm_versions + cargo_versions + pypi_versions;
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),
@@ -158,35 +160,35 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let registry_card_stats = vec![
         RegistryCardStats {
             name: "docker".to_string(),
-            artifact_count: docker_repos.len(),
+            artifact_count: docker_versions,
             downloads: state.metrics.get_registry_downloads("docker"),
             uploads: state.metrics.get_registry_uploads("docker"),
             size_bytes: docker_size,
         },
         RegistryCardStats {
             name: "maven".to_string(),
-            artifact_count: maven_repos.len(),
+            artifact_count: maven_versions,
             downloads: state.metrics.get_registry_downloads("maven"),
             uploads: state.metrics.get_registry_uploads("maven"),
             size_bytes: maven_size,
         },
         RegistryCardStats {
             name: "npm".to_string(),
-            artifact_count: npm_repos.len(),
+            artifact_count: npm_versions,
             downloads: state.metrics.get_registry_downloads("npm"),
             uploads: 0,
             size_bytes: npm_size,
         },
         RegistryCardStats {
             name: "cargo".to_string(),
-            artifact_count: cargo_repos.len(),
+            artifact_count: cargo_versions,
             downloads: state.metrics.get_registry_downloads("cargo"),
             uploads: 0,
             size_bytes: cargo_size,
         },
         RegistryCardStats {
             name: "pypi".to_string(),
-            artifact_count: pypi_repos.len(),
+            artifact_count: pypi_versions,
             downloads: state.metrics.get_registry_downloads("pypi"),
             uploads: 0,
             size_bytes: pypi_size,
