@@ -5,7 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/getnora-io/nora/ci.yml?label=CI)](https://github.com/getnora-io/nora/actions)
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Telegram](https://img.shields.io/badge/Telegram-DevITWay-blue?logo=telegram)](https://t.me/DevITWay)
+[![Telegram](https://img.shields.io/badge/Telegram-Community-blue?logo=telegram)](https://t.me/getnora)
 
 > **Your Cloud-Native Artifact Registry**
 
@@ -305,7 +305,7 @@ These builds are published as `-astra` and `-redos` tagged images in GitHub Rele
 
 **Created and maintained by [DevITWay](https://github.com/devitway)**
 
-- Website: [devopsway.ru](https://devopsway.ru)
+- Website: [getnora.io](https://getnora.io)
 - Telegram: [@DevITWay](https://t.me/DevITWay)
 - GitHub: [@devitway](https://github.com/devitway)
 - Email: devitway@gmail.com
