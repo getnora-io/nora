@@ -86,6 +86,62 @@ npm config set registry http://localhost:4000/npm/
 npm publish
 ```
 
+## Authentication
+
+NORA supports Basic Auth (htpasswd) and revocable API tokens with RBAC.
+
+### Quick Setup
+
+```bash
+# 1. Create htpasswd file with bcrypt
+htpasswd -cbB users.htpasswd admin yourpassword
+# Add more users:
+htpasswd -bB users.htpasswd ci-user ci-secret
+
+# 2. Start NORA with auth enabled
+docker run -d -p 4000:4000 \
+  -v nora-data:/data \
+  -v ./users.htpasswd:/data/users.htpasswd \
+  -e NORA_AUTH_ENABLED=true \
+  ghcr.io/getnora-io/nora:latest
+
+# 3. Verify
+curl -u admin:yourpassword http://localhost:4000/v2/_catalog
+```
+
+### API Tokens (RBAC)
+
+Tokens support three roles: `read`, `write`, `admin`.
+
+```bash
+# Create a write token (30 days TTL)
+curl -s -X POST http://localhost:4000/api/tokens \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"yourpassword","role":"write","ttl_days":90,"description":"CI/CD"}'
+
+# Use token with Docker
+docker login localhost:4000 -u token -p nra_<token>
+
+# Use token with curl
+curl -H "Authorization: Bearer nra_<token>" http://localhost:4000/v2/_catalog
+
+# List tokens
+curl -s -X POST http://localhost:4000/api/tokens/list \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"yourpassword"}'
+
+# Revoke token by hash prefix
+curl -s -X POST http://localhost:4000/api/tokens/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"yourpassword","hash_prefix":"<first 16 chars>"}'
+```
+
+| Role | Pull/Read | Push/Write | Delete/Admin |
+|------|-----------|------------|--------------|
+| `read` | Yes | No | No |
+| `write` | Yes | Yes | No |
+| `admin` | Yes | Yes | Yes |
+
 ## CLI Commands
 
 ```bash
@@ -165,6 +221,77 @@ clear_env = false
 | `/npm/` | npm |
 | `/cargo/` | Cargo |
 | `/simple/` | PyPI |
+
+## TLS / HTTPS
+
+NORA serves plain HTTP by design. **TLS is intentionally not built into the binary** — this is a deliberate architectural decision:
+
+- **Single responsibility**: NORA manages artifacts, not certificates. Embedding TLS means bundling Let's Encrypt clients, certificate renewal logic, ACME challenges, and custom CA support — all of which already exist in battle-tested tools.
+- **Operational simplicity**: One place for certificates (reverse proxy), not scattered across every service. When a cert expires, you fix it in one config — not in NORA, Grafana, GitLab, and every other service separately.
+- **Industry standard**: Docker Hub, GitHub Container Registry, AWS ECR, Harbor, Nexus — none of them terminate TLS in the registry process. A reverse proxy in front is the universal pattern.
+- **Zero-config internal use**: On trusted networks (lab, CI/CD), NORA works out of the box without generating self-signed certs or managing keystores.
+
+### Production (recommended): reverse proxy with auto-TLS
+
+```
+Client → Caddy/Nginx (HTTPS, port 443) → NORA (HTTP, port 4000)
+```
+
+Caddy example:
+
+```
+registry.example.com {
+    reverse_proxy localhost:4000
+}
+```
+
+Nginx example:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name registry.example.com;
+    ssl_certificate     /etc/letsencrypt/live/registry.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/registry.example.com/privkey.pem;
+    client_max_body_size 0;  # unlimited for large image pushes
+    location / {
+        proxy_pass http://127.0.0.1:4000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Internal / Lab: insecure registry
+
+If you run NORA without TLS (e.g., on a private network), configure Docker to trust it:
+
+```json
+// /etc/docker/daemon.json
+{
+  "insecure-registries": ["192.168.1.100:4000"]
+}
+```
+
+Then restart Docker:
+
+```bash
+sudo systemctl restart docker
+```
+
+> **Note:** `insecure-registries` disables TLS verification for that host. Use only on trusted networks.
+
+## FSTEC-Certified OS Builds
+
+NORA provides dedicated Dockerfiles for Russian FSTEC-certified operating systems:
+
+- `Dockerfile.astra` — Astra Linux SE (for government and defense sector)
+- `Dockerfile.redos` — RED OS (for enterprise and public sector)
+
+Both use `scratch` base with statically-linked binary for minimal attack surface. Comments in each file show how to switch to official distro base images if required by your security policy.
+
+These builds are published as `-astra` and `-redos` tagged images in GitHub Releases.
 
 ## Performance
 
