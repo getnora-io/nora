@@ -336,7 +336,7 @@ async fn run_server(config: Config, storage: Storage) {
         start_time,
         auth,
         tokens,
-        metrics: DashboardMetrics::new(),
+        metrics: DashboardMetrics::with_persistence(&storage_path),
         activity: ActivityLog::new(50),
         audit: AuditLog::new(&storage_path),
         docker_auth,
@@ -387,6 +387,16 @@ async fn run_server(config: Config, storage: Storage) {
         "Available endpoints"
     );
 
+    // Background task: persist metrics every 30 seconds
+    let metrics_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            metrics_state.metrics.save();
+        }
+    });
+
     // Graceful shutdown on SIGTERM/SIGINT
     axum::serve(
         listener,
@@ -395,6 +405,9 @@ async fn run_server(config: Config, storage: Storage) {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("Server error");
+
+    // Save metrics on shutdown
+    state.metrics.save();
 
     info!(
         uptime_seconds = state.start_time.elapsed().as_secs(),
