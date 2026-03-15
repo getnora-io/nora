@@ -11,6 +11,7 @@ use axum::{
     routing::get,
     Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,8 +87,13 @@ async fn package_versions(
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) =
-            fetch_package_page(&state.http_client, &url, state.config.pypi.proxy_timeout).await
+        if let Ok(html) = fetch_package_page(
+            &state.http_client,
+            &url,
+            state.config.pypi.proxy_timeout,
+            state.config.pypi.proxy_auth.as_deref(),
+        )
+        .await
         {
             // Rewrite URLs in the HTML to point to our registry
             let rewritten = rewrite_pypi_links(&html, &normalized);
@@ -140,6 +146,7 @@ async fn download_file(
             &state.http_client,
             &page_url,
             state.config.pypi.proxy_timeout,
+            state.config.pypi.proxy_auth.as_deref(),
         )
         .await
         {
@@ -149,6 +156,7 @@ async fn download_file(
                     &state.http_client,
                     &file_url,
                     state.config.pypi.proxy_timeout,
+                    state.config.pypi.proxy_auth.as_deref(),
                 )
                 .await
                 {
@@ -202,14 +210,17 @@ async fn fetch_package_page(
     client: &reqwest::Client,
     url: &str,
     timeout_secs: u64,
+    auth: Option<&str>,
 ) -> Result<String, ()> {
-    let response = client
+    let mut request = client
         .get(url)
         .timeout(Duration::from_secs(timeout_secs))
-        .header("Accept", "text/html")
-        .send()
-        .await
-        .map_err(|_| ())?;
+        .header("Accept", "text/html");
+    if let Some(credentials) = auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());
@@ -219,13 +230,18 @@ async fn fetch_package_page(
 }
 
 /// Fetch file from upstream
-async fn fetch_file(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<Vec<u8>, ()> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .map_err(|_| ())?;
+async fn fetch_file(
+    client: &reqwest::Client,
+    url: &str,
+    timeout_secs: u64,
+    auth: Option<&str>,
+) -> Result<Vec<u8>, ()> {
+    let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
+    if let Some(credentials) = auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());

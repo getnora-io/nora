@@ -93,7 +93,7 @@ fn default_bucket() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MavenConfig {
     #[serde(default)]
-    pub proxies: Vec<String>,
+    pub proxies: Vec<MavenProxyEntry>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
 }
@@ -102,6 +102,8 @@ pub struct MavenConfig {
 pub struct NpmConfig {
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
 }
@@ -110,6 +112,8 @@ pub struct NpmConfig {
 pub struct PypiConfig {
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
 }
@@ -129,6 +133,37 @@ pub struct DockerUpstream {
     pub url: String,
     #[serde(default)]
     pub auth: Option<String>, // "user:pass" for basic auth
+}
+
+/// Maven upstream proxy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MavenProxyEntry {
+    Simple(String),
+    Full(MavenProxy),
+}
+
+/// Maven upstream proxy with optional auth
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MavenProxy {
+    pub url: String,
+    #[serde(default)]
+    pub auth: Option<String>, // "user:pass" for basic auth
+}
+
+impl MavenProxyEntry {
+    pub fn url(&self) -> &str {
+        match self {
+            MavenProxyEntry::Simple(s) => s,
+            MavenProxyEntry::Full(p) => &p.url,
+        }
+    }
+    pub fn auth(&self) -> Option<&str> {
+        match self {
+            MavenProxyEntry::Simple(_) => None,
+            MavenProxyEntry::Full(p) => p.auth.as_deref(),
+        }
+    }
 }
 
 /// Raw repository configuration for simple file storage
@@ -177,7 +212,9 @@ fn default_timeout() -> u64 {
 impl Default for MavenConfig {
     fn default() -> Self {
         Self {
-            proxies: vec!["https://repo1.maven.org/maven2".to_string()],
+            proxies: vec![MavenProxyEntry::Simple(
+                "https://repo1.maven.org/maven2".to_string(),
+            )],
             proxy_timeout: 30,
         }
     }
@@ -187,6 +224,7 @@ impl Default for NpmConfig {
     fn default() -> Self {
         Self {
             proxy: Some("https://registry.npmjs.org".to_string()),
+            proxy_auth: None,
             proxy_timeout: 30,
         }
     }
@@ -196,6 +234,7 @@ impl Default for PypiConfig {
     fn default() -> Self {
         Self {
             proxy: Some("https://pypi.org/simple/".to_string()),
+            proxy_auth: None,
             proxy_timeout: 30,
         }
     }
@@ -377,9 +416,23 @@ impl Config {
             self.auth.htpasswd_file = val;
         }
 
-        // Maven config
+        // Maven config — supports "url1,url2" or "url1|auth1,url2|auth2"
         if let Ok(val) = env::var("NORA_MAVEN_PROXIES") {
-            self.maven.proxies = val.split(',').map(|s| s.trim().to_string()).collect();
+            self.maven.proxies = val
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let parts: Vec<&str> = s.trim().splitn(2, '|').collect();
+                    if parts.len() > 1 {
+                        MavenProxyEntry::Full(MavenProxy {
+                            url: parts[0].to_string(),
+                            auth: Some(parts[1].to_string()),
+                        })
+                    } else {
+                        MavenProxyEntry::Simple(parts[0].to_string())
+                    }
+                })
+                .collect();
         }
         if let Ok(val) = env::var("NORA_MAVEN_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -397,6 +450,11 @@ impl Config {
             }
         }
 
+        // npm proxy auth
+        if let Ok(val) = env::var("NORA_NPM_PROXY_AUTH") {
+            self.npm.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+
         // PyPI config
         if let Ok(val) = env::var("NORA_PYPI_PROXY") {
             self.pypi.proxy = if val.is_empty() { None } else { Some(val) };
@@ -405,6 +463,11 @@ impl Config {
             if let Ok(timeout) = val.parse() {
                 self.pypi.proxy_timeout = timeout;
             }
+        }
+
+        // PyPI proxy auth
+        if let Ok(val) = env::var("NORA_PYPI_PROXY_AUTH") {
+            self.pypi.proxy_auth = if val.is_empty() { None } else { Some(val) };
         }
 
         // Docker config

@@ -205,7 +205,12 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         MountPoint {
             registry: "Maven".to_string(),
             mount_path: "/maven2/".to_string(),
-            proxy_upstream: state.config.maven.proxies.first().cloned(),
+            proxy_upstream: state
+                .config
+                .maven
+                .proxies
+                .first()
+                .map(|p| p.url().to_string()),
         },
         MountPoint {
             registry: "npm".to_string(),
