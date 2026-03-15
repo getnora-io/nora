@@ -130,6 +130,7 @@ jobs:
       # ── Smoke test ──────────────────────────────────────────────────────────
       - name: Smoke test — verify alpine image starts and responds
         run: |
+          docker rm -f nora-smoke 2>/dev/null || true
           docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 \
             ${{ env.NORA }}/${{ env.IMAGE_NAME }}:latest
           for i in $(seq 1 10); do
