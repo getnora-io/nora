@@ -85,3 +85,74 @@ jobs:
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build NORA
+        run: cargo build --release --package nora-registry
+
+      # -- Start NORA --
+      - name: Start NORA
+        run: |
+          NORA_STORAGE_PATH=/tmp/nora-data ./target/release/nora &
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4000/health && break || sleep 2
+          done
+          curl -sf http://localhost:4000/health | jq .
+
+      # -- Docker push/pull --
+      - name: Configure Docker for insecure registry
+        run: |
+          echo '{"insecure-registries": ["localhost:4000"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 2
+
+      - name: Docker — push and pull image
+        run: |
+          docker pull alpine:3.20
+          docker tag alpine:3.20 localhost:4000/test/alpine:integration
+          docker push localhost:4000/test/alpine:integration
+          docker rmi localhost:4000/test/alpine:integration
+          docker pull localhost:4000/test/alpine:integration
+          echo "Docker push/pull OK"
+
+      - name: Docker — verify catalog and tags
+        run: |
+          curl -sf http://localhost:4000/v2/_catalog | jq .
+          curl -sf http://localhost:4000/v2/test/alpine/tags/list | jq .
+
+      # -- npm publish/install --
+      - name: npm — publish and install package
+        run: |
+          mkdir -p /tmp/test-pkg && cd /tmp/test-pkg
+          echo '{"name":"nora-integration-test","version":"1.0.0","description":"test"}' > package.json
+          echo "module.exports = true;" > index.js
+          npm publish --registry http://localhost:4000/npm/
+          cd /tmp && mkdir -p install-test && cd install-test
+          npm init -y > /dev/null
+          npm install nora-integration-test --registry http://localhost:4000/npm/
+          echo "npm publish/install OK"
+
+      # -- API checks --
+      - name: API — health, ready, metrics
+        run: |
+          curl -sf http://localhost:4000/health | jq .status
+          curl -sf http://localhost:4000/ready
+          curl -sf http://localhost:4000/metrics | head -5
+          echo "API checks OK"
+
+      - name: Stop NORA
+        if: always()
+        run: pkill nora || true
