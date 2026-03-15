@@ -110,49 +110,6 @@ impl DockerAuth {
             .and_then(|v| v.as_str())
             .map(String::from)
     }
-
-    /// Make an authenticated request to an upstream registry
-    pub async fn fetch_with_auth(
-        &self,
-        url: &str,
-        registry_url: &str,
-        name: &str,
-        basic_auth: Option<&str>,
-    ) -> Result<reqwest::Response, ()> {
-        // First try — with basic auth if configured, otherwise anonymous
-        let mut request = self.client.get(url);
-        if let Some(credentials) = basic_auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
-        }
-        let response = request.send().await.map_err(|_| ())?;
-
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // Extract Www-Authenticate header
-            let www_auth = response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-
-            // Get token and retry
-            if let Some(token) = self
-                .get_token(registry_url, name, www_auth.as_deref(), basic_auth)
-                .await
-            {
-                return self
-                    .client
-                    .get(url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-                    .map_err(|_| ());
-            }
-
-            return Err(());
-        }
-
-        Ok(response)
-    }
 }
 
 impl Default for DockerAuth {
