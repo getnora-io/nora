@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
-#![allow(dead_code)]
 //! Input validation for artifact registry paths and identifiers
 //!
 //! Provides security validation to prevent path traversal attacks and
@@ -302,63 +301,6 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
 
     for c in reference.chars() {
         if !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-') {
-            return Err(ValidationError::ForbiddenCharacter(c));
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate Maven artifact path.
-///
-/// Maven paths follow the pattern: groupId/artifactId/version/filename
-/// Example: `org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar`
-pub fn validate_maven_path(path: &str) -> Result<(), ValidationError> {
-    validate_storage_key(path)
-}
-
-/// Validate npm package name.
-pub fn validate_npm_name(name: &str) -> Result<(), ValidationError> {
-    if name.is_empty() {
-        return Err(ValidationError::EmptyInput);
-    }
-
-    if name.len() > 214 {
-        return Err(ValidationError::TooLong {
-            max: 214,
-            actual: name.len(),
-        });
-    }
-
-    // Check for path traversal
-    if name.contains("..") {
-        return Err(ValidationError::PathTraversal);
-    }
-
-    Ok(())
-}
-
-/// Validate Cargo crate name.
-pub fn validate_crate_name(name: &str) -> Result<(), ValidationError> {
-    if name.is_empty() {
-        return Err(ValidationError::EmptyInput);
-    }
-
-    if name.len() > 64 {
-        return Err(ValidationError::TooLong {
-            max: 64,
-            actual: name.len(),
-        });
-    }
-
-    // Check for path traversal
-    if name.contains("..") || name.contains('/') {
-        return Err(ValidationError::PathTraversal);
-    }
-
-    // Crate names: alphanumeric, underscores, hyphens
-    for c in name.chars() {
-        if !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-') {
             return Err(ValidationError::ForbiddenCharacter(c));
         }
     }
