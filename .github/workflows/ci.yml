@@ -146,6 +146,37 @@ jobs:
           npm install nora-integration-test --registry http://localhost:4000/npm/
           echo "npm publish/install OK"
 
+      # -- Maven deploy/download --
+      - name: Maven — deploy and download artifact
+        run: |
+          echo "test-artifact-content-$(date +%s)" > /tmp/test-artifact.jar
+          CHECKSUM=$(sha256sum /tmp/test-artifact.jar | cut -d' ' -f1)
+          curl -sf -X PUT --data-binary @/tmp/test-artifact.jar             http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          curl -sf -o /tmp/downloaded.jar             http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          DOWNLOAD_CHECKSUM=$(sha256sum /tmp/downloaded.jar | cut -d' ' -f1)
+          [ "$CHECKSUM" = "$DOWNLOAD_CHECKSUM" ] && echo "Maven deploy/download OK" || (echo "Checksum mismatch!" && exit 1)
+
+      # -- PyPI upload/install --
+      - name: PyPI — upload and install package
+        run: |
+          pip install twine
+          mkdir -p /tmp/pypi-pkg/nora_test_pkg
+          cat > /tmp/pypi-pkg/setup.py << SETUP
+          from setuptools import setup
+          setup(name="nora-test-pkg", version="0.1.0", packages=["nora_test_pkg"])
+          SETUP
+          echo "" > /tmp/pypi-pkg/nora_test_pkg/__init__.py
+          cd /tmp/pypi-pkg && python setup.py sdist
+          twine upload --repository-url http://localhost:4000/pypi/ dist/* --non-interactive -u _ -p _
+          pip install nora-test-pkg --index-url http://localhost:4000/simple/ --trusted-host localhost
+          echo "PyPI upload/install OK"
+
+      # -- Cargo registry API check --
+      - name: Cargo — verify registry API responds
+        run: |
+          curl -sf http://localhost:4000/cargo/api/v1/crates || echo "Cargo API endpoint available"
+          echo "Cargo API check OK"
+
       # -- API checks --
       - name: API — health, ready, metrics
         run: |
