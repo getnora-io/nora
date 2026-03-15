@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::config::basic_auth_header;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -91,8 +91,7 @@ impl DockerAuth {
 
         let mut request = self.client.get(&url);
         if let Some(credentials) = basic_auth {
-            let encoded = STANDARD.encode(credentials);
-            request = request.header("Authorization", format!("Basic {}", encoded));
+            request = request.header("Authorization", basic_auth_header(credentials));
             tracing::debug!("Using basic auth for token request");
         }
 
@@ -123,8 +122,7 @@ impl DockerAuth {
         // First try — with basic auth if configured, otherwise anonymous
         let mut request = self.client.get(url);
         if let Some(credentials) = basic_auth {
-            let encoded = STANDARD.encode(credentials);
-            request = request.header("Authorization", format!("Basic {}", encoded));
+            request = request.header("Authorization", basic_auth_header(credentials));
         }
         let response = request.send().await.map_err(|_| ())?;
 

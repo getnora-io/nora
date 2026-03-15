@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::basic_auth_header;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -12,7 +13,6 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,8 +108,7 @@ async fn fetch_from_proxy(
 ) -> Result<Vec<u8>, ()> {
     let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
     if let Some(credentials) = auth {
-        let encoded = STANDARD.encode(credentials);
-        request = request.header("Authorization", format!("Basic {}", encoded));
+        request = request.header("Authorization", basic_auth_header(credentials));
     }
     let response = request.send().await.map_err(|_| ())?;
 
