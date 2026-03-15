@@ -9,7 +9,6 @@ use std::fs;
 pub use crate::secrets::SecretsConfig;
 
 /// Encode "user:pass" into a Basic Auth header value, e.g. "Basic dXNlcjpwYXNz".
-/// Returns None if input is None.
 pub fn basic_auth_header(credentials: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
