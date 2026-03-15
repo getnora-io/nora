@@ -15,6 +15,7 @@ use axum::{
     routing::{delete, get, head, patch, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -181,6 +182,7 @@ async fn download_blob(
             &digest,
             &state.docker_auth,
             state.config.docker.proxy_timeout,
+            upstream.auth.as_deref(),
         )
         .await
         {
@@ -392,6 +394,7 @@ async fn get_manifest(
             &reference,
             &state.docker_auth,
             state.config.docker.proxy_timeout,
+            upstream.auth.as_deref(),
         )
         .await
         {
@@ -733,6 +736,7 @@ async fn fetch_blob_from_upstream(
     digest: &str,
     docker_auth: &DockerAuth,
     timeout: u64,
+    basic_auth: Option<&str>,
 ) -> Result<Vec<u8>, ()> {
     let url = format!(
         "{}/v2/{}/blobs/{}",
@@ -741,13 +745,13 @@ async fn fetch_blob_from_upstream(
         digest
     );
 
-    // First try without auth
-    let response = client
-        .get(&url)
-        .timeout(Duration::from_secs(timeout))
-        .send()
-        .await
-        .map_err(|_| ())?;
+    // First try — with basic auth if configured
+    let mut request = client.get(&url).timeout(Duration::from_secs(timeout));
+    if let Some(credentials) = basic_auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|_| ())?;
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Get Www-Authenticate header and fetch token
@@ -758,7 +762,7 @@ async fn fetch_blob_from_upstream(
             .map(String::from);
 
         if let Some(token) = docker_auth
-            .get_token(upstream_url, name, www_auth.as_deref())
+            .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
             .await
         {
             client
@@ -790,6 +794,7 @@ async fn fetch_manifest_from_upstream(
     reference: &str,
     docker_auth: &DockerAuth,
     timeout: u64,
+    basic_auth: Option<&str>,
 ) -> Result<(Vec<u8>, String), ()> {
     let url = format!(
         "{}/v2/{}/manifests/{}",
@@ -806,16 +811,18 @@ async fn fetch_manifest_from_upstream(
                          application/vnd.oci.image.manifest.v1+json, \
                          application/vnd.oci.image.index.v1+json";
 
-    // First try without auth
-    let response = client
+    // First try — with basic auth if configured
+    let mut request = client
         .get(&url)
         .timeout(Duration::from_secs(timeout))
-        .header("Accept", accept_header)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
-        })?;
+        .header("Accept", accept_header);
+    if let Some(credentials) = basic_auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|e| {
+        tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
+    })?;
 
     tracing::debug!(status = %response.status(), "Initial upstream response");
 
@@ -830,7 +837,7 @@ async fn fetch_manifest_from_upstream(
         tracing::debug!(www_auth = ?www_auth, "Got 401, fetching token");
 
         if let Some(token) = docker_auth
-            .get_token(upstream_url, name, www_auth.as_deref())
+            .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
             .await
         {
             tracing::debug!("Token acquired, retrying with auth");
