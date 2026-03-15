@@ -72,7 +72,7 @@ jobs:
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
           labels: ${{ steps.meta-alpine.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,ignore-error=true
           cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,mode=max
 
       # ── RED OS ───────────────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ jobs:
           push: true
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,ignore-error=true
           cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,mode=max
 
       # ── Astra Linux SE ───────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ jobs:
           push: true
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra
+          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,ignore-error=true
           cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max
 
       # ── Smoke test ──────────────────────────────────────────────────────────
