@@ -5,7 +5,6 @@
 //!
 //! Functions in this module are stubs used only for generating OpenAPI documentation.
 
-
 #![allow(dead_code)] // utoipa doc stubs — not called at runtime, used by derive macros
 
 use axum::Router;

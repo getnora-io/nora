@@ -1,0 +1,8 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+[allowlist]
+  description = "Allowlist for false positives"
+
+  # Documentation examples with placeholder credentials
+  commits = ["92155cf6574d89f93ee68503a7b68455ceaa19af"]

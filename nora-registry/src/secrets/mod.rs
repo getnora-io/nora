@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
-
 //! Secrets management for NORA
 //!
 //! Provides a trait-based architecture for secrets providers:
