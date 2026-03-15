@@ -4,6 +4,28 @@ All notable changes to NORA will be documented in this file.
 
 ---
 
+## [0.2.29] - 2026-03-15
+
+### Added / Добавлено
+- **Upstream Authentication**: All registry proxies now support Basic Auth credentials for private upstream registries
+- **Аутентификация upstream**: Все прокси реестров теперь поддерживают Basic Auth для приватных upstream-реестров
+  - Docker: `NORA_DOCKER_UPSTREAMS="https://registry.corp.com|user:pass"`
+  - Maven: `NORA_MAVEN_PROXIES="https://nexus.corp.com/maven2|user:pass"`
+  - npm: `NORA_NPM_PROXY_AUTH="user:pass"`
+  - PyPI: `NORA_PYPI_PROXY_AUTH="user:pass"`
+- **Plaintext credential warning**: NORA logs a warning at startup if credentials are stored in config.toml instead of env vars
+- **Предупреждение о plaintext credentials**: NORA логирует предупреждение при старте, если credentials хранятся в config.toml вместо переменных окружения
+
+### Changed / Изменено
+- Extracted `basic_auth_header()` helper for consistent auth across all protocols
+- Вынесен хелпер `basic_auth_header()` для единообразной авторизации всех протоколов
+
+### Removed / Удалено
+- Removed unused `DockerAuth::fetch_with_auth()` method (dead code cleanup)
+- Удалён неиспользуемый метод `DockerAuth::fetch_with_auth()` (очистка мёртвого кода)
+
+---
+
 ## [0.2.28] - 2026-03-13
 
 ### Fixed / Исправлено
