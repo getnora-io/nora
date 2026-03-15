@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ impl DockerAuth {
         registry_url: &str,
         name: &str,
         www_authenticate: Option<&str>,
+        basic_auth: Option<&str>,
     ) -> Option<String> {
         let cache_key = format!("{}:{}", registry_url, name);
 
@@ -51,7 +53,7 @@ impl DockerAuth {
 
         // Need to fetch a new token
         let www_auth = www_authenticate?;
-        let token = self.fetch_token(www_auth, name).await?;
+        let token = self.fetch_token(www_auth, name, basic_auth).await?;
 
         // Cache the token (default 5 minute expiry)
         {
@@ -70,7 +72,12 @@ impl DockerAuth {
 
     /// Parse Www-Authenticate header and fetch token from auth server
     /// Format: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
-    async fn fetch_token(&self, www_authenticate: &str, name: &str) -> Option<String> {
+    async fn fetch_token(
+        &self,
+        www_authenticate: &str,
+        name: &str,
+        basic_auth: Option<&str>,
+    ) -> Option<String> {
         let params = parse_www_authenticate(www_authenticate)?;
 
         let realm = params.get("realm")?;
@@ -82,7 +89,14 @@ impl DockerAuth {
 
         tracing::debug!(url = %url, "Fetching auth token");
 
-        let response = self.client.get(&url).send().await.ok()?;
+        let mut request = self.client.get(&url);
+        if let Some(credentials) = basic_auth {
+            let encoded = STANDARD.encode(credentials);
+            request = request.header("Authorization", format!("Basic {}", encoded));
+            tracing::debug!("Using basic auth for token request");
+        }
+
+        let response = request.send().await.ok()?;
 
         if !response.status().is_success() {
             tracing::warn!(status = %response.status(), "Token request failed");
@@ -104,9 +118,15 @@ impl DockerAuth {
         url: &str,
         registry_url: &str,
         name: &str,
+        basic_auth: Option<&str>,
     ) -> Result<reqwest::Response, ()> {
-        // First try without auth
-        let response = self.client.get(url).send().await.map_err(|_| ())?;
+        // First try — with basic auth if configured, otherwise anonymous
+        let mut request = self.client.get(url);
+        if let Some(credentials) = basic_auth {
+            let encoded = STANDARD.encode(credentials);
+            request = request.header("Authorization", format!("Basic {}", encoded));
+        }
+        let response = request.send().await.map_err(|_| ())?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Extract Www-Authenticate header
@@ -118,7 +138,7 @@ impl DockerAuth {
 
             // Get token and retry
             if let Some(token) = self
-                .get_token(registry_url, name, www_auth.as_deref())
+                .get_token(registry_url, name, www_auth.as_deref(), basic_auth)
                 .await
             {
                 return self

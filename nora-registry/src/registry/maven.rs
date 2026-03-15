@@ -12,6 +12,7 @@ use axum::{
     routing::{get, put},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,10 +50,17 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
         return with_content_type(&path, data).into_response();
     }
 
-    for proxy_url in &state.config.maven.proxies {
-        let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
+    for proxy in &state.config.maven.proxies {
+        let url = format!("{}/{}", proxy.url().trim_end_matches('/'), path);
 
-        match fetch_from_proxy(&state.http_client, &url, state.config.maven.proxy_timeout).await {
+        match fetch_from_proxy(
+            &state.http_client,
+            &url,
+            state.config.maven.proxy_timeout,
+            proxy.auth(),
+        )
+        .await
+        {
             Ok(data) => {
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_miss();
@@ -124,13 +132,14 @@ async fn fetch_from_proxy(
     client: &reqwest::Client,
     url: &str,
     timeout_secs: u64,
+    auth: Option<&str>,
 ) -> Result<Vec<u8>, ()> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .map_err(|_| ())?;
+    let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
+    if let Some(credentials) = auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());

@@ -12,6 +12,7 @@ use axum::{
     routing::get,
     Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,8 +60,13 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
     if let Some(proxy_url) = &state.config.npm.proxy {
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        if let Ok(data) =
-            fetch_from_proxy(&state.http_client, &url, state.config.npm.proxy_timeout).await
+        if let Ok(data) = fetch_from_proxy(
+            &state.http_client,
+            &url,
+            state.config.npm.proxy_timeout,
+            state.config.npm.proxy_auth.as_deref(),
+        )
+        .await
         {
             if is_tarball {
                 state.metrics.record_download("npm");
@@ -98,13 +104,14 @@ async fn fetch_from_proxy(
     client: &reqwest::Client,
     url: &str,
     timeout_secs: u64,
+    auth: Option<&str>,
 ) -> Result<Vec<u8>, ()> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .map_err(|_| ())?;
+    let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
+    if let Some(credentials) = auth {
+        let encoded = STANDARD.encode(credentials);
+        request = request.header("Authorization", format!("Basic {}", encoded));
+    }
+    let response = request.send().await.map_err(|_| ())?;
 
     if !response.status().is_success() {
         return Err(());
