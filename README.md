@@ -36,8 +36,10 @@ Fast. Organized. Feel at Home.
 
 - **Security**
   - Basic Auth (htpasswd + bcrypt)
-  - Revocable API tokens
+  - Revocable API tokens with RBAC
   - ENV-based configuration (12-Factor)
+  - SBOM (SPDX + CycloneDX) in every release
+  - See [SECURITY.md](SECURITY.md) for vulnerability reporting
 
 ## Quick Start
 
@@ -111,36 +113,13 @@ curl -u admin:yourpassword http://localhost:4000/v2/_catalog
 
 ### API Tokens (RBAC)
 
-Tokens support three roles: `read`, `write`, `admin`.
-
-```bash
-# Create a write token (30 days TTL)
-curl -s -X POST http://localhost:4000/api/tokens \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"yourpassword","role":"write","ttl_days":90,"description":"CI/CD"}'
-
-# Use token with Docker
-docker login localhost:4000 -u token -p nra_<token>
-
-# Use token with curl
-curl -H "Authorization: Bearer nra_<token>" http://localhost:4000/v2/_catalog
-
-# List tokens
-curl -s -X POST http://localhost:4000/api/tokens/list \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"yourpassword"}'
-
-# Revoke token by hash prefix
-curl -s -X POST http://localhost:4000/api/tokens/revoke \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"yourpassword","hash_prefix":"<first 16 chars>"}'
-```
-
 | Role | Pull/Read | Push/Write | Delete/Admin |
 |------|-----------|------------|--------------|
 | `read` | Yes | No | No |
 | `write` | Yes | Yes | No |
 | `admin` | Yes | Yes | Yes |
+
+See [Authentication guide](https://getnora.dev/configuration/authentication/) for token management, Docker login, and CI/CD integration.
 
 ## CLI Commands
 
@@ -161,25 +140,10 @@ nora migrate --from local --to s3
 | `NORA_HOST` | 127.0.0.1 | Bind address |
 | `NORA_PORT` | 4000 | Port |
 | `NORA_STORAGE_MODE` | local | `local` or `s3` |
-| `NORA_STORAGE_PATH` | data/storage | Local storage path |
-| `NORA_STORAGE_S3_URL` | - | S3 endpoint URL |
-| `NORA_STORAGE_BUCKET` | registry | S3 bucket name |
 | `NORA_AUTH_ENABLED` | false | Enable authentication |
-| `NORA_RATE_LIMIT_AUTH_RPS` | 1 | Auth requests per second |
-| `NORA_RATE_LIMIT_AUTH_BURST` | 5 | Auth burst size |
-| `NORA_RATE_LIMIT_UPLOAD_RPS` | 200 | Upload requests per second |
-| `NORA_RATE_LIMIT_UPLOAD_BURST` | 500 | Upload burst size |
-| `NORA_RATE_LIMIT_GENERAL_RPS` | 100 | General requests per second |
-| `NORA_RATE_LIMIT_GENERAL_BURST` | 200 | General burst size |
-| `NORA_SECRETS_PROVIDER` | env | Secrets provider (`env`) |
-| `NORA_SECRETS_CLEAR_ENV` | false | Clear env vars after reading |
 | `NORA_DOCKER_UPSTREAMS` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
-| `NORA_DOCKER_PROXY_TIMEOUT` | 60 | Docker upstream timeout (seconds) |
-| `NORA_MAVEN_PROXIES` | `https://repo1.maven.org/maven2` | Maven upstreams (`url\|user:pass,...`) |
-| `NORA_NPM_PROXY` | `https://registry.npmjs.org` | npm upstream URL |
-| `NORA_NPM_PROXY_AUTH` | - | npm upstream auth (`user:pass`) |
-| `NORA_PYPI_PROXY` | `https://pypi.org/simple/` | PyPI upstream URL |
-| `NORA_PYPI_PROXY_AUTH` | - | PyPI upstream auth (`user:pass`) |
+
+See [full configuration reference](https://getnora.dev/configuration/settings/) for all environment variables including storage, rate limiting, proxy auth, and secrets.
 
 ### config.toml
 
@@ -196,23 +160,9 @@ path = "data/storage"
 enabled = false
 htpasswd_file = "users.htpasswd"
 
-[rate_limit]
-# Strict limits for authentication (brute-force protection)
-auth_rps = 1
-auth_burst = 5
-# High limits for CI/CD upload workloads
-upload_rps = 200
-upload_burst = 500
-# Balanced limits for general API endpoints
-general_rps = 100
-general_burst = 200
-
-[secrets]
-# Provider: env (default), aws-secrets, vault, k8s (coming soon)
-provider = "env"
-# Clear environment variables after reading (security hardening)
-clear_env = false
 ```
+
+See [full config reference](https://getnora.dev/configuration/settings/) for rate limiting, secrets, and proxy settings.
 
 ## Endpoints
 
@@ -312,7 +262,7 @@ These builds are published as `-astra` and `-redos` tagged images in GitHub Rele
 
 **Created and maintained by [DevITWay](https://github.com/devitway)**
 
-- Website: [getnora.io](https://getnora.io)
+- Website: [getnora.dev](https://getnora.dev)
 - Telegram: [@DevITWay](https://t.me/DevITWay)
 - GitHub: [@devitway](https://github.com/devitway)
 - Email: devitway@gmail.com
