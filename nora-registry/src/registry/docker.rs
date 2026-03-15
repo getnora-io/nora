@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::storage::Storage;
 use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
@@ -15,7 +16,6 @@ use axum::{
     routing::{delete, get, head, patch, put},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -748,8 +748,7 @@ async fn fetch_blob_from_upstream(
     // First try — with basic auth if configured
     let mut request = client.get(&url).timeout(Duration::from_secs(timeout));
     if let Some(credentials) = basic_auth {
-        let encoded = STANDARD.encode(credentials);
-        request = request.header("Authorization", format!("Basic {}", encoded));
+        request = request.header("Authorization", basic_auth_header(credentials));
     }
     let response = request.send().await.map_err(|_| ())?;
 
@@ -817,8 +816,7 @@ async fn fetch_manifest_from_upstream(
         .timeout(Duration::from_secs(timeout))
         .header("Accept", accept_header);
     if let Some(credentials) = basic_auth {
-        let encoded = STANDARD.encode(credentials);
-        request = request.header("Authorization", format!("Basic {}", encoded));
+        request = request.header("Authorization", basic_auth_header(credentials));
     }
     let response = request.send().await.map_err(|e| {
         tracing::error!(error = %e, url = %url, "Failed to send request to upstream");

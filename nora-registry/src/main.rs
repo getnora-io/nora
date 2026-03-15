@@ -289,6 +289,9 @@ async fn run_server(config: Config, storage: Storage) {
     let storage_path = config.storage.path.clone();
     let rate_limit_enabled = config.rate_limit.enabled;
 
+    // Warn about plaintext credentials in config.toml
+    config.warn_plaintext_credentials();
+
     // Initialize Docker auth with proxy timeout
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
