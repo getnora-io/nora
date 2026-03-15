@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
-#![allow(dead_code)]
 //! Application error handling with HTTP response conversion
 //!
 //! Provides a unified error type that can be converted to HTTP responses
@@ -18,6 +17,7 @@ use thiserror::Error;
 use crate::storage::StorageError;
 use crate::validation::ValidationError;
 
+#[allow(dead_code)] // Wiring into handlers planned for v0.3
 /// Application-level errors with HTTP response conversion
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -40,6 +40,7 @@ pub enum AppError {
     Validation(#[from] ValidationError),
 }
 
+#[allow(dead_code)]
 /// JSON error response body
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -74,6 +75,7 @@ impl IntoResponse for AppError {
     }
 }
 
+#[allow(dead_code)]
 impl AppError {
     /// Create a not found error
     pub fn not_found(msg: impl Into<String>) -> Self {

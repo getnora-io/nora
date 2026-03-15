@@ -51,16 +51,14 @@ jobs:
         run: |
           curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
             | tar xz -C /usr/local/bin gitleaks
-          gitleaks detect --source . --exit-code 1 --report-format sarif --report-path gitleaks.sarif || true
-        continue-on-error: true  # findings are reported, do not block the pipeline
+          gitleaks detect --source . --exit-code 1 --report-format sarif --report-path gitleaks.sarif
 
       # ── CVE in Rust dependencies ────────────────────────────────────────────
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: cargo audit — RustSec advisory database
-        run: cargo audit
-        continue-on-error: true  # warn only; known CVEs should not block CI until triaged
+        run: cargo audit --ignore RUSTSEC-2025-0119  # known: number_prefix via indicatif
 
       # ── Licenses, banned crates, supply chain policy ────────────────────────
       - name: cargo deny — licenses and banned crates
@@ -79,7 +77,7 @@ jobs:
           format: sarif
           output: trivy-fs.sarif
           severity: HIGH,CRITICAL
-          exit-code: 0  # warn only; change to 1 to block the pipeline
+          exit-code: 1  # block pipeline on HIGH/CRITICAL vulnerabilities
 
       - name: Upload Trivy fs results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4

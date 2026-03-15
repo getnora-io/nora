@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
-#![allow(dead_code)] // Foundational code for future S3/Vault integration
 
 //! Secrets management for NORA
 //!
@@ -34,6 +33,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[allow(dead_code)] // Variants used by provider impls; external error handling planned for v0.4
 /// Secrets provider error
 #[derive(Debug, Error)]
 pub enum SecretsError {
@@ -56,9 +56,11 @@ pub enum SecretsError {
 #[async_trait]
 pub trait SecretsProvider: Send + Sync {
     /// Get a secret by key (required)
+    #[allow(dead_code)]
     async fn get_secret(&self, key: &str) -> Result<ProtectedString, SecretsError>;
 
     /// Get a secret by key (optional, returns None if not found)
+    #[allow(dead_code)]
     async fn get_secret_optional(&self, key: &str) -> Option<ProtectedString> {
         self.get_secret(key).await.ok()
     }

@@ -13,12 +13,14 @@ use zeroize::{Zeroize, Zeroizing};
 /// - Implements Zeroize: memory is overwritten with zeros when dropped
 /// - Debug shows `***REDACTED***` instead of actual value
 /// - Clone creates a new protected copy
+#[allow(dead_code)] // Used internally by SecretsProvider impls; external callers planned for v0.4
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct ProtectedString {
     inner: String,
 }
 
+#[allow(dead_code)]
 impl ProtectedString {
     /// Create a new protected string
     pub fn new(value: String) -> Self {
@@ -68,6 +70,7 @@ impl From<&str> for ProtectedString {
 }
 
 /// S3 credentials with protected secrets
+#[allow(dead_code)] // S3 storage backend planned for v0.4
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct S3Credentials {
@@ -77,6 +80,7 @@ pub struct S3Credentials {
     pub region: Option<String>,
 }
 
+#[allow(dead_code)]
 impl S3Credentials {
     pub fn new(access_key_id: String, secret_access_key: String) -> Self {
         Self {

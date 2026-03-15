@@ -127,6 +127,17 @@ jobs:
           cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra
           cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max
 
+      # ── Smoke test ──────────────────────────────────────────────────────────
+      - name: Smoke test — verify alpine image starts and responds
+        run: |
+          docker run --rm -d --name nora-smoke -p 5555:5000 \
+            ${{ env.NORA }}/${{ env.IMAGE_NAME }}:latest
+          for i in $(seq 1 10); do
+            curl -sf http://localhost:5555/health && break || sleep 2
+          done
+          curl -sf http://localhost:5555/health
+          docker stop nora-smoke
+
   scan:
     name: Scan (${{ matrix.name }})
     runs-on: [self-hosted, nora]
