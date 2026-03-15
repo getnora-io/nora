@@ -136,6 +136,7 @@ jobs:
       # -- npm publish/install --
       - name: npm — publish and install package
         run: |
+          echo "//localhost:4000/npm/:_authToken=integration-test" > ~/.npmrc
           mkdir -p /tmp/test-pkg && cd /tmp/test-pkg
           echo '{"name":"nora-integration-test","version":"1.0.0","description":"test"}' > package.json
           echo "module.exports = true;" > index.js
