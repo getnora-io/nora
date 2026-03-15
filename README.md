@@ -173,6 +173,13 @@ nora migrate --from local --to s3
 | `NORA_RATE_LIMIT_GENERAL_BURST` | 200 | General burst size |
 | `NORA_SECRETS_PROVIDER` | env | Secrets provider (`env`) |
 | `NORA_SECRETS_CLEAR_ENV` | false | Clear env vars after reading |
+| `NORA_DOCKER_UPSTREAMS` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
+| `NORA_DOCKER_PROXY_TIMEOUT` | 60 | Docker upstream timeout (seconds) |
+| `NORA_MAVEN_PROXIES` | `https://repo1.maven.org/maven2` | Maven upstreams (`url\|user:pass,...`) |
+| `NORA_NPM_PROXY` | `https://registry.npmjs.org` | npm upstream URL |
+| `NORA_NPM_PROXY_AUTH` | - | npm upstream auth (`user:pass`) |
+| `NORA_PYPI_PROXY` | `https://pypi.org/simple/` | PyPI upstream URL |
+| `NORA_PYPI_PROXY_AUTH` | - | PyPI upstream auth (`user:pass`) |
 
 ### config.toml
 
