@@ -1,11 +1,18 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 
 pub use crate::secrets::SecretsConfig;
+
+/// Encode "user:pass" into a Basic Auth header value, e.g. "Basic dXNlcjpwYXNz".
+/// Returns None if input is None.
+pub fn basic_auth_header(credentials: &str) -> String {
+    format!("Basic {}", STANDARD.encode(credentials))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -348,6 +355,37 @@ impl Default for RateLimitConfig {
 }
 
 impl Config {
+    /// Warn if credentials are configured via config.toml (not env vars)
+    pub fn warn_plaintext_credentials(&self) {
+        // Docker upstreams
+        for (i, upstream) in self.docker.upstreams.iter().enumerate() {
+            if upstream.auth.is_some() && std::env::var("NORA_DOCKER_UPSTREAMS").is_err() {
+                tracing::warn!(
+                    upstream_index = i,
+                    url = %upstream.url,
+                    "Docker upstream credentials in config.toml are plaintext — consider NORA_DOCKER_UPSTREAMS env var"
+                );
+            }
+        }
+        // Maven proxies
+        for proxy in &self.maven.proxies {
+            if proxy.auth().is_some() && std::env::var("NORA_MAVEN_PROXIES").is_err() {
+                tracing::warn!(
+                    url = %proxy.url(),
+                    "Maven proxy credentials in config.toml are plaintext — consider NORA_MAVEN_PROXIES env var"
+                );
+            }
+        }
+        // npm
+        if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
+            tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
+        }
+        // PyPI
+        if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
+            tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
+        }
+    }
+
     /// Load configuration with priority: ENV > config.toml > defaults
     pub fn load() -> Self {
         // 1. Start with defaults
