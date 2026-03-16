@@ -12,6 +12,7 @@ mod gc;
 mod health;
 mod metrics;
 mod migrate;
+mod mirror;
 mod openapi;
 mod rate_limit;
 mod registry;
@@ -81,6 +82,17 @@ enum Commands {
         /// Dry run - show what would be migrated without copying
         #[arg(long, default_value = "false")]
         dry_run: bool,
+    },
+    /// Pre-fetch dependencies through NORA proxy cache
+    Mirror {
+        #[command(subcommand)]
+        format: mirror::MirrorFormat,
+        /// NORA registry URL
+        #[arg(long, default_value = "http://localhost:4000", global = true)]
+        registry: String,
+        /// Max concurrent downloads
+        #[arg(long, default_value = "8", global = true)]
+        concurrency: usize,
     },
 }
 
@@ -162,6 +174,16 @@ async fn main() {
             println!("  Deleted:           {}", result.deleted_blobs);
             if dry_run && !result.orphan_keys.is_empty() {
                 println!("\nRun without --dry-run to delete orphaned blobs.");
+            }
+        }
+        Some(Commands::Mirror {
+            format,
+            registry,
+            concurrency,
+        }) => {
+            if let Err(e) = mirror::run_mirror(format, &registry, concurrency).await {
+                error!("Mirror failed: {}", e);
+                std::process::exit(1);
             }
         }
         Some(Commands::Migrate { from, to, dry_run }) => {
