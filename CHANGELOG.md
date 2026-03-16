@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.31] - 2026-03-16
+
+### Added / Добавлено
+- **npm URL rewriting**: Tarball URLs in proxied metadata now rewritten to point to NORA (previously tarballs bypassed NORA and downloaded directly from npmjs.org)
+- **npm scoped packages**: Full support for `@scope/package` in proxy handler and repository index
+- **npm publish**: `PUT /npm/{package}` accepts standard npm publish payload with base64-encoded tarballs
+- **npm metadata TTL**: Configurable cache TTL (`NORA_NPM_METADATA_TTL`, default 300s) with stale-while-revalidate fallback
+- **Immutable cache**: SHA256 integrity verification on cached npm tarballs — detects tampering on cache hit
+- **npm URL rewriting**: Tarball URL в проксированных метаданных теперь переписываются на NORA (ранее тарболы шли напрямую из npmjs.org)
+- **npm scoped packages**: Полная поддержка `@scope/package` в прокси-хендлере и индексе репозитория
+- **npm publish**: `PUT /npm/{package}` принимает стандартный npm publish payload с base64-тарболами
+- **npm metadata TTL**: Настраиваемый TTL кеша (`NORA_NPM_METADATA_TTL`, default 300s) с stale-while-revalidate
+- **Immutable cache**: SHA256 проверка целостности npm-тарболов — обнаружение подмены при отдаче из кеша
+
+### Security / Безопасность
+- **Path traversal protection**: Attachment filename validation in npm publish (rejects `../`, `/`, `\`)
+- **Package name mismatch**: npm publish rejects payloads where URL path doesn't match `name` field (anti-spoofing)
+- **Version immutability**: npm publish returns 409 Conflict on duplicate version
+- **Защита от path traversal**: Валидация имён файлов в npm publish (отклоняет `../`, `/`, `\`)
+- **Проверка имени пакета**: npm publish отклоняет payload если имя в URL не совпадает с полем `name` (anti-spoofing)
+- **Иммутабельность версий**: npm publish возвращает 409 Conflict при попытке перезаписать версию
+
+### Fixed / Исправлено
+- **npm proxy_auth**: `proxy_auth` field was configured but not wired into `fetch_from_proxy` — now sends Basic Auth header to upstream
+- **npm proxy_auth**: Поле `proxy_auth` было в конфиге, но не передавалось в `fetch_from_proxy` — теперь отправляет Basic Auth в upstream
+
+
+
 All notable changes to NORA will be documented in this file.
 
 ---
