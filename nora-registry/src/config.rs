@@ -112,6 +112,9 @@ pub struct NpmConfig {
     pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+    /// Metadata cache TTL in seconds (default: 300 = 5 min). Set to 0 to cache forever.
+    #[serde(default = "default_metadata_ttl")]
+    pub metadata_ttl: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +218,10 @@ fn default_timeout() -> u64 {
     30
 }
 
+fn default_metadata_ttl() -> u64 {
+    300 // 5 minutes
+}
+
 impl Default for MavenConfig {
     fn default() -> Self {
         Self {
@@ -232,6 +239,7 @@ impl Default for NpmConfig {
             proxy: Some("https://registry.npmjs.org".to_string()),
             proxy_auth: None,
             proxy_timeout: 30,
+            metadata_ttl: 300,
         }
     }
 }
@@ -484,6 +492,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_NPM_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
                 self.npm.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_NPM_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.npm.metadata_ttl = ttl;
             }
         }
 
