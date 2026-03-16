@@ -200,12 +200,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         MountPoint {
             registry: "Docker".to_string(),
             mount_path: "/v2/".to_string(),
-            proxy_upstream: state
-                .config
-                .docker
-                .upstreams
-                .first()
-                .map(|u| u.url.clone()),
+            proxy_upstream: state.config.docker.upstreams.first().map(|u| u.url.clone()),
         },
         MountPoint {
             registry: "Maven".to_string(),
