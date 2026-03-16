@@ -7,11 +7,11 @@
 [![Docs](https://img.shields.io/badge/docs-getnora.dev-green?logo=gitbook)](https://getnora.dev)
 [![Telegram](https://img.shields.io/badge/Telegram-Community-blue?logo=telegram)](https://t.me/getnora)
 
-> **Your Cloud-Native Artifact Registry**
+> **Multi-protocol artifact registry that doesn't suck.**
+>
+> One binary. All protocols. Stupidly fast.
 
-Fast. Organized. Feel at Home.
-
-**10x faster** than Nexus | **< 100 MB RAM** | **32 MB Docker image**
+**32 MB** binary | **< 100 MB** RAM | **3s** startup | **5** protocols
 
 ## Features
 
@@ -160,9 +160,14 @@ path = "data/storage"
 enabled = false
 htpasswd_file = "users.htpasswd"
 
+[docker]
+proxy_timeout = 60
+
+[[docker.upstreams]]
+url = "https://registry-1.docker.io"
 ```
 
-See [full config reference](https://getnora.dev/configuration/settings/) for rate limiting, secrets, and proxy settings.
+See [full config reference](https://getnora.dev/configuration/settings/) for rate limiting, secrets, proxy auth, and all options.
 
 ## Endpoints
 
@@ -181,20 +186,7 @@ See [full config reference](https://getnora.dev/configuration/settings/) for rat
 
 ## TLS / HTTPS
 
-NORA serves plain HTTP by design. **TLS is intentionally not built into the binary** — this is a deliberate architectural decision:
-
-- **Single responsibility**: NORA manages artifacts, not certificates. Embedding TLS means bundling Let's Encrypt clients, certificate renewal logic, ACME challenges, and custom CA support — all of which already exist in battle-tested tools.
-- **Operational simplicity**: One place for certificates (reverse proxy), not scattered across every service. When a cert expires, you fix it in one config — not in NORA, Grafana, GitLab, and every other service separately.
-- **Industry standard**: Docker Hub, GitHub Container Registry, AWS ECR, Harbor, Nexus — none of them terminate TLS in the registry process. A reverse proxy in front is the universal pattern.
-- **Zero-config internal use**: On trusted networks (lab, CI/CD), NORA works out of the box without generating self-signed certs or managing keystores.
-
-### Production (recommended): reverse proxy with auto-TLS
-
-```
-Client → Caddy/Nginx (HTTPS, port 443) → NORA (HTTP, port 4000)
-```
-
-Caddy example:
+NORA serves plain HTTP. Use a reverse proxy for TLS:
 
 ```
 registry.example.com {
@@ -202,27 +194,7 @@ registry.example.com {
 }
 ```
 
-Nginx example:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name registry.example.com;
-    ssl_certificate     /etc/letsencrypt/live/registry.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/registry.example.com/privkey.pem;
-    client_max_body_size 0;  # unlimited for large image pushes
-    location / {
-        proxy_pass http://127.0.0.1:4000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-### Internal / Lab: insecure registry
-
-If you run NORA without TLS (e.g., on a private network), configure Docker to trust it:
+For internal networks without TLS, configure Docker:
 
 ```json
 // /etc/docker/daemon.json
@@ -231,24 +203,11 @@ If you run NORA without TLS (e.g., on a private network), configure Docker to tr
 }
 ```
 
-Then restart Docker:
-
-```bash
-sudo systemctl restart docker
-```
-
-> **Note:** `insecure-registries` disables TLS verification for that host. Use only on trusted networks.
+See [TLS / HTTPS guide](https://getnora.dev/configuration/tls/) for Nginx, Traefik, and custom CA setup.
 
 ## FSTEC-Certified OS Builds
 
-NORA provides dedicated Dockerfiles for Russian FSTEC-certified operating systems:
-
-- `Dockerfile.astra` — Astra Linux SE (for government and defense sector)
-- `Dockerfile.redos` — RED OS (for enterprise and public sector)
-
-Both use `scratch` base with statically-linked binary for minimal attack surface. Comments in each file show how to switch to official distro base images if required by your security policy.
-
-These builds are published as `-astra` and `-redos` tagged images in GitHub Releases.
+Dedicated builds for Astra Linux SE and RED OS are published as `-astra` and `-redos` tagged images in every [GitHub Release](https://github.com/getnora-io/nora/releases). Both use `scratch` base with statically-linked binary.
 
 ## Performance
 
@@ -257,6 +216,16 @@ These builds are published as `-astra` and `-redos` tagged images in GitHub Rele
 | Startup | < 3s | 30-60s | 30-60s |
 | Memory | < 100 MB | 2-4 GB | 2-4 GB |
 | Image Size | 32 MB | 600+ MB | 1+ GB |
+
+## Roadmap
+
+- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
+- **Online Garbage Collection** — non-blocking cleanup without registry downtime
+- **Retention Policies** — declarative rules: keep last N tags, delete older than X days
+- **Image Signing** — cosign/notation verification and policy enforcement
+- **Replication** — push/pull sync between NORA instances
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Author
 
