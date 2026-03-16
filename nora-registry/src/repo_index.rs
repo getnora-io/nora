@@ -173,39 +173,35 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
         }
 
         if let Some(rest) = key.strip_prefix("docker/") {
-            // Support namespaced repos: docker/{ns}/{name}/manifests/{tag}.json
-            // and flat repos: docker/{name}/manifests/{tag}.json
-            if let Some(manifests_pos) = rest.find("/manifests/") {
-                let name = rest[..manifests_pos].to_string();
-                let after_manifests = &rest[manifests_pos + "/manifests/".len()..];
-                if !after_manifests.is_empty() && key.ends_with(".json") {
-                    let entry = repos.entry(name).or_insert((0, 0, 0));
-                    entry.0 += 1;
+            let parts: Vec<_> = rest.split('/').collect();
+            if parts.len() >= 3 && parts[1] == "manifests" && key.ends_with(".json") {
+                let name = parts[0].to_string();
+                let entry = repos.entry(name).or_insert((0, 0, 0));
+                entry.0 += 1;
 
-                    if let Ok(data) = storage.get(key).await {
-                        if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            let cfg = m
-                                .get("config")
-                                .and_then(|c| c.get("size"))
-                                .and_then(|s| s.as_u64())
-                                .unwrap_or(0);
-                            let layers: u64 = m
-                                .get("layers")
-                                .and_then(|l| l.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
-                                        .sum()
-                                })
-                                .unwrap_or(0);
-                            entry.1 += cfg + layers;
-                        }
+                if let Ok(data) = storage.get(key).await {
+                    if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        let cfg = m
+                            .get("config")
+                            .and_then(|c| c.get("size"))
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0);
+                        let layers: u64 = m
+                            .get("layers")
+                            .and_then(|l| l.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        entry.1 += cfg + layers;
                     }
+                }
 
-                    if let Some(meta) = storage.stat(key).await {
-                        if meta.modified > entry.2 {
-                            entry.2 = meta.modified;
-                        }
+                if let Some(meta) = storage.stat(key).await {
+                    if meta.modified > entry.2 {
+                        entry.2 = meta.modified;
                     }
                 }
             }
@@ -244,14 +240,20 @@ async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("npm/").await;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    // Count tarballs first, then fall back to metadata.json for proxy-cached packages
+    // Count tarballs instead of parsing metadata.json (faster than parsing JSON)
     for key in &keys {
         if let Some(rest) = key.strip_prefix("npm/") {
+            // Pattern: npm/{package}/tarballs/{file}.tgz
+            // Scoped:  npm/@scope/package/tarballs/{file}.tgz
             if rest.contains("/tarballs/") && key.ends_with(".tgz") {
-                // Pattern: npm/{package}/tarballs/{file}.tgz
                 let parts: Vec<_> = rest.split('/').collect();
                 if !parts.is_empty() {
-                    let name = parts[0].to_string();
+                    // Scoped packages: @scope/package → parts[0]="@scope", parts[1]="package"
+                    let name = if parts[0].starts_with('@') && parts.len() >= 4 {
+                        format!("{}/{}", parts[0], parts[1])
+                    } else {
+                        parts[0].to_string()
+                    };
                     let entry = packages.entry(name).or_insert((0, 0, 0));
                     entry.0 += 1;
 
@@ -259,21 +261,6 @@ async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
                         entry.1 += meta.size;
                         if meta.modified > entry.2 {
                             entry.2 = meta.modified;
-                        }
-                    }
-                }
-            } else if rest.ends_with("/metadata.json") {
-                // Proxy-cached package: npm/{package}/metadata.json
-                // Show package in list but don't inflate version count from upstream metadata
-                if let Some(name) = rest.strip_suffix("/metadata.json") {
-                    if !name.contains('/') {
-                        packages.entry(name.to_string()).or_insert((0, 0, 0));
-                        if let Some(stat) = storage.stat(key).await {
-                            let entry = packages.get_mut(name).unwrap();
-                            entry.1 += stat.size;
-                            if stat.modified > entry.2 {
-                                entry.2 = stat.modified;
-                            }
                         }
                     }
                 }
