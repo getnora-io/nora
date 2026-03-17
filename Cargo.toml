@@ -4,6 +4,7 @@ members = [
     "nora-registry",
     "nora-storage",
     "nora-cli",
+    "fuzz",
 ]
 
 [workspace.package]

@@ -1,0 +1,22 @@
+[package]
+name = "nora-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nora-registry = { path = "../nora-registry" }
+
+[[bin]]
+name = "fuzz_validation"
+path = "fuzz_targets/fuzz_validation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_docker_manifest"
+path = "fuzz_targets/fuzz_docker_manifest.rs"
+doc = false

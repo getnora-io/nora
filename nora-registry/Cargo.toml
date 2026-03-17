@@ -10,6 +10,10 @@ description = "Cloud-Native Artifact Registry - Fast, lightweight, multi-protoco
 keywords = ["registry", "docker", "artifacts", "cloud-native", "devops"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]
 
+[lib]
+name = "nora_registry"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nora"
 path = "src/main.rs"
