@@ -6,18 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+permissions: read-all
+
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Check formatting
         run: cargo fmt --check
@@ -33,18 +35,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write  # for uploading SARIF to GitHub Security tab
+      security-events: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          fetch-depth: 0  # full history required for gitleaks
+          fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       # ── Secrets ────────────────────────────────────────────────────────────
       - name: Gitleaks — scan for hardcoded secrets
@@ -58,11 +60,11 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: cargo audit — RustSec advisory database
-        run: cargo audit --ignore RUSTSEC-2025-0119  # known: number_prefix via indicatif
+        run: cargo audit --ignore RUSTSEC-2025-0119
 
       # ── Licenses, banned crates, supply chain policy ────────────────────────
       - name: cargo deny — licenses and banned crates
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
         with:
           command: check
           arguments: --all-features
@@ -70,17 +72,17 @@ jobs:
       # ── CVE scan of source tree and Cargo.lock ──────────────────────────────
       - name: Trivy — filesystem scan (Cargo.lock + source)
         if: always()
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           scan-type: fs
           scan-ref: .
           format: sarif
           output: trivy-fs.sarif
           severity: HIGH,CRITICAL
-          exit-code: 1  # block pipeline on HIGH/CRITICAL vulnerabilities
+          exit-code: 1
 
       - name: Upload Trivy fs results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
         if: always()
         with:
           sarif_file: trivy-fs.sarif
@@ -92,18 +94,17 @@ jobs:
     needs: test
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Build NORA
         run: cargo build --release --package nora-registry
 
-      # -- Start NORA --
       - name: Start NORA
         run: |
           NORA_STORAGE_PATH=/tmp/nora-data ./target/release/nora &
@@ -112,7 +113,6 @@ jobs:
           done
           curl -sf http://localhost:4000/health | jq .
 
-      # -- Docker push/pull --
       - name: Configure Docker for insecure registry
         run: |
           echo '{"insecure-registries": ["localhost:4000"]}' | sudo tee /etc/docker/daemon.json
@@ -133,38 +133,35 @@ jobs:
           curl -sf http://localhost:4000/v2/_catalog | jq .
           curl -sf http://localhost:4000/v2/test/alpine/tags/list | jq .
 
-      # -- npm (read-only proxy, no publish support yet) --
       - name: npm — verify registry endpoint
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/npm/lodash)
           echo "npm endpoint returned: $STATUS"
           [ "$STATUS" != "000" ] && echo "npm endpoint OK" || (echo "npm endpoint unreachable" && exit 1)
 
-      # -- Maven deploy/download --
       - name: Maven — deploy and download artifact
         run: |
           echo "test-artifact-content-$(date +%s)" > /tmp/test-artifact.jar
           CHECKSUM=$(sha256sum /tmp/test-artifact.jar | cut -d' ' -f1)
-          curl -sf -X PUT --data-binary @/tmp/test-artifact.jar             http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
-          curl -sf -o /tmp/downloaded.jar             http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          curl -sf -X PUT --data-binary @/tmp/test-artifact.jar \
+            http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          curl -sf -o /tmp/downloaded.jar \
+            http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
           DOWNLOAD_CHECKSUM=$(sha256sum /tmp/downloaded.jar | cut -d' ' -f1)
           [ "$CHECKSUM" = "$DOWNLOAD_CHECKSUM" ] && echo "Maven deploy/download OK" || (echo "Checksum mismatch!" && exit 1)
 
-      # -- PyPI (read-only proxy, no upload support yet) --
       - name: PyPI — verify simple index
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/simple/)
           echo "PyPI simple index returned: $STATUS"
           [ "$STATUS" = "200" ] && echo "PyPI endpoint OK" || (echo "Expected 200, got $STATUS" && exit 1)
 
-      # -- Cargo (read-only proxy, no publish support yet) --
       - name: Cargo — verify registry API responds
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/cargo/api/v1/crates/serde)
           echo "Cargo API returned: $STATUS"
           [ "$STATUS" != "000" ] && echo "Cargo endpoint OK" || (echo "Cargo endpoint unreachable" && exit 1)
 
-      # -- API checks --
       - name: API — health, ready, metrics
         run: |
           curl -sf http://localhost:4000/health | jq .status
