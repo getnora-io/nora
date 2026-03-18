@@ -214,6 +214,38 @@ async fn download_blob(
         }
     }
 
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            if let Ok(data) = fetch_blob_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &digest,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+            )
+            .await
+            {
+                let storage = state.storage.clone();
+                let key_clone = key.clone();
+                let data_clone = data.clone();
+                tokio::spawn(async move {
+                    let _ = storage.put(&key_clone, &data_clone).await;
+                });
+
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    Bytes::from(data),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -450,6 +482,57 @@ async fn get_manifest(
                 Bytes::from(data),
             )
                 .into_response();
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            if let Ok((data, content_type)) = fetch_manifest_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &reference,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+            )
+            .await
+            {
+                state.metrics.record_download("docker");
+                state.metrics.record_cache_miss();
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    format!("{}:{}", name, reference),
+                    "docker",
+                    "PROXY",
+                ));
+
+                use sha2::Digest;
+                let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+
+                // Cache under original name for future local hits
+                let storage = state.storage.clone();
+                let key_clone = key.clone();
+                let data_clone = data.clone();
+                tokio::spawn(async move {
+                    let _ = storage.put(&key_clone, &data_clone).await;
+                });
+
+                state.repo_index.invalidate("docker");
+
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (HeaderName::from_static("docker-content-digest"), digest),
+                    ],
+                    Bytes::from(data),
+                )
+                    .into_response();
+            }
         }
     }
 

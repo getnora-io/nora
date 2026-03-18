@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.31"
+version = "0.2.32"
 edition = "2021"
 license = "MIT"
 authors = ["DevITWay <devitway@gmail.com>"]

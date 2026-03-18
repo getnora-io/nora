@@ -173,35 +173,41 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
         }
 
         if let Some(rest) = key.strip_prefix("docker/") {
+            // Support both single-segment and namespaced images:
+            // docker/alpine/manifests/latest.json → name="alpine"
+            // docker/library/alpine/manifests/latest.json → name="library/alpine"
             let parts: Vec<_> = rest.split('/').collect();
-            if parts.len() >= 3 && parts[1] == "manifests" && key.ends_with(".json") {
-                let name = parts[0].to_string();
-                let entry = repos.entry(name).or_insert((0, 0, 0));
-                entry.0 += 1;
+            let manifest_pos = parts.iter().position(|&p| p == "manifests");
+            if let Some(pos) = manifest_pos {
+                if pos >= 1 && key.ends_with(".json") {
+                    let name = parts[..pos].join("/");
+                    let entry = repos.entry(name).or_insert((0, 0, 0));
+                    entry.0 += 1;
 
-                if let Ok(data) = storage.get(key).await {
-                    if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let cfg = m
-                            .get("config")
-                            .and_then(|c| c.get("size"))
-                            .and_then(|s| s.as_u64())
-                            .unwrap_or(0);
-                        let layers: u64 = m
-                            .get("layers")
-                            .and_then(|l| l.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
-                                    .sum()
-                            })
-                            .unwrap_or(0);
-                        entry.1 += cfg + layers;
+                    if let Ok(data) = storage.get(key).await {
+                        if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
+                            let cfg = m
+                                .get("config")
+                                .and_then(|c| c.get("size"))
+                                .and_then(|s| s.as_u64())
+                                .unwrap_or(0);
+                            let layers: u64 = m
+                                .get("layers")
+                                .and_then(|l| l.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                                        .sum()
+                                })
+                                .unwrap_or(0);
+                            entry.1 += cfg + layers;
+                        }
                     }
-                }
 
-                if let Some(meta) = storage.stat(key).await {
-                    if meta.modified > entry.2 {
-                        entry.2 = meta.modified;
+                    if let Some(meta) = storage.stat(key).await {
+                        if meta.modified > entry.2 {
+                            entry.2 = meta.modified;
+                        }
                     }
                 }
             }
