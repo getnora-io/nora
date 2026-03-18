@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.32] - 2026-03-18
+
+### Fixed / Исправлено
+- **Docker dashboard**: Namespaced images (library/alpine, grafana/grafana) now visible in UI — index builder finds manifests by position, not fixed index
+- **Docker proxy**: Auto-prepend `library/` for single-segment official Hub images (nginx, alpine, node) — no need to explicitly use library/ prefix
+- **CI**: Fixed cargo-deny license checks (NCSA for libfuzzer-sys, MIT for fuzz crate, unused-allowed-license config)
+- **Docker dashboard**: Namespaced-образы (library/alpine, grafana/grafana) теперь отображаются в UI
+- **Docker proxy**: Автоподстановка `library/` для официальных образов Docker Hub (nginx, alpine, node) — больше не нужно указывать library/ вручную
+- **CI**: Исправлены проверки лицензий cargo-deny
+
+
+
 ## [0.2.31] - 2026-03-16
 
 ### Added / Добавлено
