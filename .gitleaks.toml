@@ -30,6 +30,22 @@ title = "NORA gitleaks rules"
   regex = '''internal-config'''
   tags = ["internal"]
 
+[[rules]]
+  id = "extended-filter-2"
+  description = "Internal development methodology references"
+  regex = '''(?i)(blocked-term|panel.*expert|review-process|blocked-term.*панел|review-process|prompt.*engineer|first.principles|12.factor.*review|scorecard.*boost)'''
+  tags = ["internal"]
+  [rules.allowlist]
+    paths = ['''\.gitleaks\.toml$''']
+
+[[rules]]
+  id = "extended-filter-3"
+  description = "Code comments referencing internal review process"
+  regex = '''(?i)(reviewer.approved|reviewer.approved|kelsey.*said|security.*review.*panel|design.*approved)'''
+  tags = ["internal"]
+  [rules.allowlist]
+    paths = ['''\.gitleaks\.toml$''']
+
 [allowlist]
   description = "Allowlist for false positives"
   paths = [
