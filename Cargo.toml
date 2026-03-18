@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "nora-registry",
-    "nora-storage",
-    "nora-cli",
     "fuzz",
 ]
 
