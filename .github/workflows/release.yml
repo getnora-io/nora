@@ -90,7 +90,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=redos
+            type=raw,value=latest
 
       - name: Build and push (redos)
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
@@ -116,7 +116,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=astra
+            type=raw,value=latest
 
       - name: Build and push (astra)
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
