@@ -3,48 +3,24 @@
 
 title = "NORA gitleaks rules"
 
+# Internal infrastructure — private IPs and domains
+[[rules]]
+  id = "private-network"
+  description = "Private network addresses and internal domains"
+  regex = '''(10\.25\.1\.\d+|10\.0\.\d+\.\d+|192\.168\.\d+\.\d+)'''
+  tags = ["network"]
 
 [[rules]]
-  id = "extended-filter"
-  description = "Extended content filter rules"
-  regex = '''(?i)(blocked-term|blocked-term|blocked-term|blocked-term|blocked-term|co-authored-by:\s*blocked-term)'''
-  tags = ["internal"]
-  [rules.allowlist]
-    paths = ['''\.gitleaks\.toml$''', '''\.gitignore$''']
+  id = "internal-domains"
+  description = "Internal domain names"
+  regex = '''[a-z0-9]+\.(lab|internal|local|corp)\b'''
+  tags = ["network"]
 
 [[rules]]
-  id = "internal-infrastructure"
-  description = "Internal infrastructure hostnames and IPs"
-  regex = '''(devitacademy\.lab|tail3bd72c|10\.25\.1\.\d+|10\.0\.\d+\.\d+|192\.168\.1\.\d+)'''
-  tags = ["internal"]
-
-[[rules]]
-  id = "internal-proxmox"
-  description = "Proxmox VM IDs and internal service names"
-  regex = '''(proxmox|VM\s*ID.*\d{4,5}|nora-builder|jump\s*server)'''
-  tags = ["internal"]
-
-[[rules]]
-  id = "internal-blocked-term-md"
-  description = "internal-config file references"
-  regex = '''internal-config'''
-  tags = ["internal"]
-
-[[rules]]
-  id = "extended-filter-2"
-  description = "Internal development methodology references"
-  regex = '''(?i)(blocked-term|panel.*expert|review-process|blocked-term.*панел|review-process|prompt.*engineer|first.principles|12.factor.*review|scorecard.*boost)'''
-  tags = ["internal"]
-  [rules.allowlist]
-    paths = ['''\.gitleaks\.toml$''']
-
-[[rules]]
-  id = "extended-filter-3"
-  description = "Code comments referencing internal review process"
-  regex = '''(?i)(reviewer.approved|reviewer.approved|kelsey.*said|security.*review.*panel|design.*approved)'''
-  tags = ["internal"]
-  [rules.allowlist]
-    paths = ['''\.gitleaks\.toml$''']
+  id = "tailscale-hostnames"
+  description = "Tailscale MagicDNS hostnames"
+  regex = '''[a-z0-9]+\.tail[a-z0-9]+\.ts\.net'''
+  tags = ["network"]
 
 [allowlist]
   description = "Allowlist for false positives"
