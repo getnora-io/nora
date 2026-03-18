@@ -53,7 +53,7 @@ jobs:
         run: |
           curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
             | tar xz -C /usr/local/bin gitleaks
-          gitleaks detect --source . --exit-code 1 --report-format sarif --report-path gitleaks.sarif
+          gitleaks detect --source . --config .gitleaks.toml --exit-code 1 --report-format sarif --report-path gitleaks.sarif
 
       # ── CVE in Rust dependencies ────────────────────────────────────────────
       - name: Install cargo-audit
