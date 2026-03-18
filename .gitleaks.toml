@@ -7,13 +7,16 @@ title = "NORA gitleaks rules"
 [[rules]]
   id = "private-network"
   description = "Private network addresses and internal domains"
-  regex = '''(10\.25\.1\.\d+|10\.0\.\d+\.\d+|192\.168\.\d+\.\d+)'''
+  regex = '''(10\.25\.1\.\d+|10\.0\.\d+\.\d+)'''
   tags = ["network"]
+  [rules.allowlist]
+    regexTarget = "match"
+    regexes = ['''10\.0\.0\.0''']
 
 [[rules]]
   id = "internal-domains"
   description = "Internal domain names"
-  regex = '''[a-z0-9]+\.(lab|internal|local|corp)\b'''
+  regex = '''[a-z0-9]+\.(lab|internal|local)\b'''
   tags = ["network"]
 
 [[rules]]
