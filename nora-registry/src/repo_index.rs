@@ -3,7 +3,7 @@
 
 //! In-memory repository index with lazy rebuild on invalidation.
 //!
-//! Design (designed for efficiency):
+//! Design:
 //! - Rebuild happens ONLY on write operations, not TTL
 //! - Double-checked locking prevents duplicate rebuilds
 //! - Arc<Vec> for zero-cost reads
