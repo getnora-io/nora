@@ -14,58 +14,71 @@ Thank you for your interest in contributing to NORA!
 # Install Rust (if needed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Enable pre-commit hooks (important!)
-git config core.hooksPath .githooks
-
 # Build
-cargo build
+cargo build --package nora-registry
 
-# Run tests
-cargo test
+# Run tests (important: always use --lib --bin nora to skip fuzz targets)
+cargo test --lib --bin nora
+
+# Run clippy
+cargo clippy --package nora-registry -- -D warnings
+
+# Format
+cargo fmt
 
 # Run locally
 cargo run --bin nora -- serve
 ```
 
+## Before Submitting a PR
+
+```bash
+cargo fmt --check
+cargo clippy --package nora-registry -- -D warnings
+cargo test --lib --bin nora
+```
+
+All three must pass. CI will enforce this.
+
 ## Code Style
 
 - Run `cargo fmt` before committing
-- Run `cargo clippy` and fix warnings
+- Fix all `cargo clippy` warnings
 - Follow Rust naming conventions
+- Keep functions short and focused
+- Add tests for new functionality
 
 ## Pull Request Process
 
-1. Update documentation if needed
-2. Add tests for new features
-3. Ensure all tests pass: `cargo test`
-4. Ensure code is formatted: `cargo fmt --check`
-5. Ensure no clippy warnings: `cargo clippy`
+1. Update CHANGELOG.md if the change is user-facing
+2. Add tests for new features or bug fixes
+3. Ensure CI passes (fmt, clippy, test, security checks)
+4. Keep PRs focused — one feature or fix per PR
 
 ## Commit Messages
 
 Use conventional commits:
 
-- `feat:` - new feature
-- `fix:` - bug fix
-- `docs:` - documentation
-- `style:` - formatting
-- `refactor:` - code refactoring
-- `test:` - adding tests
-- `chore:` - maintenance
+- `feat:` new feature
+- `fix:` bug fix
+- `docs:` documentation
+- `test:` adding or updating tests
+- `security:` security improvements
+- `chore:` maintenance
 
-Example: `feat: add OAuth2 authentication`
+Example: `feat: add npm scoped package support`
 
 ## Reporting Issues
 
-- Use GitHub Issues
+- Use GitHub Issues with the provided templates
 - Include steps to reproduce
-- Include NORA version and OS
+- Include NORA version (`nora --version`) and OS
 
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
 
-## Contact
+## Community
 
-- Telegram: [@DevITWay](https://t.me/DevITWay)
+- Telegram: [@getnora](https://t.me/getnora)
 - GitHub Issues: [getnora-io/nora](https://github.com/getnora-io/nora/issues)
