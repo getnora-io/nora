@@ -37,6 +37,26 @@ else
 fi
 
 chmod +x /tmp/nora
+
+# Verify signature if cosign is available
+if command -v cosign &>/dev/null; then
+    echo "Verifying binary signature..."
+    SIG_URL="${DOWNLOAD_URL}.sig"
+    CERT_URL="${DOWNLOAD_URL}.pem"
+    if curl -fsSL -o /tmp/nora.sig "$SIG_URL" 2>/dev/null && \
+       curl -fsSL -o /tmp/nora.pem "$CERT_URL" 2>/dev/null; then
+        cosign verify-blob --signature /tmp/nora.sig --certificate /tmp/nora.pem \
+            --certificate-identity-regexp "github.com/getnora-io/nora" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            /tmp/nora && echo "Signature verified." || echo "Warning: signature verification failed."
+        rm -f /tmp/nora.sig /tmp/nora.pem
+    else
+        echo "Signature files not available, skipping verification."
+    fi
+else
+    echo "Install cosign for binary signature verification: https://docs.sigstore.dev/cosign/system_config/installation/"
+fi
+
 sudo mv /tmp/nora "$INSTALL_DIR/nora"
 
 # Create system user
