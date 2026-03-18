@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # Binary is pre-built by CI (cargo build --release) and passed via context
-FROM alpine:3.20
+FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
 
 RUN apk add --no-cache ca-certificates && mkdir -p /data
 

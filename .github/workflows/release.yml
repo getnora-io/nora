@@ -18,6 +18,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write  # Sigstore cosign keyless signing
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -130,6 +131,17 @@ jobs:
           cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max
 
       # ── Smoke test ──────────────────────────────────────────────────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd1d5ad67616c25 # v3
+
+      - name: Sign Docker images (keyless Sigstore)
+        run: |
+          TAGS=($(echo "${{ steps.meta-alpine.outputs.tags }}" | tr "\n" " "))
+          for tag in "${TAGS[@]}"; do
+            [[ "$tag" == *"localhost"* ]] && continue
+            cosign sign --yes "$tag"
+          done
+
       - name: Smoke test — verify alpine image starts and responds
         run: |
           docker rm -f nora-smoke 2>/dev/null || true
@@ -189,7 +201,8 @@ jobs:
     needs: [build, scan]
     permissions:
       contents: write
-      packages: read
+      id-token: write  # Sigstore cosign keyless signing
+      packages: write  # cosign needs push for signatures
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -226,6 +239,12 @@ jobs:
           format: cyclonedx-json
           output-file: nora-${{ github.ref_name }}.sbom.cdx.json
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd1d5ad67616c25 # v3
+
+      - name: Sign binary with cosign (keyless Sigstore)
+        run: cosign sign-blob --yes --output-signature nora-linux-amd64.sig --output-certificate nora-linux-amd64.pem ./nora-linux-amd64
+
       - name: Create Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
@@ -233,6 +252,8 @@ jobs:
           files: |
             nora-linux-amd64
             nora-linux-amd64.sha256
+            nora-linux-amd64.sig
+            nora-linux-amd64.pem
             nora-${{ github.ref_name }}.sbom.spdx.json
             nora-${{ github.ref_name }}.sbom.cdx.json
           body: |
