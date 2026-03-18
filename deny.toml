@@ -25,6 +25,7 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",   # webpki-roots (CA certificates bundle)
     "MPL-2.0",
+    "NCSA",  # libfuzzer-sys (LLVM fuzzer)
 ]
 
 [bans]
