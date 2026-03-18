@@ -1,8 +1,38 @@
 # Gitleaks configuration
 # https://github.com/gitleaks/gitleaks
 
+title = "NORA gitleaks rules"
+
+
+[[rules]]
+  id = "extended-filter"
+  description = "Extended content filter rules"
+  regex = '''(?i)(blocked-term|blocked-term|blocked-term|blocked-term|blocked-term|co-authored-by:\s*blocked-term)'''
+  tags = ["internal"]
+  [rules.allowlist]
+    paths = ['''\.gitleaks\.toml$''', '''\.gitignore$''']
+
+[[rules]]
+  id = "internal-infrastructure"
+  description = "Internal infrastructure hostnames and IPs"
+  regex = '''(devitacademy\.lab|tail3bd72c|10\.25\.1\.\d+|10\.0\.\d+\.\d+|192\.168\.1\.\d+)'''
+  tags = ["internal"]
+
+[[rules]]
+  id = "internal-proxmox"
+  description = "Proxmox VM IDs and internal service names"
+  regex = '''(proxmox|VM\s*ID.*\d{4,5}|nora-builder|jump\s*server)'''
+  tags = ["internal"]
+
+[[rules]]
+  id = "internal-blocked-term-md"
+  description = "internal-config file references"
+  regex = '''internal-config'''
+  tags = ["internal"]
+
 [allowlist]
   description = "Allowlist for false positives"
-
-  # Documentation examples with placeholder credentials
-  commits = ["92155cf6574d89f93ee68503a7b68455ceaa19af"]
+  paths = [
+    '''\.gitleaks\.toml$''',
+    '''\.gitignore$''',
+  ]
