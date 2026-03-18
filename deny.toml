@@ -9,6 +9,7 @@ ignore = [
 ]
 
 [licenses]
+unused = "allow"
 # Allowed open-source licenses
 allow = [
     "MIT",
