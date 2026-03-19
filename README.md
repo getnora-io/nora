@@ -39,6 +39,11 @@
 - **Security**
   - Basic Auth (htpasswd + bcrypt)
   - Revocable API tokens with RBAC
+  - Blob digest verification (SHA256)
+  - Non-root container images
+  - Security headers (CSP, X-Frame-Options, nosniff)
+  - Upload session limits (DoS protection)
+  - Configurable upload size for ML models (`NORA_MAX_UPLOAD_SESSION_SIZE_MB`)
   - ENV-based configuration (12-Factor)
   - SBOM (SPDX + CycloneDX) in every release
   - See [SECURITY.md](SECURITY.md) for vulnerability reporting

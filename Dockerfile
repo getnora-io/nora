@@ -2,9 +2,11 @@
 # Binary is pre-built by CI (cargo build --release) and passed via context
 FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
 
-RUN apk add --no-cache ca-certificates && mkdir -p /data
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S nora && adduser -S -G nora nora \
+    && mkdir -p /data && chown nora:nora /data
 
-COPY nora /usr/local/bin/nora
+COPY --chown=nora:nora nora /usr/local/bin/nora
 
 ENV RUST_LOG=info
 ENV NORA_HOST=0.0.0.0
@@ -16,6 +18,8 @@ ENV NORA_AUTH_TOKEN_STORAGE=/data/tokens
 EXPOSE 4000
 
 VOLUME ["/data"]
+
+USER nora
 
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]

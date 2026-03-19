@@ -1268,20 +1268,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
-name = "nora-cli"
-version = "0.2.32"
-dependencies = [
- "clap",
- "flate2",
- "indicatif",
- "reqwest",
- "serde",
- "serde_json",
- "tar",
- "tokio",
-]
-
-[[package]]
 name = "nora-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -1317,6 +1303,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tower-http",
  "tower_governor",
  "tracing",
  "tracing-subscriber",
@@ -1325,25 +1312,6 @@ dependencies = [
  "uuid",
  "wiremock",
  "zeroize",
-]
-
-[[package]]
-name = "nora-storage"
-version = "0.2.32"
-dependencies = [
- "axum",
- "base64",
- "chrono",
- "httpdate",
- "quick-xml",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1538,16 +1506,6 @@ dependencies = [
  "wasi",
  "web-sys",
  "winapi",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.39.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
-dependencies = [
- "memchr",
- "serde",
 ]
 
 [[package]]

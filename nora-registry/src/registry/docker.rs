@@ -44,10 +44,56 @@ pub struct LayerInfo {
     pub size: u64,
 }
 
+/// In-progress upload session with metadata
+struct UploadSession {
+    data: Vec<u8>,
+    name: String,
+    created_at: std::time::Instant,
+}
+
+/// Max concurrent upload sessions (prevent memory exhaustion)
+const DEFAULT_MAX_UPLOAD_SESSIONS: usize = 100;
+/// Max data per session (default 2 GB, configurable via NORA_MAX_UPLOAD_SESSION_SIZE_MB)
+const DEFAULT_MAX_SESSION_SIZE_MB: usize = 2048;
+/// Session TTL (30 minutes)
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Read max upload sessions from env or use default
+fn max_upload_sessions() -> usize {
+    std::env::var("NORA_MAX_UPLOAD_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_UPLOAD_SESSIONS)
+}
+
+/// Read max session size from env (in MB) or use default
+fn max_session_size() -> usize {
+    let mb = std::env::var("NORA_MAX_UPLOAD_SESSION_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_SESSION_SIZE_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// In-progress upload sessions for chunked uploads
-/// Maps UUID -> accumulated data
-static UPLOAD_SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, Vec<u8>>>> =
+/// Maps UUID -> UploadSession with limits and TTL
+static UPLOAD_SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, UploadSession>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Remove expired upload sessions (called periodically)
+fn cleanup_expired_sessions() {
+    let mut sessions = UPLOAD_SESSIONS.write();
+    let before = sessions.len();
+    sessions.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
+    let removed = before - sessions.len();
+    if removed > 0 {
+        tracing::info!(
+            removed = removed,
+            remaining = sessions.len(),
+            "Cleaned up expired upload sessions"
+        );
+    }
+}
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -108,9 +154,19 @@ async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut repos: Vec<String> = keys
         .iter()
         .filter_map(|k| {
-            k.strip_prefix("docker/")
-                .and_then(|rest| rest.split('/').next())
-                .map(String::from)
+            let rest = k.strip_prefix("docker/")?;
+            // Find the first known directory separator (manifests/ or blobs/)
+            let name = if let Some(idx) = rest.find("/manifests/") {
+                &rest[..idx]
+            } else if let Some(idx) = rest.find("/blobs/") {
+                &rest[..idx]
+            } else {
+                return None;
+            };
+            if name.is_empty() {
+                return None;
+            }
+            Some(name.to_string())
         })
         .collect();
 
@@ -254,7 +310,38 @@ async fn start_upload(Path(name): Path<String>) -> Response {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    // Cleanup expired sessions before checking limits
+    cleanup_expired_sessions();
+
+    // Enforce max concurrent sessions
+    {
+        let sessions = UPLOAD_SESSIONS.read();
+        let max_sessions = max_upload_sessions();
+        if sessions.len() >= max_sessions {
+            tracing::warn!(
+                max = max_sessions,
+                current = sessions.len(),
+                "Upload session limit reached — rejecting new upload"
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response();
+        }
+    }
+
     let uuid = uuid::Uuid::new_v4().to_string();
+
+    // Create session with metadata
+    {
+        let mut sessions = UPLOAD_SESSIONS.write();
+        sessions.insert(
+            uuid.clone(),
+            UploadSession {
+                data: Vec::new(),
+                name: name.clone(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+    }
+
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
     (
         StatusCode::ACCEPTED,
@@ -276,9 +363,47 @@ async fn patch_blob(Path((name, uuid)): Path<(String, String)>, body: Bytes) -> 
     // Append data to the upload session and get total size
     let total_size = {
         let mut sessions = UPLOAD_SESSIONS.write();
-        let session = sessions.entry(uuid.clone()).or_default();
-        session.extend_from_slice(&body);
-        session.len()
+        let session = match sessions.get_mut(&uuid) {
+            Some(s) => s,
+            None => {
+                return (StatusCode::NOT_FOUND, "Upload session not found or expired")
+                    .into_response();
+            }
+        };
+
+        // Verify session belongs to this repository
+        if session.name != name {
+            tracing::warn!(
+                session_name = %session.name,
+                request_name = %name,
+                "SECURITY: upload session name mismatch — possible session fixation"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                "Session does not belong to this repository",
+            )
+                .into_response();
+        }
+
+        // Check session TTL
+        if session.created_at.elapsed() >= SESSION_TTL {
+            sessions.remove(&uuid);
+            return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
+        }
+
+        // Check size limit
+        let new_size = session.data.len() + body.len();
+        if new_size > max_session_size() {
+            sessions.remove(&uuid);
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Upload session exceeds size limit",
+            )
+                .into_response();
+        }
+
+        session.data.extend_from_slice(&body);
+        session.data.len()
     };
 
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
@@ -325,8 +450,22 @@ async fn upload_blob(
     // Get data from chunked session if exists, otherwise use body directly
     let data = {
         let mut sessions = UPLOAD_SESSIONS.write();
-        if let Some(mut session_data) = sessions.remove(&uuid) {
+        if let Some(session) = sessions.remove(&uuid) {
+            // Verify session belongs to this repository
+            if session.name != name {
+                tracing::warn!(
+                    session_name = %session.name,
+                    request_name = %name,
+                    "SECURITY: upload finalization name mismatch"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Session does not belong to this repository",
+                )
+                    .into_response();
+            }
             // Chunked upload: append any final body data and use session
+            let mut session_data = session.data;
             if !body.is_empty() {
                 session_data.extend_from_slice(&body);
             }
@@ -336,6 +475,40 @@ async fn upload_blob(
             body.to_vec()
         }
     };
+
+    // Only sha256 digests are supported for verification
+    if !digest.starts_with("sha256:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Only sha256 digests are supported for blob uploads",
+        )
+            .into_response();
+    }
+
+    // Verify digest matches uploaded content (Docker Distribution Spec)
+    {
+        use sha2::Digest as _;
+        let computed = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        if computed != *digest {
+            tracing::warn!(
+                expected = %digest,
+                computed = %computed,
+                name = %name,
+                "SECURITY: blob digest mismatch — rejecting upload"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "errors": [{
+                        "code": "DIGEST_INVALID",
+                        "message": "provided digest did not match uploaded content",
+                        "detail": { "expected": digest, "computed": computed }
+                    }]
+                })),
+            )
+                .into_response();
+        }
+    }
 
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.put(&key, &data).await {
@@ -619,6 +792,7 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
+        .filter(|t| !t.ends_with(".meta") && !t.contains(".meta."))
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }

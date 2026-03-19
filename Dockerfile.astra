@@ -6,11 +6,14 @@
 #   RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805 AS certs
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S -g 10001 nora && adduser -S -u 10001 -G nora nora
 
 FROM scratch
 
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs /etc/passwd /etc/passwd
+COPY --from=certs /etc/group /etc/group
 COPY nora /usr/local/bin/nora
 
 ENV RUST_LOG=info
@@ -23,6 +26,8 @@ ENV NORA_AUTH_TOKEN_STORAGE=/data/tokens
 EXPOSE 4000
 
 VOLUME ["/data"]
+
+USER nora
 
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
