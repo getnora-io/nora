@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "0.2.32"
+version = "0.2.33"
 dependencies = [
  "async-trait",
  "axum",
