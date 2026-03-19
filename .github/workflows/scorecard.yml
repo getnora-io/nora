@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 6 * * 1'  # every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
 
 permissions: read-all
 
@@ -15,20 +15,21 @@ jobs:
     permissions:
       security-events: write
       id-token: write
+      contents: read
+      actions: read
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
-      # Note: scorecard-action is a Docker-based action that resolves by tag only,
-      # SHA pinning causes resolution failures. Using tag per ossf recommendation.
       - name: Run OpenSSF Scorecard
         uses: ossf/scorecard-action@v2.4.3
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+          repo_token: ${{ secrets.SCORECARD_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Upload Scorecard results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
