@@ -49,6 +49,7 @@ tower_governor = "0.8"
 governor = "0.10"
 parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
+tower-http = { version = "0.6", features = ["set-header"] }
 
 [dev-dependencies]
 tempfile = "3"
