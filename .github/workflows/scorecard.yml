@@ -21,8 +21,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # Note: scorecard-action is a Docker-based action that resolves by tag only,
+      # SHA pinning causes resolution failures. Using tag per ossf recommendation.
       - name: Run OpenSSF Scorecard
-        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        uses: ossf/scorecard-action@v2.4.3
         with:
           results_file: results.sarif
           results_format: sarif
