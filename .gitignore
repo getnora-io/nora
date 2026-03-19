@@ -25,3 +25,9 @@ examples/
 
 # Dead crates (kept in repo for reference but excluded from workspace)
 # nora-cli/ and nora-storage/ remain in git but are not built
+
+# Playwright / Node
+node_modules/
+package.json
+package-lock.json
+/tmp/

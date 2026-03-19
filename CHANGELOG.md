@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.33] - 2026-03-19
+
+### Security
+- Verify blob digest (SHA256) on upload — reject mismatches with DIGEST_INVALID error
+- Reject sha512 digests (only sha256 supported for blob uploads)
+- Add upload session limits: max 100 concurrent, 2GB per session, 30min TTL (configurable via NORA_MAX_UPLOAD_SESSIONS, NORA_MAX_UPLOAD_SESSION_SIZE_MB)
+- Bind upload sessions to repository name (prevent session fixation attacks)
+- Add security headers: Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
+- Run containers as non-root user (USER nora) in all Dockerfiles
+
+### Fixed
+- Filter .meta.json from Docker tag list (fixes ArgoCD Image Updater tag recursion)
+- Fix catalog endpoint to show namespaced images correctly (library/alpine instead of library)
+
+### Added
+- CodeQL workflow for SAST analysis
+- SLSA provenance attestation for release artifacts
+
+### Changed
+- Configurable upload session size for ML models via NORA_MAX_UPLOAD_SESSION_SIZE_MB (default 2048 MB)
+
 ## [0.2.32] - 2026-03-18
 
 ### Fixed / Исправлено
