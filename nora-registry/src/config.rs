@@ -200,6 +200,9 @@ fn default_max_file_size() -> u64 {
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Allow anonymous read access (pull/download without auth, push requires auth)
+    #[serde(default)]
+    pub anonymous_read: bool,
     #[serde(default = "default_htpasswd_file")]
     pub htpasswd_file: String,
     #[serde(default = "default_token_storage")]
@@ -279,6 +282,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            anonymous_read: false,
             htpasswd_file: "users.htpasswd".to_string(),
             token_storage: "data/tokens".to_string(),
         }
@@ -456,6 +460,9 @@ impl Config {
         // Auth config
         if let Ok(val) = env::var("NORA_AUTH_ENABLED") {
             self.auth.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_ANONYMOUS_READ") {
+            self.auth.anonymous_read = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_AUTH_HTPASSWD_FILE") {
             self.auth.htpasswd_file = val;
@@ -741,8 +748,38 @@ mod tests {
     fn test_auth_config_default() {
         let a = AuthConfig::default();
         assert!(!a.enabled);
+        assert!(!a.anonymous_read);
         assert_eq!(a.htpasswd_file, "users.htpasswd");
         assert_eq!(a.token_storage, "data/tokens");
+    }
+
+    #[test]
+    fn test_auth_anonymous_read_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            anonymous_read = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.enabled);
+        assert!(config.auth.anonymous_read);
+    }
+
+    #[test]
+    fn test_env_override_anonymous_read() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
+        config.apply_env_overrides();
+        assert!(config.auth.anonymous_read);
+        std::env::remove_var("NORA_AUTH_ANONYMOUS_READ");
     }
 
     #[test]
