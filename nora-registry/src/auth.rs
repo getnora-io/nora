@@ -94,6 +94,16 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // Allow anonymous read if configured
+    let is_read_method = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    );
+    if state.config.auth.anonymous_read && is_read_method {
+        // Read requests allowed without auth
+        return next.run(request).await;
+    }
+
     // Extract Authorization header
     let auth_header = request
         .headers()
