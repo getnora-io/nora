@@ -74,17 +74,44 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
             t.no_activity
         )
     } else {
-        data.activity
-            .iter()
-            .map(|entry| {
+        // Group consecutive identical entries (same action+artifact+registry+source)
+        let mut grouped: Vec<(String, String, String, String, String, usize)> = Vec::new();
+        for entry in &data.activity {
+            let action = entry.action.to_string();
+            let last_match = grouped
+                .last()
+                .map(|(_, a, art, reg, src, _)| {
+                    *a == action
+                        && *art == entry.artifact
+                        && *reg == entry.registry
+                        && *src == entry.source
+                })
+                .unwrap_or(false);
+
+            if last_match {
+                grouped.last_mut().unwrap().5 += 1;
+            } else {
                 let time_ago = format_relative_time(&entry.timestamp);
-                render_activity_row(
-                    &time_ago,
-                    &entry.action.to_string(),
-                    &entry.artifact,
-                    &entry.registry,
-                    &entry.source,
-                )
+                grouped.push((
+                    time_ago,
+                    action,
+                    entry.artifact.clone(),
+                    entry.registry.clone(),
+                    entry.source.clone(),
+                    1,
+                ));
+            }
+        }
+
+        grouped
+            .iter()
+            .map(|(time, action, artifact, registry, source, count)| {
+                let display_artifact = if *count > 1 {
+                    format!("{} (x{})", artifact, count)
+                } else {
+                    artifact.clone()
+                };
+                render_activity_row(time, action, &display_artifact, registry, source)
             })
             .collect()
     };
