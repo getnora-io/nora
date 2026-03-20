@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.34] - 2026-03-20
+
+### Fixed
+- **UI**: Group consecutive identical activity entries — repeated cache hits show as "artifact (x4)" instead of 4 identical rows
+- **UI**: Fix table cell padding in Mount Points and Activity tables — th/td alignment now consistent
+- **Security**: Update tar crate 0.4.44 → 0.4.45 (CVE-2026-33055 PAX size header bypass, CVE-2026-33056 symlink chmod traversal)
+
+### Added
+- 82 new unit tests across 7 modules (activity_log, audit, config, dashboard_metrics, error, metrics, repo_index)
+- Test coverage badge in README (12.55% → 21.56%)
+- Dashboard GIF (EN/RU crossfade) in README
+- 7 missing environment variables added to docs (NORA_PUBLIC_URL, S3 credentials, NPM_METADATA_TTL, Raw config)
+
+### Changed
+- README restructured: tagline + docker run + GIF first, badges moved to Security section
+- Remove hardcoded OpenSSF Scorecard version from README
+
+
 ## [0.2.33] - 2026-03-19
 
 ### Security
