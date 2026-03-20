@@ -361,3 +361,164 @@ pub fn paginate<T: Clone>(data: &[T], page: usize, limit: usize) -> (Vec<T>, usi
     let end = (start + limit).min(total);
     (data[start..end].to_vec(), total)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_paginate_first_page() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (page, total) = paginate(&data, 1, 3);
+        assert_eq!(page, vec![1, 2, 3]);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_paginate_second_page() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (page, total) = paginate(&data, 2, 3);
+        assert_eq!(page, vec![4, 5, 6]);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_paginate_last_page_partial() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (page, total) = paginate(&data, 4, 3);
+        assert_eq!(page, vec![10]);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_paginate_beyond_range() {
+        let data = vec![1, 2, 3];
+        let (page, total) = paginate(&data, 5, 3);
+        assert!(page.is_empty());
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_paginate_empty_data() {
+        let data: Vec<i32> = vec![];
+        let (page, total) = paginate(&data, 1, 10);
+        assert!(page.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_paginate_page_zero() {
+        // page 0 with saturating_sub becomes 0, so start = 0
+        let data = vec![1, 2, 3];
+        let (page, _) = paginate(&data, 0, 2);
+        assert_eq!(page, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_paginate_large_limit() {
+        let data = vec![1, 2, 3];
+        let (page, total) = paginate(&data, 1, 100);
+        assert_eq!(page, vec![1, 2, 3]);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_registry_index_new() {
+        let idx = RegistryIndex::new();
+        assert_eq!(idx.count(), 0);
+        assert!(idx.is_dirty());
+    }
+
+    #[test]
+    fn test_registry_index_invalidate() {
+        let idx = RegistryIndex::new();
+        // Initially dirty
+        assert!(idx.is_dirty());
+
+        // Set data clears dirty
+        idx.set(vec![RepoInfo {
+            name: "test".to_string(),
+            versions: 1,
+            size: 100,
+            updated: "2026-01-01".to_string(),
+        }]);
+        assert!(!idx.is_dirty());
+        assert_eq!(idx.count(), 1);
+
+        // Invalidate makes it dirty again
+        idx.invalidate();
+        assert!(idx.is_dirty());
+    }
+
+    #[test]
+    fn test_registry_index_get_cached() {
+        let idx = RegistryIndex::new();
+        idx.set(vec![
+            RepoInfo {
+                name: "a".to_string(),
+                versions: 2,
+                size: 200,
+                updated: "today".to_string(),
+            },
+            RepoInfo {
+                name: "b".to_string(),
+                versions: 1,
+                size: 100,
+                updated: "yesterday".to_string(),
+            },
+        ]);
+
+        let cached = idx.get_cached();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].name, "a");
+    }
+
+    #[test]
+    fn test_registry_index_default() {
+        let idx = RegistryIndex::default();
+        assert_eq!(idx.count(), 0);
+    }
+
+    #[test]
+    fn test_repo_index_new() {
+        let idx = RepoIndex::new();
+        let (d, m, n, c, p) = idx.counts();
+        assert_eq!((d, m, n, c, p), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_repo_index_invalidate() {
+        let idx = RepoIndex::new();
+        // Should not panic for any registry
+        idx.invalidate("docker");
+        idx.invalidate("maven");
+        idx.invalidate("npm");
+        idx.invalidate("cargo");
+        idx.invalidate("pypi");
+        idx.invalidate("unknown"); // should be a no-op
+    }
+
+    #[test]
+    fn test_repo_index_default() {
+        let idx = RepoIndex::default();
+        let (d, m, n, c, p) = idx.counts();
+        assert_eq!((d, m, n, c, p), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_to_sorted_vec() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("zebra".to_string(), (3usize, 100u64, 0u64));
+        map.insert("alpha".to_string(), (1, 50, 1700000000));
+
+        let result = to_sorted_vec(map);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "alpha");
+        assert_eq!(result[0].versions, 1);
+        assert_eq!(result[0].size, 50);
+        assert_ne!(result[0].updated, "N/A");
+        assert_eq!(result[1].name, "zebra");
+        assert_eq!(result[1].versions, 3);
+        assert_eq!(result[1].updated, "N/A"); // modified = 0
+    }
+}

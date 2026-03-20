@@ -71,3 +71,69 @@ impl AuditLog {
         &self.path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_audit_entry_new() {
+        let entry = AuditEntry::new(
+            "push",
+            "admin",
+            "nginx:latest",
+            "docker",
+            "uploaded manifest",
+        );
+        assert_eq!(entry.action, "push");
+        assert_eq!(entry.actor, "admin");
+        assert_eq!(entry.artifact, "nginx:latest");
+        assert_eq!(entry.registry, "docker");
+        assert_eq!(entry.detail, "uploaded manifest");
+    }
+
+    #[test]
+    fn test_audit_log_new_and_path() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path().to_str().unwrap());
+        assert!(log.path().ends_with("audit.jsonl"));
+    }
+
+    #[test]
+    fn test_audit_log_write_entry() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path().to_str().unwrap());
+
+        let entry = AuditEntry::new("pull", "user1", "lodash", "npm", "downloaded");
+        log.log(entry);
+
+        // Verify file contains the entry
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert!(content.contains(r#""action":"pull""#));
+        assert!(content.contains(r#""actor":"user1""#));
+        assert!(content.contains(r#""artifact":"lodash""#));
+    }
+
+    #[test]
+    fn test_audit_log_multiple_entries() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path().to_str().unwrap());
+
+        log.log(AuditEntry::new("push", "admin", "a", "docker", ""));
+        log.log(AuditEntry::new("pull", "user", "b", "npm", ""));
+        log.log(AuditEntry::new("delete", "admin", "c", "maven", ""));
+
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn test_audit_entry_serialization() {
+        let entry = AuditEntry::new("push", "ci", "app:v1", "docker", "ci build");
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""action":"push""#));
+        assert!(json.contains(r#""ts":""#));
+    }
+}

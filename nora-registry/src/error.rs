@@ -124,4 +124,77 @@ mod tests {
         let err = AppError::NotFound("image not found".to_string());
         assert_eq!(err.to_string(), "Not found: image not found");
     }
+
+    #[test]
+    fn test_error_constructors() {
+        let err = AppError::not_found("missing");
+        assert!(matches!(err, AppError::NotFound(_)));
+        assert_eq!(err.to_string(), "Not found: missing");
+
+        let err = AppError::bad_request("invalid input");
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(err.to_string(), "Bad request: invalid input");
+
+        let err = AppError::unauthorized("no token");
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert_eq!(err.to_string(), "Unauthorized: no token");
+
+        let err = AppError::internal("db crashed");
+        assert!(matches!(err, AppError::Internal(_)));
+        assert_eq!(err.to_string(), "Internal error: db crashed");
+    }
+
+    #[test]
+    fn test_error_display_storage() {
+        let err = AppError::Storage(StorageError::NotFound);
+        assert!(err.to_string().contains("Storage error"));
+    }
+
+    #[test]
+    fn test_error_display_validation() {
+        let err = AppError::Validation(ValidationError::PathTraversal);
+        assert!(err.to_string().contains("Validation error"));
+    }
+
+    #[test]
+    fn test_error_into_response_not_found() {
+        let err = AppError::NotFound("gone".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_into_response_bad_request() {
+        let err = AppError::BadRequest("bad".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_into_response_unauthorized() {
+        let err = AppError::Unauthorized("nope".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_error_into_response_internal() {
+        let err = AppError::Internal("boom".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_into_response_storage_not_found() {
+        let err = AppError::Storage(StorageError::NotFound);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_into_response_validation() {
+        let err = AppError::Validation(ValidationError::EmptyInput);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
