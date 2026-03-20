@@ -333,9 +333,9 @@ pub fn render_mount_points_table(
             format!(
                 r##"
                 <tr class="border-b border-slate-700">
-                    <td class="py-3 text-slate-300">{}</td>
-                    <td class="py-3 font-mono text-blue-400">{}</td>
-                    <td class="py-3 text-slate-400">{}</td>
+                    <td class="px-4 py-3 text-slate-300">{}</td>
+                    <td class="px-4 py-3 font-mono text-blue-400">{}</td>
+                    <td class="px-4 py-3 text-slate-400">{}</td>
                 </tr>
                 "##,
                 registry, mount_path, proxy_display
@@ -358,7 +358,7 @@ pub fn render_mount_points_table(
                             <th class="px-4 py-2">{}</th>
                         </tr>
                     </thead>
-                    <tbody class="px-4">
+                    <tbody>
                         {}
                     </tbody>
                 </table>
@@ -388,11 +388,11 @@ pub fn render_activity_row(
     format!(
         r##"
         <tr class="border-b border-slate-700/50 text-sm">
-            <td class="py-2 text-slate-500">{}</td>
-            <td class="py-2 font-medium {}"><span class="px-2 py-0.5 bg-slate-700 rounded">{}</span></td>
-            <td class="py-2 text-slate-300 font-mono text-xs">{}</td>
-            <td class="py-2 text-slate-400">{}</td>
-            <td class="py-2 text-slate-500">{}</td>
+            <td class="px-4 py-2 text-slate-500">{}</td>
+            <td class="px-4 py-2 font-medium {}"><span class="px-2 py-0.5 bg-slate-700 rounded">{}</span></td>
+            <td class="px-4 py-2 text-slate-300 font-mono text-xs">{}</td>
+            <td class="px-4 py-2 text-slate-400">{}</td>
+            <td class="px-4 py-2 text-slate-500">{}</td>
         </tr>
         "##,
         timestamp,
@@ -424,7 +424,7 @@ pub fn render_activity_log(rows: &str, t: &Translations) -> String {
                             <th class="px-4 py-2">{}</th>
                         </tr>
                     </thead>
-                    <tbody class="px-4">
+                    <tbody>
                         {}
                     </tbody>
                 </table>
