@@ -666,4 +666,348 @@ mod tests {
         assert_eq!(config.rate_limit.upload_burst, 1000);
         assert_eq!(config.rate_limit.auth_burst, 5); // default
     }
+
+    #[test]
+    fn test_basic_auth_header() {
+        let header = basic_auth_header("user:pass");
+        assert_eq!(header, "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn test_basic_auth_header_empty() {
+        let header = basic_auth_header("");
+        assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.server.body_limit_mb, 2048);
+        assert!(config.server.public_url.is_none());
+        assert_eq!(config.storage.path, "data/storage");
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        assert_eq!(config.storage.bucket, "registry");
+        assert_eq!(config.storage.s3_region, "us-east-1");
+        assert!(!config.auth.enabled);
+        assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
+        assert_eq!(config.auth.token_storage, "data/tokens");
+    }
+
+    #[test]
+    fn test_maven_config_default() {
+        let m = MavenConfig::default();
+        assert_eq!(m.proxy_timeout, 30);
+        assert_eq!(m.proxies.len(), 1);
+        assert_eq!(m.proxies[0].url(), "https://repo1.maven.org/maven2");
+        assert!(m.proxies[0].auth().is_none());
+    }
+
+    #[test]
+    fn test_npm_config_default() {
+        let n = NpmConfig::default();
+        assert_eq!(n.proxy, Some("https://registry.npmjs.org".to_string()));
+        assert!(n.proxy_auth.is_none());
+        assert_eq!(n.proxy_timeout, 30);
+        assert_eq!(n.metadata_ttl, 300);
+    }
+
+    #[test]
+    fn test_pypi_config_default() {
+        let p = PypiConfig::default();
+        assert_eq!(p.proxy, Some("https://pypi.org/simple/".to_string()));
+        assert!(p.proxy_auth.is_none());
+        assert_eq!(p.proxy_timeout, 30);
+    }
+
+    #[test]
+    fn test_docker_config_default() {
+        let d = DockerConfig::default();
+        assert_eq!(d.proxy_timeout, 60);
+        assert_eq!(d.upstreams.len(), 1);
+        assert_eq!(d.upstreams[0].url, "https://registry-1.docker.io");
+        assert!(d.upstreams[0].auth.is_none());
+    }
+
+    #[test]
+    fn test_raw_config_default() {
+        let r = RawConfig::default();
+        assert!(r.enabled);
+        assert_eq!(r.max_file_size, 104_857_600);
+    }
+
+    #[test]
+    fn test_auth_config_default() {
+        let a = AuthConfig::default();
+        assert!(!a.enabled);
+        assert_eq!(a.htpasswd_file, "users.htpasswd");
+        assert_eq!(a.token_storage, "data/tokens");
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_simple() {
+        let entry = MavenProxyEntry::Simple("https://repo.example.com".to_string());
+        assert_eq!(entry.url(), "https://repo.example.com");
+        assert!(entry.auth().is_none());
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_full() {
+        let entry = MavenProxyEntry::Full(MavenProxy {
+            url: "https://private.repo.com".to_string(),
+            auth: Some("user:secret".to_string()),
+        });
+        assert_eq!(entry.url(), "https://private.repo.com");
+        assert_eq!(entry.auth(), Some("user:secret"));
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_full_no_auth() {
+        let entry = MavenProxyEntry::Full(MavenProxy {
+            url: "https://repo.com".to_string(),
+            auth: None,
+        });
+        assert_eq!(entry.url(), "https://repo.com");
+        assert!(entry.auth().is_none());
+    }
+
+    #[test]
+    fn test_storage_mode_default() {
+        let mode = StorageMode::default();
+        assert_eq!(mode, StorageMode::Local);
+    }
+
+    #[test]
+    fn test_env_override_server() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_HOST", "0.0.0.0");
+        std::env::set_var("NORA_PORT", "8080");
+        std::env::set_var("NORA_PUBLIC_URL", "registry.example.com");
+        std::env::set_var("NORA_BODY_LIMIT_MB", "4096");
+        config.apply_env_overrides();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(
+            config.server.public_url,
+            Some("registry.example.com".to_string())
+        );
+        assert_eq!(config.server.body_limit_mb, 4096);
+        std::env::remove_var("NORA_HOST");
+        std::env::remove_var("NORA_PORT");
+        std::env::remove_var("NORA_PUBLIC_URL");
+        std::env::remove_var("NORA_BODY_LIMIT_MB");
+    }
+
+    #[test]
+    fn test_env_override_storage() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "s3");
+        std::env::set_var("NORA_STORAGE_PATH", "/data/nora");
+        std::env::set_var("NORA_STORAGE_BUCKET", "my-bucket");
+        std::env::set_var("NORA_STORAGE_S3_REGION", "eu-west-1");
+        config.apply_env_overrides();
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        assert_eq!(config.storage.path, "/data/nora");
+        assert_eq!(config.storage.bucket, "my-bucket");
+        assert_eq!(config.storage.s3_region, "eu-west-1");
+        std::env::remove_var("NORA_STORAGE_MODE");
+        std::env::remove_var("NORA_STORAGE_PATH");
+        std::env::remove_var("NORA_STORAGE_BUCKET");
+        std::env::remove_var("NORA_STORAGE_S3_REGION");
+    }
+
+    #[test]
+    fn test_env_override_auth() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_ENABLED", "true");
+        std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
+        std::env::set_var("NORA_AUTH_TOKEN_STORAGE", "/data/tokens");
+        config.apply_env_overrides();
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.htpasswd_file, "/etc/nora/users");
+        assert_eq!(config.auth.token_storage, "/data/tokens");
+        std::env::remove_var("NORA_AUTH_ENABLED");
+        std::env::remove_var("NORA_AUTH_HTPASSWD_FILE");
+        std::env::remove_var("NORA_AUTH_TOKEN_STORAGE");
+    }
+
+    #[test]
+    fn test_env_override_maven_proxies() {
+        let mut config = Config::default();
+        std::env::set_var(
+            "NORA_MAVEN_PROXIES",
+            "https://repo1.com,https://repo2.com|user:pass",
+        );
+        config.apply_env_overrides();
+        assert_eq!(config.maven.proxies.len(), 2);
+        assert_eq!(config.maven.proxies[0].url(), "https://repo1.com");
+        assert!(config.maven.proxies[0].auth().is_none());
+        assert_eq!(config.maven.proxies[1].url(), "https://repo2.com");
+        assert_eq!(config.maven.proxies[1].auth(), Some("user:pass"));
+        std::env::remove_var("NORA_MAVEN_PROXIES");
+    }
+
+    #[test]
+    fn test_env_override_docker_upstreams() {
+        let mut config = Config::default();
+        std::env::set_var(
+            "NORA_DOCKER_UPSTREAMS",
+            "https://mirror.gcr.io,https://private.io|token123",
+        );
+        config.apply_env_overrides();
+        assert_eq!(config.docker.upstreams.len(), 2);
+        assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
+        assert!(config.docker.upstreams[0].auth.is_none());
+        assert_eq!(config.docker.upstreams[1].url, "https://private.io");
+        assert_eq!(
+            config.docker.upstreams[1].auth,
+            Some("token123".to_string())
+        );
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+    }
+
+    #[test]
+    fn test_env_override_npm() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
+        std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
+        std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
+        std::env::set_var("NORA_NPM_METADATA_TTL", "600");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.npm.proxy,
+            Some("https://npm.company.com".to_string())
+        );
+        assert_eq!(config.npm.proxy_auth, Some("user:token".to_string()));
+        assert_eq!(config.npm.proxy_timeout, 60);
+        assert_eq!(config.npm.metadata_ttl, 600);
+        std::env::remove_var("NORA_NPM_PROXY");
+        std::env::remove_var("NORA_NPM_PROXY_AUTH");
+        std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
+        std::env::remove_var("NORA_NPM_METADATA_TTL");
+    }
+
+    #[test]
+    fn test_env_override_raw() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_RAW_ENABLED", "false");
+        std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
+        config.apply_env_overrides();
+        assert!(!config.raw.enabled);
+        assert_eq!(config.raw.max_file_size, 524288000);
+        std::env::remove_var("NORA_RAW_ENABLED");
+        std::env::remove_var("NORA_RAW_MAX_FILE_SIZE");
+    }
+
+    #[test]
+    fn test_env_override_rate_limit() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
+        std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
+        std::env::set_var("NORA_RATE_LIMIT_GENERAL_BURST", "500");
+        config.apply_env_overrides();
+        assert!(!config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.auth_rps, 10);
+        assert_eq!(config.rate_limit.general_burst, 500);
+        std::env::remove_var("NORA_RATE_LIMIT_ENABLED");
+        std::env::remove_var("NORA_RATE_LIMIT_AUTH_RPS");
+        std::env::remove_var("NORA_RATE_LIMIT_GENERAL_BURST");
+    }
+
+    #[test]
+    fn test_config_from_toml_full() {
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 8080
+            public_url = "nora.example.com"
+            body_limit_mb = 4096
+
+            [storage]
+            mode = "s3"
+            path = "/data"
+            s3_url = "http://minio:9000"
+            bucket = "artifacts"
+            s3_region = "eu-central-1"
+
+            [auth]
+            enabled = true
+            htpasswd_file = "/etc/nora/users.htpasswd"
+
+            [raw]
+            enabled = false
+            max_file_size = 500000000
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(
+            config.server.public_url,
+            Some("nora.example.com".to_string())
+        );
+        assert_eq!(config.server.body_limit_mb, 4096);
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        assert_eq!(config.storage.s3_url, "http://minio:9000");
+        assert_eq!(config.storage.bucket, "artifacts");
+        assert!(config.auth.enabled);
+        assert!(!config.raw.enabled);
+        assert_eq!(config.raw.max_file_size, 500000000);
+    }
+
+    #[test]
+    fn test_config_from_toml_minimal() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        // Defaults should be filled
+        assert_eq!(config.storage.path, "data/storage");
+        assert_eq!(config.maven.proxies.len(), 1);
+        assert_eq!(
+            config.npm.proxy,
+            Some("https://registry.npmjs.org".to_string())
+        );
+        assert_eq!(config.docker.upstreams.len(), 1);
+        assert!(config.raw.enabled);
+        assert!(!config.auth.enabled);
+    }
+
+    #[test]
+    fn test_config_toml_docker_upstreams() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [docker]
+            proxy_timeout = 120
+
+            [[docker.upstreams]]
+            url = "https://mirror.gcr.io"
+
+            [[docker.upstreams]]
+            url = "https://private.registry.io"
+            auth = "user:pass"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.docker.proxy_timeout, 120);
+        assert_eq!(config.docker.upstreams.len(), 2);
+        assert!(config.docker.upstreams[0].auth.is_none());
+        assert_eq!(
+            config.docker.upstreams[1].auth,
+            Some("user:pass".to_string())
+        );
+    }
 }

@@ -216,3 +216,146 @@ impl Default for DashboardMetrics {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_new_defaults() {
+        let m = DashboardMetrics::new();
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 0);
+        assert_eq!(m.uploads.load(Ordering::Relaxed), 0);
+        assert_eq!(m.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(m.cache_misses.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_record_download_all_registries() {
+        let m = DashboardMetrics::new();
+        for reg in &["docker", "npm", "maven", "cargo", "pypi", "raw"] {
+            m.record_download(reg);
+        }
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 6);
+        assert_eq!(m.docker_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.npm_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.maven_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.cargo_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.pypi_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.raw_downloads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_record_download_unknown_registry() {
+        let m = DashboardMetrics::new();
+        m.record_download("unknown");
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 1);
+        // no per-registry counter should increment
+        assert_eq!(m.docker_downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_record_upload() {
+        let m = DashboardMetrics::new();
+        m.record_upload("docker");
+        m.record_upload("maven");
+        m.record_upload("raw");
+        assert_eq!(m.uploads.load(Ordering::Relaxed), 3);
+        assert_eq!(m.docker_uploads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.maven_uploads.load(Ordering::Relaxed), 1);
+        assert_eq!(m.raw_uploads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_record_upload_unknown_registry() {
+        let m = DashboardMetrics::new();
+        m.record_upload("npm"); // npm has no upload counter
+        assert_eq!(m.uploads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_cache_hit_rate_zero() {
+        let m = DashboardMetrics::new();
+        assert_eq!(m.cache_hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_hit_rate_all_hits() {
+        let m = DashboardMetrics::new();
+        m.record_cache_hit();
+        m.record_cache_hit();
+        assert_eq!(m.cache_hit_rate(), 100.0);
+    }
+
+    #[test]
+    fn test_cache_hit_rate_mixed() {
+        let m = DashboardMetrics::new();
+        m.record_cache_hit();
+        m.record_cache_miss();
+        assert_eq!(m.cache_hit_rate(), 50.0);
+    }
+
+    #[test]
+    fn test_get_registry_downloads() {
+        let m = DashboardMetrics::new();
+        m.record_download("docker");
+        m.record_download("docker");
+        m.record_download("npm");
+        assert_eq!(m.get_registry_downloads("docker"), 2);
+        assert_eq!(m.get_registry_downloads("npm"), 1);
+        assert_eq!(m.get_registry_downloads("cargo"), 0);
+        assert_eq!(m.get_registry_downloads("unknown"), 0);
+    }
+
+    #[test]
+    fn test_get_registry_uploads() {
+        let m = DashboardMetrics::new();
+        m.record_upload("docker");
+        assert_eq!(m.get_registry_uploads("docker"), 1);
+        assert_eq!(m.get_registry_uploads("maven"), 0);
+        assert_eq!(m.get_registry_uploads("unknown"), 0);
+    }
+
+    #[test]
+    fn test_persistence_save_and_load() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        // Create metrics, record some data, save
+        {
+            let m = DashboardMetrics::with_persistence(path);
+            m.record_download("docker");
+            m.record_download("docker");
+            m.record_upload("maven");
+            m.record_cache_hit();
+            m.save();
+        }
+
+        // Load in new instance
+        {
+            let m = DashboardMetrics::with_persistence(path);
+            assert_eq!(m.downloads.load(Ordering::Relaxed), 2);
+            assert_eq!(m.uploads.load(Ordering::Relaxed), 1);
+            assert_eq!(m.docker_downloads.load(Ordering::Relaxed), 2);
+            assert_eq!(m.maven_uploads.load(Ordering::Relaxed), 1);
+            assert_eq!(m.cache_hits.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn test_persistence_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        // Should work even without existing metrics.json
+        let m = DashboardMetrics::with_persistence(path);
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_default() {
+        let m = DashboardMetrics::default();
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 0);
+    }
+}

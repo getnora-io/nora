@@ -148,3 +148,56 @@ pub fn record_storage_op(operation: &str, success: bool) {
         .with_label_values(&[operation, status])
         .inc();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_registry_docker() {
+        assert_eq!(detect_registry("/v2/nginx/manifests/latest"), "docker");
+        assert_eq!(detect_registry("/v2/"), "docker");
+        assert_eq!(
+            detect_registry("/v2/library/alpine/blobs/sha256:abc"),
+            "docker"
+        );
+    }
+
+    #[test]
+    fn test_detect_registry_maven() {
+        assert_eq!(detect_registry("/maven2/com/example/artifact"), "maven");
+    }
+
+    #[test]
+    fn test_detect_registry_npm() {
+        assert_eq!(detect_registry("/npm/lodash"), "npm");
+        assert_eq!(detect_registry("/npm/@scope/package"), "npm");
+    }
+
+    #[test]
+    fn test_detect_registry_cargo() {
+        assert_eq!(detect_registry("/cargo/api/v1/crates"), "cargo");
+    }
+
+    #[test]
+    fn test_detect_registry_pypi() {
+        assert_eq!(detect_registry("/simple/requests/"), "pypi");
+        assert_eq!(
+            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz"),
+            "pypi"
+        );
+    }
+
+    #[test]
+    fn test_detect_registry_ui() {
+        assert_eq!(detect_registry("/ui/dashboard"), "ui");
+        assert_eq!(detect_registry("/ui"), "ui");
+    }
+
+    #[test]
+    fn test_detect_registry_other() {
+        assert_eq!(detect_registry("/health"), "other");
+        assert_eq!(detect_registry("/ready"), "other");
+        assert_eq!(detect_registry("/unknown/path"), "other");
+    }
+}

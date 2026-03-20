@@ -99,3 +99,139 @@ impl Default for ActivityLog {
         Self::new(50)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_action_type_display() {
+        assert_eq!(ActionType::Pull.to_string(), "PULL");
+        assert_eq!(ActionType::Push.to_string(), "PUSH");
+        assert_eq!(ActionType::CacheHit.to_string(), "CACHE");
+        assert_eq!(ActionType::ProxyFetch.to_string(), "PROXY");
+    }
+
+    #[test]
+    fn test_action_type_equality() {
+        assert_eq!(ActionType::Pull, ActionType::Pull);
+        assert_ne!(ActionType::Pull, ActionType::Push);
+    }
+
+    #[test]
+    fn test_activity_entry_new() {
+        let entry = ActivityEntry::new(
+            ActionType::Pull,
+            "nginx:latest".to_string(),
+            "docker",
+            "LOCAL",
+        );
+        assert_eq!(entry.action, ActionType::Pull);
+        assert_eq!(entry.artifact, "nginx:latest");
+        assert_eq!(entry.registry, "docker");
+        assert_eq!(entry.source, "LOCAL");
+    }
+
+    #[test]
+    fn test_activity_log_push_and_len() {
+        let log = ActivityLog::new(10);
+        assert!(log.is_empty());
+        assert_eq!(log.len(), 0);
+
+        log.push(ActivityEntry::new(
+            ActionType::Push,
+            "test:v1".to_string(),
+            "docker",
+            "LOCAL",
+        ));
+        assert!(!log.is_empty());
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn test_activity_log_recent() {
+        let log = ActivityLog::new(10);
+        for i in 0..5 {
+            log.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("image:{}", i),
+                "docker",
+                "LOCAL",
+            ));
+        }
+
+        let recent = log.recent(3);
+        assert_eq!(recent.len(), 3);
+        // newest first
+        assert_eq!(recent[0].artifact, "image:4");
+        assert_eq!(recent[1].artifact, "image:3");
+        assert_eq!(recent[2].artifact, "image:2");
+    }
+
+    #[test]
+    fn test_activity_log_all() {
+        let log = ActivityLog::new(10);
+        for i in 0..3 {
+            log.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("pkg:{}", i),
+                "npm",
+                "PROXY",
+            ));
+        }
+
+        let all = log.all();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].artifact, "pkg:2"); // newest first
+    }
+
+    #[test]
+    fn test_activity_log_bounded_size() {
+        let log = ActivityLog::new(3);
+        for i in 0..5 {
+            log.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("item:{}", i),
+                "cargo",
+                "CACHE",
+            ));
+        }
+
+        assert_eq!(log.len(), 3);
+        let all = log.all();
+        // oldest entries should be dropped
+        assert_eq!(all[0].artifact, "item:4");
+        assert_eq!(all[1].artifact, "item:3");
+        assert_eq!(all[2].artifact, "item:2");
+    }
+
+    #[test]
+    fn test_activity_log_recent_more_than_available() {
+        let log = ActivityLog::new(10);
+        log.push(ActivityEntry::new(
+            ActionType::Push,
+            "one".to_string(),
+            "maven",
+            "LOCAL",
+        ));
+
+        let recent = log.recent(100);
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn test_activity_log_default() {
+        let log = ActivityLog::default();
+        assert!(log.is_empty());
+        // default capacity is 50
+        for i in 0..60 {
+            log.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("x:{}", i),
+                "docker",
+                "LOCAL",
+            ));
+        }
+        assert_eq!(log.len(), 50);
+    }
+}
