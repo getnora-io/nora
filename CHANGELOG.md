@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.35] - 2026-03-20
+
+### Added
+- **Anonymous read mode** (`NORA_AUTH_ANONYMOUS_READ=true`): allow pull/download without credentials while requiring auth for push. Use case: public demo registries, read-only mirrors.
+
+### Fixed
+- Pin slsa-github-generator and codeql-action by SHA instead of tag
+- Replace anonymous tuple with named struct in activity grouping (readability)
+- Replace unwrap() with if-let pattern in activity grouping (safety)
+- Add warning message on SLSA attestation failure instead of silent suppression
+
 ## [0.2.34] - 2026-03-20
 
 ### Fixed
