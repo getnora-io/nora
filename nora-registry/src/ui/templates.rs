@@ -75,43 +75,56 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
         )
     } else {
         // Group consecutive identical entries (same action+artifact+registry+source)
-        let mut grouped: Vec<(String, String, String, String, String, usize)> = Vec::new();
+        struct GroupedActivity {
+            time: String,
+            action: String,
+            artifact: String,
+            registry: String,
+            source: String,
+            count: usize,
+        }
+
+        let mut grouped: Vec<GroupedActivity> = Vec::new();
         for entry in &data.activity {
             let action = entry.action.to_string();
-            let last_match = grouped
-                .last()
-                .map(|(_, a, art, reg, src, _)| {
-                    *a == action
-                        && *art == entry.artifact
-                        && *reg == entry.registry
-                        && *src == entry.source
-                })
-                .unwrap_or(false);
+            let is_repeat = grouped.last().is_some_and(|last| {
+                last.action == action
+                    && last.artifact == entry.artifact
+                    && last.registry == entry.registry
+                    && last.source == entry.source
+            });
 
-            if last_match {
-                grouped.last_mut().unwrap().5 += 1;
+            if is_repeat {
+                if let Some(last) = grouped.last_mut() {
+                    last.count += 1;
+                }
             } else {
-                let time_ago = format_relative_time(&entry.timestamp);
-                grouped.push((
-                    time_ago,
+                grouped.push(GroupedActivity {
+                    time: format_relative_time(&entry.timestamp),
                     action,
-                    entry.artifact.clone(),
-                    entry.registry.clone(),
-                    entry.source.clone(),
-                    1,
-                ));
+                    artifact: entry.artifact.clone(),
+                    registry: entry.registry.clone(),
+                    source: entry.source.clone(),
+                    count: 1,
+                });
             }
         }
 
         grouped
             .iter()
-            .map(|(time, action, artifact, registry, source, count)| {
-                let display_artifact = if *count > 1 {
-                    format!("{} (x{})", artifact, count)
+            .map(|g| {
+                let display_artifact = if g.count > 1 {
+                    format!("{} (x{})", g.artifact, g.count)
                 } else {
-                    artifact.clone()
+                    g.artifact.clone()
                 };
-                render_activity_row(time, action, &display_artifact, registry, source)
+                render_activity_row(
+                    &g.time,
+                    &g.action,
+                    &display_artifact,
+                    &g.registry,
+                    &g.source,
+                )
             })
             .collect()
     };

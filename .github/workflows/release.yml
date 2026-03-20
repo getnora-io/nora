@@ -144,7 +144,7 @@ jobs:
 
       - name: Smoke test — verify alpine image starts and responds
         run: |
-          docker rm -f nora-smoke 2>/dev/null || true
+          docker rm -f nora-smoke 2>/dev/null || echo "WARNING: attestation failed, continuing without provenance"
           docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 \
             ${{ env.NORA }}/${{ env.IMAGE_NAME }}:latest
           for i in $(seq 1 10); do
@@ -226,7 +226,7 @@ jobs:
           cat nora-linux-amd64.sha256
 
       - name: Generate SLSA provenance
-        uses: slsa-framework/slsa-github-generator/.github/actions/generate-builder@v2.1.0
+        uses: slsa-framework/slsa-github-generator/.github/actions/generate-builder@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
         id: provenance-generate
         continue-on-error: true
 
@@ -234,7 +234,7 @@ jobs:
         if: always()
         run: |
           # Generate provenance using gh attestation (built-in GitHub feature)
-          gh attestation create ./nora-linux-amd64             --repo ${{ github.repository }}             --signer-workflow ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml 2>/dev/null || true
+          gh attestation create ./nora-linux-amd64             --repo ${{ github.repository }}             --signer-workflow ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml 2>/dev/null || echo "WARNING: attestation failed, continuing without provenance"
           # Also create a simple provenance file for scorecard
           cat > nora-v${{ github.ref_name }}.provenance.json << 'PROVEOF'
           {
