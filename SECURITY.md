@@ -50,4 +50,6 @@ When deploying NORA:
 
 ## Acknowledgments
 
-We appreciate responsible disclosure and will acknowledge security researchers who report valid vulnerabilities.
+We appreciate responsible disclosure and will acknowledge security researchers who report valid vulnerabilities in our release notes and CHANGELOG, unless the reporter requests anonymity.
+
+If you have previously reported a vulnerability and would like to be credited, please let us know.

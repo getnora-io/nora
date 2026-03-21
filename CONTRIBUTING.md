@@ -2,6 +2,34 @@
 
 Thank you for your interest in contributing to NORA!
 
+## Developer Certificate of Origin (DCO)
+
+By submitting a pull request, you agree to the [Developer Certificate of Origin](https://developercertificate.org/).
+Your contribution will be licensed under the [MIT License](LICENSE).
+
+You confirm that you have the right to submit the code and that it does not violate any third-party rights.
+
+## Project Governance
+
+NORA uses a **Benevolent Dictator** governance model:
+
+- **Maintainer:** [@devitway](https://github.com/devitway) — final decisions on features, releases, and architecture
+- **Contributors:** anyone who submits issues, PRs, or docs improvements
+- **Decision process:** proposals via GitHub Issues → discussion → maintainer decision
+- **Release authority:** maintainer only
+
+### Roles and Responsibilities
+
+| Role | Person | Responsibilities |
+|------|--------|-----------------|
+| Maintainer | @devitway | Code review, releases, roadmap, security response |
+| Contributor | anyone | Issues, PRs, documentation, testing |
+| Dependabot | automated | Dependency updates |
+
+### Continuity
+
+The GitHub organization [getnora-io](https://github.com/getnora-io) has multiple admin accounts to ensure project continuity. Source code is MIT-licensed, enabling anyone to fork and continue the project.
+
 ## Getting Started
 
 1. Fork the repository
