@@ -132,7 +132,7 @@ jobs:
 
       # ── Smoke test ──────────────────────────────────────────────────────────
       - name: Install cosign
-        uses: sigstore/cosign-installer@c56c2d3e59e4281cc41dea2217323ba5694b171e # v3
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v3
 
       - name: Sign Docker images (keyless Sigstore)
         run: |
@@ -276,7 +276,7 @@ jobs:
           output-file: nora-${{ github.ref_name }}.sbom.cdx.json
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@c56c2d3e59e4281cc41dea2217323ba5694b171e # v3
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v3
 
       - name: Sign binary with cosign (keyless Sigstore)
         run: cosign sign-blob --yes --output-signature nora-linux-amd64.sig --output-certificate nora-linux-amd64.pem ./nora-linux-amd64
