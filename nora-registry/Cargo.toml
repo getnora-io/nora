@@ -30,7 +30,7 @@ sha2.workspace = true
 async-trait.workspace = true
 hmac.workspace = true
 hex.workspace = true
-toml = "1.0"
+toml = "1.1"
 uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.19"
 base64 = "0.22"
