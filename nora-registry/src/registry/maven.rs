@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::config::basic_auth_header;
+use crate::registry::proxy_fetch;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -14,7 +14,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -53,7 +52,7 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
     for proxy in &state.config.maven.proxies {
         let url = format!("{}/{}", proxy.url().trim_end_matches('/'), path);
 
-        match fetch_from_proxy(
+        match proxy_fetch(
             &state.http_client,
             &url,
             state.config.maven.proxy_timeout,
@@ -126,25 +125,6 @@ async fn upload(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
-}
-
-async fn fetch_from_proxy(
-    client: &reqwest::Client,
-    url: &str,
-    timeout_secs: u64,
-    auth: Option<&str>,
-) -> Result<Vec<u8>, ()> {
-    let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
-    if let Some(credentials) = auth {
-        request = request.header("Authorization", basic_auth_header(credentials));
-    }
-    let response = request.send().await.map_err(|_| ())?;
-
-    if !response.status().is_success() {
-        return Err(());
-    }
-
-    response.bytes().await.map(|b| b.to_vec()).map_err(|_| ())
 }
 
 fn with_content_type(

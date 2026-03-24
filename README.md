@@ -27,7 +27,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | Registry | Mount Point | Upstream Proxy | Auth |
 |----------|------------|----------------|------|
 | Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI | ✓ |
-| Maven | `/maven2/` | Maven Central, custom | ✓ |
+| Maven | `/maven2/` | Maven Central, custom | proxy-only |
 | npm | `/npm/` | npmjs.org, custom | ✓ |
 | Cargo | `/cargo/` | — | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |

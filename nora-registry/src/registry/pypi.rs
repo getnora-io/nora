@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::config::basic_auth_header;
+use crate::registry::{proxy_fetch, proxy_fetch_text};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -13,7 +13,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -87,11 +86,12 @@ async fn package_versions(
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = fetch_package_page(
+        if let Ok(html) = proxy_fetch_text(
             &state.http_client,
             &url,
             state.config.pypi.proxy_timeout,
             state.config.pypi.proxy_auth.as_deref(),
+            Some(("Accept", "text/html")),
         )
         .await
         {
@@ -142,17 +142,18 @@ async fn download_file(
         // First, fetch the package page to find the actual download URL
         let page_url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = fetch_package_page(
+        if let Ok(html) = proxy_fetch_text(
             &state.http_client,
             &page_url,
             state.config.pypi.proxy_timeout,
             state.config.pypi.proxy_auth.as_deref(),
+            Some(("Accept", "text/html")),
         )
         .await
         {
             // Find the URL for this specific file
             if let Some(file_url) = find_file_url(&html, &filename) {
-                if let Ok(data) = fetch_file(
+                if let Ok(data) = proxy_fetch(
                     &state.http_client,
                     &file_url,
                     state.config.pypi.proxy_timeout,
@@ -203,49 +204,6 @@ async fn download_file(
 /// Normalize package name according to PEP 503
 fn normalize_name(name: &str) -> String {
     name.to_lowercase().replace(['-', '_', '.'], "-")
-}
-
-/// Fetch package page from upstream
-async fn fetch_package_page(
-    client: &reqwest::Client,
-    url: &str,
-    timeout_secs: u64,
-    auth: Option<&str>,
-) -> Result<String, ()> {
-    let mut request = client
-        .get(url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .header("Accept", "text/html");
-    if let Some(credentials) = auth {
-        request = request.header("Authorization", basic_auth_header(credentials));
-    }
-    let response = request.send().await.map_err(|_| ())?;
-
-    if !response.status().is_success() {
-        return Err(());
-    }
-
-    response.text().await.map_err(|_| ())
-}
-
-/// Fetch file from upstream
-async fn fetch_file(
-    client: &reqwest::Client,
-    url: &str,
-    timeout_secs: u64,
-    auth: Option<&str>,
-) -> Result<Vec<u8>, ()> {
-    let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
-    if let Some(credentials) = auth {
-        request = request.header("Authorization", basic_auth_header(credentials));
-    }
-    let response = request.send().await.map_err(|_| ())?;
-
-    if !response.status().is_success() {
-        return Err(());
-    }
-
-    response.bytes().await.map(|b| b.to_vec()).map_err(|_| ())
 }
 
 /// Rewrite PyPI links to point to our registry
