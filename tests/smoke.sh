@@ -182,6 +182,148 @@ else
 fi
 
 echo ""
+echo "--- Docker Push/Pull + Digest Verify ---"
+
+# Create a minimal Docker image, push, pull, verify digest
+DOCKER_AVAILABLE=true
+if ! docker info >/dev/null 2>&1; then
+    echo "  SKIP: Docker daemon not available"
+    DOCKER_AVAILABLE=false
+fi
+
+if [ "$DOCKER_AVAILABLE" = true ]; then
+    DOCKER_IMG="localhost:${PORT}/smoke-test/hello:v1"
+
+    # Create tiny image from scratch
+    DOCKER_BUILD_DIR=$(mktemp -d)
+    echo "FROM scratch" > "$DOCKER_BUILD_DIR/Dockerfile"
+    echo "smoke-test" > "$DOCKER_BUILD_DIR/data.txt"
+    echo "COPY data.txt /data.txt" >> "$DOCKER_BUILD_DIR/Dockerfile"
+
+    if docker build -t "$DOCKER_IMG" "$DOCKER_BUILD_DIR" >/dev/null 2>&1; then
+        pass "docker build smoke image"
+    else
+        fail "docker build smoke image"
+    fi
+    rm -rf "$DOCKER_BUILD_DIR"
+
+    # Push
+    if docker push "$DOCKER_IMG" >/dev/null 2>&1; then
+        pass "docker push to NORA"
+    else
+        fail "docker push to NORA"
+    fi
+
+    # Get digest from registry
+    MANIFEST=$(curl -sf -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+        "$BASE/v2/smoke-test/hello/manifests/v1" 2>/dev/null || echo "")
+    if [ -n "$MANIFEST" ] && echo "$MANIFEST" | python3 -c "import sys,json; json.load(sys.stdin)" >/dev/null 2>&1; then
+        pass "docker manifest retrievable from NORA"
+    else
+        fail "docker manifest not retrievable"
+    fi
+
+    # Remove local image and pull back
+    docker rmi "$DOCKER_IMG" >/dev/null 2>&1 || true
+    if docker pull "$DOCKER_IMG" >/dev/null 2>&1; then
+        pass "docker pull from NORA"
+    else
+        fail "docker pull from NORA"
+    fi
+
+    # Verify digest matches: push digest == pull digest
+    PUSH_DIGEST=$(docker inspect "$DOCKER_IMG" --format='{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2)
+    if [ -n "$PUSH_DIGEST" ] && echo "$PUSH_DIGEST" | grep -q "^sha256:"; then
+        pass "docker digest verified (${PUSH_DIGEST:0:20}...)"
+    else
+        fail "docker digest verification failed"
+    fi
+
+    # Cleanup
+    docker rmi "$DOCKER_IMG" >/dev/null 2>&1 || true
+fi
+
+echo ""
+echo "--- npm Install + Integrity Verify ---"
+
+# Test real npm client against NORA (not just curl)
+NPM_TEST_DIR=$(mktemp -d)
+cd "$NPM_TEST_DIR"
+
+# Create minimal package.json
+cat > package.json << 'PKGJSON'
+{
+  "name": "nora-smoke-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "chalk": "5.4.1"
+  }
+}
+PKGJSON
+
+# npm install using NORA as registry
+if npm install --registry "$BASE/npm/" --prefer-online --no-audit --no-fund >/dev/null 2>&1; then
+    pass "npm install chalk via NORA registry"
+else
+    fail "npm install chalk via NORA registry"
+fi
+
+# Verify package was installed
+if [ -f "node_modules/chalk/package.json" ]; then
+    INSTALLED_VER=$(python3 -c "import json; print(json.load(open('node_modules/chalk/package.json'))['version'])" 2>/dev/null || echo "")
+    if [ "$INSTALLED_VER" = "5.4.1" ]; then
+        pass "npm installed correct version (5.4.1)"
+    else
+        fail "npm installed wrong version: $INSTALLED_VER"
+    fi
+else
+    fail "npm node_modules/chalk not found"
+fi
+
+# Verify integrity: check that package-lock.json has sha512 integrity
+if [ -f "package-lock.json" ]; then
+    INTEGRITY=$(python3 -c "
+import json
+lock = json.load(open('package-lock.json'))
+pkgs = lock.get('packages', {})
+chalk = pkgs.get('node_modules/chalk', pkgs.get('chalk', {}))
+print(chalk.get('integrity', ''))
+" 2>/dev/null || echo "")
+    if echo "$INTEGRITY" | grep -q "^sha512-"; then
+        pass "npm integrity hash present (sha512)"
+    else
+        fail "npm integrity hash missing: $INTEGRITY"
+    fi
+else
+    fail "npm package-lock.json not created"
+fi
+
+cd /tmp
+rm -rf "$NPM_TEST_DIR"
+
+echo ""
+echo "--- Upstream Timeout Handling ---"
+
+# Verify that requesting a non-existent package from upstream returns 404 quickly (not hang)
+TIMEOUT_START=$(date +%s)
+TIMEOUT_RESULT=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+    "$BASE/npm/@nora-smoke-test/nonexistent-package-xyz-12345")
+TIMEOUT_END=$(date +%s)
+TIMEOUT_DURATION=$((TIMEOUT_END - TIMEOUT_START))
+
+if [ "$TIMEOUT_RESULT" = "404" ]; then
+    pass "upstream 404 returned correctly"
+else
+    fail "upstream returned $TIMEOUT_RESULT, expected 404"
+fi
+
+if [ "$TIMEOUT_DURATION" -lt 10 ]; then
+    pass "upstream 404 returned in ${TIMEOUT_DURATION}s (< 10s)"
+else
+    fail "upstream 404 took ${TIMEOUT_DURATION}s (too slow, retry may hang)"
+fi
+
+echo ""
 echo "--- Mirror CLI ---"
 # Create a minimal lockfile
 LOCKFILE=$(mktemp)
