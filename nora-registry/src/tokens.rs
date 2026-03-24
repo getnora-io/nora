@@ -1,9 +1,14 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -66,8 +71,12 @@ pub struct TokenStore {
 impl TokenStore {
     /// Create a new token store
     pub fn new(storage_path: &Path) -> Self {
-        // Ensure directory exists
+        // Ensure directory exists with restricted permissions
         let _ = fs::create_dir_all(storage_path);
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(storage_path, fs::Permissions::from_mode(0o700));
+        }
         Self {
             storage_path: storage_path.to_path_buf(),
         }
@@ -87,7 +96,9 @@ impl TokenStore {
             TOKEN_PREFIX,
             Uuid::new_v4().to_string().replace("-", "")
         );
-        let token_hash = hash_token(&raw_token);
+        let token_hash = hash_token_argon2(&raw_token)?;
+        // Use SHA256 of token as filename (deterministic, for lookup)
+        let file_id = sha256_hex(&raw_token);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -97,7 +108,7 @@ impl TokenStore {
         let expires_at = now + (ttl_days * 24 * 60 * 60);
 
         let info = TokenInfo {
-            token_hash: token_hash.clone(),
+            token_hash,
             user: user.to_string(),
             created_at: now,
             expires_at,
@@ -106,13 +117,12 @@ impl TokenStore {
             role,
         };
 
-        // Save to file
-        let file_path = self
-            .storage_path
-            .join(format!("{}.json", &token_hash[..16]));
+        // Save to file with restricted permissions
+        let file_path = self.storage_path.join(format!("{}.json", &file_id[..16]));
         let json =
             serde_json::to_string_pretty(&info).map_err(|e| TokenError::Storage(e.to_string()))?;
-        fs::write(&file_path, json).map_err(|e| TokenError::Storage(e.to_string()))?;
+        fs::write(&file_path, &json).map_err(|e| TokenError::Storage(e.to_string()))?;
+        set_file_permissions_600(&file_path);
 
         Ok(raw_token)
     }
@@ -123,22 +133,43 @@ impl TokenStore {
             return Err(TokenError::InvalidFormat);
         }
 
-        let token_hash = hash_token(token);
-        let file_path = self
-            .storage_path
-            .join(format!("{}.json", &token_hash[..16]));
+        let file_id = sha256_hex(token);
+        let file_path = self.storage_path.join(format!("{}.json", &file_id[..16]));
 
-        if !file_path.exists() {
-            return Err(TokenError::NotFound);
-        }
+        // TOCTOU fix: read directly, handle NotFound from IO error
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TokenError::NotFound);
+            }
+            Err(e) => return Err(TokenError::Storage(e.to_string())),
+        };
 
-        let content =
-            fs::read_to_string(&file_path).map_err(|e| TokenError::Storage(e.to_string()))?;
         let mut info: TokenInfo =
             serde_json::from_str(&content).map_err(|e| TokenError::Storage(e.to_string()))?;
 
-        // Verify hash matches
-        if info.token_hash != token_hash {
+        // Verify hash: try Argon2id first, fall back to legacy SHA256
+        let hash_valid = if info.token_hash.starts_with("$argon2") {
+            verify_token_argon2(token, &info.token_hash)
+        } else {
+            // Legacy SHA256 hash (no salt) — verify and migrate
+            let legacy_hash = sha256_hex(token);
+            if info.token_hash == legacy_hash {
+                // Migrate to Argon2id
+                if let Ok(new_hash) = hash_token_argon2(token) {
+                    info.token_hash = new_hash;
+                    if let Ok(json) = serde_json::to_string_pretty(&info) {
+                        let _ = fs::write(&file_path, &json);
+                        set_file_permissions_600(&file_path);
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if !hash_valid {
             return Err(TokenError::NotFound);
         }
 
@@ -155,7 +186,8 @@ impl TokenStore {
         // Update last_used
         info.last_used = Some(now);
         if let Ok(json) = serde_json::to_string_pretty(&info) {
-            let _ = fs::write(&file_path, json);
+            let _ = fs::write(&file_path, &json);
+            set_file_permissions_600(&file_path);
         }
 
         Ok((info.user, info.role))
@@ -185,13 +217,12 @@ impl TokenStore {
     pub fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
         let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
 
-        if !file_path.exists() {
-            return Err(TokenError::NotFound);
+        // TOCTOU fix: try remove directly
+        match fs::remove_file(&file_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TokenError::NotFound),
+            Err(e) => Err(TokenError::Storage(e.to_string())),
         }
-
-        fs::remove_file(&file_path).map_err(|e| TokenError::Storage(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Revoke all tokens for a user
@@ -214,11 +245,39 @@ impl TokenStore {
     }
 }
 
-/// Hash a token using SHA256
-fn hash_token(token: &str) -> String {
+/// Hash a token using Argon2id with random salt
+fn hash_token_argon2(token: &str) -> Result<String, TokenError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(token.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| TokenError::Storage(format!("hash error: {e}")))
+}
+
+/// Verify a token against an Argon2id hash
+fn verify_token_argon2(token: &str, hash: &str) -> bool {
+    match PasswordHash::new(hash) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(token.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// SHA256 hex digest (used for file naming and legacy hash verification)
+fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
+    hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Set file permissions to 600 (owner read/write only)
+fn set_file_permissions_600(path: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
 }
 
 #[derive(Debug, Error)]
@@ -252,6 +311,19 @@ mod tests {
 
         assert!(token.starts_with("nra_"));
         assert_eq!(token.len(), 4 + 32); // prefix + uuid without dashes
+    }
+
+    #[test]
+    fn test_token_hash_is_argon2() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
+
+        let tokens = store.list_tokens("testuser");
+        assert!(tokens[0].token_hash.starts_with("$argon2"));
     }
 
     #[test]
@@ -291,22 +363,78 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        // Create token and manually set it as expired
         let token = store
             .create_token("testuser", 1, None, Role::Write)
             .unwrap();
-        let token_hash = hash_token(&token);
-        let file_path = temp_dir.path().join(format!("{}.json", &token_hash[..16]));
+        let file_id = sha256_hex(&token);
+        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
 
-        // Read and modify the token to be expired
         let content = std::fs::read_to_string(&file_path).unwrap();
         let mut info: TokenInfo = serde_json::from_str(&content).unwrap();
-        info.expires_at = 0; // Set to epoch (definitely expired)
+        info.expires_at = 0;
         std::fs::write(&file_path, serde_json::to_string(&info).unwrap()).unwrap();
 
-        // Token should now be expired
         let result = store.verify_token(&token);
         assert!(matches!(result, Err(TokenError::Expired)));
+    }
+
+    #[test]
+    fn test_legacy_sha256_migration() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        // Simulate a legacy token with SHA256 hash
+        let raw_token = "nra_00112233445566778899aabbccddeeff";
+        let legacy_hash = sha256_hex(raw_token);
+        let file_id = sha256_hex(raw_token);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let info = TokenInfo {
+            token_hash: legacy_hash.clone(),
+            user: "legacyuser".to_string(),
+            created_at: now,
+            expires_at: now + 86400,
+            last_used: None,
+            description: None,
+            role: Role::Read,
+        };
+
+        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
+        fs::write(&file_path, serde_json::to_string_pretty(&info).unwrap()).unwrap();
+
+        // Verify should work with legacy hash
+        let (user, role) = store.verify_token(raw_token).unwrap();
+        assert_eq!(user, "legacyuser");
+        assert_eq!(role, Role::Read);
+
+        // After verification, hash should be migrated to Argon2id
+        let content = fs::read_to_string(&file_path).unwrap();
+        let updated: TokenInfo = serde_json::from_str(&content).unwrap();
+        assert!(updated.token_hash.starts_with("$argon2"));
+    }
+
+    #[test]
+    fn test_file_permissions() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
+
+        let file_id = sha256_hex(&token);
+        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
+
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(&file_path).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
@@ -336,16 +464,13 @@ mod tests {
         let token = store
             .create_token("testuser", 30, None, Role::Write)
             .unwrap();
-        let token_hash = hash_token(&token);
-        let hash_prefix = &token_hash[..16];
+        let file_id = sha256_hex(&token);
+        let hash_prefix = &file_id[..16];
 
-        // Verify token works
         assert!(store.verify_token(&token).is_ok());
 
-        // Revoke
         store.revoke_token(hash_prefix).unwrap();
 
-        // Verify token no longer works
         let result = store.verify_token(&token);
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
@@ -384,10 +509,8 @@ mod tests {
             .create_token("testuser", 30, None, Role::Write)
             .unwrap();
 
-        // First verification
         store.verify_token(&token).unwrap();
 
-        // Check last_used is set
         let tokens = store.list_tokens("testuser");
         assert!(tokens[0].last_used.is_some());
     }
