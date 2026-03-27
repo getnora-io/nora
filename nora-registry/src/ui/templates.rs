@@ -655,10 +655,7 @@ pub fn render_package_detail(
             "pip install {} --index-url http://127.0.0.1:4000/simple",
             name
         ),
-        "go" => format!(
-            "GOPROXY=http://127.0.0.1:4000/go go get {}",
-            name
-        ),
+        "go" => format!("GOPROXY=http://127.0.0.1:4000/go go get {}", name),
         _ => String::new(),
     };
 
