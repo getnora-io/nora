@@ -20,7 +20,6 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![Image Size](https://ghcr-badge.egpl.dev/getnora-io/nora/size?label=image)](https://github.com/getnora-io/nora/pkgs/container/nora)
-[![Downloads](https://img.shields.io/github/downloads/getnora-io/nora/total?label=downloads)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
