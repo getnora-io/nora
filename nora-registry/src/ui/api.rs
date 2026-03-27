@@ -24,6 +24,7 @@ pub struct RegistryStats {
     pub cargo: usize,
     pub pypi: usize,
     pub go: usize,
+    pub raw: usize,
 }
 
 #[derive(Serialize)]
@@ -116,8 +117,9 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
     let _ = state.repo_index.get("cargo", &state.storage).await;
     let _ = state.repo_index.get("pypi", &state.storage).await;
     let _ = state.repo_index.get("go", &state.storage).await;
+    let _ = state.repo_index.get("raw", &state.storage).await;
 
-    let (docker, maven, npm, cargo, pypi, go) = state.repo_index.counts();
+    let (docker, maven, npm, cargo, pypi, go, raw) = state.repo_index.counts();
     Json(RegistryStats {
         docker,
         maven,
@@ -125,6 +127,7 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
         cargo,
         pypi,
         go,
+        raw,
     })
 }
 
@@ -136,6 +139,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let cargo_repos = state.repo_index.get("cargo", &state.storage).await;
     let pypi_repos = state.repo_index.get("pypi", &state.storage).await;
     let go_repos = state.repo_index.get("go", &state.storage).await;
+    let raw_repos = state.repo_index.get("raw", &state.storage).await;
 
     // Calculate sizes from cached index
     let docker_size: u64 = docker_repos.iter().map(|r| r.size).sum();
@@ -144,7 +148,9 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let cargo_size: u64 = cargo_repos.iter().map(|r| r.size).sum();
     let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
     let go_size: u64 = go_repos.iter().map(|r| r.size).sum();
-    let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size + go_size;
+    let raw_size: u64 = raw_repos.iter().map(|r| r.size).sum();
+    let total_storage =
+        docker_size + maven_size + npm_size + cargo_size + pypi_size + go_size + raw_size;
 
     // Count total versions/tags, not just repositories
     let docker_versions: usize = docker_repos.iter().map(|r| r.versions).sum();
@@ -153,12 +159,14 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
     let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
     let go_versions: usize = go_repos.iter().map(|r| r.versions).sum();
+    let raw_versions: usize = raw_repos.iter().map(|r| r.versions).sum();
     let total_artifacts = docker_versions
         + maven_versions
         + npm_versions
         + cargo_versions
         + pypi_versions
-        + go_versions;
+        + go_versions
+        + raw_versions;
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),
@@ -211,6 +219,13 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             uploads: 0,
             size_bytes: go_size,
         },
+        RegistryCardStats {
+            name: "raw".to_string(),
+            artifact_count: raw_versions,
+            downloads: state.metrics.get_registry_downloads("raw"),
+            uploads: state.metrics.get_registry_uploads("raw"),
+            size_bytes: raw_size,
+        },
     ];
 
     let mount_points = vec![
@@ -248,6 +263,11 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             registry: "Go".to_string(),
             mount_path: "/go/".to_string(),
             proxy_upstream: state.config.go.proxy.clone(),
+        },
+        MountPoint {
+            registry: "Raw".to_string(),
+            mount_path: "/raw/".to_string(),
+            proxy_upstream: None,
         },
     ];
 
@@ -406,6 +426,13 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         .collect::<HashSet<_>>()
         .len();
 
+    let raw = all_keys
+        .iter()
+        .filter(|k| k.starts_with("raw/"))
+        .filter_map(|k| k.strip_prefix("raw/")?.split('/').next())
+        .collect::<HashSet<_>>()
+        .len();
+
     RegistryStats {
         docker,
         maven,
@@ -413,6 +440,7 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         cargo,
         pypi,
         go,
+        raw,
     }
 }
 
@@ -956,4 +984,27 @@ fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
+    let prefix = format!("raw/{}/", group);
+    let keys = storage.list(&prefix).await;
+
+    let mut versions = Vec::new();
+    for key in &keys {
+        if let Some(filename) = key.strip_prefix(&prefix) {
+            let (size, published) = if let Some(meta) = storage.stat(key).await {
+                (meta.size, format_timestamp(meta.modified))
+            } else {
+                (0, "N/A".to_string())
+            };
+            versions.push(VersionInfo {
+                version: filename.to_string(),
+                size,
+                published,
+            });
+        }
+    }
+
+    PackageDetail { versions }
 }

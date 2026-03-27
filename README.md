@@ -18,7 +18,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 - **Production-tested** — Docker, Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 200+ unit tests.
 
-**32 MB** binary | **< 100 MB** RAM | **3s** startup | **6** package registries
+**32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
 
 > Used in production at [DevIT Academy](https://github.com/devitway) since January 2026 for Docker images, Maven artifacts, and npm packages.
 
