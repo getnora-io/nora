@@ -23,6 +23,7 @@ pub struct RegistryStats {
     pub npm: usize,
     pub cargo: usize,
     pub pypi: usize,
+    pub go: usize,
 }
 
 #[derive(Serialize)]
@@ -114,14 +115,16 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
     let _ = state.repo_index.get("npm", &state.storage).await;
     let _ = state.repo_index.get("cargo", &state.storage).await;
     let _ = state.repo_index.get("pypi", &state.storage).await;
+    let _ = state.repo_index.get("go", &state.storage).await;
 
-    let (docker, maven, npm, cargo, pypi) = state.repo_index.counts();
+    let (docker, maven, npm, cargo, pypi, go) = state.repo_index.counts();
     Json(RegistryStats {
         docker,
         maven,
         npm,
         cargo,
         pypi,
+        go,
     })
 }
 
@@ -132,6 +135,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_repos = state.repo_index.get("npm", &state.storage).await;
     let cargo_repos = state.repo_index.get("cargo", &state.storage).await;
     let pypi_repos = state.repo_index.get("pypi", &state.storage).await;
+    let go_repos = state.repo_index.get("go", &state.storage).await;
 
     // Calculate sizes from cached index
     let docker_size: u64 = docker_repos.iter().map(|r| r.size).sum();
@@ -139,7 +143,8 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_size: u64 = npm_repos.iter().map(|r| r.size).sum();
     let cargo_size: u64 = cargo_repos.iter().map(|r| r.size).sum();
     let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
-    let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size;
+    let go_size: u64 = go_repos.iter().map(|r| r.size).sum();
+    let total_storage = docker_size + maven_size + npm_size + cargo_size + pypi_size + go_size;
 
     // Count total versions/tags, not just repositories
     let docker_versions: usize = docker_repos.iter().map(|r| r.versions).sum();
@@ -147,8 +152,9 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_versions: usize = npm_repos.iter().map(|r| r.versions).sum();
     let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
     let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
+    let go_versions: usize = go_repos.iter().map(|r| r.versions).sum();
     let total_artifacts =
-        docker_versions + maven_versions + npm_versions + cargo_versions + pypi_versions;
+        docker_versions + maven_versions + npm_versions + cargo_versions + pypi_versions + go_versions;
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),
@@ -194,6 +200,13 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             uploads: 0,
             size_bytes: pypi_size,
         },
+        RegistryCardStats {
+            name: "go".to_string(),
+            artifact_count: go_versions,
+            downloads: state.metrics.get_registry_downloads("go"),
+            uploads: 0,
+            size_bytes: go_size,
+        },
     ];
 
     let mount_points = vec![
@@ -226,6 +239,11 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             registry: "PyPI".to_string(),
             mount_path: "/simple/".to_string(),
             proxy_upstream: state.config.pypi.proxy.clone(),
+        },
+        MountPoint {
+            registry: "Go".to_string(),
+            mount_path: "/go/".to_string(),
+            proxy_upstream: state.config.go.proxy.clone(),
         },
     ];
 
@@ -373,12 +391,24 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         .collect::<HashSet<_>>()
         .len();
 
+    let go = all_keys
+        .iter()
+        .filter(|k| k.starts_with("go/") && k.ends_with(".zip"))
+        .filter_map(|k| {
+            let rest = k.strip_prefix("go/")?;
+            let pos = rest.rfind("/@v/")?;
+            Some(rest[..pos].to_string())
+        })
+        .collect::<HashSet<_>>()
+        .len();
+
     RegistryStats {
         docker,
         maven,
         npm,
         cargo,
         pypi,
+        go,
     }
 }
 
