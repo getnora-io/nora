@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
+    pub go: GoConfig,
+    #[serde(default)]
     pub raw: RawConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -125,6 +127,48 @@ pub struct PypiConfig {
     pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+}
+
+/// Go module proxy configuration (GOPROXY protocol)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoConfig {
+    /// Upstream Go module proxy URL (default: https://proxy.golang.org)
+    #[serde(default = "default_go_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+    /// Separate timeout for .zip downloads (default: 120s, zips can be large)
+    #[serde(default = "default_go_zip_timeout")]
+    pub proxy_timeout_zip: u64,
+    /// Maximum module zip size in bytes (default: 100MB)
+    #[serde(default = "default_go_max_zip_size")]
+    pub max_zip_size: u64,
+}
+
+fn default_go_proxy() -> Option<String> {
+    Some("https://proxy.golang.org".to_string())
+}
+
+fn default_go_zip_timeout() -> u64 {
+    120
+}
+
+fn default_go_max_zip_size() -> u64 {
+    104_857_600 // 100MB
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            proxy: default_go_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            proxy_timeout_zip: 120,
+            max_zip_size: 104_857_600,
+        }
+    }
 }
 
 /// Docker registry configuration with upstream proxy support
@@ -387,6 +431,10 @@ impl Config {
                 );
             }
         }
+        // Go
+        if self.go.proxy_auth.is_some() && std::env::var("NORA_GO_PROXY_AUTH").is_err() {
+            tracing::warn!("Go proxy credentials in config.toml are plaintext — consider NORA_GO_PROXY_AUTH env var");
+        }
         // npm
         if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
             tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
@@ -629,6 +677,7 @@ impl Default for Config {
             maven: MavenConfig::default(),
             npm: NpmConfig::default(),
             pypi: PypiConfig::default(),
+            go: GoConfig::default(),
             docker: DockerConfig::default(),
             raw: RawConfig::default(),
             auth: AuthConfig::default(),

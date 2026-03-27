@@ -326,7 +326,8 @@ async fn run_server(config: Config, storage: Storage) {
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
-        .merge(registry::raw_routes());
+        .merge(registry::raw_routes())
+        .merge(registry::go_routes());
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
