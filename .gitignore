@@ -32,3 +32,5 @@ package.json
 package-lock.json
 /tmp/
 scripts/
+CLAUDE.md
+.claude/
