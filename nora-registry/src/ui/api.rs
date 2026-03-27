@@ -908,6 +908,32 @@ pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail { versions }
 }
 
+pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
+    let prefix = format!("go/{}/@v/", module);
+    let keys = storage.list(&prefix).await;
+
+    let mut versions = Vec::new();
+    for key in keys.iter().filter(|k| k.ends_with(".zip")) {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if let Some(version) = rest.strip_suffix(".zip") {
+                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                    (meta.size, format_timestamp(meta.modified))
+                } else {
+                    (0, "N/A".to_string())
+                };
+                versions.push(VersionInfo {
+                    version: version.to_string(),
+                    size,
+                    published,
+                });
+            }
+        }
+    }
+
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    PackageDetail { versions }
+}
+
 fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
     // Handle both .tar.gz and .whl files
     let clean_name = name.replace('-', "_");

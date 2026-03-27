@@ -24,22 +24,8 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
         .registry_stats
         .iter()
         .map(|r| {
-            let icon = match r.name.as_str() {
-                "docker" => icons::DOCKER,
-                "maven" => icons::MAVEN,
-                "npm" => icons::NPM,
-                "cargo" => icons::CARGO,
-                "pypi" => icons::PYPI,
-                _ => icons::DOCKER,
-            };
-            let display_name = match r.name.as_str() {
-                "docker" => "Docker",
-                "maven" => "Maven",
-                "npm" => "npm",
-                "cargo" => "Cargo",
-                "pypi" => "PyPI",
-                _ => &r.name,
-            };
+            let icon = get_registry_icon(&r.name);
+            let display_name = get_registry_title(&r.name);
             render_registry_card(
                 display_name,
                 icon,
@@ -155,7 +141,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
 
         {}
 
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
             {}
         </div>
 
@@ -669,6 +655,10 @@ pub fn render_package_detail(
             "pip install {} --index-url http://127.0.0.1:4000/simple",
             name
         ),
+        "go" => format!(
+            "GOPROXY=http://127.0.0.1:4000/go go get {}",
+            name
+        ),
         _ => String::new(),
     };
 
@@ -835,6 +825,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "npm" => icons::NPM,
         "cargo" => icons::CARGO,
         "pypi" => icons::PYPI,
+        "go" => icons::GO,
         _ => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -848,6 +839,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         "npm" => "npm Registry",
         "cargo" => "Cargo Registry",
         "pypi" => "PyPI Repository",
+        "go" => "Go Modules",
         _ => "Registry",
     }
 }
