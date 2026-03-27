@@ -21,6 +21,7 @@ use axum::{
     routing::get,
     Router,
 };
+use percent_encoding::percent_decode;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -29,15 +30,27 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// Main handler — parses the wildcard path and dispatches to the right logic.
 async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+    // URL-decode the path: Go client sends %21 for !, Axum wildcard may not decode it
+    let path = percent_decode(path.as_bytes())
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or(path);
+
+    tracing::debug!(path = %path, "Go proxy request");
+
     // Validate path: no traversal, no null bytes
     if !is_safe_path(&path) {
+        tracing::debug!(path = %path, "Go proxy: unsafe path");
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     // Split: "github.com/!azure/sdk/@v/v1.0.0.info" → module + file
     let (module_encoded, file) = match split_go_path(&path) {
         Some(parts) => parts,
-        None => return StatusCode::NOT_FOUND.into_response(),
+        None => {
+            tracing::debug!(path = %path, "Go proxy: cannot split path");
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
 
     let storage_key = format!("go/{}", path);
@@ -67,16 +80,15 @@ async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) ->
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // Decode module path for upstream URL (upstream expects unencoded paths)
-    let module_decoded = match decode_module_path(&module_encoded) {
-        Ok(m) => m,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    // Validate module path encoding (but keep encoded for upstream — proxy.golang.org expects ! encoding)
+    if decode_module_path(&module_encoded).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     let upstream_url = format!(
         "{}/{}",
         proxy_url.trim_end_matches('/'),
-        format_upstream_path(&module_decoded, &file)
+        format_upstream_path(&module_encoded, &file)
     );
 
     // Use longer timeout for .zip files
