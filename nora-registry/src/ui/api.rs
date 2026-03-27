@@ -153,8 +153,12 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
     let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
     let go_versions: usize = go_repos.iter().map(|r| r.versions).sum();
-    let total_artifacts =
-        docker_versions + maven_versions + npm_versions + cargo_versions + pypi_versions + go_versions;
+    let total_artifacts = docker_versions
+        + maven_versions
+        + npm_versions
+        + cargo_versions
+        + pypi_versions
+        + go_versions;
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),

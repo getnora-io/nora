@@ -349,7 +349,10 @@ mod tests {
 
     #[test]
     fn test_encode_no_change() {
-        assert_eq!(encode_module_path("github.com/user/repo"), "github.com/user/repo");
+        assert_eq!(
+            encode_module_path("github.com/user/repo"),
+            "github.com/user/repo"
+        );
     }
 
     // ── Path splitting ──────────────────────────────────────────────────
@@ -392,10 +395,9 @@ mod tests {
 
     #[test]
     fn test_split_pseudo_version() {
-        let (module, file) = split_go_path(
-            "github.com/user/repo/@v/v0.0.0-20210101000000-abcdef123456.info",
-        )
-        .unwrap();
+        let (module, file) =
+            split_go_path("github.com/user/repo/@v/v0.0.0-20210101000000-abcdef123456.info")
+                .unwrap();
         assert_eq!(module, "github.com/user/repo");
         assert_eq!(file, "@v/v0.0.0-20210101000000-abcdef123456.info");
     }
