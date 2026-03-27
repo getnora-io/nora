@@ -110,6 +110,13 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations) -> String {
         ("cargo", "/ui/cargo", "Cargo", cargo_icon, false),
         ("pypi", "/ui/pypi", "PyPI", pypi_icon, false),
         (
+            "raw",
+            "/ui/raw",
+            "Raw",
+            r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#,
+            false,
+        ),
+        (
             "go",
             "/ui/go",
             "Go",
@@ -514,6 +521,13 @@ fn sidebar(active_page: Option<&str>) -> String {
         ("cargo", "/ui/cargo", "Cargo", cargo_icon, false),
         ("pypi", "/ui/pypi", "PyPI", pypi_icon, false),
         (
+            "raw",
+            "/ui/raw",
+            "Raw",
+            r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#,
+            false,
+        ),
+        (
             "go",
             "/ui/go",
             "Go",
@@ -691,7 +705,7 @@ pub fn render_bragging_footer(lang: Lang) -> String {
         </div>
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 text-center">
             <div class="p-3">
-                <div class="text-2xl font-bold text-blue-400">34 MB</div>
+                <div class="text-2xl font-bold text-blue-400">32 MB</div>
                 <div class="text-xs text-slate-500 mt-1">{}</div>
             </div>
             <div class="p-3">
@@ -703,7 +717,7 @@ pub fn render_bragging_footer(lang: Lang) -> String {
                 <div class="text-xs text-slate-500 mt-1">{}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-yellow-400">5</div>
+                <div class="text-2xl font-bold text-yellow-400">7</div>
                 <div class="text-xs text-slate-500 mt-1">{}</div>
             </div>
             <div class="p-3">
