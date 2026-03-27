@@ -15,10 +15,15 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
-- **Production-tested** — Docker, Maven, npm, PyPI, Cargo, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
+- **Production-tested** — Docker, Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 200+ unit tests.
 
-**32 MB** binary | **< 100 MB** RAM | **3s** startup | **6** registries
+[![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
+[![Image Size](https://ghcr-badge.egpl.dev/getnora-io/nora/size?label=image)](https://github.com/getnora-io/nora/pkgs/container/nora)
+[![Downloads](https://img.shields.io/github/downloads/getnora-io/nora/total?label=downloads)](https://github.com/getnora-io/nora/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
 
 > Used in production at [DevIT Academy](https://github.com/devitway) since January 2026 for Docker images, Maven artifacts, and npm packages.
 
@@ -31,6 +36,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | npm | `/npm/` | npmjs.org, custom | ✓ |
 | Cargo | `/cargo/` | — | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
+| Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
 | Raw files | `/raw/` | — | ✓ |
 
 ## Quick Start
@@ -80,6 +86,12 @@ docker pull localhost:4000/myapp:latest
 ```bash
 npm config set registry http://localhost:4000/npm/
 npm publish
+```
+
+### Go Modules
+
+```bash
+GOPROXY=http://localhost:4000/go go get golang.org/x/text@latest
 ```
 
 ## Features
@@ -154,6 +166,9 @@ proxy_timeout = 60
 
 [[docker.upstreams]]
 url = "https://registry-1.docker.io"
+
+[go]
+proxy = "https://proxy.golang.org"
 ```
 
 ## CLI Commands
@@ -181,6 +196,7 @@ nora mirror       # Sync packages for offline use
 | `/npm/` | npm |
 | `/cargo/` | Cargo |
 | `/simple/` | PyPI |
+| `/go/` | Go Modules |
 
 ## TLS / HTTPS
 
@@ -220,7 +236,6 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 [![CII Best Practices](https://www.bestpractices.dev/projects/12207/badge)](https://www.bestpractices.dev/projects/12207)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/devitway/0f0538f1ed16d5d9951e4f2d3f79b699/raw/nora-coverage.json)](https://github.com/getnora-io/nora/actions/workflows/ci.yml)
 [![CI](https://img.shields.io/github/actions/workflow/status/getnora-io/nora/ci.yml?label=CI)](https://github.com/getnora-io/nora/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 - **Signed releases** — every release is signed with [cosign](https://github.com/sigstore/cosign)
 - **SBOM** — SPDX + CycloneDX in every release

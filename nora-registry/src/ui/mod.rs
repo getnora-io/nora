@@ -89,6 +89,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/pypi/{name}", get(pypi_detail))
         .route("/ui/go", get(go_list))
         .route("/ui/go/{*name}", get(go_detail))
+        .route("/ui/raw", get(raw_list))
+        .route("/ui/raw/{*name}", get(raw_detail))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
@@ -337,4 +339,42 @@ async fn go_detail(
     );
     let detail = get_go_detail(&state.storage, &name).await;
     Html(render_package_detail("go", &name, &detail, lang))
+}
+
+// Raw pages
+async fn raw_list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+
+    let all_files = state.repo_index.get("raw", &state.storage).await;
+    let (files, total) = paginate(&all_files, page, limit);
+
+    Html(render_registry_list_paginated(
+        "raw",
+        "Raw Storage",
+        &files,
+        page,
+        limit,
+        total,
+        lang,
+    ))
+}
+
+async fn raw_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let detail = get_raw_detail(&state.storage, &name).await;
+    Html(render_package_detail("raw", &name, &detail, lang))
 }
