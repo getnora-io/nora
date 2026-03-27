@@ -221,11 +221,11 @@ See [TLS / HTTPS guide](https://getnora.dev/configuration/tls/) for Nginx, Traef
 
 ## Roadmap
 
+- **Mirror CLI** — offline sync for air-gapped environments
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
 - **Online Garbage Collection** — non-blocking cleanup without registry downtime
 - **Retention Policies** — declarative rules: keep last N tags, delete older than X days
-- **Image Signing** — cosign/notation verification and policy enforcement
-- **Replication** — push/pull sync between NORA instances
+- **Image Signing** — cosign verification and policy enforcement
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
