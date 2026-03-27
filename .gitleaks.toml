@@ -1,0 +1,13 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+title = "NORA gitleaks rules"
+
+[allowlist]
+  description = "Global allowlist for false positives"
+  paths = [
+    '''\.gitleaks\.toml$''',
+  ]
+  regexTarget = "match"
+  # Test placeholder tokens (e.g. nra_00112233...)
+  regexes = ['''nra_0{2}[0-9a-f]{30}''']
