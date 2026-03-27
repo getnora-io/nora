@@ -19,7 +19,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 200+ unit tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
-[![Image Size](https://ghcr-badge.egpl.dev/getnora-io/nora/size?label=image)](https://github.com/getnora-io/nora/pkgs/container/nora)
+[![Image Size](https://img.shields.io/badge/image-32%20MB-blue)](https://github.com/getnora-io/nora/pkgs/container/nora)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
@@ -249,7 +249,6 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 Created and maintained by [DevITWay](https://github.com/devitway)
 
-[![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![GHCR](https://img.shields.io/badge/ghcr.io-nora-blue?logo=github)](https://github.com/getnora-io/nora/pkgs/container/nora)
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-getnora.dev-green?logo=gitbook)](https://getnora.dev)
