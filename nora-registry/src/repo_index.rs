@@ -81,6 +81,7 @@ pub struct RepoIndex {
     pub cargo: RegistryIndex,
     pub pypi: RegistryIndex,
     pub go: RegistryIndex,
+    pub raw: RegistryIndex,
 }
 
 impl RepoIndex {
@@ -92,6 +93,7 @@ impl RepoIndex {
             cargo: RegistryIndex::new(),
             pypi: RegistryIndex::new(),
             go: RegistryIndex::new(),
+            raw: RegistryIndex::new(),
         }
     }
 
@@ -104,6 +106,7 @@ impl RepoIndex {
             "cargo" => self.cargo.invalidate(),
             "pypi" => self.pypi.invalidate(),
             "go" => self.go.invalidate(),
+            "raw" => self.raw.invalidate(),
             _ => {}
         }
     }
@@ -117,6 +120,7 @@ impl RepoIndex {
             "cargo" => &self.cargo,
             "pypi" => &self.pypi,
             "go" => &self.go,
+            "raw" => &self.raw,
             _ => return Arc::new(Vec::new()),
         };
 
@@ -137,6 +141,7 @@ impl RepoIndex {
                 "cargo" => build_cargo_index(storage).await,
                 "pypi" => build_pypi_index(storage).await,
                 "go" => build_go_index(storage).await,
+                "raw" => build_raw_index(storage).await,
                 _ => Vec::new(),
             };
             info!(registry = registry, count = data.len(), "Index rebuilt");
@@ -147,7 +152,7 @@ impl RepoIndex {
     }
 
     /// Get counts for stats (no rebuild, just current state)
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize) {
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         (
             self.docker.count(),
             self.maven.count(),
@@ -155,6 +160,7 @@ impl RepoIndex {
             self.cargo.count(),
             self.pypi.count(),
             self.go.count(),
+            self.raw.count(),
         )
     }
 }
@@ -364,6 +370,28 @@ async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
     to_sorted_vec(modules)
 }
 
+async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
+    let keys = storage.list("raw/").await;
+    let mut files: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix("raw/") {
+            // Group by top-level directory
+            let group = rest.split('/').next().unwrap_or(rest).to_string();
+            let entry = files.entry(group).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    to_sorted_vec(files)
+}
+
 /// Convert HashMap to sorted Vec<RepoInfo>
 fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
     let mut result: Vec<_> = map
@@ -517,8 +545,8 @@ mod tests {
     #[test]
     fn test_repo_index_new() {
         let idx = RepoIndex::new();
-        let (d, m, n, c, p, g) = idx.counts();
-        assert_eq!((d, m, n, c, p, g), (0, 0, 0, 0, 0, 0));
+        let (d, m, n, c, p, g, r) = idx.counts();
+        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -530,14 +558,15 @@ mod tests {
         idx.invalidate("npm");
         idx.invalidate("cargo");
         idx.invalidate("pypi");
+        idx.invalidate("raw");
         idx.invalidate("unknown"); // should be a no-op
     }
 
     #[test]
     fn test_repo_index_default() {
         let idx = RepoIndex::default();
-        let (d, m, n, c, p, g) = idx.counts();
-        assert_eq!((d, m, n, c, p, g), (0, 0, 0, 0, 0, 0));
+        let (d, m, n, c, p, g, r) = idx.counts();
+        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]

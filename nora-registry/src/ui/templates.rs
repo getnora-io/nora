@@ -141,7 +141,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
 
         {}
 
-        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
             {}
         </div>
 
@@ -656,6 +656,7 @@ pub fn render_package_detail(
             name
         ),
         "go" => format!("GOPROXY=http://127.0.0.1:4000/go go get {}", name),
+        "raw" => format!("curl -O http://127.0.0.1:4000/raw/{}/<file>", name),
         _ => String::new(),
     };
 
@@ -823,6 +824,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "cargo" => icons::CARGO,
         "pypi" => icons::PYPI,
         "go" => icons::GO,
+        "raw" => icons::RAW,
         _ => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -837,6 +839,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         "cargo" => "Cargo Registry",
         "pypi" => "PyPI Repository",
         "go" => "Go Modules",
+        "raw" => "Raw Storage",
         _ => "Registry",
     }
 }
