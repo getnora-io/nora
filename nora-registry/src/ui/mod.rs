@@ -87,6 +87,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/cargo/{name}", get(cargo_detail))
         .route("/ui/pypi", get(pypi_list))
         .route("/ui/pypi/{name}", get(pypi_detail))
+        .route("/ui/go", get(go_list))
+        .route("/ui/go/{*name}", get(go_detail))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
@@ -297,4 +299,42 @@ async fn pypi_detail(
     );
     let detail = get_pypi_detail(&state.storage, &name).await;
     Html(render_package_detail("pypi", &name, &detail, lang))
+}
+
+// Go pages
+async fn go_list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+
+    let all_modules = state.repo_index.get("go", &state.storage).await;
+    let (modules, total) = paginate(&all_modules, page, limit);
+
+    Html(render_registry_list_paginated(
+        "go",
+        "Go Modules",
+        &modules,
+        page,
+        limit,
+        total,
+        lang,
+    ))
+}
+
+async fn go_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let detail = get_go_detail(&state.storage, &name).await;
+    Html(render_package_detail("go", &name, &detail, lang))
 }

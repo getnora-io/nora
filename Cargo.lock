@@ -1321,6 +1321,7 @@ dependencies = [
  "indicatif",
  "lazy_static",
  "parking_lot",
+ "percent-encoding",
  "prometheus",
  "reqwest",
  "serde",
