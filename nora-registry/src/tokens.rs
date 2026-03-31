@@ -269,7 +269,7 @@ fn verify_token_argon2(token: &str, hash: &str) -> bool {
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Set file permissions to 600 (owner read/write only)

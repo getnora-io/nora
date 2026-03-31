@@ -488,7 +488,7 @@ async fn upload_blob(
     // Verify digest matches uploaded content (Docker Distribution Spec)
     {
         use sha2::Digest as _;
-        let computed = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
         if computed != *digest {
             tracing::warn!(
                 expected = %digest,
@@ -564,7 +564,7 @@ async fn get_manifest(
 
         // Calculate digest for Docker-Content-Digest header
         use sha2::Digest;
-        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
         // Detect manifest media type from content
         let content_type = detect_manifest_media_type(&data);
@@ -614,7 +614,7 @@ async fn get_manifest(
 
             // Calculate digest for Docker-Content-Digest header
             use sha2::Digest;
-            let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
             // Cache manifest and create metadata (fire and forget)
             let storage = state.storage.clone();
@@ -684,7 +684,7 @@ async fn get_manifest(
                 ));
 
                 use sha2::Digest;
-                let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+                let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
                 // Cache under original name for future local hits
                 let storage = state.storage.clone();
@@ -726,7 +726,7 @@ async fn put_manifest(
 
     // Calculate digest
     use sha2::Digest;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&body));
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
 
     // Store by tag/reference
     let key = format!("docker/{}/manifests/{}.json", name, reference);
@@ -819,7 +819,7 @@ async fn delete_manifest(
     if is_tag {
         if let Ok(data) = state.storage.get(&key).await {
             use sha2::Digest;
-            let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
             let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
             let _ = state.storage.delete(&digest_key).await;
             let digest_meta = format!("docker/{}/manifests/{}.meta.json", name, digest);
