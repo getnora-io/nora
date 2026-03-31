@@ -1,4 +1,5 @@
 #![deny(clippy::unwrap_used)]
+#![forbid(unsafe_code)]
 //! NORA Registry — library interface for fuzzing and testing
 
 pub mod validation;
