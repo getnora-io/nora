@@ -445,6 +445,68 @@ impl Config {
         }
     }
 
+    /// Validate configuration and return (warnings, errors).
+    ///
+    /// Warnings are logged but do not prevent startup.
+    /// Errors indicate a fatal misconfiguration and should cause a panic.
+    pub fn validate(&self) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        // 1. Port must not be 0
+        if self.server.port == 0 {
+            errors.push("server.port must not be 0".to_string());
+        }
+
+        // 2. Storage path must not be empty when mode = Local
+        if self.storage.mode == StorageMode::Local && self.storage.path.trim().is_empty() {
+            errors.push("storage.path must not be empty when storage mode is local".to_string());
+        }
+
+        // 3. S3 bucket must not be empty when mode = S3
+        if self.storage.mode == StorageMode::S3 && self.storage.bucket.trim().is_empty() {
+            errors.push("storage.bucket must not be empty when storage mode is s3".to_string());
+        }
+
+        // 4. Rate limit values must be > 0 when rate limiting is enabled
+        if self.rate_limit.enabled {
+            if self.rate_limit.auth_rps == 0 {
+                warnings
+                    .push("rate_limit.auth_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.auth_burst == 0 {
+                warnings
+                    .push("rate_limit.auth_burst is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.upload_rps == 0 {
+                warnings
+                    .push("rate_limit.upload_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.upload_burst == 0 {
+                warnings.push(
+                    "rate_limit.upload_burst is 0 while rate limiting is enabled".to_string(),
+                );
+            }
+            if self.rate_limit.general_rps == 0 {
+                warnings
+                    .push("rate_limit.general_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.general_burst == 0 {
+                warnings.push(
+                    "rate_limit.general_burst is 0 while rate limiting is enabled".to_string(),
+                );
+            }
+        }
+
+        // 5. Body limit must be > 0
+        if self.server.body_limit_mb == 0 {
+            warnings
+                .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
+        }
+
+        (warnings, errors)
+    }
+
     /// Load configuration with priority: ENV > config.toml > defaults
     pub fn load() -> Self {
         // 1. Start with defaults
@@ -456,6 +518,19 @@ impl Config {
 
         // 3. Override with ENV vars (highest priority)
         config.apply_env_overrides();
+
+        // 4. Validate configuration
+        let (warnings, errors) = config.validate();
+        for w in &warnings {
+            tracing::warn!("Config validation: {}", w);
+        }
+        if !errors.is_empty() {
+            for e in &errors {
+                tracing::error!("Config validation: {}", e);
+            }
+            panic!("Fatal configuration errors: {}", errors.join("; "));
+        }
+
         config
     }
 
@@ -1095,5 +1170,140 @@ mod tests {
             config.docker.upstreams[1].auth,
             Some("user:pass".to_string())
         );
+    }
+
+    #[test]
+    fn test_validate_default_config_ok() {
+        let config = Config::default();
+        let (warnings, errors) = config.validate();
+        assert!(
+            errors.is_empty(),
+            "default config should have no errors: {:?}",
+            errors
+        );
+        assert!(
+            warnings.is_empty(),
+            "default config should have no warnings: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_port_zero() {
+        let mut config = Config::default();
+        config.server.port = 0;
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("port"));
+    }
+
+    #[test]
+    fn test_validate_empty_storage_path_local() {
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.path"));
+    }
+
+    #[test]
+    fn test_validate_whitespace_storage_path_local() {
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = "   ".to_string();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.path"));
+    }
+
+    #[test]
+    fn test_validate_empty_bucket_s3() {
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::S3;
+        config.storage.bucket = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.bucket"));
+    }
+
+    #[test]
+    fn test_validate_empty_storage_path_s3_ok() {
+        // Empty path is fine when mode is S3
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::S3;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rate_limit_zero_rps() {
+        let mut config = Config::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("auth_rps"));
+    }
+
+    #[test]
+    fn test_validate_rate_limit_disabled_zero_ok() {
+        // Zero rate limit values are fine when rate limiting is disabled
+        let mut config = Config::default();
+        config.rate_limit.enabled = false;
+        config.rate_limit.auth_rps = 0;
+        config.rate_limit.auth_burst = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rate_limit_all_zeros() {
+        let mut config = Config::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        config.rate_limit.auth_burst = 0;
+        config.rate_limit.upload_rps = 0;
+        config.rate_limit.upload_burst = 0;
+        config.rate_limit.general_rps = 0;
+        config.rate_limit.general_burst = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 6);
+    }
+
+    #[test]
+    fn test_validate_body_limit_zero() {
+        let mut config = Config::default();
+        config.server.body_limit_mb = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("body_limit_mb"));
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let mut config = Config::default();
+        config.server.port = 0;
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_warnings_and_errors_together() {
+        let mut config = Config::default();
+        config.server.port = 0;
+        config.server.body_limit_mb = 0;
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        let (warnings, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(warnings.len(), 2); // body_limit + auth_rps
     }
 }
