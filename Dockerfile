@@ -21,5 +21,8 @@ VOLUME ["/data"]
 
 USER nora
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -q --spider http://localhost:4000/health || exit 1
+
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]

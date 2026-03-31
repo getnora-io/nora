@@ -64,7 +64,7 @@ pub fn create_progress_bar(total: u64) -> ProgressBar {
             .template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
             )
-            .unwrap()
+            .expect("static progress bar template is valid")
             .progress_chars("=>-"),
     );
     pb
@@ -220,7 +220,7 @@ fn parse_requirements_txt(content: &str) -> Vec<MirrorTarget> {
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#') && !l.starts_with('-'))
         .filter_map(|line| {
-            let line = line.split('#').next().unwrap().trim();
+            let line = line.split('#').next().unwrap_or(line).trim();
             if let Some((name, version)) = line.split_once("==") {
                 Some(MirrorTarget {
                     name: name.trim().to_string(),

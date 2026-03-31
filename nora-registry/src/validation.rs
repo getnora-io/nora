@@ -178,7 +178,12 @@ pub fn validate_docker_name(name: &str) -> Result<(), ValidationError> {
                 "empty path segment".to_string(),
             ));
         }
-        let first = segment.chars().next().unwrap();
+        // Safety: segment.is_empty() checked above, but use match for defense-in-depth
+        let Some(first) = segment.chars().next() else {
+            return Err(ValidationError::InvalidDockerName(
+                "empty path segment".to_string(),
+            ));
+        };
         if !first.is_ascii_alphanumeric() {
             return Err(ValidationError::InvalidDockerName(
                 "segment must start with alphanumeric".to_string(),
@@ -292,7 +297,10 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
     }
 
     // Validate as tag
-    let first = reference.chars().next().unwrap();
+    // Safety: empty check at function start, but use let-else for defense-in-depth
+    let Some(first) = reference.chars().next() else {
+        return Err(ValidationError::EmptyInput);
+    };
     if !first.is_ascii_alphanumeric() {
         return Err(ValidationError::InvalidReference(
             "tag must start with alphanumeric".to_string(),

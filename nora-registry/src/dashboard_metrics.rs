@@ -76,7 +76,6 @@ impl DashboardMetrics {
     pub fn with_persistence(storage_path: &str) -> Self {
         let path = Path::new(storage_path).join("metrics.json");
         let mut metrics = Self::new();
-        metrics.persist_path = Some(path.clone());
 
         // Load existing metrics if file exists
         if path.exists() {
@@ -108,6 +107,7 @@ impl DashboardMetrics {
             }
         }
 
+        metrics.persist_path = Some(path);
         metrics
     }
 

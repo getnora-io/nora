@@ -176,8 +176,7 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
             } else {
                 // Metadata: rewrite tarball URLs to point to NORA
                 let nora_base = nora_base_url(&state);
-                let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url)
-                    .unwrap_or_else(|_| data.clone());
+                let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
 
                 data_to_cache = rewritten.clone();
                 data_to_serve = rewritten;
@@ -217,8 +216,7 @@ async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Optio
     .ok()?;
 
     let nora_base = nora_base_url(state);
-    let rewritten =
-        rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|_| data.clone());
+    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
 
     let storage = state.storage.clone();
     let key_clone = key.to_string();
@@ -346,7 +344,9 @@ async fn handle_publish(
     }
 
     // Merge versions
-    let meta_obj = metadata.as_object_mut().unwrap();
+    let Some(meta_obj) = metadata.as_object_mut() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "invalid metadata format").into_response();
+    };
     let stored_versions = meta_obj.entry("versions").or_insert(serde_json::json!({}));
     if let Some(sv) = stored_versions.as_object_mut() {
         for (ver, ver_data) in new_versions {
