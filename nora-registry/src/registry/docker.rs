@@ -346,7 +346,7 @@ async fn start_upload(Path(name): Path<String>) -> Response {
     (
         StatusCode::ACCEPTED,
         [
-            (header::LOCATION, location.clone()),
+            (header::LOCATION, location),
             (HeaderName::from_static("docker-upload-uuid"), uuid),
         ],
     )
