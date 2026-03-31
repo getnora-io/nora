@@ -25,7 +25,7 @@ pub fn auth_rate_limiter(
         .burst_size(config.auth_burst)
         .use_headers()
         .finish()
-        .expect("Failed to build auth rate limiter");
+        .expect("failed to build auth rate limiter: invalid RateLimitConfig");
 
     tower_governor::GovernorLayer::new(gov_config)
 }
@@ -46,7 +46,7 @@ pub fn upload_rate_limiter(
         .burst_size(config.upload_burst)
         .use_headers()
         .finish()
-        .expect("Failed to build upload rate limiter");
+        .expect("failed to build upload rate limiter: invalid RateLimitConfig");
 
     tower_governor::GovernorLayer::new(gov_config)
 }
@@ -65,7 +65,7 @@ pub fn general_rate_limiter(
         .burst_size(config.general_burst)
         .use_headers()
         .finish()
-        .expect("Failed to build general rate limiter");
+        .expect("failed to build general rate limiter: invalid RateLimitConfig");
 
     tower_governor::GovernorLayer::new(gov_config)
 }
