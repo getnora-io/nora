@@ -1,4 +1,36 @@
 # Changelog
+## [0.3.0] - 2026-03-21
+
+### Added
+- **Go module proxy** — full GOPROXY protocol support (list, info, mod, zip, latest) (#59)
+- **Upstream proxy retry** with configurable timeout and backoff (#56)
+- **Maven proxy-only mode** — proxy Maven artifacts without local storage (#56)
+- **Anonymous read mode** docs — Go proxy section in README (#62)
+- Integration tests: Docker push/pull, npm install, upstream timeout (#57)
+- Go proxy and Raw registry integration tests in smoke suite (#72)
+- Config validation at startup — clear errors instead of runtime panics
+- Dockerfile HEALTHCHECK for standalone deployments (#72)
+- rust-toolchain.toml for reproducible builds (#72)
+
+### Changed
+- **Token hashing migrated from SHA-256 to Argon2id** — existing tokens auto-migrate on first use (#55)
+- UI: Raw registry in sidebar, footer stats updated (32MB, 7 registries) (#64)
+- README restructured: roadmap in README, removed stale ROADMAP.md (#65, #66)
+
+### Fixed
+- Remove all unwrap() from production code — proper error handling throughout (#72)
+- Add `#![forbid(unsafe_code)]` — no unsafe code allowed at crate level (#72)
+- Add input validation to Cargo registry endpoints (#72)
+- Improve expect() messages with descriptive context (#72)
+- Remove 7 unnecessary clone() calls (#72)
+- Restore .gitleaks.toml lost during merge (#58)
+- Update SECURITY.md — add 0.3.x to supported versions (#72)
+
+### Security
+- Update rustls-webpki 0.103.9 → 0.103.10 (RUSTSEC-2026-0049)
+- Argon2id token hashing replaces SHA-256 (#55)
+- `#![forbid(unsafe_code)]` enforced (#72)
+- Zero unwrap() in production code (#72)
 
 ## [0.2.35] - 2026-03-20
 
