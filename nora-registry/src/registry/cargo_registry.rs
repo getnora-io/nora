@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -26,6 +27,10 @@ async fn get_metadata(
     State(state): State<Arc<AppState>>,
     Path(crate_name): Path<String>,
 ) -> Response {
+    // Validate input to prevent path traversal
+    if validate_storage_key(&crate_name).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let key = format!("cargo/{}/metadata.json", crate_name);
     match state.storage.get(&key).await {
         Ok(data) => (StatusCode::OK, data).into_response(),
@@ -37,6 +42,10 @@ async fn download(
     State(state): State<Arc<AppState>>,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
+    // Validate inputs to prevent path traversal
+    if validate_storage_key(&crate_name).is_err() || validate_storage_key(&version).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let key = format!(
         "cargo/{}/{}/{}-{}.crate",
         crate_name, version, crate_name, version
