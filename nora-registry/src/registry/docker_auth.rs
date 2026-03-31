@@ -167,4 +167,98 @@ mod tests {
             Some(&"https://ghcr.io/token".to_string())
         );
     }
+
+    #[test]
+    fn test_parse_www_authenticate_empty() {
+        // Empty string — no "Bearer " prefix → None
+        assert!(parse_www_authenticate("").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_no_bearer_prefix() {
+        // Random header without Bearer prefix
+        assert!(parse_www_authenticate("Basic realm=test").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_bearer_only() {
+        // "Bearer " with no key-value pairs — returns empty map
+        let params = parse_www_authenticate("Bearer ").unwrap();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_realm() {
+        // Has service but no realm — map won't contain "realm"
+        let header = r#"Bearer service="registry.docker.io""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert!(params.get("realm").is_none());
+        assert_eq!(
+            params.get("service"),
+            Some(&"registry.docker.io".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_service() {
+        // Has realm but no service
+        let header = r#"Bearer realm="https://auth.docker.io/token""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert_eq!(
+            params.get("realm"),
+            Some(&"https://auth.docker.io/token".to_string())
+        );
+        assert!(params.get("service").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_malformed_kv() {
+        // Key-value pairs without '=' are silently skipped
+        let header = r#"Bearer garbage,realm="https://auth.docker.io/token""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert_eq!(
+            params.get("realm"),
+            Some(&"https://auth.docker.io/token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_token_no_www_authenticate() {
+        // When www_authenticate is None, get_token returns None immediately
+        let auth = DockerAuth::default();
+        let result = auth
+            .get_token("https://registry.example.com", "library/test", None, None)
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_token_invalid_url() {
+        // An unreachable realm URL should return None (network error)
+        let auth = DockerAuth::new(1); // 1-second timeout
+        let result = auth
+            .get_token(
+                "https://registry.example.com",
+                "library/test",
+                Some(r#"Bearer realm="http://127.0.0.1:1/token",service="test""#),
+                None,
+            )
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_token_missing_realm_in_header() {
+        // www_authenticate has no realm → fetch_token cannot build URL → None
+        let auth = DockerAuth::default();
+        let result = auth
+            .get_token(
+                "https://registry.example.com",
+                "library/test",
+                Some(r#"Bearer service="registry.docker.io""#),
+                None,
+            )
+            .await;
+        assert!(result.is_none());
+    }
 }

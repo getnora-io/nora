@@ -141,3 +141,92 @@ fn guess_content_type(path: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::{Storage, StorageError};
+
+    #[tokio::test]
+    async fn test_download_nonexistent_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        let result = storage.get("raw/does-not-exist.tar.gz").await;
+        assert!(
+            matches!(result, Err(StorageError::NotFound)),
+            "expected NotFound, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_path_traversal_rejected() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        // The Storage wrapper calls validate_storage_key which rejects ".."
+        let result = storage.put("raw/../../../etc/passwd", b"pwned").await;
+        assert!(result.is_err(), "path traversal key must be rejected");
+        // Specifically it should be a Validation error
+        match result {
+            Err(StorageError::Validation(v)) => {
+                assert_eq!(format!("{}", v), "Path traversal detected");
+            }
+            other => panic!("expected Validation(PathTraversal), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        let result = storage.delete("raw/ghost-file.bin").await;
+        assert!(
+            matches!(result, Err(StorageError::NotFound)),
+            "delete of nonexistent key should return NotFound, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_nonexistent_returns_none() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        let meta = storage.stat("raw/nothing-here").await;
+        assert!(meta.is_none(), "stat on nonexistent key must return None");
+    }
+
+    #[tokio::test]
+    async fn test_raw_disabled_storage_still_works_but_handler_would_404() {
+        // When raw.enabled=false the HTTP handler returns 404 before touching storage.
+        // Here we verify at the storage level that the key namespace still works
+        // (the 404 is an HTTP-layer concern).
+        // We also confirm that a valid raw key round-trips correctly.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        storage.put("raw/test-file.txt", b"hello").await.unwrap();
+        let data = storage.get("raw/test-file.txt").await.unwrap();
+        assert_eq!(&*data, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_guess_content_type() {
+        // Test the content type guessing function
+        assert_eq!(super::guess_content_type("file.json"), "application/json");
+        assert_eq!(super::guess_content_type("file.tar"), "application/x-tar");
+        assert_eq!(super::guess_content_type("file.gz"), "application/gzip");
+        assert_eq!(
+            super::guess_content_type("file.unknown"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            super::guess_content_type("file"),
+            "application/octet-stream"
+        );
+        assert_eq!(super::guess_content_type("file.PDF"), "application/pdf");
+        assert_eq!(super::guess_content_type("file.YAML"), "application/x-yaml");
+    }
+}
