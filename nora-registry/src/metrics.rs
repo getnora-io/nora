@@ -26,7 +26,7 @@ lazy_static! {
         "nora_http_requests_total",
         "Total number of HTTP requests",
         &["registry", "method", "status"]
-    ).expect("metric can be created");
+    ).expect("failed to create HTTP_REQUESTS_TOTAL metric at startup");
 
     /// HTTP request duration histogram
     pub static ref HTTP_REQUEST_DURATION: HistogramVec = register_histogram_vec!(
@@ -34,28 +34,28 @@ lazy_static! {
         "HTTP request latency in seconds",
         &["registry", "method"],
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-    ).expect("metric can be created");
+    ).expect("failed to create HTTP_REQUEST_DURATION metric at startup");
 
     /// Cache requests counter (hit/miss)
     pub static ref CACHE_REQUESTS: IntCounterVec = register_int_counter_vec!(
         "nora_cache_requests_total",
         "Total cache requests",
         &["registry", "result"]
-    ).expect("metric can be created");
+    ).expect("failed to create CACHE_REQUESTS metric at startup");
 
     /// Storage operations counter
     pub static ref STORAGE_OPERATIONS: IntCounterVec = register_int_counter_vec!(
         "nora_storage_operations_total",
         "Total storage operations",
         &["operation", "status"]
-    ).expect("metric can be created");
+    ).expect("failed to create STORAGE_OPERATIONS metric at startup");
 
     /// Artifacts count by registry
     pub static ref ARTIFACTS_TOTAL: IntCounterVec = register_int_counter_vec!(
         "nora_artifacts_total",
         "Total artifacts stored",
         &["registry"]
-    ).expect("metric can be created");
+    ).expect("failed to create ARTIFACTS_TOTAL metric at startup");
 }
 
 /// Routes for metrics endpoint

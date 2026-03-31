@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Volkov Pavel | DevITWay
 // SPDX-License-Identifier: MIT
-
+#![deny(clippy::unwrap_used)]
 mod activity_log;
 mod audit;
 mod auth;
