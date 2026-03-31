@@ -324,6 +324,135 @@ else
 fi
 
 echo ""
+# ============================================
+# Go Proxy Tests
+# ============================================
+echo ""
+echo "=== Go Proxy ==="
+
+# Pre-seed a Go module for testing
+GO_MODULE="example.com/testmod"
+GO_VERSION="v1.0.0"
+GO_STORAGE="$STORAGE_DIR/go"
+mkdir -p "$GO_STORAGE/example.com/testmod/@v"
+
+# Create .info file
+echo '{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}' > "$GO_STORAGE/example.com/testmod/@v/v1.0.0.info"
+
+# Create .mod file
+echo 'module example.com/testmod
+
+go 1.21' > "$GO_STORAGE/example.com/testmod/@v/v1.0.0.mod"
+
+# Create list file
+echo "v1.0.0" > "$GO_STORAGE/example.com/testmod/@v/list"
+
+# Test: Go module list
+check "Go list versions" \
+    curl -sf "$BASE/go/example.com/testmod/@v/list" -o /dev/null
+
+# Test: Go module .info
+INFO_RESULT=$(curl -sf "$BASE/go/example.com/testmod/@v/v1.0.0.info" 2>/dev/null)
+if echo "$INFO_RESULT" | grep -q "v1.0.0"; then
+    pass "Go .info returns version"
+else
+    fail "Go .info: $INFO_RESULT"
+fi
+
+# Test: Go module .mod
+MOD_RESULT=$(curl -sf "$BASE/go/example.com/testmod/@v/v1.0.0.mod" 2>/dev/null)
+if echo "$MOD_RESULT" | grep -q "module example.com/testmod"; then
+    pass "Go .mod returns module content"
+else
+    fail "Go .mod: $MOD_RESULT"
+fi
+
+# Test: Go @latest (200 with upstream, 404 without — both valid)
+LATEST_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/go/example.com/testmod/@latest")
+if [ "$LATEST_CODE" = "200" ] || [ "$LATEST_CODE" = "404" ]; then
+    pass "Go @latest handled ($LATEST_CODE)"
+else
+    fail "Go @latest returned $LATEST_CODE"
+fi
+
+# Test: Go path traversal rejection
+TRAVERSAL_RESULT=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/go/../../etc/passwd/@v/list")
+if [ "$TRAVERSAL_RESULT" = "400" ] || [ "$TRAVERSAL_RESULT" = "404" ]; then
+    pass "Go path traversal rejected ($TRAVERSAL_RESULT)"
+else
+    fail "Go path traversal returned $TRAVERSAL_RESULT"
+fi
+
+# Test: Go nonexistent module
+NOTFOUND=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/go/nonexistent.com/pkg/@v/list")
+if [ "$NOTFOUND" = "404" ]; then
+    pass "Go 404 on nonexistent module"
+else
+    fail "Go nonexistent returned $NOTFOUND"
+fi
+
+# ============================================
+# Raw Registry Extended Tests
+# ============================================
+echo ""
+echo "=== Raw Registry (extended) ==="
+
+# Test: Raw upload and download (basic — already exists, extend)
+echo "integration-test-data-$(date +%s)" | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/test.txt" >/dev/null 2>&1
+check "Raw upload + download" \
+    curl -sf "$BASE/raw/integration/test.txt" -o /dev/null
+
+# Test: Raw HEAD (check exists)
+HEAD_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" --head "$BASE/raw/integration/test.txt")
+if [ "$HEAD_RESULT" = "200" ]; then
+    pass "Raw HEAD returns 200"
+else
+    fail "Raw HEAD returned $HEAD_RESULT"
+fi
+
+# Test: Raw 404 on nonexistent
+NOTFOUND=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/raw/nonexistent/file.bin")
+if [ "$NOTFOUND" = "404" ]; then
+    pass "Raw 404 on nonexistent file"
+else
+    fail "Raw nonexistent returned $NOTFOUND"
+fi
+
+# Test: Raw path traversal
+TRAVERSAL=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/raw/../../../etc/passwd")
+if [ "$TRAVERSAL" = "400" ] || [ "$TRAVERSAL" = "404" ]; then
+    pass "Raw path traversal rejected ($TRAVERSAL)"
+else
+    fail "Raw path traversal returned $TRAVERSAL"
+fi
+
+# Test: Raw overwrite
+echo "version-1" | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/overwrite.txt" >/dev/null 2>&1
+echo "version-2" | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/overwrite.txt" >/dev/null 2>&1
+CONTENT=$(curl -sf "$BASE/raw/integration/overwrite.txt" 2>/dev/null)
+if [ "$CONTENT" = "version-2" ]; then
+    pass "Raw overwrite works"
+else
+    fail "Raw overwrite: got '$CONTENT'"
+fi
+
+# Test: Raw delete
+curl -sf -X DELETE "$BASE/raw/integration/overwrite.txt" >/dev/null 2>&1
+DELETE_CHECK=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/raw/integration/overwrite.txt")
+if [ "$DELETE_CHECK" = "404" ]; then
+    pass "Raw delete works"
+else
+    fail "Raw delete: file still returns $DELETE_CHECK"
+fi
+
+# Test: Raw binary data (not just text)
+dd if=/dev/urandom bs=1024 count=10 2>/dev/null | curl -sf -X PUT --data-binary @- "$BASE/raw/integration/binary.bin" >/dev/null 2>&1
+BIN_SIZE=$(curl -sf "$BASE/raw/integration/binary.bin" 2>/dev/null | wc -c)
+if [ "$BIN_SIZE" -ge 10000 ]; then
+    pass "Raw binary upload/download (${BIN_SIZE} bytes)"
+else
+    fail "Raw binary: expected ~10240, got $BIN_SIZE"
+fi
 echo "--- Mirror CLI ---"
 # Create a minimal lockfile
 LOCKFILE=$(mktemp)
