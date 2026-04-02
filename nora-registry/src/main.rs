@@ -43,6 +43,9 @@ use repo_index::RepoIndex;
 pub use storage::Storage;
 use tokens::TokenStore;
 
+use parking_lot::RwLock;
+use std::collections::HashMap;
+
 #[derive(Parser)]
 #[command(name = "nora", version, about = "Multi-protocol artifact registry")]
 struct Cli {
@@ -109,6 +112,7 @@ pub struct AppState {
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
+    pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
 }
 
 #[tokio::main]
@@ -369,6 +373,7 @@ async fn run_server(config: Config, storage: Storage) {
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,
+        upload_sessions: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let app = Router::new()
@@ -440,6 +445,7 @@ async fn run_server(config: Config, storage: Storage) {
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used();
             }
+            registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
         }
     });
 
