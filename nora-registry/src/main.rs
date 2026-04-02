@@ -430,13 +430,16 @@ async fn run_server(config: Config, storage: Storage) {
         "Available endpoints"
     );
 
-    // Background task: persist metrics every 30 seconds
+    // Background task: persist metrics and flush token last_used every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             metrics_state.metrics.save();
+            if let Some(ref token_store) = metrics_state.tokens {
+                token_store.flush_last_used();
+            }
         }
     });
 
