@@ -15,7 +15,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
-- **Production-tested** — Docker, Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
+- **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 200+ unit tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
@@ -30,13 +30,15 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 | Registry | Mount Point | Upstream Proxy | Auth |
 |----------|------------|----------------|------|
-| Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI | ✓ |
+| Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✓ |
 | Maven | `/maven2/` | Maven Central, custom | proxy-only |
 | npm | `/npm/` | npmjs.org, custom | ✓ |
 | Cargo | `/cargo/` | — | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
 | Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
 | Raw files | `/raw/` | — | ✓ |
+
+> **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
 
 ## Quick Start
 
@@ -142,7 +144,9 @@ See [Authentication guide](https://getnora.dev/configuration/authentication/) fo
 | `NORA_STORAGE_MODE` | local | `local` or `s3` |
 | `NORA_AUTH_ENABLED` | false | Enable authentication |
 | `NORA_DOCKER_UPSTREAMS` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
-
+| `NORA_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
+| `NORA_LOG_FORMAT` | text | Log format: `text` (human) or `json` (structured) |
+| `NORA_PUBLIC_URL` | — | Public URL for rewriting artifact links |
 See [full configuration reference](https://getnora.dev/configuration/settings/) for all options.
 
 ### config.toml

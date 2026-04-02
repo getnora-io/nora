@@ -111,8 +111,8 @@ impl DashboardMetrics {
         metrics
     }
 
-    /// Save current metrics to disk
-    pub fn save(&self) {
+    /// Save current metrics to disk (async to avoid blocking the runtime)
+    pub async fn save(&self) {
         let Some(path) = &self.persist_path else {
             return;
         };
@@ -134,8 +134,8 @@ impl DashboardMetrics {
         // Atomic write: write to tmp then rename
         let tmp = path.with_extension("json.tmp");
         if let Ok(data) = serde_json::to_string_pretty(&snap) {
-            if std::fs::write(&tmp, &data).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+            if tokio::fs::write(&tmp, &data).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp, path).await;
             }
         }
     }
@@ -317,8 +317,8 @@ mod tests {
         assert_eq!(m.get_registry_uploads("unknown"), 0);
     }
 
-    #[test]
-    fn test_persistence_save_and_load() {
+    #[tokio::test]
+    async fn test_persistence_save_and_load() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_str().unwrap();
 
@@ -329,7 +329,7 @@ mod tests {
             m.record_download("docker");
             m.record_upload("maven");
             m.record_cache_hit();
-            m.save();
+            m.save().await;
         }
 
         // Load in new instance

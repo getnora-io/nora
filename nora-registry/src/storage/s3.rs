@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use axum::body::Bytes;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{digest::KeyInit, Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
@@ -79,7 +79,8 @@ impl S3Storage {
             method, canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash
         );
 
-        let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+        let canonical_request_hash =
+            hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
 
         // String to sign
         let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
@@ -257,7 +258,8 @@ impl StorageBackend for S3Storage {
                 canonical_uri, canonical_headers, signed_headers, payload_hash
             );
 
-            let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+            let canonical_request_hash =
+                hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
             let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
             let string_to_sign = format!(
                 "AWS4-HMAC-SHA256\n{}\n{}\n{}",
@@ -353,7 +355,8 @@ impl StorageBackend for S3Storage {
                 canonical_uri, canonical_headers, signed_headers, payload_hash
             );
 
-            let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+            let canonical_request_hash =
+                hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
             let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
             let string_to_sign = format!(
                 "AWS4-HMAC-SHA256\n{}\n{}\n{}",
