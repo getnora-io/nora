@@ -1,12 +1,9 @@
 services:
   nora:
     image: ghcr.io/getnora-io/nora:latest
-    build:
-      context: ..
-      dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "4000:4000"
+    expose:
+      - "4000"
     volumes:
       - nora-data:/data
     environment:
@@ -14,6 +11,28 @@ services:
       - NORA_HOST=0.0.0.0
       - NORA_PORT=4000
       - NORA_AUTH_ENABLED=false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      nora:
+        condition: service_healthy
 
 volumes:
   nora-data:
+  caddy-data:
+  caddy-config:

@@ -1,39 +1,57 @@
 name: Bug Report
-description: Report a bug or unexpected behavior
-labels: ["bug"]
+description: Report a bug in NORA
+labels: [bug]
 body:
   - type: textarea
     id: description
     attributes:
       label: Description
-      description: What happened? What did you expect?
+      description: What happened?
     validations:
       required: true
   - type: textarea
-    id: steps
+    id: expected
     attributes:
-      label: Steps to reproduce
-      description: How can we reproduce the issue?
+      label: Expected Behavior
+      description: What did you expect to happen?
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+    validations:
+      required: true
   - type: input
     id: version
     attributes:
-      label: NORA version
-      placeholder: "0.2.32"
+      label: NORA Version
+      description: Output of 'nora --version' or Docker tag
+      placeholder: v0.3.0
+    validations:
+      required: true
   - type: dropdown
-    id: protocol
+    id: registry
     attributes:
-      label: Registry protocol
+      label: Registry Protocol
       options:
-        - Docker
+        - Docker/OCI
         - npm
         - Maven
         - PyPI
         - Cargo
+        - Go
         - Raw
         - UI/Dashboard
         - Other
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage Backend
+      options:
+        - Local filesystem
+        - S3-compatible
   - type: textarea
     id: logs
     attributes:
-      label: Logs / error output
+      label: Relevant Logs
       render: shell

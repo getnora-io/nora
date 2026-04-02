@@ -107,7 +107,7 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
         // Tarball: integrity check if hash exists
         let hash_key = format!("{}.sha256", key);
         if let Ok(stored_hash) = state.storage.get(&hash_key).await {
-            let computed = format!("{:x}", sha2::Sha256::digest(&data));
+            let computed = hex::encode(sha2::Sha256::digest(&data));
             let expected = String::from_utf8_lossy(&stored_hash);
             if computed != expected.as_ref() {
                 tracing::error!(
@@ -152,7 +152,7 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
 
             if is_tarball {
                 // Compute and store sha256
-                let hash = format!("{:x}", sha2::Sha256::digest(&data));
+                let hash = hex::encode(sha2::Sha256::digest(&data));
                 let hash_key = format!("{}.sha256", key);
                 let storage = state.storage.clone();
                 tokio::spawn(async move {
@@ -338,7 +338,7 @@ async fn handle_publish(
         }
 
         // Store sha256
-        let hash = format!("{:x}", sha2::Sha256::digest(&tarball_bytes));
+        let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
         let hash_key = format!("{}.sha256", tarball_key);
         let _ = state.storage.put(&hash_key, hash.as_bytes()).await;
     }

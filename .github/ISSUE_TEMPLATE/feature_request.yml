@@ -1,6 +1,6 @@
 name: Feature Request
-description: Suggest a new feature or improvement
-labels: ["enhancement"]
+description: Suggest a new feature for NORA
+labels: [enhancement]
 body:
   - type: textarea
     id: problem
@@ -12,19 +12,26 @@ body:
   - type: textarea
     id: solution
     attributes:
-      label: Proposed solution
+      label: Proposed Solution
       description: How would you like it to work?
-  - type: dropdown
-    id: protocol
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
     attributes:
-      label: Related protocol
+      label: Alternatives Considered
+      description: Other approaches you've thought about
+  - type: dropdown
+    id: registry
+    attributes:
+      label: Related Registry
       options:
-        - Docker
+        - Docker/OCI
         - npm
         - Maven
         - PyPI
         - Cargo
+        - Go
         - Raw
-        - CLI
         - UI/Dashboard
-        - General
+        - Core/General

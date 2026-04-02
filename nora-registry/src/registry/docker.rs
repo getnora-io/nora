@@ -45,7 +45,7 @@ pub struct LayerInfo {
 }
 
 /// In-progress upload session with metadata
-struct UploadSession {
+pub struct UploadSession {
     data: Vec<u8>,
     name: String,
     created_at: std::time::Instant,
@@ -75,21 +75,16 @@ fn max_session_size() -> usize {
     mb.saturating_mul(1024 * 1024)
 }
 
-/// In-progress upload sessions for chunked uploads
-/// Maps UUID -> UploadSession with limits and TTL
-static UPLOAD_SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, UploadSession>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
-
-/// Remove expired upload sessions (called periodically)
-fn cleanup_expired_sessions() {
-    let mut sessions = UPLOAD_SESSIONS.write();
-    let before = sessions.len();
-    sessions.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
-    let removed = before - sessions.len();
+/// Remove expired upload sessions (called by background task)
+pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>>) {
+    let mut guard = sessions.write();
+    let before = guard.len();
+    guard.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
+    let removed = before - guard.len();
     if removed > 0 {
         tracing::info!(
             removed = removed,
-            remaining = sessions.len(),
+            remaining = guard.len(),
             "Cleaned up expired upload sessions"
         );
     }
@@ -305,17 +300,14 @@ async fn download_blob(
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn start_upload(Path(name): Path<String>) -> Response {
+async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Cleanup expired sessions before checking limits
-    cleanup_expired_sessions();
-
     // Enforce max concurrent sessions
     {
-        let sessions = UPLOAD_SESSIONS.read();
+        let sessions = state.upload_sessions.read();
         let max_sessions = max_upload_sessions();
         if sessions.len() >= max_sessions {
             tracing::warn!(
@@ -331,7 +323,7 @@ async fn start_upload(Path(name): Path<String>) -> Response {
 
     // Create session with metadata
     {
-        let mut sessions = UPLOAD_SESSIONS.write();
+        let mut sessions = state.upload_sessions.write();
         sessions.insert(
             uuid.clone(),
             UploadSession {
@@ -355,14 +347,18 @@ async fn start_upload(Path(name): Path<String>) -> Response {
 
 /// PATCH handler for chunked blob uploads
 /// Docker client sends data chunks via PATCH, then finalizes with PUT
-async fn patch_blob(Path((name, uuid)): Path<(String, String)>, body: Bytes) -> Response {
+async fn patch_blob(
+    State(state): State<Arc<AppState>>,
+    Path((name, uuid)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
     // Append data to the upload session and get total size
     let total_size = {
-        let mut sessions = UPLOAD_SESSIONS.write();
+        let mut sessions = state.upload_sessions.write();
         let session = match sessions.get_mut(&uuid) {
             Some(s) => s,
             None => {
@@ -449,7 +445,7 @@ async fn upload_blob(
 
     // Get data from chunked session if exists, otherwise use body directly
     let data = {
-        let mut sessions = UPLOAD_SESSIONS.write();
+        let mut sessions = state.upload_sessions.write();
         if let Some(session) = sessions.remove(&uuid) {
             // Verify session belongs to this repository
             if session.name != name {
@@ -488,7 +484,7 @@ async fn upload_blob(
     // Verify digest matches uploaded content (Docker Distribution Spec)
     {
         use sha2::Digest as _;
-        let computed = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
         if computed != *digest {
             tracing::warn!(
                 expected = %digest,
@@ -564,7 +560,7 @@ async fn get_manifest(
 
         // Calculate digest for Docker-Content-Digest header
         use sha2::Digest;
-        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
         // Detect manifest media type from content
         let content_type = detect_manifest_media_type(&data);
@@ -614,7 +610,7 @@ async fn get_manifest(
 
             // Calculate digest for Docker-Content-Digest header
             use sha2::Digest;
-            let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
             // Cache manifest and create metadata (fire and forget)
             let storage = state.storage.clone();
@@ -684,7 +680,7 @@ async fn get_manifest(
                 ));
 
                 use sha2::Digest;
-                let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+                let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
                 // Cache under original name for future local hits
                 let storage = state.storage.clone();
@@ -726,7 +722,7 @@ async fn put_manifest(
 
     // Calculate digest
     use sha2::Digest;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&body));
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
 
     // Store by tag/reference
     let key = format!("docker/{}/manifests/{}.json", name, reference);
@@ -819,7 +815,7 @@ async fn delete_manifest(
     if is_tag {
         if let Ok(data) = state.storage.get(&key).await {
             use sha2::Digest;
-            let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
             let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
             let _ = state.storage.delete(&digest_key).await;
             let digest_meta = format!("docker/{}/manifests/{}.meta.json", name, digest);
@@ -921,17 +917,21 @@ async fn download_blob_ns(
     download_blob(state, Path((full_name, digest))).await
 }
 
-async fn start_upload_ns(Path((ns, name)): Path<(String, String)>) -> Response {
+async fn start_upload_ns(
+    state: State<Arc<AppState>>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    start_upload(Path(full_name)).await
+    start_upload(state, Path(full_name)).await
 }
 
 async fn patch_blob_ns(
+    state: State<Arc<AppState>>,
     Path((ns, name, uuid)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    patch_blob(Path((full_name, uuid)), body).await
+    patch_blob(state, Path((full_name, uuid)), body).await
 }
 
 async fn upload_blob_ns(
