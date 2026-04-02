@@ -38,24 +38,59 @@ The GitHub organization [getnora-io](https://github.com/getnora-io) has multiple
 
 ## Development Setup
 
-```bash
-# Install Rust (if needed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+### Prerequisites
 
+- **Rust** stable (1.85+) — install via [rustup](https://rustup.rs/)
+- **Docker** (optional) — for integration tests (docker push/pull)
+- **Node.js** 18+ (optional) — for npm integration tests
+
+### Build and Test
+
+```bash
 # Build
 cargo build --package nora-registry
 
-# Run tests (important: always use --lib --bin nora to skip fuzz targets)
+# Run unit tests (important: use --lib --bin to skip fuzz targets)
 cargo test --lib --bin nora
 
-# Run clippy
+# Run clippy (must pass with zero warnings)
 cargo clippy --package nora-registry -- -D warnings
 
-# Format
-cargo fmt
+# Format check
+cargo fmt --check
+```
 
-# Run locally
+### Run Locally
+
+```bash
+# Start with defaults (port 4000, local storage in ./data/)
 cargo run --bin nora -- serve
+
+# Custom port and storage
+NORA_PORT=5000 NORA_STORAGE_PATH=/tmp/nora-data cargo run --bin nora -- serve
+
+# Test health
+curl http://localhost:4000/health
+```
+
+### Integration / Smoke Tests
+
+```bash
+# Build release binary first
+cargo build --release
+
+# Run full smoke suite (starts NORA, tests all 7 protocols, stops)
+bash tests/smoke.sh
+```
+
+### Fuzz Testing
+
+```bash
+# Install cargo-fuzz (one-time)
+cargo install cargo-fuzz
+
+# Run fuzz target (Ctrl+C to stop)
+cargo +nightly fuzz run fuzz_validation -- -max_total_time=60
 ```
 
 ## Before Submitting a PR
