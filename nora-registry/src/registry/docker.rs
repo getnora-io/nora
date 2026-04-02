@@ -284,7 +284,9 @@ async fn download_blob(
                 let key_clone = key.clone();
                 let data_clone = data.clone();
                 tokio::spawn(async move {
-                    let _ = storage.put(&key_clone, &data_clone).await;
+                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                        tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                    }
                 });
 
                 return (
@@ -687,7 +689,9 @@ async fn get_manifest(
                 let key_clone = key.clone();
                 let data_clone = data.clone();
                 tokio::spawn(async move {
-                    let _ = storage.put(&key_clone, &data_clone).await;
+                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                        tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                    }
                 });
 
                 state.repo_index.invalidate("docker");
