@@ -43,6 +43,9 @@ use repo_index::RepoIndex;
 pub use storage::Storage;
 use tokens::TokenStore;
 
+use parking_lot::RwLock;
+use std::collections::HashMap;
+
 #[derive(Parser)]
 #[command(name = "nora", version, about = "Multi-protocol artifact registry")]
 struct Cli {
@@ -109,6 +112,7 @@ pub struct AppState {
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
+    pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
 }
 
 #[tokio::main]
@@ -369,6 +373,7 @@ async fn run_server(config: Config, storage: Storage) {
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,
+        upload_sessions: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let app = Router::new()
@@ -430,13 +435,17 @@ async fn run_server(config: Config, storage: Storage) {
         "Available endpoints"
     );
 
-    // Background task: persist metrics every 30 seconds
+    // Background task: persist metrics and flush token last_used every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            metrics_state.metrics.save();
+            metrics_state.metrics.save().await;
+            if let Some(ref token_store) = metrics_state.tokens {
+                token_store.flush_last_used().await;
+            }
+            registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
         }
     });
 
@@ -450,7 +459,7 @@ async fn run_server(config: Config, storage: Storage) {
     .expect("Server error");
 
     // Save metrics on shutdown
-    state.metrics.save();
+    state.metrics.save().await;
 
     info!(
         uptime_seconds = state.start_time.elapsed().as_secs(),
