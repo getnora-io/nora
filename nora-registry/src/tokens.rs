@@ -270,9 +270,9 @@ impl TokenStore {
         tokens
     }
 
-    /// Flush pending last_used timestamps to disk.
+    /// Flush pending last_used timestamps to disk (async to avoid blocking runtime).
     /// Called periodically by background task (every 30s).
-    pub fn flush_last_used(&self) {
+    pub async fn flush_last_used(&self) {
         let pending: HashMap<String, u64> = {
             let mut map = self.pending_last_used.write();
             std::mem::take(&mut *map)
@@ -284,7 +284,7 @@ impl TokenStore {
 
         for (file_prefix, timestamp) in &pending {
             let file_path = self.storage_path.join(format!("{}.json", file_prefix));
-            let content = match fs::read_to_string(&file_path) {
+            let content = match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -294,7 +294,7 @@ impl TokenStore {
             };
             info.last_used = Some(*timestamp);
             if let Ok(json) = serde_json::to_string_pretty(&info) {
-                let _ = fs::write(&file_path, &json);
+                let _ = tokio::fs::write(&file_path, &json).await;
                 set_file_permissions_600(&file_path);
             }
         }
@@ -597,8 +597,8 @@ mod tests {
         assert_eq!(store.list_tokens("user2").len(), 1);
     }
 
-    #[test]
-    fn test_token_updates_last_used() {
+    #[tokio::test]
+    async fn test_token_updates_last_used() {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
@@ -609,7 +609,7 @@ mod tests {
         store.verify_token(&token).unwrap();
 
         // last_used is deferred — flush to persist
-        store.flush_last_used();
+        store.flush_last_used().await;
 
         let tokens = store.list_tokens("testuser");
         assert!(tokens[0].last_used.is_some());

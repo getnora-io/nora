@@ -441,9 +441,9 @@ async fn run_server(config: Config, storage: Storage) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            metrics_state.metrics.save();
+            metrics_state.metrics.save().await;
             if let Some(ref token_store) = metrics_state.tokens {
-                token_store.flush_last_used();
+                token_store.flush_last_used().await;
             }
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
         }
@@ -459,7 +459,7 @@ async fn run_server(config: Config, storage: Storage) {
     .expect("Server error");
 
     // Save metrics on shutdown
-    state.metrics.save();
+    state.metrics.save().await;
 
     info!(
         uptime_seconds = state.start_time.elapsed().as_secs(),
