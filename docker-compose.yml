@@ -1,6 +1,5 @@
 services:
   nora:
-    build: .
     image: ghcr.io/getnora-io/nora:latest
     ports:
       - "4000:4000"
