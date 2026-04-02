@@ -68,10 +68,6 @@ impl StorageBackend for LocalStorage {
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
 
-        if !path.exists() {
-            return Err(StorageError::NotFound);
-        }
-
         let mut file = fs::File::open(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
@@ -91,13 +87,13 @@ impl StorageBackend for LocalStorage {
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
 
-        if !path.exists() {
-            return Err(StorageError::NotFound);
-        }
-
-        fs::remove_file(&path)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        fs::remove_file(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e.to_string())
+            }
+        })?;
 
         Ok(())
     }

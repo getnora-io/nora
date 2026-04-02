@@ -72,10 +72,10 @@ pub struct StorageConfig {
     #[serde(default = "default_bucket")]
     pub bucket: String,
     /// S3 access key (optional, uses anonymous access if not set)
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub s3_access_key: Option<String>,
     /// S3 secret key (optional, uses anonymous access if not set)
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub s3_secret_key: Option<String>,
     /// S3 region (default: us-east-1)
     #[serde(default = "default_s3_region")]

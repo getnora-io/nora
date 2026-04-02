@@ -72,10 +72,15 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
 
 async fn collect_all_blobs(storage: &Storage) -> Vec<String> {
     let mut blobs = Vec::new();
-    let docker_blobs = storage.list("docker/").await;
-    for key in docker_blobs {
-        if key.contains("/blobs/") {
-            blobs.push(key);
+    // Collect blobs from all registry types, not just Docker
+    for prefix in &[
+        "docker/", "maven/", "npm/", "cargo/", "pypi/", "raw/", "go/",
+    ] {
+        let keys = storage.list(prefix).await;
+        for key in keys {
+            if key.contains("/blobs/") || key.contains("/tarballs/") {
+                blobs.push(key);
+            }
         }
     }
     blobs
