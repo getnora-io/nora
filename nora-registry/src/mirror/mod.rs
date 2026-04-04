@@ -283,6 +283,7 @@ fn parse_maven_deps(content: &str) -> Vec<MirrorTarget> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

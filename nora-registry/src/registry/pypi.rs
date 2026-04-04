@@ -307,6 +307,7 @@ fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use proptest::prelude::*;

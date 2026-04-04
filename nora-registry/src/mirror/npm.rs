@@ -251,6 +251,7 @@ async fn mirror_npm_packages(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

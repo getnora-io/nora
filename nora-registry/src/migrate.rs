@@ -138,6 +138,7 @@ pub async fn migrate(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -201,16 +202,9 @@ mod tests {
 
         src.put("test/file", b"data").await.unwrap();
 
-        let stats = migrate(
-            &src,
-            &dst,
-            MigrateOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let stats = migrate(&src, &dst, MigrateOptions { dry_run: true })
+            .await
+            .unwrap();
 
         assert_eq!(stats.migrated, 1);
 

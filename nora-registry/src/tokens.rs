@@ -393,6 +393,7 @@ pub enum TokenError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -415,7 +416,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let token = store
+        let _token = store
             .create_token("testuser", 30, None, Role::Write)
             .unwrap();
 

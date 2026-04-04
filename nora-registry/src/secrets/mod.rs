@@ -130,6 +130,7 @@ pub fn create_secrets_provider(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

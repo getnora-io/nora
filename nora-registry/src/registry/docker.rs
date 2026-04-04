@@ -1324,6 +1324,7 @@ async fn update_metadata_on_pull(storage: Storage, meta_key: String) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -432,6 +432,7 @@ fn with_content_type(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -366,6 +366,7 @@ pub fn token_routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -403,7 +404,7 @@ mod tests {
     fn test_htpasswd_loading_with_comments() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# This is a comment").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         let hash = bcrypt::hash("secret", 4).unwrap();
         writeln!(file, "admin:{}", hash).unwrap();
         file.flush().unwrap();

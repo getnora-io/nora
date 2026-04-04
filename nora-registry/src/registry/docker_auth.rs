@@ -139,6 +139,7 @@ fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -186,7 +187,7 @@ mod tests {
             params.get("realm"),
             Some(&"https://example.com/token".to_string())
         );
-        assert!(params.get("service").is_none());
+        assert!(!params.contains_key("service"));
     }
 
     #[test]

@@ -77,6 +77,7 @@ impl AuditLog {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -112,10 +113,17 @@ mod tests {
         let entry = AuditEntry::new("pull", "user1", "lodash", "npm", "downloaded");
         log.log(entry);
 
-        // spawn_blocking is fire-and-forget; give it time to flush
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // spawn_blocking is fire-and-forget; retry until flushed (max 1s)
+        let path = log.path().clone();
+        let mut content = String::new();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            content = std::fs::read_to_string(&path).unwrap_or_default();
+            if content.contains(r#""action":"pull""#) {
+                break;
+            }
+        }
 
-        let content = std::fs::read_to_string(log.path()).unwrap();
         assert!(content.contains(r#""action":"pull""#));
         assert!(content.contains(r#""actor":"user1""#));
         assert!(content.contains(r#""artifact":"lodash""#));
@@ -130,11 +138,20 @@ mod tests {
         log.log(AuditEntry::new("pull", "user", "b", "npm", ""));
         log.log(AuditEntry::new("delete", "admin", "c", "maven", ""));
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Retry until all 3 entries flushed (max 1s)
+        let path = log.path().clone();
+        let mut line_count = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                line_count = content.lines().count();
+                if line_count >= 3 {
+                    break;
+                }
+            }
+        }
 
-        let content = std::fs::read_to_string(log.path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(line_count, 3);
     }
 
     #[test]

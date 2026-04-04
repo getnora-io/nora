@@ -126,6 +126,7 @@ async fn collect_referenced_digests(storage: &Storage) -> HashSet<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
