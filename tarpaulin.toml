@@ -1,7 +1,7 @@
 [nora]
 packages = ["nora-registry"]
 engine = "llvm"
-fail-under = 30
+fail-under = 40
 out = ["json", "html"]
 output-dir = "coverage"
 timeout = "300"

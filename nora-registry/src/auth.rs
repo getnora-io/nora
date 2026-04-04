@@ -568,3 +568,89 @@ mod tests {
         assert!(json.contains("30"));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::*;
+    use axum::http::{Method, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[tokio::test]
+    async fn test_auth_disabled_passes_all() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_public_paths_always_pass() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_blocks_without_credentials() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_basic_works() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_basic_wrong_password() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_anonymous_read() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+        // Upload with auth
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // Read without auth should work
+        let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Write without auth should fail
+        let response = send(&ctx.app, Method::PUT, "/raw/test2.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}

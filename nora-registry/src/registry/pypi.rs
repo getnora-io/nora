@@ -527,3 +527,88 @@ mod tests {
         assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_pypi_list_empty() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/simple/", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Simple Index"));
+    }
+
+    #[tokio::test]
+    async fn test_pypi_list_with_packages() {
+        let ctx = create_test_context();
+
+        // Pre-populate storage with a package
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"fake-tarball-data")
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/simple/", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("flask"));
+    }
+
+    #[tokio::test]
+    async fn test_pypi_versions_local() {
+        let ctx = create_test_context();
+
+        // Pre-populate storage
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"fake-data")
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("flask-2.0.tar.gz"));
+        assert!(html.contains("/simple/flask/flask-2.0.tar.gz"));
+    }
+
+    #[tokio::test]
+    async fn test_pypi_download_local() {
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball-content";
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", tarball_data)
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        assert_eq!(&body[..], tarball_data);
+    }
+
+    #[tokio::test]
+    async fn test_pypi_not_found_no_proxy() {
+        let ctx = create_test_context();
+
+        // No proxy configured, no local data
+        let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

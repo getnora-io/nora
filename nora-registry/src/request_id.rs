@@ -112,3 +112,49 @@ mod tests {
         assert_eq!(id.len(), 9);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{create_test_context, send, send_with_headers};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_response_has_request_id() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers().get("x-request-id");
+        assert!(
+            request_id.is_some(),
+            "Response must have X-Request-ID header"
+        );
+        let value = request_id.unwrap().to_str().unwrap();
+        assert!(!value.is_empty(), "X-Request-ID must not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_preserves_incoming_request_id() {
+        let ctx = create_test_context();
+        let custom_id = "custom-123";
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/health",
+            vec![("x-request-id", custom_id)],
+            "",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let returned_id = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(returned_id, custom_id);
+    }
+}

@@ -25,6 +25,9 @@ mod tokens;
 mod ui;
 mod validation;
 
+#[cfg(test)]
+mod test_helpers;
+
 use axum::{extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};

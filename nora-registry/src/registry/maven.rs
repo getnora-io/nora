@@ -199,3 +199,94 @@ mod tests {
         assert_eq!(data, body);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::body::Body;
+    use axum::http::{header, Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_maven_put_get_roundtrip() {
+        let ctx = create_test_context();
+        let jar_data = b"fake-jar-content";
+
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/mylib/1.0/mylib-1.0.jar",
+            Body::from(&jar_data[..]),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/mylib/1.0/mylib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], jar_data);
+    }
+
+    #[tokio::test]
+    async fn test_maven_not_found_no_proxy() {
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/missing/artifact/1.0/artifact-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_maven_content_type_pom() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/ex/1.0/ex-1.0.pom",
+            Body::from("<project/>"),
+        )
+        .await;
+
+        let get = send(&ctx.app, Method::GET, "/maven2/com/ex/1.0/ex-1.0.pom", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/xml"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maven_content_type_jar() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/org/test/app/2.0/app-2.0.jar",
+            Body::from("jar-data"),
+        )
+        .await;
+
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/org/test/app/2.0/app-2.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/java-archive"
+        );
+    }
+}

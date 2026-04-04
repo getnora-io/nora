@@ -655,3 +655,129 @@ mod tests {
         assert!(!is_valid_attachment_name("file;cmd.tgz")); // semicolon
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+
+    #[tokio::test]
+    async fn test_npm_metadata_from_cache() {
+        let ctx = create_test_context();
+
+        let metadata = serde_json::json!({
+            "name": "lodash",
+            "versions": {
+                "4.17.21": { "dist": { "tarball": "http://example.com/lodash.tgz" } }
+            }
+        });
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+
+        ctx.state
+            .storage
+            .put("npm/lodash/metadata.json", &metadata_bytes)
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/npm/lodash", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "lodash");
+    }
+
+    #[tokio::test]
+    async fn test_npm_tarball_from_cache() {
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball-bytes";
+        ctx.state
+            .storage
+            .put("npm/lodash/tarballs/lodash-4.17.21.tgz", tarball_data)
+            .await
+            .unwrap();
+
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/lodash/-/lodash-4.17.21.tgz",
+            "",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        assert_eq!(&body[..], tarball_data);
+    }
+
+    #[tokio::test]
+    async fn test_npm_not_found_no_proxy() {
+        let ctx = create_test_context();
+
+        // No proxy configured, no local data
+        let response = send(&ctx.app, Method::GET, "/npm/nonexistent", "").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_npm_publish_basic() {
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball";
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+
+        let payload = serde_json::json!({
+            "name": "mypkg",
+            "versions": {
+                "1.0.0": { "dist": {} }
+            },
+            "_attachments": {
+                "mypkg-1.0.0.tgz": { "data": base64_data }
+            },
+            "dist-tags": { "latest": "1.0.0" }
+        });
+
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let response = send(&ctx.app, Method::PUT, "/npm/mypkg", Body::from(body_bytes)).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Verify tarball was stored
+        let stored_tarball = ctx
+            .state
+            .storage
+            .get("npm/mypkg/tarballs/mypkg-1.0.0.tgz")
+            .await
+            .unwrap();
+        assert_eq!(&stored_tarball[..], tarball_data);
+    }
+
+    #[tokio::test]
+    async fn test_npm_publish_name_mismatch() {
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball";
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+
+        let payload = serde_json::json!({
+            "name": "other",
+            "versions": {
+                "1.0.0": { "dist": {} }
+            },
+            "_attachments": {
+                "other-1.0.0.tgz": { "data": base64_data }
+            },
+            "dist-tags": { "latest": "1.0.0" }
+        });
+
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let response = send(&ctx.app, Method::PUT, "/npm/mypkg", Body::from(body_bytes)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
