@@ -57,3 +57,8 @@ percent-encoding = "2"
 proptest = "1"
 tempfile = "3"
 wiremock = "0.6"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parsing"
+harness = false
