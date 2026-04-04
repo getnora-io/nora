@@ -305,3 +305,59 @@ fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn extract_filename_never_panics(s in "\\PC{0,500}") {
+            let _ = extract_filename(&s);
+        }
+
+        #[test]
+        fn extract_filename_valid_tarball(
+            name in "[a-z][a-z0-9_-]{0,20}",
+            version in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
+        ) {
+            let url = format!("https://files.example.com/packages/{}-{}.tar.gz", name, version);
+            let result = extract_filename(&url);
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().ends_with(".tar.gz"));
+        }
+
+        #[test]
+        fn extract_filename_valid_wheel(
+            name in "[a-z][a-z0-9_]{0,20}",
+            version in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
+        ) {
+            let url = format!("https://files.example.com/{}-{}-py3-none-any.whl", name, version);
+            let result = extract_filename(&url);
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().ends_with(".whl"));
+        }
+
+        #[test]
+        fn extract_filename_strips_hash(
+            name in "[a-z]{1,10}",
+            hash in "[a-f0-9]{64}"
+        ) {
+            let url = format!("https://example.com/{}.tar.gz#sha256={}", name, hash);
+            let result = extract_filename(&url);
+            prop_assert!(result.is_some());
+            let fname = result.unwrap();
+            prop_assert!(!fname.contains('#'));
+        }
+
+        #[test]
+        fn extract_filename_rejects_unknown_ext(
+            name in "[a-z]{1,10}",
+            ext in "(exe|dll|so|bin|dat)"
+        ) {
+            let url = format!("https://example.com/{}.{}", name, ext);
+            prop_assert!(extract_filename(&url).is_none());
+        }
+    }
+}

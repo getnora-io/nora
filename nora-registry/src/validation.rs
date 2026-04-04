@@ -504,3 +504,150 @@ mod tests {
         assert!(validate_docker_reference("-dash").is_err());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Valid lowercase Docker name component
+    fn docker_component() -> impl Strategy<Value = String> {
+        "[a-z0-9][a-z0-9._-]{0,30}".prop_filter("no consecutive separators", |s| {
+            !s.contains("..") && !s.contains("//") && !s.contains("--") && !s.contains("__")
+        })
+    }
+
+    /// Valid sha256 hex string
+    fn sha256_hex() -> impl Strategy<Value = String> {
+        "[0-9a-f]{64}"
+    }
+
+    /// Valid Docker tag (no `..` or `/` which trigger path traversal rejection)
+    fn docker_tag() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9][a-zA-Z0-9._-]{0,50}".prop_filter("no path traversal", |s| {
+            !s.contains("..") && !s.contains('/')
+        })
+    }
+
+    // === validate_storage_key ===
+
+    proptest! {
+        #[test]
+        fn storage_key_never_panics(s in "\\PC{0,2000}") {
+            let _ = validate_storage_key(&s);
+        }
+
+        #[test]
+        fn storage_key_rejects_path_traversal(
+            prefix in "[a-z]{0,10}",
+            suffix in "[a-z]{0,10}"
+        ) {
+            let key = format!("{}/../{}", prefix, suffix);
+            prop_assert!(validate_storage_key(&key).is_err());
+        }
+
+        #[test]
+        fn storage_key_rejects_absolute(path in "/[a-z/]{1,50}") {
+            prop_assert!(validate_storage_key(&path).is_err());
+        }
+
+        #[test]
+        fn storage_key_accepts_valid(
+            segments in prop::collection::vec("[a-z0-9]{1,20}", 1..5)
+        ) {
+            let key = segments.join("/");
+            prop_assert!(validate_storage_key(&key).is_ok());
+        }
+    }
+
+    // === validate_docker_name ===
+
+    proptest! {
+        #[test]
+        fn docker_name_never_panics(s in "\\PC{0,500}") {
+            let _ = validate_docker_name(&s);
+        }
+
+        #[test]
+        fn docker_name_accepts_valid_single(name in docker_component()) {
+            prop_assert!(validate_docker_name(&name).is_ok());
+        }
+
+        #[test]
+        fn docker_name_accepts_valid_path(
+            components in prop::collection::vec(docker_component(), 1..4)
+        ) {
+            let name = components.join("/");
+            prop_assert!(validate_docker_name(&name).is_ok());
+        }
+
+        #[test]
+        fn docker_name_rejects_uppercase(
+            lower in "[a-z]{1,10}",
+            upper in "[A-Z]{1,10}"
+        ) {
+            let name = format!("{}{}", lower, upper);
+            prop_assert!(validate_docker_name(&name).is_err());
+        }
+    }
+
+    // === validate_digest ===
+
+    proptest! {
+        #[test]
+        fn digest_never_panics(s in "\\PC{0,200}") {
+            let _ = validate_digest(&s);
+        }
+
+        #[test]
+        fn digest_sha256_roundtrip(hash in sha256_hex()) {
+            let digest = format!("sha256:{}", hash);
+            prop_assert!(validate_digest(&digest).is_ok());
+        }
+
+        #[test]
+        fn digest_sha512_roundtrip(hash in "[0-9a-f]{128}") {
+            let digest = format!("sha512:{}", hash);
+            prop_assert!(validate_digest(&digest).is_ok());
+        }
+
+        #[test]
+        fn digest_wrong_algo_rejected(
+            algo in "[a-z]{2,8}",
+            hash in "[0-9a-f]{64}"
+        ) {
+            prop_assume!(algo != "sha256" && algo != "sha512");
+            let digest = format!("{}:{}", algo, hash);
+            prop_assert!(validate_digest(&digest).is_err());
+        }
+    }
+
+    // === validate_docker_reference ===
+
+    proptest! {
+        #[test]
+        fn reference_never_panics(s in "\\PC{0,200}") {
+            let _ = validate_docker_reference(&s);
+        }
+
+        #[test]
+        fn reference_accepts_valid_tag(tag in docker_tag()) {
+            prop_assert!(validate_docker_reference(&tag).is_ok());
+        }
+
+        #[test]
+        fn reference_accepts_valid_digest(hash in sha256_hex()) {
+            let reference = format!("sha256:{}", hash);
+            prop_assert!(validate_docker_reference(&reference).is_ok());
+        }
+
+        #[test]
+        fn reference_rejects_traversal(
+            prefix in "[a-z]{0,5}",
+            suffix in "[a-z]{0,5}"
+        ) {
+            let reference = format!("{}../{}", prefix, suffix);
+            prop_assert!(validate_docker_reference(&reference).is_err());
+        }
+    }
+}
