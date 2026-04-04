@@ -472,4 +472,99 @@ mod tests {
         assert!(hash.starts_with("$2"));
         assert!(bcrypt::verify("test123", &hash).unwrap());
     }
+
+    #[test]
+    fn test_is_public_path_health() {
+        assert!(is_public_path("/health"));
+        assert!(is_public_path("/ready"));
+        assert!(is_public_path("/metrics"));
+    }
+
+    #[test]
+    fn test_is_public_path_v2() {
+        assert!(is_public_path("/v2/"));
+        assert!(is_public_path("/v2"));
+    }
+
+    #[test]
+    fn test_is_public_path_ui() {
+        assert!(is_public_path("/ui"));
+        assert!(is_public_path("/ui/dashboard"));
+        assert!(is_public_path("/ui/repos"));
+    }
+
+    #[test]
+    fn test_is_public_path_api_docs() {
+        assert!(is_public_path("/api-docs"));
+        assert!(is_public_path("/api-docs/openapi.json"));
+        assert!(is_public_path("/api/ui"));
+    }
+
+    #[test]
+    fn test_is_public_path_tokens() {
+        assert!(is_public_path("/api/tokens"));
+        assert!(is_public_path("/api/tokens/list"));
+        assert!(is_public_path("/api/tokens/revoke"));
+    }
+
+    #[test]
+    fn test_is_public_path_root() {
+        assert!(is_public_path("/"));
+    }
+
+    #[test]
+    fn test_is_not_public_path_registry() {
+        assert!(!is_public_path("/v2/library/alpine/manifests/latest"));
+        assert!(!is_public_path("/npm/lodash"));
+        assert!(!is_public_path("/maven/com/example"));
+        assert!(!is_public_path("/pypi/simple/flask"));
+    }
+
+    #[test]
+    fn test_is_not_public_path_random() {
+        assert!(!is_public_path("/admin"));
+        assert!(!is_public_path("/secret"));
+        assert!(!is_public_path("/api/data"));
+    }
+
+    #[test]
+    fn test_default_role_str() {
+        assert_eq!(default_role_str(), "read");
+    }
+
+    #[test]
+    fn test_default_ttl() {
+        assert_eq!(default_ttl(), 30);
+    }
+
+    #[test]
+    fn test_create_token_request_defaults() {
+        let json = r#"{"username":"admin","password":"pass"}"#;
+        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "admin");
+        assert_eq!(req.password, "pass");
+        assert_eq!(req.ttl_days, 30);
+        assert_eq!(req.role, "read");
+        assert!(req.description.is_none());
+    }
+
+    #[test]
+    fn test_create_token_request_custom() {
+        let json = r#"{"username":"admin","password":"pass","ttl_days":90,"role":"write","description":"CI token"}"#;
+        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.ttl_days, 90);
+        assert_eq!(req.role, "write");
+        assert_eq!(req.description, Some("CI token".to_string()));
+    }
+
+    #[test]
+    fn test_create_token_response_serialization() {
+        let resp = CreateTokenResponse {
+            token: "nora_abc123".to_string(),
+            expires_in_days: 30,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("nora_abc123"));
+        assert!(json.contains("30"));
+    }
 }

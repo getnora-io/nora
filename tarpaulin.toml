@@ -1,7 +1,8 @@
 [nora]
 packages = ["nora-registry"]
 engine = "llvm"
-fail-under = 25
+fail-under = 30
 out = ["json", "html"]
 output-dir = "coverage"
 timeout = "300"
+exclude-files = ["src/ui/*", "src/main.rs", "src/openapi.rs"]

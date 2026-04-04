@@ -360,4 +360,170 @@ mod tests {
             prop_assert!(extract_filename(&url).is_none());
         }
     }
+
+    #[test]
+    fn test_normalize_name_lowercase() {
+        assert_eq!(normalize_name("Flask"), "flask");
+        assert_eq!(normalize_name("REQUESTS"), "requests");
+    }
+
+    #[test]
+    fn test_normalize_name_separators() {
+        assert_eq!(normalize_name("my-package"), "my-package");
+        assert_eq!(normalize_name("my_package"), "my-package");
+        assert_eq!(normalize_name("my.package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_name_mixed() {
+        assert_eq!(
+            normalize_name("My_Complex.Package-Name"),
+            "my-complex-package-name"
+        );
+    }
+
+    #[test]
+    fn test_normalize_name_empty() {
+        assert_eq!(normalize_name(""), "");
+    }
+
+    #[test]
+    fn test_normalize_name_already_normal() {
+        assert_eq!(normalize_name("simple"), "simple");
+    }
+
+    #[test]
+    fn test_extract_filename_tarball() {
+        assert_eq!(
+            extract_filename(
+                "https://files.pythonhosted.org/packages/aa/bb/flask-2.0.0.tar.gz#sha256=abc123"
+            ),
+            Some("flask-2.0.0.tar.gz")
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_wheel() {
+        assert_eq!(
+            extract_filename(
+                "https://files.pythonhosted.org/packages/aa/bb/flask-2.0.0-py3-none-any.whl"
+            ),
+            Some("flask-2.0.0-py3-none-any.whl")
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_tgz() {
+        assert_eq!(
+            extract_filename("https://example.com/package-1.0.tgz"),
+            Some("package-1.0.tgz")
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_zip() {
+        assert_eq!(
+            extract_filename("https://example.com/package-1.0.zip"),
+            Some("package-1.0.zip")
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_egg() {
+        assert_eq!(
+            extract_filename("https://example.com/package-1.0.egg"),
+            Some("package-1.0.egg")
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_unknown_ext() {
+        assert_eq!(extract_filename("https://example.com/readme.txt"), None);
+    }
+
+    #[test]
+    fn test_extract_filename_no_path() {
+        assert_eq!(extract_filename(""), None);
+    }
+
+    #[test]
+    fn test_extract_filename_bare() {
+        assert_eq!(
+            extract_filename("package-1.0.tar.gz"),
+            Some("package-1.0.tar.gz")
+        );
+    }
+
+    #[test]
+    fn test_remove_attribute_present() {
+        let html = r#"<a href="url" data-core-metadata="true">link</a>"#;
+        let result = remove_attribute(html, "data-core-metadata");
+        assert_eq!(result, r#"<a href="url">link</a>"#);
+    }
+
+    #[test]
+    fn test_remove_attribute_absent() {
+        let html = r#"<a href="url">link</a>"#;
+        let result = remove_attribute(html, "data-core-metadata");
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_remove_attribute_multiple() {
+        let html =
+            r#"<a data-core-metadata="true">one</a><a data-core-metadata="sha256=abc">two</a>"#;
+        let result = remove_attribute(html, "data-core-metadata");
+        assert_eq!(result, r#"<a>one</a><a>two</a>"#);
+    }
+
+    #[test]
+    fn test_rewrite_pypi_links_basic() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
+        let result = rewrite_pypi_links(html, "flask");
+        assert!(result.contains("/simple/flask/flask-2.0.tar.gz"));
+    }
+
+    #[test]
+    fn test_rewrite_pypi_links_unknown_ext() {
+        let html = r#"<a href="https://example.com/readme.txt">readme</a>"#;
+        let result = rewrite_pypi_links(html, "test");
+        assert!(result.contains("https://example.com/readme.txt"));
+    }
+
+    #[test]
+    fn test_rewrite_pypi_links_removes_metadata_attrs() {
+        let html = r#"<a href="https://example.com/pkg-1.0.whl" data-core-metadata="sha256=abc" data-dist-info-metadata="sha256=def">pkg</a>"#;
+        let result = rewrite_pypi_links(html, "pkg");
+        assert!(!result.contains("data-core-metadata"));
+        assert!(!result.contains("data-dist-info-metadata"));
+    }
+
+    #[test]
+    fn test_rewrite_pypi_links_empty() {
+        assert_eq!(rewrite_pypi_links("", "pkg"), "");
+    }
+
+    #[test]
+    fn test_find_file_url_found() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
+        let result = find_file_url(html, "flask-2.0.tar.gz");
+        assert_eq!(
+            result,
+            Some("https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_file_url_not_found() {
+        let html = r#"<a href="https://example.com/other-1.0.tar.gz">other</a>"#;
+        let result = find_file_url(html, "flask-2.0.tar.gz");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_file_url_strips_hash() {
+        let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
+        let result = find_file_url(html, "pkg-1.0.whl");
+        assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
+    }
 }

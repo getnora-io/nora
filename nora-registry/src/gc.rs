@@ -124,3 +124,197 @@ async fn collect_referenced_digests(storage: &Storage) -> HashSet<String> {
 
     referenced
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gc_result_defaults() {
+        let result = GcResult {
+            total_blobs: 0,
+            referenced_blobs: 0,
+            orphaned_blobs: 0,
+            deleted_blobs: 0,
+            orphan_keys: vec![],
+        };
+        assert_eq!(result.total_blobs, 0);
+        assert!(result.orphan_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_gc_empty_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.total_blobs, 0);
+        assert_eq!(result.referenced_blobs, 0);
+        assert_eq!(result.orphaned_blobs, 0);
+        assert_eq!(result.deleted_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_no_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Create a manifest that references a blob
+        let manifest = serde_json::json!({
+            "config": {"digest": "sha256:configabc"},
+            "layers": [{"digest": "sha256:layer111", "size": 100}]
+        });
+        storage
+            .put(
+                "docker/test/manifests/latest.json",
+                manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:configabc", b"config-data")
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:layer111", b"layer-data")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.total_blobs, 2);
+        assert_eq!(result.orphaned_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_finds_orphans_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Create a manifest referencing only one blob
+        let manifest = serde_json::json!({
+            "config": {"digest": "sha256:configabc"},
+            "layers": [{"digest": "sha256:layer111", "size": 100}]
+        });
+        storage
+            .put(
+                "docker/test/manifests/latest.json",
+                manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:configabc", b"config-data")
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:layer111", b"layer-data")
+            .await
+            .unwrap();
+        // Orphan blob (not referenced)
+        storage
+            .put("docker/test/blobs/sha256:orphan999", b"orphan-data")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.total_blobs, 3);
+        assert_eq!(result.orphaned_blobs, 1);
+        assert_eq!(result.deleted_blobs, 0); // dry run
+        assert!(result.orphan_keys[0].contains("orphan999"));
+
+        // Verify orphan still exists (dry run)
+        assert!(storage
+            .get("docker/test/blobs/sha256:orphan999")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_deletes_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let manifest = serde_json::json!({
+            "config": {"digest": "sha256:configabc"},
+            "layers": []
+        });
+        storage
+            .put(
+                "docker/test/manifests/latest.json",
+                manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:configabc", b"config")
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:orphan1", b"orphan")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, false).await;
+        assert_eq!(result.orphaned_blobs, 1);
+        assert_eq!(result.deleted_blobs, 1);
+
+        // Verify orphan is gone
+        assert!(storage
+            .get("docker/test/blobs/sha256:orphan1")
+            .await
+            .is_err());
+        // Referenced blob still exists
+        assert!(storage
+            .get("docker/test/blobs/sha256:configabc")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_manifest_list_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Multi-arch manifest list
+        let manifest = serde_json::json!({
+            "manifests": [
+                {"digest": "sha256:platformA", "size": 100},
+                {"digest": "sha256:platformB", "size": 200}
+            ]
+        });
+        storage
+            .put(
+                "docker/multi/manifests/latest.json",
+                manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:platformA", b"arch-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:platformB", b"arch-b")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.orphaned_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_multi_registry_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // npm tarball (not referenced by Docker manifests => orphan candidate)
+        storage
+            .put("npm/lodash/tarballs/lodash-4.17.21.tgz", b"tarball-data")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        // npm tarballs contain "tarballs/" which matches the filter
+        assert_eq!(result.total_blobs, 1);
+    }
+}

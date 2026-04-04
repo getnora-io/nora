@@ -1322,3 +1322,249 @@ async fn update_metadata_on_pull(storage: Storage, meta_key: String) {
         let _ = storage.put(&meta_key, &json).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_image_metadata_default() {
+        let meta = ImageMetadata::default();
+        assert_eq!(meta.push_timestamp, 0);
+        assert_eq!(meta.last_pulled, 0);
+        assert_eq!(meta.downloads, 0);
+        assert_eq!(meta.size_bytes, 0);
+        assert_eq!(meta.os, "");
+        assert_eq!(meta.arch, "");
+        assert!(meta.variant.is_none());
+        assert!(meta.layers.is_empty());
+    }
+
+    #[test]
+    fn test_image_metadata_serialization() {
+        let meta = ImageMetadata {
+            push_timestamp: 1700000000,
+            last_pulled: 1700001000,
+            downloads: 42,
+            size_bytes: 1024000,
+            os: "linux".to_string(),
+            arch: "amd64".to_string(),
+            variant: None,
+            layers: vec![LayerInfo {
+                digest: "sha256:abc123".to_string(),
+                size: 512000,
+            }],
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"os\":\"linux\""));
+        assert!(json.contains("\"arch\":\"amd64\""));
+        assert!(!json.contains("variant")); // None => skipped
+    }
+
+    #[test]
+    fn test_image_metadata_with_variant() {
+        let meta = ImageMetadata {
+            variant: Some("v8".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"variant\":\"v8\""));
+    }
+
+    #[test]
+    fn test_image_metadata_deserialization() {
+        let json = r#"{
+            "push_timestamp": 1700000000,
+            "last_pulled": 0,
+            "downloads": 5,
+            "size_bytes": 2048,
+            "os": "linux",
+            "arch": "arm64",
+            "variant": "v8",
+            "layers": [
+                {"digest": "sha256:aaa", "size": 1024},
+                {"digest": "sha256:bbb", "size": 1024}
+            ]
+        }"#;
+        let meta: ImageMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.os, "linux");
+        assert_eq!(meta.arch, "arm64");
+        assert_eq!(meta.variant, Some("v8".to_string()));
+        assert_eq!(meta.layers.len(), 2);
+        assert_eq!(meta.layers[0].digest, "sha256:aaa");
+        assert_eq!(meta.layers[1].size, 1024);
+    }
+
+    #[test]
+    fn test_layer_info_serialization_roundtrip() {
+        let layer = LayerInfo {
+            digest: "sha256:deadbeef".to_string(),
+            size: 999999,
+        };
+        let json = serde_json::to_value(&layer).unwrap();
+        let restored: LayerInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(layer.digest, restored.digest);
+        assert_eq!(layer.size, restored.size);
+    }
+
+    #[test]
+    fn test_cleanup_expired_sessions_empty() {
+        let sessions: RwLock<HashMap<String, UploadSession>> = RwLock::new(HashMap::new());
+        cleanup_expired_sessions(&sessions);
+        assert_eq!(sessions.read().len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_sessions_fresh() {
+        let sessions: RwLock<HashMap<String, UploadSession>> = RwLock::new(HashMap::new());
+        sessions.write().insert(
+            "uuid-1".to_string(),
+            UploadSession {
+                data: vec![1, 2, 3],
+                name: "test/image".to_string(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+        cleanup_expired_sessions(&sessions);
+        assert_eq!(sessions.read().len(), 1); // not expired
+    }
+
+    #[test]
+    fn test_max_upload_sessions_default() {
+        // Without env var set, should return default
+        let max = max_upload_sessions();
+        assert!(max > 0);
+        assert_eq!(max, DEFAULT_MAX_UPLOAD_SESSIONS);
+    }
+
+    #[test]
+    fn test_max_session_size_default() {
+        let max = max_session_size();
+        assert_eq!(max, DEFAULT_MAX_SESSION_SIZE_MB * 1024 * 1024);
+    }
+
+    // --- detect_manifest_media_type tests ---
+
+    #[test]
+    fn test_detect_manifest_explicit_media_type() {
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "schemaVersion": 2
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_oci_media_type() {
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "schemaVersion": 2
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(result, "application/vnd.oci.image.manifest.v1+json");
+    }
+
+    #[test]
+    fn test_detect_manifest_schema_v1() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "test/image"
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v1+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_docker_v2_from_config() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "digest": "sha256:abc"
+            }
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_oci_from_config() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:abc"
+            }
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(result, "application/vnd.oci.image.manifest.v1+json");
+    }
+
+    #[test]
+    fn test_detect_manifest_no_config_media_type() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "digest": "sha256:abc"
+            }
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_index() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"digest": "sha256:aaa", "platform": {"os": "linux", "architecture": "amd64"}}
+            ]
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(result, "application/vnd.oci.image.index.v1+json");
+    }
+
+    #[test]
+    fn test_detect_manifest_invalid_json() {
+        let result = detect_manifest_media_type(b"not json at all");
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_empty() {
+        let result = detect_manifest_media_type(b"{}");
+        assert_eq!(
+            result,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+    }
+
+    #[test]
+    fn test_detect_manifest_helm_chart() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.cncf.helm.config.v1+json",
+                "digest": "sha256:abc"
+            }
+        });
+        let result = detect_manifest_media_type(manifest.to_string().as_bytes());
+        assert_eq!(result, "application/vnd.oci.image.manifest.v1+json");
+    }
+}

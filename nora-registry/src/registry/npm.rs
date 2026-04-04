@@ -555,4 +555,103 @@ mod tests {
         assert!(!is_valid_attachment_name(""));
         assert!(!is_valid_attachment_name("foo\0bar.tgz"));
     }
+
+    #[test]
+    fn test_with_content_type_tarball() {
+        let data = Bytes::from("tarball-data");
+        let (status, headers, body) = with_content_type(true, data.clone());
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/octet-stream");
+        assert_eq!(body, data);
+    }
+
+    #[test]
+    fn test_with_content_type_json() {
+        let data = Bytes::from("json-data");
+        let (status, headers, body) = with_content_type(false, data.clone());
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/json");
+        assert_eq!(body, data);
+    }
+
+    #[test]
+    fn test_rewrite_tarball_urls_trailing_slash() {
+        let metadata = serde_json::json!({
+            "name": "test",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:5000/", "https://registry.npmjs.org/")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let tarball = json["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(tarball.starts_with("http://nora:5000/npm/"));
+    }
+
+    #[test]
+    fn test_rewrite_tarball_urls_preserves_other_fields() {
+        let metadata = serde_json::json!({
+            "name": "test",
+            "description": "A test package",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz",
+                        "shasum": "abc123"
+                    },
+                    "dependencies": {"lodash": "^4.0.0"}
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:5000", "https://registry.npmjs.org").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(json["description"], "A test package");
+        assert_eq!(json["versions"]["1.0.0"]["dist"]["shasum"], "abc123");
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_valid() {
+        assert!(is_valid_attachment_name("package-1.0.0.tgz"));
+        assert!(is_valid_attachment_name("@scope-pkg-2.0.tgz"));
+        assert!(is_valid_attachment_name("my_pkg.tgz"));
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_traversal() {
+        assert!(!is_valid_attachment_name("../etc/passwd"));
+        assert!(!is_valid_attachment_name("foo/../bar"));
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_slash() {
+        assert!(!is_valid_attachment_name("path/file.tgz"));
+        assert!(!is_valid_attachment_name("path\\file.tgz"));
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_null_byte() {
+        assert!(!is_valid_attachment_name("file\0.tgz"));
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_empty() {
+        assert!(!is_valid_attachment_name(""));
+    }
+
+    #[test]
+    fn test_is_valid_attachment_name_special_chars() {
+        assert!(!is_valid_attachment_name("file name.tgz")); // space
+        assert!(!is_valid_attachment_name("file;cmd.tgz")); // semicolon
+    }
 }

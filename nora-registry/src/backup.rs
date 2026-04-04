@@ -300,3 +300,133 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn test_format_bytes_bytes() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_format_bytes_kilobytes() {
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        assert_eq!(format_bytes(10240), "10.00 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_megabytes() {
+        assert_eq!(format_bytes(1048576), "1.00 MB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_gigabytes() {
+        assert_eq!(format_bytes(1073741824), "1.00 GB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn test_backup_metadata_serialization() {
+        let meta = BackupMetadata {
+            version: "0.3.0".to_string(),
+            created_at: chrono::Utc::now(),
+            artifact_count: 42,
+            total_bytes: 1024000,
+            storage_backend: "local".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"version\":\"0.3.0\""));
+        assert!(json.contains("\"artifact_count\":42"));
+        assert!(json.contains("\"storage_backend\":\"local\""));
+    }
+
+    #[test]
+    fn test_backup_metadata_deserialization() {
+        let json = r#"{
+            "version": "0.3.0",
+            "created_at": "2026-01-01T00:00:00Z",
+            "artifact_count": 10,
+            "total_bytes": 5000,
+            "storage_backend": "s3"
+        }"#;
+        let meta: BackupMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.version, "0.3.0");
+        assert_eq!(meta.artifact_count, 10);
+        assert_eq!(meta.total_bytes, 5000);
+        assert_eq!(meta.storage_backend, "s3");
+    }
+
+    #[test]
+    fn test_backup_metadata_roundtrip() {
+        let meta = BackupMetadata {
+            version: "1.0.0".to_string(),
+            created_at: chrono::Utc::now(),
+            artifact_count: 100,
+            total_bytes: 999999,
+            storage_backend: "local".to_string(),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        let restored: BackupMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(meta.version, restored.version);
+        assert_eq!(meta.artifact_count, restored.artifact_count);
+        assert_eq!(meta.total_bytes, restored.total_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_create_backup_empty_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let output = dir.path().join("backup.tar.gz");
+
+        let stats = create_backup(&storage, &output).await.unwrap();
+        assert_eq!(stats.artifact_count, 0);
+        assert_eq!(stats.total_bytes, 0);
+        assert!(output.exists());
+        assert!(stats.output_size > 0); // at least metadata.json
+    }
+
+    #[tokio::test]
+    async fn test_backup_restore_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Put some test data
+        storage
+            .put("maven/com/example/1.0/test.jar", b"test-content")
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/blobs/sha256:abc123", b"blob-data")
+            .await
+            .unwrap();
+
+        // Create backup
+        let backup_file = dir.path().join("backup.tar.gz");
+        let backup_stats = create_backup(&storage, &backup_file).await.unwrap();
+        assert_eq!(backup_stats.artifact_count, 2);
+
+        // Restore to different storage
+        let restore_storage = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        let restore_stats = restore_backup(&restore_storage, &backup_file)
+            .await
+            .unwrap();
+        assert_eq!(restore_stats.artifact_count, 2);
+
+        // Verify data
+        let data = restore_storage
+            .get("maven/com/example/1.0/test.jar")
+            .await
+            .unwrap();
+        assert_eq!(&data[..], b"test-content");
+    }
+}

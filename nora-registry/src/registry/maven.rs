@@ -145,3 +145,57 @@ fn with_content_type(
 
     (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_type_pom() {
+        let (status, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.pom", Bytes::from("data"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/xml");
+    }
+
+    #[test]
+    fn test_content_type_jar() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/java-archive");
+    }
+
+    #[test]
+    fn test_content_type_xml() {
+        let (_, headers, _) =
+            with_content_type("com/example/maven-metadata.xml", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/xml");
+    }
+
+    #[test]
+    fn test_content_type_sha1() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar.sha1", Bytes::from("data"));
+        assert_eq!(headers[0].1, "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_md5() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar.md5", Bytes::from("data"));
+        assert_eq!(headers[0].1, "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_unknown() {
+        let (_, headers, _) = with_content_type("some/random/file.bin", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_content_type_preserves_body() {
+        let body = Bytes::from("test-jar-content");
+        let (_, _, data) = with_content_type("test.jar", body.clone());
+        assert_eq!(data, body);
+    }
+}

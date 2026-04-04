@@ -324,4 +324,108 @@ mod tests {
         assert_eq!(targets.len(), 1); // deduplicated
         assert_eq!(targets[0].name, "debug");
     }
+
+    #[test]
+    fn test_extract_package_name_simple() {
+        assert_eq!(extract_package_name("node_modules/lodash"), Some("lodash"));
+    }
+
+    #[test]
+    fn test_extract_package_name_scoped() {
+        assert_eq!(
+            extract_package_name("node_modules/@babel/core"),
+            Some("@babel/core")
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_nested() {
+        assert_eq!(
+            extract_package_name("node_modules/foo/node_modules/@scope/bar"),
+            Some("@scope/bar")
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_no_node_modules() {
+        assert_eq!(extract_package_name("just/a/path"), None);
+    }
+
+    #[test]
+    fn test_extract_package_name_empty_after() {
+        assert_eq!(extract_package_name("node_modules/"), None);
+    }
+
+    #[test]
+    fn test_parse_lockfile_v2() {
+        let lockfile = serde_json::json!({
+            "lockfileVersion": 2,
+            "packages": {
+                "": {"name": "root"},
+                "node_modules/express": {"version": "4.18.2"},
+                "node_modules/@types/node": {"version": "20.11.0"}
+            }
+        });
+        let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_lockfile_empty_packages() {
+        let lockfile = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {}
+        });
+        let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_lockfile_invalid_json() {
+        let result = parse_npm_lockfile("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_lockfile_v1_nested() {
+        let lockfile = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {
+                "express": {
+                    "version": "4.18.2",
+                    "dependencies": {
+                        "accepts": {"version": "1.3.8"}
+                    }
+                }
+            }
+        });
+        let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_lockfile_v2_falls_back_to_v1() {
+        // v2 with empty packages should fall back to v1 dependencies
+        let lockfile = serde_json::json!({
+            "lockfileVersion": 2,
+            "packages": {},
+            "dependencies": {
+                "lodash": {"version": "4.17.21"}
+            }
+        });
+        let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "lodash");
+    }
+
+    #[test]
+    fn test_parse_lockfile_no_version_field() {
+        let lockfile = serde_json::json!({
+            "packages": {
+                "node_modules/something": {"resolved": "https://example.com"}
+            }
+        });
+        let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
+        assert!(targets.is_empty());
+    }
 }

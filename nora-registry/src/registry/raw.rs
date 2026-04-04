@@ -141,3 +141,90 @@ fn guess_content_type(path: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guess_content_type_json() {
+        assert_eq!(guess_content_type("config.json"), "application/json");
+    }
+
+    #[test]
+    fn test_guess_content_type_xml() {
+        assert_eq!(guess_content_type("data.xml"), "application/xml");
+    }
+
+    #[test]
+    fn test_guess_content_type_html() {
+        assert_eq!(guess_content_type("index.html"), "text/html");
+        assert_eq!(guess_content_type("page.htm"), "text/html");
+    }
+
+    #[test]
+    fn test_guess_content_type_css() {
+        assert_eq!(guess_content_type("style.css"), "text/css");
+    }
+
+    #[test]
+    fn test_guess_content_type_js() {
+        assert_eq!(guess_content_type("app.js"), "application/javascript");
+    }
+
+    #[test]
+    fn test_guess_content_type_text() {
+        assert_eq!(guess_content_type("readme.txt"), "text/plain");
+    }
+
+    #[test]
+    fn test_guess_content_type_markdown() {
+        assert_eq!(guess_content_type("README.md"), "text/markdown");
+    }
+
+    #[test]
+    fn test_guess_content_type_yaml() {
+        assert_eq!(guess_content_type("config.yaml"), "application/x-yaml");
+        assert_eq!(guess_content_type("config.yml"), "application/x-yaml");
+    }
+
+    #[test]
+    fn test_guess_content_type_toml() {
+        assert_eq!(guess_content_type("Cargo.toml"), "application/toml");
+    }
+
+    #[test]
+    fn test_guess_content_type_archives() {
+        assert_eq!(guess_content_type("data.tar"), "application/x-tar");
+        assert_eq!(guess_content_type("data.gz"), "application/gzip");
+        assert_eq!(guess_content_type("data.gzip"), "application/gzip");
+        assert_eq!(guess_content_type("data.zip"), "application/zip");
+    }
+
+    #[test]
+    fn test_guess_content_type_images() {
+        assert_eq!(guess_content_type("logo.png"), "image/png");
+        assert_eq!(guess_content_type("photo.jpg"), "image/jpeg");
+        assert_eq!(guess_content_type("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_content_type("anim.gif"), "image/gif");
+        assert_eq!(guess_content_type("icon.svg"), "image/svg+xml");
+    }
+
+    #[test]
+    fn test_guess_content_type_special() {
+        assert_eq!(guess_content_type("doc.pdf"), "application/pdf");
+        assert_eq!(guess_content_type("module.wasm"), "application/wasm");
+    }
+
+    #[test]
+    fn test_guess_content_type_unknown() {
+        assert_eq!(guess_content_type("binary.bin"), "application/octet-stream");
+        assert_eq!(guess_content_type("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_guess_content_type_case_insensitive() {
+        assert_eq!(guess_content_type("FILE.JSON"), "application/json");
+        assert_eq!(guess_content_type("IMAGE.PNG"), "image/png");
+    }
+}

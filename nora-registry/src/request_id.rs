@@ -92,4 +92,23 @@ mod tests {
         let cloned = id.clone();
         assert_eq!(id.0, cloned.0);
     }
+
+    #[test]
+    fn test_request_id_debug() {
+        let id = RequestId("abc-def".to_string());
+        let debug = format!("{:?}", id);
+        assert!(debug.contains("abc-def"));
+    }
+
+    #[test]
+    fn test_request_id_header_name() {
+        assert_eq!(REQUEST_ID_HEADER.as_str(), "x-request-id");
+    }
+
+    #[test]
+    fn test_request_id_deref_string_methods() {
+        let id = RequestId("req-12345".to_string());
+        assert!(id.starts_with("req-"));
+        assert_eq!(id.len(), 9);
+    }
 }

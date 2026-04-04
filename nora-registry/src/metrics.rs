@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_registry_cargo() {
+    fn test_detect_registry_cargo_path() {
         assert_eq!(detect_registry("/cargo/api/v1/crates"), "cargo");
     }
 
@@ -199,5 +199,34 @@ mod tests {
         assert_eq!(detect_registry("/health"), "other");
         assert_eq!(detect_registry("/ready"), "other");
         assert_eq!(detect_registry("/unknown/path"), "other");
+    }
+
+    #[test]
+    fn test_detect_registry_go_path() {
+        assert_eq!(
+            detect_registry("/go/github.com/user/repo/@v/v1.0.0.info"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn test_record_cache_hit() {
+        record_cache_hit("docker");
+        // Doesn't panic — metric is recorded
+    }
+
+    #[test]
+    fn test_record_cache_miss() {
+        record_cache_miss("npm");
+    }
+
+    #[test]
+    fn test_record_storage_op_success() {
+        record_storage_op("get", true);
+    }
+
+    #[test]
+    fn test_record_storage_op_error() {
+        record_storage_op("put", false);
     }
 }
