@@ -1,4 +1,20 @@
 # Changelog
+## [0.4.0] - 2026-04-05
+
+### Added
+- **Docker image mirroring** — nora mirror docker fetches manifests and blobs from upstream registries (Docker Hub, ghcr.io, etc.) and pushes into NORA (#41)
+- **yarn.lock support** — nora mirror yarn parses v1 format with scoped packages and dedup (#44)
+- **--json output for mirror** — nora mirror npm --json outputs structured JSON for CI/CD pipelines (#43)
+- **Storage size in /health** — total_size_bytes field in health endpoint response (#42)
+- 499 total tests (up from 466), 61.5% code coverage (up from 43%)
+
+### Changed
+- fetch_blob_from_upstream and fetch_manifest_from_upstream are now pub for reuse in mirror module
+
+### Fixed
+- tarpaulin exclude-files paths corrected to workspace-relative (coverage jumped from 29% to 61%) (#92)
+- Env var naming unified across all registries (#39, #90)
+
 ## [0.3.1] - 2026-04-05
 
 ### Added
