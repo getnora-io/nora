@@ -135,8 +135,8 @@ jobs:
 
       - name: Smoke test — verify alpine image starts and responds
         run: |
-          docker rm -f nora-smoke 2>/dev/null || echo "WARNING: attestation failed, continuing without provenance"
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 \
+          docker rm -f nora-smoke 2>/dev/null || true
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
