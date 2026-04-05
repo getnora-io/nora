@@ -76,7 +76,7 @@ jobs:
           tags: ${{ steps.meta-alpine.outputs.tags }}
           labels: ${{ steps.meta-alpine.outputs.labels }}
           cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,mode=max
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,mode=max,ignore-error=true
 
       # ── RED OS ───────────────────────────────────────────────────────────────
       - name: Extract metadata (redos)
@@ -102,7 +102,7 @@ jobs:
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
           cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,mode=max
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,mode=max,ignore-error=true
 
       # ── Astra Linux SE ───────────────────────────────────────────────────────
       - name: Extract metadata (astra)
@@ -128,7 +128,7 @@ jobs:
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
           cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max
+          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max,ignore-error=true
 
       # ── Smoke test ──────────────────────────────────────────────────────────
       - name: Install cosign
