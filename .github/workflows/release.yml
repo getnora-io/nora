@@ -59,7 +59,6 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
           images: |
-            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}}
@@ -75,8 +74,6 @@ jobs:
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
           labels: ${{ steps.meta-alpine.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:alpine,mode=max,ignore-error=true
 
       # ── RED OS ───────────────────────────────────────────────────────────────
       - name: Extract metadata (redos)
@@ -84,7 +81,6 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
           images: |
-            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-redos,onlatest=true
           tags: |
@@ -101,8 +97,6 @@ jobs:
           push: true
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:redos,mode=max,ignore-error=true
 
       # ── Astra Linux SE ───────────────────────────────────────────────────────
       - name: Extract metadata (astra)
@@ -110,7 +104,6 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
           images: |
-            ${{ env.NORA }}/${{ env.IMAGE_NAME }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-astra,onlatest=true
           tags: |
@@ -127,8 +120,6 @@ jobs:
           push: true
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,ignore-error=true
-          cache-to: type=registry,ref=${{ env.NORA }}/${{ env.IMAGE_NAME }}-cache:astra,mode=max,ignore-error=true
 
       # ── Smoke test ──────────────────────────────────────────────────────────
       - name: Install cosign
@@ -146,7 +137,6 @@ jobs:
         run: |
           docker rm -f nora-smoke 2>/dev/null || echo "WARNING: attestation failed, continuing without provenance"
           docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 \
-            ${{ env.NORA }}/${{ env.IMAGE_NAME }}:latest
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
@@ -182,7 +172,6 @@ jobs:
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           scan-type: image
-          image-ref: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
@@ -264,14 +253,12 @@ jobs:
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
         with:
-          image: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
           format: spdx-json
           output-file: nora-${{ github.ref_name }}.sbom.spdx.json
 
       - name: Generate SBOM (CycloneDX)
         uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
         with:
-          image: ${{ env.NORA }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.tag }}
           format: cyclonedx-json
           output-file: nora-${{ github.ref_name }}.sbom.cdx.json
 
