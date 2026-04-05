@@ -299,17 +299,17 @@ jobs:
 
             **Alpine (standard):**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
             ```
 
             **RED OS:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}-redos
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
             ```
 
             **Astra Linux SE:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}-astra
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
             ```
 
             ## Changelog
