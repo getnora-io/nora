@@ -174,7 +174,7 @@ async fn resolve_npm_packages(
 }
 
 /// Fetch packages through NORA (triggers proxy cache)
-async fn mirror_npm_packages(
+pub async fn mirror_npm_packages(
     client: &reqwest::Client,
     registry: &str,
     targets: &[MirrorTarget],
@@ -248,6 +248,73 @@ async fn mirror_npm_packages(
         failed: failed.load(std::sync::atomic::Ordering::Relaxed),
         bytes: bytes.load(std::sync::atomic::Ordering::Relaxed),
     })
+}
+
+/// Parse yarn.lock v1 format
+/// Format: "package@version:\n  version \"X.Y.Z\"\n  resolved \"url\""
+pub fn parse_yarn_lock(content: &str) -> Vec<MirrorTarget> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current_name: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip comments and empty lines
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // Package header: "lodash@^4.17.21:" or "@babel/core@^7.0.0, @babel/core@^7.26.0:"
+        if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.ends_with(':') {
+            let header = trimmed.trim_end_matches(':');
+            // Take first entry before comma (all resolve to same version)
+            let first = header.split(',').next().unwrap_or(header).trim();
+            // Remove quotes if present
+            let first = first.trim_matches('"');
+            // Extract package name: everything before last @
+            if let Some(name) = extract_yarn_package_name(first) {
+                current_name = Some(name.to_string());
+            } else {
+                current_name = None;
+            }
+            continue;
+        }
+
+        // Version line: "  version "4.17.21""
+        if let Some(ref name) = current_name {
+            if trimmed.starts_with("version ") {
+                let ver = trimmed.trim_start_matches("version ").trim_matches('"');
+                let pair = (name.clone(), ver.to_string());
+                if seen.insert(pair.clone()) {
+                    targets.push(MirrorTarget {
+                        name: pair.0,
+                        version: pair.1,
+                    });
+                }
+                current_name = None;
+            }
+        }
+    }
+
+    targets
+}
+
+/// Extract package name from yarn.lock entry like "@babel/core@^7.0.0"
+fn extract_yarn_package_name(entry: &str) -> Option<&str> {
+    if let Some(rest) = entry.strip_prefix('@') {
+        // Scoped: @babel/core@^7.0.0 → find second @
+        let after_scope = rest.find('@')?;
+        Some(&entry[..after_scope + 1])
+    } else {
+        // Regular: lodash@^4.17.21 → find first @
+        let at = entry.find('@')?;
+        if at == 0 {
+            None
+        } else {
+            Some(&entry[..at])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +495,120 @@ mod tests {
         });
         let targets = parse_npm_lockfile(&lockfile.to_string()).unwrap();
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_basic() {
+        let content = r#"# yarn lockfile v1
+
+lodash@^4.17.21:
+  version "4.17.21"
+  resolved "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+
+express@^4.18.0:
+  version "4.18.2"
+  resolved "https://registry.npmjs.org/express/-/express-4.18.2.tgz"
+"#;
+        let targets = parse_yarn_lock(content);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "lodash");
+        assert_eq!(targets[0].version, "4.17.21");
+        assert_eq!(targets[1].name, "express");
+        assert_eq!(targets[1].version, "4.18.2");
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_scoped() {
+        let content = r#"
+"@babel/core@^7.26.0":
+  version "7.26.0"
+  resolved "https://registry.npmjs.org/@babel/core/-/core-7.26.0.tgz"
+"#;
+        let targets = parse_yarn_lock(content);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "@babel/core");
+        assert_eq!(targets[0].version, "7.26.0");
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_multiple_ranges() {
+        let content = r#"
+debug@2.6.9, debug@^2.2.0:
+  version "2.6.9"
+  resolved "https://registry.npmjs.org/debug/-/debug-2.6.9.tgz"
+
+debug@^4.1.0, debug@^4.3.4:
+  version "4.3.7"
+  resolved "https://registry.npmjs.org/debug/-/debug-4.3.7.tgz"
+"#;
+        let targets = parse_yarn_lock(content);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "debug");
+        assert_eq!(targets[0].version, "2.6.9");
+        assert_eq!(targets[1].name, "debug");
+        assert_eq!(targets[1].version, "4.3.7");
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_dedup() {
+        let content = r#"
+lodash@^4.0.0:
+  version "4.17.21"
+
+lodash@^4.17.0:
+  version "4.17.21"
+"#;
+        let targets = parse_yarn_lock(content);
+        assert_eq!(targets.len(), 1); // same name+version deduped
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_empty() {
+        let targets = parse_yarn_lock(
+            "# yarn lockfile v1
+
+",
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_comments_only() {
+        let content = "# yarn lockfile v1
+# comment
+";
+        let targets = parse_yarn_lock(content);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_extract_yarn_package_name_simple() {
+        assert_eq!(extract_yarn_package_name("lodash@^4.17.21"), Some("lodash"));
+    }
+
+    #[test]
+    fn test_extract_yarn_package_name_scoped() {
+        assert_eq!(
+            extract_yarn_package_name("@babel/core@^7.0.0"),
+            Some("@babel/core")
+        );
+    }
+
+    #[test]
+    fn test_extract_yarn_package_name_no_at() {
+        assert_eq!(extract_yarn_package_name("lodash"), None);
+    }
+
+    #[test]
+    fn test_parse_yarn_lock_quoted_headers() {
+        let content = r#"
+"@types/node@^20.0.0":
+  version "20.11.5"
+  resolved "https://registry.npmjs.org/@types/node/-/node-20.11.5.tgz"
+"#;
+        let targets = parse_yarn_lock(content);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "@types/node");
+        assert_eq!(targets[0].version, "20.11.5");
     }
 }
