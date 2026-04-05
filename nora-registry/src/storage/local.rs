@@ -138,6 +138,29 @@ impl StorageBackend for LocalStorage {
         fs::create_dir_all(&self.base_path).await.is_ok()
     }
 
+    async fn total_size(&self) -> u64 {
+        let base = self.base_path.clone();
+        tokio::task::spawn_blocking(move || {
+            fn dir_size(path: &std::path::Path) -> u64 {
+                let mut total = 0u64;
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        } else if path.is_dir() {
+                            total += dir_size(&path);
+                        }
+                    }
+                }
+                total
+            }
+            dir_size(&base)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
     fn backend_name(&self) -> &'static str {
         "local"
     }
@@ -336,6 +359,38 @@ mod tests {
 
         let data = storage.get("rw/key").await.expect("final get");
         assert_eq!(&*data, &vec![1u8; 4096]);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert_eq!(storage.total_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("a/file1", b"hello").await.unwrap(); // 5 bytes
+        storage.put("b/file2", b"world!").await.unwrap(); // 6 bytes
+
+        let size = storage.total_size().await;
+        assert_eq!(size, 11);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_after_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put("file1", b"12345").await.unwrap();
+        storage.put("file2", b"67890").await.unwrap();
+        assert_eq!(storage.total_size().await, 10);
+
+        storage.delete("file1").await.unwrap();
+        assert_eq!(storage.total_size().await, 5);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -46,6 +46,8 @@ pub trait StorageBackend: Send + Sync {
     async fn list(&self, prefix: &str) -> Vec<String>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
     async fn health_check(&self) -> bool;
+    /// Total size of all stored artifacts in bytes
+    async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
 }
 
@@ -108,6 +110,10 @@ impl Storage {
 
     pub async fn health_check(&self) -> bool {
         self.inner.health_check().await
+    }
+
+    pub async fn total_size(&self) -> u64 {
+        self.inner.total_size().await
     }
 
     pub fn backend_name(&self) -> &'static str {

@@ -382,6 +382,17 @@ impl StorageBackend for S3Storage {
         }
     }
 
+    async fn total_size(&self) -> u64 {
+        let keys = self.list("").await;
+        let mut total = 0u64;
+        for key in &keys {
+            if let Some(meta) = self.stat(key).await {
+                total += meta.size;
+            }
+        }
+        total
+    }
+
     fn backend_name(&self) -> &'static str {
         "s3"
     }
