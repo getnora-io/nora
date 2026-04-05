@@ -250,4 +250,70 @@ mod tests {
             .await;
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_parse_www_authenticate_bearer_only() {
+        let params = parse_www_authenticate("Bearer ").unwrap();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_realm() {
+        let header = r#"Bearer service="registry.docker.io""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert!(params.get("realm").is_none());
+        assert_eq!(
+            params.get("service"),
+            Some(&"registry.docker.io".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_service() {
+        let header = r#"Bearer realm="https://auth.docker.io/token""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert_eq!(
+            params.get("realm"),
+            Some(&"https://auth.docker.io/token".to_string())
+        );
+        assert!(params.get("service").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_malformed_kv() {
+        let header = r#"Bearer garbage,realm="https://auth.docker.io/token""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert_eq!(
+            params.get("realm"),
+            Some(&"https://auth.docker.io/token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_token_invalid_url() {
+        let auth = DockerAuth::new(1);
+        let result = auth
+            .get_token(
+                "https://registry.example.com",
+                "library/test",
+                Some(r#"Bearer realm="http://127.0.0.1:1/token",service="test""#),
+                None,
+            )
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_token_missing_realm_in_header() {
+        let auth = DockerAuth::default();
+        let result = auth
+            .get_token(
+                "https://registry.example.com",
+                "library/test",
+                Some(r#"Bearer service="registry.docker.io""#),
+                None,
+            )
+            .await;
+        assert!(result.is_none());
+    }
 }
