@@ -21,6 +21,7 @@ pub struct StorageHealth {
     pub backend: String,
     pub reachable: bool,
     pub endpoint: String,
+    pub total_size_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -40,6 +41,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
+    let total_size = state.storage.total_size().await;
 
     let status = if storage_reachable {
         "healthy"
@@ -60,6 +62,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
                 "s3" => state.config.storage.s3_url.clone(),
                 _ => state.config.storage.path.clone(),
             },
+            total_size_bytes: total_size,
         },
         registries: RegistriesHealth {
             docker: "ok".to_string(),
@@ -115,6 +118,41 @@ mod tests {
         let body = body_bytes(response).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("version").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_health_json_has_storage_size() {
+        let ctx = create_test_context();
+
+        // Put some data to have non-zero size
+        ctx.state
+            .storage
+            .put("test/artifact", b"hello world")
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let storage = json.get("storage").unwrap();
+        let size = storage.get("total_size_bytes").unwrap().as_u64().unwrap();
+        assert!(
+            size > 0,
+            "total_size_bytes should be > 0 after storing data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_empty_storage_size_zero() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let size = json["storage"]["total_size_bytes"].as_u64().unwrap();
+        assert_eq!(size, 0, "empty storage should report 0 bytes");
     }
 
     #[tokio::test]
