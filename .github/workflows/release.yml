@@ -136,7 +136,7 @@ jobs:
       - name: Smoke test — verify alpine image starts and responds
         run: |
           docker rm -f nora-smoke 2>/dev/null || true
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
@@ -299,17 +299,17 @@ jobs:
 
             **Alpine (standard):**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
             ```
 
             **RED OS:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-redos
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
             ```
 
             **Astra Linux SE:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}-astra
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
             ```
 
             ## Changelog
