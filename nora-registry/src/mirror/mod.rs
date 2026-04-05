@@ -24,6 +24,12 @@ pub enum MirrorFormat {
         #[arg(long)]
         all_versions: bool,
     },
+    /// Mirror npm packages from yarn.lock
+    Yarn {
+        /// Path to yarn.lock
+        #[arg(long)]
+        lockfile: PathBuf,
+    },
     /// Mirror Python packages
     Pip {
         /// Path to requirements.txt
@@ -50,6 +56,7 @@ pub struct MirrorTarget {
     pub version: String,
 }
 
+#[derive(serde::Serialize)]
 pub struct MirrorResult {
     pub total: usize,
     pub fetched: usize,
@@ -74,6 +81,7 @@ pub async fn run_mirror(
     format: MirrorFormat,
     registry: &str,
     concurrency: usize,
+    json_output: bool,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -110,6 +118,27 @@ pub async fn run_mirror(
             )
             .await?
         }
+        MirrorFormat::Yarn { lockfile } => {
+            let content = std::fs::read_to_string(&lockfile)
+                .map_err(|e| format!("Cannot read {}: {}", lockfile.display(), e))?;
+            let targets = npm::parse_yarn_lock(&content);
+            if targets.is_empty() {
+                println!("No packages found in {}", lockfile.display());
+                MirrorResult {
+                    total: 0,
+                    fetched: 0,
+                    failed: 0,
+                    bytes: 0,
+                }
+            } else {
+                println!(
+                    "Mirroring {} npm packages from yarn.lock via {}...",
+                    targets.len(),
+                    registry
+                );
+                npm::mirror_npm_packages(&client, registry, &targets, concurrency).await?
+            }
+        }
         MirrorFormat::Pip { lockfile } => {
             mirror_lockfile(&client, registry, "pip", &lockfile).await?
         }
@@ -122,12 +151,20 @@ pub async fn run_mirror(
     };
 
     let elapsed = start.elapsed();
-    println!("\nMirror complete:");
-    println!("  Total:    {}", result.total);
-    println!("  Fetched:  {}", result.fetched);
-    println!("  Failed:   {}", result.failed);
-    println!("  Size:     {:.1} MB", result.bytes as f64 / 1_048_576.0);
-    println!("  Time:     {:.1}s", elapsed.as_secs_f64());
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        println!("\nMirror complete:");
+        println!("  Total:    {}", result.total);
+        println!("  Fetched:  {}", result.fetched);
+        println!("  Failed:   {}", result.failed);
+        println!("  Size:     {:.1} MB", result.bytes as f64 / 1_048_576.0);
+        println!("  Time:     {:.1}s", elapsed.as_secs_f64());
+    }
 
     if result.failed > 0 {
         Err(format!("{} packages failed to mirror", result.failed))
@@ -439,5 +476,33 @@ version = "0.1.0"
     fn test_create_progress_bar() {
         let pb = create_progress_bar(100);
         assert_eq!(pb.length(), Some(100));
+    }
+
+    #[test]
+    fn test_mirror_result_json_serialization() {
+        let result = MirrorResult {
+            total: 10,
+            fetched: 8,
+            failed: 2,
+            bytes: 1048576,
+        };
+        let json = serde_json::to_string_pretty(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["total"], 10);
+        assert_eq!(parsed["fetched"], 8);
+        assert_eq!(parsed["failed"], 2);
+        assert_eq!(parsed["bytes"], 1048576);
+    }
+
+    #[test]
+    fn test_mirror_result_json_zero_values() {
+        let result = MirrorResult {
+            total: 0,
+            fetched: 0,
+            failed: 0,
+            bytes: 0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"total\":0"));
     }
 }

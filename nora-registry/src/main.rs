@@ -100,6 +100,9 @@ enum Commands {
         /// Max concurrent downloads
         #[arg(long, default_value = "8", global = true)]
         concurrency: usize,
+        /// Output results as JSON (for CI pipelines)
+        #[arg(long, global = true)]
+        json: bool,
     },
 }
 
@@ -188,8 +191,9 @@ async fn main() {
             format,
             registry,
             concurrency,
+            json,
         }) => {
-            if let Err(e) = mirror::run_mirror(format, &registry, concurrency).await {
+            if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json).await {
                 error!("Mirror failed: {}", e);
                 std::process::exit(1);
             }
