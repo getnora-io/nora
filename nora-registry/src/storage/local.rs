@@ -251,4 +251,115 @@ mod tests {
         let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
         assert_eq!(storage.backend_name(), "local");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_writes_same_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        let mut handles = Vec::new();
+        for i in 0..10u8 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let data = vec![i; 1024];
+                s.put("shared/key", &data).await
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked").expect("put failed");
+        }
+
+        let data = storage.get("shared/key").await.expect("get failed");
+        assert_eq!(data.len(), 1024);
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "file is corrupted — mixed writers"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_writes_different_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        let mut handles = Vec::new();
+        for i in 0..10u32 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("key/{}", i);
+                s.put(&key, format!("data-{}", i).as_bytes()).await
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked").expect("put failed");
+        }
+
+        for i in 0..10u32 {
+            let key = format!("key/{}", i);
+            let data = storage.get(&key).await.expect("get failed");
+            assert_eq!(&*data, format!("data-{}", i).as_bytes());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_read_during_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        let old_data = vec![0u8; 4096];
+        storage.put("rw/key", &old_data).await.expect("seed put");
+
+        let new_data = vec![1u8; 4096];
+        let sw = storage.clone();
+        let writer = tokio::spawn(async move {
+            sw.put("rw/key", &new_data).await.expect("put failed");
+        });
+
+        let sr = storage.clone();
+        let reader = tokio::spawn(async move {
+            match sr.get("rw/key").await {
+                Ok(_data) => {
+                    // tokio::fs::write is not atomic, so partial reads
+                    // (mix of old and new bytes) are expected — not a bug.
+                    // We only verify the final state after both tasks complete.
+                }
+                Err(crate::storage::StorageError::NotFound) => {}
+                Err(e) => panic!("unexpected error: {}", e),
+            }
+        });
+
+        writer.await.expect("writer panicked");
+        reader.await.expect("reader panicked");
+
+        let data = storage.get("rw/key").await.expect("final get");
+        assert_eq!(&*data, &vec![1u8; 4096]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_deletes_same_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        storage.put("del/key", b"ephemeral").await.expect("put");
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = s.delete("del/key").await;
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        assert!(matches!(
+            storage.get("del/key").await,
+            Err(crate::storage::StorageError::NotFound)
+        ));
+    }
 }

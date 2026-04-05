@@ -232,6 +232,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    use crate::storage::{Storage, StorageError};
     use crate::test_helpers::{
         body_bytes, create_test_context, create_test_context_with_raw_disabled, send,
     };
@@ -311,5 +312,20 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
         let put = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
         assert_eq!(put.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_upload_path_traversal_rejected() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        let result = storage.put("raw/../../../etc/passwd", b"pwned").await;
+        assert!(result.is_err(), "path traversal key must be rejected");
+        match result {
+            Err(StorageError::Validation(v)) => {
+                assert_eq!(format!("{}", v), "Path traversal detected");
+            }
+            other => panic!("expected Validation(PathTraversal), got {:?}", other),
+        }
     }
 }
