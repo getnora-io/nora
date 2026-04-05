@@ -92,4 +92,69 @@ mod tests {
         let cloned = id.clone();
         assert_eq!(id.0, cloned.0);
     }
+
+    #[test]
+    fn test_request_id_debug() {
+        let id = RequestId("abc-def".to_string());
+        let debug = format!("{:?}", id);
+        assert!(debug.contains("abc-def"));
+    }
+
+    #[test]
+    fn test_request_id_header_name() {
+        assert_eq!(REQUEST_ID_HEADER.as_str(), "x-request-id");
+    }
+
+    #[test]
+    fn test_request_id_deref_string_methods() {
+        let id = RequestId("req-12345".to_string());
+        assert!(id.starts_with("req-"));
+        assert_eq!(id.len(), 9);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{create_test_context, send, send_with_headers};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_response_has_request_id() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers().get("x-request-id");
+        assert!(
+            request_id.is_some(),
+            "Response must have X-Request-ID header"
+        );
+        let value = request_id.unwrap().to_str().unwrap();
+        assert!(!value.is_empty(), "X-Request-ID must not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_preserves_incoming_request_id() {
+        let ctx = create_test_context();
+        let custom_id = "custom-123";
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/health",
+            vec![("x-request-id", custom_id)],
+            "",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let returned_id = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(returned_id, custom_id);
+    }
 }

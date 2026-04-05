@@ -15,3 +15,13 @@ data/
 node_modules/
 package-lock.json
 /tmp/
+
+# Working files (never commit)
+SESSION_*.md
+TODO.md
+FEEDBACK.txt
+*.session.txt
+*-this-session-*.txt
+nora-review.sh
+coverage/
+target/criterion/

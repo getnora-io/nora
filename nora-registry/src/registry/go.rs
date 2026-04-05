@@ -307,6 +307,7 @@ fn with_content_type(data: Vec<u8>, content_type: &'static str) -> Response {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

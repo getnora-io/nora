@@ -51,7 +51,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          cargo tarpaulin --package nora-registry --out json --output-dir coverage/ 2>&1 | tee /tmp/tarpaulin.log
+          cargo tarpaulin --config tarpaulin.toml 2>&1 | tee /tmp/tarpaulin.log
           COVERAGE=$(python3 -c "import json; d=json.load(open('coverage/tarpaulin-report.json')); print(f\"{d['coverage']:.1f}\")")
           echo "COVERAGE=$COVERAGE" >> $GITHUB_ENV
           echo "Coverage: $COVERAGE%"

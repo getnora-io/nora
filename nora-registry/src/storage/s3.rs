@@ -427,4 +427,48 @@ mod tests {
         let result = hmac_sha256(b"key", b"data");
         assert!(!result.is_empty());
     }
+
+    #[test]
+    fn test_uri_encode_safe_chars() {
+        assert_eq!(uri_encode("hello"), "hello");
+        assert_eq!(uri_encode("foo/bar"), "foo/bar");
+        assert_eq!(uri_encode("test-file_v1.0"), "test-file_v1.0");
+        assert_eq!(uri_encode("a~b"), "a~b");
+    }
+
+    #[test]
+    fn test_uri_encode_special_chars() {
+        assert_eq!(uri_encode("hello world"), "hello%20world");
+        assert_eq!(uri_encode("file name.txt"), "file%20name.txt");
+    }
+
+    #[test]
+    fn test_uri_encode_query_chars() {
+        assert_eq!(uri_encode("key=value"), "key%3Dvalue");
+        assert_eq!(uri_encode("a&b"), "a%26b");
+        assert_eq!(uri_encode("a+b"), "a%2Bb");
+    }
+
+    #[test]
+    fn test_uri_encode_empty() {
+        assert_eq!(uri_encode(""), "");
+    }
+
+    #[test]
+    fn test_uri_encode_all_safe_ranges() {
+        // A-Z
+        assert_eq!(uri_encode("ABCXYZ"), "ABCXYZ");
+        // a-z
+        assert_eq!(uri_encode("abcxyz"), "abcxyz");
+        // 0-9
+        assert_eq!(uri_encode("0123456789"), "0123456789");
+        // Special safe: - _ . ~ /
+        assert_eq!(uri_encode("-_.~/"), "-_.~/");
+    }
+
+    #[test]
+    fn test_uri_encode_percent() {
+        assert_eq!(uri_encode("%"), "%25");
+        assert_eq!(uri_encode("100%done"), "100%25done");
+    }
 }

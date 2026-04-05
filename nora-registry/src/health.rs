@@ -90,3 +90,37 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> StatusCode {
 async fn check_storage_reachable(state: &AppState) -> bool {
     state.storage.health_check().await
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_health_returns_200() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("healthy"));
+    }
+
+    #[tokio::test]
+    async fn test_health_json_has_version() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("version").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ready_returns_200() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

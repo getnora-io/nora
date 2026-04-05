@@ -139,6 +139,7 @@ fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -166,5 +167,87 @@ mod tests {
             params.get("realm"),
             Some(&"https://ghcr.io/token".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_no_bearer() {
+        assert!(parse_www_authenticate("Basic realm=\"test\"").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_empty() {
+        assert!(parse_www_authenticate("").is_none());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_partial() {
+        let header = r#"Bearer realm="https://example.com/token""#;
+        let params = parse_www_authenticate(header).unwrap();
+        assert_eq!(
+            params.get("realm"),
+            Some(&"https://example.com/token".to_string())
+        );
+        assert!(!params.contains_key("service"));
+    }
+
+    #[test]
+    fn test_docker_auth_default() {
+        let auth = DockerAuth::default();
+        assert!(auth.tokens.read().is_empty());
+    }
+
+    #[test]
+    fn test_docker_auth_new() {
+        let auth = DockerAuth::new(30);
+        assert!(auth.tokens.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_token_no_www_authenticate() {
+        let auth = DockerAuth::default();
+        let result = auth
+            .get_token("https://registry.example.com", "library/test", None, None)
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_token_cache_hit() {
+        let auth = DockerAuth::default();
+        // Manually insert a cached token
+        {
+            let mut tokens = auth.tokens.write();
+            tokens.insert(
+                "https://registry.example.com:library/test".to_string(),
+                CachedToken {
+                    token: "cached-token-123".to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(300),
+                },
+            );
+        }
+        let result = auth
+            .get_token("https://registry.example.com", "library/test", None, None)
+            .await;
+        assert_eq!(result, Some("cached-token-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_token_cache_expired() {
+        let auth = DockerAuth::default();
+        {
+            let mut tokens = auth.tokens.write();
+            tokens.insert(
+                "https://registry.example.com:library/test".to_string(),
+                CachedToken {
+                    token: "expired-token".to_string(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        }
+        // Without www_authenticate, returns None (can't fetch new token)
+        let result = auth
+            .get_token("https://registry.example.com", "library/test", None, None)
+            .await;
+        assert!(result.is_none());
     }
 }

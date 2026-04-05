@@ -68,3 +68,73 @@ async fn download(
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_cargo_metadata_not_found() {
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/nonexistent",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_metadata_from_storage() {
+        let ctx = create_test_context();
+        let meta = r#"{"name":"test-crate","versions":[]}"#;
+        ctx.state
+            .storage
+            .put("cargo/test-crate/metadata.json", meta.as_bytes())
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/cargo/api/v1/crates/test-crate", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], meta.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_cargo_download_not_found() {
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/missing/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_download_from_storage() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("cargo/my-crate/1.2.3/my-crate-1.2.3.crate", b"crate-data")
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/my-crate/1.2.3/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"crate-data");
+    }
+}

@@ -283,6 +283,7 @@ fn parse_maven_deps(content: &str) -> Vec<MirrorTarget> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -321,5 +322,122 @@ version = \"0.1.0\"
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name, "org.apache.commons:commons-lang3");
         assert_eq!(targets[0].version, "3.12.0");
+    }
+
+    #[test]
+    fn test_parse_requirements_txt_empty() {
+        let targets = parse_requirements_txt("");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_requirements_txt_comments_only() {
+        let content = "# This is a comment\n# Another comment\n\n";
+        let targets = parse_requirements_txt(content);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_requirements_txt_flags() {
+        let content = "-r other-requirements.txt\n-i https://pypi.org/simple\nflask==2.0\n";
+        let targets = parse_requirements_txt(content);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "flask");
+    }
+
+    #[test]
+    fn test_parse_requirements_txt_version_specifiers() {
+        let content =
+            "pkg1>=1.0\npkg2<2.0\npkg3!=1.5\npkg4~=1.0\npkg5==1.0 ; python_version>='3.8'\n";
+        let targets = parse_requirements_txt(content);
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].name, "pkg1");
+        assert_eq!(targets[0].version, "latest");
+        assert_eq!(targets[4].name, "pkg5");
+        assert_eq!(targets[4].version, "1.0 ; python_version>='3.8'");
+    }
+
+    #[test]
+    fn test_parse_requirements_txt_inline_comments() {
+        let content = "flask==2.0  # web framework\n";
+        let targets = parse_requirements_txt(content);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "flask");
+        assert_eq!(targets[0].version, "2.0");
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_empty() {
+        let content = "";
+        let result = parse_cargo_lock(content);
+        let targets = result.unwrap();
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_no_packages() {
+        let content = "[metadata]\nsome = \"value\"\n";
+        let targets = parse_cargo_lock(content).unwrap();
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_git_source() {
+        let content = r#"
+[[package]]
+name = "my-dep"
+version = "0.1.0"
+source = "git+https://github.com/user/repo#abc123"
+"#;
+        let targets = parse_cargo_lock(content).unwrap();
+        assert!(targets.is_empty()); // git sources filtered out
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_multiple() {
+        let content = r#"
+[[package]]
+name = "serde"
+version = "1.0.197"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "tokio"
+version = "1.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "local-crate"
+version = "0.1.0"
+"#;
+        let targets = parse_cargo_lock(content).unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_maven_deps_empty() {
+        let targets = parse_maven_deps("");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_maven_deps_short_line() {
+        let targets = parse_maven_deps("foo:bar\n");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_maven_deps_multiple() {
+        let content = "[INFO]    org.slf4j:slf4j-api:jar:2.0.9:compile\n[INFO]    com.google.guava:guava:jar:33.0.0-jre:compile\n";
+        let targets = parse_maven_deps(content);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "org.slf4j:slf4j-api");
+        assert_eq!(targets[1].version, "33.0.0-jre");
+    }
+
+    #[test]
+    fn test_create_progress_bar() {
+        let pb = create_progress_bar(100);
+        assert_eq!(pb.length(), Some(100));
     }
 }

@@ -145,3 +145,148 @@ fn with_content_type(
 
     (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_type_pom() {
+        let (status, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.pom", Bytes::from("data"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/xml");
+    }
+
+    #[test]
+    fn test_content_type_jar() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/java-archive");
+    }
+
+    #[test]
+    fn test_content_type_xml() {
+        let (_, headers, _) =
+            with_content_type("com/example/maven-metadata.xml", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/xml");
+    }
+
+    #[test]
+    fn test_content_type_sha1() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar.sha1", Bytes::from("data"));
+        assert_eq!(headers[0].1, "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_md5() {
+        let (_, headers, _) =
+            with_content_type("com/example/1.0/example-1.0.jar.md5", Bytes::from("data"));
+        assert_eq!(headers[0].1, "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_unknown() {
+        let (_, headers, _) = with_content_type("some/random/file.bin", Bytes::from("data"));
+        assert_eq!(headers[0].1, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_content_type_preserves_body() {
+        let body = Bytes::from("test-jar-content");
+        let (_, _, data) = with_content_type("test.jar", body.clone());
+        assert_eq!(data, body);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::body::Body;
+    use axum::http::{header, Method, StatusCode};
+
+    #[tokio::test]
+    async fn test_maven_put_get_roundtrip() {
+        let ctx = create_test_context();
+        let jar_data = b"fake-jar-content";
+
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/mylib/1.0/mylib-1.0.jar",
+            Body::from(&jar_data[..]),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/mylib/1.0/mylib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], jar_data);
+    }
+
+    #[tokio::test]
+    async fn test_maven_not_found_no_proxy() {
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/missing/artifact/1.0/artifact-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_maven_content_type_pom() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/ex/1.0/ex-1.0.pom",
+            Body::from("<project/>"),
+        )
+        .await;
+
+        let get = send(&ctx.app, Method::GET, "/maven2/com/ex/1.0/ex-1.0.pom", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/xml"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maven_content_type_jar() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/org/test/app/2.0/app-2.0.jar",
+            Body::from("jar-data"),
+        )
+        .await;
+
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/org/test/app/2.0/app-2.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/java-archive"
+        );
+    }
+}

@@ -366,6 +366,7 @@ pub fn token_routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -403,7 +404,7 @@ mod tests {
     fn test_htpasswd_loading_with_comments() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# This is a comment").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         let hash = bcrypt::hash("secret", 4).unwrap();
         writeln!(file, "admin:{}", hash).unwrap();
         file.flush().unwrap();
@@ -471,5 +472,186 @@ mod tests {
         let hash = hash_password("test123").unwrap();
         assert!(hash.starts_with("$2"));
         assert!(bcrypt::verify("test123", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_is_public_path_health() {
+        assert!(is_public_path("/health"));
+        assert!(is_public_path("/ready"));
+        assert!(is_public_path("/metrics"));
+    }
+
+    #[test]
+    fn test_is_public_path_v2() {
+        assert!(is_public_path("/v2/"));
+        assert!(is_public_path("/v2"));
+    }
+
+    #[test]
+    fn test_is_public_path_ui() {
+        assert!(is_public_path("/ui"));
+        assert!(is_public_path("/ui/dashboard"));
+        assert!(is_public_path("/ui/repos"));
+    }
+
+    #[test]
+    fn test_is_public_path_api_docs() {
+        assert!(is_public_path("/api-docs"));
+        assert!(is_public_path("/api-docs/openapi.json"));
+        assert!(is_public_path("/api/ui"));
+    }
+
+    #[test]
+    fn test_is_public_path_tokens() {
+        assert!(is_public_path("/api/tokens"));
+        assert!(is_public_path("/api/tokens/list"));
+        assert!(is_public_path("/api/tokens/revoke"));
+    }
+
+    #[test]
+    fn test_is_public_path_root() {
+        assert!(is_public_path("/"));
+    }
+
+    #[test]
+    fn test_is_not_public_path_registry() {
+        assert!(!is_public_path("/v2/library/alpine/manifests/latest"));
+        assert!(!is_public_path("/npm/lodash"));
+        assert!(!is_public_path("/maven/com/example"));
+        assert!(!is_public_path("/pypi/simple/flask"));
+    }
+
+    #[test]
+    fn test_is_not_public_path_random() {
+        assert!(!is_public_path("/admin"));
+        assert!(!is_public_path("/secret"));
+        assert!(!is_public_path("/api/data"));
+    }
+
+    #[test]
+    fn test_default_role_str() {
+        assert_eq!(default_role_str(), "read");
+    }
+
+    #[test]
+    fn test_default_ttl() {
+        assert_eq!(default_ttl(), 30);
+    }
+
+    #[test]
+    fn test_create_token_request_defaults() {
+        let json = r#"{"username":"admin","password":"pass"}"#;
+        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "admin");
+        assert_eq!(req.password, "pass");
+        assert_eq!(req.ttl_days, 30);
+        assert_eq!(req.role, "read");
+        assert!(req.description.is_none());
+    }
+
+    #[test]
+    fn test_create_token_request_custom() {
+        let json = r#"{"username":"admin","password":"pass","ttl_days":90,"role":"write","description":"CI token"}"#;
+        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.ttl_days, 90);
+        assert_eq!(req.role, "write");
+        assert_eq!(req.description, Some("CI token".to_string()));
+    }
+
+    #[test]
+    fn test_create_token_response_serialization() {
+        let resp = CreateTokenResponse {
+            token: "nora_abc123".to_string(),
+            expires_in_days: 30,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("nora_abc123"));
+        assert!(json.contains("30"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::*;
+    use axum::http::{Method, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[tokio::test]
+    async fn test_auth_disabled_passes_all() {
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_public_paths_always_pass() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_blocks_without_credentials() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_basic_works() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_basic_wrong_password() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_anonymous_read() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+        // Upload with auth
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // Read without auth should work
+        let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Write without auth should fail
+        let response = send(&ctx.app, Method::PUT, "/raw/test2.txt", b"data".to_vec()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
