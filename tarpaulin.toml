@@ -5,5 +5,5 @@ fail-under = 38
 out = ["Json", "Html"]
 output-dir = "coverage"
 test-timeout = "5m"
-exclude-files = ["src/ui/*", "src/main.rs", "src/openapi.rs"]
+exclude-files = ["nora-registry/src/ui/*", "nora-registry/src/main.rs", "nora-registry/src/openapi.rs"]
 workspace = false
