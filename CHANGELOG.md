@@ -1,4 +1,36 @@
 # Changelog
+## [0.3.1] - 2026-04-05
+
+### Added
+- **Token verification cache** — in-memory with 5min TTL, eliminates repeated Argon2id on every request
+- **Property-based tests** (proptest) for Docker/OCI manifest parsers (#84)
+- 466 total tests, 43% code coverage (up from 22%) (#87)
+- MSRV declared in Cargo.toml (#84)
+
+### Changed
+- Upload sessions moved from global static to AppState
+- Blocking I/O replaced with async in hot paths
+- Production docker-compose includes Caddy reverse proxy
+- clippy.toml added for consistent lint rules
+
+### Fixed
+- Proxy request deduplication — concurrent requests coalesced (#83)
+- Multi-registry GC now handles all 7 registry types (#83)
+- TOCTOU race condition in credential validation (#83)
+- Config validation at startup — fail fast with clear errors (#73)
+- Raw registry in dashboard sidebar, footer stats updated (#64)
+- tarpaulin.toml config format (#88)
+
+### Security
+- sha2 0.10→0.11, hmac 0.12→0.13 (#75)
+- Credential hygiene — cleared from memory after use (#83)
+- cosign-installer 3.8.0→4.1.1 (#71)
+
+### Documentation
+- Development Setup in CONTRIBUTING.md (#76)
+- Roadmap consolidated into README (#65, #66)
+- Helm OCI docs and logging env vars documented
+
 ## [0.3.0] - 2026-03-21
 
 ### Added
