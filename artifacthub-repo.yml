@@ -1,0 +1,6 @@
+# Artifact Hub repository metadata
+# https://artifacthub.io/docs/topics/repositories/
+repositoryID: null  # filled by Artifact Hub after registration
+owners:
+  - name: DevITWay
+    email: devitway@gmail.com
