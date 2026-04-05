@@ -15,6 +15,8 @@ jobs:
   build:
     name: Build & Push
     runs-on: [self-hosted, nora]
+    outputs:
+      hash: ${{ steps.hash.outputs.hash }}
     permissions:
       contents: read
       packages: write
@@ -40,6 +42,13 @@ jobs:
           name: nora-binary-${{ github.run_id }}
           path: ./nora
           retention-days: 1
+
+      - name: Compute binary hash for SLSA provenance
+        id: hash
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/nora ./nora-linux-amd64
+          sha256sum nora-linux-amd64 | base64 -w0 > hash.txt
+          echo "hash=$(cat hash.txt)" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
@@ -185,10 +194,22 @@ jobs:
           sarif_file: trivy-image-${{ matrix.name }}.sarif
           category: trivy-image-${{ matrix.name }}
 
+  provenance:
+    name: SLSA Provenance
+    needs: build
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hash }}"
+      upload-assets: true
+
   release:
     name: GitHub Release
     runs-on: [self-hosted, nora]
-    needs: [build, scan]
+    needs: [build, scan, provenance]
     permissions:
       contents: write
       id-token: write  # Sigstore cosign keyless signing
@@ -215,42 +236,6 @@ jobs:
           echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
           cat nora-linux-amd64.sha256
 
-      - name: Generate SLSA provenance
-        uses: slsa-framework/slsa-github-generator/.github/actions/generate-builder@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
-        id: provenance-generate
-        continue-on-error: true
-
-      - name: Upload provenance attestation
-        if: always()
-        run: |
-          # Generate provenance using gh attestation (built-in GitHub feature)
-          gh attestation create ./nora-linux-amd64             --repo ${{ github.repository }}             --signer-workflow ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml 2>/dev/null || echo "WARNING: attestation failed, continuing without provenance"
-          # Also create a simple provenance file for scorecard
-          cat > nora-v${{ github.ref_name }}.provenance.json << 'PROVEOF'
-          {
-            "_type": "https://in-toto.io/Statement/v0.1",
-            "predicateType": "https://slsa.dev/provenance/v0.2",
-            "subject": [{"name": "nora-linux-amd64"}],
-            "predicate": {
-              "builder": {"id": "${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml"},
-              "buildType": "https://github.com/slsa-framework/slsa-github-generator/generic@v2",
-              "invocation": {
-                "configSource": {
-                  "uri": "${{ github.server_url }}/${{ github.repository }}",
-                  "digest": {"sha1": "${{ github.sha }}"},
-                  "entryPoint": ".github/workflows/release.yml"
-                }
-              },
-              "metadata": {
-                "buildInvocationID": "${{ github.run_id }}",
-                "completeness": {"parameters": true, "environment": false, "materials": false}
-              }
-            }
-          }
-          PROVEOF
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
         with:
@@ -267,7 +252,12 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
 
       - name: Sign binary with cosign (keyless Sigstore)
-        run: cosign sign-blob --yes --bundle nora-linux-amd64.bundle ./nora-linux-amd64
+        run: |
+          cosign sign-blob --yes \
+            --output-signature nora-linux-amd64.sig \
+            --output-certificate nora-linux-amd64.cert \
+            --bundle nora-linux-amd64.bundle \
+            ./nora-linux-amd64
 
       - name: Create Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
@@ -276,10 +266,11 @@ jobs:
           files: |
             nora-linux-amd64
             nora-linux-amd64.sha256
+            nora-linux-amd64.sig
+            nora-linux-amd64.cert
             nora-linux-amd64.bundle
             nora-${{ github.ref_name }}.sbom.spdx.json
             nora-${{ github.ref_name }}.sbom.cdx.json
-            nora-${{ github.ref_name }}.provenance.json
           body: |
             ## Install
 
