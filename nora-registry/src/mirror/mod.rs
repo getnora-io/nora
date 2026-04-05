@@ -3,6 +3,7 @@
 
 //! `nora mirror` — pre-fetch dependencies through NORA proxy cache.
 
+mod docker;
 mod npm;
 
 use clap::Subcommand;
@@ -47,6 +48,15 @@ pub enum MirrorFormat {
         /// Path to dependency list (mvn dependency:list output)
         #[arg(long)]
         lockfile: PathBuf,
+    },
+    /// Mirror Docker images from upstream registries
+    Docker {
+        /// Comma-separated image references (e.g., alpine:3.20,postgres:15)
+        #[arg(long, conflicts_with = "images_file", value_delimiter = ',')]
+        images: Option<Vec<String>>,
+        /// Path to file with image references (one per line)
+        #[arg(long, conflicts_with = "images")]
+        images_file: Option<PathBuf>,
     },
 }
 
@@ -147,6 +157,29 @@ pub async fn run_mirror(
         }
         MirrorFormat::Maven { lockfile } => {
             mirror_lockfile(&client, registry, "maven", &lockfile).await?
+        }
+        MirrorFormat::Docker {
+            images,
+            images_file,
+        } => {
+            let image_refs = if let Some(file) = images_file {
+                let content = std::fs::read_to_string(&file)
+                    .map_err(|e| format!("Cannot read {}: {}", file.display(), e))?;
+                docker::parse_images_file(&content)
+            } else if let Some(imgs) = images {
+                imgs.iter().map(|s| docker::parse_image_ref(s)).collect()
+            } else {
+                return Err("Either --images or --images-file is required".to_string());
+            };
+            if image_refs.is_empty() {
+                return Err("No images specified".to_string());
+            }
+            println!(
+                "Mirroring {} Docker images via {}...",
+                image_refs.len(),
+                registry
+            );
+            docker::run_docker_mirror(&client, registry, &image_refs, concurrency).await?
         }
     };
 

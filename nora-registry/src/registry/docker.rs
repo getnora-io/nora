@@ -990,7 +990,7 @@ async fn delete_blob_ns(
 }
 
 /// Fetch a blob from an upstream Docker registry
-async fn fetch_blob_from_upstream(
+pub async fn fetch_blob_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
     name: &str,
@@ -1047,7 +1047,7 @@ async fn fetch_blob_from_upstream(
 
 /// Fetch a manifest from an upstream Docker registry
 /// Returns (manifest_bytes, content_type)
-async fn fetch_manifest_from_upstream(
+pub async fn fetch_manifest_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
     name: &str,
