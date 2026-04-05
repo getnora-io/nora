@@ -1,4 +1,10 @@
 # Changelog
+## [Unreleased]
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other")
+- Go and Raw registries missing from `/health` endpoint `registries` object
+
 ## [0.4.0] - 2026-04-05
 
 ### Added

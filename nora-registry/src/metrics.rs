@@ -121,6 +121,10 @@ fn detect_registry(path: &str) -> String {
         "cargo".to_string()
     } else if path.starts_with("/simple") || path.starts_with("/packages") {
         "pypi".to_string()
+    } else if path.starts_with("/go/") {
+        "go".to_string()
+    } else if path.starts_with("/raw/") {
+        "raw".to_string()
     } else if path.starts_with("/ui") {
         "ui".to_string()
     } else {
@@ -205,8 +209,19 @@ mod tests {
     fn test_detect_registry_go_path() {
         assert_eq!(
             detect_registry("/go/github.com/user/repo/@v/v1.0.0.info"),
-            "other"
+            "go"
         );
+        assert_eq!(detect_registry("/go/github.com/user/repo/@latest"), "go");
+        // Bare prefix without trailing slash should not match
+        assert_eq!(detect_registry("/goblin/something"), "other");
+    }
+
+    #[test]
+    fn test_detect_registry_raw_path() {
+        assert_eq!(detect_registry("/raw/my-project/artifact.tar.gz"), "raw");
+        assert_eq!(detect_registry("/raw/data/file.bin"), "raw");
+        // Bare prefix without trailing slash should not match
+        assert_eq!(detect_registry("/rawdata/file"), "other");
     }
 
     #[test]
