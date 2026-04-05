@@ -414,11 +414,14 @@ impl Config {
     pub fn warn_plaintext_credentials(&self) {
         // Docker upstreams
         for (i, upstream) in self.docker.upstreams.iter().enumerate() {
-            if upstream.auth.is_some() && std::env::var("NORA_DOCKER_UPSTREAMS").is_err() {
+            if upstream.auth.is_some()
+                && std::env::var("NORA_DOCKER_PROXIES").is_err()
+                && std::env::var("NORA_DOCKER_UPSTREAMS").is_err()
+            {
                 tracing::warn!(
                     upstream_index = i,
                     url = %upstream.url,
-                    "Docker upstream credentials in config.toml are plaintext — consider NORA_DOCKER_UPSTREAMS env var"
+                    "Docker upstream credentials in config.toml are plaintext — consider NORA_DOCKER_PROXIES env var"
                 );
             }
         }
@@ -656,8 +659,14 @@ impl Config {
                 self.docker.proxy_timeout = timeout;
             }
         }
-        // NORA_DOCKER_UPSTREAMS format: "url1,url2" or "url1|auth1,url2|auth2"
-        if let Ok(val) = env::var("NORA_DOCKER_UPSTREAMS") {
+        // NORA_DOCKER_PROXIES format: "url1,url2" or "url1|auth1,url2|auth2"
+        // Backward compat: NORA_DOCKER_UPSTREAMS still works but is deprecated
+        if let Ok(val) =
+            env::var("NORA_DOCKER_PROXIES").or_else(|_| env::var("NORA_DOCKER_UPSTREAMS"))
+        {
+            if env::var("NORA_DOCKER_PROXIES").is_err() {
+                tracing::warn!("NORA_DOCKER_UPSTREAMS is deprecated, use NORA_DOCKER_PROXIES");
+            }
             self.docker.upstreams = val
                 .split(',')
                 .filter(|s| !s.is_empty())
@@ -669,6 +678,29 @@ impl Config {
                     }
                 })
                 .collect();
+        }
+
+        // Go config
+        if let Ok(val) = env::var("NORA_GO_PROXY") {
+            self.go.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_GO_PROXY_AUTH") {
+            self.go.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_GO_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.go.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_GO_PROXY_TIMEOUT_ZIP") {
+            if let Ok(timeout) = val.parse() {
+                self.go.proxy_timeout_zip = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_GO_MAX_ZIP_SIZE") {
+            if let Ok(size) = val.parse() {
+                self.go.max_zip_size = size;
+            }
         }
 
         // Raw config
@@ -1011,25 +1043,6 @@ mod tests {
     }
 
     #[test]
-    fn test_env_override_docker_upstreams() {
-        let mut config = Config::default();
-        std::env::set_var(
-            "NORA_DOCKER_UPSTREAMS",
-            "https://mirror.gcr.io,https://private.io|token123",
-        );
-        config.apply_env_overrides();
-        assert_eq!(config.docker.upstreams.len(), 2);
-        assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
-        assert!(config.docker.upstreams[0].auth.is_none());
-        assert_eq!(config.docker.upstreams[1].url, "https://private.io");
-        assert_eq!(
-            config.docker.upstreams[1].auth,
-            Some("token123".to_string())
-        );
-        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
-    }
-
-    #[test]
     fn test_env_override_npm() {
         let mut config = Config::default();
         std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
@@ -1306,5 +1319,56 @@ mod tests {
         let (warnings, errors) = config.validate();
         assert_eq!(errors.len(), 1);
         assert_eq!(warnings.len(), 2); // body_limit + auth_rps
+    }
+    #[test]
+    fn test_env_override_docker_proxies_and_backward_compat() {
+        // Test new NORA_DOCKER_PROXIES name
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+        std::env::set_var(
+            "NORA_DOCKER_PROXIES",
+            "https://mirror.gcr.io,https://private.io|token123",
+        );
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(config.docker.upstreams.len(), 2);
+        assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
+        assert!(config.docker.upstreams[0].auth.is_none());
+        assert_eq!(config.docker.upstreams[1].url, "https://private.io");
+        assert_eq!(
+            config.docker.upstreams[1].auth,
+            Some("token123".to_string())
+        );
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+
+        // Test backward compat: old NORA_DOCKER_UPSTREAMS still works
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+        std::env::set_var("NORA_DOCKER_UPSTREAMS", "https://legacy.io|secret");
+        let mut config2 = Config::default();
+        config2.apply_env_overrides();
+        assert_eq!(config2.docker.upstreams.len(), 1);
+        assert_eq!(config2.docker.upstreams[0].url, "https://legacy.io");
+        assert_eq!(config2.docker.upstreams[0].auth, Some("secret".to_string()));
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+    }
+
+    #[test]
+    fn test_env_override_go_proxy() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.go.proxy,
+            Some("https://goproxy.company.com".to_string()),
+        );
+        std::env::remove_var("NORA_GO_PROXY");
+    }
+
+    #[test]
+    fn test_env_override_go_proxy_auth() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
+        config.apply_env_overrides();
+        assert_eq!(config.go.proxy_auth, Some("user:pass".to_string()));
+        std::env::remove_var("NORA_GO_PROXY_AUTH");
     }
 }
