@@ -33,8 +33,8 @@ impl ProtectedString {
     }
 
     /// Consume and return the inner value
-    pub fn into_inner(self) -> Zeroizing<String> {
-        Zeroizing::new(self.inner.clone())
+    pub fn into_inner(mut self) -> Zeroizing<String> {
+        Zeroizing::new(std::mem::take(&mut self.inner))
     }
 
     /// Check if the secret is empty
@@ -74,8 +74,8 @@ impl From<&str> for ProtectedString {
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct S3Credentials {
-    pub access_key_id: String,
     #[zeroize(skip)] // access_key_id is not sensitive
+    pub access_key_id: String,
     pub secret_access_key: ProtectedString,
     pub region: Option<String>,
 }
