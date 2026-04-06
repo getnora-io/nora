@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::registry::proxy_fetch;
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -27,13 +28,44 @@ async fn get_metadata(
     State(state): State<Arc<AppState>>,
     Path(crate_name): Path<String>,
 ) -> Response {
-    // Validate input to prevent path traversal
     if validate_storage_key(&crate_name).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let key = format!("cargo/{}/metadata.json", crate_name);
-    match state.storage.get(&key).await {
-        Ok(data) => (StatusCode::OK, data).into_response(),
+
+    if let Ok(data) = state.storage.get(&key).await {
+        return (StatusCode::OK, data).into_response();
+    }
+
+    // Proxy fetch metadata from upstream
+    let proxy_url = match &state.config.cargo.proxy {
+        Some(url) => url.clone(),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let url = format!(
+        "{}/api/v1/crates/{}",
+        proxy_url.trim_end_matches('/'),
+        crate_name
+    );
+
+    match proxy_fetch(
+        &state.http_client,
+        &url,
+        state.config.cargo.proxy_timeout,
+        state.config.cargo.proxy_auth.as_deref(),
+    )
+    .await
+    {
+        Ok(data) => {
+            let storage = state.storage.clone();
+            let key_clone = key.clone();
+            let data_clone = data.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &data_clone).await;
+            });
+            (StatusCode::OK, data).into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -42,7 +74,6 @@ async fn download(
     State(state): State<Arc<AppState>>,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
-    // Validate inputs to prevent path traversal
     if validate_storage_key(&crate_name).is_err() || validate_storage_key(&version).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -50,19 +81,63 @@ async fn download(
         "cargo/{}/{}/{}-{}.crate",
         crate_name, version, crate_name, version
     );
-    match state.storage.get(&key).await {
+
+    // Try local storage first
+    if let Ok(data) = state.storage.get(&key).await {
+        state.metrics.record_download("cargo");
+        state.metrics.record_cache_hit();
+        state.activity.push(ActivityEntry::new(
+            ActionType::Pull,
+            format!("{}@{}", crate_name, version),
+            "cargo",
+            "LOCAL",
+        ));
+        state
+            .audit
+            .log(AuditEntry::new("pull", "api", "", "cargo", ""));
+        return (StatusCode::OK, data).into_response();
+    }
+
+    // Proxy fetch from upstream
+    let proxy_url = match &state.config.cargo.proxy {
+        Some(url) => url.clone(),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let url = format!(
+        "{}/api/v1/crates/{}/{}/download",
+        proxy_url.trim_end_matches('/'),
+        crate_name,
+        version
+    );
+
+    match proxy_fetch(
+        &state.http_client,
+        &url,
+        state.config.cargo.proxy_timeout,
+        state.config.cargo.proxy_auth.as_deref(),
+    )
+    .await
+    {
         Ok(data) => {
+            // Cache in background
+            let storage = state.storage.clone();
+            let key_clone = key.clone();
+            let data_clone = data.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &data_clone).await;
+            });
             state.metrics.record_download("cargo");
-            state.metrics.record_cache_hit();
+            state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("{}@{}", crate_name, version),
                 "cargo",
-                "LOCAL",
+                "PROXY",
             ));
             state
                 .audit
-                .log(AuditEntry::new("pull", "api", "", "cargo", ""));
+                .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
             (StatusCode::OK, data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
