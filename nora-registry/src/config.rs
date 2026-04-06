@@ -28,6 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub go: GoConfig,
     #[serde(default)]
+    pub cargo: CargoConfig,
+    #[serde(default)]
     pub raw: RawConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -127,6 +129,32 @@ pub struct PypiConfig {
     pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+}
+
+/// Cargo registry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CargoConfig {
+    /// Upstream Cargo registry (crates.io API)
+    #[serde(default = "default_cargo_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+}
+
+fn default_cargo_proxy() -> Option<String> {
+    Some("https://crates.io".to_string())
+}
+
+impl Default for CargoConfig {
+    fn default() -> Self {
+        Self {
+            proxy: default_cargo_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+        }
+    }
 }
 
 /// Go module proxy configuration (GOPROXY protocol)
@@ -446,6 +474,10 @@ impl Config {
         if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
             tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
         }
+        // Cargo
+        if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
+            tracing::warn!("Cargo proxy credentials in config.toml are plaintext — consider NORA_CARGO_PROXY_AUTH env var");
+        }
     }
 
     /// Validate configuration and return (warnings, errors).
@@ -703,6 +735,19 @@ impl Config {
             }
         }
 
+        // Cargo config
+        if let Ok(val) = env::var("NORA_CARGO_PROXY") {
+            self.cargo.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CARGO_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.cargo.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_CARGO_PROXY_AUTH") {
+            self.cargo.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+
         // Raw config
         if let Ok(val) = env::var("NORA_RAW_ENABLED") {
             self.raw.enabled = val.to_lowercase() == "true" || val == "1";
@@ -785,6 +830,7 @@ impl Default for Config {
             npm: NpmConfig::default(),
             pypi: PypiConfig::default(),
             go: GoConfig::default(),
+            cargo: CargoConfig::default(),
             docker: DockerConfig::default(),
             raw: RawConfig::default(),
             auth: AuthConfig::default(),
@@ -1370,5 +1416,12 @@ mod tests {
         config.apply_env_overrides();
         assert_eq!(config.go.proxy_auth, Some("user:pass".to_string()));
         std::env::remove_var("NORA_GO_PROXY_AUTH");
+    }
+
+    #[test]
+    fn test_cargo_config_default() {
+        let c = CargoConfig::default();
+        assert_eq!(c.proxy, Some("https://crates.io".to_string()));
+        assert_eq!(c.proxy_timeout, 30);
     }
 }

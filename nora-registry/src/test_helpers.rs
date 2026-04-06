@@ -102,6 +102,11 @@ fn build_context(
             proxy_timeout_zip: 30,
             max_zip_size: 10_485_760,
         },
+        cargo: CargoConfig {
+            proxy: None,
+            proxy_auth: None,
+            proxy_timeout: 5,
+        },
         docker: DockerConfig {
             proxy_timeout: 5,
             upstreams: vec![],
