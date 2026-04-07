@@ -1,9 +1,28 @@
 # Changelog
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-07
+
+### Added
+- **Cargo sparse index (RFC 2789)** — cargo can now use NORA as a proper registry with `sparse+http://` protocol, including `config.json`, prefix-based index lookup, and `cargo publish` wire format support
+- **Cargo publish** — full publish flow with wire format parsing, version immutability (409 Conflict), SHA-256 checksums in sparse index, and proper `warnings` response format
+- **PyPI twine upload** — `twine upload` via multipart/form-data with SHA-256 verification, filename validation, and version immutability
+- **PEP 691 JSON API** — content negotiation via `Accept: application/vnd.pypi.simple.v1+json` for package index and version listing, with hash digests in responses
+- 577 total tests (up from 504), including 25 new Cargo tests and 18 new PyPI tests
+
 ### Fixed
-- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other")
-- Go and Raw registries missing from `/health` endpoint `registries` object
+- Cargo dependency field mapping: `version_req` correctly renamed to `req` and `explicit_name_in_toml` to `package` in sparse index entries, matching Cargo registry specification
+- Cargo crate names normalized to lowercase across all endpoints (publish, download, metadata, sparse index) for consistent storage keys
+- Cargo publish write ordering: index written before .crate tarball to prevent orphaned files on partial failure
+- Cargo conflict errors now return Cargo-compatible JSON format (`{"errors": [{"detail": "..."}]}`)
+- PyPI hash fragments preserved when rewriting upstream links (PEP 503 compliance)
+- Redundant path traversal checks removed from crate name validation (charset already excludes unsafe characters)
+
+### Changed
+- Cargo sparse index and config.json responses include `Cache-Control: public, max-age=300`
+- Cargo .crate downloads include `Cache-Control: public, max-age=31536000, immutable` and `Content-Type: application/x-tar`
+- axum upgraded with `multipart` feature for PyPI upload support
+
 
 ## [0.4.0] - 2026-04-05
 
