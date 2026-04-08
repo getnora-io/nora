@@ -9,7 +9,7 @@ docker run -d -p 4000:4000 -v nora-data:/data ghcr.io/getnora-io/nora:latest
 Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is ready.
 
 <p align="center">
-  <img src=".github/assets/dashboard.gif" alt="NORA Dashboard" width="960" />
+  <img src=".github/assets/dashboard.png" alt="NORA Dashboard" width="960" />
 </p>
 
 ## Why NORA
