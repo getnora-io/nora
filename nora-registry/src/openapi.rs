@@ -18,8 +18,8 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.2.12",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, and PyPI",
+        version = "0.5.0",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, and Raw",
         license(name = "MIT"),
         contact(name = "DevITWay", url = "https://github.com/getnora-io/nora")
     ),
@@ -35,6 +35,8 @@ use crate::AppState;
         (name = "npm", description = "npm Registry API"),
         (name = "cargo", description = "Cargo Registry API"),
         (name = "pypi", description = "PyPI Simple API"),
+        (name = "go", description = "Go Module Proxy API"),
+        (name = "raw", description = "Raw File Storage API"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
