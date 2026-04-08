@@ -10,12 +10,14 @@ test.describe('NORA Dashboard', () => {
   test('dashboard shows registry sections', async ({ page }) => {
     await page.goto('/ui/');
 
-    // All registry types should be visible
+    // All 7 registry types should be visible
     await expect(page.getByText(/Docker/i).first()).toBeVisible();
     await expect(page.getByText(/npm/i).first()).toBeVisible();
     await expect(page.getByText(/Maven/i).first()).toBeVisible();
     await expect(page.getByText(/PyPI/i).first()).toBeVisible();
     await expect(page.getByText(/Cargo/i).first()).toBeVisible();
+    await expect(page.getByText(/Go/i).first()).toBeVisible();
+    await expect(page.getByText(/Raw/i).first()).toBeVisible();
   });
 
   test('dashboard shows non-zero npm count after proxy fetch', async ({ page, request }) => {
@@ -65,6 +67,8 @@ test.describe('NORA Dashboard', () => {
     expect(health.registries.maven).toBe('ok');
     expect(health.registries.pypi).toBe('ok');
     expect(health.registries.cargo).toBe('ok');
+    expect(health.registries.go).toBe('ok');
+    expect(health.registries.raw).toBe('ok');
   });
 
   test('OpenAPI docs endpoint accessible', async ({ request }) => {
