@@ -438,6 +438,7 @@ async fn run_server(config: Config, storage: Storage) {
         npm = "/npm/",
         cargo = "/cargo/",
         pypi = "/simple/",
+        go = "/go/",
         raw = "/raw/",
         "Available endpoints"
     );
