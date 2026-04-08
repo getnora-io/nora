@@ -11,6 +11,10 @@
 - 577 total tests (up from 504), including 25 new Cargo tests and 18 new PyPI tests
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Cargo dependency field mapping: `version_req` correctly renamed to `req` and `explicit_name_in_toml` to `package` in sparse index entries, matching Cargo registry specification
 - Cargo crate names normalized to lowercase across all endpoints (publish, download, metadata, sparse index) for consistent storage keys
 - Cargo publish write ordering: index written before .crate tarball to prevent orphaned files on partial failure
@@ -37,6 +41,10 @@
 - fetch_blob_from_upstream and fetch_manifest_from_upstream are now pub for reuse in mirror module
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - tarpaulin exclude-files paths corrected to workspace-relative (coverage jumped from 29% to 61%) (#92)
 - Env var naming unified across all registries (#39, #90)
 
@@ -55,6 +63,10 @@
 - clippy.toml added for consistent lint rules
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Proxy request deduplication — concurrent requests coalesced (#83)
 - Multi-registry GC now handles all 7 registry types (#83)
 - TOCTOU race condition in credential validation (#83)
@@ -91,6 +103,10 @@
 - README restructured: roadmap in README, removed stale ROADMAP.md (#65, #66)
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Remove all unwrap() from production code — proper error handling throughout (#72)
 - Add `#![forbid(unsafe_code)]` — no unsafe code allowed at crate level (#72)
 - Add input validation to Cargo registry endpoints (#72)
@@ -111,6 +127,10 @@
 - **Anonymous read mode** (`NORA_AUTH_ANONYMOUS_READ=true`): allow pull/download without credentials while requiring auth for push. Use case: public demo registries, read-only mirrors.
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Pin slsa-github-generator and codeql-action by SHA instead of tag
 - Replace anonymous tuple with named struct in activity grouping (readability)
 - Replace unwrap() with if-let pattern in activity grouping (safety)
@@ -119,6 +139,10 @@
 ## [0.2.34] - 2026-03-20
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - **UI**: Group consecutive identical activity entries — repeated cache hits show as "artifact (x4)" instead of 4 identical rows
 - **UI**: Fix table cell padding in Mount Points and Activity tables — th/td alignment now consistent
 - **Security**: Update tar crate 0.4.44 → 0.4.45 (CVE-2026-33055 PAX size header bypass, CVE-2026-33056 symlink chmod traversal)
@@ -145,6 +169,10 @@
 - Run containers as non-root user (USER nora) in all Dockerfiles
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Filter .meta.json from Docker tag list (fixes ArgoCD Image Updater tag recursion)
 - Fix catalog endpoint to show namespaced images correctly (library/alpine instead of library)
 
@@ -581,6 +609,10 @@ All notable changes to NORA will be documented in this file.
 ## [0.2.15] - 2026-01-31
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Code formatting (cargo fmt)
 
 ---
@@ -598,6 +630,10 @@ All notable changes to NORA will be documented in this file.
 ## [0.2.14] - 2026-01-31
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Docker dashboard now shows actual image size from manifest layers (config + layers sum)
 - Previously showed only manifest file size (~500 B instead of actual image size)
 
@@ -616,6 +652,10 @@ All notable changes to NORA will be documented in this file.
 ## [0.2.13] - 2026-01-31
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - npm dashboard now shows correct version count and package sizes
 - Parses metadata.json for versions, dist.unpackedSize, and time.modified
 - Previously showed 0 versions / 0 B for all packages
@@ -780,6 +820,10 @@ All notable changes to NORA will be documented in this file.
 ## [0.2.5] - 2026-01-26
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Docker push/pull: added PATCH endpoint for chunked uploads
 
 ---
@@ -797,6 +841,10 @@ All notable changes to NORA will be documented in this file.
 ## [0.2.4] - 2026-01-26
 
 ### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Rate limiting: health/metrics endpoints now exempt
 - Increased upload rate limits for Docker parallel requests
 
