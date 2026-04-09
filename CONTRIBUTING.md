@@ -107,16 +107,19 @@ All three must pass. CI will enforce this.
 
 - Run `cargo fmt` before committing
 - Fix all `cargo clippy` warnings
+- No `unwrap()` in production code (use proper error handling)
 - Follow Rust naming conventions
 - Keep functions short and focused
 - Add tests for new functionality
 
 ## Pull Request Process
 
-1. Update CHANGELOG.md if the change is user-facing
-2. Add tests for new features or bug fixes
-3. Ensure CI passes (fmt, clippy, test, security checks)
-4. Keep PRs focused — one feature or fix per PR
+1. Branch from `main`, use descriptive branch names (`feat/`, `fix/`, `chore/`)
+2. Update CHANGELOG.md if the change is user-facing
+3. Add tests for new features or bug fixes
+4. Ensure CI passes (fmt, clippy, test, security checks)
+5. Keep PRs focused — one feature or fix per PR
+6. PRs are squash-merged to keep a clean history
 
 ## Commit Messages
 
@@ -130,6 +133,20 @@ Use conventional commits:
 - `chore:` maintenance
 
 Example: `feat: add npm scoped package support`
+
+## New Registry Checklist
+
+When adding a new registry type (Docker, npm, Maven, etc.), ensure all of the following:
+
+- [ ] Handler in `nora-registry/src/registry/`
+- [ ] Health check endpoint
+- [ ] Metrics (Prometheus)
+- [ ] OpenAPI spec update
+- [ ] Startup log line
+- [ ] Dashboard UI tile
+- [ ] Playwright e2e test
+- [ ] CHANGELOG entry
+- [ ] COMPAT.md update
 
 ## Reporting Issues
 
