@@ -1,0 +1,10 @@
+[default.extend-words]
+# HashiCorp is not a typo
+Hashi = "Hashi"
+# flate2 is a Rust crate for compression
+flate = "flate"
+# grep pattern fragment in lint script
+validat = "validat"
+
+[files]
+extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/"]
