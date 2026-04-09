@@ -64,3 +64,6 @@ http-body-util = "0.1"
 [[bench]]
 name = "parsing"
 harness = false
+
+[lints]
+workspace = true

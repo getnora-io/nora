@@ -26,3 +26,27 @@ sha2 = "0.11"
 async-trait = "0.1"
 hmac = "0.13"
 hex = "0.4"
+
+[workspace.lints.clippy]
+or_fun_call = "deny"
+redundant_clone = "deny"
+collection_is_never_read = "deny"
+naive_bytecount = "deny"
+stable_sort_primitive = "deny"
+large_types_passed_by_value = "deny"
+assigning_clones = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [] }
+
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 4
+panic = "abort"
+lto = "thin"
+
+# Maximum optimization for GitHub Releases and published binaries
+[profile.release-official]
+inherits = "release"
+codegen-units = 1
+lto = true
