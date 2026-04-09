@@ -448,7 +448,7 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let features = metadata
         .get("features")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
     let features2 = metadata.get("features2").cloned();
     let links = metadata.get("links").cloned();
 
