@@ -1,16 +1,14 @@
-## Summary
+## What
 
-<!-- What does this PR do? -->
+<!-- Brief description of changes -->
 
-## Changes
+## Why
 
-<!-- List key changes -->
+<!-- Motivation / issue reference -->
 
 ## Checklist
 
-- [ ]  passes
-- [ ]  passes
-- [ ]  passes
-- [ ] No  in production code
-- [ ] New public API has documentation
-- [ ] CHANGELOG updated (if user-facing change)
+- [ ] Tests pass (`cargo test`)
+- [ ] No new clippy warnings (`cargo clippy -- -D warnings`)
+- [ ] Updated CHANGELOG.md (if user-facing change)
+- [ ] New registry? See CONTRIBUTING.md checklist
