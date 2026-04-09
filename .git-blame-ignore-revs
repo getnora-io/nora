@@ -1,0 +1,32 @@
+# Bulk formatting and lint-fix commits — ignore in git blame
+# See: https://docs.github.com/en/repositories/working-with-files/using-files/viewing-a-file#ignore-commits-in-the-blame-view
+
+# style: cargo fmt
+b2be7102fef2b42d7546ef66c8fd02f06b130bc4
+26d30b622dc4d17d160999f043e8be9985cea263
+8da4c4278a87ced1420fc6e7a9ea2c567e4e7b97
+
+# style: apply rustfmt to registry handlers
+8336166e0e541f213d0f3b20d55ea509bbb2f2d8
+
+# style: fix formatting
+a9125e6287e9f31fff0720e7c1c07cdc5e94c9db
+bbdefff07cf588ad5f848bec9031f4e51cc47c41
+ac4020d34f72b08e1eb3dc0c4248128b1012ddb5
+
+# Fix formatting
+08eea07cfe05ac64e9d6d4a7f8314f269d834e9c
+c7098a4aed2a880dff418abe48c5016ea5ac20e0
+
+# Fix code formatting
+0a97b00278c59a267c0fc7cdca7eb2bd7aa5decf
+
+# Fix clippy warnings
+cf9feee5b2116e216cbcd6b0d3ae1fe5e93cf7d5
+2f86b4852a9c9a1a5691e8b48da8be3fb45f6d0c
+
+# fix: clippy let_and_return warning
+dab3ee805edbd2e6fb3cffda9c9618468880153e
+
+# fix: resolve clippy warnings and format code
+00fbd201127defee9c24a8edeb01eba3c053f306
