@@ -194,7 +194,6 @@
 - **CI**: Исправлены проверки лицензий cargo-deny
 
 
-
 ## [0.2.31] - 2026-03-16
 
 ### Added / Добавлено
@@ -221,9 +220,6 @@
 - **npm proxy_auth**: `proxy_auth` field was configured but not wired into `fetch_from_proxy` — now sends Basic Auth header to upstream
 - **npm proxy_auth**: Поле `proxy_auth` было в конфиге, но не передавалось в `fetch_from_proxy` — теперь отправляет Basic Auth в upstream
 
-
-
-All notable changes to NORA will be documented in this file.
 
 ---
 
@@ -256,19 +252,6 @@ All notable changes to NORA will be documented in this file.
 ### Removed / Удалено
 - Removed unused `DockerAuth::fetch_with_auth()` method (dead code cleanup)
 - Удалён неиспользуемый метод `DockerAuth::fetch_with_auth()` (очистка мёртвого кода)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.28] - 2026-03-13
 
 ### Fixed / Исправлено
@@ -286,19 +269,6 @@ All notable changes to NORA will be documented in this file.
 ### Removed / Удалено
 - Removed stale `CHANGELOG.md.bak` from repository
 - Удалён устаревший `CHANGELOG.md.bak` из репозитория
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.27] - 2026-03-03
 
 ### Added / Добавлено
@@ -312,19 +282,6 @@ All notable changes to NORA will be documented in this file.
 ### Fixed / Исправлено
 - Docker push of images >100MB no longer fails with 413 error
 - Push Docker-образов >100MB больше не падает с ошибкой 413
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.26] - 2026-03-03
 
 ### Added / Добавлено
@@ -346,19 +303,6 @@ All notable changes to NORA will be documented in this file.
 ### Security / Безопасность
 - Read-only tokens (`role: read`) are now blocked from PUT/POST/DELETE/PATCH operations with HTTP 403
 - Токены только для чтения (`role: read`) теперь блокируются при PUT/POST/DELETE/PATCH с HTTP 403
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.25] - 2026-03-03
 
 ### Fixed / Исправлено
@@ -382,19 +326,6 @@ All notable changes to NORA will be documented in this file.
 - `docker/build-push-action` 5 → 6
 - Move scan/release to self-hosted runner with NORA cache
 - Сканирование/релиз перенесены на self-hosted runner с кэшем через NORA
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.24] - 2026-02-24
 
 ### Added / Добавлено
@@ -404,19 +335,6 @@ All notable changes to NORA will be documented in this file.
 ### CI/CD
 - Restore Astra Linux SE Docker image build, Trivy scan, and release artifact (`-astra` tag)
 - Восстановлена сборка Docker-образа для Astra Linux SE, сканирование Trivy и артефакт релиза (тег `-astra`)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.23] - 2026-02-24
 
 ### Added / Добавлено
@@ -449,37 +367,11 @@ All notable changes to NORA will be documented in this file.
 
 ### Documentation / Документация
 - Replace text title with SVG logo; `O` styled in blue-600 / Заголовок заменён SVG-логотипом; буква `O` стилизована в blue-600
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.22] - 2026-02-24
 
 ### Changed / Изменено
 - First stable release with Docker images published to container registry
 - Первый стабильный релиз с Docker-образами, опубликованными в container registry
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.21] - 2026-02-24
 
 ### CI/CD
@@ -491,19 +383,6 @@ All notable changes to NORA will be documented in this file.
 - Use GitHub-runner's own Rust toolchain (avoid path conflicts) / Используется Rust toolchain самого GitHub-runner'а
 - Use shared runner filesystem instead of artifact API (avoids network upload latency) / Общая файловая система runner'а вместо artifact API
 - Remove Astra Linux build temporarily / Сборка для Astra Linux временно удалена
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.20] - 2026-02-23
 
 ### Added / Добавлено
@@ -516,19 +395,6 @@ All notable changes to NORA will be documented in this file.
 ### Fixed / Исправлено
 - Auth: replace `starts_with` with explicit `matches!` for token path checks / Аутентификация: `starts_with` заменён явной проверкой `matches!` для путей с токенами
 - Remove unnecessary QEMU step for amd64-only builds / Удалён лишний шаг QEMU для amd64-сборок
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.19] - 2026-01-31
 
 ### Added / Добавлено
@@ -540,72 +406,20 @@ All notable changes to NORA will be documented in this file.
 
 ### Fixed / Исправлено
 - Use `div_ceil` instead of manual ceiling division / Использован `div_ceil` вместо ручной реализации деления с округлением вверх
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.18] - 2026-01-31
 
 ### Changed
 - Logo styling refinements
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.17] - 2026-01-31
 
 ### Added
 - Copyright headers to all source files (Volkov Pavel | DevITWay)
 - SPDX-License-Identifier: MIT in all .rs files
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.16] - 2026-01-31
 
 ### Changed
 - N○RA branding: stylized O logo across dashboard
 - Fixed O letter alignment in logo
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.15] - 2026-01-31
 
 ### Fixed
@@ -614,19 +428,6 @@ All notable changes to NORA will be documented in this file.
 - Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
 - Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Code formatting (cargo fmt)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.14] - 2026-01-31
 
 ### Fixed
@@ -636,19 +437,6 @@ All notable changes to NORA will be documented in this file.
 - Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Docker dashboard now shows actual image size from manifest layers (config + layers sum)
 - Previously showed only manifest file size (~500 B instead of actual image size)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.13] - 2026-01-31
 
 ### Fixed
@@ -659,19 +447,6 @@ All notable changes to NORA will be documented in this file.
 - npm dashboard now shows correct version count and package sizes
 - Parses metadata.json for versions, dist.unpackedSize, and time.modified
 - Previously showed 0 versions / 0 B for all packages
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.12] - 2026-01-30
 
 ### Added
@@ -693,106 +468,28 @@ All notable changes to NORA will be documented in this file.
 
 #### Documentation
 - Bilingual onboarding guide (EN/RU)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.11] - 2026-01-26
 
 ### Added
 - Internationalization (i18n) support
 - PyPI registry proxy
 - UI improvements
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.10] - 2026-01-26
 
 ### Changed
 - Dark theme applied to all UI pages
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.9] - 2026-01-26
 
 ### Changed
 - Version bump release
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.8] - 2026-01-26
 
 ### Added
 - Dashboard endpoint added to OpenAPI documentation
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.7] - 2026-01-26
 
 ### Added
 - Dynamic version display in UI sidebar
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.6] - 2026-01-26
 
 ### Added
@@ -804,19 +501,6 @@ All notable changes to NORA will be documented in this file.
 
 #### UI
 - Dark theme (bg: #0f172a, cards: #1e293b)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.5] - 2026-01-26
 
 ### Fixed
@@ -825,19 +509,6 @@ All notable changes to NORA will be documented in this file.
 - Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
 - Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Docker push/pull: added PATCH endpoint for chunked uploads
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.4] - 2026-01-26
 
 ### Fixed
@@ -847,19 +518,6 @@ All notable changes to NORA will be documented in this file.
 - Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
 - Rate limiting: health/metrics endpoints now exempt
 - Increased upload rate limits for Docker parallel requests
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.2.0] - 2026-01-25
 
 ### Added
@@ -927,19 +585,6 @@ All notable changes to NORA will be documented in this file.
 - `src/error.rs` - application error types
 - `src/request_id.rs` - request ID middleware
 - `src/rate_limit.rs` - rate limiting configuration
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
 ## [0.1.0] - 2026-01-24
 
 ### Added
@@ -956,308 +601,3 @@ All notable changes to NORA will be documented in this file.
 - Environment variable configuration
 - Graceful shutdown (SIGTERM/SIGINT)
 - Backup/restore commands
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-# Журнал изменений (RU)
-
-Все значимые изменения NORA документируются в этом файле.
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.12] - 2026-01-30
-
-### Добавлено
-
-#### Настраиваемый Rate Limiting
-- Rate limits настраиваются через `config.toml` и переменные окружения
-- Новая секция `[rate_limit]` с параметрами: `auth_rps`, `auth_burst`, `upload_rps`, `upload_burst`, `general_rps`, `general_burst`
-- Переменные окружения: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
-
-#### Архитектура Secrets Provider
-- Trait-based управление секретами (`SecretsProvider` trait)
-- ENV provider по умолчанию (12-Factor App паттерн)
-- Защищённые секреты с `zeroize` (память обнуляется при drop)
-- Redacted Debug impl предотвращает утечку секретов в логи
-- Новая секция `[secrets]` с опциями `provider` и `clear_env`
-
-#### Docker Image Metadata
-- Поддержка получения метаданных образов
-
-#### Документация
-- Двуязычный onboarding guide (EN/RU)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.11] - 2026-01-26
-
-### Добавлено
-- Поддержка интернационализации (i18n)
-- PyPI registry proxy
-- Улучшения UI
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.10] - 2026-01-26
-
-### Изменено
-- Тёмная тема применена ко всем страницам UI
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.9] - 2026-01-26
-
-### Изменено
-- Релиз с обновлением версии
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.8] - 2026-01-26
-
-### Добавлено
-- Dashboard endpoint добавлен в OpenAPI документацию
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.7] - 2026-01-26
-
-### Добавлено
-- Динамическое отображение версии в сайдбаре UI
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.6] - 2026-01-26
-
-### Добавлено
-
-#### Dashboard Metrics
-- Глобальная панель статистики: downloads, uploads, artifacts, cache hit rate, storage
-- Расширенные карточки реестров с количеством артефактов, размером, счётчиками
-- Лог активности (последние 20 событий)
-
-#### UI
-- Тёмная тема (bg: #0f172a, cards: #1e293b)
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.5] - 2026-01-26
-
-### Исправлено
-- Docker push/pull: добавлен PATCH endpoint для chunked uploads
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.4] - 2026-01-26
-
-### Исправлено
-- Rate limiting: health/metrics endpoints теперь исключены
-- Увеличены лимиты upload для параллельных Docker запросов
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.2.0] - 2026-01-25
-
-### Добавлено
-
-#### UI: SVG иконки брендов
-- Эмоджи заменены на SVG иконки брендов (стиль Simple Icons)
-- Docker, Maven, npm, Cargo, PyPI теперь отображаются как векторная графика
-- Единый стиль иконок на дашборде, сайдбаре и страницах деталей
-
-#### Тестовая инфраструктура
-- Unit-тесты для LocalStorage (8 тестов): put/get, list, stat, health_check
-- Unit-тесты для S3Storage с HTTP-мокированием wiremock (11 тестов)
-- Интеграционные тесты auth/htpasswd (7 тестов)
-- Тесты жизненного цикла токенов (11 тестов)
-- Тесты валидации (21 тест)
-- **Всего: 75 тестов проходят**
-
-#### Безопасность: Валидация ввода (`validation.rs`)
-- Защита от path traversal: отклоняет `../`, `..\\`, null-байты, абсолютные пути
-- Валидация имён Docker-образов по спецификации OCI distribution
-- Валидация дайджестов (`sha256:[64 hex]`, `sha512:[128 hex]`)
-- Валидация тегов и ссылок Docker
-- Ограничение длины ключей хранилища (макс. 1024 символа)
-
-#### Безопасность: Rate Limiting (`rate_limit.rs`)
-- Auth endpoints: 1 req/sec, burst 5 (защита от брутфорса)
-- Upload endpoints: 10 req/sec, burst 20
-- Общие endpoints: 100 req/sec, burst 200
-- Использует `tower_governor` 0.8 с `PeerIpKeyExtractor`
-
-#### Наблюдаемость: Отслеживание Request ID (`request_id.rs`)
-- Заголовок `X-Request-ID` добавляется ко всем ответам
-- Принимает upstream request ID или генерирует UUID v4
-- Tracing spans включают request_id для корреляции логов
-
-#### CLI: Команда миграции (`migrate.rs`)
-- `nora migrate --from local --to s3` - миграция между storage backends
-- Флаг `--dry-run` для предпросмотра без копирования
-- Прогресс-бар с indicatif
-- Пропуск существующих файлов в destination
-- Итоговая статистика (migrated, skipped, failed, bytes)
-
-#### Обработка ошибок (`error.rs`)
-- Enum `AppError` с `IntoResponse` для Axum
-- Автоматическая конверсия из `StorageError` и `ValidationError`
-- JSON-ответы об ошибках с поддержкой request_id
-
-### Изменено
-- `StorageError` теперь использует макрос `thiserror`
-- `TokenError` теперь использует макрос `thiserror`
-- Storage wrapper валидирует ключи перед делегированием backend
-- Docker registry handlers валидируют name, digest, reference
-- Лимит размера body установлен в 100MB через `DefaultBodyLimit`
-
-### Добавлены зависимости
-- `thiserror = "2"` - типизированная обработка ошибок
-- `tower_governor = "0.8"` - rate limiting
-- `governor = "0.10"` - backend для rate limiting
-- `tempfile = "3"` (dev) - временные директории для тестов
-- `wiremock = "0.6"` (dev) - HTTP-мокирование для S3 тестов
-
-### Добавлены файлы
-- `src/validation.rs` - модуль валидации ввода
-- `src/migrate.rs` - модуль миграции хранилища
-- `src/error.rs` - типы ошибок приложения
-- `src/request_id.rs` - middleware для request ID
-- `src/rate_limit.rs` - конфигурация rate limiting
-
----
-
-## [0.2.30] - 2026-03-16
-
-### Fixed / Исправлено
-- **Dashboard**: Docker upstream now shown in mount points table (was null)
-- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
-- **Dashboard**: npm proxy-cached packages now appear in package list
-- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
-- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
-- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
-
-## [0.1.0] - 2026-01-24
-
-### Добавлено
-- Мульти-протокольная поддержка: Docker Registry v2, Maven, npm, Cargo, PyPI
-- Web UI дашборд
-- Swagger UI (`/api-docs`)
-- Storage backends: локальная файловая система, S3-совместимое хранилище
-- Умный прокси/кэш для Maven и npm
-- Health checks (`/health`, `/ready`)
-- Базовая аутентификация (htpasswd с bcrypt)
-- API токены (отзываемые, per-user)
-- Prometheus метрики (`/metrics`)
-- JSON структурированное логирование
-- Конфигурация через переменные окружения
-- Graceful shutdown (SIGTERM/SIGINT)
-- Команды backup/restore
