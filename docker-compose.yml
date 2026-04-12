@@ -7,6 +7,7 @@ services:
       - nora-data:/data
     environment:
       - RUST_LOG=info
+      - NORA_HOST=0.0.0.0
       - NORA_AUTH_ENABLED=false
     restart: unless-stopped
 
