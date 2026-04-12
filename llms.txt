@@ -163,11 +163,10 @@ nora mirror maven --registry http://localhost:4000 --artifact org.slf4j:slf4j-ap
 | `NORA_STORAGE_MODE` | `local` | `local` or `s3` |
 | `NORA_AUTH_ENABLED` | `false` | Enable authentication |
 | `NORA_AUTH_ANONYMOUS_READ` | `false` | Allow pull without auth |
-| `NORA_DOCKER_UPSTREAMS` | Docker Hub | Upstream registries |
-| `NORA_LOG_LEVEL` | `info` | trace, debug, info, warn, error |
-| `NORA_LOG_FORMAT` | `text` | `text` or `json` |
+| `NORA_DOCKER_PROXIES` | Docker Hub | Upstream registries (deprecated: `NORA_DOCKER_UPSTREAMS`) |
+| `RUST_LOG` | `info` | Logging filter: trace, debug, info, warn, error |
 | `NORA_PUBLIC_URL` | — | Public URL for artifact links |
-| `NORA_RATE_LIMIT_ENABLED` | `false` | Enable rate limiting |
+| `NORA_RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
 
 ## Endpoints
 
@@ -286,7 +285,7 @@ Q: Can NORA run on Astra Linux or RED OS?
 A: Yes. Every release includes Docker images built on Astra Linux SE and RED OS base images, alongside the standard Alpine image.
 
 Q: How do I monitor NORA?
-A: Prometheus metrics at `/metrics`, health check at `/health`, readiness probe at `/ready`. Structured JSON logging available with `NORA_LOG_FORMAT=json`.
+A: Prometheus metrics at `/metrics`, health check at `/health`, readiness probe at `/ready`. Structured JSON logging available with `RUST_LOG=info (or debug, trace etc.)`.
 
 Q: How do I backup NORA?
 A: `nora backup -o backup.tar.gz` creates a full backup. `nora restore -i backup.tar.gz` restores it. For S3 backends, use your S3 backup tooling.

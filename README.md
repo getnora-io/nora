@@ -16,7 +16,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
 - **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 460+ tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 570+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![Image Size](https://img.shields.io/badge/image-32%20MB-blue)](https://github.com/getnora-io/nora/pkgs/container/nora)
@@ -143,10 +143,10 @@ See [Authentication guide](https://getnora.dev/configuration/authentication/) fo
 | `NORA_PORT` | 4000 | Port |
 | `NORA_STORAGE_MODE` | local | `local` or `s3` |
 | `NORA_AUTH_ENABLED` | false | Enable authentication |
-| `NORA_DOCKER_UPSTREAMS` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
-| `NORA_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
-| `NORA_LOG_FORMAT` | text | Log format: `text` (human) or `json` (structured) |
+| `NORA_AUTH_ANONYMOUS_READ` | false | Allow unauthenticated read access |
+| `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
 | `NORA_PUBLIC_URL` | — | Public URL for rewriting artifact links |
+| `NORA_RATE_LIMIT_ENABLED` | true | Enable rate limiting |
 See [full configuration reference](https://getnora.dev/configuration/settings/) for all options.
 
 ### config.toml
@@ -182,6 +182,7 @@ nora serve        # Start server (explicit)
 nora backup -o backup.tar.gz
 nora restore -i backup.tar.gz
 nora migrate --from local --to s3
+nora gc            # Garbage collect orphaned blobs
 nora mirror       # Sync packages for offline use
 ```
 
@@ -248,6 +249,14 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - **Security headers** — CSP, X-Frame-Options, nosniff
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+## Documentation
+
+Full documentation: **https://getnora.dev**
+
+> The `docs/` directory has been removed. All documentation lives on getnora.dev.
+> Configuration reference: [getnora.dev/configuration/settings](https://getnora.dev/configuration/settings/)
+> Source of truth for env vars: `nora-registry/src/config.rs` → `apply_env_overrides()`
 
 ## Author
 
