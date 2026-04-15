@@ -5,9 +5,9 @@
 //!
 //! Provides a trait-based architecture for secrets providers:
 //! - `env` - Environment variables (default, 12-Factor App)
-//! - `aws-secrets` - AWS Secrets Manager (v0.4.0+)
-//! - `vault` - HashiCorp Vault (v0.5.0+)
-//! - `k8s` - Kubernetes Secrets (v0.4.0+)
+//!
+//! Additional providers (AWS Secrets Manager, HashiCorp Vault, Kubernetes
+//! Secrets) may be added in future releases.
 //!
 //! # Example
 //!
@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[allow(dead_code)] // Variants used by provider impls; external error handling planned for v0.4
+#[allow(dead_code)] // Variants used by provider impls
 /// Secrets provider error
 #[derive(Debug, Error)]
 pub enum SecretsError {
@@ -105,11 +105,6 @@ impl Default for SecretsConfig {
 ///
 /// Currently supports:
 /// - `env` - Environment variables (default)
-///
-/// Future versions will add:
-/// - `aws-secrets` - AWS Secrets Manager
-/// - `vault` - HashiCorp Vault
-/// - `k8s` - Kubernetes Secrets
 pub fn create_secrets_provider(
     config: &SecretsConfig,
 ) -> Result<Box<dyn SecretsProvider>, SecretsError> {
@@ -121,10 +116,6 @@ pub fn create_secrets_provider(
             }
             Ok(Box::new(provider))
         }
-        // Future providers:
-        // "aws-secrets" => { ... }
-        // "vault" => { ... }
-        // "k8s" => { ... }
         other => Err(SecretsError::UnsupportedProvider(other.to_string())),
     }
 }

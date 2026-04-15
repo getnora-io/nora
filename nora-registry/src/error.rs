@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::storage::StorageError;
 use crate::validation::ValidationError;
 
-#[allow(dead_code)] // Wiring into handlers planned for v0.3
+#[allow(dead_code)] // Handler integration tracked in backlog
 /// Application-level errors with HTTP response conversion
 #[derive(Debug, Error)]
 pub enum AppError {
