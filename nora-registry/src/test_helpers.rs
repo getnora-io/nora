@@ -83,6 +83,8 @@ fn build_context(
         maven: MavenConfig {
             proxies: vec![],
             proxy_timeout: 5,
+            checksum_verify: true,
+            immutable_releases: true,
         },
         npm: NpmConfig {
             proxy: None,
@@ -126,6 +128,8 @@ fn build_context(
             ..RateLimitConfig::default()
         },
         secrets: SecretsConfig::default(),
+        gc: crate::config::GcConfig::default(),
+        retention: crate::config::RetentionConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -168,6 +172,7 @@ fn build_context(
         repo_index: RepoIndex::new(),
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
+        publish_locks: parking_lot::Mutex::new(HashMap::new()),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
