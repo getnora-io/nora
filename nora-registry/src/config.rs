@@ -386,8 +386,8 @@ impl Default for AuthConfig {
 /// [rate_limit]
 /// auth_rps = 1
 /// auth_burst = 5
-/// upload_rps = 500
-/// upload_burst = 1000
+/// upload_rps = 200
+/// upload_burst = 500
 /// general_rps = 100
 /// general_burst = 200
 /// ```
@@ -508,6 +508,11 @@ pub struct RetentionRule {
 }
 
 /// Retention policies configuration.
+///
+/// # Environment Variables
+/// - `NORA_RETENTION_ENABLED` — enable/disable background retention (default: false)
+/// - `NORA_RETENTION_INTERVAL` — interval in seconds between runs (default: 86400)
+/// - `NORA_RETENTION_DRY_RUN` — if true, only report what would be deleted (default: false)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionConfig {
     /// Enable background retention scheduler
@@ -516,6 +521,9 @@ pub struct RetentionConfig {
     /// Interval in seconds between retention runs (default: 86400 = 24h)
     #[serde(default = "default_retention_interval")]
     pub interval: u64,
+    /// If true, only log what would be deleted without actually deleting (default: false)
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default)]
     pub rules: Vec<RetentionRule>,
 }
@@ -529,6 +537,7 @@ impl Default for RetentionConfig {
         Self {
             enabled: false,
             interval: 86400,
+            dry_run: false,
             rules: Vec::new(),
         }
     }
@@ -636,17 +645,60 @@ impl Config {
                 .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
         }
 
+        // 6. "Enabled but empty" — subsystems that silently do nothing
+        if self.gc.enabled && self.gc.dry_run {
+            warnings.push(
+                "gc.enabled=true with gc.dry_run=true — GC will run but never delete anything. Set gc.dry_run=false to actually free space".to_string(),
+            );
+        }
+        if self.retention.enabled && self.retention.rules.is_empty() {
+            warnings.push(
+                "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
+            );
+        }
+
         (warnings, errors)
     }
 
-    /// Load configuration with priority: ENV > config.toml > defaults
+    /// Load configuration with priority: ENV > config file > defaults
+    ///
+    /// Config file resolution order:
+    /// 1. `NORA_CONFIG_PATH` env var (fatal if set but file not found)
+    /// 2. `config.toml` in current working directory (optional)
+    /// 3. Built-in defaults
     pub fn load() -> Self {
         // 1. Start with defaults
-        // 2. Override with config.toml if exists
-        let mut config: Config = fs::read_to_string("config.toml")
-            .ok()
-            .and_then(|content| toml::from_str(&content).ok())
-            .unwrap_or_default();
+        // 2. Override with config file if exists
+        let mut config: Config = if let Ok(config_path) = env::var("NORA_CONFIG_PATH") {
+            let content = fs::read_to_string(&config_path).unwrap_or_else(|e| {
+                panic!(
+                    "NORA_CONFIG_PATH={} but file cannot be read: {}",
+                    config_path, e
+                );
+            });
+            let cfg = toml::from_str(&content).unwrap_or_else(|e| {
+                panic!(
+                    "NORA_CONFIG_PATH={} contains invalid TOML: {}",
+                    config_path, e
+                );
+            });
+            tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
+            cfg
+        } else {
+            match fs::read_to_string("config.toml") {
+                Ok(content) => match toml::from_str(&content) {
+                    Ok(cfg) => {
+                        tracing::info!("Loaded config from config.toml");
+                        cfg
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "config.toml exists but contains invalid TOML, using defaults");
+                        Config::default()
+                    }
+                },
+                Err(_) => Config::default(),
+            }
+        };
 
         // 3. Override with ENV vars (highest priority)
         config.apply_env_overrides();
@@ -916,6 +968,9 @@ impl Config {
             if let Ok(v) = val.parse() {
                 self.retention.interval = v;
             }
+        }
+        if let Ok(val) = env::var("NORA_RETENTION_DRY_RUN") {
+            self.retention.dry_run = val.to_lowercase() == "true" || val == "1";
         }
 
         // Secrets config
@@ -1488,6 +1543,53 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(warnings.len(), 2); // body_limit + auth_rps
     }
+    #[test]
+    fn test_validate_gc_enabled_dry_run() {
+        let mut config = Config::default();
+        config.gc.enabled = true;
+        config.gc.dry_run = true;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("gc.dry_run"));
+    }
+
+    #[test]
+    fn test_validate_gc_enabled_no_dry_run_ok() {
+        let mut config = Config::default();
+        config.gc.enabled = true;
+        config.gc.dry_run = false;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_empty_rules() {
+        let mut config = Config::default();
+        config.retention.enabled = true;
+        config.retention.rules = Vec::new();
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("retention"));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_with_rules_ok() {
+        let mut config = Config::default();
+        config.retention.enabled = true;
+        config.retention.rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            keep_last: Some(5),
+            older_than_days: None,
+            exclude_tags: Vec::new(),
+        }];
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
     #[test]
     fn test_env_override_docker_proxies_and_backward_compat() {
         // Test new NORA_DOCKER_PROXIES name

@@ -34,7 +34,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✓ |
 | Maven | `/maven2/` | Maven Central, custom | proxy-only |
 | npm | `/npm/` | npmjs.org, custom | ✓ |
-| Cargo | `/cargo/` | — | ✓ |
+| Cargo | `/cargo/` | crates.io | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
 | Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
 | Raw files | `/raw/` | — | ✓ |
@@ -232,6 +232,7 @@ nora mirror                 # Sync packages for offline use
 | `/cargo/` | Cargo |
 | `/simple/` | PyPI |
 | `/go/` | Go Modules |
+| `/raw/` | Raw files |
 
 ## TLS / HTTPS
 
@@ -260,9 +261,9 @@ See [TLS / HTTPS guide](https://getnora.dev/configuration/tls/) for Nginx, Traef
 - ~~**Mirror CLI** — offline sync for air-gapped environments~~ ✅ v0.4.0
 - ~~**Online Garbage Collection** — non-blocking cleanup without registry downtime~~ ✅ v0.6.0
 - ~~**Retention Policies** — declarative rules: keep last N tags, delete older than X days~~ ✅ v0.6.0
+- ~~**Helm Chart** — official chart for Kubernetes deployment~~ ✅ v0.6.1
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
 - **Image Signing** — cosign verification and policy enforcement
-- **Helm Chart** — official chart for Kubernetes deployment
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

@@ -608,6 +608,7 @@ pub fn spawn_retention_scheduler(
     storage: Storage,
     rules: Vec<RetentionRule>,
     interval_secs: u64,
+    dry_run: bool,
     audit: Option<Arc<crate::audit::AuditLog>>,
 ) {
     let lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -627,8 +628,11 @@ pub fn spawn_retention_scheduler(
                 continue;
             }
 
-            info!("Retention scheduler: starting periodic run");
-            let result = run_retention(&storage, &rules, false).await;
+            info!(
+                dry_run = dry_run,
+                "Retention scheduler: starting periodic run"
+            );
+            let result = run_retention(&storage, &rules, dry_run).await;
             info!(
                 "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                 result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed

@@ -379,25 +379,6 @@ async fn run_server(config: Config, storage: Storage) {
         "Rate limiting configured"
     );
 
-    // Initialize secrets provider
-    let secrets_provider = match secrets::create_secrets_provider(&config.secrets) {
-        Ok(provider) => {
-            info!(
-                provider = provider.provider_name(),
-                clear_env = config.secrets.clear_env,
-                "Secrets provider initialized"
-            );
-            Some(provider)
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to initialize secrets provider, using defaults");
-            None
-        }
-    };
-
-    // Store secrets provider for future use (S3 credentials, etc.)
-    let _secrets = secrets_provider;
-
     // Load auth if enabled
     let auth = if config.auth.enabled {
         let path = Path::new(&config.auth.htpasswd_file);
@@ -508,11 +489,13 @@ async fn run_server(config: Config, storage: Storage) {
             state.storage.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
+            state.config.retention.dry_run,
             Some(std::sync::Arc::new(audit::AuditLog::new(&storage_path))),
         );
         info!(
             interval_secs = state.config.retention.interval,
             rules = state.config.retention.rules.len(),
+            dry_run = state.config.retention.dry_run,
             "Retention scheduler started"
         );
     }
