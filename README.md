@@ -21,6 +21,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![Image Size](https://img.shields.io/badge/image-32%20MB-blue)](https://github.com/getnora-io/nora/pkgs/container/nora)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 
 **32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
 
@@ -54,6 +55,15 @@ docker run -d -p 4000:4000 -v nora-data:/data ghcr.io/getnora-io/nora:latest
 curl -fsSL https://github.com/getnora-io/nora/releases/latest/download/nora-linux-amd64 -o nora
 chmod +x nora && ./nora
 ```
+
+### Kubernetes (Helm)
+
+```bash
+helm repo add nora https://getnora-io.github.io/helm-charts
+helm install nora nora/nora
+```
+
+See [chart documentation](https://github.com/getnora-io/helm-charts/tree/main/charts/nora) for configuration options.
 
 ### From Source
 
