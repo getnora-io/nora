@@ -37,6 +37,10 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub gc: GcConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +110,16 @@ pub struct MavenConfig {
     pub proxies: Vec<MavenProxyEntry>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+    /// Verify client-uploaded checksums against server-computed values
+    #[serde(default = "default_true")]
+    pub checksum_verify: bool,
+    /// Prevent overwriting released (non-SNAPSHOT) artifacts
+    #[serde(default = "default_true")]
+    pub immutable_releases: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +318,8 @@ impl Default for MavenConfig {
                 "https://repo1.maven.org/maven2".to_string(),
             )],
             proxy_timeout: 30,
+            checksum_verify: true,
+            immutable_releases: true,
         }
     }
 }
@@ -433,6 +449,87 @@ impl Default for RateLimitConfig {
             upload_burst: default_upload_burst(),
             general_rps: default_general_rps(),
             general_burst: default_general_burst(),
+        }
+    }
+}
+
+// ============================================================================
+// GC Configuration
+// ============================================================================
+
+/// Garbage collection configuration.
+///
+/// # Environment Variables
+/// - `NORA_GC_ENABLED` — enable/disable background GC (default: false)
+/// - `NORA_GC_INTERVAL` — interval in seconds between GC runs (default: 86400)
+/// - `NORA_GC_DRY_RUN` — if true, only report orphans without deleting (default: false)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_gc_interval")]
+    pub interval: u64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_gc_interval() -> u64 {
+    86400 // 24 hours
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: 86400,
+            dry_run: false,
+        }
+    }
+}
+
+// ============================================================================
+// Retention Configuration
+// ============================================================================
+
+/// A single retention rule applied to a registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionRule {
+    /// Registry name (e.g., "docker", "maven", "npm", "pypi", "cargo") or "*" for all
+    pub registry: String,
+    /// Keep the N most recent versions
+    #[serde(default)]
+    pub keep_last: Option<u32>,
+    /// Only delete versions older than N days
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    /// Glob patterns that protect versions from deletion
+    #[serde(default)]
+    pub exclude_tags: Vec<String>,
+}
+
+/// Retention policies configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Enable background retention scheduler
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interval in seconds between retention runs (default: 86400 = 24h)
+    #[serde(default = "default_retention_interval")]
+    pub interval: u64,
+    #[serde(default)]
+    pub rules: Vec<RetentionRule>,
+}
+
+fn default_retention_interval() -> u64 {
+    86400 // 24 hours
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: 86400,
+            rules: Vec::new(),
         }
     }
 }
@@ -798,6 +895,29 @@ impl Config {
             }
         }
 
+        // GC config
+        if let Ok(val) = env::var("NORA_GC_ENABLED") {
+            self.gc.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_GC_INTERVAL") {
+            if let Ok(v) = val.parse() {
+                self.gc.interval = v;
+            }
+        }
+        if let Ok(val) = env::var("NORA_GC_DRY_RUN") {
+            self.gc.dry_run = val.to_lowercase() == "true" || val == "1";
+        }
+
+        // Retention scheduler config
+        if let Ok(val) = env::var("NORA_RETENTION_ENABLED") {
+            self.retention.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_RETENTION_INTERVAL") {
+            if let Ok(v) = val.parse() {
+                self.retention.interval = v;
+            }
+        }
+
         // Secrets config
         if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
             self.secrets.provider = val;
@@ -836,6 +956,8 @@ impl Default for Config {
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             secrets: SecretsConfig::default(),
+            gc: GcConfig::default(),
+            retention: RetentionConfig::default(),
         }
     }
 }

@@ -1,6 +1,31 @@
 # Changelog
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-17
+
+### Added
+- **Maven registry** — immutable releases with publish mutex, checksum generation (MD5, SHA-1, SHA-256, SHA-512), `maven-metadata.xml` auto-generation
+- **Retention policies** — `keep_last`, `older_than_days`, `exclude` patterns per registry; `retention-plan` (dry-run) and `retention-apply --yes` (safe-by-default)
+- **Background retention scheduler** — `retention.enabled = true` with configurable interval, single-flight lock prevents overlapping runs
+- **Retention Prometheus metrics** — `nora_retention_versions_deleted_total`, `nora_retention_bytes_freed_total`, `nora_retention_duration_seconds`, `nora_retention_last_run_timestamp`
+- **GC expanded to all registries** — Go incomplete version detection (missing `.info` or `.zip`), Cargo index/crate cross-check, Maven/npm/PyPI checksum orphans, Docker blob orphans
+- **GC/Retention visibility** — reports uncovered registries with file counts after each run
+- **Go retention collector** — `keep_last` for Go modules, parsing `module/@v/version.{info,mod,zip}`
+- **Audit log** — one entry per retention run with keys/bytes/duration
+- 588 total tests (up from 577)
+
+### Changed
+- GC now requires `--apply` flag to delete (dry-run by default)
+- Retention requires `--yes` to apply (plan-only by default)
+- Binary size reduced from 60MB to 21MB (stripped debug symbols in release profile)
+- `RetentionConfig` expanded with `enabled`, `interval` fields and env var overrides (`NORA_RETENTION_ENABLED`, `NORA_RETENTION_INTERVAL`)
+
+### Fixed
+- `md-5` crate aligned to `0.11` (compatible with `digest 0.11`), replacing `md5 0.7` which lacked `Digest` trait
+- Clippy warnings cleaned up across all modules
+- `dead_code` warning on `ArtifactMeta` suppressed
+- Token sorting uses `sort_by_key` for stability
+
 ## [0.5.0] - 2026-04-07
 
 ### Added

@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -40,7 +40,8 @@ assigning_clones = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = [] }
 
 [profile.release]
-debug = "line-tables-only"
+debug = false
+strip = true
 codegen-units = 4
 panic = "abort"
 lto = "thin"
@@ -49,4 +50,4 @@ lto = "thin"
 [profile.release-official]
 inherits = "release"
 codegen-units = 1
-lto = true
+lto = "fat"

@@ -266,7 +266,7 @@ impl TokenStore {
             }
         }
 
-        tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        tokens.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         tokens
     }
 
