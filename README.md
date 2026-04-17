@@ -16,7 +16,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
 - **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 570+ tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 588 tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![Image Size](https://img.shields.io/badge/image-32%20MB-blue)](https://github.com/getnora-io/nora/pkgs/container/nora)
@@ -147,6 +147,8 @@ See [Authentication guide](https://getnora.dev/configuration/authentication/) fo
 | `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
 | `NORA_PUBLIC_URL` | — | Public URL for rewriting artifact links |
 | `NORA_RATE_LIMIT_ENABLED` | true | Enable rate limiting |
+| `NORA_RETENTION_ENABLED` | false | Enable background retention scheduler |
+| `NORA_RETENTION_INTERVAL` | 86400 | Retention run interval in seconds |
 See [full configuration reference](https://getnora.dev/configuration/settings/) for all options.
 
 ### config.toml
@@ -172,18 +174,37 @@ url = "https://registry-1.docker.io"
 
 [go]
 proxy = "https://proxy.golang.org"
+
+[gc]
+enabled = true        # background GC scheduler
+interval = 86400      # run every 24h
+
+[retention]
+enabled = true        # background retention scheduler
+interval = 86400      # run every 24h
+
+[[retention.rules]]
+registry = "docker"
+keep_last = 10
+
+[[retention.rules]]
+registry = "maven"
+keep_last = 5
+older_than_days = 90
 ```
 
 ## CLI Commands
 
 ```bash
-nora              # Start server
-nora serve        # Start server (explicit)
+nora serve                  # Start server
+nora gc                     # Show orphaned blobs (dry-run)
+nora gc --apply             # Delete orphaned blobs
+nora retention-plan         # Show what retention would delete (dry-run)
+nora retention-apply --yes  # Apply retention policies
 nora backup -o backup.tar.gz
 nora restore -i backup.tar.gz
 nora migrate --from local --to s3
-nora gc            # Garbage collect orphaned blobs
-nora mirror       # Sync packages for offline use
+nora mirror                 # Sync packages for offline use
 ```
 
 ## Endpoints
@@ -226,11 +247,12 @@ See [TLS / HTTPS guide](https://getnora.dev/configuration/tls/) for Nginx, Traef
 
 ## Roadmap
 
-- **Mirror CLI** — offline sync for air-gapped environments
+- ~~**Mirror CLI** — offline sync for air-gapped environments~~ ✅ v0.4.0
+- ~~**Online Garbage Collection** — non-blocking cleanup without registry downtime~~ ✅ v0.6.0
+- ~~**Retention Policies** — declarative rules: keep last N tags, delete older than X days~~ ✅ v0.6.0
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
-- **Online Garbage Collection** — non-blocking cleanup without registry downtime
-- **Retention Policies** — declarative rules: keep last N tags, delete older than X days
 - **Image Signing** — cosign verification and policy enforcement
+- **Helm Chart** — official chart for Kubernetes deployment
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
