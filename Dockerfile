@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.4
 # Binary is pre-built by CI (cargo build --release) and passed via context
-FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
 
-RUN apk add --no-cache ca-certificates \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
     && addgroup -S nora && adduser -S -G nora nora \
     && mkdir -p /data && chown nora:nora /data
 
