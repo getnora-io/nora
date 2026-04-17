@@ -97,7 +97,7 @@ fn default_storage_path() -> String {
 }
 
 fn default_s3_url() -> String {
-    "http://127.0.0.1:3000".to_string()
+    "http://127.0.0.1:9000".to_string()
 }
 
 fn default_bucket() -> String {
@@ -798,6 +798,12 @@ impl Config {
                 self.maven.proxy_timeout = timeout;
             }
         }
+        if let Ok(val) = env::var("NORA_MAVEN_CHECKSUM_VERIFY") {
+            self.maven.checksum_verify = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_MAVEN_IMMUTABLE_RELEASES") {
+            self.maven.immutable_releases = val.to_lowercase() == "true" || val == "1";
+        }
 
         // npm config
         if let Ok(val) = env::var("NORA_NPM_PROXY") {
@@ -995,7 +1001,7 @@ impl Default for Config {
             storage: StorageConfig {
                 mode: StorageMode::Local,
                 path: String::from("data/storage"),
-                s3_url: String::from("http://127.0.0.1:3000"),
+                s3_url: String::from("http://127.0.0.1:9000"),
                 bucket: String::from("registry"),
                 s3_access_key: None,
                 s3_secret_key: None,
@@ -1263,6 +1269,26 @@ mod tests {
         assert_eq!(config.maven.proxies[1].url(), "https://repo2.com");
         assert_eq!(config.maven.proxies[1].auth(), Some("user:pass"));
         std::env::remove_var("NORA_MAVEN_PROXIES");
+    }
+
+    #[test]
+    fn test_env_override_maven_checksum_and_immutable() {
+        let mut config = Config::default();
+        assert!(config.maven.checksum_verify); // default true
+        assert!(config.maven.immutable_releases); // default true
+        std::env::set_var("NORA_MAVEN_CHECKSUM_VERIFY", "false");
+        std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
+        config.apply_env_overrides();
+        assert!(!config.maven.checksum_verify);
+        assert!(!config.maven.immutable_releases);
+        std::env::remove_var("NORA_MAVEN_CHECKSUM_VERIFY");
+        std::env::remove_var("NORA_MAVEN_IMMUTABLE_RELEASES");
+    }
+
+    #[test]
+    fn test_s3_default_url() {
+        let config = Config::default();
+        assert_eq!(config.storage.s3_url, "http://127.0.0.1:9000");
     }
 
     #[test]
