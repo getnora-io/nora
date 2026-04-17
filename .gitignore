@@ -16,6 +16,9 @@ node_modules/
 package-lock.json
 /tmp/
 
+# Local build config (machine-specific)
+.cargo/
+
 # Working files (never commit)
 SESSION_*.md
 TODO.md

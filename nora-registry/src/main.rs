@@ -75,14 +75,18 @@ enum Commands {
     },
     /// Garbage collect orphaned blobs and checksum sidecars
     Gc {
-        /// Dry run - show what would be deleted without deleting
+        /// Actually delete orphans (default: dry-run only)
         #[arg(long, default_value = "false")]
-        dry_run: bool,
+        apply: bool,
     },
     /// Show retention plan (dry-run)
     RetentionPlan,
     /// Apply retention policies (delete old versions)
-    RetentionApply,
+    RetentionApply {
+        /// Confirm deletion (required to actually delete)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Migrate artifacts between storage backends
     Migrate {
         /// Source storage: local or s3
@@ -194,9 +198,10 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Gc { dry_run }) => {
+        Some(Commands::Gc { apply }) => {
+            let dry_run = !apply;
             let result = gc::run_gc(&storage, dry_run).await;
-            println!("GC Summary:");
+            println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
@@ -207,7 +212,7 @@ async fn main() {
                 for key in &result.orphan_keys {
                     println!("  {}", key);
                 }
-                println!("\nRun without --dry-run to delete orphans.");
+                println!("\nRun with --apply to delete orphans.");
             }
         }
         Some(Commands::RetentionPlan) => {
@@ -229,12 +234,38 @@ async fn main() {
                 println!("\nRun `nora retention-apply` to execute.");
             }
         }
-        Some(Commands::RetentionApply) => {
-            let result = retention::run_retention(&storage, &config.retention.rules, false).await;
-            println!("Retention Applied:");
-            println!("  Versions deleted:   {}", result.planned);
-            println!("  Keys deleted:       {}", result.deleted_keys);
-            println!("  Bytes freed:        {}", result.bytes_freed);
+        Some(Commands::RetentionApply { yes }) => {
+            if !yes {
+                // Show plan first, require --yes to execute
+                let result =
+                    retention::run_retention(&storage, &config.retention.rules, true).await;
+                println!("Retention Plan:");
+                println!("  Versions to delete: {}", result.planned);
+                println!("  Bytes to free:      {}", result.bytes_freed);
+                for (group, plans) in &result.plans {
+                    for plan in plans {
+                        println!(
+                            "  {} / {} — {} ({})",
+                            group, plan.version_name, plan.reason, plan.size
+                        );
+                    }
+                }
+                if result.planned > 0 {
+                    println!(
+                        "\nThis will delete {} versions. Run with --yes to confirm.",
+                        result.planned
+                    );
+                } else {
+                    println!("\nNothing to delete.");
+                }
+            } else {
+                let result =
+                    retention::run_retention(&storage, &config.retention.rules, false).await;
+                println!("Retention Applied:");
+                println!("  Versions deleted:   {}", result.planned);
+                println!("  Keys deleted:       {}", result.deleted_keys);
+                println!("  Bytes freed:        {}", result.bytes_freed);
+            }
         }
         Some(Commands::Mirror {
             format,

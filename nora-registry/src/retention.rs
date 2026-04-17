@@ -58,8 +58,12 @@ pub fn plan_deletions(
         return vec![];
     }
 
-    // Sort by modified descending (newest first)
-    versions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    // Sort by modified descending (newest first), then by name descending as tiebreaker
+    versions.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| b.name.cmp(&a.name))
+    });
 
     let mut deletions = Vec::new();
 
@@ -222,16 +226,9 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
     for (repo, tags) in &repos {
         let mut entries = Vec::new();
         for (tag, manifest_key) in tags {
-            let modified = storage
-                .stat(manifest_key)
-                .await
-                .map(|m| m.modified)
-                .unwrap_or(0);
-            let size = storage
-                .stat(manifest_key)
-                .await
-                .map(|m| m.size)
-                .unwrap_or(0);
+            let meta = storage.stat(manifest_key).await;
+            let modified = meta.as_ref().map(|m| m.modified).unwrap_or(0);
+            let size = meta.as_ref().map(|m| m.size).unwrap_or(0);
             // Note: we don't include blob keys here because blobs may be
             // shared across tags. GC handles orphan blobs separately.
             entries.push(VersionEntry {
@@ -272,7 +269,7 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         let mut entries = Vec::new();
         for key in tarball_keys {
             let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, &[key.clone()]).await;
+            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
             // Include associated .sha256
             let mut keys = vec![key.clone()];
             let hash_key = format!("{}.sha256", key);
@@ -316,7 +313,7 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
         let mut entries = Vec::new();
         for key in file_keys {
             let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, &[key.clone()]).await;
+            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
             let mut keys = vec![key.clone()];
             let hash_key = format!("{}.sha256", key);
             if storage.stat(&hash_key).await.is_some() {
@@ -475,6 +472,15 @@ pub async fn run_retention(
         }
 
         all_plans.push((group_name, plans));
+    }
+
+    if !dry_run && total_planned > 0 {
+        info!(
+            versions = total_planned,
+            keys = total_deleted_keys,
+            bytes_freed = total_bytes,
+            "Retention complete"
+        );
     }
 
     RetentionResult {
@@ -670,7 +676,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        // Create 3 Maven versions
+        // Create 3 Maven versions (same mtime is fine — tiebreaker is name desc)
         storage
             .put("maven/com/example/lib/1.0/lib-1.0.jar", b"v1")
             .await
@@ -679,8 +685,6 @@ mod tests {
             .put("maven/com/example/lib/2.0/lib-2.0.jar", b"v2")
             .await
             .unwrap();
-        // Sleep briefly so mtime differs
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         storage
             .put("maven/com/example/lib/3.0/lib-3.0.jar", b"v3")
             .await
@@ -710,7 +714,6 @@ mod tests {
             .put("maven/com/test/a/1.0/a.jar", b"data")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         storage
             .put("maven/com/test/a/2.0/a.jar", b"data")
             .await
@@ -762,7 +765,6 @@ mod tests {
             .put("maven/com/test/a/1.0/a.jar", b"data")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         storage
             .put("maven/com/test/a/2.0/a.jar", b"data")
             .await

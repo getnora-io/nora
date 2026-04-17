@@ -60,14 +60,14 @@ fn classify_path(path: &str) -> MavenPathKind {
 
     let last = segments[segments.len() - 1];
 
-    if last == "maven-metadata.xml" || last.starts_with("maven-metadata.xml.") {
-        if segments.len() >= 2 {
-            return MavenPathKind::ArtifactMeta {
-                group_path: segments[..segments.len() - 2].join("/"),
-                artifact_id: segments[segments.len() - 2].to_string(),
-                filename: last.to_string(),
-            };
-        }
+    if (last == "maven-metadata.xml" || last.starts_with("maven-metadata.xml."))
+        && segments.len() >= 2
+    {
+        return MavenPathKind::ArtifactMeta {
+            group_path: segments[..segments.len() - 2].join("/"),
+            artifact_id: segments[segments.len() - 2].to_string(),
+            filename: last.to_string(),
+        };
     }
 
     if segments.len() >= 4 {
@@ -217,8 +217,8 @@ async fn upload(
             let snap = is_snapshot(&coords.version);
 
             if !snap && state.config.maven.immutable_releases {
-                let _publish_lock = state.publish_lock(&key);
-                let _publish_guard = _publish_lock.lock().await;
+                let lock = state.publish_lock(&key);
+                let _guard = lock.lock().await;
                 if state.storage.stat(&key).await.is_some() {
                     return (
                         StatusCode::CONFLICT,
@@ -643,6 +643,7 @@ mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
+    use sha2::Digest;
 
     #[tokio::test]
     async fn test_maven_put_get_roundtrip() {
