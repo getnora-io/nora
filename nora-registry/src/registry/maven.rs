@@ -43,6 +43,8 @@ struct MavenCoordinates {
 
 enum MavenPathKind {
     VersionFile(MavenCoordinates),
+    #[allow(dead_code)]
+    // Fields used in classify_path, will be consumed by retention metadata cleanup
     ArtifactMeta {
         group_path: String,
         artifact_id: String,
