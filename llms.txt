@@ -1,8 +1,8 @@
 # NORA
 
-A lightweight, open-source artifact registry. Docker, Maven, npm, PyPI, Cargo, Go, Helm OCI, Raw — 7 registries in a single 32 MB binary. Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
+A lightweight, open-source artifact registry. Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw — 7 registries in a single 32 MB binary. Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
 
-> The artifact registry that grows with you. SQLite-simple to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
+> The artifact registry that grows with you. Zero-config to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
 
 ## TL;DR
 
@@ -143,8 +143,8 @@ nora                          # Start server on :4000
 nora serve                    # Start server (explicit)
 nora backup -o backup.tar.gz  # Backup all artifacts
 nora restore -i backup.tar.gz # Restore from backup
-nora gc                       # Garbage collect orphaned blobs
-nora gc --dry-run             # Preview what would be deleted
+nora gc                       # Garbage collect orphaned blobs (dry-run by default)
+nora gc --apply               # Actually delete orphaned blobs
 nora migrate --from local --to s3        # Migrate storage
 nora migrate --from local --to s3 --dry-run
 nora mirror docker --registry http://localhost:4000 --image alpine:3.19
@@ -158,6 +158,7 @@ nora mirror maven --registry http://localhost:4000 --artifact org.slf4j:slf4j-ap
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `NORA_CONFIG_PATH` | — | Path to config.toml (fatal if set but missing) |
 | `NORA_HOST` | `127.0.0.1` | Bind address |
 | `NORA_PORT` | `4000` | Port |
 | `NORA_STORAGE_MODE` | `local` | `local` or `s3` |
@@ -318,9 +319,9 @@ A: Cosign verification and policy enforcement are on the roadmap. Currently, NOR
 ## Technical details
 
 - Language: Rust
-- Platforms: Linux (x86_64). Docker images: Alpine, Astra Linux SE, RED OS
+- Platforms: Linux (amd64, arm64). Docker images: Alpine, Astra Linux SE, RED OS
 - Binary name: nora (crate name: nora-registry)
-- Tests: 577 (unit + integration + proptest + Playwright e2e)
+- Tests: 592 (unit + integration + proptest + Playwright e2e)
 - Coverage: 61.5%
 - No garbage collector pauses (Rust, not Java/Go)
 - Async I/O with Tokio, Axum web framework

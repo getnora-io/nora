@@ -282,8 +282,12 @@ async fn handle_publish(
         None => return (StatusCode::BAD_REQUEST, "Missing versions").into_response(),
     };
 
-    // Load or create metadata
+    // TOCTOU protection: lock per package to prevent concurrent version conflicts
     let metadata_key = format!("npm/{}/metadata.json", package_name);
+    let lock = state.publish_lock(&metadata_key);
+    let _guard = lock.lock().await;
+
+    // Load or create metadata
     let mut metadata = if let Ok(existing) = state.storage.get(&metadata_key).await {
         serde_json::from_slice::<serde_json::Value>(&existing)
             .unwrap_or_else(|_| serde_json::json!({}))

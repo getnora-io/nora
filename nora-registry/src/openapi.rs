@@ -18,7 +18,7 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.5.0",
+        version = "0.6.2",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, and Raw",
         license(name = "MIT"),
         contact(name = "DevITWay", url = "https://github.com/getnora-io/nora")
@@ -70,6 +70,14 @@ use crate::AppState;
         // PyPI
         crate::openapi::pypi_simple,
         crate::openapi::pypi_package,
+        // Go
+        crate::openapi::go_module_latest,
+        crate::openapi::go_module_info,
+        crate::openapi::go_module_mod,
+        crate::openapi::go_module_zip,
+        // Raw
+        crate::openapi::raw_file_get,
+        crate::openapi::raw_file_put,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -600,6 +608,103 @@ pub async fn pypi_simple() {}
     )
 )]
 pub async fn pypi_package() {}
+
+// -------------------- Go Modules --------------------
+
+/// Get latest version of a Go module
+#[utoipa::path(
+    get,
+    path = "/go/{module}/@latest",
+    tag = "go",
+    params(
+        ("module" = String, Path, description = "Module path (e.g., 'golang.org/x/text')")
+    ),
+    responses(
+        (status = 200, description = "Latest version info (JSON)"),
+        (status = 404, description = "Module not found")
+    )
+)]
+pub async fn go_module_latest() {}
+
+/// Get Go module version info
+#[utoipa::path(
+    get,
+    path = "/go/{module}/@v/{version}.info",
+    tag = "go",
+    params(
+        ("module" = String, Path, description = "Module path"),
+        ("version" = String, Path, description = "Module version (e.g., 'v1.14.0')")
+    ),
+    responses(
+        (status = 200, description = "Version info (JSON)"),
+        (status = 404, description = "Version not found")
+    )
+)]
+pub async fn go_module_info() {}
+
+/// Get Go module go.mod file
+#[utoipa::path(
+    get,
+    path = "/go/{module}/@v/{version}.mod",
+    tag = "go",
+    params(
+        ("module" = String, Path, description = "Module path"),
+        ("version" = String, Path, description = "Module version")
+    ),
+    responses(
+        (status = 200, description = "go.mod file content"),
+        (status = 404, description = "Version not found")
+    )
+)]
+pub async fn go_module_mod() {}
+
+/// Download Go module zip
+#[utoipa::path(
+    get,
+    path = "/go/{module}/@v/{version}.zip",
+    tag = "go",
+    params(
+        ("module" = String, Path, description = "Module path"),
+        ("version" = String, Path, description = "Module version")
+    ),
+    responses(
+        (status = 200, description = "Module zip archive"),
+        (status = 404, description = "Version not found")
+    )
+)]
+pub async fn go_module_zip() {}
+
+// -------------------- Raw Files --------------------
+
+/// Get raw file
+#[utoipa::path(
+    get,
+    path = "/raw/{path}",
+    tag = "raw",
+    params(
+        ("path" = String, Path, description = "File path (e.g., 'myproject/config.yaml')")
+    ),
+    responses(
+        (status = 200, description = "File content"),
+        (status = 404, description = "File not found")
+    )
+)]
+pub async fn raw_file_get() {}
+
+/// Upload raw file
+#[utoipa::path(
+    put,
+    path = "/raw/{path}",
+    tag = "raw",
+    params(
+        ("path" = String, Path, description = "File path")
+    ),
+    responses(
+        (status = 201, description = "File uploaded"),
+        (status = 409, description = "File already exists (immutable)")
+    )
+)]
+pub async fn raw_file_put() {}
 
 // -------------------- Auth / Tokens --------------------
 

@@ -397,8 +397,12 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let name = name.to_lowercase();
     let vers = vers.to_string();
 
-    // Check version immutability
+    // TOCTOU protection: lock per crate version to prevent concurrent publishes
     let crate_key = format!("cargo/{}/{}/{}-{}.crate", name, vers, name, vers);
+    let lock = state.publish_lock(&crate_key);
+    let _guard = lock.lock().await;
+
+    // Check version immutability
     if state.storage.stat(&crate_key).await.is_some() {
         let err = serde_json::json!({
             "errors": [{"detail": format!("crate version `{}@{}` already exists", name, vers)}]

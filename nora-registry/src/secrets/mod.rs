@@ -65,6 +65,7 @@ pub trait SecretsProvider: Send + Sync {
     }
 
     /// Get provider name for logging
+    #[allow(dead_code)]
     fn provider_name(&self) -> &'static str;
 }
 
@@ -101,6 +102,7 @@ impl Default for SecretsConfig {
     }
 }
 
+#[allow(dead_code)] // Scaffolding for future secrets integration (Vault, AWS SM, K8s)
 /// Create a secrets provider based on configuration
 ///
 /// Currently supports:

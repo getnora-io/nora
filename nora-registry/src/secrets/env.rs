@@ -12,6 +12,7 @@ use super::{SecretsError, SecretsProvider};
 use crate::secrets::protected::ProtectedString;
 use async_trait::async_trait;
 
+#[allow(dead_code)] // Scaffolding for future secrets integration
 /// Environment variables secrets provider
 ///
 /// Reads secrets from environment variables.

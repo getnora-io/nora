@@ -329,8 +329,12 @@ async fn upload(State(state): State<Arc<AppState>>, mut multipart: Multipart) ->
     // Normalize name and store
     let normalized = normalize_name(&name);
 
-    // Check immutability (same filename = already exists)
+    // TOCTOU protection: lock per file to prevent concurrent uploads
     let file_key = format!("pypi/{}/{}", normalized, filename);
+    let lock = state.publish_lock(&file_key);
+    let _guard = lock.lock().await;
+
+    // Check immutability (same filename = already exists)
     if state.storage.stat(&file_key).await.is_some() {
         return (
             StatusCode::CONFLICT,
