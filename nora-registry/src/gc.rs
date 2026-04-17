@@ -308,7 +308,11 @@ async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
         let has_info = files.iter().any(|f| f.ends_with(".info"));
         let has_zip = files.iter().any(|f| f.ends_with(".zip"));
         if !has_info || !has_zip {
-            info!("Go incomplete version: {} (has {} of 3 expected files)", version_key, files.len());
+            info!(
+                "Go incomplete version: {} (has {} of 3 expected files)",
+                version_key,
+                files.len()
+            );
             orphans.extend(files.clone());
         }
     }
@@ -332,13 +336,20 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
     for key in &keys {
         if key.starts_with("cargo/index/") {
             // cargo/index/XX/XX/name
-            if let Some(name) = key.strip_prefix("cargo/index/").and_then(|s| s.split('/').nth(2)) {
+            if let Some(name) = key
+                .strip_prefix("cargo/index/")
+                .and_then(|s| s.split('/').nth(2))
+            {
                 index_entries.insert(name.to_string());
                 index_keys.push(key.clone());
             }
         } else if key.ends_with(".crate") {
             // cargo/name/version/name-version.crate
-            let parts: Vec<&str> = key.strip_prefix("cargo/").unwrap_or(key).split('/').collect();
+            let parts: Vec<&str> = key
+                .strip_prefix("cargo/")
+                .unwrap_or(key)
+                .split('/')
+                .collect();
             if parts.len() >= 2 {
                 crate_files.insert(parts[0].to_string());
                 crate_keys.push(key.clone());
@@ -351,7 +362,10 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
 
     // Index entries without any .crate files
     for key in &index_keys {
-        if let Some(name) = key.strip_prefix("cargo/index/").and_then(|s| s.split('/').nth(2)) {
+        if let Some(name) = key
+            .strip_prefix("cargo/index/")
+            .and_then(|s| s.split('/').nth(2))
+        {
             if !crate_files.contains(name) {
                 info!("Cargo orphan index: {} (no .crate files)", key);
                 orphans.push(key.clone());
@@ -361,7 +375,11 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
 
     // .crate files without index entry
     for key in &crate_keys {
-        let parts: Vec<&str> = key.strip_prefix("cargo/").unwrap_or(key).split('/').collect();
+        let parts: Vec<&str> = key
+            .strip_prefix("cargo/")
+            .unwrap_or(key)
+            .split('/')
+            .collect();
         if parts.len() >= 2 && !index_entries.contains(parts[0]) {
             info!("Cargo orphan crate: {} (no index entry)", key);
             orphans.push(key.clone());
@@ -636,12 +654,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        storage.put("go/example.com/mod/@v/v1.0.0.info", b"{}").await.unwrap();
-        storage.put("go/example.com/mod/@v/v1.0.0.mod", b"module").await.unwrap();
-        storage.put("go/example.com/mod/@v/v1.0.0.zip", b"zip").await.unwrap();
+        storage
+            .put("go/example.com/mod/@v/v1.0.0.info", b"{}")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/mod/@v/v1.0.0.mod", b"module")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/mod/@v/v1.0.0.zip", b"zip")
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, true).await;
-        assert_eq!(result.orphaned, 0, "complete Go version should have no orphans");
+        assert_eq!(
+            result.orphaned, 0,
+            "complete Go version should have no orphans"
+        );
     }
 
     #[tokio::test]
@@ -650,7 +680,10 @@ mod tests {
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
         // Only .mod — missing .info and .zip
-        storage.put("go/example.com/mod/@v/v1.0.0.mod", b"module").await.unwrap();
+        storage
+            .put("go/example.com/mod/@v/v1.0.0.mod", b"module")
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, true).await;
         assert_eq!(result.orphaned, 1);
@@ -662,11 +695,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        storage.put("cargo/serde/1.0.0/serde-1.0.0.crate", b"crate").await.unwrap();
-        storage.put("cargo/index/se/rd/serde", b"index-data").await.unwrap();
+        storage
+            .put("cargo/serde/1.0.0/serde-1.0.0.crate", b"crate")
+            .await
+            .unwrap();
+        storage
+            .put("cargo/index/se/rd/serde", b"index-data")
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, true).await;
-        assert_eq!(result.orphaned, 0, "cargo with matching index should have no orphans");
+        assert_eq!(
+            result.orphaned, 0,
+            "cargo with matching index should have no orphans"
+        );
     }
 
     #[tokio::test]
@@ -675,7 +717,10 @@ mod tests {
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
         // Index entry but no .crate file
-        storage.put("cargo/index/se/rd/serde", b"index-data").await.unwrap();
+        storage
+            .put("cargo/index/se/rd/serde", b"index-data")
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, true).await;
         assert_eq!(result.orphaned, 1);

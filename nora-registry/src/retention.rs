@@ -424,7 +424,7 @@ async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry
         if let Some(at_v_pos) = key.find("/@v/") {
             let module = &key["go/".len()..at_v_pos];
             let file = &key[at_v_pos + 4..]; // after "/@v/"
-            // Extract version: "v1.0.0.info" → "v1.0.0"
+                                             // Extract version: "v1.0.0.info" → "v1.0.0"
             let version = file
                 .strip_suffix(".info")
                 .or_else(|| file.strip_suffix(".mod"))
@@ -940,10 +940,7 @@ mod tests {
         // 3 Go module versions with .info, .mod, .zip each
         for ver in &["v1.0.0", "v2.0.0", "v3.0.0"] {
             storage
-                .put(
-                    &format!("go/github.com/user/repo/@v/{}.info", ver),
-                    b"{}",
-                )
+                .put(&format!("go/github.com/user/repo/@v/{}.info", ver), b"{}")
                 .await
                 .unwrap();
             storage
@@ -972,7 +969,7 @@ mod tests {
         let result = run_retention(&storage, &rules, false).await;
         assert_eq!(result.planned, 2); // v1.0.0 and v2.0.0 deleted
         assert_eq!(result.deleted_keys, 6); // 3 files per version * 2
-        // v3.0.0 kept (newest by name tiebreaker)
+                                            // v3.0.0 kept (newest by name tiebreaker)
         assert!(storage
             .get("go/github.com/user/repo/@v/v3.0.0.zip")
             .await
