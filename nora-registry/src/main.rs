@@ -19,6 +19,7 @@ mod rate_limit;
 mod registry;
 mod repo_index;
 mod request_id;
+mod retention;
 mod secrets;
 mod storage;
 mod tokens;
@@ -47,7 +48,7 @@ pub use storage::Storage;
 use tokens::TokenStore;
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Parser)]
 #[command(name = "nora", version, about = "Multi-protocol artifact registry")]
@@ -72,11 +73,19 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
     },
-    /// Garbage collect orphaned blobs
+    /// Garbage collect orphaned blobs and checksum sidecars
     Gc {
-        /// Dry run - show what would be deleted without deleting
+        /// Actually delete orphans (default: dry-run only)
         #[arg(long, default_value = "false")]
-        dry_run: bool,
+        apply: bool,
+    },
+    /// Show retention plan (dry-run)
+    RetentionPlan,
+    /// Apply retention policies (delete old versions)
+    RetentionApply {
+        /// Confirm deletion (required to actually delete)
+        #[arg(long)]
+        yes: bool,
     },
     /// Migrate artifacts between storage backends
     Migrate {
@@ -119,6 +128,19 @@ pub struct AppState {
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
+    /// Per-key publish locks for TOCTOU protection (immutable releases)
+    publish_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AppState {
+    /// Get or create a per-key publish lock for TOCTOU protection.
+    pub fn publish_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.publish_locks.lock();
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 #[tokio::main]
@@ -176,15 +198,97 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Gc { dry_run }) => {
+        Some(Commands::Gc { apply }) => {
+            let dry_run = !apply;
             let result = gc::run_gc(&storage, dry_run).await;
-            println!("GC Summary:");
-            println!("  Total blobs:      {}", result.total_blobs);
-            println!("  Referenced:        {}", result.referenced_blobs);
-            println!("  Orphaned:          {}", result.orphaned_blobs);
-            println!("  Deleted:           {}", result.deleted_blobs);
+            println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
+            println!("  Candidates:       {}", result.total_candidates);
+            println!("  Orphaned:          {}", result.orphaned);
+            println!("  Deleted:           {}", result.deleted);
+            println!("  Bytes freed:       {}", result.bytes_freed);
+            println!("  Duration:          {:.1}s", result.duration_secs);
             if dry_run && !result.orphan_keys.is_empty() {
-                println!("\nRun without --dry-run to delete orphaned blobs.");
+                println!("\nOrphan keys:");
+                for key in &result.orphan_keys {
+                    println!("  {}", key);
+                }
+                println!("\nRun with --apply to delete orphans.");
+            }
+            if !result.uncovered.is_empty() {
+                let parts: Vec<String> = result
+                    .uncovered
+                    .iter()
+                    .map(|(name, count)| format!("{} ({} files)", name, count))
+                    .collect();
+                println!("\nNote: GC does not scan: {}", parts.join(", "));
+            }
+        }
+        Some(Commands::RetentionPlan) => {
+            let result = retention::run_retention(&storage, &config.retention.rules, true).await;
+            println!("Retention Plan (dry-run):");
+            println!("  Versions to delete: {}", result.planned);
+            println!("  Bytes to free:      {}", result.bytes_freed);
+            for (group, plans) in &result.plans {
+                for plan in plans {
+                    println!(
+                        "  {} / {} — {} ({})",
+                        group, plan.version_name, plan.reason, plan.size
+                    );
+                }
+            }
+            if result.planned == 0 {
+                println!("\nNothing to delete.");
+            } else {
+                println!("\nRun `nora retention-apply` to execute.");
+            }
+            print_retention_coverage(&storage, &config.retention.rules).await;
+        }
+        Some(Commands::RetentionApply { yes }) => {
+            if !yes {
+                // Show plan first, require --yes to execute
+                let result =
+                    retention::run_retention(&storage, &config.retention.rules, true).await;
+                println!("Retention Plan:");
+                println!("  Versions to delete: {}", result.planned);
+                println!("  Bytes to free:      {}", result.bytes_freed);
+                for (group, plans) in &result.plans {
+                    for plan in plans {
+                        println!(
+                            "  {} / {} — {} ({})",
+                            group, plan.version_name, plan.reason, plan.size
+                        );
+                    }
+                }
+                if result.planned > 0 {
+                    println!(
+                        "\nThis will delete {} versions. Run with --yes to confirm.",
+                        result.planned
+                    );
+                } else {
+                    println!("\nNothing to delete.");
+                }
+                print_retention_coverage(&storage, &config.retention.rules).await;
+            } else {
+                let result =
+                    retention::run_retention(&storage, &config.retention.rules, false).await;
+                println!("Retention Applied:");
+                println!("  Versions deleted:   {}", result.planned);
+                println!("  Keys deleted:       {}", result.deleted_keys);
+                println!("  Bytes freed:        {}", result.bytes_freed);
+                if result.planned > 0 {
+                    let audit = AuditLog::new(&config.storage.path);
+                    audit.log(audit::AuditEntry::new(
+                        "retention-apply",
+                        "cli",
+                        &format!("{} versions", result.planned),
+                        "*",
+                        &format!(
+                            "keys={} bytes_freed={} duration={:.1}s",
+                            result.deleted_keys, result.bytes_freed, result.duration_secs
+                        ),
+                    ));
+                }
+                print_retention_coverage(&storage, &config.retention.rules).await;
             }
         }
         Some(Commands::Mirror {
@@ -381,7 +485,37 @@ async fn run_server(config: Config, storage: Storage) {
         repo_index: RepoIndex::new(),
         http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
+        publish_locks: parking_lot::Mutex::new(HashMap::new()),
     });
+
+    // Spawn background GC scheduler if enabled
+    if state.config.gc.enabled {
+        gc::spawn_gc_scheduler(
+            state.storage.clone(),
+            state.config.gc.interval,
+            state.config.gc.dry_run,
+        );
+        info!(
+            interval_secs = state.config.gc.interval,
+            dry_run = state.config.gc.dry_run,
+            "GC scheduler started"
+        );
+    }
+
+    // Spawn background retention scheduler if enabled
+    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+        retention::spawn_retention_scheduler(
+            state.storage.clone(),
+            state.config.retention.rules.clone(),
+            state.config.retention.interval,
+            Some(std::sync::Arc::new(audit::AuditLog::new(&storage_path))),
+        );
+        info!(
+            interval_secs = state.config.retention.interval,
+            rules = state.config.retention.rules.len(),
+            "Retention scheduler started"
+        );
+    }
 
     let app = Router::new()
         .merge(public_routes)
@@ -501,5 +635,26 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received SIGTERM, starting graceful shutdown...");
         }
+    }
+}
+
+/// Print note about registries that have data but no retention rules configured.
+async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionRule]) {
+    let covered: HashSet<&str> = rules.iter().map(|r| r.registry.as_str()).collect();
+    if covered.contains("*") {
+        return;
+    }
+    let all_registries = ["docker", "maven", "npm", "pypi", "cargo", "go", "raw"];
+    let mut uncovered = Vec::new();
+    for name in &all_registries {
+        if !covered.contains(name) {
+            let count = storage.list(&format!("{}/", name)).await.len();
+            if count > 0 {
+                uncovered.push(format!("{} ({} files)", name, count));
+            }
+        }
+    }
+    if !uncovered.is_empty() {
+        println!("\nNote: No retention rules for: {}", uncovered.join(", "));
     }
 }
