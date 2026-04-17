@@ -48,7 +48,7 @@ pub use storage::Storage;
 use tokens::TokenStore;
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Parser)]
 #[command(name = "nora", version, about = "Multi-protocol artifact registry")]
@@ -214,6 +214,14 @@ async fn main() {
                 }
                 println!("\nRun with --apply to delete orphans.");
             }
+            if !result.uncovered.is_empty() {
+                let parts: Vec<String> = result
+                    .uncovered
+                    .iter()
+                    .map(|(name, count)| format!("{} ({} files)", name, count))
+                    .collect();
+                println!("\nNote: GC does not scan: {}", parts.join(", "));
+            }
         }
         Some(Commands::RetentionPlan) => {
             let result = retention::run_retention(&storage, &config.retention.rules, true).await;
@@ -233,6 +241,7 @@ async fn main() {
             } else {
                 println!("\nRun `nora retention-apply` to execute.");
             }
+            print_retention_coverage(&storage, &config.retention.rules).await;
         }
         Some(Commands::RetentionApply { yes }) => {
             if !yes {
@@ -258,6 +267,7 @@ async fn main() {
                 } else {
                     println!("\nNothing to delete.");
                 }
+                print_retention_coverage(&storage, &config.retention.rules).await;
             } else {
                 let result =
                     retention::run_retention(&storage, &config.retention.rules, false).await;
@@ -265,6 +275,20 @@ async fn main() {
                 println!("  Versions deleted:   {}", result.planned);
                 println!("  Keys deleted:       {}", result.deleted_keys);
                 println!("  Bytes freed:        {}", result.bytes_freed);
+                if result.planned > 0 {
+                    let audit = AuditLog::new(&config.storage.path);
+                    audit.log(audit::AuditEntry::new(
+                        "retention-apply",
+                        "cli",
+                        &format!("{} versions", result.planned),
+                        "*",
+                        &format!(
+                            "keys={} bytes_freed={} duration={:.1}s",
+                            result.deleted_keys, result.bytes_freed, result.duration_secs
+                        ),
+                    ));
+                }
+                print_retention_coverage(&storage, &config.retention.rules).await;
             }
         }
         Some(Commands::Mirror {
@@ -478,6 +502,21 @@ async fn run_server(config: Config, storage: Storage) {
         );
     }
 
+    // Spawn background retention scheduler if enabled
+    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+        retention::spawn_retention_scheduler(
+            state.storage.clone(),
+            state.config.retention.rules.clone(),
+            state.config.retention.interval,
+            Some(std::sync::Arc::new(audit::AuditLog::new(&storage_path))),
+        );
+        info!(
+            interval_secs = state.config.retention.interval,
+            rules = state.config.retention.rules.len(),
+            "Retention scheduler started"
+        );
+    }
+
     let app = Router::new()
         .merge(public_routes)
         .merge(app_routes)
@@ -596,5 +635,26 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received SIGTERM, starting graceful shutdown...");
         }
+    }
+}
+
+/// Print note about registries that have data but no retention rules configured.
+async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionRule]) {
+    let covered: HashSet<&str> = rules.iter().map(|r| r.registry.as_str()).collect();
+    if covered.contains("*") {
+        return;
+    }
+    let all_registries = ["docker", "maven", "npm", "pypi", "cargo", "go", "raw"];
+    let mut uncovered = Vec::new();
+    for name in &all_registries {
+        if !covered.contains(name) {
+            let count = storage.list(&format!("{}/", name)).await.len();
+            if count > 0 {
+                uncovered.push(format!("{} ({} files)", name, count));
+            }
+        }
+    }
+    if !uncovered.is_empty() {
+        println!("\nNote: No retention rules for: {}", uncovered.join(", "));
     }
 }

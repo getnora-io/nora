@@ -4,14 +4,47 @@
 //! CLI commands: `nora retention plan` (dry-run) and `nora retention apply`.
 //!
 //! Retention is per-registry and operates on "versions" (Maven versions,
-//! Docker tags, npm tarballs, PyPI files, Cargo versions).
+//! Docker tags, npm tarballs, PyPI files, Cargo versions, Go modules).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use lazy_static::lazy_static;
+use prometheus::{
+    register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
+};
 use tracing::info;
 
 use crate::config::RetentionRule;
 use crate::storage::Storage;
+
+// ============================================================================
+// Prometheus metrics
+// ============================================================================
+
+lazy_static! {
+    pub static ref RETENTION_VERSIONS_DELETED: IntCounter = register_int_counter!(
+        "nora_retention_versions_deleted_total",
+        "Total versions removed by retention policies"
+    )
+    .expect("retention_versions_deleted metric");
+    pub static ref RETENTION_BYTES_FREED: IntCounter = register_int_counter!(
+        "nora_retention_bytes_freed_total",
+        "Total bytes freed by retention policies"
+    )
+    .expect("retention_bytes_freed metric");
+    pub static ref RETENTION_DURATION: Histogram = register_histogram!(
+        "nora_retention_duration_seconds",
+        "Duration of retention runs in seconds",
+        vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
+    )
+    .expect("retention_duration metric");
+    pub static ref RETENTION_LAST_RUN: IntGauge = register_int_gauge!(
+        "nora_retention_last_run_timestamp",
+        "Unix timestamp of last retention run"
+    )
+    .expect("retention_last_run metric");
+}
 
 // ============================================================================
 // Retention planner (pure function)
@@ -379,6 +412,51 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     result
 }
 
+async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    let all_keys = storage.list("go/").await;
+    let mut modules: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<String>>,
+    > = std::collections::HashMap::new();
+
+    for key in &all_keys {
+        // go/{module}/@v/{version}.{info|mod|zip}
+        if let Some(at_v_pos) = key.find("/@v/") {
+            let module = &key["go/".len()..at_v_pos];
+            let file = &key[at_v_pos + 4..]; // after "/@v/"
+            // Extract version: "v1.0.0.info" → "v1.0.0"
+            let version = file
+                .strip_suffix(".info")
+                .or_else(|| file.strip_suffix(".mod"))
+                .or_else(|| file.strip_suffix(".zip"));
+            if let Some(ver) = version {
+                modules
+                    .entry(module.to_string())
+                    .or_default()
+                    .entry(ver.to_string())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for (module, versions) in &modules {
+        let mut entries = Vec::new();
+        for (version, keys) in versions {
+            let (modified, size) = aggregate_meta(storage, keys).await;
+            entries.push(VersionEntry {
+                name: version.clone(),
+                keys: keys.clone(),
+                modified,
+                size,
+            });
+        }
+        result.push((format!("go:{}", module), entries));
+    }
+    result
+}
+
 /// Get max modified time and total size across keys.
 async fn aggregate_meta(storage: &Storage, keys: &[String]) -> (u64, u64) {
     let mut max_modified = 0u64;
@@ -401,6 +479,7 @@ pub struct RetentionResult {
     pub planned: usize,
     pub deleted_keys: usize,
     pub bytes_freed: u64,
+    pub duration_secs: f64,
     pub plans: Vec<(String, Vec<DeletionPlan>)>,
 }
 
@@ -410,6 +489,7 @@ pub async fn run_retention(
     rules: &[RetentionRule],
     dry_run: bool,
 ) -> RetentionResult {
+    let start = Instant::now();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -422,6 +502,7 @@ pub async fn run_retention(
     all_groups.extend(collect_npm_versions(storage).await);
     all_groups.extend(collect_pypi_versions(storage).await);
     all_groups.extend(collect_cargo_versions(storage).await);
+    all_groups.extend(collect_go_versions(storage).await);
 
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
@@ -474,19 +555,33 @@ pub async fn run_retention(
         all_plans.push((group_name, plans));
     }
 
-    if !dry_run && total_planned > 0 {
-        info!(
-            versions = total_planned,
-            keys = total_deleted_keys,
-            bytes_freed = total_bytes,
-            "Retention complete"
-        );
+    let duration = start.elapsed().as_secs_f64();
+    RETENTION_DURATION.observe(duration);
+    RETENTION_LAST_RUN.set(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
+
+    if !dry_run {
+        RETENTION_VERSIONS_DELETED.inc_by(total_planned as u64);
+        RETENTION_BYTES_FREED.inc_by(total_bytes);
+        if total_planned > 0 {
+            info!(
+                versions = total_planned,
+                keys = total_deleted_keys,
+                bytes_freed = total_bytes,
+                "Retention complete"
+            );
+        }
     }
 
     RetentionResult {
         planned: total_planned,
         deleted_keys: total_deleted_keys,
         bytes_freed: total_bytes,
+        duration_secs: duration,
         plans: all_plans,
     }
 }
@@ -501,6 +596,62 @@ fn find_matching_rule<'a>(
     rules
         .iter()
         .find(|r| r.registry == registry || r.registry == "*")
+}
+
+// ============================================================================
+// Background scheduler
+// ============================================================================
+
+/// Spawn a background retention task that runs periodically.
+/// Uses a tokio::sync::Mutex as single-flight lock to prevent overlapping runs.
+pub fn spawn_retention_scheduler(
+    storage: Storage,
+    rules: Vec<RetentionRule>,
+    interval_secs: u64,
+    audit: Option<Arc<crate::audit::AuditLog>>,
+) {
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        // First tick fires immediately — skip it so retention doesn't run on startup
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            // Single-flight: skip if previous run is still going
+            let guard = lock.try_lock();
+            if guard.is_err() {
+                info!("Retention: previous run still active, skipping");
+                continue;
+            }
+
+            info!("Retention scheduler: starting periodic run");
+            let result = run_retention(&storage, &rules, false).await;
+            info!(
+                "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
+                result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
+            );
+
+            if let Some(ref audit_log) = audit {
+                if result.planned > 0 {
+                    audit_log.log(crate::audit::AuditEntry::new(
+                        "retention-apply",
+                        "scheduler",
+                        &format!("{} versions", result.planned),
+                        "*",
+                        &format!(
+                            "keys={} bytes_freed={} duration={:.1}s",
+                            result.deleted_keys, result.bytes_freed, result.duration_secs
+                        ),
+                    ));
+                }
+            }
+
+            drop(guard);
+        }
+    });
 }
 
 // ============================================================================
@@ -779,5 +930,57 @@ mod tests {
 
         let result = run_retention(&storage, &rules, false).await;
         assert!(result.planned >= 1); // at least 1.0 deleted
+    }
+
+    #[tokio::test]
+    async fn test_retention_go_keep_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // 3 Go module versions with .info, .mod, .zip each
+        for ver in &["v1.0.0", "v2.0.0", "v3.0.0"] {
+            storage
+                .put(
+                    &format!("go/github.com/user/repo/@v/{}.info", ver),
+                    b"{}",
+                )
+                .await
+                .unwrap();
+            storage
+                .put(
+                    &format!("go/github.com/user/repo/@v/{}.mod", ver),
+                    b"module",
+                )
+                .await
+                .unwrap();
+            storage
+                .put(
+                    &format!("go/github.com/user/repo/@v/{}.zip", ver),
+                    b"zipdata",
+                )
+                .await
+                .unwrap();
+        }
+
+        let rules = vec![RetentionRule {
+            registry: "go".to_string(),
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &rules, false).await;
+        assert_eq!(result.planned, 2); // v1.0.0 and v2.0.0 deleted
+        assert_eq!(result.deleted_keys, 6); // 3 files per version * 2
+        // v3.0.0 kept (newest by name tiebreaker)
+        assert!(storage
+            .get("go/github.com/user/repo/@v/v3.0.0.zip")
+            .await
+            .is_ok());
+        // v1.0.0 deleted
+        assert!(storage
+            .get("go/github.com/user/repo/@v/v1.0.0.zip")
+            .await
+            .is_err());
     }
 }

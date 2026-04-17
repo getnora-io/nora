@@ -508,10 +508,30 @@ pub struct RetentionRule {
 }
 
 /// Retention policies configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionConfig {
+    /// Enable background retention scheduler
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interval in seconds between retention runs (default: 86400 = 24h)
+    #[serde(default = "default_retention_interval")]
+    pub interval: u64,
     #[serde(default)]
     pub rules: Vec<RetentionRule>,
+}
+
+fn default_retention_interval() -> u64 {
+    86400 // 24 hours
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: 86400,
+            rules: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -886,6 +906,16 @@ impl Config {
         }
         if let Ok(val) = env::var("NORA_GC_DRY_RUN") {
             self.gc.dry_run = val.to_lowercase() == "true" || val == "1";
+        }
+
+        // Retention scheduler config
+        if let Ok(val) = env::var("NORA_RETENTION_ENABLED") {
+            self.retention.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_RETENTION_INTERVAL") {
+            if let Ok(v) = val.parse() {
+                self.retention.interval = v;
+            }
         }
 
         // Secrets config
