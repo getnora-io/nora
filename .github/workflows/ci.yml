@@ -259,18 +259,20 @@ jobs:
           curl -sf http://localhost:4000/metrics | head -5
           echo "API checks OK"
 
-      - name: Negative — reject invalid Docker manifest
+      - name: Negative — Maven immutable release rejects re-deploy
         run: |
-          # Push garbage as a manifest — expect 400, not 500
+          echo "first-deploy" > /tmp/immutable.jar
+          curl -sf -X PUT --data-binary @/tmp/immutable.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar
+          echo "second-deploy" > /tmp/immutable2.jar
           STATUS=$(curl -s -o /tmp/neg-body.txt -w "%{http_code}" \
-            -X PUT -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
-            --data '{"this": "is not a valid manifest"}' \
-            http://localhost:4000/v2/test/bad/manifests/latest)
-          echo "Invalid manifest push returned: $STATUS (body: $(cat /tmp/neg-body.txt))"
-          if [[ "$STATUS" =~ ^4 ]]; then
-            echo "Negative test OK — server rejected with $STATUS"
+            -X PUT --data-binary @/tmp/immutable2.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar)
+          echo "Re-deploy returned: $STATUS (body: $(cat /tmp/neg-body.txt))"
+          if [ "$STATUS" = "409" ]; then
+            echo "Immutable release OK — re-deploy rejected with 409"
           else
-            echo "Negative test FAILED — expected 4xx, got $STATUS"
+            echo "Expected 409 Conflict, got $STATUS"
             exit 1
           fi
 
