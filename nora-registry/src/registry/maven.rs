@@ -218,19 +218,28 @@ async fn upload(
             // Primary artifact upload (jar, pom, war, etc.)
             let snap = is_snapshot(&coords.version);
 
-            if !snap && state.config.maven.immutable_releases {
-                let lock = state.publish_lock(&key);
-                let _guard = lock.lock().await;
-                if state.storage.stat(&key).await.is_some() {
-                    return (
-                        StatusCode::CONFLICT,
-                        format!(
-                            "Version {}:{} is immutable (already deployed)",
-                            coords.artifact_id, coords.version
-                        ),
-                    )
-                        .into_response();
-                }
+            // Lock on metadata key to serialize all uploads for the same artifact.
+            // This prevents TOCTOU races on both immutability checks and
+            // maven-metadata.xml generation (read-list-generate-write cycle).
+            let metadata_lock_key = format!(
+                "maven/{}/{}/maven-metadata.xml",
+                coords.group_path, coords.artifact_id
+            );
+            let lock = state.publish_lock(&metadata_lock_key);
+            let _guard = lock.lock().await;
+
+            if !snap
+                && state.config.maven.immutable_releases
+                && state.storage.stat(&key).await.is_some()
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Version {}:{} is immutable (already deployed)",
+                        coords.artifact_id, coords.version
+                    ),
+                )
+                    .into_response();
             }
 
             if state.storage.put(&key, &body).await.is_err() {

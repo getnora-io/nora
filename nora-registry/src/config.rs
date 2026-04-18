@@ -592,6 +592,15 @@ impl Config {
     /// Warnings are logged but do not prevent startup.
     /// Errors indicate a fatal misconfiguration and should cause a panic.
     pub fn validate(&self) -> (Vec<String>, Vec<String>) {
+        self.validate_with_config_path(env::var("NORA_CONFIG_PATH").ok())
+    }
+
+    /// Validate configuration with explicit config_path to avoid env var
+    /// dependency in tests (env vars are process-global, tests run in parallel).
+    pub fn validate_with_config_path(
+        &self,
+        config_path: Option<String>,
+    ) -> (Vec<String>, Vec<String>) {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
 
@@ -647,7 +656,7 @@ impl Config {
         }
 
         // 6. Relative paths with explicit config — may resolve unexpectedly
-        if env::var("NORA_CONFIG_PATH").is_ok() {
+        if config_path.is_some() {
             if self.storage.mode == StorageMode::Local && !self.storage.path.starts_with('/') {
                 warnings.push(format!(
                     "storage.path=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
@@ -1641,11 +1650,11 @@ mod tests {
 
     #[test]
     fn test_validate_relative_paths_with_config_path() {
-        std::env::set_var("NORA_CONFIG_PATH", "/tmp/test-config.toml");
         let mut config = Config::default();
         config.auth.enabled = true;
         // default paths are relative: "data/storage", "data/tokens"
-        let (warnings, _) = config.validate();
+        let (warnings, _) =
+            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
         assert!(
             warnings.iter().any(|w| w.contains("storage.path")),
             "should warn about relative storage.path"
@@ -1654,17 +1663,16 @@ mod tests {
             warnings.iter().any(|w| w.contains("token_storage")),
             "should warn about relative token_storage"
         );
-        std::env::remove_var("NORA_CONFIG_PATH");
     }
 
     #[test]
     fn test_validate_absolute_paths_no_warning() {
-        std::env::set_var("NORA_CONFIG_PATH", "/tmp/test-config.toml");
         let mut config = Config::default();
         config.storage.path = "/data/storage".to_string();
         config.auth.enabled = true;
         config.auth.token_storage = "/data/tokens".to_string();
-        let (warnings, _) = config.validate();
+        let (warnings, _) =
+            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
         assert!(
             !warnings.iter().any(|w| w.contains("storage.path")),
             "should not warn about absolute storage.path"
@@ -1673,7 +1681,6 @@ mod tests {
             !warnings.iter().any(|w| w.contains("token_storage")),
             "should not warn about absolute token_storage"
         );
-        std::env::remove_var("NORA_CONFIG_PATH");
     }
 
     #[test]

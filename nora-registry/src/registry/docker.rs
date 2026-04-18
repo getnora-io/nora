@@ -569,8 +569,13 @@ async fn get_manifest(
 
         // Update metadata (downloads, last_pulled) in background
         let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
+        let state_clone = state.clone();
         let storage_clone = state.storage.clone();
-        tokio::spawn(update_metadata_on_pull(storage_clone, meta_key));
+        tokio::spawn(update_metadata_on_pull(
+            state_clone,
+            storage_clone,
+            meta_key,
+        ));
 
         return (
             StatusCode::OK,
@@ -1300,7 +1305,11 @@ async fn get_config_info(
 
 /// Update metadata when a manifest is pulled
 /// Increments download counter and updates last_pulled timestamp
-async fn update_metadata_on_pull(storage: Storage, meta_key: String) {
+async fn update_metadata_on_pull(state: Arc<AppState>, storage: Storage, meta_key: String) {
+    // Lock to prevent lost counter increments from concurrent pulls
+    let lock = state.publish_lock(&meta_key);
+    let _guard = lock.lock().await;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
