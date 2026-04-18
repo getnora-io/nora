@@ -16,6 +16,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: crate-ci/typos@cf5f1c29a8ac336af8568821ec41919923b05a83 # v1.45.1
 
+  coherence:
+    name: Coherence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Run coherence check
+        run: ./scripts/coherence-check.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -250,6 +258,30 @@ jobs:
           curl -sf http://localhost:4000/ready
           curl -sf http://localhost:4000/metrics | head -5
           echo "API checks OK"
+
+      - name: Negative — Maven immutable release rejects re-deploy
+        run: |
+          echo "first-deploy" > /tmp/immutable.jar
+          curl -sf -X PUT --data-binary @/tmp/immutable.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar
+          echo "second-deploy" > /tmp/immutable2.jar
+          STATUS=$(curl -s -o /tmp/neg-body.txt -w "%{http_code}" \
+            -X PUT --data-binary @/tmp/immutable2.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar)
+          echo "Re-deploy returned: $STATUS (body: $(cat /tmp/neg-body.txt))"
+          if [ "$STATUS" = "409" ]; then
+            echo "Immutable release OK — re-deploy rejected with 409"
+          else
+            echo "Expected 409 Conflict, got $STATUS"
+            exit 1
+          fi
+
+      - name: Negative — GET nonexistent tag returns 404
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:4000/v2/nonexistent/repo/manifests/v999)
+          echo "Nonexistent tag returned: $STATUS"
+          [ "$STATUS" = "404" ] && echo "404 OK" || (echo "Expected 404, got $STATUS" && exit 1)
 
       - name: Stop NORA
         if: always()
