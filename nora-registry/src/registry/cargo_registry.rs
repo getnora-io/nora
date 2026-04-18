@@ -397,9 +397,14 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let name = name.to_lowercase();
     let vers = vers.to_string();
 
-    // TOCTOU protection: lock per crate version to prevent concurrent publishes
+    // TOCTOU protection: lock per crate (not per version!) to serialize
+    // index read-modify-write. The index file is shared across all versions
+    // of the same crate, so concurrent publishes of different versions
+    // must be serialized to prevent lost index entries.
     let crate_key = format!("cargo/{}/{}/{}-{}.crate", name, vers, name, vers);
-    let lock = state.publish_lock(&crate_key);
+    let prefix = crate_index_prefix(&name);
+    let index_lock_key = format!("cargo/index/{}/{}", prefix, name);
+    let lock = state.publish_lock(&index_lock_key);
     let _guard = lock.lock().await;
 
     // Check version immutability
@@ -476,8 +481,7 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 
     // Write index FIRST — if it fails, no orphaned .crate file
     // If .crate write fails later, re-publish is possible (immutability checks .crate, not index)
-    let prefix = crate_index_prefix(&name);
-    let index_key = format!("cargo/index/{}/{}", prefix, name);
+    let index_key = index_lock_key.clone();
 
     let mut index_content = state
         .storage
