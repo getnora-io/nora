@@ -1,6 +1,22 @@
 # Changelog
 ## [Unreleased]
 
+## [0.6.2] - 2026-04-17
+
+### Fixed
+- Upgrade Alpine 3.20 → 3.21, patching 18 CVEs (5 HIGH: OpenSSL, musl, zlib-ng)
+
+### Changed
+- ArtifactHub logo added to Helm chart metadata
+
+## [0.6.1] - 2026-04-17
+
+### Added
+- Helm chart support — `helm repo add nora https://getnora-io.github.io/helm-charts`
+
+### Changed
+- README updated for v0.6.0
+
 ## [0.6.0] - 2026-04-17
 
 ### Added
