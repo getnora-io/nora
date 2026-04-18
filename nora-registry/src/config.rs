@@ -401,6 +401,7 @@ impl Default for AuthConfig {
 /// - `NORA_RATE_LIMIT_GENERAL_BURST` - General burst size
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
+    /// Enable rate limiting (default: true). Set `NORA_RATE_LIMIT_ENABLED=false` to disable.
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
     #[serde(default = "default_auth_rps")]
@@ -645,7 +646,23 @@ impl Config {
                 .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
         }
 
-        // 6. "Enabled but empty" — subsystems that silently do nothing
+        // 6. Relative paths with explicit config — may resolve unexpectedly
+        if env::var("NORA_CONFIG_PATH").is_ok() {
+            if self.storage.mode == StorageMode::Local && !self.storage.path.starts_with('/') {
+                warnings.push(format!(
+                    "storage.path=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
+                    self.storage.path
+                ));
+            }
+            if self.auth.enabled && !self.auth.token_storage.starts_with('/') {
+                warnings.push(format!(
+                    "auth.token_storage=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
+                    self.auth.token_storage
+                ));
+            }
+        }
+
+        // 7. "Enabled but empty" — subsystems that silently do nothing
         if self.gc.enabled && self.gc.dry_run {
             warnings.push(
                 "gc.enabled=true with gc.dry_run=true — GC will run but never delete anything. Set gc.dry_run=false to actually free space".to_string(),
@@ -1614,6 +1631,43 @@ mod tests {
         let (warnings, errors) = config.validate();
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_relative_paths_with_config_path() {
+        std::env::set_var("NORA_CONFIG_PATH", "/tmp/test-config.toml");
+        let mut config = Config::default();
+        config.auth.enabled = true;
+        // default paths are relative: "data/storage", "data/tokens"
+        let (warnings, _) = config.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("storage.path")),
+            "should warn about relative storage.path"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("token_storage")),
+            "should warn about relative token_storage"
+        );
+        std::env::remove_var("NORA_CONFIG_PATH");
+    }
+
+    #[test]
+    fn test_validate_absolute_paths_no_warning() {
+        std::env::set_var("NORA_CONFIG_PATH", "/tmp/test-config.toml");
+        let mut config = Config::default();
+        config.storage.path = "/data/storage".to_string();
+        config.auth.enabled = true;
+        config.auth.token_storage = "/data/tokens".to_string();
+        let (warnings, _) = config.validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("storage.path")),
+            "should not warn about absolute storage.path"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("token_storage")),
+            "should not warn about absolute token_storage"
+        );
+        std::env::remove_var("NORA_CONFIG_PATH");
     }
 
     #[test]
