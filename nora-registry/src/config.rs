@@ -882,6 +882,12 @@ impl Config {
                     }
                 })
                 .collect();
+            if self.docker.upstreams.iter().any(|u| u.auth.is_some()) {
+                tracing::warn!(
+                    "Docker upstream credentials passed via NORA_DOCKER_PROXIES environment variable. \
+                     For production use config.toml with [[docker.upstreams]] and mount credentials from a Kubernetes Secret."
+                );
+            }
         }
 
         // Go config

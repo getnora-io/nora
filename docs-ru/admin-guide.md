@@ -122,7 +122,18 @@ htpasswd -Bc /etc/nora/users.htpasswd admin
 | `NORA_NPM_METADATA_TTL` | TTL кэша метаданных (секунды) | `300` |
 | `NORA_PYPI_PROXY` | URL PyPI-реестра | `https://pypi.org/simple/` |
 | `NORA_MAVEN_PROXIES` | Список Maven-репозиториев через запятую | `https://repo1.maven.org/maven2` |
-| `NORA_DOCKER_PROXIES` | Docker-реестры, формат: `url\|auth,url2` | `https://registry-1.docker.io` |
+| `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), формат: `url\|auth,url2` | `https://registry-1.docker.io` |
+
+> **Рекомендация для production.** Для Docker-прокси с аутентификацией используйте `config.toml` вместо переменной окружения. Это позволяет хранить учётные данные отдельно (например, в Kubernetes Secret, смонтированном как файл) и упрощает ротацию токенов.
+>
+> ```toml
+> [[docker.upstreams]]
+> url = "https://registry-1.docker.io"
+>
+> [[docker.upstreams]]
+> url = "https://private.registry.io"
+> auth = "user:token"
+> ```
 
 ### 3.4. Ограничение частоты запросов
 

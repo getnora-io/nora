@@ -154,7 +154,7 @@ See [Authentication guide](https://getnora.dev/configuration/authentication/) fo
 | `NORA_STORAGE_MODE` | local | `local` or `s3` |
 | `NORA_AUTH_ENABLED` | false | Enable authentication |
 | `NORA_AUTH_ANONYMOUS_READ` | false | Allow unauthenticated read access |
-| `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Docker upstreams (`url\|user:pass,...`) |
+| `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Docker upstreams for quick start (`url\|user:pass,...`). For production, use `config.toml` |
 | `NORA_PUBLIC_URL` | — | Public URL for rewriting artifact links |
 | `NORA_RATE_LIMIT_ENABLED` | true | Enable rate limiting |
 | `NORA_RETENTION_ENABLED` | false | Enable background retention scheduler |
@@ -181,6 +181,10 @@ proxy_timeout = 60
 
 [[docker.upstreams]]
 url = "https://registry-1.docker.io"
+
+[[docker.upstreams]]
+url = "https://private.registry.io"
+auth = "user:token"
 
 [go]
 proxy = "https://proxy.golang.org"
