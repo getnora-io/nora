@@ -394,10 +394,13 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
 // ============================================================================
 
 /// Spawn a background GC task that runs periodically.
-/// Uses a tokio::sync::Mutex as single-flight lock to prevent overlapping runs.
-pub fn spawn_gc_scheduler(storage: Storage, interval_secs: u64, dry_run: bool) {
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-
+/// Accepts a shared cleanup lock to prevent concurrent runs with retention scheduler.
+pub fn spawn_gc_scheduler(
+    storage: Storage,
+    interval_secs: u64,
+    dry_run: bool,
+    cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // First tick fires immediately — skip it so GC doesn't run on startup
@@ -406,10 +409,10 @@ pub fn spawn_gc_scheduler(storage: Storage, interval_secs: u64, dry_run: bool) {
         loop {
             interval.tick().await;
 
-            // Single-flight: skip if previous run is still going
-            let guard = lock.try_lock();
+            // Cross-scheduler lock: skip if GC or retention is already running
+            let guard = cleanup_lock.try_lock();
             if guard.is_err() {
-                info!("GC: previous run still active, skipping");
+                info!("GC: cleanup lock held (GC or retention running), skipping");
                 continue;
             }
 

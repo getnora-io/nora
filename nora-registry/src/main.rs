@@ -469,12 +469,16 @@ async fn run_server(config: Config, storage: Storage) {
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
     });
 
+    // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
+    let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     // Spawn background GC scheduler if enabled
     if state.config.gc.enabled {
         gc::spawn_gc_scheduler(
             state.storage.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
+            cleanup_lock.clone(),
         );
         info!(
             interval_secs = state.config.gc.interval,
@@ -491,6 +495,7 @@ async fn run_server(config: Config, storage: Storage) {
             state.config.retention.interval,
             state.config.retention.dry_run,
             Some(std::sync::Arc::new(audit::AuditLog::new(&storage_path))),
+            cleanup_lock.clone(),
         );
         info!(
             interval_secs = state.config.retention.interval,

@@ -603,16 +603,15 @@ fn find_matching_rule<'a>(
 // ============================================================================
 
 /// Spawn a background retention task that runs periodically.
-/// Uses a tokio::sync::Mutex as single-flight lock to prevent overlapping runs.
+/// Accepts a shared cleanup lock to prevent concurrent runs with GC scheduler.
 pub fn spawn_retention_scheduler(
     storage: Storage,
     rules: Vec<RetentionRule>,
     interval_secs: u64,
     dry_run: bool,
     audit: Option<Arc<crate::audit::AuditLog>>,
+    cleanup_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // First tick fires immediately — skip it so retention doesn't run on startup
@@ -621,10 +620,10 @@ pub fn spawn_retention_scheduler(
         loop {
             interval.tick().await;
 
-            // Single-flight: skip if previous run is still going
-            let guard = lock.try_lock();
+            // Cross-scheduler lock: skip if GC or retention is already running
+            let guard = cleanup_lock.try_lock();
             if guard.is_err() {
-                info!("Retention: previous run still active, skipping");
+                info!("Retention: cleanup lock held (GC or retention running), skipping");
                 continue;
             }
 
