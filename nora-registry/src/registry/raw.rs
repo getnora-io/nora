@@ -70,6 +70,19 @@ async fn upload(
     }
 
     let key = format!("raw/{}", path);
+
+    // Immutable: reject overwrite of existing files
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+
+    if state.storage.stat(&key).await.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            format!("File already exists: {}", path),
+        )
+            .into_response();
+    }
+
     match state.storage.put(&key, &body).await {
         Ok(()) => {
             state.metrics.record_upload("raw");
@@ -284,6 +297,34 @@ mod integration_tests {
         let ctx = create_test_context();
         let resp = send(&ctx.app, Method::GET, "/raw/missing.txt", "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_raw_immutable_overwrite_rejected() {
+        let ctx = create_test_context();
+        let put1 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/immutable.txt",
+            b"first".to_vec(),
+        )
+        .await;
+        assert_eq!(put1.status(), StatusCode::CREATED);
+
+        let put2 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/immutable.txt",
+            b"second".to_vec(),
+        )
+        .await;
+        assert_eq!(put2.status(), StatusCode::CONFLICT);
+
+        // Verify original content preserved
+        let get = send(&ctx.app, Method::GET, "/raw/immutable.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], b"first");
     }
 
     #[tokio::test]

@@ -677,6 +677,11 @@ impl Config {
                 "gc.enabled=true with gc.dry_run=true — GC will run but never delete anything. Set gc.dry_run=false to actually free space".to_string(),
             );
         }
+        if self.retention.enabled && self.retention.dry_run && !self.retention.rules.is_empty() {
+            warnings.push(
+                "retention.enabled=true with retention.dry_run=true — retention will run but never delete anything. Set retention.dry_run=false to actually enforce policies".to_string(),
+            );
+        }
         if self.retention.enabled && self.retention.rules.is_empty() {
             warnings.push(
                 "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
