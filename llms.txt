@@ -321,8 +321,8 @@ A: Cosign verification and policy enforcement are on the roadmap. Currently, NOR
 - Language: Rust
 - Platforms: Linux (amd64, arm64). Docker images: Alpine, Astra Linux SE, RED OS
 - Binary name: nora (crate name: nora-registry)
-- Tests: 592 (unit + integration + proptest + Playwright e2e)
-- Coverage: 61.5%
+- Tests: 633 (unit + integration + proptest + Playwright e2e)
+- Coverage: ~62% (tarpaulin)
 - No garbage collector pauses (Rust, not Java/Go)
 - Async I/O with Tokio, Axum web framework
 - SHA256 digest verification on every blob upload
