@@ -147,11 +147,11 @@ nora gc                       # Garbage collect orphaned blobs (dry-run by defau
 nora gc --apply               # Actually delete orphaned blobs
 nora migrate --from local --to s3        # Migrate storage
 nora migrate --from local --to s3 --dry-run
-nora mirror docker --registry http://localhost:4000 --image alpine:3.19
-nora mirror npm --registry http://localhost:4000 --package express
-nora mirror pip --registry http://localhost:4000 --package requests
-nora mirror cargo --registry http://localhost:4000 --crate serde
-nora mirror maven --registry http://localhost:4000 --artifact org.slf4j:slf4j-api:2.0.9
+nora mirror docker --registry http://localhost:4000 --images alpine:3.19
+nora mirror npm --registry http://localhost:4000 --packages express
+nora mirror pip --registry http://localhost:4000 --lockfile requirements.txt
+nora mirror cargo --registry http://localhost:4000 --lockfile Cargo.lock
+nora mirror maven --registry http://localhost:4000 --lockfile deps.txt
 ```
 
 ## Configuration
