@@ -1,6 +1,30 @@
 # Changelog
 ## [Unreleased]
 
+## [0.6.3] - 2026-04-19
+
+### Fixed
+- GC and Retention schedulers now share a cleanup lock preventing concurrent `storage.delete()` races (#164)
+- Publish lock race conditions: Maven lock guard was inside if-block (P0), Cargo lock key was per-version instead of per-crate (P1), Docker pull counter lacked lock (P2) (#160)
+- Raw registry enforces immutability — overwrites return 409 Conflict instead of silently replacing files (#162)
+- Retention `dry_run=true` validation warning added (symmetric with GC) (#162)
+- Flaky test: `validate()` read env var directly, parallel tests broke each other (#160)
+- `llms.txt` mirror CLI examples corrected: `--image` → `--images`, `--package` → `--packages`, pip/cargo/maven use `--lockfile` (#161)
+
+### Changed
+- OpenAPI spec expanded: npm publish, Cargo publish, PyPI upload, Cargo sparse index, Docker manifest delete endpoints documented (#161, #163)
+- README env var table expanded from 10 to 24 variables with full descriptions (#163)
+- README mirror subcommand examples added for all 6 formats (#163)
+- Maven auth column corrected from "proxy-only" to full auth support (#163)
+- Coherence CI pipeline added: version sync, env var coverage, registry list, dead code budget, license check (#156)
+- Negative integration tests added for auth and validation (#156)
+- Config validation warns on Docker proxy credentials in env var (#157)
+- Config validation warns on relative paths with explicit config (#154)
+- Maven env var overrides added, S3 default port fixed to 9000 (#153)
+- Docker pull counter added with publish lock (#160)
+- `lock-audit.sh` script and Makefile targets added (#160)
+- 633 total tests (up from 588)
+
 ## [0.6.2] - 2026-04-17
 
 ### Fixed
