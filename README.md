@@ -32,7 +32,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | Registry | Mount Point | Upstream Proxy | Auth |
 |----------|------------|----------------|------|
 | Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✓ |
-| Maven | `/maven2/` | Maven Central, custom | proxy-only |
+| Maven | `/maven2/` | Maven Central, custom | ✓ |
 | npm | `/npm/` | npmjs.org, custom | ✓ |
 | Cargo | `/cargo/` | crates.io | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
@@ -159,6 +159,18 @@ See [Authentication guide](https://getnora.dev/configuration/authentication/) fo
 | `NORA_RATE_LIMIT_ENABLED` | true | Enable rate limiting |
 | `NORA_RETENTION_ENABLED` | false | Enable background retention scheduler |
 | `NORA_RETENTION_INTERVAL` | 86400 | Retention run interval in seconds |
+| `NORA_CONFIG_PATH` | — | Path to config.toml (fatal if set but missing) |
+| `NORA_STORAGE_PATH` | data/storage | Storage directory for local mode |
+| `NORA_BODY_LIMIT_MB` | 512 | Max request body size in MB |
+| `NORA_GC_ENABLED` | false | Enable background garbage collection |
+| `NORA_GC_INTERVAL` | 86400 | GC run interval in seconds |
+| `NORA_GC_DRY_RUN` | true | Log only, do not delete |
+| `NORA_RETENTION_DRY_RUN` | true | Log only, do not delete |
+| `NORA_STORAGE_S3_URL` | — | S3 endpoint URL (for `s3` storage mode) |
+| `NORA_STORAGE_BUCKET` | nora | S3 bucket name |
+| `NORA_RAW_ENABLED` | true | Enable raw file storage |
+| `NORA_RAW_MAX_FILE_SIZE` | 104857600 | Max raw file size in bytes (100 MB) |
+
 See [full configuration reference](https://getnora.dev/configuration/settings/) for all options.
 
 ### config.toml
@@ -220,7 +232,12 @@ nora retention-apply --yes  # Apply retention policies
 nora backup -o backup.tar.gz
 nora restore -i backup.tar.gz
 nora migrate --from local --to s3
-nora mirror                 # Sync packages for offline use
+nora mirror npm --lockfile package-lock.json     # Mirror npm from lockfile
+nora mirror npm --packages express,lodash        # Mirror specific npm packages
+nora mirror pip --lockfile requirements.txt      # Mirror Python packages
+nora mirror cargo --lockfile Cargo.lock          # Mirror Cargo crates
+nora mirror maven --lockfile deps.txt            # Mirror Maven artifacts
+nora mirror docker --images alpine:3.20,nginx    # Mirror Docker images
 ```
 
 ## Endpoints

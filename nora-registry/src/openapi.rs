@@ -21,7 +21,7 @@ use crate::AppState;
         version = "0.6.2",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, and Raw",
         license(name = "MIT"),
-        contact(name = "DevITWay", url = "https://github.com/getnora-io/nora")
+        contact(name = "DevITWay", url = "https://getnora.dev")
     ),
     servers(
         (url = "/", description = "Current server")
@@ -56,6 +56,7 @@ use crate::AppState;
         crate::openapi::docker_blob_get,
         // Docker - Write
         crate::openapi::docker_manifest_put,
+        crate::openapi::docker_manifest_delete,
         crate::openapi::docker_blob_upload_start,
         crate::openapi::docker_blob_upload_patch,
         crate::openapi::docker_blob_upload_put,
@@ -66,6 +67,8 @@ use crate::AppState;
         crate::openapi::npm_package,
         crate::openapi::npm_publish,
         // Cargo
+        crate::openapi::cargo_index_config,
+        crate::openapi::cargo_sparse_index,
         crate::openapi::cargo_metadata,
         crate::openapi::cargo_download,
         crate::openapi::cargo_publish,
@@ -452,6 +455,22 @@ pub async fn docker_blob_get() {}
 )]
 pub async fn docker_manifest_put() {}
 
+/// Delete manifest
+#[utoipa::path(
+    delete,
+    path = "/v2/{name}/manifests/{reference}",
+    tag = "docker",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+        ("reference" = String, Path, description = "Tag or digest (sha256:...)")
+    ),
+    responses(
+        (status = 202, description = "Manifest deleted"),
+        (status = 404, description = "Manifest not found")
+    )
+)]
+pub async fn docker_manifest_delete() {}
+
 /// Start blob upload
 ///
 /// Initiates a resumable blob upload. Returns a Location header with the upload URL.
@@ -572,6 +591,37 @@ pub async fn npm_package() {}
 pub async fn npm_publish() {}
 
 // -------------------- Cargo --------------------
+
+/// Cargo sparse index configuration
+///
+/// Returns the registry configuration for sparse index protocol (RFC 2789).
+#[utoipa::path(
+    get,
+    path = "/cargo/index/config.json",
+    tag = "cargo",
+    responses(
+        (status = 200, description = "Sparse index configuration (JSON)")
+    )
+)]
+pub async fn cargo_index_config() {}
+
+/// Cargo sparse index lookup
+///
+/// Returns crate index entries for the sparse index protocol.
+/// Path structure depends on crate name length (1/, 2/, 3/first-two/, etc.).
+#[utoipa::path(
+    get,
+    path = "/cargo/index/{path}",
+    tag = "cargo",
+    params(
+        ("path" = String, Path, description = "Sparse index path (e.g., 'se/rd/serde')")
+    ),
+    responses(
+        (status = 200, description = "Crate index entries (one JSON per line)"),
+        (status = 404, description = "Crate not found in index")
+    )
+)]
+pub async fn cargo_sparse_index() {}
 
 /// Get Cargo crate metadata
 #[utoipa::path(
