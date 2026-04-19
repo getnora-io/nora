@@ -64,12 +64,15 @@ use crate::AppState;
         crate::openapi::maven_artifact_put,
         // npm
         crate::openapi::npm_package,
+        crate::openapi::npm_publish,
         // Cargo
         crate::openapi::cargo_metadata,
         crate::openapi::cargo_download,
+        crate::openapi::cargo_publish,
         // PyPI
         crate::openapi::pypi_simple,
         crate::openapi::pypi_package,
+        crate::openapi::pypi_upload,
         // Go
         crate::openapi::go_module_latest,
         crate::openapi::go_module_info,
@@ -142,6 +145,8 @@ pub struct RegistriesHealth {
     pub npm: String,
     pub cargo: String,
     pub pypi: String,
+    pub go: String,
+    pub raw: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -246,7 +251,7 @@ pub struct GlobalStats {
 
 #[derive(Serialize, ToSchema)]
 pub struct RegistryCardStats {
-    /// Registry name (docker, maven, npm, cargo, pypi)
+    /// Registry name (docker, maven, npm, cargo, pypi, go, raw)
     pub name: String,
     /// Number of artifacts in this registry
     pub artifact_count: usize,
@@ -548,6 +553,24 @@ pub async fn maven_artifact_put() {}
 )]
 pub async fn npm_package() {}
 
+/// Publish npm package
+///
+/// Accepts a full npm publish payload (packument with attachments).
+#[utoipa::path(
+    put,
+    path = "/npm/{name}",
+    tag = "npm",
+    params(
+        ("name" = String, Path, description = "Package name (e.g., 'lodash' or '@scope/package')")
+    ),
+    responses(
+        (status = 200, description = "Package published"),
+        (status = 409, description = "Version already exists"),
+        (status = 400, description = "Invalid package data")
+    )
+)]
+pub async fn npm_publish() {}
+
 // -------------------- Cargo --------------------
 
 /// Get Cargo crate metadata
@@ -581,6 +604,21 @@ pub async fn cargo_metadata() {}
 )]
 pub async fn cargo_download() {}
 
+/// Publish Cargo crate
+///
+/// Accepts a crate publish payload (metadata + .crate tarball).
+#[utoipa::path(
+    put,
+    path = "/cargo/api/v1/crates/new",
+    tag = "cargo",
+    responses(
+        (status = 200, description = "Crate published"),
+        (status = 409, description = "Version already exists"),
+        (status = 400, description = "Invalid crate data")
+    )
+)]
+pub async fn cargo_publish() {}
+
 // -------------------- PyPI --------------------
 
 /// PyPI Simple index
@@ -608,6 +646,21 @@ pub async fn pypi_simple() {}
     )
 )]
 pub async fn pypi_package() {}
+
+/// Upload Python package
+///
+/// Accepts a multipart form upload (twine-compatible).
+#[utoipa::path(
+    post,
+    path = "/simple/",
+    tag = "pypi",
+    responses(
+        (status = 200, description = "Package uploaded"),
+        (status = 409, description = "Version already exists"),
+        (status = 400, description = "Invalid upload data")
+    )
+)]
+pub async fn pypi_upload() {}
 
 // -------------------- Go Modules --------------------
 
