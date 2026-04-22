@@ -46,6 +46,9 @@ pub struct AuditLog {
 impl AuditLog {
     pub fn new(storage_path: &str) -> Self {
         let path = PathBuf::from(storage_path).join("audit.jsonl");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let writer = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => {
                 info!(path = %path.display(), "Audit log initialized");

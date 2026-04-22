@@ -1746,4 +1746,31 @@ mod tests {
         assert_eq!(c.proxy, Some("https://crates.io".to_string()));
         assert_eq!(c.proxy_timeout, 30);
     }
+
+    #[test]
+    fn test_config_file_sets_s3_mode_without_env() {
+        // Regression test for issue #4: config.toml mode="s3" must work
+        // without NORA_STORAGE_MODE env var (previously overridden by
+        // Dockerfile ENV NORA_STORAGE_MODE=local)
+        std::env::remove_var("NORA_STORAGE_MODE");
+
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 4000
+
+            [storage]
+            mode = "s3"
+            s3_url = "http://minio:9000"
+            bucket = "nora"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.storage.mode,
+            StorageMode::S3,
+            "config.toml mode=s3 must not be overridden when NORA_STORAGE_MODE is unset"
+        );
+    }
 }

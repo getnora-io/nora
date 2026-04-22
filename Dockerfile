@@ -12,7 +12,6 @@ COPY --chown=nora:nora nora /usr/local/bin/nora
 ENV RUST_LOG=info
 ENV NORA_HOST=0.0.0.0
 ENV NORA_PORT=4000
-ENV NORA_STORAGE_MODE=local
 ENV NORA_STORAGE_PATH=/data/storage
 ENV NORA_AUTH_TOKEN_STORAGE=/data/tokens
 
