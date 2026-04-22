@@ -143,6 +143,9 @@ impl DashboardMetrics {
             registry_uploads: self.registry_uploads.snapshot(),
         };
         let tmp = path.with_extension("json.tmp");
+        if let Some(parent) = tmp.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         if let Ok(data) = serde_json::to_string_pretty(&snap) {
             if tokio::fs::write(&tmp, &data).await.is_ok() {
                 let _ = tokio::fs::rename(&tmp, path).await;
