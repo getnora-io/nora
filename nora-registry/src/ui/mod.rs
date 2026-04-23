@@ -21,6 +21,23 @@ use api::*;
 use i18n::Lang;
 use templates::*;
 
+/// Returns base URL for UI install commands.
+/// Uses public_url if set (trimming trailing slash), otherwise http://host:port.
+fn resolve_base_url(state: &AppState) -> String {
+    state
+        .config
+        .server
+        .public_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                state.config.server.host, state.config.server.port
+            )
+        })
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct LangQuery {
     lang: Option<String>,
@@ -147,8 +164,9 @@ async fn docker_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_docker_detail(&state, &name).await;
-    Html(render_docker_detail(&name, &detail, lang))
+    Html(render_docker_detail(&name, &detail, lang, &base_url))
 }
 
 // Maven pages
@@ -223,8 +241,11 @@ async fn npm_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_npm_detail(&state.storage, &name).await;
-    Html(render_package_detail("npm", &name, &detail, lang))
+    Html(render_package_detail(
+        "npm", &name, &detail, lang, &base_url,
+    ))
 }
 
 // Cargo pages
@@ -261,8 +282,11 @@ async fn cargo_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_cargo_detail(&state.storage, &name).await;
-    Html(render_package_detail("cargo", &name, &detail, lang))
+    Html(render_package_detail(
+        "cargo", &name, &detail, lang, &base_url,
+    ))
 }
 
 // PyPI pages
@@ -299,8 +323,11 @@ async fn pypi_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_pypi_detail(&state.storage, &name).await;
-    Html(render_package_detail("pypi", &name, &detail, lang))
+    Html(render_package_detail(
+        "pypi", &name, &detail, lang, &base_url,
+    ))
 }
 
 // Go pages
@@ -337,8 +364,9 @@ async fn go_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_go_detail(&state.storage, &name).await;
-    Html(render_package_detail("go", &name, &detail, lang))
+    Html(render_package_detail("go", &name, &detail, lang, &base_url))
 }
 
 // Raw pages
@@ -375,6 +403,9 @@ async fn raw_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let base_url = resolve_base_url(&state);
     let detail = get_raw_detail(&state.storage, &name).await;
-    Html(render_package_detail("raw", &name, &detail, lang))
+    Html(render_package_detail(
+        "raw", &name, &detail, lang, &base_url,
+    ))
 }
