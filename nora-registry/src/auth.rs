@@ -104,6 +104,9 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // Compute realm from public_url for WWW-Authenticate header
+    let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
+
     // Extract Authorization header
     let auth_header = request
         .headers()
@@ -112,7 +115,7 @@ pub async fn auth_middleware(
 
     let auth_header = match auth_header {
         Some(h) => h,
-        None => return unauthorized_response("Authentication required"),
+        None => return unauthorized_response("Authentication required", realm),
     };
 
     // Try Bearer token first
@@ -131,49 +134,52 @@ pub async fn auth_middleware(
                     }
                     return next.run(request).await;
                 }
-                Err(_) => return unauthorized_response("Invalid or expired token"),
+                Err(_) => return unauthorized_response("Invalid or expired token", realm),
             }
         } else {
-            return unauthorized_response("Token authentication not configured");
+            return unauthorized_response("Token authentication not configured", realm);
         }
     }
 
     // Parse Basic auth
     if !auth_header.starts_with("Basic ") {
-        return unauthorized_response("Basic or Bearer authentication required");
+        return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
     let encoded = &auth_header[6..];
     let decoded = match STANDARD.decode(encoded) {
         Ok(d) => d,
-        Err(_) => return unauthorized_response("Invalid credentials encoding"),
+        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
     };
 
     let credentials = match String::from_utf8(decoded) {
         Ok(c) => c,
-        Err(_) => return unauthorized_response("Invalid credentials encoding"),
+        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
     };
 
     let (username, password) = match credentials.split_once(':') {
         Some((u, p)) => (u, p),
-        None => return unauthorized_response("Invalid credentials format"),
+        None => return unauthorized_response("Invalid credentials format", realm),
     };
 
     // Verify credentials
     if !auth.authenticate(username, password) {
-        return unauthorized_response("Invalid username or password");
+        return unauthorized_response("Invalid username or password", realm);
     }
 
     // Auth successful
     next.run(request).await
 }
 
-fn unauthorized_response(message: &str) -> Response {
+fn unauthorized_response(message: &str, realm: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [
-            (header::WWW_AUTHENTICATE, "Basic realm=\"Nora\""),
-            (header::CONTENT_TYPE, "application/json"),
+            (
+                header::WWW_AUTHENTICATE,
+                format!("Basic realm=\"{}\"", realm),
+            ),
+            (header::CONTENT_TYPE, "application/json".to_string()),
         ],
         format!(r#"{{"error":"{}"}}"#, message),
     )

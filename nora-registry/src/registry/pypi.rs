@@ -89,6 +89,23 @@ async fn list_packages(
 // Package versions
 // ============================================================================
 
+/// Returns base URL for PyPI download links.
+/// Uses public_url if set, otherwise http://host:port.
+fn pypi_base_url(state: &AppState) -> String {
+    state
+        .config
+        .server
+        .public_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                state.config.server.host, state.config.server.port
+            )
+        })
+}
+
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 async fn package_versions(
     State(state): State<Arc<AppState>>,
@@ -98,6 +115,7 @@ async fn package_versions(
     let normalized = normalize_name(&name);
     let prefix = format!("pypi/{}/", normalized);
     let keys = state.storage.list(&prefix).await;
+    let base_url = pypi_base_url(&state);
 
     // Collect files with their hashes
     let mut files: Vec<FileEntry> = Vec::new();
@@ -120,9 +138,9 @@ async fn package_versions(
 
     if !files.is_empty() {
         return if wants_json(&headers) {
-            versions_json_response(&normalized, &files)
+            versions_json_response(&normalized, &files, &base_url)
         } else {
-            versions_html_response(&normalized, &files)
+            versions_html_response(&normalized, &files, &base_url)
         };
     }
 
@@ -139,7 +157,7 @@ async fn package_versions(
         )
         .await
         {
-            let rewritten = rewrite_pypi_links(&html, &normalized);
+            let rewritten = rewrite_pypi_links(&html, &normalized, &base_url);
             return (StatusCode::OK, Html(rewritten)).into_response();
         }
     }
@@ -376,13 +394,13 @@ struct FileEntry {
     sha256: Option<String>,
 }
 
-fn versions_json_response(normalized: &str, files: &[FileEntry]) -> Response {
+fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
     let file_entries: Vec<serde_json::Value> = files
         .iter()
         .map(|f| {
             let mut entry = serde_json::json!({
                 "filename": f.filename,
-                "url": format!("/simple/{}/{}", normalized, f.filename),
+                "url": format!("{}/simple/{}/{}", base_url, normalized, f.filename),
             });
             if let Some(hash) = &f.sha256 {
                 entry["digests"] = serde_json::json!({"sha256": hash});
@@ -405,7 +423,7 @@ fn versions_json_response(normalized: &str, files: &[FileEntry]) -> Response {
         .into_response()
 }
 
-fn versions_html_response(normalized: &str, files: &[FileEntry]) -> Response {
+fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
     let mut html = format!(
         "<!DOCTYPE html>\n<html><head><title>Links for {}</title></head><body><h1>Links for {}</h1>\n",
         normalized, normalized
@@ -418,8 +436,8 @@ fn versions_html_response(normalized: &str, files: &[FileEntry]) -> Response {
             .map(|h| format!("#sha256={}", h))
             .unwrap_or_default();
         html.push_str(&format!(
-            "<a href=\"/simple/{}/{}{}\">{}</a><br>\n",
-            normalized, f.filename, hash_fragment, f.filename
+            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>\n",
+            base_url, normalized, f.filename, hash_fragment, f.filename
         ));
     }
     html.push_str("</body></html>");
@@ -471,7 +489,7 @@ fn is_valid_pypi_filename(name: &str) -> bool {
 }
 
 /// Rewrite PyPI links to point to our registry.
-fn rewrite_pypi_links(html: &str, package_name: &str) -> String {
+fn rewrite_pypi_links(html: &str, package_name: &str, base_url: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut remaining = html;
 
@@ -486,8 +504,8 @@ fn rewrite_pypi_links(html: &str, package_name: &str) -> String {
                 // Extract hash fragment from original URL
                 let hash_fragment = url.find('#').map(|pos| &url[pos..]).unwrap_or("");
                 result.push_str(&format!(
-                    "/simple/{}/{}{}",
-                    package_name, filename, hash_fragment
+                    "{}/simple/{}/{}{}",
+                    base_url, package_name, filename, hash_fragment
                 ));
             } else {
                 result.push_str(url);
@@ -739,35 +757,36 @@ mod tests {
     #[test]
     fn test_rewrite_pypi_links_basic() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = rewrite_pypi_links(html, "flask");
-        assert!(result.contains("/simple/flask/flask-2.0.tar.gz#sha256=abc"));
+        let result = rewrite_pypi_links(html, "flask", "https://registry.example.com");
+        assert!(result
+            .contains("https://registry.example.com/simple/flask/flask-2.0.tar.gz#sha256=abc"));
     }
 
     #[test]
     fn test_rewrite_pypi_links_preserves_hash() {
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
-        let result = rewrite_pypi_links(html, "pkg");
+        let result = rewrite_pypi_links(html, "pkg", "http://localhost:4000");
         assert!(result.contains("#sha256=deadbeef"));
     }
 
     #[test]
     fn test_rewrite_pypi_links_unknown_ext() {
         let html = r#"<a href="https://example.com/readme.txt">readme</a>"#;
-        let result = rewrite_pypi_links(html, "test");
+        let result = rewrite_pypi_links(html, "test", "http://localhost:4000");
         assert!(result.contains("https://example.com/readme.txt"));
     }
 
     #[test]
     fn test_rewrite_pypi_links_removes_metadata_attrs() {
         let html = r#"<a href="https://example.com/pkg-1.0.whl" data-core-metadata="sha256=abc" data-dist-info-metadata="sha256=def">pkg</a>"#;
-        let result = rewrite_pypi_links(html, "pkg");
+        let result = rewrite_pypi_links(html, "pkg", "http://localhost:4000");
         assert!(!result.contains("data-core-metadata"));
         assert!(!result.contains("data-dist-info-metadata"));
     }
 
     #[test]
     fn test_rewrite_pypi_links_empty() {
-        assert_eq!(rewrite_pypi_links("", "pkg"), "");
+        assert_eq!(rewrite_pypi_links("", "pkg", "http://localhost:4000"), "");
     }
 
     #[test]
@@ -910,6 +929,7 @@ mod integration_tests {
         let body = body_bytes(response).await;
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("flask-2.0.tar.gz"));
+        // URL should contain base_url + /simple/flask/flask-2.0.tar.gz
         assert!(html.contains("/simple/flask/flask-2.0.tar.gz"));
     }
 
