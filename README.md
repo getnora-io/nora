@@ -285,8 +285,15 @@ See [TLS / HTTPS guide](https://getnora.dev/configuration/tls/) for Nginx, Traef
 - ~~**Online Garbage Collection** — non-blocking cleanup without registry downtime~~ ✅ v0.6.0
 - ~~**Retention Policies** — declarative rules: keep last N tags, delete older than X days~~ ✅ v0.6.0
 - ~~**Helm Chart** — official chart for Kubernetes deployment~~ ✅ v0.6.1
+- ~~**Signed releases** — cosign keyless signing and SLSA provenance~~ ✅ v0.6.4
+- **Token management UI** — CRUD for API tokens in the web interface *(v0.7)*
+- **SBOM** — CycloneDX generation in release pipeline *(v0.7)*
+
+### Post-1.0
+
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
-- **Image Signing** — cosign verification and policy enforcement
+- **Image Signing Policy** — cosign verification and enforcement on upstream pulls
+- **Curation** — package blocklist, minimum release age, scope protection
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
