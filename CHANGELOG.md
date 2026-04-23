@@ -1,8 +1,12 @@
 # Changelog
 ## [Unreleased]
 
+## [0.6.5] - 2026-04-23
+
 ### Fixed
 - UI install commands now respect `NORA_PUBLIC_URL` for all registries — PyPI, npm, Go, Raw, Docker (#177)
+- Docker `WWW-Authenticate` realm uses `NORA_PUBLIC_URL` instead of hardcoded "Nora" (#177)
+- PyPI simple index generates absolute download URLs using `NORA_PUBLIC_URL` (#177)
 
 ## [0.6.4] - 2026-04-22
 
