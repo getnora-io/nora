@@ -519,7 +519,12 @@ pub fn render_registry_list_paginated(
 }
 
 /// Renders Docker image detail page
-pub fn render_docker_detail(name: &str, detail: &DockerDetail, lang: Lang) -> String {
+pub fn render_docker_detail(
+    name: &str,
+    detail: &DockerDetail,
+    lang: Lang,
+    base_url: &str,
+) -> String {
     let _t = get_translations(lang);
     let tags_rows = if detail.tags.is_empty() {
         r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No tags found</td></tr>"##.to_string()
@@ -547,7 +552,10 @@ pub fn render_docker_detail(name: &str, detail: &DockerDetail, lang: Lang) -> St
             .join("")
     };
 
-    let pull_cmd = format!("docker pull 127.0.0.1:4000/{}", name);
+    let registry_host = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let pull_cmd = format!("docker pull {}/{}", registry_host, name);
 
     let content = format!(
         r##"
@@ -617,6 +625,7 @@ pub fn render_package_detail(
     name: &str,
     detail: &PackageDetail,
     lang: Lang,
+    base_url: &str,
 ) -> String {
     let _t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
@@ -649,14 +658,11 @@ pub fn render_package_detail(
     };
 
     let install_cmd = match registry_type {
-        "npm" => format!("npm install {} --registry http://127.0.0.1:4000/npm", name),
+        "npm" => format!("npm install {} --registry {}/npm", name, base_url),
         "cargo" => format!("cargo add {}", name),
-        "pypi" => format!(
-            "pip install {} --index-url http://127.0.0.1:4000/simple",
-            name
-        ),
-        "go" => format!("GOPROXY=http://127.0.0.1:4000/go go get {}", name),
-        "raw" => format!("curl -O http://127.0.0.1:4000/raw/{}/<file>", name),
+        "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
+        "go" => format!("GOPROXY={}/go go get {}", base_url, name),
+        "raw" => format!("curl -O {}/raw/{}/<file>", base_url, name),
         _ => String::new(),
     };
 
@@ -858,4 +864,93 @@ pub fn encode_uri_component(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::api::PackageDetail;
+
+    fn empty_detail() -> PackageDetail {
+        PackageDetail { versions: vec![] }
+    }
+
+    #[test]
+    fn test_package_detail_uses_public_url() {
+        let base_url = "https://registry.example.com";
+        let html = render_package_detail("pypi", "requests", &empty_detail(), Lang::En, base_url);
+        assert!(
+            html.contains("https://registry.example.com/simple"),
+            "PyPI install command must use public_url"
+        );
+        assert!(
+            !html.contains("127.0.0.1"),
+            "Must not contain hardcoded localhost"
+        );
+
+        let html = render_package_detail("npm", "lodash", &empty_detail(), Lang::En, base_url);
+        assert!(
+            html.contains("https://registry.example.com/npm"),
+            "npm install command must use public_url"
+        );
+
+        let html = render_package_detail(
+            "go",
+            "github.com/foo/bar",
+            &empty_detail(),
+            Lang::En,
+            base_url,
+        );
+        assert!(
+            html.contains("https://registry.example.com/go"),
+            "Go proxy command must use public_url"
+        );
+
+        let html = render_package_detail("raw", "myfiles", &empty_detail(), Lang::En, base_url);
+        assert!(
+            html.contains("https://registry.example.com/raw"),
+            "Raw download command must use public_url"
+        );
+    }
+
+    #[test]
+    fn test_package_detail_fallback_url() {
+        let base_url = "http://0.0.0.0:4000";
+        let html = render_package_detail("pypi", "flask", &empty_detail(), Lang::En, base_url);
+        assert!(
+            html.contains("http://0.0.0.0:4000/simple"),
+            "Must use fallback host:port when public_url is not set"
+        );
+    }
+
+    #[test]
+    fn test_docker_detail_strips_scheme() {
+        let detail = super::super::api::DockerDetail { tags: vec![] };
+
+        let html = render_docker_detail("myapp", &detail, Lang::En, "https://registry.example.com");
+        assert!(
+            html.contains("docker pull registry.example.com/myapp"),
+            "Docker pull must strip https:// scheme"
+        );
+        assert!(
+            !html.contains("https://registry.example.com/myapp"),
+            "Docker pull must not include scheme"
+        );
+
+        let html = render_docker_detail("myapp", &detail, Lang::En, "http://localhost:4000");
+        assert!(
+            html.contains("docker pull localhost:4000/myapp"),
+            "Docker pull must strip http:// scheme"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_no_double_slash() {
+        let base_url = "https://registry.example.com";
+        let html = render_package_detail("pypi", "pkg", &empty_detail(), Lang::En, base_url);
+        assert!(
+            !html.contains("com//simple"),
+            "Must not produce double slashes"
+        );
+    }
 }

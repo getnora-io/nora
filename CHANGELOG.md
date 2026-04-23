@@ -1,13 +1,15 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- UI install commands now respect `NORA_PUBLIC_URL` for all registries — PyPI, npm, Go, Raw, Docker (#177)
+
 ## [0.6.4] - 2026-04-22
 
 ### Fixed
 - S3 storage mode: removed Dockerfile ENV override that forced local mode regardless of config.toml (#173)
 - Audit log and dashboard metrics: create parent directories before file open (fixes crash with readOnlyRootFilesystem)
 - Security: update rustls-webpki to 0.103.13 (RUSTSEC-2026-0104)
-
 ## [0.6.3] - 2026-04-19
 
 ### Fixed
