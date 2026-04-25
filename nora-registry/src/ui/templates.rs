@@ -5,9 +5,10 @@ use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail};
 use super::components::*;
 use super::i18n::{get_translations, Lang};
 use crate::repo_index::RepoInfo;
+use crate::tokens::TokenListEntry;
 
 /// Renders the main dashboard page with dark theme
-pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
+pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool) -> String {
     let t = get_translations(lang);
     // Render global stats
     let global_stats = render_global_stats(
@@ -170,6 +171,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang) -> String {
         Some("dashboard"),
         &polling_script,
         lang,
+        auth_enabled,
     )
 }
 
@@ -199,6 +201,7 @@ pub fn render_registry_list(
     title: &str,
     repos: &[RepoInfo],
     lang: Lang,
+    auth_enabled: bool,
 ) -> String {
     let t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
@@ -301,10 +304,11 @@ pub fn render_registry_list(
         table_rows
     );
 
-    layout_dark(title, &content, Some(registry_type), "", lang)
+    layout_dark(title, &content, Some(registry_type), "", lang, auth_enabled)
 }
 
 /// Renders a registry list page with pagination
+#[allow(clippy::too_many_arguments)]
 pub fn render_registry_list_paginated(
     registry_type: &str,
     title: &str,
@@ -313,6 +317,7 @@ pub fn render_registry_list_paginated(
     limit: usize,
     total: usize,
     lang: Lang,
+    auth_enabled: bool,
 ) -> String {
     let t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
@@ -515,7 +520,7 @@ pub fn render_registry_list_paginated(
         pagination
     );
 
-    layout_dark(title, &content, Some(registry_type), "", lang)
+    layout_dark(title, &content, Some(registry_type), "", lang, auth_enabled)
 }
 
 /// Renders Docker image detail page
@@ -524,6 +529,7 @@ pub fn render_docker_detail(
     detail: &DockerDetail,
     lang: Lang,
     base_url: &str,
+    auth_enabled: bool,
 ) -> String {
     let _t = get_translations(lang);
     let tags_rows = if detail.tags.is_empty() {
@@ -616,6 +622,7 @@ pub fn render_docker_detail(
         Some("docker"),
         "",
         lang,
+        auth_enabled,
     )
 }
 
@@ -626,6 +633,7 @@ pub fn render_package_detail(
     detail: &PackageDetail,
     lang: Lang,
     base_url: &str,
+    auth_enabled: bool,
 ) -> String {
     let _t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
@@ -727,11 +735,17 @@ pub fn render_package_detail(
         Some(registry_type),
         "",
         lang,
+        auth_enabled,
     )
 }
 
 /// Renders Maven artifact detail page
-pub fn render_maven_detail(path: &str, detail: &MavenDetail, lang: Lang) -> String {
+pub fn render_maven_detail(
+    path: &str,
+    detail: &MavenDetail,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
     let _t = get_translations(lang);
     let artifact_rows = if detail.artifacts.is_empty() {
         r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-500">No artifacts found</td></tr>"##.to_string()
@@ -818,6 +832,218 @@ pub fn render_maven_detail(path: &str, detail: &MavenDetail, lang: Lang) -> Stri
         Some("maven"),
         "",
         lang,
+        auth_enabled,
+    )
+}
+
+// ==================== Token Management Pages ====================
+
+/// Renders the token management page
+pub fn render_tokens_page(tokens: &[TokenListEntry], lang: Lang, auth_enabled: bool) -> String {
+    let t = get_translations(lang);
+
+    let token_list = render_token_list_fragment(tokens, lang);
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <h1 class="text-2xl font-bold text-slate-200 mb-1">{title}</h1>
+            <p class="text-slate-400">{subtitle}</p>
+        </div>
+
+        <!-- Create Token Form -->
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 p-6 mb-6">
+            <h2 class="text-lg font-semibold text-slate-200 mb-4">{create_title}</h2>
+            <form hx-post="/api/ui/tokens/create"
+                  hx-target="#create-result"
+                  hx-swap="innerHTML"
+                  class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-300 mb-1">{desc_label}</label>
+                        <input type="text" name="description" placeholder="{desc_placeholder}"
+                               class="w-full px-3 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-slate-500"
+                               required>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-300 mb-1">{role_label}</label>
+                        <select name="role"
+                                class="w-full px-3 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="read">Read</option>
+                            <option value="write">Write</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-300 mb-1">{ttl_label} ({ttl_days})</label>
+                        <input type="number" name="ttl_days" value="90" min="1" max="3650"
+                               class="w-full px-3 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                </div>
+                <button type="submit"
+                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors">
+                    {create_btn}
+                </button>
+            </form>
+            <div id="create-result" class="mt-4"></div>
+        </div>
+
+        <!-- Token List -->
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-700">
+                <h2 class="text-lg font-semibold text-slate-200">{nav_tokens}</h2>
+            </div>
+            <div id="token-list"
+                 hx-get="/api/ui/tokens/list"
+                 hx-trigger="refreshTokens from:body"
+                 hx-swap="innerHTML">
+                {token_list}
+            </div>
+        </div>
+    "##,
+        title = t.token_management,
+        subtitle = t.token_management_subtitle,
+        create_title = t.token_create,
+        desc_label = t.token_description,
+        desc_placeholder = t.token_description_placeholder,
+        role_label = t.token_role,
+        ttl_label = t.token_ttl,
+        ttl_days = t.token_ttl_days,
+        create_btn = t.token_create,
+        nav_tokens = t.nav_tokens,
+        token_list = token_list,
+    );
+
+    layout_dark(
+        t.token_management,
+        &content,
+        Some("tokens"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
+/// Renders the HTMX fragment shown after token creation (with raw token)
+pub fn render_token_created_fragment(raw_token: &str, lang: Lang) -> String {
+    let t = get_translations(lang);
+    format!(
+        r##"
+        <div class="bg-green-900/30 border border-green-700 rounded-lg p-4">
+            <div class="flex items-start">
+                <svg class="w-5 h-5 text-green-400 mt-0.5 mr-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <div class="flex-1">
+                    <p class="text-green-400 font-medium mb-2">{success}</p>
+                    <div class="flex items-center bg-slate-900 rounded-lg p-3 font-mono text-sm text-slate-200">
+                        <code class="flex-1 break-all">{token}</code>
+                        <button onclick="navigator.clipboard.writeText('{token}'); this.textContent='OK'; setTimeout(() => this.textContent='{copy}', 2000)"
+                                class="ml-3 px-3 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded text-xs font-medium transition-colors flex-shrink-0">
+                            {copy}
+                        </button>
+                    </div>
+                    <p class="text-yellow-400 text-sm mt-2">{warning}</p>
+                </div>
+            </div>
+        </div>
+        <script>document.body.dispatchEvent(new Event('refreshTokens'));</script>
+    "##,
+        success = html_escape(t.token_created_success),
+        token = html_escape(raw_token),
+        copy = t.token_copy,
+        warning = html_escape(t.token_created_warning),
+    )
+}
+
+/// Renders the token list table body (HTMX fragment for refresh)
+pub fn render_token_list_fragment(tokens: &[TokenListEntry], lang: Lang) -> String {
+    let t = get_translations(lang);
+
+    if tokens.is_empty() {
+        return format!(
+            r##"<div class="px-6 py-12 text-center text-slate-500">{}</div>"##,
+            t.token_no_tokens
+        );
+    }
+
+    let rows: String = tokens
+        .iter()
+        .map(|token| {
+            let role_badge = render_role_badge(&token.role);
+            let description = token
+                .description
+                .as_deref()
+                .unwrap_or("-");
+            let expires = format_timestamp(token.expires_at);
+            let last_used = token
+                .last_used
+                .map(format_timestamp)
+                .unwrap_or_else(|| t.token_never_used.to_string());
+
+            format!(
+                r##"
+                <tr class="border-b border-slate-700/50">
+                    <td class="px-6 py-4 text-slate-300">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
+                    <td class="px-6 py-4">{}</td>
+                    <td class="px-6 py-4 text-slate-400 text-sm">{}</td>
+                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-6 py-4">
+                        <button hx-post="/api/ui/tokens/{}/revoke"
+                                hx-confirm="{}"
+                                hx-target="#token-list"
+                                hx-swap="innerHTML"
+                                class="px-3 py-1 text-xs font-medium text-red-400 hover:text-red-300 bg-red-900/20 hover:bg-red-900/40 border border-red-800 rounded transition-colors">
+                            {}
+                        </button>
+                    </td>
+                </tr>
+            "##,
+                html_escape(description),
+                html_escape(&token.user),
+                role_badge,
+                expires,
+                last_used,
+                html_escape(&token.file_id),
+                html_escape(t.token_revoke_confirm),
+                t.token_revoke,
+            )
+        })
+        .collect();
+
+    format!(
+        r##"
+        <table class="w-full">
+            <thead class="bg-slate-800 border-b border-slate-700">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                    <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {}
+            </tbody>
+        </table>
+    "##,
+        t.token_description, t.token_user, t.token_role, t.token_expires, t.token_last_used, rows,
+    )
+}
+
+/// Renders a colored role badge
+fn render_role_badge(role: &crate::tokens::Role) -> String {
+    let (color, bg) = match role {
+        crate::tokens::Role::Read => ("text-blue-400", "bg-blue-900/30 border-blue-800"),
+        crate::tokens::Role::Write => ("text-green-400", "bg-green-900/30 border-green-800"),
+        crate::tokens::Role::Admin => ("text-purple-400", "bg-purple-900/30 border-purple-800"),
+    };
+    format!(
+        r##"<span class="px-2 py-0.5 text-xs font-medium {} {} border rounded">{}</span>"##,
+        color, bg, role
     )
 }
 
@@ -878,7 +1104,14 @@ mod tests {
     #[test]
     fn test_package_detail_uses_public_url() {
         let base_url = "https://registry.example.com";
-        let html = render_package_detail("pypi", "requests", &empty_detail(), Lang::En, base_url);
+        let html = render_package_detail(
+            "pypi",
+            "requests",
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
         assert!(
             html.contains("https://registry.example.com/simple"),
             "PyPI install command must use public_url"
@@ -888,7 +1121,8 @@ mod tests {
             "Must not contain hardcoded localhost"
         );
 
-        let html = render_package_detail("npm", "lodash", &empty_detail(), Lang::En, base_url);
+        let html =
+            render_package_detail("npm", "lodash", &empty_detail(), Lang::En, base_url, false);
         assert!(
             html.contains("https://registry.example.com/npm"),
             "npm install command must use public_url"
@@ -900,13 +1134,15 @@ mod tests {
             &empty_detail(),
             Lang::En,
             base_url,
+            false,
         );
         assert!(
             html.contains("https://registry.example.com/go"),
             "Go proxy command must use public_url"
         );
 
-        let html = render_package_detail("raw", "myfiles", &empty_detail(), Lang::En, base_url);
+        let html =
+            render_package_detail("raw", "myfiles", &empty_detail(), Lang::En, base_url, false);
         assert!(
             html.contains("https://registry.example.com/raw"),
             "Raw download command must use public_url"
@@ -916,7 +1152,8 @@ mod tests {
     #[test]
     fn test_package_detail_fallback_url() {
         let base_url = "http://0.0.0.0:4000";
-        let html = render_package_detail("pypi", "flask", &empty_detail(), Lang::En, base_url);
+        let html =
+            render_package_detail("pypi", "flask", &empty_detail(), Lang::En, base_url, false);
         assert!(
             html.contains("http://0.0.0.0:4000/simple"),
             "Must use fallback host:port when public_url is not set"
@@ -927,7 +1164,13 @@ mod tests {
     fn test_docker_detail_strips_scheme() {
         let detail = super::super::api::DockerDetail { tags: vec![] };
 
-        let html = render_docker_detail("myapp", &detail, Lang::En, "https://registry.example.com");
+        let html = render_docker_detail(
+            "myapp",
+            &detail,
+            Lang::En,
+            "https://registry.example.com",
+            false,
+        );
         assert!(
             html.contains("docker pull registry.example.com/myapp"),
             "Docker pull must strip https:// scheme"
@@ -937,7 +1180,7 @@ mod tests {
             "Docker pull must not include scheme"
         );
 
-        let html = render_docker_detail("myapp", &detail, Lang::En, "http://localhost:4000");
+        let html = render_docker_detail("myapp", &detail, Lang::En, "http://localhost:4000", false);
         assert!(
             html.contains("docker pull localhost:4000/myapp"),
             "Docker pull must strip http:// scheme"
@@ -947,10 +1190,33 @@ mod tests {
     #[test]
     fn test_trailing_slash_no_double_slash() {
         let base_url = "https://registry.example.com";
-        let html = render_package_detail("pypi", "pkg", &empty_detail(), Lang::En, base_url);
+        let html = render_package_detail("pypi", "pkg", &empty_detail(), Lang::En, base_url, false);
         assert!(
             !html.contains("com//simple"),
             "Must not produce double slashes"
         );
+    }
+
+    #[test]
+    fn test_render_tokens_page_empty() {
+        let html = render_tokens_page(&[], Lang::En, true);
+        assert!(html.contains("Token Management"));
+        assert!(html.contains("No tokens yet"));
+        assert!(html.contains("/api/ui/tokens/create"));
+    }
+
+    #[test]
+    fn test_render_role_badge() {
+        let badge = render_role_badge(&crate::tokens::Role::Admin);
+        assert!(badge.contains("purple"));
+        assert!(badge.contains("admin"));
+    }
+
+    #[test]
+    fn test_render_token_created_fragment() {
+        let html = render_token_created_fragment("nra_test_token_123", Lang::En);
+        assert!(html.contains("nra_test_token_123"));
+        assert!(html.contains("refreshTokens"));
+        assert!(html.contains("Copy"));
     }
 }
