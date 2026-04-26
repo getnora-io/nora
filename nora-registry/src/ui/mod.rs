@@ -8,12 +8,14 @@ mod logo;
 mod templates;
 
 use crate::repo_index::paginate;
+use crate::tokens::Role;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{Html, IntoResponse, Redirect},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Form, Router,
 };
 use std::sync::Arc;
 
@@ -88,6 +90,29 @@ fn extract_lang_from_list(query: &ListQuery, cookie_header: Option<&str>) -> Lan
     Lang::default()
 }
 
+fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
+    // Try cookie
+    if let Some(cookies) = headers.get("cookie").and_then(|v| v.to_str().ok()) {
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("nora_lang=") {
+                return Lang::from_str(value);
+            }
+        }
+    }
+    Lang::default()
+}
+
+/// Extract username from Basic Auth header (already validated by auth middleware)
+fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+    let encoded = auth_header.strip_prefix("Basic ")?;
+    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
+    let (user, _) = decoded.split_once(':')?;
+    Some(user.to_string())
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // UI Pages
@@ -108,6 +133,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/go/{*name}", get(go_detail))
         .route("/ui/raw", get(raw_list))
         .route("/ui/raw/{*name}", get(raw_detail))
+        // Token management UI (protected by auth middleware)
+        .route("/ui/tokens", get(tokens_page))
+        // Token management API (HTMX endpoints)
+        .route("/api/ui/tokens/create", post(tokens_create))
+        .route("/api/ui/tokens/list", get(tokens_list))
+        .route("/api/ui/tokens/{file_id}/revoke", post(tokens_revoke))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
@@ -126,8 +157,9 @@ async fn dashboard(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let auth_enabled = state.auth.is_some();
     let response = api_dashboard(State(state)).await.0;
-    Html(render_dashboard(&response, lang))
+    Html(render_dashboard(&response, lang, auth_enabled))
 }
 
 // Docker pages
@@ -139,6 +171,7 @@ async fn docker_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_repos = state.repo_index.get("docker", &state.storage).await;
     let (repos, total) = paginate(&all_repos, page, limit);
@@ -151,6 +184,7 @@ async fn docker_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -165,8 +199,15 @@ async fn docker_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_docker_detail(&state, &name).await;
-    Html(render_docker_detail(&name, &detail, lang, &base_url))
+    Html(render_docker_detail(
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
 }
 
 // Maven pages
@@ -178,6 +219,7 @@ async fn maven_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_repos = state.repo_index.get("maven", &state.storage).await;
     let (repos, total) = paginate(&all_repos, page, limit);
@@ -190,6 +232,7 @@ async fn maven_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -203,8 +246,9 @@ async fn maven_detail(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
+    let auth_enabled = state.auth.is_some();
     let detail = get_maven_detail(&state.storage, &path).await;
-    Html(render_maven_detail(&path, &detail, lang))
+    Html(render_maven_detail(&path, &detail, lang, auth_enabled))
 }
 
 // npm pages
@@ -216,6 +260,7 @@ async fn npm_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_packages = state.repo_index.get("npm", &state.storage).await;
     let (packages, total) = paginate(&all_packages, page, limit);
@@ -228,6 +273,7 @@ async fn npm_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -242,9 +288,15 @@ async fn npm_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_npm_detail(&state.storage, &name).await;
     Html(render_package_detail(
-        "npm", &name, &detail, lang, &base_url,
+        "npm",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
     ))
 }
 
@@ -257,6 +309,7 @@ async fn cargo_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_crates = state.repo_index.get("cargo", &state.storage).await;
     let (crates, total) = paginate(&all_crates, page, limit);
@@ -269,6 +322,7 @@ async fn cargo_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -283,9 +337,15 @@ async fn cargo_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_cargo_detail(&state.storage, &name).await;
     Html(render_package_detail(
-        "cargo", &name, &detail, lang, &base_url,
+        "cargo",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
     ))
 }
 
@@ -298,6 +358,7 @@ async fn pypi_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_packages = state.repo_index.get("pypi", &state.storage).await;
     let (packages, total) = paginate(&all_packages, page, limit);
@@ -310,6 +371,7 @@ async fn pypi_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -324,9 +386,15 @@ async fn pypi_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_pypi_detail(&state.storage, &name).await;
     Html(render_package_detail(
-        "pypi", &name, &detail, lang, &base_url,
+        "pypi",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
     ))
 }
 
@@ -339,6 +407,7 @@ async fn go_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_modules = state.repo_index.get("go", &state.storage).await;
     let (modules, total) = paginate(&all_modules, page, limit);
@@ -351,6 +420,7 @@ async fn go_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -365,8 +435,16 @@ async fn go_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_go_detail(&state.storage, &name).await;
-    Html(render_package_detail("go", &name, &detail, lang, &base_url))
+    Html(render_package_detail(
+        "go",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
 }
 
 // Raw pages
@@ -378,6 +456,7 @@ async fn raw_list(
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
 
     let all_files = state.repo_index.get("raw", &state.storage).await;
     let (files, total) = paginate(&all_files, page, limit);
@@ -390,6 +469,7 @@ async fn raw_list(
         limit,
         total,
         lang,
+        auth_enabled,
     ))
 }
 
@@ -404,8 +484,162 @@ async fn raw_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
     let detail = get_raw_detail(&state.storage, &name).await;
     Html(render_package_detail(
-        "raw", &name, &detail, lang, &base_url,
+        "raw",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
     ))
+}
+
+// ==================== Token Management Handlers ====================
+
+/// Token management page (GET /ui/tokens)
+async fn tokens_page(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_headers(&headers);
+
+    let tokens = match &state.tokens {
+        Some(store) => store.list_all_tokens(),
+        None => vec![],
+    };
+
+    Html(render_tokens_page(&tokens, lang, true))
+}
+
+/// Create token (POST /api/ui/tokens/create)
+#[derive(serde::Deserialize)]
+struct CreateTokenForm {
+    description: String,
+    role: String,
+    ttl_days: Option<u64>,
+}
+
+async fn tokens_create(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<CreateTokenForm>,
+) -> impl IntoResponse {
+    // CSRF check: require HX-Request header (HTMX sets this automatically)
+    if headers.get("hx-request").is_none() {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string()));
+    }
+
+    let lang = extract_lang_from_headers(&headers);
+
+    let store = match &state.tokens {
+        Some(store) => store,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("Token store not configured".to_string()),
+            );
+        }
+    };
+
+    // Get authenticated user from Basic Auth header
+    let user = extract_basic_auth_user(&headers).unwrap_or_else(|| "admin".to_string());
+
+    let role = match form.role.as_str() {
+        "read" => Role::Read,
+        "write" => Role::Write,
+        "admin" => Role::Admin,
+        _ => Role::Read,
+    };
+
+    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
+
+    let description = if form.description.trim().is_empty() {
+        None
+    } else {
+        Some(form.description.trim().to_string())
+    };
+
+    match store.create_token(&user, ttl_days, description, role) {
+        Ok(raw_token) => {
+            let html = render_token_created_fragment(&raw_token, lang);
+            (StatusCode::OK, Html(html))
+        }
+        Err(e) => {
+            let html = format!(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
+                components::html_escape(&e.to_string())
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+        }
+    }
+}
+
+/// List tokens HTMX fragment (GET /api/ui/tokens/list)
+async fn tokens_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_headers(&headers);
+
+    let tokens = match &state.tokens {
+        Some(store) => store.list_all_tokens(),
+        None => vec![],
+    };
+
+    Html(render_token_list_fragment(&tokens, lang))
+}
+
+/// Revoke token (POST /api/ui/tokens/{file_id}/revoke)
+async fn tokens_revoke(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // CSRF check
+    if headers.get("hx-request").is_none() {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string()));
+    }
+
+    // Validate file_id: must be exactly 16 hex chars (path traversal prevention)
+    if file_id.len() != 16 || !file_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("Invalid token ID".to_string()),
+        );
+    }
+
+    let lang = extract_lang_from_headers(&headers);
+
+    let store = match &state.tokens {
+        Some(store) => store,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("Token store not configured".to_string()),
+            );
+        }
+    };
+
+    match store.revoke_token(&file_id) {
+        Ok(()) => {
+            // Return refreshed token list
+            let tokens = store.list_all_tokens();
+            (
+                StatusCode::OK,
+                Html(render_token_list_fragment(&tokens, lang)),
+            )
+        }
+        Err(crate::tokens::TokenError::NotFound) => {
+            (StatusCode::NOT_FOUND, Html("Token not found".to_string()))
+        }
+        Err(e) => {
+            let html = format!(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
+                components::html_escape(&e.to_string())
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+        }
+    }
 }
