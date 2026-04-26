@@ -7,5 +7,17 @@ Dockerfile*
 docker-compose*
 .env*
 *.htpasswd
-data/
 .internal*
+
+# Non-build directories
+fuzz/
+coverage/
+data/
+deploy/
+dist/
+docs-ru/
+docs-site/
+examples/
+research/
+scripts/
+tests/
