@@ -24,10 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
         with:
@@ -72,7 +68,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{version}}-
+            type=semver,pattern={{version}}-{{sha}}
             type=raw,value=latest
 
       - name: Build and push (alpine)
@@ -95,7 +91,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{version}}-
+            type=semver,pattern={{version}}-{{sha}}
             type=raw,value=latest
 
       - name: Build and push (redos)
@@ -119,7 +115,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{version}}-
+            type=semver,pattern={{version}}-{{sha}}
             type=raw,value=latest
 
       - name: Build and push (astra)
@@ -219,7 +215,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
       - name: Set version tag (strip leading v)
         id: ver
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
