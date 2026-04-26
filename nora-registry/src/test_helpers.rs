@@ -55,6 +55,11 @@ pub fn create_test_context_with_raw_disabled() -> TestContext {
     build_context(false, &[], false, |cfg| cfg.raw.enabled = false)
 }
 
+/// Build a test context with auth disabled and custom config tweaks.
+pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> TestContext {
+    build_context(false, &[], false, customize)
+}
+
 fn build_context(
     auth_enabled: bool,
     users: &[(&str, &str)],
@@ -93,6 +98,11 @@ fn build_context(
             metadata_ttl: 0,
         },
         pypi: PypiConfig {
+            proxy: None,
+            proxy_auth: None,
+            proxy_timeout: 5,
+        },
+        pub_dart: PubConfig {
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
@@ -182,6 +192,7 @@ fn build_context(
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
+        .merge(registry::pub_routes())
         .merge(registry::raw_routes())
         .merge(registry::go_routes());
 

@@ -95,6 +95,20 @@ This document describes which parts of each registry protocol are implemented in
 | Yanking | — | Not implemented |
 | Upload signatures (PGP) | — | Not implemented |
 
+## pub.dev (Hosted Repository v2)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Package search | Full | `GET /api/packages?q=...` |
+| Package metadata | Full | `GET /api/packages/{package}` |
+| Version metadata | Full | `GET /api/packages/{package}/versions/{version}` |
+| Security advisories | Full | `GET /api/packages/{package}/advisories` |
+| Archive download | Full | `GET /packages/{package}/versions/{version}.tar.gz` |
+| Upstream proxy | Full | `pub.dev` by default, custom hosted repos supported |
+| URL rewriting | Full | `archive_url`, `package_url`, `url`, `next_url` point to NORA |
+| Checksum verification | Full | SHA-256 sidecar stored for cached archives |
+| Publish / upload | — | Not implemented |
+
 ## Go Module Proxy (GOPROXY)
 
 | Feature | Status | Notes |

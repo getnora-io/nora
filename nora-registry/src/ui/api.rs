@@ -23,6 +23,7 @@ pub struct RegistryStats {
     pub npm: usize,
     pub cargo: usize,
     pub pypi: usize,
+    pub r#pub: usize,
     pub go: usize,
     pub raw: usize,
 }
@@ -116,16 +117,18 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
     let _ = state.repo_index.get("npm", &state.storage).await;
     let _ = state.repo_index.get("cargo", &state.storage).await;
     let _ = state.repo_index.get("pypi", &state.storage).await;
+    let _ = state.repo_index.get("pub", &state.storage).await;
     let _ = state.repo_index.get("go", &state.storage).await;
     let _ = state.repo_index.get("raw", &state.storage).await;
 
-    let (docker, maven, npm, cargo, pypi, go, raw) = state.repo_index.counts();
+    let (docker, maven, npm, cargo, pypi, pub_count, go, raw) = state.repo_index.counts();
     Json(RegistryStats {
         docker,
         maven,
         npm,
         cargo,
         pypi,
+        r#pub: pub_count,
         go,
         raw,
     })
@@ -138,6 +141,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_repos = state.repo_index.get("npm", &state.storage).await;
     let cargo_repos = state.repo_index.get("cargo", &state.storage).await;
     let pypi_repos = state.repo_index.get("pypi", &state.storage).await;
+    let pub_repos = state.repo_index.get("pub", &state.storage).await;
     let go_repos = state.repo_index.get("go", &state.storage).await;
     let raw_repos = state.repo_index.get("raw", &state.storage).await;
 
@@ -147,10 +151,17 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_size: u64 = npm_repos.iter().map(|r| r.size).sum();
     let cargo_size: u64 = cargo_repos.iter().map(|r| r.size).sum();
     let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
+    let pub_size: u64 = pub_repos.iter().map(|r| r.size).sum();
     let go_size: u64 = go_repos.iter().map(|r| r.size).sum();
     let raw_size: u64 = raw_repos.iter().map(|r| r.size).sum();
-    let total_storage =
-        docker_size + maven_size + npm_size + cargo_size + pypi_size + go_size + raw_size;
+    let total_storage = docker_size
+        + maven_size
+        + npm_size
+        + cargo_size
+        + pypi_size
+        + pub_size
+        + go_size
+        + raw_size;
 
     // Count total versions/tags, not just repositories
     let docker_versions: usize = docker_repos.iter().map(|r| r.versions).sum();
@@ -158,6 +169,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
     let npm_versions: usize = npm_repos.iter().map(|r| r.versions).sum();
     let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
     let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
+    let pub_versions: usize = pub_repos.iter().map(|r| r.versions).sum();
     let go_versions: usize = go_repos.iter().map(|r| r.versions).sum();
     let raw_versions: usize = raw_repos.iter().map(|r| r.versions).sum();
     let total_artifacts = docker_versions
@@ -165,6 +177,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         + npm_versions
         + cargo_versions
         + pypi_versions
+        + pub_versions
         + go_versions
         + raw_versions;
 
@@ -211,6 +224,13 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             downloads: state.metrics.get_registry_downloads("pypi"),
             uploads: 0,
             size_bytes: pypi_size,
+        },
+        RegistryCardStats {
+            name: "pub".to_string(),
+            artifact_count: pub_versions,
+            downloads: state.metrics.get_registry_downloads("pub"),
+            uploads: state.metrics.get_registry_uploads("pub"),
+            size_bytes: pub_size,
         },
         RegistryCardStats {
             name: "go".to_string(),
@@ -260,6 +280,11 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             proxy_upstream: state.config.pypi.proxy.clone(),
         },
         MountPoint {
+            registry: "pub.dev".to_string(),
+            mount_path: "/api/packages".to_string(),
+            proxy_upstream: state.config.pub_dart.proxy.clone(),
+        },
+        MountPoint {
             registry: "Go".to_string(),
             mount_path: "/go/".to_string(),
             proxy_upstream: state.config.go.proxy.clone(),
@@ -306,6 +331,10 @@ pub async fn api_detail(
         }
         "cargo" => {
             let detail = get_cargo_detail(&state.storage, &name).await;
+            Json(serde_json::to_value(detail).unwrap_or_default())
+        }
+        "pub" => {
+            let detail = get_pub_detail(&state.storage, &name).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         _ => Json(serde_json::json!({})),
@@ -415,6 +444,13 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         .collect::<HashSet<_>>()
         .len();
 
+    let pub_count = all_keys
+        .iter()
+        .filter(|k| k.starts_with("pub/api/packages/") && !k.contains("/versions/"))
+        .filter_map(|k| k.strip_prefix("pub/api/packages/")?.strip_suffix(".json"))
+        .collect::<HashSet<_>>()
+        .len();
+
     let go = all_keys
         .iter()
         .filter(|k| k.starts_with("go/") && k.ends_with(".zip"))
@@ -439,6 +475,7 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         npm,
         cargo,
         pypi,
+        r#pub: pub_count,
         go,
         raw,
     }
@@ -933,6 +970,66 @@ pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
         }
     }
 
+    PackageDetail { versions }
+}
+
+pub async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
+    let metadata_key = format!("pub/api/packages/{}.json", name);
+    let mut versions = Vec::new();
+
+    if let Ok(data) = storage.get(&metadata_key).await {
+        if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(items) = metadata.get("versions").and_then(|v| v.as_array()) {
+                for item in items {
+                    let Some(version) = item.get("version").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+
+                    let archive_key = format!("pub/packages/{}/versions/{}.tar.gz", name, version);
+                    let (size, published) = if let Some(meta) = storage.stat(&archive_key).await {
+                        (meta.size, format_timestamp(meta.modified))
+                    } else {
+                        let published = item
+                            .get("published")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.chars().take(10).collect::<String>())
+                            .unwrap_or_else(|| "N/A".to_string());
+                        (0, published)
+                    };
+
+                    versions.push(VersionInfo {
+                        version: version.to_string(),
+                        size,
+                        published,
+                    });
+                }
+            }
+        }
+    }
+
+    if versions.is_empty() {
+        let prefix = format!("pub/packages/{}/versions/", name);
+        let keys = storage.list(&prefix).await;
+        for key in keys.iter().filter(|k| k.ends_with(".tar.gz")) {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                if let Some(version) = rest.strip_suffix(".tar.gz") {
+                    let (size, published) = if let Some(meta) = storage.stat(key).await {
+                        (meta.size, format_timestamp(meta.modified))
+                    } else {
+                        (0, "N/A".to_string())
+                    };
+
+                    versions.push(VersionInfo {
+                        version: version.to_string(),
+                        size,
+                        published,
+                    });
+                }
+            }
+        }
+    }
+
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
     PackageDetail { versions }
 }
 

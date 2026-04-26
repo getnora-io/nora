@@ -80,6 +80,7 @@ pub struct RepoIndex {
     pub npm: RegistryIndex,
     pub cargo: RegistryIndex,
     pub pypi: RegistryIndex,
+    pub r#pub: RegistryIndex,
     pub go: RegistryIndex,
     pub raw: RegistryIndex,
 }
@@ -92,6 +93,7 @@ impl RepoIndex {
             npm: RegistryIndex::new(),
             cargo: RegistryIndex::new(),
             pypi: RegistryIndex::new(),
+            r#pub: RegistryIndex::new(),
             go: RegistryIndex::new(),
             raw: RegistryIndex::new(),
         }
@@ -105,6 +107,7 @@ impl RepoIndex {
             "npm" => self.npm.invalidate(),
             "cargo" => self.cargo.invalidate(),
             "pypi" => self.pypi.invalidate(),
+            "pub" => self.r#pub.invalidate(),
             "go" => self.go.invalidate(),
             "raw" => self.raw.invalidate(),
             _ => {}
@@ -119,6 +122,7 @@ impl RepoIndex {
             "npm" => &self.npm,
             "cargo" => &self.cargo,
             "pypi" => &self.pypi,
+            "pub" => &self.r#pub,
             "go" => &self.go,
             "raw" => &self.raw,
             _ => return Arc::new(Vec::new()),
@@ -140,6 +144,7 @@ impl RepoIndex {
                 "npm" => build_npm_index(storage).await,
                 "cargo" => build_cargo_index(storage).await,
                 "pypi" => build_pypi_index(storage).await,
+                "pub" => build_pub_index(storage).await,
                 "go" => build_go_index(storage).await,
                 "raw" => build_raw_index(storage).await,
                 _ => Vec::new(),
@@ -152,13 +157,14 @@ impl RepoIndex {
     }
 
     /// Get counts for stats (no rebuild, just current state)
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
         (
             self.docker.count(),
             self.maven.count(),
             self.npm.count(),
             self.cargo.count(),
             self.pypi.count(),
+            self.r#pub.count(),
             self.go.count(),
             self.raw.count(),
         )
@@ -334,6 +340,72 @@ async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
                         entry.2 = meta.modified;
                     }
                 }
+            }
+        }
+    }
+
+    to_sorted_vec(packages)
+}
+
+async fn build_pub_index(storage: &Storage) -> Vec<RepoInfo> {
+    let metadata_keys = storage.list("pub/api/packages/").await;
+    let archive_keys = storage.list("pub/packages/").await;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &metadata_keys {
+        let Some(rest) = key.strip_prefix("pub/api/packages/") else {
+            continue;
+        };
+        if rest.contains('/') || !rest.ends_with(".json") {
+            continue;
+        }
+
+        let Some(name) = rest.strip_suffix(".json") else {
+            continue;
+        };
+
+        let entry = packages.entry(name.to_string()).or_insert((0, 0, 0));
+
+        if let Ok(data) = storage.get(key).await {
+            entry.0 = serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|json| {
+                    json.get("versions")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len())
+                })
+                .unwrap_or_else(|| entry.0.max(1));
+        }
+
+        if let Some(meta) = storage.stat(key).await {
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
+            }
+        }
+    }
+
+    for key in &archive_keys {
+        if !key.ends_with(".tar.gz") || key.ends_with(".tar.gz.sha256") {
+            continue;
+        }
+
+        let Some(rest) = key.strip_prefix("pub/packages/") else {
+            continue;
+        };
+        let parts: Vec<_> = rest.split('/').collect();
+        if parts.len() != 4 || parts[1] != "versions" {
+            continue;
+        }
+
+        let entry = packages.entry(parts[0].to_string()).or_insert((0, 0, 0));
+        if entry.0 == 0 {
+            entry.0 = 1;
+        }
+
+        if let Some(meta) = storage.stat(key).await {
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
         }
     }
@@ -545,8 +617,11 @@ mod tests {
     #[test]
     fn test_repo_index_new() {
         let idx = RepoIndex::new();
-        let (d, m, n, c, p, g, r) = idx.counts();
-        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
+        let (d, m, n, c, pypi, pub_count, g, r) = idx.counts();
+        assert_eq!(
+            (d, m, n, c, pypi, pub_count, g, r),
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        );
     }
 
     #[test]
@@ -558,6 +633,7 @@ mod tests {
         idx.invalidate("npm");
         idx.invalidate("cargo");
         idx.invalidate("pypi");
+        idx.invalidate("pub");
         idx.invalidate("raw");
         idx.invalidate("unknown"); // should be a no-op
     }
@@ -565,8 +641,11 @@ mod tests {
     #[test]
     fn test_repo_index_default() {
         let idx = RepoIndex::default();
-        let (d, m, n, c, p, g, r) = idx.counts();
-        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
+        let (d, m, n, c, pypi, pub_count, g, r) = idx.counts();
+        assert_eq!(
+            (d, m, n, c, pypi, pub_count, g, r),
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        );
     }
 
     #[test]

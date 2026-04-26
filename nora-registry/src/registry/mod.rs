@@ -7,6 +7,7 @@ pub mod docker_auth;
 mod go;
 mod maven;
 mod npm;
+mod pub_dart;
 mod pypi;
 mod raw;
 
@@ -16,6 +17,7 @@ pub use docker_auth::DockerAuth;
 pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
+pub use pub_dart::routes as pub_routes;
 pub use pypi::routes as pypi_routes;
 pub use raw::routes as raw_routes;
 

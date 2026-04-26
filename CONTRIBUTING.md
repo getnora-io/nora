@@ -79,7 +79,7 @@ curl http://localhost:4000/health
 # Build release binary first
 cargo build --release
 
-# Run full smoke suite (starts NORA, tests all 7 protocols, stops)
+# Run full smoke suite (starts NORA, tests all 8 protocols, stops)
 bash tests/smoke.sh
 ```
 

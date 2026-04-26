@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub pypi: PypiConfig,
     #[serde(default)]
+    pub pub_dart: PubConfig,
+    #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
     pub go: GoConfig,
@@ -143,6 +145,31 @@ pub struct PypiConfig {
     pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+}
+
+/// Dart/Flutter pub registry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubConfig {
+    #[serde(default = "default_pub_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+}
+
+fn default_pub_proxy() -> Option<String> {
+    Some("https://pub.dev".to_string())
+}
+
+impl Default for PubConfig {
+    fn default() -> Self {
+        Self {
+            proxy: default_pub_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+        }
+    }
 }
 
 /// Cargo registry configuration
@@ -585,6 +612,10 @@ impl Config {
         if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
             tracing::warn!("Cargo proxy credentials in config.toml are plaintext — consider NORA_CARGO_PROXY_AUTH env var");
         }
+        // pub.dev
+        if self.pub_dart.proxy_auth.is_some() && std::env::var("NORA_PUB_PROXY_AUTH").is_err() {
+            tracing::warn!("pub proxy credentials in config.toml are plaintext — consider NORA_PUB_PROXY_AUTH env var");
+        }
     }
 
     /// Validate configuration and return (warnings, errors).
@@ -871,6 +902,19 @@ impl Config {
             self.pypi.proxy_auth = if val.is_empty() { None } else { Some(val) };
         }
 
+        // pub.dev config
+        if let Ok(val) = env::var("NORA_PUB_PROXY") {
+            self.pub_dart.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_PUB_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.pub_dart.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_PUB_PROXY_AUTH") {
+            self.pub_dart.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+
         // Docker config
         if let Ok(val) = env::var("NORA_DOCKER_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -1047,6 +1091,7 @@ impl Default for Config {
             maven: MavenConfig::default(),
             npm: NpmConfig::default(),
             pypi: PypiConfig::default(),
+            pub_dart: PubConfig::default(),
             go: GoConfig::default(),
             cargo: CargoConfig::default(),
             docker: DockerConfig::default(),

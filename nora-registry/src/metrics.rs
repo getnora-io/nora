@@ -119,6 +119,10 @@ fn detect_registry(path: &str) -> String {
         "npm".to_string()
     } else if path.starts_with("/cargo") {
         "cargo".to_string()
+    } else if path.starts_with("/api/packages")
+        || (path.starts_with("/packages/") && path.contains("/versions/"))
+    {
+        "pub".to_string()
     } else if path.starts_with("/simple") || path.starts_with("/packages") {
         "pypi".to_string()
     } else if path.starts_with("/go/") {
@@ -186,9 +190,15 @@ mod tests {
     #[test]
     fn test_detect_registry_pypi() {
         assert_eq!(detect_registry("/simple/requests/"), "pypi");
+        assert_eq!(detect_registry("/simple/requests/pkg-1.0.0.tar.gz"), "pypi");
+    }
+
+    #[test]
+    fn test_detect_registry_pub() {
+        assert_eq!(detect_registry("/api/packages?q=http"), "pub");
         assert_eq!(
-            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz"),
-            "pypi"
+            detect_registry("/packages/http/versions/1.0.0.tar.gz"),
+            "pub"
         );
     }
 

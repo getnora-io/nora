@@ -8,11 +8,13 @@ use argon2::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -407,13 +409,15 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Set file permissions to 600 (owner read/write only)
+/// Set file permissions to 600 (owner read/write only).
+#[cfg(unix)]
 fn set_file_permissions_600(path: &Path) {
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
+
+/// No-op on non-Unix platforms.
+#[cfg(not(unix))]
+fn set_file_permissions_600(_: &Path) {}
 
 #[derive(Debug, Error)]
 pub enum TokenError {
@@ -569,13 +573,19 @@ mod tests {
             .unwrap();
 
         let file_id = sha256_hex(&token);
-        let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
 
         #[cfg(unix)]
         {
+            let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
             let metadata = fs::metadata(&file_path).unwrap();
             let mode = metadata.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
+            assert!(file_path.exists());
         }
     }
 

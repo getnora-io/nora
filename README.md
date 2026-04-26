@@ -15,7 +15,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
-- **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
+- **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, pub.dev, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 633 tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
@@ -23,7 +23,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 
-**32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
+**32 MB** binary | **< 100 MB** RAM | **3s** startup | **8** registries
 
 > Used in production at [DevIT Academy](https://github.com/devitway) since January 2026 for Docker images, Maven artifacts, and npm packages.
 
@@ -36,6 +36,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | npm | `/npm/` | npmjs.org, custom | ✓ |
 | Cargo | `/cargo/` | crates.io | ✓ |
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
+| pub.dev | `/api/packages` | pub.dev, custom | ✓ |
 | Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
 | Raw files | `/raw/` | — | ✓ |
 
@@ -103,6 +104,12 @@ npm publish
 
 ```bash
 GOPROXY=http://localhost:4000/go go get golang.org/x/text@latest
+```
+
+### Dart / Flutter pub
+
+```bash
+dart pub add http --hosted-url http://localhost:4000
 ```
 
 ## Features
@@ -254,6 +261,7 @@ nora mirror docker --images alpine:3.20,nginx    # Mirror Docker images
 | `/npm/` | npm |
 | `/cargo/` | Cargo |
 | `/simple/` | PyPI |
+| `/api/packages` | pub.dev |
 | `/go/` | Go Modules |
 | `/raw/` | Raw files |
 

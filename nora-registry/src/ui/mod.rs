@@ -129,6 +129,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/cargo/{name}", get(cargo_detail))
         .route("/ui/pypi", get(pypi_list))
         .route("/ui/pypi/{name}", get(pypi_detail))
+        .route("/ui/pub", get(pub_list))
+        .route("/ui/pub/{name}", get(pub_detail))
         .route("/ui/go", get(go_list))
         .route("/ui/go/{*name}", get(go_detail))
         .route("/ui/raw", get(raw_list))
@@ -390,6 +392,55 @@ async fn pypi_detail(
     let detail = get_pypi_detail(&state.storage, &name).await;
     Html(render_package_detail(
         "pypi",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// pub.dev pages
+async fn pub_list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_packages = state.repo_index.get("pub", &state.storage).await;
+    let (packages, total) = paginate(&all_packages, page, limit);
+
+    Html(render_registry_list_paginated(
+        "pub",
+        "pub.dev Repository",
+        &packages,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn pub_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let detail = get_pub_detail(&state.storage, &name).await;
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    Html(render_package_detail(
+        "pub",
         &name,
         &detail,
         lang,

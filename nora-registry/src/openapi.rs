@@ -19,9 +19,9 @@ use crate::AppState;
     info(
         title = "Nora",
         version = "0.6.5",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, and Raw",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, pub.dev and Raw",
         license(name = "MIT"),
-        contact(name = "DevITWay", url = "https://getnora.dev")
+        contact(name = "NORA Docs", url = "https://getnora.dev")
     ),
     servers(
         (url = "/", description = "Current server")
@@ -35,6 +35,7 @@ use crate::AppState;
         (name = "npm", description = "npm Registry API"),
         (name = "cargo", description = "Cargo Registry API"),
         (name = "pypi", description = "PyPI Simple API"),
+        (name = "pub", description = "Dart pub hosted API"),
         (name = "go", description = "Go Module Proxy API"),
         (name = "raw", description = "Raw File Storage API"),
         (name = "auth", description = "Authentication & API Tokens")
@@ -76,6 +77,12 @@ use crate::AppState;
         crate::openapi::pypi_simple,
         crate::openapi::pypi_package,
         crate::openapi::pypi_upload,
+        // pub.dev
+        crate::openapi::pub_search,
+        crate::openapi::pub_package,
+        crate::openapi::pub_version,
+        crate::openapi::pub_advisories,
+        crate::openapi::pub_archive,
         // Go
         crate::openapi::go_module_latest,
         crate::openapi::go_module_info,
@@ -148,6 +155,7 @@ pub struct RegistriesHealth {
     pub npm: String,
     pub cargo: String,
     pub pypi: String,
+    pub r#pub: String,
     pub go: String,
     pub raw: String,
 }
@@ -254,7 +262,7 @@ pub struct GlobalStats {
 
 #[derive(Serialize, ToSchema)]
 pub struct RegistryCardStats {
-    /// Registry name (docker, maven, npm, cargo, pypi, go, raw)
+    /// Registry name (docker, maven, npm, cargo, pypi, pub, go, raw)
     pub name: String,
     /// Number of artifacts in this registry
     pub artifact_count: usize,
@@ -711,6 +719,82 @@ pub async fn pypi_package() {}
     )
 )]
 pub async fn pypi_upload() {}
+
+// -------------------- pub.dev --------------------
+
+/// Search pub packages
+#[utoipa::path(
+    get,
+    path = "/api/packages",
+    tag = "pub",
+    responses(
+        (status = 200, description = "Package search results"),
+        (status = 404, description = "Proxy not configured")
+    )
+)]
+pub async fn pub_search() {}
+
+/// Get pub package metadata
+#[utoipa::path(
+    get,
+    path = "/api/packages/{package}",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name")
+    ),
+    responses(
+        (status = 200, description = "Package metadata with versions"),
+        (status = 404, description = "Package not found")
+    )
+)]
+pub async fn pub_package() {}
+
+/// Get pub version metadata
+#[utoipa::path(
+    get,
+    path = "/api/packages/{package}/versions/{version}",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name"),
+        ("version" = String, Path, description = "Package version")
+    ),
+    responses(
+        (status = 200, description = "Version metadata"),
+        (status = 404, description = "Version not found")
+    )
+)]
+pub async fn pub_version() {}
+
+/// Get pub security advisories
+#[utoipa::path(
+    get,
+    path = "/api/packages/{package}/advisories",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name")
+    ),
+    responses(
+        (status = 200, description = "Package advisories"),
+        (status = 404, description = "Package not found")
+    )
+)]
+pub async fn pub_advisories() {}
+
+/// Download pub package archive
+#[utoipa::path(
+    get,
+    path = "/packages/{package}/versions/{version}.tar.gz",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name"),
+        ("version" = String, Path, description = "Package version")
+    ),
+    responses(
+        (status = 200, description = "Package archive"),
+        (status = 404, description = "Archive not found")
+    )
+)]
+pub async fn pub_archive() {}
 
 // -------------------- Go Modules --------------------
 

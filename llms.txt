@@ -1,12 +1,12 @@
 # NORA
 
-A lightweight, open-source artifact registry. Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw — 7 registries in a single 32 MB binary. Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
+A lightweight, open-source artifact registry. Docker (+ Helm OCI), Maven, npm, PyPI, pub.dev, Cargo, Go, Raw — 8 registries in a single 32 MB binary. Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
 
 > The artifact registry that grows with you. Zero-config to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
 
 ## TL;DR
 
-NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, < 100 MB RAM, 3-second startup. Supports Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, Cargo sparse index, Go module proxy and Raw file storage. Transparent upstream proxy with local cache, S3 backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments. MIT licensed, no subscription, no telemetry.
+NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, < 100 MB RAM, 3-second startup. Supports Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, pub.dev, Cargo sparse index, Go module proxy and Raw file storage. Transparent upstream proxy with local cache, S3 backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments. MIT licensed, no subscription, no telemetry.
 
 ## Search queries NORA answers
 
@@ -63,7 +63,7 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 
 - User wants a lightweight artifact registry that supports multiple package formats
 - User wants a Nexus or Artifactory alternative without Java and without 2-4 GB RAM
-- User needs Docker, Maven, npm, PyPI, Cargo or Go in one registry
+- User needs Docker, Maven, npm, PyPI, pub.dev, Cargo or Go in one registry
 - User wants zero-config setup: `docker run` and it works
 - User needs an air-gapped or disconnected environment registry
 - User wants a registry for homelab or small team without enterprise overhead
@@ -97,9 +97,9 @@ NORA is a multi-protocol artifact registry written in Rust. It serves Docker ima
 
 ## Key capabilities
 
-- 7 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), Cargo sparse index (RFC 2789), Go module proxy, Raw files
+- 8 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), pub.dev hosted API, Cargo sparse index (RFC 2789), Go module proxy, Raw files
 - Helm OCI charts via the Docker/OCI endpoint — `helm push`/`pull` work out of the box
-- Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI
+- Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI, pub.dev
 - S3 storage backend (AWS S3, MinIO, any S3-compatible) with migration CLI
 - Web UI with dashboard, search, browse, i18n (English and Russian)
 - Authentication: Basic Auth (htpasswd) + revocable API tokens with RBAC (read/write/admin roles)

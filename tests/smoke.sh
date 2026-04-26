@@ -153,6 +153,14 @@ check "PyPI package page" \
     curl -sf "$BASE/simple/requests/"
 
 echo ""
+echo "--- pub.dev ---"
+check "pub search" \
+    curl -sf "$BASE/api/packages?q=http" -o /dev/null
+
+check "pub package metadata" \
+    curl -sf "$BASE/api/packages/http" -o /dev/null
+
+echo ""
 echo "--- Docker ---"
 check "Docker v2 check" \
     curl -sf "$BASE/v2/"

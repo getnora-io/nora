@@ -142,7 +142,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
 
         {}
 
-        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 mb-6">
             {}
         </div>
 
@@ -194,7 +194,7 @@ fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Renders a registry list page (docker, maven, npm, cargo, pypi)
+/// Renders a registry list page (docker, maven, npm, cargo, pypi, pub)
 #[allow(dead_code)]
 pub fn render_registry_list(
     registry_type: &str,
@@ -626,7 +626,7 @@ pub fn render_docker_detail(
     )
 }
 
-/// Renders package detail page (npm, cargo, pypi)
+/// Renders package detail page (npm, cargo, pypi, pub)
 pub fn render_package_detail(
     registry_type: &str,
     name: &str,
@@ -670,6 +670,7 @@ pub fn render_package_detail(
         "cargo" => format!("cargo add {}", name),
         "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
         "go" => format!("GOPROXY={}/go go get {}", base_url, name),
+        "pub" => format!("dart pub add {} --hosted-url {}", name, base_url),
         "raw" => format!("curl -O {}/raw/{}/<file>", base_url, name),
         _ => String::new(),
     };
@@ -1055,6 +1056,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "npm" => icons::NPM,
         "cargo" => icons::CARGO,
         "pypi" => icons::PYPI,
+        "pub" => icons::PUB,
         "go" => icons::GO,
         "raw" => icons::RAW,
         _ => {
@@ -1070,6 +1072,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         "npm" => "npm Registry",
         "cargo" => "Cargo Registry",
         "pypi" => "PyPI Repository",
+        "pub" => "pub.dev Repository",
         "go" => "Go Modules",
         "raw" => "Raw Storage",
         _ => "Registry",

@@ -31,6 +31,7 @@ pub struct RegistriesHealth {
     pub npm: String,
     pub cargo: String,
     pub pypi: String,
+    pub r#pub: String,
     pub go: String,
     pub raw: String,
 }
@@ -72,6 +73,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
             npm: "ok".to_string(),
             cargo: "ok".to_string(),
             pypi: "ok".to_string(),
+            r#pub: "ok".to_string(),
             go: "ok".to_string(),
             raw: "ok".to_string(),
         },

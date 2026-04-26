@@ -423,6 +423,7 @@ async fn run_server(config: Config, storage: Storage) {
         .merge(registry::npm_routes())
         .merge(registry::cargo_routes())
         .merge(registry::pypi_routes())
+        .merge(registry::pub_routes())
         .merge(registry::raw_routes())
         .merge(registry::go_routes());
 
@@ -560,6 +561,7 @@ async fn run_server(config: Config, storage: Storage) {
         npm = "/npm/",
         cargo = "/cargo/",
         pypi = "/simple/",
+        r#pub = "/api/packages",
         go = "/go/",
         raw = "/raw/",
         "Available endpoints"
@@ -632,7 +634,9 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     if covered.contains("*") {
         return;
     }
-    let all_registries = ["docker", "maven", "npm", "pypi", "cargo", "go", "raw"];
+    let all_registries = [
+        "docker", "maven", "npm", "pypi", "pub", "cargo", "go", "raw",
+    ];
     let mut uncovered = Vec::new();
     for name in &all_registries {
         if !covered.contains(name) {

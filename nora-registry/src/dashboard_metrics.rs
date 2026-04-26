@@ -9,7 +9,9 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 /// Known registry names for per-registry metrics
-const REGISTRIES: &[&str] = &["docker", "maven", "npm", "cargo", "pypi", "raw", "go"];
+const REGISTRIES: &[&str] = &[
+    "docker", "maven", "npm", "cargo", "pypi", "pub", "raw", "go",
+];
 
 /// Serializable snapshot of metrics for persistence.
 /// Uses HashMap for per-registry counters — adding a new registry only
@@ -215,15 +217,18 @@ mod tests {
     #[test]
     fn test_record_download_all_registries() {
         let m = DashboardMetrics::new();
-        for reg in &["docker", "npm", "maven", "cargo", "pypi", "go", "raw"] {
+        for reg in &[
+            "docker", "npm", "maven", "cargo", "pypi", "pub", "go", "raw",
+        ] {
             m.record_download(reg);
         }
-        assert_eq!(m.downloads.load(Ordering::Relaxed), 7);
+        assert_eq!(m.downloads.load(Ordering::Relaxed), 8);
         assert_eq!(m.get_registry_downloads("docker"), 1);
         assert_eq!(m.get_registry_downloads("npm"), 1);
         assert_eq!(m.get_registry_downloads("maven"), 1);
         assert_eq!(m.get_registry_downloads("cargo"), 1);
         assert_eq!(m.get_registry_downloads("pypi"), 1);
+        assert_eq!(m.get_registry_downloads("pub"), 1);
         assert_eq!(m.get_registry_downloads("go"), 1);
         assert_eq!(m.get_registry_downloads("raw"), 1);
     }
@@ -239,15 +244,18 @@ mod tests {
     #[test]
     fn test_record_upload_all_registries() {
         let m = DashboardMetrics::new();
-        for reg in &["docker", "npm", "maven", "cargo", "pypi", "go", "raw"] {
+        for reg in &[
+            "docker", "npm", "maven", "cargo", "pypi", "pub", "go", "raw",
+        ] {
             m.record_upload(reg);
         }
-        assert_eq!(m.uploads.load(Ordering::Relaxed), 7);
+        assert_eq!(m.uploads.load(Ordering::Relaxed), 8);
         assert_eq!(m.get_registry_uploads("docker"), 1);
         assert_eq!(m.get_registry_uploads("npm"), 1);
         assert_eq!(m.get_registry_uploads("maven"), 1);
         assert_eq!(m.get_registry_uploads("cargo"), 1);
         assert_eq!(m.get_registry_uploads("pypi"), 1);
+        assert_eq!(m.get_registry_uploads("pub"), 1);
         assert_eq!(m.get_registry_uploads("go"), 1);
         assert_eq!(m.get_registry_uploads("raw"), 1);
     }
