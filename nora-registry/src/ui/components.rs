@@ -149,8 +149,7 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
             </a>
         "##, href, active_class, fill_attr, stroke_attr, icon_path, label)
     }).collect();
-
-    // Admin section (only when auth is enabled)
+    // Flat sidebar items (no umbrella category)
     let admin_section = if auth_enabled {
         let tokens_active = if active == "tokens" {
             "bg-slate-700 text-white"
@@ -159,17 +158,16 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
         };
         format!(
             r##"
-                <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mt-6 mb-3">
-                    {}
+                <div class="border-t border-slate-700 mt-6 pt-4">
+                    <a href="/ui/tokens" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+                        </svg>
+                        {}
+                    </a>
                 </div>
-                <a href="/ui/tokens" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
-                    <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
-                    </svg>
-                    {}
-                </a>
             "##,
-            t.nav_admin, tokens_active, t.nav_tokens
+            tokens_active, t.nav_tokens
         )
     } else {
         String::new()
