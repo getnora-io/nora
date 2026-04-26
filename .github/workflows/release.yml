@@ -17,6 +17,8 @@ jobs:
     runs-on: [self-hosted, nora]
     outputs:
       hash: ${{ steps.hash.outputs.hash }}
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+      version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
       packages: write
@@ -24,6 +26,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Extract version and SHA
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Set up Rust
         run: |
@@ -70,6 +80,7 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
@@ -93,6 +104,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-redos,onlatest=true
           tags: |
+            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
@@ -116,6 +128,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-astra,onlatest=true
           tags: |
+            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
@@ -145,7 +158,7 @@ jobs:
       - name: Smoke test — verify alpine image starts and responds
         run: |
           docker rm -f nora-smoke 2>/dev/null || true
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}-${{ steps.sha.outputs.short_sha }}
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
@@ -173,15 +186,11 @@ jobs:
             suffix: "-astra"
 
     steps:
-      - name: Set version tag (strip leading v)
-        id: ver
-        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
       - name: Trivy — image scan (${{ matrix.name }})
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           scan-type: image
-          image-ref: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
+          image-ref: ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}${{ matrix.suffix }}
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
@@ -217,10 +226,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Set version tag (strip leading v)
-        id: ver
-        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Download binary artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -290,17 +295,17 @@ jobs:
 
             **Alpine (standard):**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}
             ```
 
             **RED OS:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}-redos
             ```
 
             **Astra Linux SE:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}-astra
             ```
 
             ## Changelog
