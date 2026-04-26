@@ -86,17 +86,23 @@ async fn handle_request(
         path.clone()
     };
 
+    // Parse tarball version (used for both pre-download and integrity checks)
+    let tarball_version = if is_tarball {
+        let filename = path.split("/-/").nth(1).unwrap_or("");
+        crate::curation::parse_npm_tarball_version(&package_name, filename)
+    } else {
+        None
+    };
+
     // Curation check — tarball downloads only (metadata passes through)
     if is_tarball {
-        let filename = path.split("/-/").nth(1).unwrap_or("");
-        let version = crate::curation::parse_npm_tarball_version(&package_name, filename);
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
             &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
-            version.as_deref(),
+            tarball_version.as_deref(),
         ) {
             return response;
         }
@@ -139,6 +145,17 @@ async fn handle_request(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed")
                     .into_response();
             }
+        }
+
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Npm,
+            &package_name,
+            tarball_version.as_deref(),
+            &data,
+        ) {
+            return response;
         }
 
         state.metrics.record_download("npm");

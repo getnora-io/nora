@@ -57,21 +57,28 @@ async fn handle(
         }
     };
 
-    // Curation check — .zip downloads only (metadata passes through)
-    if file.ends_with(".zip") {
+    // Parse curation coords for .zip downloads (used in both pre-download and integrity checks)
+    let go_curation = if file.ends_with(".zip") {
         let module_name =
             decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
-        // Extract version: "@v/v1.0.0.zip" → "v1.0.0"
         let version = file
             .strip_prefix("@v/")
-            .and_then(|f| f.strip_suffix(".zip"));
+            .and_then(|f| f.strip_suffix(".zip"))
+            .map(|v| v.to_string());
+        Some((module_name, version))
+    } else {
+        None
+    };
+
+    // Curation check — .zip downloads only (metadata passes through)
+    if let Some((ref module_name, ref version)) = go_curation {
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
             &headers,
             crate::curation::RegistryType::Go,
-            &module_name,
-            version,
+            module_name,
+            version.as_deref(),
         ) {
             return response;
         }
@@ -87,6 +94,19 @@ async fn handle(
 
     // 1. Try local cache (for immutable files, this is authoritative)
     if let Ok(data) = state.storage.get(&storage_key).await {
+        // Curation integrity verification (issue #189)
+        if let Some((ref module_name, ref version)) = go_curation {
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation,
+                crate::curation::RegistryType::Go,
+                module_name,
+                version.as_deref(),
+                &data,
+            ) {
+                return response;
+            }
+        }
+
         state.metrics.record_download("go");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

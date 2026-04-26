@@ -252,6 +252,17 @@ async fn download(
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Post-download integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Cargo,
+            &crate_name,
+            Some(&version),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("cargo");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

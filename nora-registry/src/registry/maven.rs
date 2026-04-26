@@ -115,26 +115,46 @@ async fn download(
         .collect::<Vec<_>>()
         .join("/");
 
-    // Curation check — only for versioned artifact files, not metadata
-    if let MavenPathKind::VersionFile(ref coords) = classify_path(&path) {
+    // Classify path for curation (used in both pre-download and integrity checks)
+    let curation_coords = if let MavenPathKind::VersionFile(coords) = classify_path(&path) {
         let maven_name = format!(
             "{}:{}",
             coords.group_path.replace('/', "."),
             coords.artifact_id
         );
+        Some((maven_name, coords.version))
+    } else {
+        None
+    };
+
+    // Curation check — only for versioned artifact files, not metadata
+    if let Some((ref maven_name, ref maven_version)) = curation_coords {
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
             &headers,
             crate::curation::RegistryType::Maven,
-            &maven_name,
-            Some(&coords.version),
+            maven_name,
+            Some(maven_version),
         ) {
             return response;
         }
     }
 
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some((ref maven_name, ref maven_version)) = curation_coords {
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation,
+                crate::curation::RegistryType::Maven,
+                maven_name,
+                Some(maven_version),
+                &data,
+            ) {
+                return response;
+            }
+        }
+
         state.metrics.record_download("maven");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

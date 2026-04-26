@@ -194,6 +194,17 @@ async fn download_file(
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+            version.as_deref(),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("pypi");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

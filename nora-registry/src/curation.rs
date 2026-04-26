@@ -329,6 +329,73 @@ pub fn check_download(
     }
 }
 
+/// Verify artifact integrity after download (post-download phase, issue #189).
+///
+/// Computes SHA-256 of `data`, then runs curation evaluation with the hash
+/// filled in `FilterRequest.integrity`. This catches integrity mismatches
+/// against allowlist entries.
+///
+/// Returns `Some(Response)` if integrity check fails (403), `None` to proceed.
+pub fn verify_integrity(
+    engine: &CurationEngine,
+    registry: RegistryType,
+    name: &str,
+    version: Option<&str>,
+    data: &[u8],
+) -> Option<Response> {
+    // Only run if curation is active (not Off)
+    if !engine.is_active() {
+        return None;
+    }
+
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(data);
+    let integrity = format!("sha256:{}", hex::encode(hash));
+
+    let request = FilterRequest {
+        registry,
+        upstream: None,
+        name: name.to_string(),
+        version: version.map(|v| v.to_string()),
+        integrity: Some(integrity),
+        bypass: false, // bypass already checked in pre-download phase
+    };
+
+    let result = engine.evaluate(&request);
+
+    match &result.decision {
+        Decision::Block { rule, reason } => {
+            // Only act on integrity-related blocks
+            if !rule.contains("integrity") {
+                return None;
+            }
+            if result.audited {
+                tracing::info!(
+                    registry = %registry,
+                    package = %name,
+                    version = version.unwrap_or("*"),
+                    rule = %rule,
+                    reason = %reason,
+                    "[AUDIT] Integrity check would block download"
+                );
+                None
+            } else {
+                Some(
+                    BlockedResponse {
+                        rule: rule.clone(),
+                        reason: reason.clone(),
+                        registry: registry.to_string(),
+                        package: name.to_string(),
+                        version: version.map(|v| v.to_string()),
+                    }
+                    .into_response(),
+                )
+            }
+        }
+        Decision::Allow | Decision::Skip => None,
+    }
+}
+
 // ============================================================================
 // Version parsers for filename-based registries (issue #187)
 // ============================================================================
@@ -687,26 +754,29 @@ impl ProxyFilter for AllowlistFilter {
                 ),
             },
             Some(entry) => {
-                if let Some(ref entry_hash) = entry.integrity {
-                    if let Some(ref req_hash) = request.integrity {
-                        if entry_hash != req_hash {
+                // Integrity check only runs when request provides a hash
+                // (post-download phase). Pre-download checks pass integrity=None
+                // and skip this entirely.
+                if let Some(ref actual_hash) = request.integrity {
+                    if let Some(ref expected_hash) = entry.integrity {
+                        if actual_hash != expected_hash {
                             return Decision::Block {
                                 rule: "allowlist:integrity".to_string(),
                                 reason: format!(
-                                    "Integrity mismatch for '{}@{}'",
-                                    request.name, version
+                                    "Integrity mismatch for '{}@{}': expected {}, got {}",
+                                    request.name, version, expected_hash, actual_hash
                                 ),
                             };
                         }
+                    } else if self.require_integrity {
+                        return Decision::Block {
+                            rule: "allowlist:integrity".to_string(),
+                            reason: format!(
+                                "Allowlist entry '{}@{}' missing integrity hash (require_integrity=true)",
+                                request.name, version
+                            ),
+                        };
                     }
-                } else if self.require_integrity {
-                    return Decision::Block {
-                        rule: "allowlist:integrity".to_string(),
-                        reason: format!(
-                            "Entry '{}@{}' missing integrity hash (require_integrity=true)",
-                            request.name, version
-                        ),
-                    };
                 }
                 Decision::Allow
             }
@@ -768,6 +838,7 @@ impl ProxyFilter for NamespaceFilter {
 mod tests {
     use super::*;
     use crate::config::{CurationConfig, CurationMode, CurationOnFailure};
+    use sha2::Digest;
 
     /// A test filter that always allows.
     struct AllowAllFilter;
@@ -1954,6 +2025,7 @@ mod tests {
 
     #[test]
     fn test_allowlist_require_integrity_missing_blocks() {
+        // require_integrity=true + entry without integrity + post-download (integrity provided) → block
         let filter = make_allowlist_entries(
             vec![AllowlistEntry {
                 registry: "npm".to_string(),
@@ -1964,7 +2036,15 @@ mod tests {
             }],
             true, // require_integrity=true
         );
-        let req = make_request_with_registry(RegistryType::Npm, "lodash", Some("4.17.21"));
+        // Post-download request: integrity is provided (computed from downloaded data)
+        let req = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "lodash".to_string(),
+            version: Some("4.17.21".to_string()),
+            integrity: Some("sha256:abc123".to_string()),
+            bypass: false,
+        };
         match filter.evaluate(&req) {
             Decision::Block { rule, reason } => {
                 assert_eq!(rule, "allowlist:integrity");
@@ -2293,6 +2373,188 @@ mod tests {
         assert_eq!(
             super::parse_pypi_version("requests", "requests-2.31.0.zip"),
             Some("2.31.0".to_string())
+        );
+    }
+
+    // ── verify_integrity tests (issue #189) ─────────────────────────────
+
+    #[test]
+    fn test_verify_integrity_mode_off_returns_none() {
+        let engine = super::CurationEngine::new(CurationConfig::default());
+        let result = super::verify_integrity(
+            &engine,
+            super::RegistryType::Cargo,
+            "my-crate",
+            Some("1.0.0"),
+            b"some data",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_verify_integrity_matching_hash() {
+        let hash = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"crate-data"))
+        );
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "cargo",
+                "name": "my-crate",
+                "version": "1.0.0",
+                "integrity": hash,
+                "integrity_source": "manual"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        let mut config = CurationConfig::default();
+        config.mode = super::super::config::CurationMode::Enforce;
+        let mut engine = super::CurationEngine::new(config);
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        engine.add_filter(Box::new(filter));
+
+        let result = super::verify_integrity(
+            &engine,
+            super::RegistryType::Cargo,
+            "my-crate",
+            Some("1.0.0"),
+            b"crate-data",
+        );
+        assert!(result.is_none(), "matching hash should pass");
+    }
+
+    #[test]
+    fn test_verify_integrity_mismatched_hash() {
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "cargo",
+                "name": "my-crate",
+                "version": "1.0.0",
+                "integrity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "integrity_source": "manual"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        let mut config = CurationConfig::default();
+        config.mode = super::super::config::CurationMode::Enforce;
+        let mut engine = super::CurationEngine::new(config);
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        engine.add_filter(Box::new(filter));
+
+        let result = super::verify_integrity(
+            &engine,
+            super::RegistryType::Cargo,
+            "my-crate",
+            Some("1.0.0"),
+            b"tampered-data",
+        );
+        assert!(result.is_some(), "mismatched hash should block");
+    }
+
+    #[test]
+    fn test_verify_integrity_no_hash_in_entry_passes() {
+        // Allowlist entry without integrity — verify_integrity should pass
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "cargo",
+                "name": "my-crate",
+                "version": "1.0.0"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        let mut config = CurationConfig::default();
+        config.mode = super::super::config::CurationMode::Enforce;
+        let mut engine = super::CurationEngine::new(config);
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        engine.add_filter(Box::new(filter));
+
+        let result = super::verify_integrity(
+            &engine,
+            super::RegistryType::Cargo,
+            "my-crate",
+            Some("1.0.0"),
+            b"any-data",
+        );
+        assert!(result.is_none(), "no integrity in entry → pass");
+    }
+
+    #[test]
+    fn test_allowlist_pre_download_no_integrity_passes() {
+        // Pre-download check (integrity=None) should NOT block on require_integrity
+        let hash = "sha256:abc123";
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "cargo",
+                "name": "my-crate",
+                "version": "1.0.0",
+                "integrity": hash,
+                "integrity_source": "manual"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        // require_integrity=true, but pre-download has no integrity → should STILL allow
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), true).unwrap();
+        let request = super::FilterRequest {
+            registry: super::RegistryType::Cargo,
+            upstream: None,
+            name: "my-crate".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None, // pre-download: no integrity
+            bypass: false,
+        };
+        let decision = filter.evaluate(&request);
+        assert!(
+            matches!(decision, super::Decision::Allow),
+            "pre-download with integrity=None must not block: got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn test_allowlist_post_download_require_integrity_blocks_missing() {
+        // Post-download check with require_integrity but entry has no hash → block
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "cargo",
+                "name": "my-crate",
+                "version": "1.0.0"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), true).unwrap();
+        let request = super::FilterRequest {
+            registry: super::RegistryType::Cargo,
+            upstream: None,
+            name: "my-crate".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: Some("sha256:abc123".to_string()), // post-download: has integrity
+            bypass: false,
+        };
+        let decision = filter.evaluate(&request);
+        assert!(
+            matches!(decision, super::Decision::Block { .. }),
+            "require_integrity + entry without hash + post-download → block: got {:?}",
+            decision
         );
     }
 }

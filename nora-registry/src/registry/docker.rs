@@ -221,6 +221,17 @@ async fn download_blob(
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&digest),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("docker");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(
@@ -577,6 +588,17 @@ async fn get_manifest(
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&reference),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("docker");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

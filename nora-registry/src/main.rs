@@ -114,6 +114,25 @@ enum Commands {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Curation tools: validate files, explain decisions
+    Curation {
+        #[command(subcommand)]
+        action: CurationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CurationCommand {
+    /// Validate blocklist/allowlist JSON files
+    Validate {
+        /// Path to the JSON file to validate
+        file: PathBuf,
+    },
+    /// Explain curation decision for a specific package
+    Explain {
+        /// Package in format "registry:name@version" (e.g., "cargo:serde@1.0.0")
+        package: String,
+    },
 }
 
 pub struct AppState {
@@ -347,6 +366,186 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Curation { action }) => match action {
+            CurationCommand::Validate { file } => {
+                run_curation_validate(&file);
+            }
+            CurationCommand::Explain { package } => {
+                run_curation_explain(&config, &package);
+            }
+        },
+    }
+}
+
+fn run_curation_validate(file: &Path) {
+    let content = match std::fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: Cannot read '{}': {}", file.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    // Try as blocklist first
+    if let Ok(parsed) = serde_json::from_str::<curation::BlocklistFile>(&content) {
+        if parsed.version != 1 {
+            eprintln!(
+                "ERROR: Unsupported blocklist version {} (expected 1)",
+                parsed.version
+            );
+            std::process::exit(1);
+        }
+        println!("OK: Valid blocklist — {} rules", parsed.rules.len());
+        for (i, rule) in parsed.rules.iter().enumerate() {
+            println!(
+                "  [{}] {}/{}@{} — {}",
+                i + 1,
+                rule.registry,
+                rule.name,
+                rule.version,
+                rule.reason
+            );
+        }
+        return;
+    }
+
+    // Try as allowlist
+    if let Ok(parsed) = serde_json::from_str::<curation::AllowlistFile>(&content) {
+        if parsed.version != 1 {
+            eprintln!(
+                "ERROR: Unsupported allowlist version {} (expected 1)",
+                parsed.version
+            );
+            std::process::exit(1);
+        }
+        let with_integrity = parsed
+            .entries
+            .iter()
+            .filter(|e| e.integrity.is_some())
+            .count();
+        println!(
+            "OK: Valid allowlist — {} entries ({} with integrity)",
+            parsed.entries.len(),
+            with_integrity
+        );
+        for (i, entry) in parsed.entries.iter().enumerate() {
+            let integrity_flag = if entry.integrity.is_some() {
+                " [hash]"
+            } else {
+                ""
+            };
+            println!(
+                "  [{}] {}/{}@{}{}",
+                i + 1,
+                entry.registry,
+                entry.name,
+                entry.version,
+                integrity_flag
+            );
+        }
+        return;
+    }
+
+    eprintln!(
+        "ERROR: '{}' is not a valid blocklist or allowlist JSON",
+        file.display()
+    );
+    eprintln!("  Expected {{ \"version\": 1, \"rules\": [...] }} or {{ \"version\": 1, \"entries\": [...] }}");
+    std::process::exit(1);
+}
+
+fn run_curation_explain(config: &Config, package_spec: &str) {
+    // Parse "registry:name@version"
+    let (registry_str, rest) = match package_spec.split_once(':') {
+        Some(parts) => parts,
+        None => {
+            eprintln!("ERROR: Expected format 'registry:name@version' (e.g., 'cargo:serde@1.0.0')");
+            std::process::exit(1);
+        }
+    };
+
+    let (name, version) = match rest.split_once('@') {
+        Some((n, v)) => (n.to_string(), Some(v.to_string())),
+        None => (rest.to_string(), None),
+    };
+
+    let registry = match registry_str {
+        "npm" => curation::RegistryType::Npm,
+        "pypi" => curation::RegistryType::PyPI,
+        "maven" => curation::RegistryType::Maven,
+        "cargo" => curation::RegistryType::Cargo,
+        "go" => curation::RegistryType::Go,
+        "docker" => curation::RegistryType::Docker,
+        other => {
+            eprintln!(
+                "ERROR: Unknown registry '{}'. Use: npm, pypi, maven, cargo, go, docker",
+                other
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Build engine with configured filters
+    let mut engine = curation::CurationEngine::new(config.curation.clone());
+
+    if let Some(ref path) = config.curation.blocklist_path {
+        match curation::BlocklistFilter::from_file(path) {
+            Ok(filter) => {
+                println!("Blocklist: {} ({} rules)", path, filter.rule_count());
+                engine.add_filter(Box::new(filter));
+            }
+            Err(e) => println!("Blocklist: {} (ERROR: {})", path, e),
+        }
+    } else {
+        println!("Blocklist: not configured");
+    }
+
+    if let Some(ref path) = config.curation.allowlist_path {
+        match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
+            Ok(filter) => {
+                println!("Allowlist: {} ({} entries)", path, filter.entry_count());
+                engine.add_filter(Box::new(filter));
+            }
+            Err(e) => println!("Allowlist: {} (ERROR: {})", path, e),
+        }
+    } else {
+        println!("Allowlist: not configured");
+    }
+
+    if !config.curation.internal_namespaces.is_empty() {
+        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
+        println!("Namespaces: {} patterns", ns_filter.pattern_count());
+        engine.set_namespace_filter(Box::new(ns_filter));
+    } else {
+        println!("Namespaces: not configured");
+    }
+
+    println!("Mode: {}", config.curation.mode);
+    println!("---");
+
+    let request = curation::FilterRequest {
+        registry,
+        upstream: None,
+        name: name.clone(),
+        version: version.clone(),
+        integrity: None,
+        bypass: false,
+    };
+
+    let result = engine.evaluate(&request);
+    println!(
+        "Package: {}:{}@{}",
+        registry_str,
+        name,
+        version.as_deref().unwrap_or("*")
+    );
+    println!("Decision: {:?}", result.decision);
+    println!(
+        "Decided by: {}",
+        result.decided_by.as_deref().unwrap_or("(default)")
+    );
+    if result.audited {
+        println!("Mode: AUDIT (would block but logs only)");
     }
 }
 
