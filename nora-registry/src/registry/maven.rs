@@ -98,7 +98,11 @@ fn is_snapshot(version: &str) -> bool {
 // Download
 // ============================================================================
 
-async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn download(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     let key = format!("maven/{}", path);
 
     let artifact_name = path
@@ -110,6 +114,25 @@ async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) 
         .rev()
         .collect::<Vec<_>>()
         .join("/");
+
+    // Curation check — only for versioned artifact files, not metadata
+    if let MavenPathKind::VersionFile(ref coords) = classify_path(&path) {
+        let maven_name = format!(
+            "{}:{}",
+            coords.group_path.replace('/', "."),
+            coords.artifact_id
+        );
+        if let Some(response) = crate::curation::check_download(
+            &state.curation,
+            state.config.curation.bypass_token.as_deref(),
+            &headers,
+            crate::curation::RegistryType::Maven,
+            &maven_name,
+            Some(&coords.version),
+        ) {
+            return response;
+        }
+    }
 
     if let Ok(data) = state.storage.get(&key).await {
         state.metrics.record_download("maven");

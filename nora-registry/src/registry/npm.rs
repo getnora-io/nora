@@ -62,7 +62,11 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
     serde_json::to_vec(&json).map_err(|_| ())
 }
 
-async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn handle_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     let is_tarball = path.contains("/-/");
 
     let key = if is_tarball {
@@ -81,6 +85,22 @@ async fn handle_request(State(state): State<Arc<AppState>>, Path(path): Path<Str
     } else {
         path.clone()
     };
+
+    // Curation check — tarball downloads only (metadata passes through)
+    if is_tarball {
+        let filename = path.split("/-/").nth(1).unwrap_or("");
+        let version = crate::curation::parse_npm_tarball_version(&package_name, filename);
+        if let Some(response) = crate::curation::check_download(
+            &state.curation,
+            state.config.curation.bypass_token.as_deref(),
+            &headers,
+            crate::curation::RegistryType::Npm,
+            &package_name,
+            version.as_deref(),
+        ) {
+            return response;
+        }
+    }
 
     // --- Cache hit path ---
     if let Ok(data) = state.storage.get(&key).await {

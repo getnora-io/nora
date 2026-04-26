@@ -29,7 +29,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 /// Main handler — parses the wildcard path and dispatches to the right logic.
-async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn handle(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     // URL-decode the path: Go client sends %21 for !, Axum wildcard may not decode it
     let path = percent_decode(path.as_bytes())
         .decode_utf8()
@@ -52,6 +56,26 @@ async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) ->
             return StatusCode::NOT_FOUND.into_response();
         }
     };
+
+    // Curation check — .zip downloads only (metadata passes through)
+    if file.ends_with(".zip") {
+        let module_name =
+            decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+        // Extract version: "@v/v1.0.0.zip" → "v1.0.0"
+        let version = file
+            .strip_prefix("@v/")
+            .and_then(|f| f.strip_suffix(".zip"));
+        if let Some(response) = crate::curation::check_download(
+            &state.curation,
+            state.config.curation.bypass_token.as_deref(),
+            &headers,
+            crate::curation::RegistryType::Go,
+            &module_name,
+            version,
+        ) {
+            return response;
+        }
+    }
 
     let storage_key = format!("go/{}", path);
     let content_type = content_type_for(&file);

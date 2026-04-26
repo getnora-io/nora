@@ -225,12 +225,26 @@ async fn get_metadata(
 /// GET /cargo/api/v1/crates/{name}/{version}/download — download .crate file.
 async fn download(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
     if validate_storage_key(&crate_name).is_err() || validate_storage_key(&version).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let crate_name = crate_name.to_lowercase();
+
+    // Curation check — before storage access
+    if let Some(response) = crate::curation::check_download(
+        &state.curation,
+        state.config.curation.bypass_token.as_deref(),
+        &headers,
+        crate::curation::RegistryType::Cargo,
+        &crate_name,
+        Some(&version),
+    ) {
+        return response;
+    }
+
     let key = format!(
         "cargo/{}/{}/{}-{}.crate",
         crate_name, version, crate_name, version
@@ -1203,5 +1217,107 @@ mod integration_tests {
             .as_str()
             .unwrap()
             .contains("already exists"));
+    }
+
+    // ── Curation integration tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cargo_download_blocked_by_curation() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+
+        // Write blocklist file to a temp location
+        let blocklist_dir = tempfile::TempDir::new().unwrap();
+        let blocklist_path = blocklist_dir.path().join("blocklist.json");
+        let blocklist = serde_json::json!({
+            "version": 1,
+            "rules": [{
+                "registry": "cargo",
+                "name": "evil-crate",
+                "version": "*",
+                "reason": "known malware"
+            }]
+        });
+        std::fs::write(&blocklist_path, serde_json::to_string(&blocklist).unwrap()).unwrap();
+
+        let bl_path = blocklist_path.to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl_path);
+        });
+
+        // Put a crate in storage so it would normally be downloadable
+        ctx.state
+            .storage
+            .put(
+                "cargo/evil-crate/1.0.0/evil-crate-1.0.0.crate",
+                b"evil-data",
+            )
+            .await
+            .unwrap();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/evil-crate/1.0.0/download",
+            vec![],
+            "",
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get("x-nora-decision")
+                .and_then(|v| v.to_str().ok()),
+            Some("blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cargo_download_allowed_by_curation() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+
+        // Blocklist only blocks "evil-crate"
+        let blocklist_dir = tempfile::TempDir::new().unwrap();
+        let blocklist_path = blocklist_dir.path().join("blocklist.json");
+        let blocklist = serde_json::json!({
+            "version": 1,
+            "rules": [{
+                "registry": "cargo",
+                "name": "evil-crate",
+                "version": "*",
+                "reason": "known malware"
+            }]
+        });
+        std::fs::write(&blocklist_path, serde_json::to_string(&blocklist).unwrap()).unwrap();
+
+        let bl_path = blocklist_path.to_str().unwrap().to_string();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl_path);
+        });
+
+        // Put a SAFE crate in storage
+        ctx.state
+            .storage
+            .put(
+                "cargo/safe-crate/2.0.0/safe-crate-2.0.0.crate",
+                b"safe-data",
+            )
+            .await
+            .unwrap();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/safe-crate/2.0.0/download",
+            vec![],
+            "",
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"safe-data");
     }
 }

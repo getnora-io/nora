@@ -42,7 +42,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use activity_log::ActivityLog;
 use audit::AuditLog;
 use auth::HtpasswdAuth;
-use config::{Config, StorageMode};
+use config::{Config, CurationMode, StorageMode};
 use dashboard_metrics::DashboardMetrics;
 use repo_index::RepoIndex;
 pub use storage::Storage;
@@ -419,12 +419,54 @@ async fn run_server(config: Config, storage: Storage) {
     let http_client = reqwest::Client::new();
 
     // Initialize curation engine
-    let curation_engine = curation::CurationEngine::new(config.curation.clone());
+    let mut curation_engine = curation::CurationEngine::new(config.curation.clone());
     if curation_engine.is_active() {
         info!(
             mode = %config.curation.mode,
             "Curation layer active"
         );
+    }
+
+    // Load blocklist filter if configured
+    if let Some(ref path) = config.curation.blocklist_path {
+        match curation::BlocklistFilter::from_file(path) {
+            Ok(filter) => {
+                let count = filter.rule_count();
+                curation_engine.add_filter(Box::new(filter));
+                info!(path = %path, rules = count, "Blocklist filter loaded");
+            }
+            Err(e) => {
+                error!(path = %path, error = %e, "Failed to load blocklist");
+                if config.curation.mode == CurationMode::Enforce {
+                    panic!("Cannot start in enforce mode with invalid blocklist");
+                }
+            }
+        }
+    }
+
+    // Load allowlist filter if configured (after blocklist — blocklist wins on overlap)
+    if let Some(ref path) = config.curation.allowlist_path {
+        match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
+            Ok(filter) => {
+                let count = filter.entry_count();
+                curation_engine.add_filter(Box::new(filter));
+                info!(path = %path, entries = count, "Allowlist filter loaded");
+            }
+            Err(e) => {
+                error!(path = %path, error = %e, "Failed to load allowlist");
+                if config.curation.mode == CurationMode::Enforce {
+                    panic!("Cannot start in enforce mode with invalid allowlist");
+                }
+            }
+        }
+    }
+
+    // Load namespace isolation filter if configured (always active, even in mode=Off)
+    if !config.curation.internal_namespaces.is_empty() {
+        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
+        let count = ns_filter.pattern_count();
+        curation_engine.set_namespace_filter(Box::new(ns_filter));
+        info!(patterns = count, "Namespace isolation filter loaded");
     }
 
     // Registry routes (shared between rate-limited and non-limited paths)

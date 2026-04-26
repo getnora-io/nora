@@ -595,6 +595,7 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_BLOCKLIST_PATH` — path to blocklist JSON file
 /// - `NORA_CURATION_BYPASS_TOKEN` — token to bypass curation checks
 /// - `NORA_CURATION_REQUIRE_INTEGRITY` — require integrity metadata (default: false)
+/// - `NORA_CURATION_INTERNAL_NAMESPACES` — comma-separated glob patterns
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -610,6 +611,10 @@ pub struct CurationConfig {
     pub bypass_token: Option<String>,
     #[serde(default)]
     pub require_integrity: bool,
+    /// Glob patterns for internal namespaces that must never be proxied upstream.
+    /// Always active regardless of curation mode (security boundary).
+    #[serde(default)]
+    pub internal_namespaces: Vec<String>,
 }
 
 impl Default for CurationConfig {
@@ -621,6 +626,7 @@ impl Default for CurationConfig {
             blocklist_path: None,
             bypass_token: None,
             require_integrity: false,
+            internal_namespaces: Vec::new(),
         }
     }
 }
@@ -1157,6 +1163,13 @@ impl Config {
         }
         if let Ok(val) = env::var("NORA_CURATION_REQUIRE_INTEGRITY") {
             self.curation.require_integrity = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_CURATION_INTERNAL_NAMESPACES") {
+            self.curation.internal_namespaces = if val.is_empty() {
+                Vec::new()
+            } else {
+                val.split(',').map(|s| s.trim().to_string()).collect()
+            };
         }
     }
 }
