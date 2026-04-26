@@ -189,6 +189,7 @@ fn build_context(
 
     let app_routes = Router::new()
         .merge(crate::auth::token_routes())
+        .merge(crate::ui::routes())
         .merge(registry_routes);
 
     let app = Router::new()

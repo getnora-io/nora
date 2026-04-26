@@ -62,6 +62,11 @@ impl HtpasswdAuth {
 
 /// Check if path is public (no auth required)
 fn is_public_path(path: &str) -> bool {
+    // Token UI pages require auth — exclude before wildcard match
+    if path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens") {
+        return false;
+    }
+
     matches!(
         path,
         "/" | "/health"
@@ -313,7 +318,7 @@ async fn list_tokens(
         .list_tokens(&req.username)
         .into_iter()
         .map(|t| TokenListItem {
-            hash_prefix: t.token_hash[..16].to_string(),
+            hash_prefix: t.file_id,
             created_at: t.created_at,
             expires_at: t.expires_at,
             last_used: t.last_used,
@@ -461,6 +466,13 @@ mod tests {
         assert!(is_public_path("/api/tokens/list"));
         assert!(is_public_path("/api/tokens/revoke"));
 
+        // Token UI pages are NOT public (require auth)
+        assert!(!is_public_path("/ui/tokens"));
+        assert!(!is_public_path("/ui/tokens/"));
+        assert!(!is_public_path("/api/ui/tokens/create"));
+        assert!(!is_public_path("/api/ui/tokens/list"));
+        assert!(!is_public_path("/api/ui/tokens/abc123/revoke"));
+
         // Protected paths
         assert!(!is_public_path("/api/tokens/unknown"));
         assert!(!is_public_path("/api/tokens/admin"));
@@ -574,6 +586,16 @@ mod tests {
         assert!(json.contains("nora_abc123"));
         assert!(json.contains("30"));
     }
+
+    #[test]
+    fn test_token_ui_paths_not_public() {
+        // Token management UI must require authentication
+        assert!(!is_public_path("/ui/tokens"));
+        assert!(!is_public_path("/ui/tokens/"));
+        assert!(!is_public_path("/api/ui/tokens/create"));
+        assert!(!is_public_path("/api/ui/tokens/list"));
+        assert!(!is_public_path("/api/ui/tokens/abcd1234abcd1234/revoke"));
+    }
 }
 
 #[cfg(test)]
@@ -659,5 +681,146 @@ mod integration_tests {
         // Write without auth should fail
         let response = send(&ctx.app, Method::PUT, "/raw/test2.txt", b"data".to_vec()).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_token_ui_requires_auth() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+
+        // Token UI page without auth should return 401
+        let response = send(&ctx.app, Method::GET, "/ui/tokens", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Token UI page with auth should work
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/ui/tokens",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_token_ui_create_requires_htmx() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+
+        // POST without HX-Request header should be rejected (CSRF)
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            "description=test&role=read&ttl_days=30",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // POST with HX-Request header should work
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("hx-request", "true"),
+            ],
+            "description=test&role=read&ttl_days=30",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_token_ui_revoke_validates_file_id() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+
+        // Invalid file_id (not hex, no slashes so route matches)
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/not_valid_hex_xx/revoke",
+            vec![("authorization", &header_val), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Valid hex but non-existent
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/abcd1234abcd1234/revoke",
+            vec![("authorization", &header_val), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_token_ui_full_lifecycle() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+
+        // Create a token via UI endpoint
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("hx-request", "true"),
+            ],
+            "description=CI+Pipeline&role=write&ttl_days=30",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+        assert!(body.contains("nra_"), "Response should contain raw token");
+
+        // List tokens
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/api/ui/tokens/list",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+        assert!(body.contains("CI Pipeline"), "List should show description");
+
+        // Get file_id from the token store directly for revoke test
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(tokens.len(), 1);
+        let file_id = &tokens[0].file_id;
+
+        // Revoke
+        let revoke_url = format!("/api/ui/tokens/{}/revoke", file_id);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            &revoke_url,
+            vec![("authorization", &header_val), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify token is gone
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(tokens.len(), 0);
     }
 }

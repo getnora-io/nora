@@ -8,7 +8,6 @@ permissions: read-all
 
 env:
   REGISTRY: ghcr.io
-  NORA: localhost:5000
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -17,8 +16,6 @@ jobs:
     runs-on: [self-hosted, nora]
     outputs:
       hash: ${{ steps.hash.outputs.hash }}
-      short_sha: ${{ steps.sha.outputs.short_sha }}
-      version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
       packages: write
@@ -27,24 +24,23 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Extract version and SHA
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
       - name: Get short SHA
         id: sha
         run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Set up Rust
-        run: |
-          echo "/home/github-runner/.cargo/bin" >> $GITHUB_PATH
-          echo "RUSTUP_HOME=/home/github-runner/.rustup" >> $GITHUB_ENV
-          echo "CARGO_HOME=/home/github-runner/.cargo" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        with:
+          driver-opts: network=host
 
-      - name: Build release binary (musl static)
+      - name: Extract binary from multi-stage build
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl --package nora-registry
-          cp target/x86_64-unknown-linux-musl/release/nora ./nora
+          docker buildx build --target binary --output type=local,dest=./dist .
+          cp ./dist/nora ./nora
+          cp ./dist/nora ./nora-linux-amd64
+          chmod +x ./nora-linux-amd64
+          echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
+          file ./nora-linux-amd64
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -56,14 +52,8 @@ jobs:
       - name: Compute binary hash for SLSA provenance
         id: hash
         run: |
-          cp target/x86_64-unknown-linux-musl/release/nora ./nora-linux-amd64
           sha256sum nora-linux-amd64 | base64 -w0 > hash.txt
           echo "hash=$(cat hash.txt)" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
-        with:
-          driver-opts: network=host
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
@@ -72,7 +62,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Alpine ───────────────────────────────────────────────────────────────
+      # ── Alpine (default target — last stage in Dockerfile) ─────────────────
       - name: Extract metadata (alpine)
         id: meta-alpine
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -80,16 +70,15 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{version}}-
             type=raw,value=latest
 
       - name: Build and push (alpine)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
@@ -104,16 +93,16 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-redos,onlatest=true
           tags: |
-            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{version}}-
             type=raw,value=latest
 
       - name: Build and push (redos)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: Dockerfile.redos
+          target: redos
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-redos.outputs.tags }}
@@ -128,22 +117,22 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-astra,onlatest=true
           tags: |
-            type=semver,pattern={{version}}-{{sha}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{version}}-
             type=raw,value=latest
 
       - name: Build and push (astra)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: Dockerfile.astra
+          target: astra
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
 
-      # ── Smoke test ──────────────────────────────────────────────────────────
+      # ── Sign & Smoke test ───────────────────────────────────────────────────
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
 
@@ -158,7 +147,7 @@ jobs:
       - name: Smoke test — verify alpine image starts and responds
         run: |
           docker rm -f nora-smoke 2>/dev/null || true
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}-${{ steps.sha.outputs.short_sha }}
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
@@ -186,11 +175,15 @@ jobs:
             suffix: "-astra"
 
     steps:
+      - name: Set version tag (strip leading v)
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       - name: Trivy — image scan (${{ matrix.name }})
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           scan-type: image
-          image-ref: ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}${{ matrix.suffix }}
+          image-ref: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
           format: sarif
           output: trivy-image-${{ matrix.name }}.sarif
           severity: HIGH,CRITICAL
@@ -226,6 +219,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set version tag (strip leading v)
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Download binary artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -295,17 +292,17 @@ jobs:
 
             **Alpine (standard):**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
             ```
 
             **RED OS:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}-redos
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
             ```
 
             **Astra Linux SE:**
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}-${{ needs.build.outputs.short_sha }}-astra
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
             ```
 
             ## Changelog

@@ -79,6 +79,18 @@ fn default_role() -> Role {
     Role::Read
 }
 
+/// Token list entry for UI display (no hash exposed)
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenListEntry {
+    pub file_id: String,
+    pub user: String,
+    pub role: Role,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub last_used: Option<u64>,
+    pub description: Option<String>,
+}
+
 /// Token store for managing API tokens
 #[derive(Clone)]
 pub struct TokenStore {
@@ -250,17 +262,43 @@ impl TokenStore {
         Ok((info.user, info.role))
     }
 
-    /// List all tokens for a user
-    pub fn list_tokens(&self, user: &str) -> Vec<TokenInfo> {
+    /// List all tokens for a user (returns TokenListEntry with file_id)
+    pub fn list_tokens(&self, user: &str) -> Vec<TokenListEntry> {
+        self.list_all_tokens()
+            .into_iter()
+            .filter(|t| t.user == user)
+            .collect()
+    }
+
+    /// List all tokens across all users (for admin UI)
+    pub fn list_all_tokens(&self) -> Vec<TokenListEntry> {
         let mut tokens = Vec::new();
 
         if let Ok(entries) = fs::read_dir(&self.storage_path) {
             for entry in entries.flatten() {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let file_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if file_id.is_empty() {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(info) = serde_json::from_str::<TokenInfo>(&content) {
-                        if info.user == user {
-                            tokens.push(info);
-                        }
+                        tokens.push(TokenListEntry {
+                            file_id,
+                            user: info.user,
+                            role: info.role,
+                            created_at: info.created_at,
+                            expires_at: info.expires_at,
+                            last_used: info.last_used,
+                            description: info.description,
+                        });
                     }
                 }
             }
@@ -420,8 +458,14 @@ mod tests {
             .create_token("testuser", 30, None, Role::Write)
             .unwrap();
 
-        let tokens = store.list_tokens("testuser");
-        assert!(tokens[0].token_hash.starts_with("$argon2"));
+        let tokens = store.list_all_tokens();
+        // Verify file_id is a hex prefix, not an Argon2 hash
+        assert!(
+            tokens[0].file_id.chars().all(|c| c.is_ascii_hexdigit()),
+            "file_id must be hex, got: {}",
+            tokens[0].file_id
+        );
+        assert_eq!(tokens[0].file_id.len(), 16);
     }
 
     #[test]
@@ -552,6 +596,51 @@ mod tests {
 
         let unknown_tokens = store.list_tokens("unknown");
         assert_eq!(unknown_tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_list_all_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        store
+            .create_token("user1", 30, Some("Token A".to_string()), Role::Write)
+            .unwrap();
+        store.create_token("user2", 30, None, Role::Read).unwrap();
+        store
+            .create_token("user1", 30, Some("Token B".to_string()), Role::Admin)
+            .unwrap();
+
+        let all = store.list_all_tokens();
+        assert_eq!(all.len(), 3);
+
+        // All file_ids should be 16 hex chars
+        for entry in &all {
+            assert_eq!(entry.file_id.len(), 16);
+            assert!(entry.file_id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn test_file_id_matches_revoke() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token = store
+            .create_token("testuser", 30, None, Role::Write)
+            .unwrap();
+
+        // Get file_id from list
+        let entries = store.list_all_tokens();
+        assert_eq!(entries.len(), 1);
+        let file_id = &entries[0].file_id;
+
+        // Revoke using file_id from list
+        store.revoke_token(file_id).unwrap();
+
+        // Token should be gone
+        assert!(store.verify_token(&token).is_err());
+        assert_eq!(store.list_all_tokens().len(), 0);
     }
 
     #[test]
