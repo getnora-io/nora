@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The Nora Authors
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
 #![forbid(unsafe_code)]
@@ -7,6 +7,7 @@ mod audit;
 mod auth;
 mod backup;
 mod config;
+mod curation;
 mod dashboard_metrics;
 mod error;
 mod gc;
@@ -130,6 +131,7 @@ pub struct AppState {
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub curation: curation::CurationEngine,
 }
 
 impl AppState {
@@ -416,6 +418,15 @@ async fn run_server(config: Config, storage: Storage) {
 
     let http_client = reqwest::Client::new();
 
+    // Initialize curation engine
+    let curation_engine = curation::CurationEngine::new(config.curation.clone());
+    if curation_engine.is_active() {
+        info!(
+            mode = %config.curation.mode,
+            "Curation layer active"
+        );
+    }
+
     // Registry routes (shared between rate-limited and non-limited paths)
     let registry_routes = Router::new()
         .merge(registry::docker_routes())
@@ -467,6 +478,7 @@ async fn run_server(config: Config, storage: Storage) {
         http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
+        curation: curation_engine,
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)

@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The Nora Authors
 // SPDX-License-Identifier: MIT
 
 //! Shared test infrastructure for integration tests.
@@ -19,6 +19,7 @@ use crate::activity_log::ActivityLog;
 use crate::audit::AuditLog;
 use crate::auth::HtpasswdAuth;
 use crate::config::*;
+use crate::curation::CurationEngine;
 use crate::dashboard_metrics::DashboardMetrics;
 use crate::registry;
 use crate::repo_index::RepoIndex;
@@ -130,6 +131,7 @@ fn build_context(
         secrets: SecretsConfig::default(),
         gc: crate::config::GcConfig::default(),
         retention: crate::config::RetentionConfig::default(),
+        curation: CurationConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -173,6 +175,7 @@ fn build_context(
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
+        curation: CurationEngine::new(CurationConfig::default()),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
