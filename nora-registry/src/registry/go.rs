@@ -29,7 +29,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 /// Main handler — parses the wildcard path and dispatches to the right logic.
-async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn handle(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     // URL-decode the path: Go client sends %21 for !, Axum wildcard may not decode it
     let path = percent_decode(path.as_bytes())
         .decode_utf8()
@@ -53,6 +57,33 @@ async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) ->
         }
     };
 
+    // Parse curation coords for .zip downloads (used in both pre-download and integrity checks)
+    let go_curation = if file.ends_with(".zip") {
+        let module_name =
+            decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+        let version = file
+            .strip_prefix("@v/")
+            .and_then(|f| f.strip_suffix(".zip"))
+            .map(|v| v.to_string());
+        Some((module_name, version))
+    } else {
+        None
+    };
+
+    // Curation check — .zip downloads only (metadata passes through)
+    if let Some((ref module_name, ref version)) = go_curation {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation,
+            state.config.curation.bypass_token.as_deref(),
+            &headers,
+            crate::curation::RegistryType::Go,
+            module_name,
+            version.as_deref(),
+        ) {
+            return response;
+        }
+    }
+
     let storage_key = format!("go/{}", path);
     let content_type = content_type_for(&file);
 
@@ -63,6 +94,19 @@ async fn handle(State(state): State<Arc<AppState>>, Path(path): Path<String>) ->
 
     // 1. Try local cache (for immutable files, this is authoritative)
     if let Ok(data) = state.storage.get(&storage_key).await {
+        // Curation integrity verification (issue #189)
+        if let Some((ref module_name, ref version)) = go_curation {
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation,
+                crate::curation::RegistryType::Go,
+                module_name,
+                version.as_deref(),
+                &data,
+            ) {
+                return response;
+            }
+        }
+
         state.metrics.record_download("go");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

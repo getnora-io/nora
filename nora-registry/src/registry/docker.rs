@@ -195,6 +195,7 @@ async fn check_blob(
 
 async fn download_blob(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) = validate_docker_name(&name) {
@@ -204,10 +205,33 @@ async fn download_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    // Curation check — defense in depth: check blobs too
+    if let Some(response) = crate::curation::check_download(
+        &state.curation,
+        state.config.curation.bypass_token.as_deref(),
+        &headers,
+        crate::curation::RegistryType::Docker,
+        &name,
+        Some(&digest),
+    ) {
+        return response;
+    }
+
     let key = format!("docker/{}/blobs/{}", name, digest);
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&digest),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("docker");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(
@@ -538,6 +562,7 @@ async fn upload_blob(
 
 async fn get_manifest(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) = validate_docker_name(&name) {
@@ -547,10 +572,33 @@ async fn get_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    // Curation check — manifests carry the image identity
+    if let Some(response) = crate::curation::check_download(
+        &state.curation,
+        state.config.curation.bypass_token.as_deref(),
+        &headers,
+        crate::curation::RegistryType::Docker,
+        &name,
+        Some(&reference),
+    ) {
+        return response;
+    }
+
     let key = format!("docker/{}/manifests/{}.json", name, reference);
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&reference),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("docker");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(
@@ -920,10 +968,11 @@ async fn check_blob_ns(
 
 async fn download_blob_ns(
     state: State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((ns, name, digest)): Path<(String, String, String)>,
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    download_blob(state, Path((full_name, digest))).await
+    download_blob(state, headers, Path((full_name, digest))).await
 }
 
 async fn start_upload_ns(
@@ -955,10 +1004,11 @@ async fn upload_blob_ns(
 
 async fn get_manifest_ns(
     state: State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((ns, name, reference)): Path<(String, String, String)>,
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    get_manifest(state, Path((full_name, reference))).await
+    get_manifest(state, headers, Path((full_name, reference))).await
 }
 
 async fn put_manifest_ns(

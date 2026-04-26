@@ -172,13 +172,39 @@ async fn package_versions(
 /// GET /simple/{name}/{filename} — download a specific file.
 async fn download_file(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
     let normalized = normalize_name(&name);
+
+    // Curation check — before storage access
+    let version = crate::curation::parse_pypi_version(&normalized, &filename);
+    if let Some(response) = crate::curation::check_download(
+        &state.curation,
+        state.config.curation.bypass_token.as_deref(),
+        &headers,
+        crate::curation::RegistryType::PyPI,
+        &normalized,
+        version.as_deref(),
+    ) {
+        return response;
+    }
+
     let key = format!("pypi/{}/{}", normalized, filename);
 
     // Try local storage first
     if let Ok(data) = state.storage.get(&key).await {
+        // Curation integrity verification (issue #189)
+        if let Some(response) = crate::curation::verify_integrity(
+            &state.curation,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+            version.as_deref(),
+            &data,
+        ) {
+            return response;
+        }
+
         state.metrics.record_download("pypi");
         state.metrics.record_cache_hit();
         state.activity.push(ActivityEntry::new(

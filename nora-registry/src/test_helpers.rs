@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The Nora Authors
 // SPDX-License-Identifier: MIT
 
 //! Shared test infrastructure for integration tests.
@@ -19,6 +19,7 @@ use crate::activity_log::ActivityLog;
 use crate::audit::AuditLog;
 use crate::auth::HtpasswdAuth;
 use crate::config::*;
+use crate::curation::CurationEngine;
 use crate::dashboard_metrics::DashboardMetrics;
 use crate::registry;
 use crate::repo_index::RepoIndex;
@@ -53,6 +54,11 @@ pub fn create_test_context_with_anonymous_read(users: &[(&str, &str)]) -> TestCo
 /// Build a test context with raw storage **disabled**.
 pub fn create_test_context_with_raw_disabled() -> TestContext {
     build_context(false, &[], false, |cfg| cfg.raw.enabled = false)
+}
+
+/// Build a test context with custom config tweaks.
+pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> TestContext {
+    build_context(false, &[], false, customize)
 }
 
 fn build_context(
@@ -130,6 +136,7 @@ fn build_context(
         secrets: SecretsConfig::default(),
         gc: crate::config::GcConfig::default(),
         retention: crate::config::RetentionConfig::default(),
+        curation: CurationConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -159,6 +166,26 @@ fn build_context(
 
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
+    // Build curation engine before consuming config (mirroring main.rs)
+    let mut curation_engine = CurationEngine::new(config.curation.clone());
+    if let Some(ref path) = config.curation.blocklist_path {
+        if let Ok(filter) = crate::curation::BlocklistFilter::from_file(path) {
+            curation_engine.add_filter(Box::new(filter));
+        }
+    }
+    if let Some(ref path) = config.curation.allowlist_path {
+        if let Ok(filter) =
+            crate::curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
+        {
+            curation_engine.add_filter(Box::new(filter));
+        }
+    }
+    if !config.curation.internal_namespaces.is_empty() {
+        let ns_filter =
+            crate::curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
+        curation_engine.set_namespace_filter(Box::new(ns_filter));
+    }
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -173,6 +200,7 @@ fn build_context(
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
+        curation: curation_engine,
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

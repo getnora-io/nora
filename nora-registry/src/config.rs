@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The Nora Authors
 // SPDX-License-Identifier: MIT
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -41,6 +41,8 @@ pub struct Config {
     pub gc: GcConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub curation: CurationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +546,91 @@ impl Default for RetentionConfig {
     }
 }
 
+// ============================================================================
+// Curation Configuration
+// ============================================================================
+
+/// Curation operating mode.
+///
+/// - `off` — curation disabled, all requests pass through (default)
+/// - `audit` — evaluate filters and log decisions, but never block
+/// - `enforce` — evaluate filters and block requests that match a deny rule
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CurationMode {
+    #[default]
+    Off,
+    Audit,
+    Enforce,
+}
+
+impl std::fmt::Display for CurationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CurationMode::Off => write!(f, "off"),
+            CurationMode::Audit => write!(f, "audit"),
+            CurationMode::Enforce => write!(f, "enforce"),
+        }
+    }
+}
+
+/// Behavior when a curation filter returns an error or panics.
+///
+/// - `closed` — treat as blocked (fail-safe, default)
+/// - `open` — treat as allowed (fail-open)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CurationOnFailure {
+    #[default]
+    Closed,
+    Open,
+}
+
+/// Curation layer configuration.
+///
+/// # Environment Variables
+/// - `NORA_CURATION_MODE` — off/audit/enforce (default: off)
+/// - `NORA_CURATION_ON_FAILURE` — closed/open (default: closed)
+/// - `NORA_CURATION_ALLOWLIST_PATH` — path to allowlist JSON file
+/// - `NORA_CURATION_BLOCKLIST_PATH` — path to blocklist JSON file
+/// - `NORA_CURATION_BYPASS_TOKEN` — token to bypass curation checks
+/// - `NORA_CURATION_REQUIRE_INTEGRITY` — require integrity metadata (default: false)
+/// - `NORA_CURATION_INTERNAL_NAMESPACES` — comma-separated glob patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurationConfig {
+    #[serde(default)]
+    pub mode: CurationMode,
+    #[serde(default)]
+    pub on_failure: CurationOnFailure,
+    #[serde(default)]
+    pub allowlist_path: Option<String>,
+    #[serde(default)]
+    pub blocklist_path: Option<String>,
+    /// Token to bypass curation. Should only be set via env var, not config file.
+    #[serde(default, skip_serializing)]
+    pub bypass_token: Option<String>,
+    #[serde(default)]
+    pub require_integrity: bool,
+    /// Glob patterns for internal namespaces that must never be proxied upstream.
+    /// Always active regardless of curation mode (security boundary).
+    #[serde(default)]
+    pub internal_namespaces: Vec<String>,
+}
+
+impl Default for CurationConfig {
+    fn default() -> Self {
+        Self {
+            mode: CurationMode::Off,
+            on_failure: CurationOnFailure::Closed,
+            allowlist_path: None,
+            blocklist_path: None,
+            bypass_token: None,
+            require_integrity: false,
+            internal_namespaces: Vec::new(),
+        }
+    }
+}
+
 impl Config {
     /// Warn if credentials are configured via config.toml (not env vars)
     pub fn warn_plaintext_credentials(&self) {
@@ -685,6 +772,33 @@ impl Config {
         if self.retention.enabled && self.retention.rules.is_empty() {
             warnings.push(
                 "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
+            );
+        }
+
+        // 8. Curation validation
+        if self.curation.mode == CurationMode::Enforce && self.curation.allowlist_path.is_none() {
+            errors.push(
+                "curation.mode=enforce requires curation.allowlist_path to be set".to_string(),
+            );
+        }
+        if self.curation.mode == CurationMode::Enforce {
+            if let Some(ref path) = self.curation.allowlist_path {
+                if !std::path::Path::new(path).exists() {
+                    errors.push(format!(
+                        "curation.allowlist_path=\"{}\" does not exist (required for enforce mode)",
+                        path
+                    ));
+                }
+            }
+        }
+        if self.curation.bypass_token.is_some() && env::var("NORA_CURATION_BYPASS_TOKEN").is_err() {
+            warnings.push(
+                "curation.bypass_token is set in config file — consider using NORA_CURATION_BYPASS_TOKEN env var instead".to_string(),
+            );
+        }
+        if self.curation.mode == CurationMode::Audit && self.curation.allowlist_path.is_none() {
+            warnings.push(
+                "curation.mode=audit but no allowlist_path configured — no allowlist filter will be active".to_string(),
             );
         }
 
@@ -1023,6 +1137,40 @@ impl Config {
         if let Ok(val) = env::var("NORA_SECRETS_CLEAR_ENV") {
             self.secrets.clear_env = val.to_lowercase() == "true" || val == "1";
         }
+
+        // Curation config
+        if let Ok(val) = env::var("NORA_CURATION_MODE") {
+            self.curation.mode = match val.to_lowercase().as_str() {
+                "audit" => CurationMode::Audit,
+                "enforce" => CurationMode::Enforce,
+                _ => CurationMode::Off,
+            };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_ON_FAILURE") {
+            self.curation.on_failure = match val.to_lowercase().as_str() {
+                "open" => CurationOnFailure::Open,
+                _ => CurationOnFailure::Closed,
+            };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_ALLOWLIST_PATH") {
+            self.curation.allowlist_path = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_BLOCKLIST_PATH") {
+            self.curation.blocklist_path = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_BYPASS_TOKEN") {
+            self.curation.bypass_token = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_REQUIRE_INTEGRITY") {
+            self.curation.require_integrity = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_CURATION_INTERNAL_NAMESPACES") {
+            self.curation.internal_namespaces = if val.is_empty() {
+                Vec::new()
+            } else {
+                val.split(',').map(|s| s.trim().to_string()).collect()
+            };
+        }
     }
 }
 
@@ -1056,6 +1204,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             gc: GcConfig::default(),
             retention: RetentionConfig::default(),
+            curation: CurationConfig::default(),
         }
     }
 }
@@ -1772,5 +1921,168 @@ mod tests {
             StorageMode::S3,
             "config.toml mode=s3 must not be overridden when NORA_STORAGE_MODE is unset"
         );
+    }
+
+    // ========================================================================
+    // Curation config tests
+    // ========================================================================
+
+    #[test]
+    fn test_curation_config_default() {
+        let c = CurationConfig::default();
+        assert_eq!(c.mode, CurationMode::Off);
+        assert_eq!(c.on_failure, CurationOnFailure::Closed);
+        assert!(c.allowlist_path.is_none());
+        assert!(c.blocklist_path.is_none());
+        assert!(c.bypass_token.is_none());
+        assert!(!c.require_integrity);
+    }
+
+    #[test]
+    fn test_curation_config_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            mode = "audit"
+            on_failure = "open"
+            require_integrity = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::Audit);
+        assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
+        assert!(config.curation.require_integrity);
+    }
+
+    #[test]
+    fn test_curation_config_missing_defaults_to_off() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::Off);
+    }
+
+    #[test]
+    fn test_curation_env_override_mode() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "enforce");
+        config.apply_env_overrides();
+        assert_eq!(config.curation.mode, CurationMode::Enforce);
+        std::env::remove_var("NORA_CURATION_MODE");
+    }
+
+    #[test]
+    fn test_curation_env_override_on_failure() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_ON_FAILURE", "open");
+        config.apply_env_overrides();
+        assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
+        std::env::remove_var("NORA_CURATION_ON_FAILURE");
+    }
+
+    #[test]
+    fn test_curation_env_override_paths() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_ALLOWLIST_PATH", "/etc/nora/allow.json");
+        std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", "/etc/nora/block.json");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.curation.allowlist_path,
+            Some("/etc/nora/allow.json".to_string())
+        );
+        assert_eq!(
+            config.curation.blocklist_path,
+            Some("/etc/nora/block.json".to_string())
+        );
+        std::env::remove_var("NORA_CURATION_ALLOWLIST_PATH");
+        std::env::remove_var("NORA_CURATION_BLOCKLIST_PATH");
+    }
+
+    #[test]
+    fn test_curation_env_override_bypass_token() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.curation.bypass_token,
+            Some("secret-bypass".to_string())
+        );
+        std::env::remove_var("NORA_CURATION_BYPASS_TOKEN");
+    }
+
+    #[test]
+    fn test_curation_env_override_require_integrity() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_REQUIRE_INTEGRITY", "true");
+        config.apply_env_overrides();
+        assert!(config.curation.require_integrity);
+        std::env::remove_var("NORA_CURATION_REQUIRE_INTEGRITY");
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_no_allowlist() {
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("allowlist_path")),
+            "enforce without allowlist should be an error"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_missing_allowlist_file() {
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = Some("/nonexistent/allow.json".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("does not exist")),
+            "enforce with missing allowlist file should be an error"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_audit_no_allowlist_warning() {
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Audit;
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(errors.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("no allowlist_path")),
+            "audit without allowlist should be a warning"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_off_no_warnings() {
+        let config = Config::default();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(errors.is_empty());
+        assert!(
+            !warnings.iter().any(|w| w.contains("curation")),
+            "mode=off should produce no curation warnings"
+        );
+    }
+
+    #[test]
+    fn test_curation_mode_display() {
+        assert_eq!(CurationMode::Off.to_string(), "off");
+        assert_eq!(CurationMode::Audit.to_string(), "audit");
+        assert_eq!(CurationMode::Enforce.to_string(), "enforce");
     }
 }
