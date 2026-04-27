@@ -1,10 +1,13 @@
-// Copyright (c) 2026 The Nora Authors
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
+
+use crate::registry_type::RegistryType;
 
 pub use crate::secrets::SecretsConfig;
 
@@ -31,6 +34,18 @@ pub struct Config {
     pub cargo: CargoConfig,
     #[serde(default)]
     pub raw: RawConfig,
+    #[serde(default)]
+    pub gems: GemsConfig,
+    #[serde(default)]
+    pub terraform: TerraformConfig,
+    #[serde(default)]
+    pub ansible: AnsibleConfig,
+    #[serde(default)]
+    pub nuget: NugetConfig,
+    #[serde(default)]
+    pub pub_dart: PubDartConfig,
+    #[serde(default)]
+    pub conan: ConanConfig,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -108,6 +123,8 @@ fn default_bucket() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MavenConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub proxies: Vec<MavenProxyEntry>,
     #[serde(default = "default_timeout")]
@@ -126,6 +143,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpmConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
@@ -139,6 +158,8 @@ pub struct NpmConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PypiConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
@@ -150,6 +171,8 @@ pub struct PypiConfig {
 /// Cargo registry configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Upstream Cargo registry (crates.io API)
     #[serde(default = "default_cargo_proxy")]
     pub proxy: Option<String>,
@@ -166,6 +189,7 @@ fn default_cargo_proxy() -> Option<String> {
 impl Default for CargoConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy: default_cargo_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
@@ -176,6 +200,8 @@ impl Default for CargoConfig {
 /// Go module proxy configuration (GOPROXY protocol)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Upstream Go module proxy URL (default: https://proxy.golang.org)
     #[serde(default = "default_go_proxy")]
     pub proxy: Option<String>,
@@ -206,6 +232,7 @@ fn default_go_max_zip_size() -> u64 {
 impl Default for GoConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy: default_go_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
@@ -218,6 +245,8 @@ impl Default for GoConfig {
 /// Docker registry configuration with upstream proxy support
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_docker_timeout")]
     pub proxy_timeout: u64,
     #[serde(default)]
@@ -272,6 +301,200 @@ pub struct RawConfig {
     pub max_file_size: u64, // in bytes
 }
 
+/// RubyGems proxy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GemsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream RubyGems registry (default: https://rubygems.org)
+    #[serde(default = "default_gems_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+    /// Index cache TTL in seconds (default: 300 = 5 min)
+    #[serde(default = "default_metadata_ttl")]
+    pub index_ttl: u64,
+}
+
+fn default_gems_proxy() -> Option<String> {
+    Some("https://rubygems.org".to_string())
+}
+
+impl Default for GemsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_gems_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            index_ttl: 300,
+        }
+    }
+}
+
+/// Terraform provider/module proxy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerraformConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream Terraform registry (default: https://registry.terraform.io)
+    #[serde(default = "default_terraform_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+    /// Separate timeout for binary downloads (default: 120s)
+    #[serde(default = "default_go_zip_timeout")]
+    pub proxy_timeout_download: u64,
+}
+
+fn default_terraform_proxy() -> Option<String> {
+    Some("https://registry.terraform.io".to_string())
+}
+
+impl Default for TerraformConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_terraform_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            proxy_timeout_download: 120,
+        }
+    }
+}
+
+/// Ansible Galaxy collection proxy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnsibleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream Galaxy server (default: https://galaxy.ansible.com)
+    #[serde(default = "default_ansible_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+}
+
+fn default_ansible_proxy() -> Option<String> {
+    Some("https://galaxy.ansible.com".to_string())
+}
+
+impl Default for AnsibleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_ansible_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+        }
+    }
+}
+
+/// NuGet V3 proxy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NugetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream NuGet API (default: https://api.nuget.org)
+    #[serde(default = "default_nuget_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+    /// Metadata cache TTL in seconds (default: 300 = 5 min)
+    #[serde(default = "default_metadata_ttl")]
+    pub metadata_ttl: u64,
+}
+
+fn default_nuget_proxy() -> Option<String> {
+    Some("https://api.nuget.org".to_string())
+}
+
+impl Default for NugetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_nuget_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            metadata_ttl: 300,
+        }
+    }
+}
+
+/// Dart/Flutter pub registry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubDartConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream pub registry (default: https://pub.dev)
+    #[serde(default = "default_pub_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+}
+
+fn default_pub_proxy() -> Option<String> {
+    Some("https://pub.dev".to_string())
+}
+
+impl Default for PubDartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_pub_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+        }
+    }
+}
+
+/// Conan V2 proxy configuration (C/C++ packages)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream Conan registry (default: https://center2.conan.io)
+    #[serde(default = "default_conan_proxy")]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub proxy_timeout: u64,
+    /// Separate timeout for binary downloads (default: 120s)
+    #[serde(default = "default_go_zip_timeout")]
+    pub proxy_timeout_download: u64,
+    /// Metadata cache TTL in seconds (default: 300 = 5 min)
+    #[serde(default = "default_metadata_ttl")]
+    pub metadata_ttl: u64,
+}
+
+fn default_conan_proxy() -> Option<String> {
+    Some("https://center2.conan.io".to_string())
+}
+
+impl Default for ConanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy: default_conan_proxy(),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            proxy_timeout_download: 120,
+            metadata_ttl: 300,
+        }
+    }
+}
+
 fn default_docker_timeout() -> u64 {
     60
 }
@@ -316,6 +539,7 @@ fn default_metadata_ttl() -> u64 {
 impl Default for MavenConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxies: vec![MavenProxyEntry::Simple(
                 "https://repo1.maven.org/maven2".to_string(),
             )],
@@ -329,6 +553,7 @@ impl Default for MavenConfig {
 impl Default for NpmConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy: Some("https://registry.npmjs.org".to_string()),
             proxy_auth: None,
             proxy_timeout: 30,
@@ -340,6 +565,7 @@ impl Default for NpmConfig {
 impl Default for PypiConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy: Some("https://pypi.org/simple/".to_string()),
             proxy_auth: None,
             proxy_timeout: 30,
@@ -350,6 +576,7 @@ impl Default for PypiConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy_timeout: 60,
             upstreams: vec![DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
@@ -632,6 +859,54 @@ impl Default for CurationConfig {
 }
 
 impl Config {
+    /// Returns the set of enabled registry types based on config.
+    pub fn enabled_registries(&self) -> HashSet<RegistryType> {
+        let mut set = HashSet::new();
+        if self.docker.enabled {
+            set.insert(RegistryType::Docker);
+        }
+        if self.maven.enabled {
+            set.insert(RegistryType::Maven);
+        }
+        if self.npm.enabled {
+            set.insert(RegistryType::Npm);
+        }
+        if self.cargo.enabled {
+            set.insert(RegistryType::Cargo);
+        }
+        if self.pypi.enabled {
+            set.insert(RegistryType::PyPI);
+        }
+        if self.go.enabled {
+            set.insert(RegistryType::Go);
+        }
+        if self.raw.enabled {
+            set.insert(RegistryType::Raw);
+        }
+        if self.gems.enabled {
+            set.insert(RegistryType::Gems);
+        }
+        if self.terraform.enabled {
+            set.insert(RegistryType::Terraform);
+        }
+        if self.ansible.enabled {
+            set.insert(RegistryType::Ansible);
+        }
+        if self.nuget.enabled {
+            set.insert(RegistryType::Nuget);
+        }
+        if self.pub_dart.enabled {
+            set.insert(RegistryType::PubDart);
+        }
+        if self.conan.enabled {
+            set.insert(RegistryType::Conan);
+        }
+        if set.is_empty() {
+            tracing::warn!("No registries enabled! All registries are disabled.");
+        }
+        set
+    }
+
     /// Warn if credentials are configured via config.toml (not env vars)
     pub fn warn_plaintext_credentials(&self) {
         // Docker upstreams
@@ -920,6 +1195,44 @@ impl Config {
             self.auth.htpasswd_file = val;
         }
 
+        // Registry enabled flags
+        if let Ok(val) = env::var("NORA_DOCKER_ENABLED") {
+            self.docker.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_MAVEN_ENABLED") {
+            self.maven.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_NPM_ENABLED") {
+            self.npm.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_CARGO_ENABLED") {
+            self.cargo.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_PYPI_ENABLED") {
+            self.pypi.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_GO_ENABLED") {
+            self.go.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_GEMS_ENABLED") {
+            self.gems.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_TERRAFORM_ENABLED") {
+            self.terraform.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_ENABLED") {
+            self.ansible.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_NUGET_ENABLED") {
+            self.nuget.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_PUB_ENABLED") {
+            self.pub_dart.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_CONAN_ENABLED") {
+            self.conan.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+
         // Maven config — supports "url1,url2" or "url1|auth1,url2|auth2"
         if let Ok(val) = env::var("NORA_MAVEN_PROXIES") {
             self.maven.proxies = val
@@ -1064,6 +1377,109 @@ impl Config {
             }
         }
 
+        // Gems config
+        if let Ok(val) = env::var("NORA_GEMS_PROXY") {
+            self.gems.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_GEMS_PROXY_AUTH") {
+            self.gems.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_GEMS_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.gems.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_GEMS_INDEX_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.gems.index_ttl = ttl;
+            }
+        }
+
+        // Terraform config
+        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY") {
+            self.terraform.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_AUTH") {
+            self.terraform.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.terraform.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_TIMEOUT_DOWNLOAD") {
+            if let Ok(timeout) = val.parse() {
+                self.terraform.proxy_timeout_download = timeout;
+            }
+        }
+
+        // Ansible Galaxy config
+        if let Ok(val) = env::var("NORA_ANSIBLE_PROXY") {
+            self.ansible.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_PROXY_AUTH") {
+            self.ansible.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.ansible.proxy_timeout = timeout;
+            }
+        }
+
+        // NuGet config
+        if let Ok(val) = env::var("NORA_NUGET_PROXY") {
+            self.nuget.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_NUGET_PROXY_AUTH") {
+            self.nuget.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_NUGET_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.nuget.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_NUGET_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.nuget.metadata_ttl = ttl;
+            }
+        }
+
+        // pub.dev config
+        if let Ok(val) = env::var("NORA_PUB_PROXY") {
+            self.pub_dart.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_PUB_PROXY_AUTH") {
+            self.pub_dart.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_PUB_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.pub_dart.proxy_timeout = timeout;
+            }
+        }
+
+        // Conan proxy config
+        if let Ok(val) = env::var("NORA_CONAN_PROXY") {
+            self.conan.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CONAN_PROXY_AUTH") {
+            self.conan.proxy_auth = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.conan.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT_DOWNLOAD") {
+            if let Ok(timeout) = val.parse() {
+                self.conan.proxy_timeout_download = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_CONAN_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.conan.metadata_ttl = ttl;
+            }
+        }
+
         // Token storage
         if let Ok(val) = env::var("NORA_AUTH_TOKEN_STORAGE") {
             self.auth.token_storage = val;
@@ -1199,6 +1615,12 @@ impl Default for Config {
             cargo: CargoConfig::default(),
             docker: DockerConfig::default(),
             raw: RawConfig::default(),
+            gems: GemsConfig::default(),
+            terraform: TerraformConfig::default(),
+            ansible: AnsibleConfig::default(),
+            nuget: NugetConfig::default(),
+            pub_dart: PubDartConfig::default(),
+            conan: ConanConfig::default(),
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             secrets: SecretsConfig::default(),

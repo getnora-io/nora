@@ -6,11 +6,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.5"
+version = "0.7.0-rc5"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
-authors = ["DevITWay <devitway@gmail.com>"]
+authors = ["Pavel Volkov <devitway@gmail.com>"]
 repository = "https://github.com/getnora-io/nora"
 homepage = "https://getnora.dev"
 

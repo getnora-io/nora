@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The Nora Authors
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 //! Shared test infrastructure for integration tests.
@@ -87,23 +87,27 @@ fn build_context(
             s3_region: String::new(),
         },
         maven: MavenConfig {
+            enabled: true,
             proxies: vec![],
             proxy_timeout: 5,
             checksum_verify: true,
             immutable_releases: true,
         },
         npm: NpmConfig {
+            enabled: true,
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
             metadata_ttl: 0,
         },
         pypi: PypiConfig {
+            enabled: true,
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
         },
         go: GoConfig {
+            enabled: true,
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
@@ -111,11 +115,13 @@ fn build_context(
             max_zip_size: 10_485_760,
         },
         cargo: CargoConfig {
+            enabled: true,
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
         },
         docker: DockerConfig {
+            enabled: true,
             proxy_timeout: 5,
             upstreams: vec![],
         },
@@ -123,6 +129,12 @@ fn build_context(
             enabled: true,
             max_file_size: 1_048_576, // 1 MB
         },
+        gems: GemsConfig::default(),
+        terraform: TerraformConfig::default(),
+        ansible: AnsibleConfig::default(),
+        nuget: NugetConfig::default(),
+        pub_dart: crate::config::PubDartConfig::default(),
+        conan: crate::config::ConanConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
@@ -186,9 +198,12 @@ fn build_context(
         curation_engine.set_namespace_filter(Box::new(ns_filter));
     }
 
+    let enabled_registries = config.enabled_registries();
+
     let state = Arc::new(AppState {
         storage,
         config,
+        enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),
         auth,
         tokens,
@@ -204,14 +219,51 @@ fn build_context(
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
-    let registry_routes = Router::new()
-        .merge(registry::docker_routes())
-        .merge(registry::maven_routes())
-        .merge(registry::npm_routes())
-        .merge(registry::cargo_routes())
-        .merge(registry::pypi_routes())
-        .merge(registry::raw_routes())
-        .merge(registry::go_routes());
+    // Dynamic route merging based on enabled registries
+    let mut registry_routes = Router::new();
+    for reg in &enabled_registries {
+        match reg {
+            crate::registry_type::RegistryType::Docker => {
+                registry_routes = registry_routes.merge(registry::docker_routes());
+            }
+            crate::registry_type::RegistryType::Maven => {
+                registry_routes = registry_routes.merge(registry::maven_routes());
+            }
+            crate::registry_type::RegistryType::Npm => {
+                registry_routes = registry_routes.merge(registry::npm_routes());
+            }
+            crate::registry_type::RegistryType::Cargo => {
+                registry_routes = registry_routes.merge(registry::cargo_routes());
+            }
+            crate::registry_type::RegistryType::PyPI => {
+                registry_routes = registry_routes.merge(registry::pypi_routes());
+            }
+            crate::registry_type::RegistryType::Raw => {
+                registry_routes = registry_routes.merge(registry::raw_routes());
+            }
+            crate::registry_type::RegistryType::Go => {
+                registry_routes = registry_routes.merge(registry::go_routes());
+            }
+            crate::registry_type::RegistryType::Gems => {
+                registry_routes = registry_routes.merge(registry::gems_routes());
+            }
+            crate::registry_type::RegistryType::Terraform => {
+                registry_routes = registry_routes.merge(registry::terraform_routes());
+            }
+            crate::registry_type::RegistryType::Ansible => {
+                registry_routes = registry_routes.merge(registry::ansible_routes());
+            }
+            crate::registry_type::RegistryType::Nuget => {
+                registry_routes = registry_routes.merge(registry::nuget_routes());
+            }
+            crate::registry_type::RegistryType::PubDart => {
+                registry_routes = registry_routes.merge(registry::pub_dart_routes());
+            }
+            crate::registry_type::RegistryType::Conan => {
+                registry_routes = registry_routes.merge(registry::conan_routes());
+            }
+        }
+    }
 
     let public_routes = Router::new().merge(crate::health::routes());
 

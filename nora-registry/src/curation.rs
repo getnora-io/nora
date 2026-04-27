@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The Nora Authors
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 //! Curation layer — package access control for proxy registries.
@@ -16,38 +16,13 @@ use crate::config::{CurationConfig, CurationMode};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
-// Registry Type
+// Registry Type (re-export from shared module)
 // ============================================================================
 
-/// Supported registry formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RegistryType {
-    Npm,
-    PyPI,
-    Maven,
-    Cargo,
-    Go,
-    Docker,
-    Raw,
-}
-
-impl fmt::Display for RegistryType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RegistryType::Npm => write!(f, "npm"),
-            RegistryType::PyPI => write!(f, "pypi"),
-            RegistryType::Maven => write!(f, "maven"),
-            RegistryType::Cargo => write!(f, "cargo"),
-            RegistryType::Go => write!(f, "go"),
-            RegistryType::Docker => write!(f, "docker"),
-            RegistryType::Raw => write!(f, "raw"),
-        }
-    }
-}
+pub use crate::registry_type::RegistryType;
 
 // ============================================================================
 // Filter Request

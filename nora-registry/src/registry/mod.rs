@@ -1,23 +1,35 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+mod ansible;
 mod cargo_registry;
+mod conan;
 pub mod docker;
 pub mod docker_auth;
+mod gems;
 mod go;
 mod maven;
 mod npm;
+mod nuget;
+mod pub_dart;
 mod pypi;
 mod raw;
+mod terraform;
 
+pub use ansible::routes as ansible_routes;
 pub use cargo_registry::routes as cargo_routes;
+pub use conan::routes as conan_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
+pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
+pub use nuget::routes as nuget_routes;
+pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 pub use raw::routes as raw_routes;
+pub use terraform::routes as terraform_routes;
 
 use crate::config::basic_auth_header;
 use std::time::Duration;
