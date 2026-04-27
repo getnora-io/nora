@@ -2,15 +2,27 @@
 ## [Unreleased]
 
 ### Added
-- RubyGems proxy registry (`/gems/`) — compact index, gem/gemspec immutable caching, TTL-based index refresh
-- Terraform proxy registry (`/terraform/`) — provider/module proxy with service discovery, download_url rewriting
-- Ansible Galaxy proxy registry (`/ansible/`) — Galaxy v3 API, collection tarball immutable caching
-- NuGet v3 proxy registry (`/nuget/`) — service index @id URL rewriting, .nupkg/.nuspec immutable caching
-- Pub (Dart/Flutter) proxy registry (`/pub/`) — package metadata URL rewriting, SHA256-verified archive caching (based on PR #191 by @mit-73)
+- **Curation layer** — policy engine for download filtering across all 13 registries (#184-#190)
+  - Blocklist/allowlist rules with glob patterns and namespace isolation
+  - Three modes: `off` (passthrough), `audit` (log only), `enforce` (block downloads)
+  - Integrity verification via SHA256/SHA512 checksums
+  - CVE blocking via OSV.dev integration
+  - CLI tools: `nora curation validate`, `nora curation explain`
+- RubyGems proxy registry (`/gems/`) — compact index, gem/gemspec immutable caching, TTL-based index refresh (#141)
+- Terraform proxy registry (`/terraform/`) — provider/module proxy with service discovery, download_url rewriting (#133)
+- Ansible Galaxy proxy registry (`/ansible/`) — Galaxy v3 API, collection tarball immutable caching (#134)
+- NuGet v3 proxy registry (`/nuget/`) — service index @id URL rewriting, .nupkg/.nuspec immutable caching (#140)
+- Pub (Dart/Flutter) proxy registry (`/pub/`) — package metadata URL rewriting, SHA256-verified archive caching (#166, based on PR #191 by @mit-73)
 - Conan V2 proxy registry (`/conan/`) — recipe/package caching with immutable revision-scoped storage, ConanCenter upstream (#142)
 - Dynamic registry loading — only enabled registries mount routes, appear in UI sidebar and health endpoint
 - Per-registry `enabled` flag in config (env: `NORA_DOCKER_ENABLED`, `NORA_MAVEN_ENABLED`, etc.)
 - Shared `RegistryType` enum for type-safe cross-module registry identification
+- UI: 13-registry sidebar with format-specific SVG icons, dashboard cards for all registries
+- Short-SHA Docker tags in CI builds (#182, #192)
+
+### Changed
+- Copyright updated to "The NORA Authors"
+- OpenAPI spec version synced with Cargo.toml
 
 ## [0.6.5] - 2026-04-23
 
