@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The Nora Authors
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
 #![forbid(unsafe_code)]
@@ -18,6 +18,7 @@ mod mirror;
 mod openapi;
 mod rate_limit;
 mod registry;
+mod registry_type;
 mod repo_index;
 mod request_id;
 mod retention;
@@ -44,6 +45,7 @@ use audit::AuditLog;
 use auth::HtpasswdAuth;
 use config::{Config, CurationMode, StorageMode};
 use dashboard_metrics::DashboardMetrics;
+use registry_type::RegistryType;
 use repo_index::RepoIndex;
 pub use storage::Storage;
 use tokens::TokenStore;
@@ -138,6 +140,7 @@ enum CurationCommand {
 pub struct AppState {
     pub storage: Storage,
     pub config: Config,
+    pub enabled_registries: HashSet<RegistryType>,
     pub start_time: Instant,
     pub auth: Option<HtpasswdAuth>,
     pub tokens: Option<TokenStore>,
@@ -469,17 +472,17 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         None => (rest.to_string(), None),
     };
 
-    let registry = match registry_str {
-        "npm" => curation::RegistryType::Npm,
-        "pypi" => curation::RegistryType::PyPI,
-        "maven" => curation::RegistryType::Maven,
-        "cargo" => curation::RegistryType::Cargo,
-        "go" => curation::RegistryType::Go,
-        "docker" => curation::RegistryType::Docker,
-        other => {
+    let registry = match RegistryType::from_str_opt(registry_str) {
+        Some(rt) => rt,
+        None => {
             eprintln!(
-                "ERROR: Unknown registry '{}'. Use: npm, pypi, maven, cargo, go, docker",
-                other
+                "ERROR: Unknown registry '{}'. Use: {}",
+                registry_str,
+                RegistryType::all()
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             std::process::exit(1);
         }
@@ -668,15 +671,44 @@ async fn run_server(config: Config, storage: Storage) {
         info!(patterns = count, "Namespace isolation filter loaded");
     }
 
-    // Registry routes (shared between rate-limited and non-limited paths)
-    let registry_routes = Router::new()
-        .merge(registry::docker_routes())
-        .merge(registry::maven_routes())
-        .merge(registry::npm_routes())
-        .merge(registry::cargo_routes())
-        .merge(registry::pypi_routes())
-        .merge(registry::raw_routes())
-        .merge(registry::go_routes());
+    // Determine enabled registries from config
+    let enabled_registries = config.enabled_registries();
+
+    // Registry routes — only merge enabled registries
+    let mut registry_routes = Router::new();
+    for reg in &enabled_registries {
+        match reg {
+            RegistryType::Docker => {
+                registry_routes = registry_routes.merge(registry::docker_routes())
+            }
+            RegistryType::Maven => {
+                registry_routes = registry_routes.merge(registry::maven_routes())
+            }
+            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
+            RegistryType::Cargo => {
+                registry_routes = registry_routes.merge(registry::cargo_routes())
+            }
+            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
+            RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
+            RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
+            RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
+            RegistryType::Terraform => {
+                registry_routes = registry_routes.merge(registry::terraform_routes())
+            }
+            RegistryType::Ansible => {
+                registry_routes = registry_routes.merge(registry::ansible_routes())
+            }
+            RegistryType::Nuget => {
+                registry_routes = registry_routes.merge(registry::nuget_routes())
+            }
+            RegistryType::PubDart => {
+                registry_routes = registry_routes.merge(registry::pub_dart_routes())
+            }
+            RegistryType::Conan => {
+                registry_routes = registry_routes.merge(registry::conan_routes())
+            }
+        }
+    }
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
@@ -708,6 +740,7 @@ async fn run_server(config: Config, storage: Storage) {
     let state = Arc::new(AppState {
         storage,
         config,
+        enabled_registries,
         start_time,
         auth,
         tokens,
@@ -802,20 +835,25 @@ async fn run_server(config: Config, storage: Storage) {
         "Nora started"
     );
 
+    // Log enabled registries and their mount points
+    let enabled_names: Vec<String> = state
+        .enabled_registries
+        .iter()
+        .map(|r| format!("{} ({})", r.display_name(), r.mount_point()))
+        .collect();
+    info!(
+        registries = ?enabled_names,
+        count = state.enabled_registries.len(),
+        "Enabled registries"
+    );
+
     info!(
         health = "/health",
         ready = "/ready",
         metrics = "/metrics",
         ui = "/ui/",
         api_docs = "/api-docs",
-        docker = "/v2/",
-        maven = "/maven2/",
-        npm = "/npm/",
-        cargo = "/cargo/",
-        pypi = "/simple/",
-        go = "/go/",
-        raw = "/raw/",
-        "Available endpoints"
+        "System endpoints"
     );
 
     // Background task: persist metrics and flush token last_used every 30 seconds
@@ -885,7 +923,10 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     if covered.contains("*") {
         return;
     }
-    let all_registries = ["docker", "maven", "npm", "pypi", "cargo", "go", "raw"];
+    let all_registries = RegistryType::all_v1()
+        .iter()
+        .map(|r| r.as_str())
+        .collect::<Vec<_>>();
     let mut uncovered = Vec::new();
     for name in &all_registries {
         if !covered.contains(name) {

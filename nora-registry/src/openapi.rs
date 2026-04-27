@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 //! OpenAPI documentation and Swagger UI
@@ -18,10 +18,10 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.6.5",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, and Raw",
+        version = "0.7.0-rc5",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, and Conan",
         license(name = "MIT"),
-        contact(name = "DevITWay", url = "https://getnora.dev")
+        contact(name = "The NORA Authors", url = "https://getnora.dev")
     ),
     servers(
         (url = "/", description = "Current server")
@@ -37,6 +37,12 @@ use crate::AppState;
         (name = "pypi", description = "PyPI Simple API"),
         (name = "go", description = "Go Module Proxy API"),
         (name = "raw", description = "Raw File Storage API"),
+        (name = "gems", description = "RubyGems Proxy API"),
+        (name = "terraform", description = "Terraform Registry Proxy API"),
+        (name = "ansible", description = "Ansible Galaxy Proxy API"),
+        (name = "nuget", description = "NuGet v3 Registry Proxy API"),
+        (name = "pub", description = "Dart/Flutter Pub Registry Proxy API"),
+        (name = "conan", description = "Conan V2 Registry Proxy API (C/C++)"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
@@ -84,6 +90,24 @@ use crate::AppState;
         // Raw
         crate::openapi::raw_file_get,
         crate::openapi::raw_file_put,
+        // RubyGems
+        crate::openapi::gems_info,
+        crate::openapi::gems_download,
+        // Terraform
+        crate::openapi::terraform_service_discovery,
+        crate::openapi::terraform_provider_versions,
+        // Ansible Galaxy
+        crate::openapi::ansible_collection_list,
+        crate::openapi::ansible_download,
+        // NuGet
+        crate::openapi::nuget_service_index,
+        crate::openapi::nuget_download,
+        // Pub (Dart/Flutter)
+        crate::openapi::pub_package_list,
+        crate::openapi::pub_archive_download,
+        // Conan (C/C++)
+        crate::openapi::conan_ping,
+        crate::openapi::conan_recipe_file,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -808,6 +832,190 @@ pub async fn raw_file_get() {}
     )
 )]
 pub async fn raw_file_put() {}
+
+// -------------------- RubyGems --------------------
+
+/// Get gem compact index
+#[utoipa::path(
+    get,
+    path = "/gems/info/{name}",
+    tag = "gems",
+    params(
+        ("name" = String, Path, description = "Gem name (e.g., 'rails')")
+    ),
+    responses(
+        (status = 200, description = "Compact index for gem"),
+        (status = 404, description = "Gem not found")
+    )
+)]
+pub async fn gems_info() {}
+
+/// Download gem file
+#[utoipa::path(
+    get,
+    path = "/gems/gems/{filename}",
+    tag = "gems",
+    params(
+        ("filename" = String, Path, description = "Gem file (e.g., 'rails-7.0.0.gem')")
+    ),
+    responses(
+        (status = 200, description = "Gem binary"),
+        (status = 404, description = "Gem not found")
+    )
+)]
+pub async fn gems_download() {}
+
+// -------------------- Terraform --------------------
+
+/// Terraform service discovery
+#[utoipa::path(
+    get,
+    path = "/terraform/.well-known/terraform.json",
+    tag = "terraform",
+    responses(
+        (status = 200, description = "Service discovery JSON")
+    )
+)]
+pub async fn terraform_service_discovery() {}
+
+/// List Terraform provider versions
+#[utoipa::path(
+    get,
+    path = "/terraform/v1/providers/{ns}/{ptype}/versions",
+    tag = "terraform",
+    params(
+        ("ns" = String, Path, description = "Provider namespace"),
+        ("ptype" = String, Path, description = "Provider type")
+    ),
+    responses(
+        (status = 200, description = "Version list"),
+        (status = 404, description = "Provider not found")
+    )
+)]
+pub async fn terraform_provider_versions() {}
+
+// -------------------- Ansible Galaxy --------------------
+
+/// List Ansible Galaxy collections
+#[utoipa::path(
+    get,
+    path = "/ansible/api/v3/plugin/ansible/content/published/collections/index/",
+    tag = "ansible",
+    responses(
+        (status = 200, description = "Collection list"),
+        (status = 502, description = "Upstream unreachable")
+    )
+)]
+pub async fn ansible_collection_list() {}
+
+/// Download Ansible collection tarball
+#[utoipa::path(
+    get,
+    path = "/ansible/download/{filename}",
+    tag = "ansible",
+    params(
+        ("filename" = String, Path, description = "Collection tarball (e.g., 'community-general-7.0.0.tar.gz')")
+    ),
+    responses(
+        (status = 200, description = "Collection tarball"),
+        (status = 404, description = "Collection not found")
+    )
+)]
+pub async fn ansible_download() {}
+
+// -------------------- NuGet --------------------
+
+/// NuGet v3 service index
+#[utoipa::path(
+    get,
+    path = "/nuget/v3/index.json",
+    tag = "nuget",
+    responses(
+        (status = 200, description = "Service index JSON with @id URLs rewritten")
+    )
+)]
+pub async fn nuget_service_index() {}
+
+/// Download NuGet package
+#[utoipa::path(
+    get,
+    path = "/nuget/v3/flatcontainer/{path}",
+    tag = "nuget",
+    params(
+        ("path" = String, Path, description = "Package path (e.g., 'newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg')")
+    ),
+    responses(
+        (status = 200, description = "Package file (.nupkg or .nuspec)"),
+        (status = 404, description = "Package not found")
+    )
+)]
+pub async fn nuget_download() {}
+
+// -------------------- Pub (Dart/Flutter) --------------------
+
+/// List or search pub packages
+#[utoipa::path(
+    get,
+    path = "/pub/api/packages/{package}",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name")
+    ),
+    responses(
+        (status = 200, description = "Package metadata with versions"),
+        (status = 404, description = "Package not found")
+    )
+)]
+pub async fn pub_package_list() {}
+
+/// Download pub package archive
+#[utoipa::path(
+    get,
+    path = "/pub/packages/{package}/versions/{archive}",
+    tag = "pub",
+    params(
+        ("package" = String, Path, description = "Package name"),
+        ("archive" = String, Path, description = "Version archive (e.g., '1.2.0.tar.gz')")
+    ),
+    responses(
+        (status = 200, description = "Package archive (.tar.gz)"),
+        (status = 404, description = "Package not found")
+    )
+)]
+pub async fn pub_archive_download() {}
+
+// -------------------- Conan --------------------
+
+/// Conan v2 ping (capabilities check)
+#[utoipa::path(
+    get,
+    path = "/conan/v2/ping",
+    tag = "conan",
+    responses(
+        (status = 200, description = "Ping response with X-Conan-Server-Capabilities header")
+    )
+)]
+pub async fn conan_ping() {}
+
+/// Download a Conan recipe or package file
+#[utoipa::path(
+    get,
+    path = "/conan/v2/conans/{name}/{ver}/{user}/{chan}/revisions/{rrev}/files/{filename}",
+    tag = "conan",
+    params(
+        ("name" = String, Path, description = "Package name"),
+        ("ver" = String, Path, description = "Package version"),
+        ("user" = String, Path, description = "User (or _ for default)"),
+        ("chan" = String, Path, description = "Channel (or _ for default)"),
+        ("rrev" = String, Path, description = "Recipe revision hash"),
+        ("filename" = String, Path, description = "File name (e.g., conanfile.py)")
+    ),
+    responses(
+        (status = 200, description = "File content"),
+        (status = 404, description = "File not found")
+    )
+)]
+pub async fn conan_recipe_file() {}
 
 // -------------------- Auth / Tokens --------------------
 

@@ -122,6 +122,104 @@ This document describes which parts of each registry protocol are implemented in
 | Directory listing | — | Not implemented |
 | Versioning | — | Overwrite-only |
 
+## RubyGems
+
+Caching proxy for rubygems.org. Immutable gem/gemspec caching with TTL-based index refresh.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Compact index (`/info/{name}`) | Full | TTL-cached |
+| Gem download (`/gems/{name}-{ver}.gem`) | Full | Immutable cache |
+| Gemspec (`/quick/Marshal.4.8/...`) | Full | Immutable cache |
+| Full index (`specs.4.8.gz`) | Full | TTL-cached |
+| Latest index (`latest_specs.4.8.gz`) | Full | TTL-cached |
+| Gem push | — | Proxy-only (read) |
+
+Client: `bundle config mirror.https://rubygems.org http://nora:4000/gems/`
+
+## Terraform
+
+Caching proxy for registry.terraform.io. Provider binaries are immutably cached; metadata uses TTL.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Service discovery (`.well-known/terraform.json`) | Full | Points to NORA |
+| Provider versions list | Full | TTL-cached |
+| Provider download metadata | Full | `download_url` rewritten to NORA |
+| Provider binary download | Full | Immutable cache |
+| Module versions list | Full | TTL-cached |
+| Module download | Full | `X-Terraform-Get` header pass-through |
+| Provider publish | — | Proxy-only (read) |
+
+Client: `provider_installation { network_mirror { url = "http://nora:4000/terraform/" } }`
+
+## Ansible Galaxy (v3 API)
+
+Caching proxy for galaxy.ansible.com. Collection tarballs are immutably cached.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Collection list | Full | TTL-cached |
+| Collection detail | Full | TTL-cached |
+| Collection versions | Full | TTL-cached |
+| Version detail | Full | TTL-cached |
+| Tarball download | Full | Immutable cache |
+| Collection publish | — | Proxy-only (read) |
+
+Client: `ansible-galaxy collection install ns.name -s http://nora:4000/ansible/`
+
+## NuGet (v3 API)
+
+Caching proxy for api.nuget.org. Service index URLs are rewritten to point through NORA.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Service index (`/v3/index.json`) | Full | `@id` URLs rewritten to NORA |
+| Registration index | Full | TTL-cached |
+| Version list (flat container) | Full | TTL-cached |
+| `.nupkg` download | Full | Immutable cache |
+| `.nuspec` download | Full | Immutable cache |
+| Package push | — | Proxy-only (read) |
+| Search | — | Not implemented |
+
+Client: `dotnet nuget add source http://nora:4000/nuget/v3/index.json -n nora`
+
+## Pub (Dart/Flutter)
+
+Caching proxy for pub.dev. Package archives are immutably cached with SHA256 verification.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Package search (`/api/packages?q=`) | Full | Response URL rewriting |
+| Package metadata (`/api/packages/{name}`) | Full | `archive_url` rewritten to NORA |
+| Version metadata | Full | Cached |
+| Security advisories | Full | Cached |
+| Archive download (`.tar.gz`) | Full | Immutable cache, SHA256 verified |
+| Package publish | — | Proxy-only (read) |
+
+Client: `export PUB_HOSTED_URL=http://nora:4000/pub && dart pub get`
+
+## Conan (C/C++)
+
+Caching proxy for ConanCenter (center2.conan.io). Recipe and package files are immutably cached (scoped to revision hashes). Metadata uses TTL-based caching.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Ping (`/v2/ping`) | Full | Returns `X-Conan-Server-Capabilities: revisions` |
+| Recipe search | Full | Proxied to upstream |
+| Recipe latest revision | Full | TTL-cached |
+| Recipe revision list | Full | TTL-cached |
+| Recipe file list | Full | Immutable cache (revision-scoped) |
+| Recipe file download | Full | Immutable cache |
+| Package latest revision | Full | TTL-cached |
+| Package revision list | Full | TTL-cached |
+| Package file list | Full | Immutable cache (revision-scoped) |
+| Package file download | Full | Immutable cache |
+| Recipe/package upload | — | Proxy-only (read) |
+| Authentication | — | Anonymous read only |
+
+Client: `conan remote add nora http://nora:4000/conan`
+
 ## Helm OCI
 
 Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm push` and `helm pull` work through the standard `/v2/` API.

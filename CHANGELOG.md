@@ -1,6 +1,17 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- RubyGems proxy registry (`/gems/`) — compact index, gem/gemspec immutable caching, TTL-based index refresh
+- Terraform proxy registry (`/terraform/`) — provider/module proxy with service discovery, download_url rewriting
+- Ansible Galaxy proxy registry (`/ansible/`) — Galaxy v3 API, collection tarball immutable caching
+- NuGet v3 proxy registry (`/nuget/`) — service index @id URL rewriting, .nupkg/.nuspec immutable caching
+- Pub (Dart/Flutter) proxy registry (`/pub/`) — package metadata URL rewriting, SHA256-verified archive caching (based on PR #191 by @mit-73)
+- Conan V2 proxy registry (`/conan/`) — recipe/package caching with immutable revision-scoped storage, ConanCenter upstream (#142)
+- Dynamic registry loading — only enabled registries mount routes, appear in UI sidebar and health endpoint
+- Per-registry `enabled` flag in config (env: `NORA_DOCKER_ENABLED`, `NORA_MAVEN_ENABLED`, etc.)
+- Shared `RegistryType` enum for type-safe cross-module registry identification
+
 ## [0.6.5] - 2026-04-23
 
 ### Fixed

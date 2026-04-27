@@ -1,8 +1,9 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AppState;
@@ -13,7 +14,7 @@ pub struct HealthStatus {
     pub version: String,
     pub uptime_seconds: u64,
     pub storage: StorageHealth,
-    pub registries: RegistriesHealth,
+    pub registries: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -22,17 +23,6 @@ pub struct StorageHealth {
     pub reachable: bool,
     pub endpoint: String,
     pub total_size_bytes: u64,
-}
-
-#[derive(Serialize)]
-pub struct RegistriesHealth {
-    pub docker: String,
-    pub maven: String,
-    pub npm: String,
-    pub cargo: String,
-    pub pypi: String,
-    pub go: String,
-    pub raw: String,
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -53,6 +43,12 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
 
     let uptime = state.start_time.elapsed().as_secs();
 
+    // Build registries map from enabled registries
+    let mut registries = HashMap::new();
+    for reg in &state.enabled_registries {
+        registries.insert(reg.as_str().to_string(), "ok".to_string());
+    }
+
     let health = HealthStatus {
         status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -66,15 +62,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
             },
             total_size_bytes: total_size,
         },
-        registries: RegistriesHealth {
-            docker: "ok".to_string(),
-            maven: "ok".to_string(),
-            npm: "ok".to_string(),
-            cargo: "ok".to_string(),
-            pypi: "ok".to_string(),
-            go: "ok".to_string(),
-            raw: "ok".to_string(),
-        },
+        registries,
     };
 
     let status_code = if storage_reachable {
@@ -101,7 +89,9 @@ async fn check_storage_reachable(state: &AppState) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
     use axum::http::{Method, StatusCode};
 
     #[tokio::test]
@@ -164,5 +154,39 @@ mod tests {
         let ctx = create_test_context();
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_registries_dynamic() {
+        // Default context has all 7 v1 registries enabled
+        let ctx = create_test_context();
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let registries = json.get("registries").unwrap().as_object().unwrap();
+        assert!(registries.contains_key("docker"));
+        assert!(registries.contains_key("maven"));
+        assert!(registries.contains_key("npm"));
+        assert!(registries.contains_key("cargo"));
+        assert!(registries.contains_key("pypi"));
+        assert!(registries.contains_key("go"));
+        assert!(registries.contains_key("raw"));
+    }
+
+    #[tokio::test]
+    async fn test_health_disabled_registry_absent() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.enabled = false;
+        });
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let registries = json.get("registries").unwrap().as_object().unwrap();
+        assert!(
+            !registries.contains_key("docker"),
+            "disabled docker should not appear in health"
+        );
+        // Others should still be present
+        assert!(registries.contains_key("maven"));
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use axum::{
@@ -125,6 +125,18 @@ fn detect_registry(path: &str) -> String {
         "go".to_string()
     } else if path.starts_with("/raw/") {
         "raw".to_string()
+    } else if path.starts_with("/gems/") {
+        "gems".to_string()
+    } else if path.starts_with("/terraform/") {
+        "terraform".to_string()
+    } else if path.starts_with("/ansible/") {
+        "ansible".to_string()
+    } else if path.starts_with("/nuget/") {
+        "nuget".to_string()
+    } else if path.starts_with("/pub/") {
+        "pub".to_string()
+    } else if path.starts_with("/conan/") {
+        "conan".to_string()
     } else if path.starts_with("/ui") {
         "ui".to_string()
     } else {
