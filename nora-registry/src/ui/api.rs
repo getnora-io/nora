@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use super::components::{format_size, format_timestamp, html_escape};
@@ -111,13 +111,9 @@ pub struct MountPoint {
 
 pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats> {
     // Trigger index rebuild if needed, then get counts
-    let _ = state.repo_index.get("docker", &state.storage).await;
-    let _ = state.repo_index.get("maven", &state.storage).await;
-    let _ = state.repo_index.get("npm", &state.storage).await;
-    let _ = state.repo_index.get("cargo", &state.storage).await;
-    let _ = state.repo_index.get("pypi", &state.storage).await;
-    let _ = state.repo_index.get("go", &state.storage).await;
-    let _ = state.repo_index.get("raw", &state.storage).await;
+    for reg in &state.enabled_registries {
+        let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
+    }
 
     let (docker, maven, npm, cargo, pypi, go, raw) = state.repo_index.counts();
     Json(RegistryStats {
@@ -132,41 +128,104 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
 }
 
 pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
-    // Get indexes (will rebuild if dirty)
-    let docker_repos = state.repo_index.get("docker", &state.storage).await;
-    let maven_repos = state.repo_index.get("maven", &state.storage).await;
-    let npm_repos = state.repo_index.get("npm", &state.storage).await;
-    let cargo_repos = state.repo_index.get("cargo", &state.storage).await;
-    let pypi_repos = state.repo_index.get("pypi", &state.storage).await;
-    let go_repos = state.repo_index.get("go", &state.storage).await;
-    let raw_repos = state.repo_index.get("raw", &state.storage).await;
+    use crate::registry_type::RegistryType;
 
-    // Calculate sizes from cached index
-    let docker_size: u64 = docker_repos.iter().map(|r| r.size).sum();
-    let maven_size: u64 = maven_repos.iter().map(|r| r.size).sum();
-    let npm_size: u64 = npm_repos.iter().map(|r| r.size).sum();
-    let cargo_size: u64 = cargo_repos.iter().map(|r| r.size).sum();
-    let pypi_size: u64 = pypi_repos.iter().map(|r| r.size).sum();
-    let go_size: u64 = go_repos.iter().map(|r| r.size).sum();
-    let raw_size: u64 = raw_repos.iter().map(|r| r.size).sum();
-    let total_storage =
-        docker_size + maven_size + npm_size + cargo_size + pypi_size + go_size + raw_size;
+    let mut total_storage: u64 = 0;
+    let mut total_artifacts: usize = 0;
+    let mut registry_card_stats = Vec::new();
+    let mut mount_points = Vec::new();
 
-    // Count total versions/tags, not just repositories
-    let docker_versions: usize = docker_repos.iter().map(|r| r.versions).sum();
-    let maven_versions: usize = maven_repos.iter().map(|r| r.versions).sum();
-    let npm_versions: usize = npm_repos.iter().map(|r| r.versions).sum();
-    let cargo_versions: usize = cargo_repos.iter().map(|r| r.versions).sum();
-    let pypi_versions: usize = pypi_repos.iter().map(|r| r.versions).sum();
-    let go_versions: usize = go_repos.iter().map(|r| r.versions).sum();
-    let raw_versions: usize = raw_repos.iter().map(|r| r.versions).sum();
-    let total_artifacts = docker_versions
-        + maven_versions
-        + npm_versions
-        + cargo_versions
-        + pypi_versions
-        + go_versions
-        + raw_versions;
+    for reg in RegistryType::all_v1() {
+        if !state.enabled_registries.contains(reg) {
+            continue;
+        }
+
+        let name = reg.as_str();
+        let repos = state.repo_index.get(name, &state.storage).await;
+        let size: u64 = repos.iter().map(|r| r.size).sum();
+        let versions: usize = repos.iter().map(|r| r.versions).sum();
+
+        total_storage += size;
+        total_artifacts += versions;
+
+        registry_card_stats.push(RegistryCardStats {
+            name: name.to_string(),
+            artifact_count: versions,
+            downloads: state.metrics.get_registry_downloads(name),
+            uploads: state.metrics.get_registry_uploads(name),
+            size_bytes: size,
+        });
+
+        let proxy_upstream = match reg {
+            RegistryType::Docker => state.config.docker.upstreams.first().map(|u| u.url.clone()),
+            RegistryType::Maven => state
+                .config
+                .maven
+                .proxies
+                .first()
+                .map(|p| p.url().to_string()),
+            RegistryType::Npm => state.config.npm.proxy.clone(),
+            RegistryType::PyPI => state.config.pypi.proxy.clone(),
+            RegistryType::Go => state.config.go.proxy.clone(),
+            RegistryType::Gems => state.config.gems.proxy.clone(),
+            RegistryType::Terraform => state.config.terraform.proxy.clone(),
+            RegistryType::Ansible => state.config.ansible.proxy.clone(),
+            RegistryType::Nuget => state.config.nuget.proxy.clone(),
+            _ => None,
+        };
+
+        mount_points.push(MountPoint {
+            registry: reg.display_name().to_string(),
+            mount_path: reg.mount_point().to_string(),
+            proxy_upstream,
+        });
+    }
+
+    // Also include new format registries if enabled
+    for reg in &[
+        RegistryType::Gems,
+        RegistryType::Terraform,
+        RegistryType::Ansible,
+        RegistryType::Nuget,
+        RegistryType::PubDart,
+        RegistryType::Conan,
+    ] {
+        if !state.enabled_registries.contains(reg) {
+            continue;
+        }
+
+        let name = reg.as_str();
+        let repos = state.repo_index.get(name, &state.storage).await;
+        let size: u64 = repos.iter().map(|r| r.size).sum();
+        let versions: usize = repos.iter().map(|r| r.versions).sum();
+
+        total_storage += size;
+        total_artifacts += versions;
+
+        registry_card_stats.push(RegistryCardStats {
+            name: name.to_string(),
+            artifact_count: versions,
+            downloads: state.metrics.get_registry_downloads(name),
+            uploads: state.metrics.get_registry_uploads(name),
+            size_bytes: size,
+        });
+
+        let proxy_upstream = match reg {
+            RegistryType::Gems => state.config.gems.proxy.clone(),
+            RegistryType::Terraform => state.config.terraform.proxy.clone(),
+            RegistryType::Ansible => state.config.ansible.proxy.clone(),
+            RegistryType::Nuget => state.config.nuget.proxy.clone(),
+            RegistryType::PubDart => state.config.pub_dart.proxy.clone(),
+            RegistryType::Conan => state.config.conan.proxy.clone(),
+            _ => None,
+        };
+
+        mount_points.push(MountPoint {
+            registry: reg.display_name().to_string(),
+            mount_path: reg.mount_point().to_string(),
+            proxy_upstream,
+        });
+    }
 
     let global_stats = GlobalStats {
         downloads: state.metrics.downloads.load(Ordering::Relaxed),
@@ -175,101 +234,6 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         cache_hit_percent: state.metrics.cache_hit_rate(),
         storage_bytes: total_storage,
     };
-
-    let registry_card_stats = vec![
-        RegistryCardStats {
-            name: "docker".to_string(),
-            artifact_count: docker_versions,
-            downloads: state.metrics.get_registry_downloads("docker"),
-            uploads: state.metrics.get_registry_uploads("docker"),
-            size_bytes: docker_size,
-        },
-        RegistryCardStats {
-            name: "maven".to_string(),
-            artifact_count: maven_versions,
-            downloads: state.metrics.get_registry_downloads("maven"),
-            uploads: state.metrics.get_registry_uploads("maven"),
-            size_bytes: maven_size,
-        },
-        RegistryCardStats {
-            name: "npm".to_string(),
-            artifact_count: npm_versions,
-            downloads: state.metrics.get_registry_downloads("npm"),
-            uploads: 0,
-            size_bytes: npm_size,
-        },
-        RegistryCardStats {
-            name: "cargo".to_string(),
-            artifact_count: cargo_versions,
-            downloads: state.metrics.get_registry_downloads("cargo"),
-            uploads: 0,
-            size_bytes: cargo_size,
-        },
-        RegistryCardStats {
-            name: "pypi".to_string(),
-            artifact_count: pypi_versions,
-            downloads: state.metrics.get_registry_downloads("pypi"),
-            uploads: 0,
-            size_bytes: pypi_size,
-        },
-        RegistryCardStats {
-            name: "go".to_string(),
-            artifact_count: go_versions,
-            downloads: state.metrics.get_registry_downloads("go"),
-            uploads: 0,
-            size_bytes: go_size,
-        },
-        RegistryCardStats {
-            name: "raw".to_string(),
-            artifact_count: raw_versions,
-            downloads: state.metrics.get_registry_downloads("raw"),
-            uploads: state.metrics.get_registry_uploads("raw"),
-            size_bytes: raw_size,
-        },
-    ];
-
-    let mount_points = vec![
-        MountPoint {
-            registry: "Docker".to_string(),
-            mount_path: "/v2/".to_string(),
-            proxy_upstream: state.config.docker.upstreams.first().map(|u| u.url.clone()),
-        },
-        MountPoint {
-            registry: "Maven".to_string(),
-            mount_path: "/maven2/".to_string(),
-            proxy_upstream: state
-                .config
-                .maven
-                .proxies
-                .first()
-                .map(|p| p.url().to_string()),
-        },
-        MountPoint {
-            registry: "npm".to_string(),
-            mount_path: "/npm/".to_string(),
-            proxy_upstream: state.config.npm.proxy.clone(),
-        },
-        MountPoint {
-            registry: "Cargo".to_string(),
-            mount_path: "/cargo/".to_string(),
-            proxy_upstream: None,
-        },
-        MountPoint {
-            registry: "PyPI".to_string(),
-            mount_path: "/simple/".to_string(),
-            proxy_upstream: state.config.pypi.proxy.clone(),
-        },
-        MountPoint {
-            registry: "Go".to_string(),
-            mount_path: "/go/".to_string(),
-            proxy_upstream: state.config.go.proxy.clone(),
-        },
-        MountPoint {
-            registry: "Raw".to_string(),
-            mount_path: "/raw/".to_string(),
-            proxy_upstream: None,
-        },
-    ];
 
     let activity = state.activity.recent(20);
     let uptime_seconds = state.start_time.elapsed().as_secs();

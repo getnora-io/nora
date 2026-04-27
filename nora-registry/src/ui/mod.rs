@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 mod api;
@@ -133,6 +133,13 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/go/{*name}", get(go_detail))
         .route("/ui/raw", get(raw_list))
         .route("/ui/raw/{*name}", get(raw_detail))
+        // New registries (v0.7 — generic list pages)
+        .route("/ui/gems", get(generic_registry_list))
+        .route("/ui/terraform", get(generic_registry_list))
+        .route("/ui/ansible", get(generic_registry_list))
+        .route("/ui/nuget", get(generic_registry_list))
+        .route("/ui/pub", get(generic_registry_list))
+        .route("/ui/conan", get(generic_registry_list))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
         // Token management API (HTMX endpoints)
@@ -492,6 +499,45 @@ async fn raw_detail(
         &detail,
         lang,
         &base_url,
+        auth_enabled,
+    ))
+}
+
+// Generic registry list handler for new formats (v0.7)
+async fn generic_registry_list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    // Extract registry type from URI path: /ui/{type}
+    let registry_key = uri.path().strip_prefix("/ui/").unwrap_or("raw");
+    let title = match registry_key {
+        "gems" => "RubyGems",
+        "terraform" => "Terraform Registry",
+        "ansible" => "Ansible Galaxy",
+        "nuget" => "NuGet Gallery",
+        "pub" => "Pub (Dart/Flutter)",
+        "conan" => "Conan (C/C++)",
+        _ => registry_key,
+    };
+
+    let all_items = state.repo_index.get(registry_key, &state.storage).await;
+    let (items, total) = paginate(&all_items, page, limit);
+
+    Html(render_registry_list_paginated(
+        registry_key,
+        title,
+        &items,
+        page,
+        limit,
+        total,
+        lang,
         auth_enabled,
     ))
 }
