@@ -124,7 +124,10 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
 
     // Render bragging footer (demo builds only)
     #[cfg(feature = "demo")]
-    let bragging_footer = render_bragging_footer(lang);
+    let bragging_footer = {
+        let stats = BraggingStats::collect(data.registry_stats.len(), data.uptime_seconds);
+        render_bragging_footer(lang, &stats)
+    };
     #[cfg(not(feature = "demo"))]
     let bragging_footer = String::new();
 
@@ -970,7 +973,15 @@ pub fn render_token_list_fragment(tokens: &[TokenListEntry], lang: Lang) -> Stri
         );
     }
 
-    let rows: String = tokens
+    // Sort: active tokens first, expired last
+    let mut sorted_tokens: Vec<&TokenListEntry> = tokens.iter().collect();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    sorted_tokens.sort_by_key(|t| if t.expires_at <= now_ts { 1u8 } else { 0u8 });
+
+    let rows: String = sorted_tokens
         .iter()
         .map(|token| {
             let role_badge = render_role_badge(&token.role);
@@ -978,39 +989,50 @@ pub fn render_token_list_fragment(tokens: &[TokenListEntry], lang: Lang) -> Stri
                 .description
                 .as_deref()
                 .unwrap_or("-");
-            let expires = format_timestamp(token.expires_at);
+            let (expires_text, is_expired) = format_expiry(token.expires_at);
+            let expires_html = if is_expired {
+                format!(r##"<span class="px-2 py-0.5 text-xs font-medium text-red-400 bg-red-900/30 border border-red-800 rounded">{}</span>"##, expires_text)
+            } else {
+                format!(r##"<span class="text-slate-400">{}</span>"##, expires_text)
+            };
             let last_used = token
                 .last_used
                 .map(format_timestamp)
                 .unwrap_or_else(|| t.token_never_used.to_string());
+            let row_class = if is_expired {
+                "border-b border-slate-700/50 opacity-60"
+            } else {
+                "border-b border-slate-700/50"
+            };
 
             format!(
                 r##"
-                <tr class="border-b border-slate-700/50">
-                    <td class="px-6 py-4 text-slate-300">{}</td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4">{}</td>
-                    <td class="px-6 py-4 text-slate-400 text-sm">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                <tr class="{row_class}">
+                    <td class="px-6 py-4 text-slate-300">{desc}</td>
+                    <td class="px-6 py-4 text-slate-400">{user}</td>
+                    <td class="px-6 py-4">{role}</td>
+                    <td class="px-6 py-4 text-sm">{expires}</td>
+                    <td class="px-6 py-4 text-slate-500 text-sm">{last_used}</td>
                     <td class="px-6 py-4">
-                        <button hx-post="/api/ui/tokens/{}/revoke"
-                                hx-confirm="{}"
+                        <button hx-post="/api/ui/tokens/{file_id}/revoke"
+                                hx-confirm="{confirm}"
                                 hx-target="#token-list"
                                 hx-swap="innerHTML"
                                 class="px-3 py-1 text-xs font-medium text-red-400 hover:text-red-300 bg-red-900/20 hover:bg-red-900/40 border border-red-800 rounded transition-colors">
-                            {}
+                            {revoke}
                         </button>
                     </td>
                 </tr>
             "##,
-                html_escape(description),
-                html_escape(&token.user),
-                role_badge,
-                expires,
-                last_used,
-                html_escape(&token.file_id),
-                html_escape(t.token_revoke_confirm),
-                t.token_revoke,
+                row_class = row_class,
+                desc = html_escape(description),
+                user = html_escape(&token.user),
+                role = role_badge,
+                expires = expires_html,
+                last_used = last_used,
+                file_id = html_escape(&token.file_id),
+                confirm = html_escape(t.token_revoke_confirm),
+                revoke = t.token_revoke,
             )
         })
         .collect();

@@ -43,6 +43,8 @@ pub struct FilterRequest {
     pub integrity: Option<String>,
     /// Whether the request carries a valid bypass token.
     pub bypass: bool,
+    /// Publish date as Unix timestamp (seconds). None = unknown.
+    pub publish_date: Option<i64>,
 }
 
 // ============================================================================
@@ -271,6 +273,7 @@ pub fn check_download(
         version: version.map(|v| v.to_string()),
         integrity: None,
         bypass,
+        publish_date: None,
     };
 
     let result = engine.evaluate(&request);
@@ -334,6 +337,7 @@ pub fn verify_integrity(
         version: version.map(|v| v.to_string()),
         integrity: Some(integrity),
         bypass: false, // bypass already checked in pre-download phase
+        publish_date: None,
     };
 
     let result = engine.evaluate(&request);
@@ -808,6 +812,121 @@ impl ProxyFilter for NamespaceFilter {
 // Tests
 // ============================================================================
 
+// ============================================================================
+// MinReleaseAgeFilter — block packages younger than N seconds (supply chain)
+// ============================================================================
+
+/// Parse a human-readable duration string into seconds.
+///
+/// Supported formats: `"7d"` (days), `"24h"` (hours), `"1w"` (weeks).
+/// Multiple units can be combined: `"1w2d"` = 9 days.
+pub fn parse_duration(s: &str) -> Result<i64, String> {
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else {
+            if num_buf.is_empty() {
+                return Err(format!("unexpected unit '{}' without number", ch));
+            }
+            let n: i64 = num_buf
+                .parse()
+                .map_err(|_| format!("invalid number '{}'", num_buf))?;
+            num_buf.clear();
+
+            match ch {
+                'd' => total += n * 86400,
+                'h' => total += n * 3600,
+                'w' => total += n * 604800,
+                _ => return Err(format!("unknown unit '{}' (use d/h/w)", ch)),
+            }
+        }
+    }
+
+    if !num_buf.is_empty() {
+        return Err(format!(
+            "trailing number '{}' without unit (use d/h/w)",
+            num_buf
+        ));
+    }
+
+    if total == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+
+    Ok(total)
+}
+
+/// Filter that blocks packages published less than `min_age_secs` ago.
+///
+/// If `publish_date` is `None` (unknown), the filter returns `Skip` (no opinion).
+pub struct MinReleaseAgeFilter {
+    min_age_secs: i64,
+    label: String,
+}
+
+impl MinReleaseAgeFilter {
+    pub fn new(min_age_secs: i64, label: &str) -> Self {
+        Self {
+            min_age_secs,
+            label: label.to_string(),
+        }
+    }
+
+    fn format_duration(secs: i64) -> String {
+        if secs >= 604800 {
+            let weeks = secs / 604800;
+            let days = (secs % 604800) / 86400;
+            if days > 0 {
+                format!("{}w{}d", weeks, days)
+            } else {
+                format!("{}w", weeks)
+            }
+        } else if secs >= 86400 {
+            format!("{}d", secs / 86400)
+        } else {
+            format!("{}h", secs / 3600)
+        }
+    }
+}
+
+impl ProxyFilter for MinReleaseAgeFilter {
+    fn name(&self) -> &'static str {
+        "min-release-age"
+    }
+
+    fn evaluate(&self, request: &FilterRequest) -> Decision {
+        let Some(publish_ts) = request.publish_date else {
+            return Decision::Skip; // Unknown date — don't block
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let age = now - publish_ts;
+        if age < self.min_age_secs {
+            Decision::Block {
+                rule: "min-release-age".to_string(),
+                reason: format!(
+                    "package is {}  old (minimum: {})",
+                    Self::format_duration(age.max(0)),
+                    self.label,
+                ),
+            }
+        } else {
+            Decision::Skip
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -879,6 +998,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             integrity: Some("sha256-abc123".to_string()),
             bypass: false,
+            publish_date: None,
         }
     }
 
@@ -890,6 +1010,7 @@ mod tests {
             version: None,
             integrity: None,
             bypass: false,
+            publish_date: None,
         }
     }
 
@@ -901,6 +1022,7 @@ mod tests {
             version: None,
             integrity: None,
             bypass: true,
+            publish_date: None,
         }
     }
 
@@ -949,7 +1071,10 @@ mod tests {
 
     #[test]
     fn test_enforce_allow_all() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(AllowAllFilter));
         let result = engine.evaluate(&make_request("lodash"));
         assert_eq!(result.decision, Decision::Allow);
@@ -959,7 +1084,10 @@ mod tests {
 
     #[test]
     fn test_enforce_block_all() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let result = engine.evaluate(&make_request("lodash"));
         assert!(matches!(result.decision, Decision::Block { .. }));
@@ -969,7 +1097,10 @@ mod tests {
 
     #[test]
     fn test_enforce_block_increments_blocked_metric() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         engine.evaluate(&make_request("lodash"));
         assert_eq!(engine.metrics().blocked.load(Ordering::Relaxed), 1);
@@ -978,7 +1109,10 @@ mod tests {
 
     #[test]
     fn test_enforce_allow_increments_allowed_metric() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(AllowAllFilter));
         engine.evaluate(&make_request("lodash"));
         assert_eq!(engine.metrics().allowed.load(Ordering::Relaxed), 1);
@@ -1019,7 +1153,10 @@ mod tests {
 
     #[test]
     fn test_chain_first_block_wins() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         engine.add_filter(Box::new(AllowAllFilter));
         let result = engine.evaluate(&make_request("lodash"));
@@ -1029,7 +1166,10 @@ mod tests {
 
     #[test]
     fn test_chain_first_allow_wins() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(AllowAllFilter));
         engine.add_filter(Box::new(BlockAllFilter));
         let result = engine.evaluate(&make_request("lodash"));
@@ -1039,7 +1179,10 @@ mod tests {
 
     #[test]
     fn test_chain_skip_then_block() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(SkipFilter));
         engine.add_filter(Box::new(BlockAllFilter));
         let result = engine.evaluate(&make_request("lodash"));
@@ -1049,7 +1192,10 @@ mod tests {
 
     #[test]
     fn test_chain_all_skip_allows() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(SkipFilter));
         engine.add_filter(Box::new(SkipFilter));
         let result = engine.evaluate(&make_request("lodash"));
@@ -1067,7 +1213,10 @@ mod tests {
 
     #[test]
     fn test_selective_block() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockPackageFilter {
             target: "evil-pkg".to_string(),
         }));
@@ -1083,7 +1232,10 @@ mod tests {
 
     #[test]
     fn test_bypass_allows_despite_block_filter() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let result = engine.evaluate(&make_bypass_request("lodash"));
         assert_eq!(result.decision, Decision::Allow);
@@ -1092,7 +1244,10 @@ mod tests {
 
     #[test]
     fn test_bypass_increments_allowed() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         engine.evaluate(&make_bypass_request("lodash"));
         assert_eq!(engine.metrics().allowed.load(Ordering::Relaxed), 1);
@@ -1208,7 +1363,10 @@ mod tests {
 
     #[test]
     fn test_metrics_accumulate() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockPackageFilter {
             target: "evil".to_string(),
         }));
@@ -1321,6 +1479,7 @@ mod tests {
             version: version.map(|v| v.to_string()),
             integrity: None,
             bypass: false,
+            publish_date: None,
         }
     }
 
@@ -1516,7 +1675,10 @@ mod tests {
         );
         let filter = BlocklistFilter::from_file(&path).unwrap();
 
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(filter));
 
         let result = engine.evaluate(&make_request("evil"));
@@ -1533,7 +1695,10 @@ mod tests {
         );
         let filter = BlocklistFilter::from_file(&path).unwrap();
 
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(filter));
 
         let result = engine.evaluate(&make_request("lodash"));
@@ -1715,7 +1880,10 @@ mod tests {
 
     #[test]
     fn test_engine_namespace_blocks_before_bypass() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.set_namespace_filter(Box::new(make_ns_filter(&["@internal/*"])));
         engine.add_filter(Box::new(AllowAllFilter));
 
@@ -1729,7 +1897,10 @@ mod tests {
 
     #[test]
     fn test_engine_namespace_skip_continues_to_chain() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.set_namespace_filter(Box::new(make_ns_filter(&["@internal/*"])));
         engine.add_filter(Box::new(BlockPackageFilter {
             target: "evil-pkg".to_string(),
@@ -2019,6 +2190,7 @@ mod tests {
             version: Some("4.17.21".to_string()),
             integrity: Some("sha256:abc123".to_string()),
             bypass: false,
+            publish_date: None,
         };
         match filter.evaluate(&req) {
             Decision::Block { rule, reason } => {
@@ -2067,7 +2239,10 @@ mod tests {
             false,
         );
 
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(blocklist));
         engine.add_filter(Box::new(allowlist));
 
@@ -2090,7 +2265,10 @@ mod tests {
             false,
         );
 
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(allowlist));
 
         // Unknown package → blocked
@@ -2127,7 +2305,10 @@ mod tests {
     fn test_engine_empty_allowlist_blocks_everything() {
         let allowlist = make_allowlist_entries(vec![], false);
 
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(allowlist));
 
         let req = make_request_with_registry(RegistryType::Npm, "lodash", Some("4.17.21"));
@@ -2173,7 +2354,10 @@ mod tests {
 
     #[test]
     fn test_check_download_enforce_block_returns_403() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let headers = axum::http::HeaderMap::new();
         let result = super::check_download(
@@ -2207,7 +2391,10 @@ mod tests {
 
     #[test]
     fn test_check_download_bypass_token_matches() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let headers = make_headers(&[("x-nora-bypass-token", "secret123")]);
         let result = super::check_download(
@@ -2223,7 +2410,10 @@ mod tests {
 
     #[test]
     fn test_check_download_bypass_token_mismatch() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let headers = make_headers(&[("x-nora-bypass-token", "wrong")]);
         let result = super::check_download(
@@ -2239,7 +2429,10 @@ mod tests {
 
     #[test]
     fn test_check_download_no_bypass_configured() {
-        let mut engine = CurationEngine::new(enforce_config());
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
         engine.add_filter(Box::new(BlockAllFilter));
         let headers = make_headers(&[("x-nora-bypass-token", "anything")]);
         let result = super::check_download(
@@ -2492,6 +2685,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             integrity: None, // pre-download: no integrity
             bypass: false,
+            publish_date: None,
         };
         let decision = filter.evaluate(&request);
         assert!(
@@ -2524,6 +2718,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             integrity: Some("sha256:abc123".to_string()), // post-download: has integrity
             bypass: false,
+            publish_date: None,
         };
         let decision = filter.evaluate(&request);
         assert!(
@@ -2531,5 +2726,175 @@ mod tests {
             "require_integrity + entry without hash + post-download → block: got {:?}",
             decision
         );
+    }
+}
+
+// ============================================================================
+// MinReleaseAge tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod min_release_age_tests {
+    use super::*;
+
+    // ── parse_duration tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration("7d").unwrap(), 604800);
+        assert_eq!(parse_duration("1d").unwrap(), 86400);
+        assert_eq!(parse_duration("30d").unwrap(), 2592000);
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("24h").unwrap(), 86400);
+        assert_eq!(parse_duration("1h").unwrap(), 3600);
+    }
+
+    #[test]
+    fn test_parse_duration_weeks() {
+        assert_eq!(parse_duration("1w").unwrap(), 604800);
+        assert_eq!(parse_duration("2w").unwrap(), 1209600);
+    }
+
+    #[test]
+    fn test_parse_duration_combined() {
+        assert_eq!(parse_duration("1w2d").unwrap(), 604800 + 172800);
+        assert_eq!(parse_duration("1d12h").unwrap(), 86400 + 43200);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("7").is_err()); // no unit
+        assert!(parse_duration("7x").is_err()); // unknown unit
+        assert!(parse_duration("d").is_err()); // no number
+    }
+
+    // ── MinReleaseAgeFilter tests ───────────────────────────────────────
+
+    #[test]
+    fn test_min_release_age_young_package_blocked() {
+        let filter = MinReleaseAgeFilter::new(604800, "7d"); // 7 days
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let request = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "fresh-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 86400), // 1 day ago
+        };
+        assert!(matches!(filter.evaluate(&request), Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_min_release_age_old_package_passes() {
+        let filter = MinReleaseAgeFilter::new(604800, "7d"); // 7 days
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let request = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "stable-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 864000), // 10 days ago
+        };
+        assert!(matches!(filter.evaluate(&request), Decision::Skip));
+    }
+
+    #[test]
+    fn test_min_release_age_unknown_date_skips() {
+        let filter = MinReleaseAgeFilter::new(604800, "7d");
+        let request = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "unknown-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        assert!(matches!(filter.evaluate(&request), Decision::Skip));
+    }
+
+    #[test]
+    fn test_min_release_age_exactly_at_boundary() {
+        let filter = MinReleaseAgeFilter::new(86400, "1d"); // 1 day
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Exactly at boundary — age == min_age, should pass (not less than)
+        let request = FilterRequest {
+            registry: RegistryType::Cargo,
+            upstream: None,
+            name: "boundary-pkg".to_string(),
+            version: Some("2.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 86400),
+        };
+        assert!(matches!(filter.evaluate(&request), Decision::Skip));
+    }
+
+    #[test]
+    fn test_min_release_age_chain_integration() {
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Enforce,
+            ..CurationConfig::default()
+        });
+        engine.add_filter(Box::new(MinReleaseAgeFilter::new(604800, "7d")));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Young package — blocked
+        let req_young = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "young-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 3600), // 1 hour ago
+        };
+        let result = engine.evaluate(&req_young);
+        assert!(matches!(result.decision, Decision::Block { .. }));
+        assert_eq!(result.decided_by.as_deref(), Some("min-release-age"));
+
+        // Old package — passes (Skip -> default Allow in enforce)
+        let req_old = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "old-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - 864000), // 10 days
+        };
+        let result = engine.evaluate(&req_old);
+        assert!(!matches!(result.decision, Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_min_release_age_format_duration() {
+        assert_eq!(MinReleaseAgeFilter::format_duration(3600), "1h");
+        assert_eq!(MinReleaseAgeFilter::format_duration(86400), "1d");
+        assert_eq!(MinReleaseAgeFilter::format_duration(604800), "1w");
+        assert_eq!(MinReleaseAgeFilter::format_duration(691200), "1w1d");
     }
 }

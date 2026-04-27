@@ -1,6 +1,19 @@
 # Changelog
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-27
+
+### Added
+- **Min-release-age filter** — block packages younger than N days/hours/weeks (#132). Config: `min_release_age = "7d"`, env `NORA_CURATION_MIN_RELEASE_AGE`
+- **Token RBAC** — read/write/admin roles per token, expiry badges in UI, expired tokens sorted to bottom (#124)
+- **Dynamic stats footer** — demo builds show live binary size, VmRSS, registry count from /proc (replaces hardcoded values)
+- 850 total tests (up from 821)
+
+### Changed
+- Token list UI: expired tokens show red badge, sorted to bottom with reduced opacity
+- `format_expiry()` replaces `format_timestamp()` for token expiry display — correctly shows "in 28d" for future, "expired 3d ago" for past
+- `#[non_exhaustive]` on `Role` enum for forward compatibility
+
 ## [0.7.0] - 2026-04-27
 
 ### Added

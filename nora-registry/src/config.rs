@@ -826,6 +826,7 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_BYPASS_TOKEN` — token to bypass curation checks
 /// - `NORA_CURATION_REQUIRE_INTEGRITY` — require integrity metadata (default: false)
 /// - `NORA_CURATION_INTERNAL_NAMESPACES` — comma-separated glob patterns
+/// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -845,6 +846,10 @@ pub struct CurationConfig {
     /// Always active regardless of curation mode (security boundary).
     #[serde(default)]
     pub internal_namespaces: Vec<String>,
+    /// Minimum release age before a package is allowed (e.g., "7d", "24h", "1w").
+    /// Packages published less than this duration ago are blocked.
+    #[serde(default)]
+    pub min_release_age: Option<String>,
 }
 
 impl Default for CurationConfig {
@@ -857,6 +862,7 @@ impl Default for CurationConfig {
             bypass_token: None,
             require_integrity: false,
             internal_namespaces: Vec::new(),
+            min_release_age: None,
         }
     }
 }
@@ -1826,6 +1832,9 @@ impl Config {
             } else {
                 val.split(',').map(|s| s.trim().to_string()).collect()
             };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_MIN_RELEASE_AGE") {
+            self.curation.min_release_age = if val.is_empty() { None } else { Some(val) };
         }
     }
 }

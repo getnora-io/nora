@@ -36,6 +36,7 @@ const TOKEN_PREFIX: &str = "nra_";
 /// Access role for API tokens
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     Read,
     Write,
