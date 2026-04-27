@@ -523,6 +523,19 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         println!("Namespaces: not configured");
     }
 
+    if let Some(ref age_str) = config.curation.min_release_age {
+        match curation::parse_duration(age_str) {
+            Ok(secs) => {
+                let filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                println!("Min-release-age: {} ({}s)", age_str, secs);
+                engine.add_filter(Box::new(filter));
+            }
+            Err(e) => println!("Min-release-age: {} (ERROR: {})", age_str, e),
+        }
+    } else {
+        println!("Min-release-age: not configured");
+    }
+
     println!("Mode: {}", config.curation.mode);
     println!("---");
 
@@ -533,6 +546,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         version: version.clone(),
         integrity: None,
         bypass: false,
+        publish_date: None,
     };
 
     let result = engine.evaluate(&request);
@@ -669,6 +683,26 @@ async fn run_server(config: Config, storage: Storage) {
         let count = ns_filter.pattern_count();
         curation_engine.set_namespace_filter(Box::new(ns_filter));
         info!(patterns = count, "Namespace isolation filter loaded");
+    }
+
+    // Load min-release-age filter if configured
+    if let Some(ref age_str) = config.curation.min_release_age {
+        match curation::parse_duration(age_str) {
+            Ok(secs) => {
+                let filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                curation_engine.add_filter(Box::new(filter));
+                info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
+            }
+            Err(e) => {
+                error!(value = %age_str, error = %e, "Invalid min_release_age");
+                if config.curation.mode == CurationMode::Enforce {
+                    panic!(
+                        "Cannot start in enforce mode with invalid min_release_age: {}",
+                        e
+                    );
+                }
+            }
+        }
     }
 
     // Determine enabled registries from config

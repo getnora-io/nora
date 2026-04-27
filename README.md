@@ -16,7 +16,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
 - **13 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++).
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 821 tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 850 tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -94,7 +94,8 @@ See [full documentation](https://getnora.dev) for all registries.
 
 - **Web UI** — dashboard with search, browse, i18n (EN/RU)
 - **Proxy & Cache** — transparent proxy to upstream registries with local cache
-- **Curation** — blocklist, allowlist, CVE blocking, integrity verification
+- **Curation** — blocklist, allowlist, namespace isolation, integrity verification, min-release-age filter
+- **Token RBAC** — read/write/admin roles, expiry tracking, deferred last_used flush
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
 - **Backup & Restore** — `nora backup` / `nora restore`
 - **S3 Storage** — MinIO, AWS S3, any S3-compatible backend
@@ -114,6 +115,16 @@ docker run -d -p 4000:4000 \
   ghcr.io/getnora-io/nora:latest
 ```
 
+```bash
+# Curation — block packages younger than 7 days
+docker run -d -p 4000:4000 \
+  -v nora-data:/data \
+  -e NORA_CURATION_MODE=enforce \
+  -e NORA_CURATION_MIN_RELEASE_AGE=7d \
+  -e NORA_CURATION_ALLOWLIST_PATH=/data/allowlist.json \
+  ghcr.io/getnora-io/nora:latest
+```
+
 ## Performance
 
 | Metric | NORA | Nexus | JFrog |
@@ -130,7 +141,7 @@ docker run -d -p 4000:4000 \
 - ~~Signed releases & SBOM~~ ✅ v0.6.4
 - ~~Curation layer~~ ✅ v0.7.0
 - ~~13 registry formats~~ ✅ v0.7.0
-- **Min Release Age** — block packages younger than N days
+- ~~Min Release Age~~ ✅ v0.7.1
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
 - **Image Signing Policy** — cosign verification on upstream pulls
 

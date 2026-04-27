@@ -720,55 +720,135 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Dynamic stats for the bragging footer (demo builds only).
+#[cfg(feature = "demo")]
+pub struct BraggingStats {
+    /// Binary size in MB (from /proc/self/exe).
+    pub binary_size_mb: u64,
+    /// Resident memory in MB (from /proc/self/status VmRSS).
+    pub memory_mb: u64,
+    /// Number of enabled registries.
+    pub registry_count: usize,
+    /// Uptime in seconds.
+    pub uptime_secs: u64,
+}
+
+#[cfg(feature = "demo")]
+impl BraggingStats {
+    /// Collect live stats from the running process.
+    pub fn collect(registry_count: usize, uptime_secs: u64) -> Self {
+        let binary_size_mb = Self::read_binary_size().unwrap_or(32);
+        let memory_mb = Self::read_vmrss().unwrap_or(30);
+        Self {
+            binary_size_mb,
+            memory_mb,
+            registry_count,
+            uptime_secs,
+        }
+    }
+
+    /// Read binary size from /proc/self/exe (Linux only).
+    fn read_binary_size() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::metadata("/proc/self/exe")
+                .ok()
+                .map(|m| m.len() / (1024 * 1024))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Read VmRSS from /proc/self/status (Linux only).
+    fn read_vmrss() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let trimmed = rest.trim();
+                    // Format: "12345 kB"
+                    let kb_str = trimmed.split_whitespace().next()?;
+                    let kb: u64 = kb_str.parse().ok()?;
+                    return Some(kb / 1024);
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    fn format_uptime(&self) -> String {
+        if self.uptime_secs < 60 {
+            format!("{}s", self.uptime_secs)
+        } else if self.uptime_secs < 3600 {
+            format!("{}m", self.uptime_secs / 60)
+        } else if self.uptime_secs < 86400 {
+            format!("{}h", self.uptime_secs / 3600)
+        } else {
+            format!("{}d", self.uptime_secs / 86400)
+        }
+    }
+}
+
 /// Render the "bragging" footer with NORA stats (demo builds only)
 #[cfg(feature = "demo")]
-pub fn render_bragging_footer(lang: Lang) -> String {
+pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
     let t = get_translations(lang);
     format!(
         r##"
     <div class="mt-8 bg-gradient-to-r from-slate-800 to-slate-900 rounded-lg border border-slate-700 p-6">
         <div class="text-center mb-4">
-            <span class="text-slate-400 text-sm uppercase tracking-wider">{}</span>
+            <span class="text-slate-400 text-sm uppercase tracking-wider">{built_for_speed}</span>
         </div>
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 text-center">
             <div class="p-3">
-                <div class="text-2xl font-bold text-blue-400">32 MB</div>
-                <div class="text-xs text-slate-500 mt-1">{}</div>
+                <div class="text-2xl font-bold text-blue-400">{binary_size} MB</div>
+                <div class="text-xs text-slate-500 mt-1">{docker_image}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-green-400">&lt;1s</div>
-                <div class="text-xs text-slate-500 mt-1">{}</div>
+                <div class="text-2xl font-bold text-green-400">{uptime}</div>
+                <div class="text-xs text-slate-500 mt-1">{cold_start}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-purple-400">~30 MB</div>
-                <div class="text-xs text-slate-500 mt-1">{}</div>
+                <div class="text-2xl font-bold text-purple-400">~{memory} MB</div>
+                <div class="text-xs text-slate-500 mt-1">{mem_label}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-yellow-400">13</div>
-                <div class="text-xs text-slate-500 mt-1">{}</div>
+                <div class="text-2xl font-bold text-yellow-400">{reg_count}</div>
+                <div class="text-xs text-slate-500 mt-1">{reg_label}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-pink-400">{}</div>
+                <div class="text-2xl font-bold text-pink-400">{multi_arch}</div>
                 <div class="text-xs text-slate-500 mt-1">amd64 / arm64</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-cyan-400">{}</div>
+                <div class="text-2xl font-bold text-cyan-400">{zero_config}</div>
                 <div class="text-xs text-slate-500 mt-1">Config</div>
             </div>
         </div>
         <div class="text-center mt-4">
-            <span class="text-slate-500 text-xs">{}</span>
+            <span class="text-slate-500 text-xs">{tagline}</span>
         </div>
     </div>
     "##,
-        t.built_for_speed,
-        t.docker_image,
-        t.cold_start,
-        t.memory,
-        t.registries_count,
-        t.multi_arch,
-        t.zero_config,
-        t.tagline
+        built_for_speed = t.built_for_speed,
+        binary_size = stats.binary_size_mb,
+        docker_image = t.docker_image,
+        uptime = stats.format_uptime(),
+        cold_start = t.cold_start,
+        memory = stats.memory_mb,
+        mem_label = t.memory,
+        reg_count = stats.registry_count,
+        reg_label = t.registries_count,
+        multi_arch = t.multi_arch,
+        zero_config = t.zero_config,
+        tagline = t.tagline,
     )
 }
 
@@ -806,5 +886,56 @@ pub fn format_timestamp(ts: u64) -> String {
     } else {
         let months = diff / 2592000;
         format!("{} month{} ago", months, if months == 1 { "" } else { "s" })
+    }
+}
+
+/// Format a future Unix timestamp as relative time ("in 28d") or past ("Expired").
+/// Returns `(display_text, is_expired)`.
+pub fn format_expiry(ts: u64) -> (String, bool) {
+    if ts == 0 {
+        return ("N/A".to_string(), false);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if now >= ts {
+        // Expired
+        let diff = now - ts;
+        if diff < 3600 {
+            let mins = diff / 60;
+            return (
+                format!(
+                    "expired {} min{} ago",
+                    mins.max(1),
+                    if mins <= 1 { "" } else { "s" }
+                ),
+                true,
+            );
+        } else if diff < 86400 {
+            let hours = diff / 3600;
+            return (format!("expired {}h ago", hours), true);
+        } else {
+            let days = diff / 86400;
+            return (format!("expired {}d ago", days), true);
+        }
+    }
+
+    // Future
+    let diff = ts - now;
+    if diff < 3600 {
+        let mins = diff / 60;
+        (
+            format!("in {} min{}", mins.max(1), if mins <= 1 { "" } else { "s" }),
+            false,
+        )
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        (format!("in {}h", hours), false)
+    } else {
+        let days = diff / 86400;
+        (format!("in {}d", days), false)
     }
 }
