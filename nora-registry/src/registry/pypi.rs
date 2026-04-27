@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 //! PyPI registry — PEP 503 (Simple HTML) + PEP 691 (JSON) + twine upload.

@@ -17,7 +17,7 @@
 Instead, please report them via:
 
 1. **Email:** devitway@gmail.com
-2. **Telegram:** [@DevITWay](https://t.me/DevITWay) (private message)
+2. **Telegram:** [@devitway_pavel](https://t.me/devitway_pavel) (private message)
 
 ### What to Include
 
