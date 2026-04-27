@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail};
@@ -1057,6 +1057,12 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "pypi" => icons::PYPI,
         "go" => icons::GO,
         "raw" => icons::RAW,
+        "gems" => icons::GEMS,
+        "terraform" => icons::TERRAFORM,
+        "ansible" => icons::ANSIBLE,
+        "nuget" => icons::NUGET,
+        "pub" => icons::PUB,
+        "conan" => icons::CONAN,
         _ => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -1072,6 +1078,12 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         "pypi" => "PyPI Repository",
         "go" => "Go Modules",
         "raw" => "Raw Storage",
+        "gems" => "RubyGems",
+        "terraform" => "Terraform Registry",
+        "ansible" => "Ansible Galaxy",
+        "nuget" => "NuGet Gallery",
+        "pub" => "pub.dev",
+        "conan" => "Conan (C/C++)",
         _ => "Registry",
     }
 }

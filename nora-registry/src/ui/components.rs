@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Volkov Pavel | DevITWay
+// Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
 use super::i18n::{get_translations, Lang, Translations};
@@ -14,6 +14,27 @@ pub fn layout_dark(
     extra_scripts: &str,
     lang: Lang,
     auth_enabled: bool,
+) -> String {
+    layout_dark_filtered(
+        title,
+        content,
+        active_page,
+        extra_scripts,
+        lang,
+        auth_enabled,
+        None,
+    )
+}
+
+/// Dark theme layout wrapper with optional registry filter
+pub fn layout_dark_filtered(
+    title: &str,
+    content: &str,
+    active_page: Option<&str>,
+    extra_scripts: &str,
+    lang: Lang,
+    auth_enabled: bool,
+    enabled_registries: Option<&std::collections::HashSet<crate::registry_type::RegistryType>>,
 ) -> String {
     let t = get_translations(lang);
     format!(
@@ -77,15 +98,20 @@ pub fn layout_dark(
 </html>"##,
         lang.code(),
         html_escape(title),
-        sidebar_dark(active_page, t, auth_enabled),
+        sidebar_dark_with_registries(active_page, t, auth_enabled, enabled_registries),
         header_dark(lang),
         content,
         extra_scripts
     )
 }
 
-/// Dark theme sidebar
-fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool) -> String {
+/// Dark theme sidebar with optional registry filter
+pub fn sidebar_dark_with_registries(
+    active_page: Option<&str>,
+    t: &Translations,
+    auth_enabled: bool,
+    enabled: Option<&std::collections::HashSet<crate::registry_type::RegistryType>>,
+) -> String {
     let active = active_page.unwrap_or("");
 
     let docker_icon = r#"<path fill="currentColor" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.186m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.185-.186h-2.12a.186.186 0 00-.185.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/>"#;
@@ -97,20 +123,60 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
     // Dashboard label is translated, registry names stay as-is
     let dashboard_label = t.nav_dashboard;
 
-    let nav_items = [
+    use crate::registry_type::RegistryType;
+
+    // All possible nav items with their RegistryType
+    let all_nav_items: Vec<(Option<RegistryType>, &str, &str, &str, &str, bool)> = vec![
         (
+            None,
             "dashboard",
             "/ui/",
             dashboard_label,
             r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>"#,
             true,
         ),
-        ("docker", "/ui/docker", "Docker", docker_icon, false),
-        ("maven", "/ui/maven", "Maven", maven_icon, false),
-        ("npm", "/ui/npm", "npm", npm_icon, false),
-        ("cargo", "/ui/cargo", "Cargo", cargo_icon, false),
-        ("pypi", "/ui/pypi", "PyPI", pypi_icon, false),
         (
+            Some(RegistryType::Docker),
+            "docker",
+            "/ui/docker",
+            "Docker",
+            docker_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Maven),
+            "maven",
+            "/ui/maven",
+            "Maven",
+            maven_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Npm),
+            "npm",
+            "/ui/npm",
+            "npm",
+            npm_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Cargo),
+            "cargo",
+            "/ui/cargo",
+            "Cargo",
+            cargo_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::PyPI),
+            "pypi",
+            "/ui/pypi",
+            "PyPI",
+            pypi_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Raw),
             "raw",
             "/ui/raw",
             "Raw",
@@ -118,37 +184,125 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
             false,
         ),
         (
+            Some(RegistryType::Go),
             "go",
             "/ui/go",
             "Go",
             r#"<path fill="currentColor" d="M2.64 9.56s.24-.14.65-.38c.41-.24.97-.5 1.63-.7A7.85 7.85 0 017.53 8c.86 0 1.67.17 2.37.52.7.35 1.26.87 1.63 1.51.37.64.54 1.41.54 2.27v.2h-2.7v-.16c0-.47-.09-.86-.28-1.15a1.7 1.7 0 00-.77-.67 2.7 2.7 0 00-1.14-.22c-.56 0-1.06.13-1.46.4-.41.27-.72.66-.93 1.16-.21.5-.31 1.1-.31 1.8 0 .69.1 1.28.32 1.78.21.5.53.88.94 1.15.41.27.9.4 1.47.4.38 0 .73-.06 1.04-.17.31-.12.56-.29.74-.52.19-.23.29-.51.29-.84v-.14H7.15v-1.76h5.07v1.3c0 .8-.17 1.48-.52 2.04a3.46 3.46 0 01-1.5 1.3c-.66.3-1.44.45-2.35.45-.99 0-1.87-.18-2.63-.55a4.2 4.2 0 01-1.77-1.59C3.15 14.82 3 13.94 3 12.89v-.28c0-1.04.16-1.93.48-2.65a3.08 3.08 0 01-.84-.4zm12.1-1.34c.92 0 1.74.18 2.44.55a3.96 3.96 0 011.66 1.59c.4.7.6 1.54.6 2.53v.28c0 .99-.2 1.83-.6 2.53a3.96 3.96 0 01-1.66 1.59c-.7.37-1.52.55-2.44.55s-1.74-.18-2.44-.55a3.96 3.96 0 01-1.66-1.59c-.4-.7-.6-1.54-.6-2.53v-.28c0-.99.2-1.83.6-2.53a3.96 3.96 0 011.66-1.59c.7-.37 1.52-.55 2.44-.55zm0 2.12c-.44 0-.82.12-1.14.37-.32.24-.56.6-.73 1.06-.17.46-.26 1.01-.26 1.65v.28c0 .64.09 1.19.26 1.65.17.46.41.82.73 1.06.32.25.7.37 1.14.37.44 0 .82-.12 1.14-.37.32-.24.56-.6.73-1.06.17-.46.26-1.01.26-1.65v-.28c0-.64-.09-1.19-.26-1.65a2.17 2.17 0 00-.73-1.06 1.78 1.78 0 00-1.14-.37z"/>"#,
             false,
         ),
+        (
+            Some(RegistryType::Gems),
+            "gems",
+            "/ui/gems",
+            "RubyGems",
+            icons::GEMS,
+            false,
+        ),
+        (
+            Some(RegistryType::Terraform),
+            "terraform",
+            "/ui/terraform",
+            "Terraform",
+            icons::TERRAFORM,
+            false,
+        ),
+        (
+            Some(RegistryType::Ansible),
+            "ansible",
+            "/ui/ansible",
+            "Ansible",
+            icons::ANSIBLE,
+            false,
+        ),
+        (
+            Some(RegistryType::Nuget),
+            "nuget",
+            "/ui/nuget",
+            "NuGet",
+            icons::NUGET,
+            false,
+        ),
+        (
+            Some(RegistryType::PubDart),
+            "pub",
+            "/ui/pub",
+            "pub.dev",
+            icons::PUB,
+            true,
+        ),
+        (
+            Some(RegistryType::Conan),
+            "conan",
+            "/ui/conan",
+            "Conan",
+            icons::CONAN,
+            false,
+        ),
     ];
 
-    let nav_html: String = nav_items.iter().map(|(id, href, label, icon_path, is_stroke)| {
-        let is_active = active == *id;
+    // Filter to enabled registries (dashboard always shown)
+    let nav_items: Vec<_> = all_nav_items
+        .into_iter()
+        .filter(|(reg_type, _, _, _, _, _)| {
+            match reg_type {
+                None => true, // Dashboard always visible
+                Some(rt) => match enabled {
+                    Some(set) => set.contains(rt),
+                    None => true, // No filter = show all
+                },
+            }
+        })
+        .map(|(_, id, href, label, icon, is_stroke)| (id, href, label, icon, is_stroke))
+        .collect();
+
+    let render_nav_item = |id: &str,
+                           href: &str,
+                           label: &str,
+                           icon_path: &str,
+                           is_stroke: bool|
+     -> String {
+        let is_active = active == id;
         let active_class = if is_active {
             "bg-slate-700 text-white"
         } else {
             "text-slate-300 hover:bg-slate-700 hover:text-white"
         };
 
-        let (fill_attr, stroke_attr) = if *is_stroke {
+        let (fill_attr, stroke_attr) = if is_stroke {
             ("none", r#" stroke="currentColor""#)
         } else {
             ("currentColor", "")
         };
 
-        format!(r##"
+        format!(
+            r##"
             <a href="{}" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
                 <svg class="w-5 h-5 mr-3" fill="{}"{} viewBox="0 0 24 24">
                     {}
                 </svg>
                 {}
             </a>
-        "##, href, active_class, fill_attr, stroke_attr, icon_path, label)
-    }).collect();
+        "##,
+            href, active_class, fill_attr, stroke_attr, icon_path, label
+        )
+    };
+
+    let dashboard_html: String = nav_items
+        .iter()
+        .filter(|(id, _, _, _, _)| *id == "dashboard")
+        .map(|(id, href, label, icon, is_stroke)| {
+            render_nav_item(id, href, label, icon, *is_stroke)
+        })
+        .collect();
+
+    let registries_html: String = nav_items
+        .iter()
+        .filter(|(id, _, _, _, _)| *id != "dashboard")
+        .map(|(id, href, label, icon, is_stroke)| {
+            render_nav_item(id, href, label, icon, *is_stroke)
+        })
+        .collect();
     // Flat sidebar items (no umbrella category)
     let admin_section = if auth_enabled {
         let tokens_active = if active == "tokens" {
@@ -188,7 +342,10 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
             </div>
             <nav class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
                 {}
-                <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mt-6 mb-3">
+                <div class="border-t border-slate-700 mt-4 pt-4">
+                    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mb-3">
+                        {}
+                    </div>
                     {}
                 </div>
                 {}
@@ -200,7 +357,7 @@ fn sidebar_dark(active_page: Option<&str>, t: &Translations, auth_enabled: bool)
             </div>
         </div>
     "#,
-        nav_html, t.nav_registries, admin_section, VERSION
+        dashboard_html, t.nav_registries, registries_html, admin_section, VERSION
     )
 }
 
@@ -528,6 +685,12 @@ pub mod icons {
     pub const CARGO: &str = r#"<path fill="currentColor" d="M6 2h12a1 1 0 011 1v8a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1zm0 2v2h12V4H6zm0 3v2h12V7H6zM2 14h8a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16H2zM14 14h8a1 1 0 011 1v6a1 1 0 01-1 1h-8a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16h-8z"/>"#;
     pub const GO: &str = r#"<path fill="currentColor" d="M2.64 9.56s.24-.14.65-.38c.41-.24.97-.5 1.63-.7A7.85 7.85 0 017.53 8c.86 0 1.67.17 2.37.52.7.35 1.26.87 1.63 1.51.37.64.54 1.41.54 2.27v.2h-2.7v-.16c0-.47-.09-.86-.28-1.15a1.7 1.7 0 00-.77-.67 2.7 2.7 0 00-1.14-.22c-.56 0-1.06.13-1.46.4-.41.27-.72.66-.93 1.16-.21.5-.31 1.1-.31 1.8 0 .69.1 1.28.32 1.78.21.5.53.88.94 1.15.41.27.9.4 1.47.4.38 0 .73-.06 1.04-.17.31-.12.56-.29.74-.52.19-.23.29-.51.29-.84v-.14H7.15v-1.76h5.07v1.3c0 .8-.17 1.48-.52 2.04a3.46 3.46 0 01-1.5 1.3c-.66.3-1.44.45-2.35.45-.99 0-1.87-.18-2.63-.55a4.2 4.2 0 01-1.77-1.59C3.15 14.82 3 13.94 3 12.89v-.28c0-1.04.16-1.93.48-2.65a3.08 3.08 0 01-.84-.4zm12.1-1.34c.92 0 1.74.18 2.44.55a3.96 3.96 0 011.66 1.59c.4.7.6 1.54.6 2.53v.28c0 .99-.2 1.83-.6 2.53a3.96 3.96 0 01-1.66 1.59c-.7.37-1.52.55-2.44.55s-1.74-.18-2.44-.55a3.96 3.96 0 01-1.66-1.59c-.4-.7-.6-1.54-.6-2.53v-.28c0-.99.2-1.83.6-2.53a3.96 3.96 0 011.66-1.59c.7-.37 1.52-.55 2.44-.55zm0 2.12c-.44 0-.82.12-1.14.37-.32.24-.56.6-.73 1.06-.17.46-.26 1.01-.26 1.65v.28c0 .64.09 1.19.26 1.65.17.46.41.82.73 1.06.32.25.7.37 1.14.37.44 0 .82-.12 1.14-.37.32-.24.56-.6.73-1.06.17-.46.26-1.01.26-1.65v-.28c0-.64-.09-1.19-.26-1.65a2.17 2.17 0 00-.73-1.06 1.78 1.78 0 00-1.14-.37z"/>"#;
     pub const RAW: &str = r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#;
+    pub const GEMS: &str = r#"<path fill="currentColor" d="M7.81 7.9l-2.97 2.95 7.19 7.18 2.96-2.95 4.22-4.23-2.96-2.96v-.01H7.8zM12 0L1.53 6v12L12 24l10.47-6V6L12 0zm8.47 16.85L12 21.73l-8.47-4.88V7.12L12 2.24l8.47 4.88v9.73z"/>"#;
+    pub const TERRAFORM: &str = r#"<path fill="currentColor" d="M1.5 0v7.69l6.56 3.85V3.85L1.5 0zm7.94 4.62v7.69l6.56-3.84V.77L9.44 4.62zm7.94 0v7.69l6.56-3.84V.77l-6.56 3.85zM9.44 13.46v7.69l6.56-3.85v-7.69l-6.56 3.85z"/>"#;
+    pub const ANSIBLE: &str = r#"<path fill="currentColor" d="M10.617 11.473l4.686 3.695-3.102-7.662zM12 0C5.371 0 0 5.371 0 12s5.371 12 12 12 12-5.371 12-12S18.629 0 12 0zm5.797 17.305c-.011.471-.403.842-.875.83-.236 0-.416-.09-.664-.293l-6.19-5-2.079 5.203H6.191L11.438 5.44c.124-.314.427-.52.764-.506.326-.014.63.189.742.506l4.774 11.494c.045.111.08.234.08.348-.001.009-.001.009-.001.023z"/>"#;
+    pub const NUGET: &str = r#"<circle cx="7" cy="17" r="3.5" fill="currentColor"/><circle cx="16" cy="8.5" r="5" fill="currentColor"/><circle cx="4" cy="5" r="2" fill="currentColor"/>"#;
+    pub const CONAN: &str = r#"<path fill="currentColor" d="M11.709 0 0 5.534V16.76L11.984 24l4.857-2.706V9.998c.13-.084.275-.196.399-.27l.032-.017c.197-.11.329-.102.23.33v10.884l6.466-3.603V6.11L24 6.093Zm.915 2.83c.932.02 1.855.191 2.706.552 1.32.533 2.522 1.364 3.45 2.429a62.814 62.814 0 0 1-3.044 1.616c.56-.853.14-2.009-.76-2.455-.93-.648-2.093-.73-3.205-.674-1.064.175-2.258.51-2.893 1.474-.722.862-.084 2.11.914 2.408 1.2.509 2.543.38 3.806.413-.975.457-1.931.97-2.927 1.358-1.701-.176-3.585-.917-4.374-2.51-.574-1.178.215-2.572 1.319-3.14a11.426 11.426 0 0 1 3.336-1.348 9.212 9.212 0 0 1 1.672-.123Z"/>"#;
+    pub const PUB: &str = r#"<g><path fill="none" stroke="currentColor" d="M4.105 4.105v12.79c0 1.266.159 1.577.79 2.21L9.79 24h9.947v-4.263L4.105 4.105z"/><path fill="none" stroke="currentColor" d="M4.105 16.894c0 1.266.159 1.577.79 2.21l.632.632h14.21L4.105 4.105v12.79z"/><path fill="none" stroke="currentColor" d="M4.105 4.105L.316 12c-.135.287-.316.64-.316.95c0 .69.303 1.395.79 1.895l4.105 4.105c-.631-.633-.79-.944-.79-2.21V4.105z"/><path fill="none" stroke="currentColor" d="M5.053 19.263c-.631-.633-.79-.944-.79-2.21V4.263l-.158-.158v12.79c0 1.266.159 1.577.79 2.21l.632.632h0L5.053 19.263z"/><path fill="none" stroke="currentColor" d="M16.737 4.105H4.105l15.632 15.632H24V9.947l-5.053-5.053c-.711-.712-1.342-.79-2.21-.79z"/><path fill="none" stroke="currentColor" d="M18.947 4.895l-4.105-4.105C14.484.429 13.737 0 13.105 0c-.543 0-1.076.108-1.421.316L4.105 4.105h12.632c.868 0 1.499.078 2.21.79z"/><polygon fill="none" stroke="currentColor" points="23.842 9.79 23.842 19.579 19.579 19.579 19.737 19.737 24 19.737 24 9.947"/><path fill="none" stroke="currentColor" d="M18.947 4.895c-.783-.783-1.425-.79-2.368-.79H4.105l.158.158h12.316c.395 0 1.185-.079 1.895.632l.474.474z"/></g>"#;
     pub const PYPI: &str = r#"<path fill="currentColor" d="M14.25.18l.9.2.73.26.59.3.45.32.34.34.25.34.16.33.1.3.04.26.02.2-.01.13V8.5l-.05.63-.13.55-.21.46-.26.38-.3.31-.33.25-.35.19-.35.14-.33.1-.3.07-.26.04-.21.02H8.83l-.69.05-.59.14-.5.22-.41.27-.33.32-.27.35-.2.36-.15.37-.1.35-.07.32-.04.27-.02.21v3.06H3.23l-.21-.03-.28-.07-.32-.12-.35-.18-.36-.26-.36-.36-.35-.46-.32-.59-.28-.73-.21-.88-.14-1.05L0 11.97l.06-1.22.16-1.04.24-.87.32-.71.36-.57.4-.44.42-.33.42-.24.4-.16.36-.1.32-.05.24-.01h.16l.06.01h8.16v-.83H6.24l-.01-2.75-.02-.37.05-.34.11-.31.17-.28.25-.26.31-.23.38-.2.44-.18.51-.15.58-.12.64-.1.71-.06.77-.04.84-.02 1.27.05 1.07.13zm-6.3 1.98l-.23.33-.08.41.08.41.23.34.33.22.41.09.41-.09.33-.22.23-.34.08-.41-.08-.41-.23-.33-.33-.22-.41-.09-.41.09-.33.22zM21.1 6.11l.28.06.32.12.35.18.36.27.36.35.35.47.32.59.28.73.21.88.14 1.04.05 1.23-.06 1.23-.16 1.04-.24.86-.32.71-.36.57-.4.45-.42.33-.42.24-.4.16-.36.09-.32.05-.24.02-.16-.01h-8.22v.82h5.84l.01 2.76.02.36-.05.34-.11.31-.17.29-.25.25-.31.24-.38.2-.44.17-.51.15-.58.13-.64.09-.71.07-.77.04-.84.01-1.27-.04-1.07-.14-.9-.2-.73-.25-.59-.3-.45-.33-.34-.34-.25-.34-.16-.33-.1-.3-.04-.25-.02-.2.01-.13v-5.34l.05-.64.13-.54.21-.46.26-.38.3-.32.33-.24.35-.2.35-.14.33-.1.3-.06.26-.04.21-.02.13-.01h5.84l.69-.05.59-.14.5-.21.41-.28.33-.32.27-.35.2-.36.15-.36.1-.35.07-.32.04-.28.02-.21V6.07h2.09l.14.01.21.03zm-6.47 14.25l-.23.33-.08.41.08.41.23.33.33.23.41.08.41-.08.33-.23.23-.33.08-.41-.08-.41-.23-.33-.33-.23-.41-.08-.41.08-.33.23z"/>"#;
 }
 
@@ -580,7 +743,7 @@ pub fn render_bragging_footer(lang: Lang) -> String {
                 <div class="text-xs text-slate-500 mt-1">{}</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-yellow-400">7</div>
+                <div class="text-2xl font-bold text-yellow-400">13</div>
                 <div class="text-xs text-slate-500 mt-1">{}</div>
             </div>
             <div class="p-3">
