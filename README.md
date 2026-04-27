@@ -15,15 +15,15 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single 32 MB binary, no database, no dependencies. `docker run` and it works.
-- **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw. Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 633 tests.
+- **Production-tested** — Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++). Used in real CI/CD with ArgoCD, Buildx cache, and air-gapped environments.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 814 tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![Image Size](https://img.shields.io/badge/image-32%20MB-blue)](https://github.com/getnora-io/nora/pkgs/container/nora)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 
-**32 MB** binary | **< 100 MB** RAM | **3s** startup | **7** registries
+**32 MB** binary | **< 100 MB** RAM | **3s** startup | **13** registries
 
 > Used in production at [DevIT Academy](https://github.com/devitway) since January 2026 for Docker images, Maven artifacts, and npm packages.
 
@@ -38,6 +38,12 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | PyPI | `/simple/` | pypi.org, custom | ✓ |
 | Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
 | Raw files | `/raw/` | — | ✓ |
+| RubyGems | `/gems/` | rubygems.org | ✓ |
+| Terraform | `/terraform/` | registry.terraform.io | ✓ |
+| Ansible Galaxy | `/ansible/` | galaxy.ansible.com | ✓ |
+| NuGet | `/nuget/` | api.nuget.org | ✓ |
+| Pub (Dart/Flutter) | `/pub/` | pub.dev | ✓ |
+| Conan (C/C++) | `/conan/` | ConanCenter | ✓ |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
 
@@ -256,6 +262,12 @@ nora mirror docker --images alpine:3.20,nginx    # Mirror Docker images
 | `/simple/` | PyPI |
 | `/go/` | Go Modules |
 | `/raw/` | Raw files |
+| `/gems/` | RubyGems |
+| `/terraform/` | Terraform |
+| `/ansible/` | Ansible Galaxy |
+| `/nuget/` | NuGet |
+| `/pub/` | Pub (Dart/Flutter) |
+| `/conan/` | Conan (C/C++) |
 
 ## TLS / HTTPS
 
@@ -323,7 +335,7 @@ Full documentation: **https://getnora.dev**
 
 ## Author
 
-Created and maintained by [DevITWay](https://github.com/devitway)
+Created and maintained by [Pavel Volkov](https://github.com/devitway)
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-nora-blue?logo=github)](https://github.com/getnora-io/nora/pkgs/container/nora)
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -343,4 +355,4 @@ NORA welcomes contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelin
 
 MIT License — see [LICENSE](LICENSE)
 
-Copyright (c) 2026 DevITWay
+Copyright (c) 2026 The NORA Authors
