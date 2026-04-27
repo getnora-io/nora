@@ -23,10 +23,11 @@ COPY nora-registry/ nora-registry/
 # Exclude fuzz workspace member (requires C++ libfuzzer, not needed for binary)
 RUN sed -i '/"fuzz"/d' Cargo.toml
 
+ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p nora-registry && \
+    cargo build --release -p nora-registry $CARGO_FEATURES && \
     cp target/release/nora /nora && \
     strip /nora
 

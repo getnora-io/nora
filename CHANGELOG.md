@@ -2,6 +2,7 @@
 ## [Unreleased]
 
 ### Added
+- **Declarative registry selection** — `[registries] enable = ["docker","npm"]` / `"all"` / `["all","-maven"]`, env `NORA_REGISTRIES_ENABLE`, 3-tier priority (env > TOML > legacy)
 - **Curation layer** — policy engine for download filtering across all 13 registries (#184-#190)
   - Blocklist/allowlist rules with glob patterns and namespace isolation
   - Three modes: `off` (passthrough), `audit` (log only), `enforce` (block downloads)

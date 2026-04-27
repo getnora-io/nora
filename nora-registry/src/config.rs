@@ -58,6 +58,9 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub curation: CurationConfig,
+    /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
+    #[serde(default)]
+    pub registries: Option<RegistriesSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,9 +861,205 @@ impl Default for CurationConfig {
     }
 }
 
+// ============================================================================
+// Registries Section (nginx-style enable)
+// ============================================================================
+
+/// Top-level `[registries]` section for declarative registry selection.
+///
+/// # Example
+/// ```toml
+/// [registries]
+/// enable = ["docker", "npm", "pypi"]
+///
+/// # Or enable all except some:
+/// # enable = ["all", "-maven"]
+///
+/// # Or enable everything:
+/// # enable = "all"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistriesSection {
+    #[serde(default)]
+    pub enable: Option<EnableSpec>,
+}
+
+/// What registries to enable — a single string or list of strings.
+///
+/// Supports:
+/// - `"all"` — all 13 registries
+/// - `"docker"` — single registry
+/// - `["docker", "npm", "pypi"]` — explicit list
+/// - `["all", "-maven"]` — all except maven
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum EnableSpec {
+    /// Single string: `enable = "all"` or `enable = "docker"`
+    Single(String),
+    /// List of strings: `enable = ["docker", "npm"]`
+    List(Vec<String>),
+}
+
+impl EnableSpec {
+    /// Parse from comma-separated env var string.
+    /// E.g. `"docker,npm,pypi"` or `"all,-maven"`.
+    pub fn from_env_str(s: &str) -> Self {
+        let items: Vec<String> = s
+            .split(',')
+            .map(|item| item.trim().to_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect();
+        match items.len() {
+            1 => {
+                // Safety: we just checked len() == 1
+                let item = items.into_iter().next().unwrap_or_default();
+                EnableSpec::Single(item)
+            }
+            _ => EnableSpec::List(items),
+        }
+    }
+
+    /// Resolve the spec into a concrete set of RegistryTypes.
+    ///
+    /// Rules:
+    /// - `"all"` → all 13 registries
+    /// - `"-name"` → exclusion (only valid when `"all"` is present)
+    /// - `"name"` → inclusion
+    /// - Unknown name → Err
+    /// - Empty result → Err
+    pub fn resolve(&self) -> Result<HashSet<RegistryType>, String> {
+        let items = match self {
+            EnableSpec::Single(s) => vec![s.clone()],
+            EnableSpec::List(v) => v.clone(),
+        };
+
+        if items.is_empty() {
+            return Err("registries.enable must not be empty".to_string());
+        }
+
+        let has_all = items.iter().any(|s| s == "all");
+        let exclusions: Vec<&str> = items
+            .iter()
+            .filter(|s| s.starts_with('-'))
+            .map(|s| s.as_str())
+            .collect();
+        let inclusions: Vec<&str> = items
+            .iter()
+            .filter(|s| *s != "all" && !s.starts_with('-'))
+            .map(|s| s.as_str())
+            .collect();
+
+        // Exclusions without "all" is an error
+        if !exclusions.is_empty() && !has_all {
+            return Err(format!(
+                "exclusion entries ({}) require \"all\" in the list",
+                exclusions.join(", ")
+            ));
+        }
+
+        // "all" with inclusions is ambiguous
+        if has_all && !inclusions.is_empty() {
+            return Err(format!(
+                "\"all\" cannot be combined with inclusions ({}); use \"all\" with exclusions like \"-maven\"",
+                inclusions.join(", ")
+            ));
+        }
+
+        if has_all {
+            // Start with all, then remove exclusions
+            let mut set: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
+            for ex in &exclusions {
+                let name = &ex[1..]; // strip leading '-'
+                match RegistryType::from_str_opt(name) {
+                    Some(rt) => {
+                        set.remove(&rt);
+                    }
+                    None => {
+                        return Err(format!("unknown registry in exclusion: \"{}\"", ex));
+                    }
+                }
+            }
+            if set.is_empty() {
+                return Err("all registries excluded — at least one must be enabled".to_string());
+            }
+            Ok(set)
+        } else {
+            // Explicit inclusion list
+            let mut set = HashSet::new();
+            for name in &inclusions {
+                match RegistryType::from_str_opt(name) {
+                    Some(rt) => {
+                        set.insert(rt);
+                    }
+                    None => {
+                        return Err(format!("unknown registry: \"{}\"", name));
+                    }
+                }
+            }
+            if set.is_empty() {
+                return Err("registries.enable must not be empty".to_string());
+            }
+            Ok(set)
+        }
+    }
+}
+
 impl Config {
-    /// Returns the set of enabled registry types based on config.
+    /// Returns the set of enabled registry types.
+    ///
+    /// Resolution priority (three tiers):
+    /// 1. `NORA_REGISTRIES_ENABLE` env var (highest)
+    /// 2. `[registries].enable` from TOML config
+    /// 3. Legacy per-registry `enabled` flags (backward compatible)
     pub fn enabled_registries(&self) -> HashSet<RegistryType> {
+        // Tier 1: NORA_REGISTRIES_ENABLE env var
+        if let Ok(val) = env::var("NORA_REGISTRIES_ENABLE") {
+            if !val.is_empty() {
+                let spec = EnableSpec::from_env_str(&val);
+                match spec.resolve() {
+                    Ok(set) => {
+                        Self::warn_legacy_env_vars_if_present();
+                        tracing::info!(
+                            registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                            "Registry selection from NORA_REGISTRIES_ENABLE"
+                        );
+                        return set;
+                    }
+                    Err(e) => {
+                        tracing::error!("NORA_REGISTRIES_ENABLE is invalid: {} — falling back", e);
+                    }
+                }
+            }
+        }
+
+        // Tier 2: [registries].enable from TOML
+        if let Some(ref section) = self.registries {
+            if let Some(ref spec) = section.enable {
+                match spec.resolve() {
+                    Ok(set) => {
+                        Self::warn_legacy_env_vars_if_present();
+                        tracing::info!(
+                            registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                            "Registry selection from [registries].enable"
+                        );
+                        return set;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[registries].enable is invalid: {} — falling back to legacy",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Tier 3: legacy per-registry enabled flags
+        self.enabled_registries_legacy()
+    }
+
+    /// Legacy registry resolution from individual `*.enabled` flags.
+    fn enabled_registries_legacy(&self) -> HashSet<RegistryType> {
         let mut set = HashSet::new();
         if self.docker.enabled {
             set.insert(RegistryType::Docker);
@@ -905,6 +1104,38 @@ impl Config {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
         set
+    }
+
+    /// Warn if legacy NORA_*_ENABLED env vars are set while using the new
+    /// `[registries].enable` or `NORA_REGISTRIES_ENABLE`.
+    fn warn_legacy_env_vars_if_present() {
+        let legacy_vars = [
+            "NORA_DOCKER_ENABLED",
+            "NORA_MAVEN_ENABLED",
+            "NORA_NPM_ENABLED",
+            "NORA_CARGO_ENABLED",
+            "NORA_PYPI_ENABLED",
+            "NORA_GO_ENABLED",
+            "NORA_RAW_ENABLED",
+            "NORA_GEMS_ENABLED",
+            "NORA_TERRAFORM_ENABLED",
+            "NORA_ANSIBLE_ENABLED",
+            "NORA_NUGET_ENABLED",
+            "NORA_PUB_ENABLED",
+            "NORA_CONAN_ENABLED",
+        ];
+        let found: Vec<&str> = legacy_vars
+            .iter()
+            .filter(|v| env::var(v).is_ok())
+            .copied()
+            .collect();
+        if !found.is_empty() {
+            tracing::warn!(
+                vars = ?found,
+                "Legacy NORA_*_ENABLED env vars are set but ignored — \
+                 [registries].enable or NORA_REGISTRIES_ENABLE takes precedence"
+            );
+        }
     }
 
     /// Warn if credentials are configured via config.toml (not env vars)
@@ -1075,6 +1306,15 @@ impl Config {
             warnings.push(
                 "curation.mode=audit but no allowlist_path configured — no allowlist filter will be active".to_string(),
             );
+        }
+
+        // 9. [registries].enable validation
+        if let Some(ref section) = self.registries {
+            if let Some(ref spec) = section.enable {
+                if let Err(e) = spec.resolve() {
+                    errors.push(format!("[registries].enable: {}", e));
+                }
+            }
         }
 
         (warnings, errors)
@@ -1627,6 +1867,7 @@ impl Default for Config {
             gc: GcConfig::default(),
             retention: RetentionConfig::default(),
             curation: CurationConfig::default(),
+            registries: None,
         }
     }
 }
@@ -2506,5 +2747,296 @@ mod tests {
         assert_eq!(CurationMode::Off.to_string(), "off");
         assert_eq!(CurationMode::Audit.to_string(), "audit");
         assert_eq!(CurationMode::Enforce.to_string(), "enforce");
+    }
+
+    // ========================================================================
+    // EnableSpec + [registries] tests
+    // ========================================================================
+
+    #[test]
+    fn test_enable_spec_single_all() {
+        let spec = EnableSpec::Single("all".to_string());
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), RegistryType::all().len());
+        for rt in RegistryType::all() {
+            assert!(set.contains(rt), "missing {:?}", rt);
+        }
+    }
+
+    #[test]
+    fn test_enable_spec_single_registry() {
+        let spec = EnableSpec::Single("docker".to_string());
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_enable_spec_list_explicit() {
+        let spec = EnableSpec::List(vec![
+            "docker".to_string(),
+            "npm".to_string(),
+            "pypi".to_string(),
+        ]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Npm));
+        assert!(set.contains(&RegistryType::PyPI));
+    }
+
+    #[test]
+    fn test_enable_spec_all_minus() {
+        let spec = EnableSpec::List(vec!["all".to_string(), "-maven".to_string()]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), RegistryType::all().len() - 1);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_enable_spec_all_minus_multiple() {
+        let spec = EnableSpec::List(vec![
+            "all".to_string(),
+            "-maven".to_string(),
+            "-conan".to_string(),
+        ]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Conan));
+    }
+
+    #[test]
+    fn test_enable_spec_unknown_error() {
+        let spec = EnableSpec::Single("bogus".to_string());
+        assert!(spec.resolve().is_err());
+    }
+
+    #[test]
+    fn test_enable_spec_exclusion_without_all() {
+        let spec = EnableSpec::List(vec!["docker".to_string(), "-maven".to_string()]);
+        let err = spec.resolve().unwrap_err();
+        assert!(err.contains("require \"all\""), "got: {}", err);
+    }
+
+    #[test]
+    fn test_enable_spec_empty_error() {
+        let spec = EnableSpec::List(vec![]);
+        assert!(spec.resolve().is_err());
+    }
+
+    #[test]
+    fn test_enable_spec_aliases() {
+        let spec = EnableSpec::Single("rubygems".to_string());
+        let set = spec.resolve().unwrap();
+        assert!(set.contains(&RegistryType::Gems));
+
+        let spec2 = EnableSpec::Single("dart".to_string());
+        let set2 = spec2.resolve().unwrap();
+        assert!(set2.contains(&RegistryType::PubDart));
+
+        let spec3 = EnableSpec::Single("pub_dart".to_string());
+        let set3 = spec3.resolve().unwrap();
+        assert!(set3.contains(&RegistryType::PubDart));
+    }
+
+    #[test]
+    fn test_enable_spec_all_with_inclusions_error() {
+        let spec = EnableSpec::List(vec!["all".to_string(), "docker".to_string()]);
+        let err = spec.resolve().unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_registries_toml_list() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["docker", "npm"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_some());
+        let section = config.registries.as_ref().unwrap();
+        assert_eq!(
+            section.enable,
+            Some(EnableSpec::List(vec![
+                "docker".to_string(),
+                "npm".to_string()
+            ]))
+        );
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Npm));
+    }
+
+    #[test]
+    fn test_registries_toml_string() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = "all"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), RegistryType::all().len());
+    }
+
+    #[test]
+    fn test_registries_toml_absent() {
+        // No [registries] section → legacy mode
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_none());
+        // Legacy: 7 core enabled by default
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 7);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Gems)); // new registries default disabled
+    }
+
+    #[test]
+    fn test_registries_toml_empty_section() {
+        // [registries] without enable → legacy mode
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_some());
+        assert!(config.registries.as_ref().unwrap().enable.is_none());
+        // Falls through to legacy
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn test_env_overrides_toml_registries() {
+        // NORA_REGISTRIES_ENABLE should take precedence over [registries].enable
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["docker", "npm"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "cargo,pypi");
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&RegistryType::Cargo));
+        assert!(set.contains(&RegistryType::PyPI));
+        assert!(!set.contains(&RegistryType::Docker));
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+    }
+
+    #[test]
+    fn test_from_env_str_parsing() {
+        let spec = EnableSpec::from_env_str("docker, npm , pypi");
+        assert_eq!(
+            spec,
+            EnableSpec::List(vec![
+                "docker".to_string(),
+                "npm".to_string(),
+                "pypi".to_string()
+            ])
+        );
+
+        // Single value
+        let spec2 = EnableSpec::from_env_str("all");
+        assert_eq!(spec2, EnableSpec::Single("all".to_string()));
+
+        // Uppercase → lowercase
+        let spec3 = EnableSpec::from_env_str("Docker,NPM");
+        assert_eq!(
+            spec3,
+            EnableSpec::List(vec!["docker".to_string(), "npm".to_string()])
+        );
+
+        // With exclusions
+        let spec4 = EnableSpec::from_env_str("all,-maven,-conan");
+        assert_eq!(
+            spec4,
+            EnableSpec::List(vec![
+                "all".to_string(),
+                "-maven".to_string(),
+                "-conan".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_validate_unknown_registry_in_enable() {
+        let mut config = Config::default();
+        config.registries = Some(RegistriesSection {
+            enable: Some(EnableSpec::List(vec![
+                "docker".to_string(),
+                "bogus".to_string(),
+            ])),
+        });
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("[registries].enable")),
+            "should report validation error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_registries_toml_all_minus() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["all", "-maven", "-conan"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Conan));
+        assert!(set.contains(&RegistryType::Docker));
     }
 }

@@ -149,6 +149,7 @@ fn build_context(
         gc: crate::config::GcConfig::default(),
         retention: crate::config::RetentionConfig::default(),
         curation: CurationConfig::default(),
+        registries: None,
     };
 
     // Apply any custom config tweaks

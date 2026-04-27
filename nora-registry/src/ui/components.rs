@@ -720,7 +720,8 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Render the "bragging" footer with NORA stats
+/// Render the "bragging" footer with NORA stats (demo builds only)
+#[cfg(feature = "demo")]
 pub fn render_bragging_footer(lang: Lang) -> String {
     let t = get_translations(lang);
     format!(

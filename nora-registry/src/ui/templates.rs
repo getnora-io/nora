@@ -122,8 +122,11 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     let mins = (data.uptime_seconds % 3600) / 60;
     let uptime_str = format!("{}h {}m", hours, mins);
 
-    // Render bragging footer
+    // Render bragging footer (demo builds only)
+    #[cfg(feature = "demo")]
     let bragging_footer = render_bragging_footer(lang);
+    #[cfg(not(feature = "demo"))]
+    let bragging_footer = String::new();
 
     let content = format!(
         r##"
