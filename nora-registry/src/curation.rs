@@ -256,6 +256,7 @@ pub fn check_download(
     registry: RegistryType,
     name: &str,
     version: Option<&str>,
+    publish_date: Option<i64>,
 ) -> Option<Response> {
     let bypass = match bypass_token {
         Some(token) => headers
@@ -273,7 +274,7 @@ pub fn check_download(
         version: version.map(|v| v.to_string()),
         integrity: None,
         bypass,
-        publish_date: None,
+        publish_date,
     };
 
     let result = engine.evaluate(&request);
@@ -305,6 +306,33 @@ pub fn check_download(
         }
         Decision::Allow | Decision::Skip => None,
     }
+}
+
+/// Parse an ISO 8601 / RFC 3339 date string to a Unix timestamp (seconds).
+///
+/// Handles common formats from registry metadata:
+/// - `2024-01-15T10:30:00Z` (Go .info `Time` field)
+/// - `2024-01-15T10:30:00.123Z` (npm `time` field)
+/// - `2024-01-15T10:30:00+00:00` (PyPI `upload_time_iso_8601`)
+///
+/// Returns `None` if the string is not parseable.
+pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    use chrono::{DateTime, FixedOffset, NaiveDateTime};
+
+    // Try RFC 3339 / ISO 8601 with timezone
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+
+    // Try without timezone (assume UTC) — some registries omit the Z
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(ndt.and_utc().timestamp());
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(ndt.and_utc().timestamp());
+    }
+
+    None
 }
 
 /// Verify artifact integrity after download (post-download phase, issue #189).
@@ -866,9 +894,13 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
 /// Filter that blocks packages published less than `min_age_secs` ago.
 ///
 /// If `publish_date` is `None` (unknown), the filter returns `Skip` (no opinion).
+/// Supports per-registry overrides: if a registry has its own threshold,
+/// it takes precedence over the global `min_age_secs`.
 pub struct MinReleaseAgeFilter {
     min_age_secs: i64,
     label: String,
+    /// Per-registry override thresholds (seconds).
+    overrides: std::collections::HashMap<RegistryType, (i64, String)>,
 }
 
 impl MinReleaseAgeFilter {
@@ -876,7 +908,14 @@ impl MinReleaseAgeFilter {
         Self {
             min_age_secs,
             label: label.to_string(),
+            overrides: std::collections::HashMap::new(),
         }
+    }
+
+    /// Add a per-registry override. If `registry` has its own min_release_age,
+    /// it will be used instead of the global default.
+    pub fn add_override(&mut self, registry: RegistryType, age_secs: i64, label: String) {
+        self.overrides.insert(registry, (age_secs, label));
     }
 
     fn format_duration(secs: i64) -> String {
@@ -906,19 +945,26 @@ impl ProxyFilter for MinReleaseAgeFilter {
             return Decision::Skip; // Unknown date — don't block
         };
 
+        // Use per-registry override if available, otherwise global default
+        let (threshold, label) = if let Some((secs, lbl)) = self.overrides.get(&request.registry) {
+            (*secs, lbl.as_str())
+        } else {
+            (self.min_age_secs, self.label.as_str())
+        };
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
         let age = now - publish_ts;
-        if age < self.min_age_secs {
+        if age < threshold {
             Decision::Block {
                 rule: "min-release-age".to_string(),
                 reason: format!(
-                    "package is {}  old (minimum: {})",
+                    "package is {} old (minimum: {})",
                     Self::format_duration(age.max(0)),
-                    self.label,
+                    label,
                 ),
             }
         } else {
@@ -2348,6 +2394,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_none());
     }
@@ -2367,6 +2414,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_some());
         let response = result.unwrap();
@@ -2385,6 +2433,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_none());
     }
@@ -2404,6 +2453,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_none());
     }
@@ -2423,6 +2473,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_some());
     }
@@ -2442,6 +2493,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_some());
     }
@@ -2451,8 +2503,15 @@ mod tests {
         let engine = CurationEngine::new(enforce_config());
         // No filters → all Skip → Allow
         let headers = axum::http::HeaderMap::new();
-        let result =
-            super::check_download(&engine, None, &headers, RegistryType::Npm, "lodash", None);
+        let result = super::check_download(
+            &engine,
+            None,
+            &headers,
+            RegistryType::Npm,
+            "lodash",
+            None,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -2467,6 +2526,7 @@ mod tests {
             RegistryType::Cargo,
             "serde",
             Some("1.0.0"),
+            None,
         );
         assert!(result.is_none());
     }

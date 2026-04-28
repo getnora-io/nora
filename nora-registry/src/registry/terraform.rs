@@ -184,6 +184,7 @@ async fn provider_download_meta(
         crate::curation::RegistryType::Terraform,
         &format!("{}/{}", ns, ptype),
         Some(&ver),
+        None,
     ) {
         return response;
     }

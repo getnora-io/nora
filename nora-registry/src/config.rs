@@ -850,6 +850,39 @@ pub struct CurationConfig {
     /// Packages published less than this duration ago are blocked.
     #[serde(default)]
     pub min_release_age: Option<String>,
+    /// Per-registry curation overrides. Overrides `min_release_age` per registry.
+    #[serde(default)]
+    pub npm: RegistryCurationOverride,
+    #[serde(default)]
+    pub pypi: RegistryCurationOverride,
+    #[serde(default)]
+    pub cargo: RegistryCurationOverride,
+    #[serde(default)]
+    pub go: RegistryCurationOverride,
+    #[serde(default)]
+    pub docker: RegistryCurationOverride,
+    #[serde(default)]
+    pub maven: RegistryCurationOverride,
+    #[serde(default)]
+    pub gems: RegistryCurationOverride,
+    #[serde(default)]
+    pub terraform: RegistryCurationOverride,
+    #[serde(default)]
+    pub ansible: RegistryCurationOverride,
+    #[serde(default)]
+    pub nuget: RegistryCurationOverride,
+    #[serde(rename = "pub", default)]
+    pub pub_dart: RegistryCurationOverride,
+    #[serde(default)]
+    pub conan: RegistryCurationOverride,
+}
+
+/// Per-registry curation override (used within `[curation.{registry}]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryCurationOverride {
+    /// Override min_release_age for this specific registry.
+    #[serde(default)]
+    pub min_release_age: Option<String>,
 }
 
 impl Default for CurationConfig {
@@ -863,6 +896,18 @@ impl Default for CurationConfig {
             require_integrity: false,
             internal_namespaces: Vec::new(),
             min_release_age: None,
+            npm: RegistryCurationOverride::default(),
+            pypi: RegistryCurationOverride::default(),
+            cargo: RegistryCurationOverride::default(),
+            go: RegistryCurationOverride::default(),
+            docker: RegistryCurationOverride::default(),
+            maven: RegistryCurationOverride::default(),
+            gems: RegistryCurationOverride::default(),
+            terraform: RegistryCurationOverride::default(),
+            ansible: RegistryCurationOverride::default(),
+            nuget: RegistryCurationOverride::default(),
+            pub_dart: RegistryCurationOverride::default(),
+            conan: RegistryCurationOverride::default(),
         }
     }
 }
@@ -1835,6 +1880,26 @@ impl Config {
         }
         if let Ok(val) = env::var("NORA_CURATION_MIN_RELEASE_AGE") {
             self.curation.min_release_age = if val.is_empty() { None } else { Some(val) };
+        }
+
+        // Per-registry curation overrides
+        for (env_suffix, field) in [
+            ("NPM", &mut self.curation.npm),
+            ("PYPI", &mut self.curation.pypi),
+            ("CARGO", &mut self.curation.cargo),
+            ("GO", &mut self.curation.go),
+            ("DOCKER", &mut self.curation.docker),
+            ("MAVEN", &mut self.curation.maven),
+            ("GEMS", &mut self.curation.gems),
+            ("TERRAFORM", &mut self.curation.terraform),
+            ("ANSIBLE", &mut self.curation.ansible),
+            ("NUGET", &mut self.curation.nuget),
+            ("PUB", &mut self.curation.pub_dart),
+            ("CONAN", &mut self.curation.conan),
+        ] {
+            if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
+                field.min_release_age = if val.is_empty() { None } else { Some(val) };
+            }
         }
     }
 }

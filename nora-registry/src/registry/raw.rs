@@ -92,6 +92,7 @@ async fn upload(
             state
                 .audit
                 .log(AuditEntry::new("push", "api", "", "raw", ""));
+            state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -105,7 +106,10 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String
 
     let key = format!("raw/{}", path);
     match state.storage.delete(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.repo_index.invalidate("raw");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

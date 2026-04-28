@@ -136,6 +136,7 @@ async fn download(
             crate::curation::RegistryType::Maven,
             maven_name,
             Some(maven_version),
+            None,
         ) {
             return response;
         }

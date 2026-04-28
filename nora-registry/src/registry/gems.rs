@@ -150,6 +150,7 @@ async fn compact_index(
         crate::curation::RegistryType::Gems,
         &name,
         None,
+        None,
     ) {
         return response;
     }
@@ -246,6 +247,7 @@ async fn download_gem(
         crate::curation::RegistryType::Gems,
         &name,
         Some(&version),
+        None,
     ) {
         return response;
     }

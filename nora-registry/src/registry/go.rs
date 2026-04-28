@@ -72,6 +72,14 @@ async fn handle(
 
     // Curation check — .zip downloads only (metadata passes through)
     if let Some((ref module_name, ref version)) = go_curation {
+        // Extract publish date from cached .info file
+        let publish_date = if let Some(ref ver) = version {
+            let info_key = format!("go/{}/@v/{}.info", module_encoded, ver);
+            extract_go_publish_date(&state.storage, &info_key).await
+        } else {
+            None
+        };
+
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
@@ -79,6 +87,7 @@ async fn handle(
             crate::curation::RegistryType::Go,
             module_name,
             version.as_deref(),
+            publish_date,
         ) {
             return response;
         }
@@ -222,6 +231,19 @@ async fn handle(
 // ============================================================================
 // Module path encoding/decoding
 // ============================================================================
+
+/// Extract publish date from a cached Go .info file.
+///
+/// Go .info JSON has a `Time` field in RFC 3339 format:
+/// ```json
+/// { "Version": "v1.0.0", "Time": "2024-01-15T10:30:00Z" }
+/// ```
+async fn extract_go_publish_date(storage: &crate::storage::Storage, info_key: &str) -> Option<i64> {
+    let data = storage.get(info_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let date_str = json.get("Time")?.as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
 
 /// Decode Go module path: `!x` → `X`
 ///

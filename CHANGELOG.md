@@ -1,6 +1,19 @@
 # Changelog
 ## [Unreleased]
 
+## [0.7.2] - 2026-04-28
+
+### Added
+- **Publish date extraction** — curation min-release-age filter now extracts real publish dates from cached metadata for npm, PyPI, Cargo, and Go registries (#207)
+- **Per-registry curation overrides** — configure min_release_age per registry via TOML (`[curation.npm] min_release_age = "3d"`) or env (`NORA_CURATION_NPM_MIN_RELEASE_AGE`) (#205)
+- `parse_iso8601_to_unix()` helper for ISO 8601 / RFC 3339 date parsing across registry formats
+
+### Fixed
+- Raw registry: UI now updates immediately after upload/delete — added missing `repo_index.invalidate("raw")` calls (#212)
+
+### Verified
+- Token RBAC: `last_used` tracking (deferred flush), auto-expire rejection, description field — all functional (#206)
+
 ## [0.7.1] - 2026-04-27
 
 ### Added

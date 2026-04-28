@@ -380,6 +380,51 @@ async fn main() {
     }
 }
 
+/// Load per-registry min_release_age overrides from CurationConfig into the filter.
+fn load_registry_overrides(
+    filter: &mut curation::MinReleaseAgeFilter,
+    curation_config: &config::CurationConfig,
+) {
+    let registry_overrides: &[(RegistryType, &config::RegistryCurationOverride)] = &[
+        (RegistryType::Npm, &curation_config.npm),
+        (RegistryType::PyPI, &curation_config.pypi),
+        (RegistryType::Cargo, &curation_config.cargo),
+        (RegistryType::Go, &curation_config.go),
+        (RegistryType::Docker, &curation_config.docker),
+        (RegistryType::Maven, &curation_config.maven),
+        (RegistryType::Gems, &curation_config.gems),
+        (RegistryType::Terraform, &curation_config.terraform),
+        (RegistryType::Ansible, &curation_config.ansible),
+        (RegistryType::Nuget, &curation_config.nuget),
+        (RegistryType::PubDart, &curation_config.pub_dart),
+        (RegistryType::Conan, &curation_config.conan),
+    ];
+
+    for (registry, override_cfg) in registry_overrides {
+        if let Some(ref age_str) = override_cfg.min_release_age {
+            match curation::parse_duration(age_str) {
+                Ok(secs) => {
+                    filter.add_override(*registry, secs, age_str.clone());
+                    tracing::info!(
+                        registry = %registry,
+                        min_age = %age_str,
+                        seconds = secs,
+                        "Per-registry min-release-age override loaded"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        registry = %registry,
+                        value = %age_str,
+                        error = %e,
+                        "Invalid per-registry min_release_age"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn run_curation_validate(file: &Path) {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -526,7 +571,8 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     if let Some(ref age_str) = config.curation.min_release_age {
         match curation::parse_duration(age_str) {
             Ok(secs) => {
-                let filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                load_registry_overrides(&mut filter, &config.curation);
                 println!("Min-release-age: {} ({}s)", age_str, secs);
                 engine.add_filter(Box::new(filter));
             }
@@ -689,7 +735,8 @@ async fn run_server(config: Config, storage: Storage) {
     if let Some(ref age_str) = config.curation.min_release_age {
         match curation::parse_duration(age_str) {
             Ok(secs) => {
-                let filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                load_registry_overrides(&mut filter, &config.curation);
                 curation_engine.add_filter(Box::new(filter));
                 info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
             }
