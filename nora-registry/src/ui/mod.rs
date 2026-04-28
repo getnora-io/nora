@@ -5,6 +5,7 @@ mod api;
 pub mod components;
 pub mod i18n;
 mod logo;
+mod static_assets;
 mod templates;
 
 use crate::repo_index::paginate;
@@ -146,6 +147,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/ui/tokens/create", post(tokens_create))
         .route("/api/ui/tokens/list", get(tokens_list))
         .route("/api/ui/tokens/{file_id}/revoke", post(tokens_revoke))
+        // Static assets (embedded)
+        .route(
+            "/ui/static/tailwind.css",
+            get(static_assets::serve_tailwind_css),
+        )
+        .route("/ui/static/htmx.min.js", get(static_assets::serve_htmx_js))
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
