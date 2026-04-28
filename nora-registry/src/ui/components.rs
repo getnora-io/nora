@@ -44,8 +44,8 @@ pub fn layout_dark_filtered(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Nora</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <link rel="stylesheet" href="/ui/static/tailwind.css">
+    <script src="/ui/static/htmx.min.js"></script>
     <style>
         [x-cloak] {{ display: none !important; }}
         .sidebar-open {{ overflow: hidden; }}

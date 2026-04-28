@@ -7,4 +7,4 @@ flate = "flate"
 validat = "validat"
 
 [files]
-extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/"]
+extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]
