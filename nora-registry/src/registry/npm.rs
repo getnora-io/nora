@@ -96,6 +96,14 @@ async fn handle_request(
 
     // Curation check — tarball downloads only (metadata passes through)
     if is_tarball {
+        // Extract publish date from cached metadata (npm time field)
+        let publish_date = if let Some(ref ver) = tarball_version {
+            let meta_key = format!("npm/{}/metadata.json", package_name);
+            extract_npm_publish_date(&state.storage, &meta_key, ver).await
+        } else {
+            None
+        };
+
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
@@ -103,6 +111,7 @@ async fn handle_request(
             crate::curation::RegistryType::Npm,
             &package_name,
             tarball_version.as_deref(),
+            publish_date,
         ) {
             return response;
         }
@@ -458,6 +467,23 @@ async fn handle_publish(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Extract publish date for a specific version from cached npm metadata.
+///
+/// npm metadata JSON has a `time` object mapping versions to ISO 8601 dates:
+/// ```json
+/// { "time": { "1.0.0": "2024-01-15T10:30:00.000Z" } }
+/// ```
+async fn extract_npm_publish_date(
+    storage: &crate::storage::Storage,
+    metadata_key: &str,
+    version: &str,
+) -> Option<i64> {
+    let data = storage.get(metadata_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let date_str = json.get("time")?.get(version)?.as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
 
 fn with_content_type(
     is_tarball: bool,

@@ -127,6 +127,7 @@ async fn version_detail(
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
         Some(&ver),
+        None,
     ) {
         return response;
     }
@@ -172,6 +173,7 @@ async fn download_tarball(
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
         Some(ver),
+        None,
     ) {
         return response;
     }

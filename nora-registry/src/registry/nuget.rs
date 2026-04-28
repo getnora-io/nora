@@ -103,6 +103,7 @@ async fn registration_index(
         crate::curation::RegistryType::Nuget,
         &id_lower,
         None,
+        None,
     ) {
         return response;
     }
@@ -285,6 +286,7 @@ async fn flatcontainer_download(
             crate::curation::RegistryType::Nuget,
             &id_lower,
             Some(ver),
+            None,
         ) {
             return response;
         }

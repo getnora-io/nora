@@ -306,6 +306,7 @@ async fn recipe_file_download(
         crate::curation::RegistryType::Conan,
         &name,
         Some(&ver),
+        None,
     ) {
         return response;
     }
@@ -579,6 +580,7 @@ async fn package_file_download(
         crate::curation::RegistryType::Conan,
         &name,
         Some(&ver),
+        None,
     ) {
         return response;
     }

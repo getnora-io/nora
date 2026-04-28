@@ -179,6 +179,15 @@ async fn download_file(
 
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
+
+    // Extract publish date from cached PyPI metadata
+    let publish_date = if let Some(ref ver) = version {
+        let meta_key = format!("pypi/{}/metadata.json", normalized);
+        extract_pypi_publish_date(&state.storage, &meta_key, ver).await
+    } else {
+        None
+    };
+
     if let Some(response) = crate::curation::check_download(
         &state.curation,
         state.config.curation.bypass_token.as_deref(),
@@ -186,6 +195,7 @@ async fn download_file(
         crate::curation::RegistryType::PyPI,
         &normalized,
         version.as_deref(),
+        publish_date,
     ) {
         return response;
     }
@@ -474,6 +484,24 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Extract publish date for a specific version from cached PyPI metadata.
+///
+/// PyPI metadata JSON has `releases` mapping versions to file arrays:
+/// ```json
+/// { "releases": { "1.0.0": [{ "upload_time_iso_8601": "2024-01-15T10:30:00Z" }] } }
+/// ```
+async fn extract_pypi_publish_date(
+    storage: &crate::storage::Storage,
+    metadata_key: &str,
+    version: &str,
+) -> Option<i64> {
+    let data = storage.get(metadata_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let files = json.get("releases")?.get(version)?.as_array()?;
+    let date_str = files.first()?.get("upload_time_iso_8601")?.as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
 
 /// Normalize package name according to PEP 503.
 fn normalize_name(name: &str) -> String {

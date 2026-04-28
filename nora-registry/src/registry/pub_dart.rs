@@ -133,6 +133,7 @@ async fn package_listing(
         crate::curation::RegistryType::PubDart,
         &package,
         None,
+        None,
     ) {
         return response;
     }
@@ -280,6 +281,7 @@ async fn download_archive(
         crate::curation::RegistryType::PubDart,
         &package,
         Some(version),
+        None,
     ) {
         return response;
     }

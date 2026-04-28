@@ -233,6 +233,12 @@ async fn download(
     }
     let crate_name = crate_name.to_lowercase();
 
+    // Extract publish date from cached Cargo metadata
+    let publish_date = {
+        let meta_key = format!("cargo/{}/metadata.json", crate_name);
+        extract_cargo_publish_date(&state.storage, &meta_key, &version).await
+    };
+
     // Curation check — before storage access
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -241,6 +247,7 @@ async fn download(
         crate::curation::RegistryType::Cargo,
         &crate_name,
         Some(&version),
+        publish_date,
     ) {
         return response;
     }
@@ -621,6 +628,29 @@ fn sparse_index_response(data: Vec<u8>) -> Response {
         data,
     )
         .into_response()
+}
+
+/// Extract publish date for a specific version from cached Cargo metadata.
+///
+/// crates.io API metadata has `versions` array with `num` and `created_at`:
+/// ```json
+/// { "versions": [{ "num": "1.0.0", "created_at": "2024-01-15T10:30:00Z" }] }
+/// ```
+async fn extract_cargo_publish_date(
+    storage: &crate::storage::Storage,
+    metadata_key: &str,
+    version: &str,
+) -> Option<i64> {
+    let data = storage.get(metadata_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let versions = json.get("versions")?.as_array()?;
+    for v in versions {
+        if v.get("num")?.as_str()? == version {
+            let date_str = v.get("created_at")?.as_str()?;
+            return crate::curation::parse_iso8601_to_unix(date_str);
+        }
+    }
+    None
 }
 
 // ============================================================================

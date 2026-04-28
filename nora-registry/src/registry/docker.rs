@@ -213,6 +213,7 @@ async fn download_blob(
         crate::curation::RegistryType::Docker,
         &name,
         Some(&digest),
+        None,
     ) {
         return response;
     }
@@ -580,6 +581,7 @@ async fn get_manifest(
         crate::curation::RegistryType::Docker,
         &name,
         Some(&reference),
+        None,
     ) {
         return response;
     }
