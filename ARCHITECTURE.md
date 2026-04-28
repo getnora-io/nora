@@ -145,7 +145,8 @@ nora/
 │   │   ├── components.rs    #   Sidebar, nav, icons
 │   │   ├── api.rs           #   Dashboard JSON API
 │   │   ├── i18n.rs          #   English/Russian UI strings
-│   │   └── logo.rs          #   SVG logo
+│   │   ├── logo.rs          #   Embedded JPEG logo (base64)
+│   │   └── static_assets.rs #   Embedded CSS/JS (Tailwind, htmx)
 │   │
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
 │   ├── secrets/             # Secret value handling (env vars, redaction)
@@ -176,7 +177,7 @@ compatibility matrices, and runtime loading failures.
 
 **Rationale:** A single binary eliminates deployment complexity. There are
 no plugins to install, no versions to align, no ClassNotFoundExceptions.
-The binary is ~25 MB as a Docker image. The trade-off is that unused
+The binary is ~25 MB; the Alpine Docker image is ~45 MB. The trade-off is that unused
 formats still occupy binary space — mitigated by Cargo features for
 compile-time exclusion if needed.
 
@@ -237,7 +238,7 @@ too broad (leaking abstraction through dozens of `Option<T>` fields).
 The explicit approach has practical advantages:
 
 - **Testability.** Each handler is a standalone module with its own test
-  block. All 821 tests run in ~15 seconds with `cargo test`. No plugin
+  block. All 850 tests run in ~15 seconds with `cargo test`. No plugin
   loading, no mock trait implementations, no integration harness.
 - **Compile-time completeness.** When a new `RegistryType` variant is
   added, the compiler flags every unhandled match arm. Missing a
