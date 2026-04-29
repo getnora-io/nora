@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use subtle::ConstantTimeEq;
 
 // ============================================================================
 // Registry Type (re-export from shared module)
@@ -262,7 +263,10 @@ pub fn check_download(
         Some(token) => headers
             .get("x-nora-bypass-token")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == token)
+            .map(|v| {
+                // Constant-time comparison to prevent timing side-channel
+                v.as_bytes().ct_eq(token.as_bytes()).into()
+            })
             .unwrap_or(false),
         None => false,
     };
@@ -567,7 +571,7 @@ pub struct BlocklistRule {
 ///
 /// Supports:
 /// - `"*"` — matches everything
-/// - `"foo.**"` — hierarchical prefix (dot separator, for Maven groupIds)
+/// - `"foo.**"` — hierarchical prefix (dot OR colon separator, for Maven groupId:artifactId)
 /// - `"foo/**"` — hierarchical prefix (slash separator, for Go modules)
 /// - `"foo*"` — prefix match
 /// - `"*foo"` — suffix match
@@ -576,9 +580,11 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    // "foo.**" → matches "foo" itself and "foo.anything.deeper"
+    // "foo.**" → matches "foo" itself and "foo.anything" or "foo:anything" (Maven colon)
     if let Some(prefix) = pattern.strip_suffix(".**") {
-        return value == prefix || value.starts_with(&format!("{}.", prefix));
+        return value == prefix
+            || value.starts_with(&format!("{}.", prefix))
+            || value.starts_with(&format!("{}:", prefix));
     }
     // "foo/**" → matches "foo" itself and "foo/anything/deeper"
     if let Some(prefix) = pattern.strip_suffix("/**") {
@@ -1783,6 +1789,20 @@ mod tests {
     fn test_glob_match_double_star_dot_no_match() {
         assert!(!glob_match("com.company.**", "com.other"));
         assert!(!glob_match("com.company.**", "company.utils"));
+    }
+
+    #[test]
+    fn test_glob_match_double_star_colon_matches_maven() {
+        // Maven groupId:artifactId — colon separator
+        assert!(glob_match("com.evil.**", "com.evil:lib"));
+        assert!(glob_match("com.evil.**", "com.evil:lib-core"));
+        assert!(glob_match("com.evil.sub.**", "com.evil.sub:utils"));
+    }
+
+    #[test]
+    fn test_glob_match_double_star_colon_no_false_positive() {
+        assert!(!glob_match("com.evil.**", "com.evilcorp:lib"));
+        assert!(!glob_match("com.evil.**", "org.evil:lib"));
     }
 
     #[test]
