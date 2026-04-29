@@ -176,9 +176,9 @@ compatibility matrices, and runtime loading failures.
 
 **Rationale:** A single binary eliminates deployment complexity. There are
 no plugins to install, no versions to align, no ClassNotFoundExceptions.
-The binary is ~25 MB as a Docker image. The trade-off is that unused
-formats still occupy binary space — mitigated by Cargo features for
-compile-time exclusion if needed.
+The stripped binary is ~22 MB; the Alpine Docker image is ~31 MB. The
+trade-off is that unused formats still occupy binary space — mitigated
+by Cargo features for compile-time exclusion if needed.
 
 ### ADR-2: Filesystem as Source of Truth
 

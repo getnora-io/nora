@@ -64,6 +64,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       # ── Alpine (default target — last stage in Dockerfile) ─────────────────
       - name: Extract metadata (alpine)
         id: meta-alpine
@@ -71,6 +77,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            docker.io/getnora/nora
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -93,6 +100,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            docker.io/getnora/nora
           flavor: suffix=-redos,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -117,6 +125,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            docker.io/getnora/nora
           flavor: suffix=-astra,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -293,16 +302,22 @@ jobs:
 
             **Alpine (standard):**
             ```bash
+            docker pull getnora/nora:${{ steps.ver.outputs.tag }}
+            # or from GHCR:
             docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
             ```
 
             **RED OS:**
             ```bash
+            docker pull getnora/nora:${{ steps.ver.outputs.tag }}-redos
+            # or from GHCR:
             docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
             ```
 
             **Astra Linux SE:**
             ```bash
+            docker pull getnora/nora:${{ steps.ver.outputs.tag }}-astra
+            # or from GHCR:
             docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
             ```
 
