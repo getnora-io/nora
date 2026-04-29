@@ -423,26 +423,26 @@ pub fn render_global_stats(
     let t = get_translations(lang);
     format!(
         r##"
-        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-downloads" class="text-2xl font-bold text-slate-200">{}</div>
+        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-6">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-uploads" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-uploads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-artifacts" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-artifacts" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-cache-hit" class="text-2xl font-bold text-slate-200">{:.1}%</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200">{:.1}%</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-storage" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-storage" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
         </div>
         "##,
@@ -473,14 +473,14 @@ pub fn render_registry_card(
 ) -> String {
     format!(
         r##"
-        <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-3 hover:border-blue-400 transition-all">
-            <div class="flex items-center justify-between mb-2">
-                <svg class="w-6 h-6 text-slate-400" fill="currentColor" viewBox="0 0 24 24">
+        <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-2 md:p-3 hover:border-blue-400 transition-all">
+            <div class="flex items-center justify-between mb-1 md:mb-2">
+                <svg class="w-5 h-5 md:w-6 md:h-6 text-slate-400" fill="currentColor" viewBox="0 0 24 24">
                     {}
                 </svg>
                 <span class="text-[10px] font-medium text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded-full">{}</span>
             </div>
-            <div class="text-sm font-semibold text-slate-200 mb-2">{}</div>
+            <div class="text-xs md:text-sm font-semibold text-slate-200 mb-1 md:mb-2 leading-tight">{}</div>
             <div class="grid grid-cols-2 gap-1 text-xs">
                 <div>
                     <span class="text-slate-500">{}</span>
