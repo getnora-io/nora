@@ -250,7 +250,7 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     showing_all: "Showing all {count} items",
     no_more_items: "No more items on this page",
     one_file: "1 file",
-    items: "Items",
+    items: "Files",
 };
 
 pub static TRANSLATIONS_RU: Translations = Translations {
@@ -358,5 +358,5 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     showing_all: "Показаны все ({count})",
     no_more_items: "На этой странице больше нет элементов",
     one_file: "1 файл",
-    items: "Элементы",
+    items: "Файлы",
 };
