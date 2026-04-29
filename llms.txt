@@ -1,6 +1,6 @@
 # NORA
 
-A lightweight, open-source artifact registry. 13 formats in a single < 25 MB binary: Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
+A lightweight, open-source artifact registry. 13 formats in a single < 23 MB binary: Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
 
 > The artifact registry that grows with you. Zero-config to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
 
@@ -180,13 +180,13 @@ cd nora && cargo build --release
 |--------|------|-------|-------------------|
 | Startup | < 3s | 30-60s | 30-60s |
 | Memory | < 100 MB | 2-4 GB | 2-4 GB |
-| Binary | < 25 MB | 600+ MB | 1+ GB |
+| Binary | < 23 MB | 600+ MB | 1+ GB |
 | Dependencies | None | Java 11+ | Java 11+ |
 | Database | None (filesystem) | Embedded/PostgreSQL | Embedded/PostgreSQL |
 
 ## How NORA compares to alternatives
 
-- vs Sonatype Nexus: NORA is 24x smaller (< 25 MB vs 600+ MB), needs no Java, starts in 3s vs 30-60s. Nexus supports more formats (30+) and has LDAP/SAML
+- vs Sonatype Nexus: NORA is 24x smaller (< 23 MB vs 600+ MB), needs no Java, starts in 3s vs 30-60s. Nexus supports more formats (30+) and has LDAP/SAML
 - vs JFrog Artifactory: NORA is free and open-source with no feature gating. Artifactory has more enterprise features (replication, Xray scanning, RBAC)
 - vs Docker Distribution (registry:2): NORA adds 12 more formats, Web UI, upstream proxy, backup/restore, metrics. Distribution is Docker-only
 - vs Verdaccio: Verdaccio is npm-only. NORA handles npm plus 12 other formats

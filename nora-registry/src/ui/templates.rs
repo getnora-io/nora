@@ -338,22 +338,37 @@ pub fn render_registry_list_paginated(
             t.no_repos_found, t.push_first_artifact
         )
     } else if repos.is_empty() {
-        r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">📭</div>
-            <div>No more items on this page</div>
-        </td></tr>"##
-            .to_string()
+            <div>{}</div>
+        </td></tr>"##,
+            t.no_more_items
+        )
     } else {
         repos
             .iter()
             .map(|repo| {
                 let detail_url =
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
+                // For raw registry: show folder/file icons
+                let icon = if repo.is_file {
+                    r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
+                } else if registry_type == "raw" {
+                    r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#
+                } else {
+                    ""
+                };
+                let versions_display = if repo.is_file {
+                    t.one_file.to_string()
+                } else {
+                    format!("{}", repo.versions)
+                };
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
                     <td class="px-6 py-4">
-                        <a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a>
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
                     <td class="px-6 py-4 text-slate-400">{}</td>
                     <td class="px-6 py-4 text-slate-400">{}</td>
@@ -361,9 +376,10 @@ pub fn render_registry_list_paginated(
                 </tr>
             "##,
                     detail_url,
+                    icon,
                     detail_url,
                     html_escape(&repo.name),
-                    repo.versions,
+                    versions_display,
                     format_size(repo.size),
                     &repo.updated
                 )
@@ -451,19 +467,23 @@ pub fn render_registry_list_paginated(
             r##"
             <div class="mt-4 flex items-center justify-between">
                 <div class="text-sm text-slate-500">
-                    Showing {}-{} of {} items
+                    {}
                 </div>
                 <div class="flex items-center gap-1">
                     {}
                 </div>
             </div>
             "##,
-            start_item, end_item, total, pages_html
+            t.showing_range
+                .replace("{start}", &start_item.to_string())
+                .replace("{end}", &end_item.to_string())
+                .replace("{total}", &total.to_string()),
+            pages_html
         )
     } else if total > 0 {
         format!(
-            r##"<div class="mt-4 text-sm text-slate-500">Showing all {} items</div>"##,
-            total
+            r##"<div class="mt-4 text-sm text-slate-500">{}</div>"##,
+            t.showing_all.replace("{count}", &total.to_string())
         )
     } else {
         String::new()
@@ -632,6 +652,126 @@ pub fn render_docker_detail(
     )
 }
 
+/// Renders a raw directory browser with breadcrumbs and folder/file listing
+pub fn render_raw_dir(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+
+    // Build breadcrumbs: Raw / docs / api / v1
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut breadcrumbs =
+        r#"<a href="/ui/raw" class="text-blue-400 hover:text-blue-300">Raw</a>"#.to_string();
+    for (i, seg) in segments.iter().enumerate() {
+        let crumb_path = segments[..=i]
+            .iter()
+            .copied()
+            .map(encode_uri_component)
+            .collect::<Vec<_>>()
+            .join("/");
+        if i == segments.len() - 1 {
+            breadcrumbs.push_str(&format!(
+                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                html_escape(seg)
+            ));
+        } else {
+            breadcrumbs.push_str(&format!(
+                r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                crumb_path,
+                html_escape(seg)
+            ));
+        }
+    }
+
+    let rows: String = entries
+        .iter()
+        .map(|entry| {
+            let icon = if entry.is_file {
+                r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
+            } else {
+                r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#
+            };
+            let encoded_path = path
+                .split('/')
+                .map(encode_uri_component)
+                .collect::<Vec<_>>()
+                .join("/");
+            let href = format!("/ui/raw/{}/{}", encoded_path, encode_uri_component(&entry.name));
+            let versions_display = if entry.is_file {
+                t.one_file.to_string()
+            } else {
+                format!("{}", entry.versions)
+            };
+            format!(
+                r##"
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-6 py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                    </td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
+                    <td class="px-6 py-4 text-slate-400">{}</td>
+                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                </tr>
+            "##,
+                href, icon, href, html_escape(&entry.name),
+                versions_display, format_size(entry.size), &entry.updated
+            )
+        })
+        .collect();
+
+    let showing = t.showing_all.replace("{count}", &total.to_string());
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 mr-3 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+                <h1 class="text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_versions}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_size}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_updated}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        title = html_escape(segments.last().unwrap_or(&path)),
+        col_name = t.name,
+        col_versions = t.versions,
+        col_size = t.size,
+        col_updated = t.updated,
+        rows = rows,
+        showing = showing,
+    );
+
+    layout_dark(
+        &format!("{} — Raw", path),
+        &content,
+        Some("raw"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -645,8 +785,17 @@ pub fn render_package_detail(
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
 
+    let file_icon = if registry_type == "raw" {
+        r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
+    } else {
+        ""
+    };
+
     let versions_rows = if detail.versions.is_empty() {
-        r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No versions found</td></tr>"##.to_string()
+        format!(
+            r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">{}</td></tr>"##,
+            _t.no_repos_found
+        )
     } else {
         detail
             .versions
@@ -656,12 +805,13 @@ pub fn render_package_detail(
                     r##"
                 <tr class="hover:bg-slate-700">
                     <td class="px-6 py-4">
-                        <span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>
+                        <div class="flex items-center gap-2">{}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span></div>
                     </td>
                     <td class="px-6 py-4 text-slate-400">{}</td>
                     <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
                 </tr>
             "##,
+                    file_icon,
                     html_escape(&v.version),
                     format_size(v.size),
                     &v.published
@@ -676,17 +826,63 @@ pub fn render_package_detail(
         "cargo" => format!("cargo add {}", name),
         "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
         "go" => format!("GOPROXY={}/go go get {}", base_url, name),
-        "raw" => format!("curl -O {}/raw/{}/<file>", base_url, name),
+        "raw" => {
+            if detail.versions.len() == 1 && detail.versions[0].version == name {
+                // Root-level file — direct download URL
+                format!("curl -O {}/raw/{}", base_url, name)
+            } else {
+                format!("curl -O {}/raw/{}/<file>", base_url, name)
+            }
+        }
         _ => String::new(),
+    };
+
+    // Build breadcrumbs — for raw, make each path segment clickable
+    let breadcrumb_html = if registry_type == "raw" && name.contains('/') {
+        let segments: Vec<&str> = name.split('/').collect();
+        let mut crumbs =
+            r#"<a href="/ui/raw" class="text-blue-400 hover:text-blue-300">Raw</a>"#.to_string();
+        for (i, seg) in segments.iter().enumerate() {
+            let crumb_path = segments[..=i]
+                .iter()
+                .copied()
+                .map(encode_uri_component)
+                .collect::<Vec<_>>()
+                .join("/");
+            if i == segments.len() - 1 {
+                crumbs.push_str(&format!(
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    html_escape(seg)
+                ));
+            } else {
+                crumbs.push_str(&format!(
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    crumb_path,
+                    html_escape(seg)
+                ));
+            }
+        }
+        crumbs
+    } else {
+        format!(
+            r#"<a href="/ui/{reg}" class="text-blue-400 hover:text-blue-300">{title}</a><span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{name}</span>"#,
+            reg = registry_type,
+            title = registry_title,
+            name = html_escape(name),
+        )
+    };
+
+    let detail_title = if registry_type == "raw" && name.contains('/') {
+        html_escape(name.rsplit('/').next().unwrap_or(name))
+    } else {
+        html_escape(name)
     };
 
     let content = format!(
         r##"
         <div class="mb-6">
-            <div class="flex items-center mb-2">
-                <a href="/ui/{}" class="text-blue-400 hover:text-blue-300">{}</a>
-                <span class="mx-2 text-slate-500">/</span>
-                <span class="text-slate-200 font-medium">{}</span>
+            <div class="flex items-center mb-2 text-sm">
+                {}
             </div>
             <div class="flex items-center">
                 <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
@@ -695,7 +891,7 @@ pub fn render_package_detail(
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-200 mb-3">Install Command</h2>
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">{}</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm">
                 <code class="flex-1">{}</code>
                 <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors" title="Copy to clipboard">
@@ -708,14 +904,14 @@ pub fn render_package_detail(
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
             <div class="px-6 py-4 border-b border-slate-700">
-                <h2 class="text-lg font-semibold text-slate-200">Versions ({} total)</h2>
+                <h2 class="text-lg font-semibold text-slate-200">{} ({} {})</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Version</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Published</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
@@ -724,14 +920,26 @@ pub fn render_package_detail(
             </table>
         </div>
     "##,
-        registry_type,
-        registry_title,
-        html_escape(name),
+        breadcrumb_html,
         icon,
-        html_escape(name),
+        detail_title,
+        _t.install_command,
         install_cmd,
         install_cmd,
+        if registry_type == "raw" {
+            _t.files
+        } else {
+            _t.versions
+        },
         detail.versions.len(),
+        _t.total,
+        if registry_type == "raw" {
+            _t.filename
+        } else {
+            _t.versions
+        },
+        _t.size,
+        _t.published,
         versions_rows
     );
 
@@ -1255,5 +1463,50 @@ mod tests {
         assert!(html.contains("nra_test_token_123"));
         assert!(html.contains("refreshTokens"));
         assert!(html.contains("Copy"));
+    }
+
+    #[test]
+    fn test_raw_root_file_install_command() {
+        let base_url = "https://registry.example.com";
+
+        // Root-level file: single version whose name equals the group
+        let detail = PackageDetail {
+            versions: vec![crate::ui::api::VersionInfo {
+                version: "myfile.txt".to_string(),
+                size: 42,
+                published: "2026-04-29".to_string(),
+            }],
+        };
+        let html = render_package_detail("raw", "myfile.txt", &detail, Lang::En, base_url, false);
+        assert!(
+            html.contains("curl -O https://registry.example.com/raw/myfile.txt"),
+            "Root-level raw file must have direct download URL"
+        );
+        assert!(
+            !html.contains("/raw/myfile.txt/"),
+            "Root-level raw file must NOT have trailing slash or /<file>"
+        );
+
+        // Subdirectory group: multiple files or version != name
+        let subdir_detail = PackageDetail {
+            versions: vec![
+                crate::ui::api::VersionInfo {
+                    version: "a.txt".to_string(),
+                    size: 10,
+                    published: "2026-04-29".to_string(),
+                },
+                crate::ui::api::VersionInfo {
+                    version: "b.txt".to_string(),
+                    size: 20,
+                    published: "2026-04-29".to_string(),
+                },
+            ],
+        };
+        let html =
+            render_package_detail("raw", "subdir", &subdir_detail, Lang::En, base_url, false);
+        assert!(
+            html.contains("curl -O https://registry.example.com/raw/subdir/<file>"),
+            "Subdirectory raw group must show <file> placeholder"
+        );
     }
 }

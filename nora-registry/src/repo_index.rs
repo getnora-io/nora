@@ -20,12 +20,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
 /// Repository info for UI display
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct RepoInfo {
     pub name: String,
     pub versions: usize,
     pub size: u64,
     pub updated: String,
+    /// True for root-level files in raw storage (not directories)
+    #[serde(default)]
+    pub is_file: bool,
 }
 
 /// Index for a single registry type
@@ -372,13 +375,14 @@ async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
 
 async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("raw/").await;
-    let mut files: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    // (count, size, modified, is_file)
+    let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
 
     for key in &keys {
         if let Some(rest) = key.strip_prefix("raw/") {
-            // Group by top-level directory
+            let is_root_file = !rest.contains('/');
             let group = rest.split('/').next().unwrap_or(rest).to_string();
-            let entry = files.entry(group).or_insert((0, 0, 0));
+            let entry = groups.entry(group).or_insert((0, 0, 0, is_root_file));
             entry.0 += 1;
             if let Some(meta) = storage.stat(key).await {
                 entry.1 += meta.size;
@@ -389,7 +393,24 @@ async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(files)
+    let mut result: Vec<_> = groups
+        .into_iter()
+        .map(|(name, (versions, size, modified, is_file))| RepoInfo {
+            name,
+            versions,
+            size,
+            updated: if modified > 0 {
+                format_timestamp(modified)
+            } else {
+                "N/A".to_string()
+            },
+            is_file,
+        })
+        .collect();
+
+    // Directories first (alphabetical), then files (alphabetical)
+    result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
+    result
 }
 
 /// Convert HashMap to sorted Vec<RepoInfo>
@@ -405,6 +426,7 @@ fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
             } else {
                 "N/A".to_string()
             },
+            is_file: false,
         })
         .collect();
 
@@ -504,6 +526,7 @@ mod tests {
             versions: 1,
             size: 100,
             updated: "2026-01-01".to_string(),
+            ..Default::default()
         }]);
         assert!(!idx.is_dirty());
         assert_eq!(idx.count(), 1);
@@ -522,12 +545,14 @@ mod tests {
                 versions: 2,
                 size: 200,
                 updated: "today".to_string(),
+                ..Default::default()
             },
             RepoInfo {
                 name: "b".to_string(),
                 versions: 1,
                 size: 100,
                 updated: "yesterday".to_string(),
+                ..Default::default()
             },
         ]);
 
