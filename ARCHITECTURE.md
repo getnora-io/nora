@@ -145,7 +145,8 @@ nora/
 │   │   ├── components.rs    #   Sidebar, nav, icons
 │   │   ├── api.rs           #   Dashboard JSON API
 │   │   ├── i18n.rs          #   English/Russian UI strings
-│   │   └── logo.rs          #   SVG logo
+│   │   ├── logo.rs          #   Embedded JPEG logo (base64)
+│   │   └── static_assets.rs #   Embedded CSS/JS (Tailwind, htmx)
 │   │
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
 │   ├── secrets/             # Secret value handling (env vars, redaction)
@@ -237,7 +238,7 @@ too broad (leaking abstraction through dozens of `Option<T>` fields).
 The explicit approach has practical advantages:
 
 - **Testability.** Each handler is a standalone module with its own test
-  block. All 821 tests run in ~15 seconds with `cargo test`. No plugin
+  block. All 851 tests run in ~15 seconds with `cargo test`. No plugin
   loading, no mock trait implementations, no integration harness.
 - **Compile-time completeness.** When a new `RegistryType` variant is
   added, the compiler flags every unhandled match arm. Missing a
