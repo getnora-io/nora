@@ -259,7 +259,7 @@ pub fn render_registry_list(
         r##"
         <div class="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div class="flex items-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
                     <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
                     <p class="text-slate-500">{} {}</p>
@@ -493,7 +493,7 @@ pub fn render_registry_list_paginated(
         r##"
         <div class="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div class="flex items-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
                     <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
                     <p class="text-slate-500">{} {}</p>
@@ -598,7 +598,7 @@ pub fn render_docker_detail(
                 <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
@@ -885,7 +885,7 @@ pub fn render_package_detail(
                 {}
             </div>
             <div class="flex items-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
@@ -1005,7 +1005,7 @@ pub fn render_maven_detail(
                 <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
