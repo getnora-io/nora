@@ -499,15 +499,32 @@ async fn raw_detail(
     );
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let detail = get_raw_detail(&state.storage, &name).await;
-    Html(render_package_detail(
-        "raw",
-        &name,
-        &detail,
-        lang,
-        &base_url,
-        auth_enabled,
-    ))
+
+    // Check if this path is a directory (has children) or a single file
+    let (entries, is_dir) = api::get_raw_dir_listing(&state.storage, &name).await;
+
+    if is_dir && !entries.is_empty() {
+        // Directory with children — render as browsable folder listing
+        let total = entries.len();
+        Html(templates::render_raw_dir(
+            &name,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    } else {
+        // Single file or leaf directory — render detail page
+        let detail = api::get_raw_detail(&state.storage, &name).await;
+        Html(templates::render_package_detail(
+            "raw",
+            &name,
+            &detail,
+            lang,
+            &base_url,
+            auth_enabled,
+        ))
+    }
 }
 
 // Generic registry list handler for new formats (v0.7)
