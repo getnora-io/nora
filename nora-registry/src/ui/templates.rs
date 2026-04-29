@@ -125,7 +125,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     // Render bragging footer (demo builds only)
     #[cfg(feature = "demo")]
     let bragging_footer = {
-        let stats = BraggingStats::collect(data.registry_stats.len(), data.uptime_seconds);
+        let stats = BraggingStats::collect(data.registry_stats.len(), data.startup_duration_ms);
         render_bragging_footer(lang, &stats)
     };
     #[cfg(not(feature = "demo"))]

@@ -729,21 +729,21 @@ pub struct BraggingStats {
     pub memory_mb: u64,
     /// Number of enabled registries.
     pub registry_count: usize,
-    /// Uptime in seconds.
-    pub uptime_secs: u64,
+    /// Startup duration in milliseconds.
+    pub startup_duration_ms: u64,
 }
 
 #[cfg(feature = "demo")]
 impl BraggingStats {
     /// Collect live stats from the running process.
-    pub fn collect(registry_count: usize, uptime_secs: u64) -> Self {
+    pub fn collect(registry_count: usize, startup_duration_ms: u64) -> Self {
         let binary_size_mb = Self::read_binary_size().unwrap_or(32);
         let memory_mb = Self::read_vmrss().unwrap_or(30);
         Self {
             binary_size_mb,
             memory_mb,
             registry_count,
-            uptime_secs,
+            startup_duration_ms,
         }
     }
 
@@ -783,15 +783,11 @@ impl BraggingStats {
         }
     }
 
-    fn format_uptime(&self) -> String {
-        if self.uptime_secs < 60 {
-            format!("{}s", self.uptime_secs)
-        } else if self.uptime_secs < 3600 {
-            format!("{}m", self.uptime_secs / 60)
-        } else if self.uptime_secs < 86400 {
-            format!("{}h", self.uptime_secs / 3600)
+    fn format_startup(&self) -> String {
+        if self.startup_duration_ms < 1000 {
+            format!("{}ms", self.startup_duration_ms)
         } else {
-            format!("{}d", self.uptime_secs / 86400)
+            format!("{:.1}s", self.startup_duration_ms as f64 / 1000.0)
         }
     }
 }
@@ -840,7 +836,7 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         built_for_speed = t.built_for_speed,
         binary_size = stats.binary_size_mb,
         docker_image = t.docker_image,
-        uptime = stats.format_uptime(),
+        uptime = stats.format_startup(),
         cold_start = t.cold_start,
         memory = stats.memory_mb,
         mem_label = t.memory,
