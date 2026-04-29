@@ -3,7 +3,7 @@
 **The artifact registry that grows with you.** Starts with `docker run`, scales to enterprise.
 
 ```bash
-docker run -d -p 4000:4000 -v nora-data:/data ghcr.io/getnora-io/nora:latest
+docker run -d -p 4000:4000 -v nora-data:/data getnora/nora:latest
 ```
 
 Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is ready.
@@ -21,8 +21,9 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
+[![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
 
-**< 25 MB** binary | **< 100 MB** RAM | **3s** startup | **13** registries
+**< 23 MB** binary | **< 100 MB** RAM | **3s** startup | **13** registries
 
 ## Supported Registries
 
@@ -49,7 +50,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ### Docker (Recommended)
 
 ```bash
-docker run -d -p 4000:4000 -v nora-data:/data ghcr.io/getnora-io/nora:latest
+docker run -d -p 4000:4000 -v nora-data:/data getnora/nora:latest
 ```
 
 ### Binary
@@ -112,7 +113,7 @@ docker run -d -p 4000:4000 \
   -v nora-data:/data \
   -v ./users.htpasswd:/data/users.htpasswd \
   -e NORA_AUTH_ENABLED=true \
-  ghcr.io/getnora-io/nora:latest
+  getnora/nora:latest
 ```
 
 ```bash
@@ -122,7 +123,7 @@ docker run -d -p 4000:4000 \
   -e NORA_CURATION_MODE=enforce \
   -e NORA_CURATION_MIN_RELEASE_AGE=7d \
   -e NORA_CURATION_ALLOWLIST_PATH=/data/allowlist.json \
-  ghcr.io/getnora-io/nora:latest
+  getnora/nora:latest
 ```
 
 ## Performance
@@ -131,7 +132,7 @@ docker run -d -p 4000:4000 \
 |--------|------|-------|-------|
 | Startup | < 3s | 30-60s | 30-60s |
 | Memory | < 100 MB | 2-4 GB | 2-4 GB |
-| Binary | < 25 MB | 600+ MB | 1+ GB |
+| Binary | < 23 MB | 600+ MB | 1+ GB |
 
 ## Roadmap
 

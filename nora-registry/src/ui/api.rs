@@ -80,6 +80,7 @@ pub struct DashboardResponse {
     pub mount_points: Vec<MountPoint>,
     pub activity: Vec<ActivityEntry>,
     pub uptime_seconds: u64,
+    pub startup_duration_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -244,6 +245,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         mount_points,
         activity,
         uptime_seconds,
+        startup_duration_ms: state.startup_duration_ms,
     })
 }
 
@@ -431,6 +433,7 @@ pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
                             versions: 0,
                             size: 0,
                             updated: "N/A".to_string(),
+                            ..Default::default()
                         },
                         0,
                     )
@@ -605,6 +608,7 @@ pub async fn get_maven_repos(storage: &Storage) -> Vec<RepoInfo> {
                             versions: 0,
                             size: 0,
                             updated: "N/A".to_string(),
+                            ..Default::default()
                         },
                         0,
                     )
@@ -700,6 +704,7 @@ pub async fn get_npm_packages(storage: &Storage) -> Vec<RepoInfo> {
                                 versions: versions_count,
                                 size: total_size,
                                 updated,
+                                ..Default::default()
                             },
                         );
                     }
@@ -783,6 +788,7 @@ pub async fn get_cargo_crates(storage: &Storage) -> Vec<RepoInfo> {
                             versions: 0,
                             size: 0,
                             updated: "N/A".to_string(),
+                            ..Default::default()
                         },
                         0,
                     )
@@ -851,6 +857,7 @@ pub async fn get_pypi_packages(storage: &Storage) -> Vec<RepoInfo> {
                             versions: 0,
                             size: 0,
                             updated: "N/A".to_string(),
+                            ..Default::default()
                         },
                         0,
                     )
@@ -955,6 +962,20 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
     let keys = storage.list(&prefix).await;
 
     let mut versions = Vec::new();
+
+    if keys.is_empty() {
+        // Root-level file: "raw/myfile.txt" (no subdirectory)
+        let direct_key = format!("raw/{}", group);
+        if let Some(meta) = storage.stat(&direct_key).await {
+            versions.push(VersionInfo {
+                version: group.to_string(),
+                size: meta.size,
+                published: format_timestamp(meta.modified),
+            });
+            return PackageDetail { versions };
+        }
+    }
+
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
             let (size, published) = if let Some(meta) = storage.stat(key).await {
@@ -971,4 +992,60 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
     }
 
     PackageDetail { versions }
+}
+
+/// List immediate children (subfolders + files) of a raw directory path.
+/// Returns (entries, is_directory). If the path is a single file, returns empty vec + false.
+pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+    let prefix = format!("raw/{}/", path);
+    let keys = storage.list(&prefix).await;
+
+    if keys.is_empty() {
+        // Check if it's a direct file
+        let direct_key = format!("raw/{}", path);
+        if storage.stat(&direct_key).await.is_some() {
+            return (vec![], false); // It's a file, not a directory
+        }
+        return (vec![], true); // Empty directory
+    }
+
+    // Group by immediate child segment
+    let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
+
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.is_empty() {
+                continue;
+            }
+            let is_direct_file = !rest.contains('/');
+            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
+
+            let entry = groups
+                .entry(child_name)
+                .or_insert((0, 0, 0, is_direct_file));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<RepoInfo> = groups
+        .into_iter()
+        .map(|(name, (count, size, modified, is_file))| RepoInfo {
+            name,
+            versions: count,
+            size,
+            updated: format_timestamp(modified),
+            is_file,
+        })
+        .collect();
+
+    // Sort: directories first, then files, alphabetical within each group
+    result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
+
+    (result, true)
 }

@@ -423,26 +423,26 @@ pub fn render_global_stats(
     let t = get_translations(lang);
     format!(
         r##"
-        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-downloads" class="text-2xl font-bold text-slate-200">{}</div>
+        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-6">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-uploads" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-uploads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-artifacts" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-artifacts" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-cache-hit" class="text-2xl font-bold text-slate-200">{:.1}%</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200">{:.1}%</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-4 border border-slate-700">
-                <div class="text-slate-400 text-sm mb-1">{}</div>
-                <div id="stat-storage" class="text-2xl font-bold text-slate-200">{}</div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-storage" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
         </div>
         "##,
@@ -473,14 +473,14 @@ pub fn render_registry_card(
 ) -> String {
     format!(
         r##"
-        <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-3 hover:border-blue-400 transition-all">
-            <div class="flex items-center justify-between mb-2">
-                <svg class="w-6 h-6 text-slate-400" fill="currentColor" viewBox="0 0 24 24">
+        <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-2 md:p-3 hover:border-blue-400 transition-all">
+            <div class="flex items-center justify-between mb-1 md:mb-2">
+                <svg class="w-5 h-5 md:w-6 md:h-6 text-slate-400" fill="currentColor" viewBox="0 0 24 24">
                     {}
                 </svg>
                 <span class="text-[10px] font-medium text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded-full">{}</span>
             </div>
-            <div class="text-sm font-semibold text-slate-200 mb-2">{}</div>
+            <div class="text-xs md:text-sm font-semibold text-slate-200 mb-1 md:mb-2 leading-tight">{}</div>
             <div class="grid grid-cols-2 gap-1 text-xs">
                 <div>
                     <span class="text-slate-500">{}</span>
@@ -729,21 +729,21 @@ pub struct BraggingStats {
     pub memory_mb: u64,
     /// Number of enabled registries.
     pub registry_count: usize,
-    /// Uptime in seconds.
-    pub uptime_secs: u64,
+    /// Startup duration in milliseconds.
+    pub startup_duration_ms: u64,
 }
 
 #[cfg(feature = "demo")]
 impl BraggingStats {
     /// Collect live stats from the running process.
-    pub fn collect(registry_count: usize, uptime_secs: u64) -> Self {
+    pub fn collect(registry_count: usize, startup_duration_ms: u64) -> Self {
         let binary_size_mb = Self::read_binary_size().unwrap_or(32);
         let memory_mb = Self::read_vmrss().unwrap_or(30);
         Self {
             binary_size_mb,
             memory_mb,
             registry_count,
-            uptime_secs,
+            startup_duration_ms,
         }
     }
 
@@ -783,15 +783,11 @@ impl BraggingStats {
         }
     }
 
-    fn format_uptime(&self) -> String {
-        if self.uptime_secs < 60 {
-            format!("{}s", self.uptime_secs)
-        } else if self.uptime_secs < 3600 {
-            format!("{}m", self.uptime_secs / 60)
-        } else if self.uptime_secs < 86400 {
-            format!("{}h", self.uptime_secs / 3600)
+    fn format_startup(&self) -> String {
+        if self.startup_duration_ms < 1000 {
+            format!("{}ms", self.startup_duration_ms)
         } else {
-            format!("{}d", self.uptime_secs / 86400)
+            format!("{:.1}s", self.startup_duration_ms as f64 / 1000.0)
         }
     }
 }
@@ -840,7 +836,7 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         built_for_speed = t.built_for_speed,
         binary_size = stats.binary_size_mb,
         docker_image = t.docker_image,
-        uptime = stats.format_uptime(),
+        uptime = stats.format_startup(),
         cold_start = t.cold_start,
         memory = stats.memory_mb,
         mem_label = t.memory,

@@ -129,6 +129,13 @@ pub struct Translations {
     pub token_expires: &'static str,
     pub token_last_used: &'static str,
     pub token_never_used: &'static str,
+
+    // Pagination
+    pub showing_range: &'static str,
+    pub showing_all: &'static str,
+    pub no_more_items: &'static str,
+    pub one_file: &'static str,
+    pub items: &'static str,
 }
 
 pub fn get_translations(lang: Lang) -> &'static Translations {
@@ -237,6 +244,13 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     token_expires: "Expires",
     token_last_used: "Last Used",
     token_never_used: "Never",
+
+    // Pagination
+    showing_range: "Showing {start}-{end} of {total} items",
+    showing_all: "Showing all {count} items",
+    no_more_items: "No more items on this page",
+    one_file: "1 file",
+    items: "Files",
 };
 
 pub static TRANSLATIONS_RU: Translations = Translations {
@@ -338,4 +352,11 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     token_expires: "Истекает",
     token_last_used: "Последнее использование",
     token_never_used: "Не использовался",
+
+    // Pagination
+    showing_range: "Показаны {start}-{end} из {total}",
+    showing_all: "Показаны все ({count})",
+    no_more_items: "На этой странице больше нет элементов",
+    one_file: "1 файл",
+    items: "Файлы",
 };
