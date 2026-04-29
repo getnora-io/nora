@@ -252,6 +252,7 @@ pub fn render_registry_list(
 
     let version_label = match registry_type {
         "docker" => t.tags,
+        "raw" => t.items,
         _ => t.versions,
     };
 
@@ -360,7 +361,7 @@ pub fn render_registry_list_paginated(
                     ""
                 };
                 let versions_display = if repo.is_file {
-                    t.one_file.to_string()
+                    String::new()
                 } else {
                     format!("{}", repo.versions)
                 };
@@ -390,6 +391,7 @@ pub fn render_registry_list_paginated(
 
     let version_label = match registry_type {
         "docker" => t.tags,
+        "raw" => t.items,
         _ => t.versions,
     };
 
@@ -702,7 +704,7 @@ pub fn render_raw_dir(
                 .join("/");
             let href = format!("/ui/raw/{}/{}", encoded_path, encode_uri_component(&entry.name));
             let versions_display = if entry.is_file {
-                t.one_file.to_string()
+                String::new()
             } else {
                 format!("{}", entry.versions)
             };
@@ -755,7 +757,7 @@ pub fn render_raw_dir(
         breadcrumbs = breadcrumbs,
         title = html_escape(segments.last().unwrap_or(&path)),
         col_name = t.name,
-        col_versions = t.versions,
+        col_versions = t.items,
         col_size = t.size,
         col_updated = t.updated,
         rows = rows,
