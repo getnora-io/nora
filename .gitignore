@@ -28,3 +28,9 @@ FEEDBACK.txt
 nora-review.sh
 coverage/
 target/criterion/
+
+# Internal tooling (not for public repo)
+scripts/docs-quality-gate.py
+docs-manifest.json
+ARCHITECTURE.ru.md
+docs-site/
