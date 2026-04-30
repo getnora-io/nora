@@ -142,6 +142,7 @@ pub struct AppState {
     pub config: Config,
     pub enabled_registries: HashSet<RegistryType>,
     pub start_time: Instant,
+    pub startup_duration_ms: u64,
     pub auth: Option<HtpasswdAuth>,
     pub tokens: Option<TokenStore>,
     pub metrics: DashboardMetrics,
@@ -818,11 +819,14 @@ async fn run_server(config: Config, storage: Storage) {
             .merge(registry_routes)
     };
 
+    let startup_duration_ms = start_time.elapsed().as_millis() as u64;
+
     let state = Arc::new(AppState {
         storage,
         config,
         enabled_registries,
         start_time,
+        startup_duration_ms,
         auth,
         tokens,
         metrics: DashboardMetrics::with_persistence(&storage_path),

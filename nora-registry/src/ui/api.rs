@@ -80,6 +80,7 @@ pub struct DashboardResponse {
     pub mount_points: Vec<MountPoint>,
     pub activity: Vec<ActivityEntry>,
     pub uptime_seconds: u64,
+    pub startup_duration_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -244,6 +245,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
         mount_points,
         activity,
         uptime_seconds,
+        startup_duration_ms: state.startup_duration_ms,
     })
 }
 

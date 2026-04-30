@@ -260,6 +260,8 @@ pub struct DashboardResponse {
     pub activity: Vec<ActivityEntry>,
     /// Server uptime in seconds
     pub uptime_seconds: u64,
+    /// Server startup duration in milliseconds
+    pub startup_duration_ms: u64,
 }
 
 #[derive(Serialize, ToSchema)]
