@@ -137,8 +137,15 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
 }
 
-async fn check() -> (StatusCode, Json<Value>) {
-    (StatusCode::OK, Json(json!({})))
+async fn check() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            HeaderName::from_static("docker-distribution-api-version"),
+            "registry/2.0",
+        )],
+        Json(json!({})),
+    )
 }
 
 /// List all repositories in the registry
