@@ -206,6 +206,7 @@ fn build_context(
         config,
         enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),
+        startup_duration_ms: 0,
         auth,
         tokens,
         metrics: DashboardMetrics::new(),

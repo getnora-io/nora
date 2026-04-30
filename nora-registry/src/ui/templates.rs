@@ -125,7 +125,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     // Render bragging footer (demo builds only)
     #[cfg(feature = "demo")]
     let bragging_footer = {
-        let stats = BraggingStats::collect(data.registry_stats.len(), data.uptime_seconds);
+        let stats = BraggingStats::collect(data.registry_stats.len(), data.startup_duration_ms);
         render_bragging_footer(lang, &stats)
     };
     #[cfg(not(feature = "demo"))]
@@ -148,7 +148,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
 
         {}
 
-        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 md:gap-3 mb-6">
             {}
         </div>
 
@@ -230,12 +230,12 @@ pub fn render_registry_list(
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
                     detail_url,
@@ -252,24 +252,25 @@ pub fn render_registry_list(
 
     let version_label = match registry_type {
         "docker" => t.tags,
+        "raw" => t.items,
         _ => t.versions,
     };
 
     let content = format!(
         r##"
-        <div class="mb-6 flex items-center justify-between">
+        <div class="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
-                    <h1 class="text-2xl font-bold text-slate-200">{}</h1>
+                    <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
                     <p class="text-slate-500">{} {}</p>
                 </div>
             </div>
             <div class="flex items-center gap-4">
-                <div class="relative">
+                <div class="relative w-full md:w-auto">
                     <input type="text"
                            placeholder="{}"
-                           class="pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
+                           class="w-full md:w-auto pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
                            hx-get="/api/ui/{}/search"
                            hx-trigger="keyup changed delay:300ms"
                            hx-target="#repo-table-body"
@@ -281,14 +282,14 @@ pub fn render_registry_list(
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
                     </tr>
                 </thead>
                 <tbody id="repo-table-body" class="divide-y divide-slate-700">
@@ -360,19 +361,19 @@ pub fn render_registry_list_paginated(
                     ""
                 };
                 let versions_display = if repo.is_file {
-                    t.one_file.to_string()
+                    String::new()
                 } else {
                     format!("{}", repo.versions)
                 };
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
                     detail_url,
@@ -390,6 +391,7 @@ pub fn render_registry_list_paginated(
 
     let version_label = match registry_type {
         "docker" => t.tags,
+        "raw" => t.items,
         _ => t.versions,
     };
 
@@ -491,19 +493,19 @@ pub fn render_registry_list_paginated(
 
     let content = format!(
         r##"
-        <div class="mb-6 flex items-center justify-between">
+        <div class="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
                 <div>
-                    <h1 class="text-2xl font-bold text-slate-200">{}</h1>
+                    <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
                     <p class="text-slate-500">{} {}</p>
                 </div>
             </div>
             <div class="flex items-center gap-4">
-                <div class="relative">
+                <div class="relative w-full md:w-auto">
                     <input type="text"
                            placeholder="{}"
-                           class="pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
+                           class="w-full md:w-auto pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
                            hx-get="/api/ui/{}/search"
                            hx-trigger="keyup changed delay:300ms"
                            hx-target="#repo-table-body"
@@ -515,14 +517,14 @@ pub fn render_registry_list_paginated(
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
                     </tr>
                 </thead>
                 <tbody id="repo-table-body" class="divide-y divide-slate-700">
@@ -568,11 +570,11 @@ pub fn render_docker_detail(
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
                     html_escape(&tag.name),
@@ -598,16 +600,16 @@ pub fn render_docker_detail(
                 <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">Pull Command</h2>
-            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm">
-                <code class="flex-1">{}</code>
-                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors" title="Copy to clipboard">
+            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
+                <code class="flex-1 whitespace-nowrap">{}</code>
+                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
@@ -615,16 +617,16 @@ pub fn render_docker_detail(
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-700">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700">
                 <h2 class="text-lg font-semibold text-slate-200">Tags ({} total)</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Tag</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Created</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Tag</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">Created</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
@@ -702,19 +704,19 @@ pub fn render_raw_dir(
                 .join("/");
             let href = format!("/ui/raw/{}/{}", encoded_path, encode_uri_component(&entry.name));
             let versions_display = if entry.is_file {
-                t.one_file.to_string()
+                String::new()
             } else {
                 format!("{}", entry.versions)
             };
             format!(
                 r##"
                 <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
                 href, icon, href, html_escape(&entry.name),
@@ -735,14 +737,14 @@ pub fn render_raw_dir(
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_versions}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_size}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_updated}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_versions}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
@@ -755,7 +757,7 @@ pub fn render_raw_dir(
         breadcrumbs = breadcrumbs,
         title = html_escape(segments.last().unwrap_or(&path)),
         col_name = t.name,
-        col_versions = t.versions,
+        col_versions = t.items,
         col_size = t.size,
         col_updated = t.updated,
         rows = rows,
@@ -804,11 +806,11 @@ pub fn render_package_detail(
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-2">{}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span></div>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
                     file_icon,
@@ -885,16 +887,16 @@ pub fn render_package_detail(
                 {}
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">{}</h2>
-            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm">
-                <code class="flex-1">{}</code>
-                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors" title="Copy to clipboard">
+            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
+                <code class="flex-1 whitespace-nowrap">{}</code>
+                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
@@ -902,16 +904,16 @@ pub fn render_package_detail(
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-700">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700">
                 <h2 class="text-lg font-semibold text-slate-200">{} ({} {})</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
@@ -968,10 +970,10 @@ pub fn render_maven_detail(
             let download_url = format!("/maven2/{}/{}", path, a.filename);
             format!(r##"
                 <tr class="hover:bg-slate-700">
-                    <td class="px-6 py-4">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
                         <a href="{}" class="text-blue-400 hover:text-blue-300 font-mono text-sm">{}</a>
                     </td>
-                    <td class="px-6 py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                 </tr>
             "##, download_url, html_escape(&a.filename), format_size(a.size))
         }).collect::<Vec<_>>().join("")
@@ -1005,25 +1007,25 @@ pub fn render_maven_detail(
                 <span class="text-slate-200 font-medium">{}</span>
             </div>
             <div class="flex items-center">
-                <svg class="w-10 h-10 mr-3 text-slate-400" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-2xl font-bold text-slate-200">{}</h1>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
             </div>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-6 mb-6">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">Maven Dependency</h2>
-            <pre class="bg-slate-900 text-green-400 rounded-lg p-4 font-mono text-sm overflow-x-auto">{}</pre>
+            <pre class="bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">{}</pre>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-hidden">
-            <div class="px-6 py-4 border-b border-slate-700">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700">
                 <h2 class="text-lg font-semibold text-slate-200">Artifacts ({} files)</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Filename</th>
-                        <th class="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Filename</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
