@@ -1358,6 +1358,11 @@ impl Config {
                 "curation.mode=audit but no allowlist_path configured — no allowlist filter will be active".to_string(),
             );
         }
+        if self.curation.on_failure != CurationOnFailure::Closed {
+            warnings.push(
+                "curation.on_failure is not yet implemented — the setting is parsed but has no effect. All filter errors are treated as closed (blocked). This field will be removed in v0.9".to_string(),
+            );
+        }
 
         // 9. [registries].enable validation
         if let Some(ref section) = self.registries {
@@ -2728,6 +2733,19 @@ mod tests {
         config.apply_env_overrides();
         assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
         std::env::remove_var("NORA_CURATION_ON_FAILURE");
+    }
+
+    #[test]
+    fn test_curation_on_failure_open_emits_warning() {
+        let mut config = Config::default();
+        config.curation.on_failure = CurationOnFailure::Open;
+        let (warnings, _errors) = config.validate_with_config_path(None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("on_failure is not yet implemented")),
+            "expected deprecation warning for on_failure=open"
+        );
     }
 
     #[test]
