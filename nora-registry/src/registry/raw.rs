@@ -24,9 +24,26 @@ pub fn routes() -> Router<Arc<AppState>> {
     )
 }
 
-async fn download(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn download(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Curation check — raw files are treated as name=path, no version
+    if let Some(response) = crate::curation::check_download(
+        &state.curation,
+        state.config.curation.bypass_token.as_deref(),
+        &headers,
+        crate::curation::RegistryType::Raw,
+        &path,
+        None,
+        None,
+    ) {
+        return response;
     }
 
     let key = format!("raw/{}", path);
@@ -357,6 +374,39 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
         let put = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
         assert_eq!(put.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_raw_curation_blocks_download() {
+        use crate::config::CurationMode;
+
+        // Create a blocklist file
+        let blocklist_dir = tempfile::TempDir::new().unwrap();
+        let blocklist_path = blocklist_dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist_path,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "secret*", "version": "*", "reason": "blocked"}]}"#,
+        ).unwrap();
+
+        let bp = blocklist_path.to_str().unwrap().to_string();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+
+        // Upload a file first (upload is not curated)
+        let put = send(&ctx.app, Method::PUT, "/raw/secret.txt", b"data".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        // Download should be blocked by curation
+        let get = send(&ctx.app, Method::GET, "/raw/secret.txt", "").await;
+        assert_eq!(get.status(), StatusCode::FORBIDDEN);
+
+        // Non-matching file should pass
+        let put2 = send(&ctx.app, Method::PUT, "/raw/public.txt", b"ok".to_vec()).await;
+        assert_eq!(put2.status(), StatusCode::CREATED);
+        let get2 = send(&ctx.app, Method::GET, "/raw/public.txt", "").await;
+        assert_eq!(get2.status(), StatusCode::OK);
     }
 
     #[tokio::test]
