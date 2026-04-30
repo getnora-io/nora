@@ -72,14 +72,19 @@ fn is_public_path(path: &str) -> bool {
         "/" | "/health"
             | "/ready"
             | "/metrics"
-            | "/v2/"
-            | "/v2"
             | "/api/tokens"
             | "/api/tokens/list"
             | "/api/tokens/revoke"
     ) || path.starts_with("/ui")
         || path.starts_with("/api-docs")
         || path.starts_with("/api/ui")
+}
+
+/// Check if path is a Docker V2 auth challenge endpoint.
+/// Per Docker Registry V2 spec, /v2/ must return 401 with WWW-Authenticate
+/// header when auth is enabled, so Docker clients know to send credentials.
+fn is_docker_auth_challenge_path(path: &str) -> bool {
+    matches!(path, "/v2/" | "/v2")
 }
 
 /// Auth middleware - supports Basic auth and Bearer tokens
@@ -99,12 +104,19 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Allow anonymous read if configured
+    // Docker V2 auth challenge: /v2/ must NOT bypass auth via anonymous_read.
+    // Per Docker Registry V2 spec, unauthenticated GET /v2/ must return 401
+    // with WWW-Authenticate header, so Docker clients send credentials on
+    // subsequent requests. If /v2/ returns 200 without auth, Docker assumes
+    // the registry is anonymous and never sends Authorization headers.
+    let is_docker_challenge = is_docker_auth_challenge_path(request.uri().path());
+
+    // Allow anonymous read if configured (but not for Docker /v2/ endpoint)
     let is_read_method = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
     );
-    if state.config.auth.anonymous_read && is_read_method {
+    if state.config.auth.anonymous_read && is_read_method && !is_docker_challenge {
         // Read requests allowed without auth
         return next.run(request).await;
     }
@@ -455,8 +467,6 @@ mod tests {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/ready"));
         assert!(is_public_path("/metrics"));
-        assert!(is_public_path("/v2/"));
-        assert!(is_public_path("/v2"));
         assert!(is_public_path("/ui"));
         assert!(is_public_path("/ui/dashboard"));
         assert!(is_public_path("/api-docs"));
@@ -465,6 +475,10 @@ mod tests {
         assert!(is_public_path("/api/tokens"));
         assert!(is_public_path("/api/tokens/list"));
         assert!(is_public_path("/api/tokens/revoke"));
+
+        // Docker /v2/ is NOT public — requires auth challenge per V2 spec
+        assert!(!is_public_path("/v2/"));
+        assert!(!is_public_path("/v2"));
 
         // Token UI pages are NOT public (require auth)
         assert!(!is_public_path("/ui/tokens"));
@@ -500,9 +514,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_public_path_v2() {
-        assert!(is_public_path("/v2/"));
-        assert!(is_public_path("/v2"));
+    fn test_v2_is_not_public_path() {
+        // Docker /v2/ must NOT be public — it needs auth challenge per V2 spec
+        assert!(!is_public_path("/v2/"));
+        assert!(!is_public_path("/v2"));
+        // But it IS a docker auth challenge path
+        assert!(is_docker_auth_challenge_path("/v2/"));
+        assert!(is_docker_auth_challenge_path("/v2"));
+        // Sub-paths are neither public nor docker challenge
+        assert!(!is_docker_auth_challenge_path(
+            "/v2/alpine/manifests/latest"
+        ));
     }
 
     #[test]
@@ -619,6 +641,63 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Docker Registry V2 spec: GET /v2/ without credentials must return 401
+    /// with WWW-Authenticate header when auth is enabled (issue #219)
+    #[tokio::test]
+    async fn test_docker_v2_requires_auth_when_enabled() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+
+        // Without credentials: must return 401 + WWW-Authenticate
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+
+        // With valid credentials: must return 200
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Docker /v2/ must NOT pass through anonymous_read bypass.
+    /// Even with anonymous_read=true, /v2/ must require auth so Docker
+    /// clients know to send credentials on subsequent push/pull requests.
+    #[tokio::test]
+    async fn test_docker_v2_ignores_anonymous_read() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+
+        // /v2/ without auth: must still return 401 even with anonymous_read=true
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+
+        // Other read endpoints should still work anonymously
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// When auth is disabled, /v2/ should pass through normally
+    #[tokio::test]
+    async fn test_docker_v2_passes_when_auth_disabled() {
+        let ctx = create_test_context();
         let response = send(&ctx.app, Method::GET, "/v2/", "").await;
         assert_eq!(response.status(), StatusCode::OK);
     }
