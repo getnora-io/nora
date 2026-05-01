@@ -39,7 +39,7 @@ base64 = "0.22"
 prometheus = "0.14"
 lazy_static = "1.5"
 httpdate = "1"
-utoipa = { version = "5", features = ["axum_extras"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
@@ -70,6 +70,9 @@ harness = false
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
 
 [features]
 demo = []

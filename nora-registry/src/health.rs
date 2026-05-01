@@ -5,6 +5,7 @@ use axum::{extract::State, http::StatusCode, response::Json, routing::get, Route
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::AppState;
 
@@ -17,7 +18,7 @@ pub struct HealthStatus {
     pub registries: HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct StorageHealth {
     pub backend: String,
     pub reachable: bool,

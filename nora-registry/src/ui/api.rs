@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 #[derive(Serialize)]
 pub struct RegistryStats {
@@ -73,7 +74,7 @@ pub struct SearchQuery {
     pub q: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DashboardResponse {
     pub global_stats: GlobalStats,
     pub registry_stats: Vec<RegistryCardStats>,
@@ -83,7 +84,7 @@ pub struct DashboardResponse {
     pub startup_duration_ms: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct GlobalStats {
     pub downloads: u64,
     pub uploads: u64,
@@ -92,7 +93,7 @@ pub struct GlobalStats {
     pub storage_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct RegistryCardStats {
     pub name: String,
     pub artifact_count: usize,
@@ -101,7 +102,7 @@ pub struct RegistryCardStats {
     pub size_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct MountPoint {
     pub registry: String,
     pub mount_path: String,
