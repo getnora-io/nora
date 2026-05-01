@@ -240,7 +240,7 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |
-| S3 backend | Full | AWS, MinIO, any S3-compatible |
+| S3 backend | Full | AWS S3, Ceph RGW, any S3-compatible |
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
 | Backup/restore | Full | CLI commands |

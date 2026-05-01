@@ -11,7 +11,7 @@ use super::{FileMeta, Result, StorageBackend, StorageError};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// S3-compatible storage backend (MinIO, AWS S3)
+/// S3-compatible storage backend (AWS S3, Ceph RGW, etc.)
 pub struct S3Storage {
     s3_url: String,
     bucket: String,
