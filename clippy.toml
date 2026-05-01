@@ -2,3 +2,8 @@
 cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 7
 type-complexity-threshold = 300
+
+# NOTE: SystemTime::now and env::var rules are enforced via semgrep
+# (~/nora-private-tests/semgrep-rules/) which supports path exclusions.
+# clippy disallowed-methods has no per-file granularity — too many
+# false positives in config.rs, tokens.rs, backup.rs, registry modules.

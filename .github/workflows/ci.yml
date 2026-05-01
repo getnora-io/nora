@@ -178,6 +178,19 @@ jobs:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
 
+  semver:
+    name: Semver
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: nora-registry
+
   integration:
     name: Integration
     runs-on: ubuntu-latest
