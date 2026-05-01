@@ -99,7 +99,7 @@ See [full documentation](https://getnora.dev) for all registries.
 - **Token RBAC** — read/write/admin roles, expiry tracking, deferred last_used flush
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
 - **Backup & Restore** — `nora backup` / `nora restore`
-- **S3 Storage** — MinIO, AWS S3, any S3-compatible backend
+- **S3 Storage** — AWS S3, Ceph RGW, any S3-compatible backend
 - **Prometheus Metrics** — `/metrics` endpoint
 - **Rate Limiting** — configurable per-endpoint rate limits
 

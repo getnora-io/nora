@@ -209,7 +209,7 @@ storage backends was considered, effectively making NORA a caching proxy
 in front of other registries.
 
 **Rationale:** Each storage backend is a maintenance surface. S3 covers
-every cloud provider and on-prem MinIO. Local covers single-node and
+every cloud provider and on-prem S3-compatible stores. Local covers single-node and
 development. A third backend (e.g., GCS-native, Azure Blob) adds testing
 burden without meaningful capability gain — both are S3-compatible. For
 migrating away from other registries, the `nora migrate` CLI copies

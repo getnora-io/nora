@@ -5,9 +5,10 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::VecDeque;
+use utoipa::ToSchema;
 
 /// Type of action that was performed
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub enum ActionType {
     Pull,
     Push,
@@ -27,7 +28,7 @@ impl std::fmt::Display for ActionType {
 }
 
 /// A single activity log entry
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ActivityEntry {
     pub timestamp: DateTime<Utc>,
     pub action: ActionType,

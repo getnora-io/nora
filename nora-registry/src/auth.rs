@@ -212,6 +212,7 @@ pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
 // Token management API routes
 use axum::{routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
@@ -238,7 +239,8 @@ pub struct CreateTokenResponse {
     pub expires_in_days: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
+#[schema(as = TokenInfo)]
 pub struct TokenListItem {
     pub hash_prefix: String,
     pub created_at: u64,
@@ -248,7 +250,7 @@ pub struct TokenListItem {
     pub role: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TokenListResponse {
     pub tokens: Vec<TokenListItem>,
 }

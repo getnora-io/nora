@@ -101,7 +101,7 @@
 | Параметр | Значение |
 |----------|----------|
 | Локальное хранилище | Файловая система (ext4, XFS, ZFS) |
-| Объектное хранилище | S3-совместимое API (MinIO, Yandex Object Storage, Selectel S3) |
+| Объектное хранилище | S3-совместимое API (Yandex Object Storage, Selectel S3, Ceph RGW) |
 | Структура | Иерархическая: `{protocol}/{package}/{artifact}` |
 | Аудит | Append-only JSONL файл |
 

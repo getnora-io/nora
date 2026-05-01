@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-mod api;
+pub(crate) mod api;
 pub mod components;
 pub mod i18n;
 mod logo;

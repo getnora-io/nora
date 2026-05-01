@@ -2279,7 +2279,7 @@ mod tests {
             [storage]
             mode = "s3"
             path = "/data"
-            s3_url = "http://minio:9000"
+            s3_url = "http://s3.example.com:9000"
             bucket = "artifacts"
             s3_region = "eu-central-1"
 
@@ -2301,7 +2301,7 @@ mod tests {
         );
         assert_eq!(config.server.body_limit_mb, 4096);
         assert_eq!(config.storage.mode, StorageMode::S3);
-        assert_eq!(config.storage.s3_url, "http://minio:9000");
+        assert_eq!(config.storage.s3_url, "http://s3.example.com:9000");
         assert_eq!(config.storage.bucket, "artifacts");
         assert!(config.auth.enabled);
         assert!(!config.raw.enabled);
@@ -2652,7 +2652,7 @@ mod tests {
 
             [storage]
             mode = "s3"
-            s3_url = "http://minio:9000"
+            s3_url = "http://s3.example.com:9000"
             bucket = "nora"
         "#;
 

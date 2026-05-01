@@ -12,6 +12,10 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::activity_log::ActivityEntry;
+use crate::auth::{TokenListItem, TokenListResponse};
+use crate::health::StorageHealth;
+use crate::ui::api::{DashboardResponse, GlobalStats, MountPoint, RegistryCardStats};
 use crate::AppState;
 
 #[derive(OpenApi)]
@@ -129,7 +133,7 @@ use crate::AppState;
             TokenRequest,
             TokenResponse,
             TokenListResponse,
-            TokenInfo,
+            TokenListItem,
             ErrorResponse
         )
     )
@@ -153,16 +157,6 @@ pub struct HealthResponse {
     pub storage: StorageHealth,
     /// Registry health status
     pub registries: RegistriesHealth,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct StorageHealth {
-    /// Backend type (local, s3)
-    pub backend: String,
-    /// Whether storage is reachable
-    pub reachable: bool,
-    /// Storage endpoint/path
-    pub endpoint: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -223,97 +217,9 @@ pub struct TokenResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct TokenListResponse {
-    /// List of tokens
-    pub tokens: Vec<TokenInfo>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct TokenInfo {
-    /// Token hash prefix (for identification)
-    pub hash_prefix: String,
-    /// Creation timestamp
-    pub created_at: u64,
-    /// Expiration timestamp
-    pub expires_at: u64,
-    /// Last used timestamp
-    pub last_used: Option<u64>,
-    /// Description
-    pub description: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
 pub struct ErrorResponse {
     /// Error message
     pub error: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct DashboardResponse {
-    /// Global statistics across all registries
-    pub global_stats: GlobalStats,
-    /// Per-registry statistics
-    pub registry_stats: Vec<RegistryCardStats>,
-    /// Registry mount points and proxy configuration
-    pub mount_points: Vec<MountPoint>,
-    /// Recent activity log entries
-    pub activity: Vec<ActivityEntry>,
-    /// Server uptime in seconds
-    pub uptime_seconds: u64,
-    /// Server startup duration in milliseconds
-    pub startup_duration_ms: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct GlobalStats {
-    /// Total downloads across all registries
-    pub downloads: u64,
-    /// Total uploads across all registries
-    pub uploads: u64,
-    /// Total artifact count
-    pub artifacts: u64,
-    /// Cache hit percentage (0-100)
-    pub cache_hit_percent: f64,
-    /// Total storage used in bytes
-    pub storage_bytes: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct RegistryCardStats {
-    /// Registry name (docker, maven, npm, cargo, pypi, go, raw)
-    pub name: String,
-    /// Number of artifacts in this registry
-    pub artifact_count: usize,
-    /// Download count for this registry
-    pub downloads: u64,
-    /// Upload count for this registry
-    pub uploads: u64,
-    /// Storage used by this registry in bytes
-    pub size_bytes: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct MountPoint {
-    /// Registry display name
-    pub registry: String,
-    /// URL mount path (e.g., /v2/, /maven2/)
-    pub mount_path: String,
-    /// Upstream proxy URL if configured
-    pub proxy_upstream: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct ActivityEntry {
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// Action type (Pull, Push, CacheHit, ProxyFetch)
-    pub action: String,
-    /// Artifact name/identifier
-    pub artifact: String,
-    /// Registry type
-    pub registry: String,
-    /// Source (LOCAL, PROXY, CACHE)
-    pub source: String,
 }
 
 // ============ Path Operations (documentation only) ============
