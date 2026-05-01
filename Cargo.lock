@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "argon2",
  "async-trait",
