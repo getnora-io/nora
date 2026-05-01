@@ -6,9 +6,9 @@
 
 CARGO := cargo
 
-.PHONY: check test build release fmt clippy coherence lock-audit
+.PHONY: check test build release fmt clippy coherence lock-audit version-check
 
-check: fmt clippy test coherence lock-audit
+check: version-check fmt clippy test coherence lock-audit
 	@echo ""
 	@echo "=== All checks passed ==="
 
@@ -30,11 +30,14 @@ lock-audit:
 build:
 	$(CARGO) build --release
 
+version-check:
+	@scripts/pre-commit-check.sh
+
 release:
 ifndef VERSION
-	$(error VERSION is required. Usage: make release VERSION=0.6.3)
+	$(error VERSION is required. Usage: make release VERSION=0.7.3)
 endif
-	@echo "=== Release v$(VERSION) ==="
+	@scripts/pre-commit-check.sh "v$(VERSION)"
 	$(MAKE) check
 	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
 	@echo "Ready to push: git push origin v$(VERSION)"
