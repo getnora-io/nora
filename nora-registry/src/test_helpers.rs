@@ -218,6 +218,7 @@ fn build_context(
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
+        auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

@@ -7,9 +7,11 @@ mod s3;
 pub use local::LocalStorage;
 pub use s3::S3Storage;
 
+use crate::hash_pin_store::HashPinStore;
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -51,16 +53,19 @@ pub trait StorageBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
 }
 
-/// Storage wrapper for dynamic dispatch
+/// Storage wrapper for dynamic dispatch with integrity verification.
 #[derive(Clone)]
 pub struct Storage {
     inner: Arc<dyn StorageBackend>,
+    pin_store: Option<Arc<HashPinStore>>,
 }
 
 impl Storage {
     pub fn new_local(path: &str) -> Self {
+        let pin_path = PathBuf::from(path).join(".nora-pins.ndjson");
         Self {
             inner: Arc::new(LocalStorage::new(path)),
+            pin_store: Some(Arc::new(HashPinStore::new(pin_path))),
         }
     }
 
@@ -75,22 +80,35 @@ impl Storage {
             inner: Arc::new(S3Storage::new(
                 s3_url, bucket, region, access_key, secret_key,
             )),
+            pin_store: None,
         }
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         validate_storage_key(key)?;
-        self.inner.put(key, data).await
+        self.inner.put(key, data).await?;
+        if let Some(ref pins) = self.pin_store {
+            pins.record(key, data);
+        }
+        Ok(())
     }
 
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         validate_storage_key(key)?;
-        self.inner.get(key).await
+        let data = self.inner.get(key).await?;
+        if let Some(ref pins) = self.pin_store {
+            pins.verify(key, &data);
+        }
+        Ok(data)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {
         validate_storage_key(key)?;
-        self.inner.delete(key).await
+        self.inner.delete(key).await?;
+        if let Some(ref pins) = self.pin_store {
+            pins.remove(key);
+        }
+        Ok(())
     }
 
     pub async fn list(&self, prefix: &str) -> Vec<String> {
@@ -98,7 +116,12 @@ impl Storage {
         if !prefix.is_empty() && validate_storage_key(prefix).is_err() {
             return Vec::new();
         }
-        self.inner.list(prefix).await
+        self.inner
+            .list(prefix)
+            .await
+            .into_iter()
+            .filter(|k| !k.starts_with(".nora-"))
+            .collect()
     }
 
     pub async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -118,5 +141,10 @@ impl Storage {
 
     pub fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
+    }
+
+    /// Number of pinned hashes (0 if pin store is disabled).
+    pub fn pinned_count(&self) -> usize {
+        self.pin_store.as_ref().map_or(0, |p| p.len())
     }
 }

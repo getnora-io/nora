@@ -11,6 +11,7 @@ mod curation;
 mod dashboard_metrics;
 mod error;
 mod gc;
+mod hash_pin_store;
 mod health;
 mod metrics;
 mod migrate;
@@ -155,6 +156,8 @@ pub struct AppState {
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub curation: curation::CurationEngine,
+    /// Per-IP failed auth attempt tracker for brute-force protection
+    pub auth_failures: auth::AuthFailureTracker,
 }
 
 impl AppState {
@@ -838,6 +841,7 @@ async fn run_server(config: Config, storage: Storage) {
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
+        auth_failures: auth::AuthFailureTracker::new(5, 900),
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
@@ -952,6 +956,7 @@ async fn run_server(config: Config, storage: Storage) {
                 token_store.flush_last_used().await;
             }
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
+            metrics_state.auth_failures.cleanup();
         }
     });
 
