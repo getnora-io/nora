@@ -3,7 +3,7 @@ cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 7
 type-complexity-threshold = 300
 
-disallowed-methods = [
-    { path = "std::time::SystemTime::now", reason = "Use Instant for elapsed time; SystemTime only for serialization" },
-    { path = "std::env::var", reason = "Use config system, not raw env::var in business logic" },
-]
+# NOTE: SystemTime::now and env::var rules are enforced via semgrep
+# (~/nora-private-tests/semgrep-rules/) which supports path exclusions.
+# clippy disallowed-methods has no per-file granularity — too many
+# false positives in config.rs, tokens.rs, backup.rs, registry modules.
