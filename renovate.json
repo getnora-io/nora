@@ -1,0 +1,10 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "minimumReleaseAge": "5 days",
+  "cargo": { "enabled": true },
+  "github-actions": { "enabled": true },
+  "schedule": ["before 9am on Monday"],
+  "prConcurrentLimit": 3,
+  "labels": ["dependencies"]
+}

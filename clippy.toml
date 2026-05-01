@@ -2,3 +2,8 @@
 cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 7
 type-complexity-threshold = 300
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "Use Instant for elapsed time; SystemTime only for serialization" },
+    { path = "std::env::var", reason = "Use config system, not raw env::var in business logic" },
+]

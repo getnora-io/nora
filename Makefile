@@ -6,7 +6,7 @@
 
 CARGO := cargo
 
-.PHONY: check test build release fmt clippy coherence lock-audit version-check
+.PHONY: check test build release fmt clippy coherence lock-audit version-check install-hooks
 
 check: version-check fmt clippy test coherence lock-audit
 	@echo ""
@@ -32,6 +32,9 @@ build:
 
 version-check:
 	@scripts/pre-commit-check.sh
+
+install-hooks:
+	@scripts/install-hooks.sh
 
 release:
 ifndef VERSION
