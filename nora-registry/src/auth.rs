@@ -3,18 +3,80 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::tokens::Role;
 use crate::AppState;
+
+/// Tracks failed authentication attempts per IP for brute-force protection.
+///
+/// After `max_failures` consecutive failures, the IP is locked out with
+/// exponential backoff: 2^(failures - max_failures) seconds, capped at 15 minutes.
+pub struct AuthFailureTracker {
+    /// IP -> (consecutive failures, last failure time)
+    entries: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// Number of failures before lockout kicks in (default: 5)
+    max_failures: u32,
+    /// Maximum lockout duration in seconds (default: 900 = 15 minutes)
+    max_lockout_secs: u64,
+}
+
+impl AuthFailureTracker {
+    pub fn new(max_failures: u32, max_lockout_secs: u64) -> Self {
+        Self {
+            entries: parking_lot::Mutex::new(HashMap::new()),
+            max_failures,
+            max_lockout_secs,
+        }
+    }
+
+    /// Check if IP is currently locked out. Returns remaining lockout seconds if blocked.
+    pub fn check_blocked(&self, ip: &IpAddr) -> Option<u64> {
+        let entries = self.entries.lock();
+        let (failures, last_failure) = entries.get(ip)?;
+        if *failures < self.max_failures {
+            return None;
+        }
+        let exponent = (*failures - self.max_failures).min(20);
+        let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
+        let elapsed = last_failure.elapsed().as_secs();
+        if elapsed < lockout_secs {
+            Some(lockout_secs - elapsed)
+        } else {
+            None
+        }
+    }
+
+    /// Record a failed auth attempt for an IP.
+    pub fn record_failure(&self, ip: IpAddr) {
+        let mut entries = self.entries.lock();
+        let entry = entries.entry(ip).or_insert_with(|| (0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+    }
+
+    /// Clear failure count on successful auth.
+    pub fn record_success(&self, ip: &IpAddr) {
+        let mut entries = self.entries.lock();
+        entries.remove(ip);
+    }
+
+    /// Remove entries older than max_lockout_secs (call periodically).
+    pub fn cleanup(&self) {
+        let mut entries = self.entries.lock();
+        entries.retain(|_, (_, last)| last.elapsed().as_secs() < self.max_lockout_secs * 2);
+    }
+}
 
 /// Htpasswd-based authentication
 #[derive(Clone)]
@@ -87,6 +149,33 @@ fn is_docker_auth_challenge_path(path: &str) -> bool {
     matches!(path, "/v2/" | "/v2")
 }
 
+/// Extract client IP from request (X-Forwarded-For, X-Real-IP, or ConnectInfo).
+fn extract_client_ip(request: &Request<Body>) -> Option<IpAddr> {
+    // Try X-Forwarded-For first (first IP in chain is the client)
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            if let Some(first) = s.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    // Try X-Real-IP
+    if let Some(xri) = request.headers().get("x-real-ip") {
+        if let Ok(s) = xri.to_str() {
+            if let Ok(ip) = s.trim().parse::<IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    // Fall back to ConnectInfo
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+}
+
 /// Auth middleware - supports Basic auth and Bearer tokens
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -109,20 +198,47 @@ pub async fn auth_middleware(
     // with WWW-Authenticate header, so Docker clients send credentials on
     // subsequent requests. If /v2/ returns 200 without auth, Docker assumes
     // the registry is anonymous and never sends Authorization headers.
-    let is_docker_challenge = is_docker_auth_challenge_path(request.uri().path());
+    let path = request.uri().path();
+    let is_docker_challenge = is_docker_auth_challenge_path(path);
 
-    // Allow anonymous read if configured (but not for Docker /v2/ endpoint)
+    // Token management always requires auth, even with anonymous_read
+    let is_token_management = path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens");
+
+    // Allow anonymous read if configured (but not for Docker /v2/ or token management)
     let is_read_method = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
     );
-    if state.config.auth.anonymous_read && is_read_method && !is_docker_challenge {
+    if state.config.auth.anonymous_read
+        && is_read_method
+        && !is_docker_challenge
+        && !is_token_management
+    {
         // Read requests allowed without auth
         return next.run(request).await;
     }
 
     // Compute realm from public_url for WWW-Authenticate header
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
+
+    // Check if client IP is blocked due to too many failed attempts
+    let client_ip = extract_client_ip(&request);
+    if let Some(ip) = client_ip {
+        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, retry_after.to_string()),
+                    (header::CONTENT_TYPE, "application/json".to_string()),
+                ],
+                format!(
+                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                    retry_after
+                ),
+            )
+                .into_response();
+        }
+    }
 
     // Extract Authorization header
     let auth_header = request
@@ -140,6 +256,9 @@ pub async fn auth_middleware(
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((_user, role)) => {
+                    if let Some(ip) = client_ip {
+                        state.auth_failures.record_success(&ip);
+                    }
                     let method = request.method().clone();
                     if (method == axum::http::Method::PUT
                         || method == axum::http::Method::POST
@@ -151,7 +270,12 @@ pub async fn auth_middleware(
                     }
                     return next.run(request).await;
                 }
-                Err(_) => return unauthorized_response("Invalid or expired token", realm),
+                Err(_) => {
+                    if let Some(ip) = client_ip {
+                        state.auth_failures.record_failure(ip);
+                    }
+                    return unauthorized_response("Invalid or expired token", realm);
+                }
             }
         } else {
             return unauthorized_response("Token authentication not configured", realm);
@@ -181,10 +305,16 @@ pub async fn auth_middleware(
 
     // Verify credentials
     if !auth.authenticate(username, password) {
+        if let Some(ip) = client_ip {
+            state.auth_failures.record_failure(ip);
+        }
         return unauthorized_response("Invalid username or password", realm);
     }
 
-    // Auth successful
+    // Auth successful — clear failure counter
+    if let Some(ip) = client_ip {
+        state.auth_failures.record_success(&ip);
+    }
     next.run(request).await
 }
 
@@ -620,6 +750,97 @@ mod tests {
         assert!(!is_public_path("/api/ui/tokens/list"));
         assert!(!is_public_path("/api/ui/tokens/abcd1234abcd1234/revoke"));
     }
+
+    #[test]
+    fn test_auth_failure_tracker_allows_under_threshold() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..4 {
+            tracker.record_failure(ip);
+        }
+        assert!(tracker.check_blocked(&ip).is_none());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_blocks_at_threshold() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..5 {
+            tracker.record_failure(ip);
+        }
+        assert!(tracker.check_blocked(&ip).is_some());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_success_clears() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..10 {
+            tracker.record_failure(ip);
+        }
+        assert!(tracker.check_blocked(&ip).is_some());
+        tracker.record_success(&ip);
+        assert!(tracker.check_blocked(&ip).is_none());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_independent_ips() {
+        let tracker = AuthFailureTracker::new(3, 900);
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..3 {
+            tracker.record_failure(ip1);
+        }
+        assert!(tracker.check_blocked(&ip1).is_some());
+        assert!(tracker.check_blocked(&ip2).is_none());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_cleanup() {
+        let tracker = AuthFailureTracker::new(3, 1); // 1 sec max lockout
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..5 {
+            tracker.record_failure(ip);
+        }
+        // Cleanup should remove entries older than 2x max_lockout_secs
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        tracker.cleanup();
+        assert!(tracker.check_blocked(&ip).is_none());
+    }
+
+    #[test]
+    fn test_auth_failure_tracker_exponential_backoff() {
+        let tracker = AuthFailureTracker::new(5, 900);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // 5 failures = threshold, lockout = 2^0 = 1 sec
+        for _ in 0..5 {
+            tracker.record_failure(ip);
+        }
+        let retry1 = tracker.check_blocked(&ip).unwrap();
+        assert!(
+            retry1 <= 1,
+            "first lockout should be ~1 sec, got {}",
+            retry1
+        );
+
+        // 6 failures = 2^1 = 2 sec
+        tracker.record_failure(ip);
+        let retry2 = tracker.check_blocked(&ip).unwrap();
+        assert!(
+            retry2 <= 2,
+            "second lockout should be ~2 sec, got {}",
+            retry2
+        );
+
+        // 7 failures = 2^2 = 4 sec
+        tracker.record_failure(ip);
+        let retry3 = tracker.check_blocked(&ip).unwrap();
+        assert!(
+            retry3 <= 4,
+            "third lockout should be ~4 sec, got {}",
+            retry3
+        );
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +983,36 @@ mod integration_tests {
         // Write without auth should fail
         let response = send(&ctx.app, Method::PUT, "/raw/test2.txt", b"data".to_vec()).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Token management must require auth even with anonymous_read=true (#221)
+    #[tokio::test]
+    async fn test_token_ui_requires_auth_with_anonymous_read() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+
+        // GET /ui/tokens without auth must return 401 even with anonymous_read
+        let response = send(&ctx.app, Method::GET, "/ui/tokens", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // GET /api/ui/tokens/list without auth must also return 401
+        let response = send(&ctx.app, Method::GET, "/api/ui/tokens/list", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // With auth, token UI should work
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/ui/tokens",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Other read endpoints should still work anonymously
+        let response = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
