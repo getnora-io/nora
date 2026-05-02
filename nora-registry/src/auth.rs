@@ -149,8 +149,30 @@ fn is_docker_auth_challenge_path(path: &str) -> bool {
     matches!(path, "/v2/" | "/v2")
 }
 
-/// Extract client IP from request (X-Forwarded-For, X-Real-IP, or ConnectInfo).
-fn extract_client_ip(request: &Request<Body>) -> Option<IpAddr> {
+/// Extract client IP from request, honoring XFF/X-Real-IP only from trusted proxies.
+///
+/// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
+/// ignored and the peer IP is returned. This prevents attackers from spoofing
+/// their IP to bypass `AuthFailureTracker` lockout.
+fn extract_client_ip(
+    request: &Request<Body>,
+    trusted_proxies: &crate::config::TrustedProxies,
+) -> Option<IpAddr> {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    let peer = match peer_ip {
+        Some(ip) => ip,
+        None => return None,
+    };
+
+    // Only trust forwarding headers from known proxies
+    if !trusted_proxies.contains(peer) {
+        return Some(peer);
+    }
+
     // Try X-Forwarded-For first (first IP in chain is the client)
     if let Some(xff) = request.headers().get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
@@ -169,11 +191,8 @@ fn extract_client_ip(request: &Request<Body>) -> Option<IpAddr> {
             }
         }
     }
-    // Fall back to ConnectInfo
-    request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
+    // No forwarding headers — use peer IP
+    Some(peer)
 }
 
 /// Auth middleware - supports Basic auth and Bearer tokens
@@ -222,7 +241,7 @@ pub async fn auth_middleware(
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
 
     // Check if client IP is blocked due to too many failed attempts
-    let client_ip = extract_client_ip(&request);
+    let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
     if let Some(ip) = client_ip {
         if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
             return (
@@ -752,6 +771,80 @@ mod tests {
     }
 
     #[test]
+    fn test_xff_trusted_proxy_uses_forwarded_ip() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::parse("127.0.0.1,::1");
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "1.2.3.4, 127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new("127.0.0.1".parse().unwrap(), 1234)));
+        let ip = extract_client_ip(&request, &proxies);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_xff_untrusted_proxy_uses_peer_ip() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::parse("127.0.0.1,::1");
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(Body::empty())
+            .unwrap();
+        // Peer is NOT in trusted list
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new("5.6.7.8".parse().unwrap(), 1234)));
+        let ip = extract_client_ip(&request, &proxies);
+        assert_eq!(ip, Some("5.6.7.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_xff_no_header_uses_peer_ip() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::parse("127.0.0.1,::1");
+        let mut request = Request::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new("127.0.0.1".parse().unwrap(), 1234)));
+        let ip = extract_client_ip(&request, &proxies);
+        assert_eq!(ip, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_parse_cidr() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::parse("10.0.0.0/8");
+        assert!(proxies.contains("10.1.2.3".parse().unwrap()));
+        assert!(proxies.contains("10.255.255.255".parse().unwrap()));
+        assert!(!proxies.contains("11.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_parse_single_ip() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::parse("192.168.1.1");
+        assert!(proxies.contains("192.168.1.1".parse().unwrap()));
+        assert!(!proxies.contains("192.168.1.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_default_loopback() {
+        use crate::config::TrustedProxies;
+        let proxies = TrustedProxies::default_loopback();
+        assert!(proxies.contains("127.0.0.1".parse().unwrap()));
+        assert!(proxies.contains("::1".parse().unwrap()));
+        assert!(!proxies.contains("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
     fn test_auth_failure_tracker_allows_under_threshold() {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1097,6 +1190,71 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Token API endpoints are public (in is_public_path) because they validate
+    /// credentials in the handler body. Verify that empty/missing credentials
+    /// are properly rejected with 401 — defense-in-depth against any future
+    /// refactor that might accidentally remove body-level auth checks.
+    #[tokio::test]
+    async fn test_token_create_without_credentials_returns_401() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/tokens",
+            vec![("content-type", "application/json")],
+            r#"{}"#,
+        )
+        .await;
+        // Empty JSON body has no username/password — serde fails or handler rejects
+        assert!(
+            response.status() == StatusCode::UNAUTHORIZED
+                || response.status() == StatusCode::UNPROCESSABLE_ENTITY
+                || response.status() == StatusCode::BAD_REQUEST,
+            "Expected 401/422/400, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_list_without_credentials_returns_401() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/tokens/list",
+            vec![("content-type", "application/json")],
+            r#"{}"#,
+        )
+        .await;
+        assert!(
+            response.status() == StatusCode::UNAUTHORIZED
+                || response.status() == StatusCode::UNPROCESSABLE_ENTITY
+                || response.status() == StatusCode::BAD_REQUEST,
+            "Expected 401/422/400, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_revoke_without_credentials_returns_401() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/tokens/revoke",
+            vec![("content-type", "application/json")],
+            r#"{}"#,
+        )
+        .await;
+        assert!(
+            response.status() == StatusCode::UNAUTHORIZED
+                || response.status() == StatusCode::UNPROCESSABLE_ENTITY
+                || response.status() == StatusCode::BAD_REQUEST,
+            "Expected 401/422/400, got {}",
+            response.status()
+        );
     }
 
     #[tokio::test]
