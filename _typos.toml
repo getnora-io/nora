@@ -3,8 +3,9 @@
 Hashi = "Hashi"
 # flate2 is a Rust crate for compression
 flate = "flate"
-# grep pattern fragment in lint script
+# grep pattern fragments in lint scripts
 validat = "validat"
+registr = "registr"
 
 [files]
 extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]
