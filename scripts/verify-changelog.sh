@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # verify-changelog.sh — Verify CHANGELOG claims against actual code
-# Part of Protocol G (Changelog Verification Gate)
 #
 # Catches: phantom features, wrong env var names, inflated numbers
 # Runs in CI (<5s, no dependencies beyond bash+grep)
