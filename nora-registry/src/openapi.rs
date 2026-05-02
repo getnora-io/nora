@@ -482,6 +482,8 @@ pub async fn maven_artifact_get() {}
     ),
     responses(
         (status = 201, description = "Artifact uploaded"),
+        (status = 400, description = "Invalid path (non-ASCII characters)"),
+        (status = 409, description = "Version already exists (immutable releases)"),
         (status = 500, description = "Storage error")
     )
 )]
@@ -736,7 +738,10 @@ pub async fn raw_file_get() {}
     ),
     responses(
         (status = 201, description = "File uploaded"),
-        (status = 409, description = "File already exists (immutable)")
+        (status = 400, description = "Invalid path (non-ASCII characters)"),
+        (status = 409, description = "File already exists (immutable)"),
+        (status = 413, description = "File too large"),
+        (status = 500, description = "Storage error")
     )
 )]
 pub async fn raw_file_put() {}
@@ -936,7 +941,8 @@ pub async fn conan_recipe_file() {}
     responses(
         (status = 200, description = "Token created", body = TokenResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
-        (status = 400, description = "Auth not configured", body = ErrorResponse)
+        (status = 422, description = "Missing required fields", body = ErrorResponse),
+        (status = 503, description = "Auth not configured", body = ErrorResponse)
     )
 )]
 pub async fn create_token() {}
