@@ -6,9 +6,9 @@
 
 CARGO := cargo
 
-.PHONY: check test build release fmt clippy coherence lock-audit version-check install-hooks
+.PHONY: check test build release fmt clippy coherence lock-audit version-check install-hooks verify-changelog
 
-check: version-check fmt clippy test coherence lock-audit
+check: version-check fmt clippy test coherence lock-audit verify-changelog
 	@echo ""
 	@echo "=== All checks passed ==="
 
@@ -26,6 +26,9 @@ coherence:
 
 lock-audit:
 	@if [ -x scripts/lock-audit.sh ]; then scripts/lock-audit.sh; fi
+
+verify-changelog:
+	@if [ -x scripts/verify-changelog.sh ]; then scripts/verify-changelog.sh; fi
 
 build:
 	$(CARGO) build --release
