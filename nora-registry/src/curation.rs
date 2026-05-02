@@ -312,12 +312,23 @@ pub fn check_download(
     }
 }
 
+/// Extract publish date from file mtime. ONLY for hosted registries —
+/// proxy mtime reflects cache time, not actual publish date.
+// TODO(v1.0): trust_upstream_dates config for high-security installs
+pub async fn extract_mtime_as_publish_date(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> Option<i64> {
+    storage.stat(key).await.map(|m| m.modified as i64)
+}
+
 /// Parse an ISO 8601 / RFC 3339 date string to a Unix timestamp (seconds).
 ///
 /// Handles common formats from registry metadata:
 /// - `2024-01-15T10:30:00Z` (Go .info `Time` field)
 /// - `2024-01-15T10:30:00.123Z` (npm `time` field)
 /// - `2024-01-15T10:30:00+00:00` (PyPI `upload_time_iso_8601`)
+/// - `2024-01-15T10:30:00.000+0000` (Conan `time` field — non-standard tz offset)
 ///
 /// Returns `None` if the string is not parseable.
 pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
@@ -334,6 +345,15 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     }
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(ndt.and_utc().timestamp());
+    }
+
+    // Try non-standard offset format without colon: +0000, +0530
+    // (Conan center uses this format)
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
+        return Some(dt.timestamp());
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
+        return Some(dt.timestamp());
     }
 
     None
@@ -2976,5 +2996,25 @@ mod min_release_age_tests {
         assert_eq!(MinReleaseAgeFilter::format_duration(86400), "1d");
         assert_eq!(MinReleaseAgeFilter::format_duration(604800), "1w");
         assert_eq!(MinReleaseAgeFilter::format_duration(691200), "1w1d");
+    }
+
+    #[tokio::test]
+    async fn test_extract_mtime_as_publish_date_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage.put("raw/test.txt", b"hello").await.unwrap();
+
+        let result = extract_mtime_as_publish_date(&storage, "raw/test.txt").await;
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_extract_mtime_as_publish_date_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let result = extract_mtime_as_publish_date(&storage, "raw/nonexistent.txt").await;
+        assert!(result.is_none());
     }
 }

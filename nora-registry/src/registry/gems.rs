@@ -238,6 +238,14 @@ async fn download_gem(
     }
 
     let artifact = format!("{}-{}", name, version);
+    let storage_key = format!("gems/gems/{}.gem", artifact);
+
+    // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
+    let publish_date = if state.config.gems.proxy.is_none() {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
+    } else {
+        None
+    };
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
@@ -247,12 +255,10 @@ async fn download_gem(
         crate::curation::RegistryType::Gems,
         &name,
         Some(&version),
-        None,
+        publish_date,
     ) {
         return response;
     }
-
-    let storage_key = format!("gems/gems/{}.gem", artifact);
 
     // Immutable: if cached, serve directly
     if let Ok(data) = state.storage.get(&storage_key).await {

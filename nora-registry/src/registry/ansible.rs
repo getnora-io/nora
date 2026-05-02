@@ -165,6 +165,15 @@ async fn download_tarball(
     }
     let (ns, name, ver) = (parts[0], parts[1], parts[2]);
 
+    let storage_key = format!("ansible/download/{}", filename);
+
+    // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
+    let publish_date = if state.config.ansible.proxy.is_none() {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
+    } else {
+        None
+    };
+
     // Curation check
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -173,12 +182,10 @@ async fn download_tarball(
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
         Some(ver),
-        None,
+        publish_date,
     ) {
         return response;
     }
-
-    let storage_key = format!("ansible/download/{}", filename);
 
     // Immutable cache
     if let Ok(data) = state.storage.get(&storage_key).await {

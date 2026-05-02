@@ -298,6 +298,9 @@ async fn recipe_file_download(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let artifact = format!("{} rrev={} {}", ref_str, rrev, filename);
 
+    // Extract publish date from cached revision metadata
+    let publish_date = extract_conan_publish_date(&state.storage, &name, &ver, &user, &chan).await;
+
     // Curation check
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -306,7 +309,7 @@ async fn recipe_file_download(
         crate::curation::RegistryType::Conan,
         &name,
         Some(&ver),
-        None,
+        publish_date,
     ) {
         return response;
     }
@@ -572,6 +575,9 @@ async fn package_file_download(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let artifact = format!("{}#{}:{}#{} {}", ref_str, rrev, pkg_id, prev, filename);
 
+    // Extract publish date from cached revision metadata
+    let publish_date = extract_conan_publish_date(&state.storage, &name, &ver, &user, &chan).await;
+
     // Curation check
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -580,7 +586,7 @@ async fn package_file_download(
         crate::curation::RegistryType::Conan,
         &name,
         Some(&ver),
-        None,
+        publish_date,
     ) {
         return response;
     }
@@ -766,6 +772,28 @@ async fn fetch_and_cache_immutable_json(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Extract publish date from cached Conan recipe revision metadata.
+///
+/// Conan v2 `latest.json` contains:
+/// ```json
+/// { "revision": "abc123", "time": "2024-01-15T10:30:00.000+0000" }
+/// ```
+// TODO(v1.0): trust_upstream_dates config for high-security installs
+async fn extract_conan_publish_date(
+    storage: &crate::storage::Storage,
+    name: &str,
+    ver: &str,
+    user: &str,
+    chan: &str,
+) -> Option<i64> {
+    let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
+    let meta_key = format!("conan/{}/latest.json", ref_str);
+    let data = storage.get(&meta_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let date_str = json.get("time")?.as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
 
 fn upstream_url(state: &AppState) -> String {
     state
@@ -1159,5 +1187,52 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"safe recipe");
+    }
+
+    #[tokio::test]
+    async fn test_extract_conan_publish_date_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({
+            "revision": "abc123",
+            "time": "2024-03-15T14:30:00.000+0000"
+        });
+        storage
+            .put(
+                "conan/zlib/1.3/_/_/latest.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_").await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_extract_conan_publish_date_no_time_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({"revision": "abc123"});
+        storage
+            .put(
+                "conan/zlib/1.3/_/_/latest.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_conan_publish_date_no_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let result =
+            super::extract_conan_publish_date(&storage, "nonexistent", "1.0", "_", "_").await;
+        assert!(result.is_none());
     }
 }
