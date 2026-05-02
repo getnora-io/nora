@@ -85,6 +85,10 @@ async fn upload(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    if !path.is_ascii() {
+        return (StatusCode::BAD_REQUEST, "Path must contain only ASCII characters").into_response();
+    }
+
     // Check file size limit
     if body.len() as u64 > state.config.raw.max_file_size {
         return (

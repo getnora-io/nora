@@ -73,6 +73,11 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
         });
     }
 
+    // Reject non-ASCII characters — all registry paths are ASCII-only
+    if let Some(ch) = key.chars().find(|c| !c.is_ascii()) {
+        return Err(ValidationError::ForbiddenCharacter(ch));
+    }
+
     // Check for null bytes
     if key.contains('\0') {
         return Err(ValidationError::ForbiddenCharacter('\0'));
@@ -362,6 +367,21 @@ mod tests {
             validate_storage_key("foo\0bar"),
             Err(ValidationError::ForbiddenCharacter('\0'))
         ));
+    }
+
+    #[test]
+    fn test_storage_key_non_ascii() {
+        assert!(matches!(
+            validate_storage_key("maven/com/café/1.0/file.jar"),
+            Err(ValidationError::ForbiddenCharacter('é'))
+        ));
+        assert!(matches!(
+            validate_storage_key("raw/ünïcödé.txt"),
+            Err(ValidationError::ForbiddenCharacter(_))
+        ));
+        // ASCII-only paths remain valid
+        assert!(validate_storage_key("maven/com/example/1.0/file.jar").is_ok());
+        assert!(validate_storage_key("raw/file-name_v2.0.tar.gz").is_ok());
     }
 
     #[test]
