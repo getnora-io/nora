@@ -4,11 +4,11 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.5.x   | :white_check_mark: |
-| 0.4.x   | :white_check_mark: |
-| 0.3.x   | :white_check_mark: |
-| 0.2.x   | :white_check_mark: |
-| < 0.2   | :x:                |
+| 0.8.x   | :white_check_mark: |
+| < 0.8   | :x:                |
+
+Only the latest minor release receives security patches.
+Upgrade to the latest version for all fixes.
 
 ## Reporting a Vulnerability
 
@@ -16,8 +16,9 @@
 
 Instead, please report them via:
 
-1. **Email:** devitway@gmail.com
-2. **Telegram:** [@devitway_pavel](https://t.me/devitway_pavel) (private message)
+1. **GitHub Private Vulnerability Reporting:** [Report a vulnerability](https://github.com/getnora-io/nora/security/advisories/new) (preferred)
+2. **Email:** devitway@gmail.com
+3. **Telegram:** [@devitway_pavel](https://t.me/devitway_pavel) (private message)
 
 ### What to Include
 

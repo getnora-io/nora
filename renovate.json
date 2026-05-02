@@ -6,5 +6,14 @@
   "github-actions": { "enabled": true },
   "schedule": ["before 9am on Monday"],
   "prConcurrentLimit": 3,
-  "labels": ["dependencies"]
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Auto-merge patch and digest updates that pass CI",
+      "matchUpdateTypes": ["patch", "digest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash"
+    }
+  ]
 }
