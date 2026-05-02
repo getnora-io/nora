@@ -5,9 +5,9 @@
 
 ### Added
 - **Hash Pin Store** — content-addressable integrity verification for all stored artifacts, `put_if_absent()` semantics with NDJSON persistence (#229)
-- **Circuit breaker** — per-registry circuit breaker for upstream proxy connections, returns 503+Retry-After on failures, disabled by default (#229)
-- **Trusted proxy support** — `NORA_TRUSTED_PROXIES` accepts CIDR ranges for X-Forwarded-For extraction (#230)
-- **Cache-Control headers** — proper caching directives for all 13 registry responses (#230)
+- **Trusted proxy support** — `NORA_AUTH_TRUSTED_PROXIES` accepts CIDR ranges for X-Forwarded-For extraction (#230)
+- **Cache-Control headers** — proper caching directives for proxy registries: Docker, Maven, npm, Cargo, PyPI, Go, Pub, Raw (#230)
+- **Auth rate limiting** — per-IP exponential backoff on failed authentication (429+Retry-After) (#229)
 - **Docker publish_locks eviction** — automatic cleanup of stale upload locks (#230)
 - **GOVERNANCE.md and ROADMAP.md** — project governance model and public roadmap (#228)
 - **Version consistency gate** — `scripts/pre-commit-check.sh` validates Cargo.toml vs OpenAPI vs Cargo.lock versions, enforced in release pipeline (#224, #225)
@@ -17,7 +17,7 @@
 - **Docker proxy timeout** — default timeout raised from 60s/120s to 300s, large image pulls no longer time out (#233)
 - **Unicode path validation** — non-ASCII characters in Maven/Raw upload paths now return 400 instead of 500 (#234)
 - **Docker /v2/ auth** — require authentication per Docker V2 spec (#220)
-- **Token auth timing** — constant-time comparison for token validation (#230)
+- **Curation bypass token timing** — constant-time comparison using `subtle` crate (#230)
 - **S3 paginated listing** — storage size calculation now handles >1000 objects correctly (#230)
 - **Docker temp file cleanup** — upload temp files are removed on failure (#230)
 - **OpenAPI schema deduplication** — removed 8 duplicate type definitions (#227)
@@ -84,7 +84,7 @@
   - Blocklist/allowlist rules with glob patterns and namespace isolation
   - Three modes: `off` (passthrough), `audit` (log only), `enforce` (block downloads)
   - Integrity verification via SHA256/SHA512 checksums
-  - CVE blocking via OSV.dev integration
+  - CVE blocking via blocklist rules (manual CVE entries)
   - CLI tools: `nora curation validate`, `nora curation explain`
 - RubyGems proxy registry (`/gems/`) — compact index, gem/gemspec immutable caching, TTL-based index refresh (#141)
 - Terraform proxy registry (`/terraform/`) — provider/module proxy with service discovery, download_url rewriting (#133)
