@@ -9,7 +9,7 @@ use reqwest::Client;
 use std::time::Duration;
 
 const DEFAULT_REGISTRY: &str = "https://registry-1.docker.io";
-const DEFAULT_TIMEOUT: u64 = 120;
+const DEFAULT_TIMEOUT: u64 = 300;
 
 /// Parsed Docker image reference
 #[derive(Debug, Clone, PartialEq)]
