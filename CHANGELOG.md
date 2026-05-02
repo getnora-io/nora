@@ -1,6 +1,39 @@
 # Changelog
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-02
+
+### Added
+- **Hash Pin Store** — content-addressable integrity verification for all stored artifacts, `put_if_absent()` semantics with NDJSON persistence (#229)
+- **Circuit breaker** — per-registry circuit breaker for upstream proxy connections, returns 503+Retry-After on failures, disabled by default (#229)
+- **Trusted proxy support** — `NORA_TRUSTED_PROXIES` accepts CIDR ranges for X-Forwarded-For extraction (#230)
+- **Cache-Control headers** — proper caching directives for all 13 registry responses (#230)
+- **Docker publish_locks eviction** — automatic cleanup of stale upload locks (#230)
+- **GOVERNANCE.md and ROADMAP.md** — project governance model and public roadmap (#228)
+- **Version consistency gate** — `scripts/pre-commit-check.sh` validates Cargo.toml vs OpenAPI vs Cargo.lock versions, enforced in release pipeline (#224, #225)
+- 908 total tests (up from 851)
+
+### Fixed
+- **Docker proxy timeout** — default timeout raised from 60s/120s to 300s, large image pulls no longer time out (#233)
+- **Unicode path validation** — non-ASCII characters in Maven/Raw upload paths now return 400 instead of 500 (#234)
+- **Docker /v2/ auth** — require authentication per Docker V2 spec (#220)
+- **Token auth timing** — constant-time comparison for token validation (#230)
+- **S3 paginated listing** — storage size calculation now handles >1000 objects correctly (#230)
+- **Docker temp file cleanup** — upload temp files are removed on failure (#230)
+- **OpenAPI schema deduplication** — removed 8 duplicate type definitions (#227)
+- **OpenAPI status codes** — documented 400/409/413/422/503 responses that API already returns (#235)
+
+### Changed
+- Mobile-responsive UI — dashboard grid, hidden table columns on small screens, Raw registry "Files" tab (#218)
+- Startup metric renamed to `startup_duration_ms` with Cold Start display on dashboard (#218)
+- Guardrails: semver-checks, Renovate config, pre-commit hooks, clippy deny rules (#225)
+- cargo-deny-action bumped to v2.0.17 (#231)
+
+### Security
+- Rate limiting hardening for token endpoints (#229)
+- Curation completeness checks for all registry formats (#230)
+- Raw registry glob pattern validation (#230)
+
 ## [0.7.2] - 2026-04-28
 
 ### Added
