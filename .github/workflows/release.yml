@@ -282,10 +282,20 @@ jobs:
             --bundle nora-linux-amd64.bundle \
             ./nora-linux-amd64
 
+      - name: Generate changelog with git-cliff
+        id: changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Create Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
-          generate_release_notes: true
+          generate_release_notes: false
           files: |
             nora-linux-amd64
             nora-linux-amd64.sha256
@@ -295,13 +305,9 @@ jobs:
             nora-${{ github.ref_name }}.sbom.spdx.json
             nora-${{ github.ref_name }}.sbom.cdx.json
           body: |
+            ${{ steps.changelog.outputs.content }}
+
             ## Install
-
-            ```bash
-            curl -fsSL https://getnora.io/install.sh | sh
-            ```
-
-            Or download the binary directly:
 
             ```bash
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-linux-amd64
@@ -311,26 +317,16 @@ jobs:
 
             ## Docker
 
-            **Alpine (standard):**
             ```bash
             docker pull getnora/nora:${{ steps.ver.outputs.tag }}
-            # or from GHCR:
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
             ```
 
-            **RED OS:**
-            ```bash
-            docker pull getnora/nora:${{ steps.ver.outputs.tag }}-redos
-            # or from GHCR:
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-redos
-            ```
-
-            **Astra Linux SE:**
-            ```bash
-            docker pull getnora/nora:${{ steps.ver.outputs.tag }}-astra
-            # or from GHCR:
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}-astra
-            ```
+            | Variant | Image |
+            |---------|-------|
+            | Alpine (default) | `getnora/nora:${{ steps.ver.outputs.tag }}` |
+            | RED OS | `getnora/nora:${{ steps.ver.outputs.tag }}-redos` |
+            | Astra Linux SE | `getnora/nora:${{ steps.ver.outputs.tag }}-astra` |
+            | GHCR | `ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}` |
 
             ## Changelog
 
