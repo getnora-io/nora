@@ -34,6 +34,22 @@
 - Curation completeness checks for all registry formats (#230)
 - Raw registry glob pattern validation (#230)
 
+## [0.7.3] - 2026-05-01
+
+### Fixed
+- **Docker /v2/ auth flow** — endpoint now correctly returns 401 Unauthorized with WWW-Authenticate header when auth is enabled. Previously, Docker clients received 200 OK without authentication, causing `docker login` to appear successful while `docker pull`/`docker push` failed with "unauthorized" (#219)
+- **Raw registry curation bypass** — raw was the only registry without `check_download()`, completely bypassing curation enforce mode. All 13 registries are now curated consistently
+- **Timing side-channel on bypass token** — replaced string comparison with constant-time comparison (`subtle` crate) to prevent timing attacks
+- **Maven glob matching** — `com.evil.**` pattern now correctly matches `com.evil:lib` (colon separator for Maven groupId:artifactId)
+- **Mobile dashboard** — responsive layout with 3-column stats grid, compact padding, and word-wrap on small screens
+
+### Added
+- **Raw directory browser** — nested navigation with breadcrumbs, folder/file icons, directories-first sorting. Browse raw artifacts at any depth
+- **Docker Hub images** — NORA is now published to Docker Hub as `getnora/nora` alongside GHCR
+- **Docker-Distribution-API-Version header** — `/v2/` response now includes `registry/2.0` header per Docker Registry V2 spec
+- **Startup time metric** — `startup_duration_ms` exposed on dashboard (cold start tracking)
+- 857 tests (up from 851)
+
 ## [0.7.2] - 2026-04-28
 
 ### Added
