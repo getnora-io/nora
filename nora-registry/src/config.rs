@@ -499,7 +499,7 @@ impl Default for ConanConfig {
 }
 
 fn default_docker_timeout() -> u64 {
-    60
+    300
 }
 
 fn default_raw_enabled() -> bool {
@@ -703,7 +703,7 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            proxy_timeout: 60,
+            proxy_timeout: 300,
             upstreams: vec![DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
@@ -2172,7 +2172,7 @@ mod tests {
     #[test]
     fn test_docker_config_default() {
         let d = DockerConfig::default();
-        assert_eq!(d.proxy_timeout, 60);
+        assert_eq!(d.proxy_timeout, 300);
         assert_eq!(d.upstreams.len(), 1);
         assert_eq!(d.upstreams[0].url, "https://registry-1.docker.io");
         assert!(d.upstreams[0].auth.is_none());
