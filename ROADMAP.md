@@ -12,26 +12,20 @@ For completed milestones, see [CHANGELOG.md](CHANGELOG.md).
 - **v0.6.0** — Retention policies, garbage collection, Maven immutability
 - **v0.7.0** — 13 registry formats, declarative registry selection, curation layer
 - **v0.7.1** — Min-release-age filter for supply chain protection
-- **v0.7.3** — Circuit breaker for upstream proxies, version consistency gate
+- **v0.7.3** — Docker auth fix, raw directory browser, version consistency gate
+- **v0.8.0** — Hash Pin Store, auth rate limiting, trusted proxies, Cache-Control
 
-## v0.8 — Integrity & Hardening
+## v0.9 — Resilience & Enterprise Auth
 
-Focus: supply chain integrity, platform coverage, security hardening.
+Focus: upstream resilience, production-grade authentication, operational maturity.
 
-- **Hash Pin Store** — immutable hash verification for stored artifacts. Detect tampering at the storage level. ([design](ARCHITECTURE.md))
-- **Auth rate limiting** — per-IP throttling on failed authentication attempts
-- **Publish date extraction** — extend min-release-age to all 13 registry formats (currently: npm, PyPI, Cargo, Go)
-- **Metadata cleanup** — automatic removal of metadata entries with zero versions
-- **arm64 support** — Linux arm64 binary and multi-arch Docker image ([#193](https://github.com/getnora-io/nora/issues/193))
-- **Token UI auth fix** — token management requires authentication regardless of anonymous_read setting ([#221](https://github.com/getnora-io/nora/issues/221))
-
-## v0.9 — Enterprise Auth
-
-Focus: production-grade authentication for CI/CD pipelines and corporate environments.
-
+- **Circuit breaker** — per-registry circuit breaker for upstream proxy connections (503+Retry-After on failures, half-open recovery)
+- **Cache-Control completeness** — extend caching headers to remaining registries (Ansible, Conan, Gems, NuGet, Terraform)
+- **Streaming read_timeout** — per-chunk timeout for large blob downloads instead of total request timeout
 - **OIDC / Workload Identity** — zero-secret auth for GitHub Actions and GitLab CI JWT
 - **Hot reload** — apply curation policy and configuration changes without restart
 - **Audit log to stdout** — structured JSON logs for multi-replica deployments and SIEM integration ([#175](https://github.com/getnora-io/nora/issues/175))
+- **arm64 support** — Linux arm64 binary and multi-arch Docker image ([#193](https://github.com/getnora-io/nora/issues/193))
 
 ## v1.0 — Stability
 
