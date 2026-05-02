@@ -86,7 +86,11 @@ async fn upload(
     }
 
     if !path.is_ascii() {
-        return (StatusCode::BAD_REQUEST, "Path must contain only ASCII characters").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Path must contain only ASCII characters",
+        )
+            .into_response();
     }
 
     // Check file size limit
