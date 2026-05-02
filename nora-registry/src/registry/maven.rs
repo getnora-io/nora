@@ -228,6 +228,14 @@ async fn upload(
     Path(path): Path<String>,
     body: Bytes,
 ) -> Response {
+    if !path.is_ascii() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Path must contain only ASCII characters",
+        )
+            .into_response();
+    }
+
     let key = format!("maven/{}", path);
 
     let artifact_name = path
