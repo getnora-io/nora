@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability
+    url: https://github.com/getnora-io/nora/security/advisories/new
+    about: Report security vulnerabilities privately
+  - name: Question
+    url: https://t.me/getnora
+    about: Ask questions in the Telegram community
