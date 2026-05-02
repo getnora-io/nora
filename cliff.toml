@@ -1,0 +1,84 @@
+# git-cliff configuration for NORA
+# https://git-cliff.org/docs/configuration
+#
+# Usage:
+#   git cliff                          # full changelog
+#   git cliff --unreleased             # changes since last tag
+#   git cliff --latest                 # latest tag only
+#   git cliff v0.7.3..v0.8.0          # specific range
+#   git cliff --unreleased -o /dev/stdout  # preview without overwriting
+
+[changelog]
+header = """# Changelog
+
+All notable changes to NORA are documented in this file.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).\n
+"""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif -%}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits
+| filter(attribute="scope")
+| sort(attribute="scope") %}
+- **{{ commit.scope }}** — {{ commit.message | split(pat="\n") | first | upper_first }}
+{%- endfor -%}
+{% for commit in commits %}
+{%- if not commit.scope %}
+- {{ commit.message | split(pat="\n") | first | upper_first }}
+{%- endif -%}
+{%- endfor -%}
+{% endfor %}\n
+"""
+footer = ""
+trim = true
+postprocessors = [
+  # Link PR references: (#123) -> ([#123](url))
+  { pattern = '\(#(\d+)\)', replace = "([#${1}](https://github.com/getnora-io/nora/pull/${1}))" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_preprocessors = [
+  # Strip PR number suffix — postprocessor will re-link them
+  { pattern = '\s*\(#\d+\)\s*$', replace = "" },
+  # Normalize non-conventional commits that start with a common verb
+  { pattern = '^[Aa]dd\s', replace = "feat: add " },
+  { pattern = '^[Ff]ix\s', replace = "fix: fix " },
+  { pattern = '^[Uu]pdate\s', replace = "docs: update " },
+  { pattern = '^[Rr]emove\s', replace = "refactor: remove " },
+  { pattern = '^[Bb]ump\s', replace = "chore: bump " },
+]
+commit_parsers = [
+  # Skip noise
+  { message = "^chore\\(deps\\)", group = "<!-- 90 -->Dependencies" },
+  { message = "^chore: bump version", skip = true },
+  { message = "^chore: release", skip = true },
+  { message = "^Merge", skip = true },
+
+  # Map conventional types to Keep a Changelog sections
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^fix", group = "<!-- 1 -->Fixed" },
+  { message = "^security", group = "<!-- 2 -->Security" },
+  { message = "^refactor", group = "<!-- 3 -->Changed" },
+  { message = "^perf", group = "<!-- 3 -->Changed" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^ci", group = "<!-- 5 -->CI" },
+  { message = "^chore", group = "<!-- 6 -->Maintenance" },
+  { message = "^test", group = "<!-- 7 -->Testing" },
+
+  # Catch-all for non-conventional commits (anti-phantom: nothing is hidden)
+  { message = ".*", group = "<!-- 8 -->Other" },
+]
+protect_breaking_commits = false
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
+tag_pattern = "v[0-9].*"
