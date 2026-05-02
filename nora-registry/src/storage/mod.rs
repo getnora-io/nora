@@ -51,6 +51,8 @@ pub trait StorageBackend: Send + Sync {
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
+    /// Refresh any cached size data. No-op for backends without caching.
+    async fn refresh_total_size(&self) {}
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
@@ -76,6 +78,7 @@ impl Storage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Self {
+        tracing::warn!("Hash pin store disabled for S3 backend — integrity verification unavailable");
         Self {
             inner: Arc::new(S3Storage::new(
                 s3_url, bucket, region, access_key, secret_key,
@@ -146,5 +149,10 @@ impl Storage {
     /// Number of pinned hashes (0 if pin store is disabled).
     pub fn pinned_count(&self) -> usize {
         self.pin_store.as_ref().map_or(0, |p| p.len())
+    }
+
+    /// Refresh cached total_size. No-op for local storage, computes for S3.
+    pub async fn refresh_total_size_cache(&self) {
+        self.inner.refresh_total_size().await;
     }
 }

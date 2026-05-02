@@ -949,14 +949,27 @@ async fn run_server(config: Config, storage: Storage) {
     let metrics_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut tick_count: u64 = 0;
         loop {
             interval.tick().await;
+            tick_count += 1;
             metrics_state.metrics.save().await;
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used().await;
             }
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
             metrics_state.auth_failures.cleanup();
+
+            // Every 60s (every other tick): refresh S3 total_size cache
+            if tick_count % 2 == 0 {
+                metrics_state.storage.refresh_total_size_cache().await;
+            }
+
+            // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
+            if tick_count % 10 == 0 {
+                let mut locks = metrics_state.publish_locks.lock();
+                locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+            }
         }
     });
 
