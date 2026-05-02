@@ -49,6 +49,11 @@ lazy_static! {
         "Unix timestamp of last GC run"
     )
     .expect("gc_last_run metric");
+    pub static ref GC_METADATA_PHANTOMS: IntCounter = register_int_counter!(
+        "nora_gc_metadata_phantoms_total",
+        "Total phantom version entries cleaned from metadata"
+    )
+    .expect("gc_metadata_phantoms metric");
 }
 
 // ============================================================================
@@ -64,6 +69,8 @@ pub struct GcResult {
     pub duration_secs: f64,
     /// Registries with data but no GC orphan detection (name, file_count)
     pub uncovered: Vec<(String, usize)>,
+    /// Phantom version entries cleaned from metadata files (npm/PyPI)
+    pub metadata_phantoms_removed: usize,
 }
 
 // ============================================================================
@@ -130,6 +137,19 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
         }
     }
 
+    // Metadata phantom cleanup (npm/PyPI) — under the same GC write lock
+    let metadata_phantoms_removed = detect_and_clean_metadata_phantoms(storage, dry_run).await;
+    if metadata_phantoms_removed > 0 {
+        if !dry_run {
+            GC_METADATA_PHANTOMS.inc_by(metadata_phantoms_removed as u64);
+        }
+        info!(
+            "Metadata phantoms {}: {}",
+            if dry_run { "detected" } else { "cleaned" },
+            metadata_phantoms_removed
+        );
+    }
+
     // Detect registries with data but no GC coverage
     // Raw has no version model and no reference graph — nothing to GC by design
     let mut uncovered = Vec::new();
@@ -155,6 +175,7 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
         orphan_keys: all_orphans,
         duration_secs: duration,
         uncovered,
+        metadata_phantoms_removed,
     }
 }
 
@@ -390,6 +411,212 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
 }
 
 // ============================================================================
+// Metadata phantom detection (npm/PyPI)
+// ============================================================================
+
+/// Detect and clean phantom version entries from npm/PyPI metadata files.
+///
+/// When GC/retention deletes version tarballs, the metadata.json may still
+/// reference those deleted versions. This function:
+/// 1. Lists all existing tarballs for each package
+/// 2. Reads metadata.json and checks which versions have no tarball
+/// 3. Removes phantom entries (and rewrites metadata.json if not dry_run)
+async fn detect_and_clean_metadata_phantoms(storage: &Storage, dry_run: bool) -> usize {
+    let mut total_removed = 0usize;
+
+    // npm metadata cleanup
+    let npm_keys = storage.list("npm/").await;
+    let mut npm_meta_keys: Vec<String> = Vec::new();
+    let mut npm_tarball_keys: HashSet<String> = HashSet::new();
+
+    for key in &npm_keys {
+        if key.ends_with("/metadata.json") {
+            npm_meta_keys.push(key.clone());
+        } else if key.contains("/tarballs/") {
+            npm_tarball_keys.insert(key.clone());
+        }
+    }
+
+    for meta_key in &npm_meta_keys {
+        if let Some(removed) =
+            clean_npm_metadata(storage, meta_key, &npm_tarball_keys, dry_run).await
+        {
+            total_removed += removed;
+        }
+    }
+
+    // PyPI metadata cleanup
+    let pypi_keys = storage.list("pypi/").await;
+    let mut pypi_meta_keys: Vec<String> = Vec::new();
+    let mut pypi_file_keys: HashSet<String> = HashSet::new();
+
+    for key in &pypi_keys {
+        if key.ends_with("/metadata.json") {
+            pypi_meta_keys.push(key.clone());
+        } else if !key.ends_with(".sha256")
+            && !key.ends_with(".md5")
+            && !key.ends_with(".sha1")
+            && !key.ends_with(".sha512")
+        {
+            pypi_file_keys.insert(key.clone());
+        }
+    }
+
+    for meta_key in &pypi_meta_keys {
+        if let Some(removed) =
+            clean_pypi_metadata(storage, meta_key, &pypi_file_keys, dry_run).await
+        {
+            total_removed += removed;
+        }
+    }
+
+    total_removed
+}
+
+/// Clean phantom versions from a single npm metadata.json.
+///
+/// npm metadata has `versions` and `time` objects keyed by version string.
+/// A phantom = a version key with no corresponding tarball in storage.
+async fn clean_npm_metadata(
+    storage: &Storage,
+    meta_key: &str,
+    all_tarball_keys: &HashSet<String>,
+    dry_run: bool,
+) -> Option<usize> {
+    let data = storage.get(meta_key).await.ok()?;
+    let mut json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+
+    // Extract package name from key: npm/{name}/metadata.json
+    let package_name = meta_key
+        .strip_prefix("npm/")?
+        .strip_suffix("/metadata.json")?;
+
+    let versions = json.get("versions")?.as_object()?.clone();
+    let mut phantoms: Vec<String> = Vec::new();
+
+    for ver_key in versions.keys() {
+        // npm tarballs: npm/{name}/tarballs/{name}-{version}.tgz
+        // For scoped packages @scope/name, tarball uses just "name" part
+        let name_part = if package_name.contains('/') {
+            package_name.rsplit('/').next().unwrap_or(package_name)
+        } else {
+            package_name
+        };
+        let tarball_key = format!(
+            "npm/{}/tarballs/{}-{}.tgz",
+            package_name, name_part, ver_key
+        );
+        if !all_tarball_keys.contains(&tarball_key) {
+            phantoms.push(ver_key.clone());
+        }
+    }
+
+    if phantoms.is_empty() {
+        return Some(0);
+    }
+
+    let count = phantoms.len();
+    for phantom in &phantoms {
+        info!(
+            "[metadata-gc] npm {}: phantom version {} (no tarball)",
+            package_name, phantom
+        );
+    }
+
+    if !dry_run {
+        // Remove phantom entries from versions object
+        if let Some(versions_obj) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
+            for phantom in &phantoms {
+                versions_obj.remove(phantom.as_str());
+            }
+        }
+        // Remove corresponding time entries
+        if let Some(time_obj) = json.get_mut("time").and_then(|v| v.as_object_mut()) {
+            for phantom in &phantoms {
+                time_obj.remove(phantom.as_str());
+            }
+        }
+        // Rewrite metadata
+        if let Ok(new_data) = serde_json::to_vec(&json) {
+            let _ = storage.put(meta_key, &new_data).await;
+        }
+    }
+
+    Some(count)
+}
+
+/// Clean phantom releases from a single PyPI metadata.json.
+///
+/// PyPI metadata has `releases` keyed by version, each containing an array of files.
+/// A phantom = a version key where none of the referenced files exist in storage.
+async fn clean_pypi_metadata(
+    storage: &Storage,
+    meta_key: &str,
+    all_file_keys: &HashSet<String>,
+    dry_run: bool,
+) -> Option<usize> {
+    let data = storage.get(meta_key).await.ok()?;
+    let mut json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+
+    // Extract package name from key: pypi/{name}/metadata.json
+    let package_name = meta_key
+        .strip_prefix("pypi/")?
+        .strip_suffix("/metadata.json")?;
+
+    let releases = json.get("releases")?.as_object()?.clone();
+    let mut phantoms: Vec<String> = Vec::new();
+
+    for (ver_key, files_val) in &releases {
+        let files = match files_val.as_array() {
+            Some(arr) => arr,
+            None => {
+                phantoms.push(ver_key.clone());
+                continue;
+            }
+        };
+
+        // Check if ANY file from this release exists in storage
+        let has_file = files.iter().any(|f| {
+            if let Some(filename) = f.get("filename").and_then(|v| v.as_str()) {
+                let file_key = format!("pypi/{}/{}", package_name, filename);
+                all_file_keys.contains(&file_key)
+            } else {
+                false
+            }
+        });
+
+        if !has_file && !files.is_empty() {
+            phantoms.push(ver_key.clone());
+        }
+    }
+
+    if phantoms.is_empty() {
+        return Some(0);
+    }
+
+    let count = phantoms.len();
+    for phantom in &phantoms {
+        info!(
+            "[metadata-gc] pypi {}: phantom release {} (no files)",
+            package_name, phantom
+        );
+    }
+
+    if !dry_run {
+        if let Some(releases_obj) = json.get_mut("releases").and_then(|v| v.as_object_mut()) {
+            for phantom in &phantoms {
+                releases_obj.remove(phantom.as_str());
+            }
+        }
+        if let Ok(new_data) = serde_json::to_vec(&json) {
+            let _ = storage.put(meta_key, &new_data).await;
+        }
+    }
+
+    Some(count)
+}
+
+// ============================================================================
 // Background scheduler
 // ============================================================================
 
@@ -419,8 +646,9 @@ pub fn spawn_gc_scheduler(
             info!("GC scheduler: starting periodic run");
             let result = run_gc(&storage, dry_run).await;
             info!(
-                "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed",
-                result.duration_secs, result.orphaned, result.deleted, result.bytes_freed
+                "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms",
+                result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
+                result.metadata_phantoms_removed
             );
 
             drop(guard);
@@ -447,6 +675,7 @@ mod tests {
             orphan_keys: vec![],
             duration_secs: 0.0,
             uncovered: vec![],
+            metadata_phantoms_removed: 0,
         };
         assert_eq!(result.total_candidates, 0);
         assert!(result.orphan_keys.is_empty());
@@ -914,5 +1143,218 @@ mod tests {
         let result = run_gc(&storage, false).await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
+    }
+
+    // -- Metadata phantom tests --
+
+    #[tokio::test]
+    async fn test_gc_npm_no_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // metadata + matching tarball
+        let meta = serde_json::json!({
+            "versions": {"1.0.0": {"name": "lodash"}},
+            "time": {"1.0.0": "2024-01-15T10:30:00Z"}
+        });
+        storage
+            .put(
+                "npm/lodash/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/lodash/tarballs/lodash-1.0.0.tgz", b"tarball")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.metadata_phantoms_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_phantom_detected_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // metadata references 1.0.0 and 2.0.0, but only 2.0.0 tarball exists
+        let meta = serde_json::json!({
+            "versions": {
+                "1.0.0": {"name": "lodash"},
+                "2.0.0": {"name": "lodash"}
+            },
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00Z",
+                "2.0.0": "2024-06-01T00:00:00Z"
+            }
+        });
+        storage
+            .put(
+                "npm/lodash/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/lodash/tarballs/lodash-2.0.0.tgz", b"tarball")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.metadata_phantoms_removed, 1);
+
+        // Dry run: metadata should be unchanged
+        let data = storage.get("npm/lodash/metadata.json").await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert!(json["versions"]["1.0.0"].is_object()); // still there
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_phantom_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let meta = serde_json::json!({
+            "versions": {
+                "1.0.0": {"name": "lodash"},
+                "2.0.0": {"name": "lodash"}
+            },
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00Z",
+                "2.0.0": "2024-06-01T00:00:00Z"
+            }
+        });
+        storage
+            .put(
+                "npm/lodash/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/lodash/tarballs/lodash-2.0.0.tgz", b"tarball")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, false).await;
+        assert_eq!(result.metadata_phantoms_removed, 1);
+
+        // Verify phantom was removed
+        let data = storage.get("npm/lodash/metadata.json").await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert!(json["versions"]["1.0.0"].is_null());
+        assert!(json["versions"]["2.0.0"].is_object());
+        assert!(json["time"]["1.0.0"].is_null());
+        assert!(json["time"]["2.0.0"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_gc_pypi_no_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let meta = serde_json::json!({
+            "releases": {
+                "1.0.0": [{"filename": "flask-1.0.0.tar.gz"}]
+            }
+        });
+        storage
+            .put(
+                "pypi/flask/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("pypi/flask/flask-1.0.0.tar.gz", b"package")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, true).await;
+        assert_eq!(result.metadata_phantoms_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_pypi_phantom_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let meta = serde_json::json!({
+            "releases": {
+                "1.0.0": [{"filename": "flask-1.0.0.tar.gz"}],
+                "2.0.0": [{"filename": "flask-2.0.0.tar.gz"}]
+            }
+        });
+        storage
+            .put(
+                "pypi/flask/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        // Only 2.0.0 tarball exists
+        storage
+            .put("pypi/flask/flask-2.0.0.tar.gz", b"package")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, false).await;
+        assert_eq!(result.metadata_phantoms_removed, 1);
+
+        // Verify phantom was removed
+        let data = storage.get("pypi/flask/metadata.json").await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert!(json["releases"]["1.0.0"].is_null());
+        assert!(json["releases"]["2.0.0"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_gc_mixed_orphans_and_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Docker: 1 orphan blob
+        let manifest = serde_json::json!({
+            "config": {"digest": "sha256:cfg1"},
+            "layers": []
+        });
+        storage
+            .put(
+                "docker/app/manifests/v1.json",
+                manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/app/blobs/sha256:cfg1", b"config")
+            .await
+            .unwrap();
+        storage
+            .put("docker/app/blobs/sha256:stale", b"old")
+            .await
+            .unwrap();
+
+        // npm: 1 phantom version
+        let meta = serde_json::json!({
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z", "2.0.0": "2024-06-01T00:00:00Z"}
+        });
+        storage
+            .put(
+                "npm/test-pkg/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/test-pkg/tarballs/test-pkg-2.0.0.tgz", b"tarball")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, false).await;
+        assert_eq!(result.orphaned, 1); // docker blob
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
     }
 }
