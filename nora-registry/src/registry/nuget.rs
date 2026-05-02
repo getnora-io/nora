@@ -279,6 +279,9 @@ async fn flatcontainer_download(
 
     // Curation check for .nupkg downloads
     if filename.ends_with(".nupkg") {
+        // Extract publish date from cached registration index
+        let publish_date = extract_nuget_publish_date(&state.storage, &id_lower, ver).await;
+
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
@@ -286,7 +289,7 @@ async fn flatcontainer_download(
             crate::curation::RegistryType::Nuget,
             &id_lower,
             Some(ver),
-            None,
+            publish_date,
         ) {
             return response;
         }
@@ -399,6 +402,36 @@ fn extract_host(state: &AppState, headers: &HeaderMap) -> String {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost:4000")
         .to_string()
+}
+
+/// Extract publish date from cached NuGet registration index.
+///
+/// NuGet registration index JSON has nested items:
+/// ```json
+/// { "items": [{ "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
+/// ```
+// TODO(v1.0): trust_upstream_dates config for high-security installs
+async fn extract_nuget_publish_date(
+    storage: &crate::storage::Storage,
+    id: &str,
+    version: &str,
+) -> Option<i64> {
+    let meta_key = format!("nuget/registration/{}/index.json", id.to_lowercase());
+    let data = storage.get(&meta_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let pages = json.get("items")?.as_array()?;
+    for page in pages {
+        let items = page.get("items")?.as_array()?;
+        for item in items {
+            let entry = item.get("catalogEntry")?;
+            let ver = entry.get("version")?.as_str()?;
+            if ver.eq_ignore_ascii_case(version) {
+                let date_str = entry.get("published")?.as_str()?;
+                return crate::curation::parse_iso8601_to_unix(date_str);
+            }
+        }
+    }
+    None
 }
 
 fn upstream_url(state: &AppState) -> String {
@@ -553,5 +586,59 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_extract_nuget_publish_date_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({
+            "items": [{
+                "items": [{
+                    "catalogEntry": {
+                        "version": "6.0.0",
+                        "published": "2023-11-14T10:30:00Z"
+                    }
+                }]
+            }]
+        });
+        storage
+            .put(
+                "nuget/registration/newtonsoft.json/index.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_nuget_publish_date(&storage, "newtonsoft.json", "6.0.0").await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_extract_nuget_publish_date_version_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({
+            "items": [{"items": [{"catalogEntry": {"version": "1.0.0", "published": "2023-01-01T00:00:00Z"}}]}]
+        });
+        storage
+            .put(
+                "nuget/registration/test/index.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_nuget_publish_date(&storage, "test", "9.9.9").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_nuget_publish_date_no_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let result = super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0").await;
+        assert!(result.is_none());
     }
 }

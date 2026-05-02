@@ -360,9 +360,23 @@ fn format_artifact(module: &str, file: &str) -> String {
 
 /// Build response with Content-Type header
 fn with_content_type(data: Vec<u8>, content_type: &'static str) -> Response {
+    // .zip and .mod are content-addressed/versioned (immutable)
+    // .info, list, @latest are metadata (mutable)
+    let cache_control = if content_type == "application/zip" || content_type == "text/plain" {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=60, must-revalidate"
+    };
+
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(cache_control),
+            ),
+        ],
         data,
     )
         .into_response()

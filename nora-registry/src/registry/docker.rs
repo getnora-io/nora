@@ -44,9 +44,15 @@ pub struct LayerInfo {
     pub size: u64,
 }
 
-/// In-progress upload session with metadata
+/// In-progress upload session with metadata.
+///
+/// Blob data is streamed to a temporary file instead of being buffered in memory.
+/// This prevents 100 concurrent 2GB uploads from consuming 200GB of RAM.
 pub struct UploadSession {
-    data: Vec<u8>,
+    /// Path to the temporary file holding blob data.
+    temp_path: std::path::PathBuf,
+    /// Current size of data written to temp file.
+    size: u64,
     name: String,
     created_at: std::time::Instant,
 }
@@ -75,11 +81,18 @@ fn max_session_size() -> usize {
     mb.saturating_mul(1024 * 1024)
 }
 
-/// Remove expired upload sessions (called by background task)
+/// Remove expired upload sessions and their temp files (called by background task)
 pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>>) {
     let mut guard = sessions.write();
     let before = guard.len();
-    guard.retain(|_, s| s.created_at.elapsed() < SESSION_TTL);
+    guard.retain(|_, s| {
+        if s.created_at.elapsed() >= SESSION_TTL {
+            let _ = std::fs::remove_file(&s.temp_path);
+            false
+        } else {
+            true
+        }
+    });
     let removed = before - guard.len();
     if removed > 0 {
         tracing::info!(
@@ -88,6 +101,13 @@ pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>
             "Cleaned up expired upload sessions"
         );
     }
+}
+
+/// Get the temp directory for Docker uploads, creating it if needed.
+fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -250,7 +270,10 @@ async fn download_blob(
         ));
         return (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
             data,
         )
             .into_response();
@@ -355,13 +378,18 @@ async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 
     let uuid = uuid::Uuid::new_v4().to_string();
 
+    // Create temp file for blob data
+    let temp_dir = upload_temp_dir(&state.config.storage.path);
+    let temp_path = temp_dir.join(&uuid);
+
     // Create session with metadata
     {
         let mut sessions = state.upload_sessions.write();
         sessions.insert(
             uuid.clone(),
             UploadSession {
-                data: Vec::new(),
+                temp_path,
+                size: 0,
                 name: name.clone(),
                 created_at: std::time::Instant::now(),
             },
@@ -390,7 +418,7 @@ async fn patch_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Append data to the upload session and get total size
+    // Append data to temp file and get total size
     let total_size = {
         let mut sessions = state.upload_sessions.write();
         let session = match sessions.get_mut(&uuid) {
@@ -417,13 +445,15 @@ async fn patch_blob(
 
         // Check session TTL
         if session.created_at.elapsed() >= SESSION_TTL {
+            let _ = std::fs::remove_file(&session.temp_path);
             sessions.remove(&uuid);
             return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
         }
 
         // Check size limit
-        let new_size = session.data.len() + body.len();
+        let new_size = session.size as usize + body.len();
         if new_size > max_session_size() {
+            let _ = std::fs::remove_file(&session.temp_path);
             sessions.remove(&uuid);
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -432,8 +462,31 @@ async fn patch_blob(
                 .into_response();
         }
 
-        session.data.extend_from_slice(&body);
-        session.data.len()
+        // Append to temp file
+        use std::io::Write;
+        let temp_path = session.temp_path.clone();
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temp_path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&body) {
+                    tracing::error!(error = %e, "Failed to write to upload temp file");
+                    let _ = std::fs::remove_file(&temp_path);
+                    sessions.remove(&uuid);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to open upload temp file");
+                sessions.remove(&uuid);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+
+        session.size = new_size as u64;
+        new_size
     };
 
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
@@ -477,7 +530,7 @@ async fn upload_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Get data from chunked session if exists, otherwise use body directly
+    // Get data from chunked session (temp file) if exists, otherwise use body directly
     let data = {
         let mut sessions = state.upload_sessions.write();
         if let Some(session) = sessions.remove(&uuid) {
@@ -488,14 +541,30 @@ async fn upload_blob(
                     request_name = %name,
                     "SECURITY: upload finalization name mismatch"
                 );
+                let _ = std::fs::remove_file(&session.temp_path);
                 return (
                     StatusCode::BAD_REQUEST,
                     "Session does not belong to this repository",
                 )
                     .into_response();
             }
-            // Chunked upload: append any final body data and use session
-            let mut session_data = session.data;
+            // Read temp file if it exists (may not exist for monolithic uploads
+            // where no PATCH was sent before the final PUT)
+            let mut session_data = if session.temp_path.exists() {
+                match std::fs::read(&session.temp_path) {
+                    Ok(data) => {
+                        let _ = std::fs::remove_file(&session.temp_path);
+                        data
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to read upload temp file");
+                        let _ = std::fs::remove_file(&session.temp_path);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             if !body.is_empty() {
                 session_data.extend_from_slice(&body);
             }
@@ -580,6 +649,15 @@ async fn get_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    // Extract publish date from .meta.json sidecar
+    let publish_date = extract_docker_publish_date(
+        &state.storage,
+        &name,
+        &reference,
+        state.config.docker.upstreams.is_empty(),
+    )
+    .await;
+
     // Curation check — manifests carry the image identity
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -588,7 +666,7 @@ async fn get_manifest(
         crate::curation::RegistryType::Docker,
         &name,
         Some(&reference),
-        None,
+        publish_date,
     ) {
         return response;
     }
@@ -1236,6 +1314,36 @@ fn detect_manifest_media_type(data: &[u8]) -> String {
     "application/vnd.docker.distribution.manifest.v2+json".to_string()
 }
 
+/// Extract publish date from Docker manifest `.meta.json` sidecar.
+///
+/// Docker metadata sidecar stores `push_timestamp` (Unix seconds) when the
+/// manifest was first pushed or cached.
+// TODO(v1.0): trust_upstream_dates config for high-security installs
+async fn extract_docker_publish_date(
+    storage: &Storage,
+    name: &str,
+    reference: &str,
+    upstreams_empty: bool,
+) -> Option<i64> {
+    // Try .meta.json sidecar (has push_timestamp)
+    let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
+    if let Ok(data) = storage.get(&meta_key).await {
+        if let Ok(meta) = serde_json::from_slice::<ImageMetadata>(&data) {
+            if meta.push_timestamp > 0 {
+                return Some(meta.push_timestamp as i64);
+            }
+        }
+    }
+
+    // mtime fallback — only for hosted mode (no upstreams configured)
+    if upstreams_empty {
+        let manifest_key = format!("docker/{}/manifests/{}.json", name, reference);
+        return crate::curation::extract_mtime_as_publish_date(storage, &manifest_key).await;
+    }
+
+    None
+}
+
 /// Extract metadata from a Docker manifest
 /// Handles both single-arch manifests and multi-arch indexes
 async fn extract_metadata(manifest: &[u8], storage: &Storage, name: &str) -> ImageMetadata {
@@ -1486,10 +1594,14 @@ mod tests {
     #[test]
     fn test_cleanup_expired_sessions_fresh() {
         let sessions: RwLock<HashMap<String, UploadSession>> = RwLock::new(HashMap::new());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path().join("uuid-1");
+        std::fs::write(&temp_path, b"test data").unwrap();
         sessions.write().insert(
             "uuid-1".to_string(),
             UploadSession {
-                data: vec![1, 2, 3],
+                temp_path,
+                size: 9,
                 name: "test/image".to_string(),
                 created_at: std::time::Instant::now(),
             },
@@ -1984,5 +2096,74 @@ mod integration_tests {
             .to_str()
             .unwrap()
             .starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_docker_publish_date_from_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = super::ImageMetadata {
+            push_timestamp: 1700000000,
+            ..Default::default()
+        };
+        storage
+            .put(
+                "docker/library/nginx/manifests/latest.meta.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_docker_publish_date(
+            &storage,
+            "library/nginx",
+            "latest",
+            true, // no upstreams
+        )
+        .await;
+        assert_eq!(result, Some(1700000000));
+    }
+
+    #[tokio::test]
+    async fn test_extract_docker_publish_date_mtime_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // No .meta.json, but manifest exists — should fall back to mtime (hosted mode)
+        storage
+            .put("docker/library/nginx/manifests/latest.json", b"{}")
+            .await
+            .unwrap();
+
+        let result = super::extract_docker_publish_date(
+            &storage,
+            "library/nginx",
+            "latest",
+            true, // hosted mode (no upstreams)
+        )
+        .await;
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_extract_docker_publish_date_proxy_no_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // No .meta.json, manifest exists, but proxy mode — no fallback
+        storage
+            .put("docker/library/nginx/manifests/latest.json", b"{}")
+            .await
+            .unwrap();
+
+        let result = super::extract_docker_publish_date(
+            &storage,
+            "library/nginx",
+            "latest",
+            false, // proxy mode (has upstreams)
+        )
+        .await;
+        assert!(result.is_none());
     }
 }

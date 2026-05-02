@@ -176,6 +176,9 @@ async fn provider_download_meta(
     let host = extract_host(&state, &headers);
     let artifact = format!("{}/{} v{} {}/{}", ns, ptype, ver, os, arch);
 
+    // Extract publish date from cached metadata
+    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver).await;
+
     // Curation check
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -184,7 +187,7 @@ async fn provider_download_meta(
         crate::curation::RegistryType::Terraform,
         &format!("{}/{}", ns, ptype),
         Some(&ver),
-        None,
+        publish_date,
     ) {
         return response;
     }
@@ -495,6 +498,42 @@ fn extract_host(state: &AppState, headers: &HeaderMap) -> String {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost:4000")
         .to_string()
+}
+
+/// Extract publish date from cached Terraform provider versions metadata.
+///
+/// Terraform registry API does not reliably include `published_at` in the
+/// versions listing. Falls back to mtime for hosted-only mode.
+// TODO(v1.0): trust_upstream_dates config for high-security installs
+async fn extract_terraform_publish_date(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+) -> Option<i64> {
+    // Try download metadata JSON (per-version cached file)
+    let storage_key = format!("terraform/providers/{}/{}/{}/download.json", ns, ptype, ver);
+    if let Ok(data) = state.storage.get(&storage_key).await {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(date_str) = json.get("published_at").and_then(|v| v.as_str()) {
+                return crate::curation::parse_iso8601_to_unix(date_str);
+            }
+        }
+    }
+
+    // mtime fallback — only for hosted mode (proxy mtime = cache time)
+    if state.config.terraform.proxy.is_none() {
+        // Try any cached platform-specific metadata
+        for suffix in &["linux_amd64.json", "linux_arm64.json", "darwin_amd64.json"] {
+            let meta_key = format!("terraform/providers/{}/{}/{}/{}", ns, ptype, ver, suffix);
+            if let Some(ts) =
+                crate::curation::extract_mtime_as_publish_date(&state.storage, &meta_key).await
+            {
+                return Some(ts);
+            }
+        }
+    }
+    None
 }
 
 fn upstream_url(state: &AppState) -> String {

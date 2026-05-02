@@ -72,13 +72,21 @@ impl HashPinStore {
     /// If the key is new, the hash is pinned. If the key exists with the same
     /// hash, this is a no-op. If the hash changed (normal metadata update),
     /// the pin is updated.
+    ///
+    /// The write lock is released before file I/O to minimize lock contention.
     pub fn record(&self, key: &str, data: &[u8]) {
         let hash = Self::sha256_hex(data);
-        let mut pins = self.pins.write();
-        let should_write = pins.get(key).is_none_or(|existing| *existing != hash);
+        let should_write = {
+            let mut pins = self.pins.write();
+            let changed = pins.get(key).is_none_or(|existing| *existing != hash);
+            if changed {
+                pins.insert(key.to_string(), hash.clone());
+            }
+            changed
+        };
+        // File append after lock release — ~100 bytes, fast on any filesystem
         if should_write {
-            pins.insert(key.to_string(), hash.clone());
-            self.append(key, &hash);
+            Self::append_to_file(&self.path, key, &hash);
         }
     }
 
@@ -104,10 +112,15 @@ impl HashPinStore {
     }
 
     /// Remove a pin entry. Called on `delete()`.
+    ///
+    /// The write lock is released before file I/O.
     pub fn remove(&self, key: &str) {
-        let mut pins = self.pins.write();
-        if pins.remove(key).is_some() {
-            self.append(key, "");
+        let removed = {
+            let mut pins = self.pins.write();
+            pins.remove(key).is_some()
+        };
+        if removed {
+            Self::append_to_file(&self.path, key, "");
         }
     }
 
@@ -140,12 +153,12 @@ impl HashPinStore {
         }
     }
 
-    /// Append a single entry to the NDJSON file.
-    fn append(&self, key: &str, hash: &str) {
+    /// Append a single entry to the NDJSON file (static, safe to call from any thread).
+    fn append_to_file(path: &std::path::Path, key: &str, hash: &str) {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(path)
         {
             let entry = PinEntry {
                 k: key.to_string(),
@@ -266,6 +279,9 @@ mod tests {
         // Same data twice — should not append duplicate
         store.record("key", b"data");
         store.record("key", b"data");
+
+        // Wait for background I/O thread to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

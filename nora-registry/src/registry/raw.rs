@@ -33,6 +33,11 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let key = format!("raw/{}", path);
+
+    // mtime fallback — Raw is always hosted (no proxy)
+    let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await;
+
     // Curation check — raw files are treated as name=path, no version
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -41,12 +46,10 @@ async fn download(
         crate::curation::RegistryType::Raw,
         &path,
         None,
-        None,
+        publish_date,
     ) {
         return response;
     }
-
-    let key = format!("raw/{}", path);
     match state.storage.get(&key).await {
         Ok(data) => {
             state.metrics.record_download("raw");
@@ -59,7 +62,15 @@ async fn download(
 
             // Guess content type from extension
             let content_type = guess_content_type(&key);
-            (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data).into_response()
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                ],
+                data,
+            )
+                .into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }

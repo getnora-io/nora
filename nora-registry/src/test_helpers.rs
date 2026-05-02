@@ -140,6 +140,7 @@ fn build_context(
             anonymous_read,
             htpasswd_file: String::new(),
             token_storage: tempdir.path().join("tokens").to_str().unwrap().to_string(),
+            trusted_proxies: crate::config::TrustedProxies::default_loopback(),
         },
         rate_limit: RateLimitConfig {
             enabled: false,

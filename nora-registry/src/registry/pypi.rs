@@ -68,7 +68,10 @@ async fn list_packages(
         });
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, PEP691_JSON)],
+            [
+                (header::CONTENT_TYPE, PEP691_JSON),
+                (header::CACHE_CONTROL, "public, max-age=60, must-revalidate"),
+            ],
             serde_json::to_string(&body).unwrap_or_default(),
         )
             .into_response()
@@ -81,7 +84,12 @@ async fn list_packages(
             html.push_str(&format!("<a href=\"/simple/{}/\">{}</a><br>\n", pkg, pkg));
         }
         html.push_str("</body></html>");
-        (StatusCode::OK, Html(html)).into_response()
+        (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "public, max-age=60, must-revalidate")],
+            Html(html),
+        )
+            .into_response()
     }
 }
 
@@ -228,7 +236,15 @@ async fn download_file(
             .log(AuditEntry::new("cache_hit", "api", "", "pypi", ""));
 
         let content_type = pypi_content_type(&filename);
-        return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data).into_response();
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            data,
+        )
+            .into_response();
     }
 
     // Try proxy if configured

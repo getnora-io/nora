@@ -273,6 +273,9 @@ async fn download_archive(
         );
     }
 
+    // Extract publish date from cached metadata (works for both hosted and proxy)
+    let publish_date = extract_pub_publish_date(&state.storage, &package, version).await;
+
     // Curation check
     if let Some(response) = crate::curation::check_download(
         &state.curation,
@@ -281,7 +284,7 @@ async fn download_archive(
         crate::curation::RegistryType::PubDart,
         &package,
         Some(version),
-        None,
+        publish_date,
     ) {
         return response;
     }
@@ -588,6 +591,30 @@ fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
+/// Extract publish date from cached pub.dev package metadata.
+///
+/// Pub metadata JSON has a `versions` array, each with `published`:
+/// ```json
+/// { "versions": [{ "version": "1.0.0", "published": "2024-01-15T10:30:00.000Z" }] }
+/// ```
+async fn extract_pub_publish_date(
+    storage: &crate::storage::Storage,
+    package: &str,
+    version: &str,
+) -> Option<i64> {
+    let meta_key = format!("pub/api/packages/{}.json", package);
+    let data = storage.get(&meta_key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let versions = json.get("versions")?.as_array()?;
+    for v in versions {
+        if v.get("version")?.as_str()? == version {
+            let date_str = v.get("published")?.as_str()?;
+            return crate::curation::parse_iso8601_to_unix(date_str);
+        }
+    }
+    None
+}
+
 fn is_valid_pub_package_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
@@ -838,5 +865,57 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&cached).unwrap();
         assert!(json["advisories"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_extract_pub_publish_date_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({
+            "name": "http",
+            "versions": [
+                {"version": "0.13.0", "published": "2021-01-08T12:30:00.000Z"},
+                {"version": "1.0.0", "published": "2023-05-15T08:00:00.000Z"}
+            ]
+        });
+        storage
+            .put(
+                "pub/api/packages/http.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_pub_publish_date(&storage, "http", "1.0.0").await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_extract_pub_publish_date_version_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({
+            "name": "http",
+            "versions": [{"version": "1.0.0", "published": "2023-05-15T08:00:00Z"}]
+        });
+        storage
+            .put(
+                "pub/api/packages/http.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::extract_pub_publish_date(&storage, "http", "2.0.0").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_pub_publish_date_no_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let result = super::extract_pub_publish_date(&storage, "nonexistent", "1.0.0").await;
+        assert!(result.is_none());
     }
 }
