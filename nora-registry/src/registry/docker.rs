@@ -270,7 +270,13 @@ async fn download_blob(
         ));
         return (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
             data,
         )
             .into_response();

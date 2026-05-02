@@ -129,6 +129,13 @@ async fn download(
 
     // Curation check — only for versioned artifact files, not metadata
     if let Some((ref maven_name, ref maven_version)) = curation_coords {
+        // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
+        let publish_date = if state.config.maven.proxies.is_empty() {
+            crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+        } else {
+            None
+        };
+
         if let Some(response) = crate::curation::check_download(
             &state.curation,
             state.config.curation.bypass_token.as_deref(),
@@ -136,7 +143,7 @@ async fn download(
             crate::curation::RegistryType::Maven,
             maven_name,
             Some(maven_version),
-            None,
+            publish_date,
         ) {
             return response;
         }
@@ -467,7 +474,7 @@ fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String])
 fn with_content_type(
     path: &str,
     data: Bytes,
-) -> (StatusCode, [(header::HeaderName, &'static str); 1], Bytes) {
+) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
     let content_type = if path.ends_with(".pom") {
         "application/xml"
     } else if path.ends_with(".jar") {
@@ -484,7 +491,24 @@ fn with_content_type(
         "application/octet-stream"
     };
 
-    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
+    // maven-metadata.xml is mutable; release artifacts are immutable
+    let cache_control = if path.ends_with("maven-metadata.xml")
+        || path.ends_with("maven-metadata.xml.sha1")
+        || path.ends_with("maven-metadata.xml.md5")
+    {
+        "public, max-age=60, must-revalidate"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        data,
+    )
 }
 
 // ============================================================================

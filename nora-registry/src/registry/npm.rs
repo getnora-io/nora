@@ -488,14 +488,28 @@ async fn extract_npm_publish_date(
 fn with_content_type(
     is_tarball: bool,
     data: Bytes,
-) -> (StatusCode, [(header::HeaderName, &'static str); 1], Bytes) {
-    let content_type = if is_tarball {
-        "application/octet-stream"
+) -> (
+    StatusCode,
+    [(header::HeaderName, &'static str); 2],
+    Bytes,
+) {
+    let (content_type, cache_control) = if is_tarball {
+        (
+            "application/octet-stream",
+            "public, max-age=31536000, immutable",
+        )
     } else {
-        "application/json"
+        ("application/json", "public, max-age=60, must-revalidate")
     };
 
-    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        data,
+    )
 }
 
 #[cfg(test)]
