@@ -488,11 +488,7 @@ async fn extract_npm_publish_date(
 fn with_content_type(
     is_tarball: bool,
     data: Bytes,
-) -> (
-    StatusCode,
-    [(header::HeaderName, &'static str); 2],
-    Bytes,
-) {
+) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
     let (content_type, cache_control) = if is_tarball {
         (
             "application/octet-stream",

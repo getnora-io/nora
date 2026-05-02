@@ -73,8 +73,7 @@ impl HashPinStore {
     /// hash, this is a no-op. If the hash changed (normal metadata update),
     /// the pin is updated.
     ///
-    /// File I/O is dispatched to a blocking thread to avoid holding the
-    /// write lock during disk writes on the tokio runtime.
+    /// The write lock is released before file I/O to minimize lock contention.
     pub fn record(&self, key: &str, data: &[u8]) {
         let hash = Self::sha256_hex(data);
         let should_write = {
@@ -85,12 +84,9 @@ impl HashPinStore {
             }
             changed
         };
+        // File append after lock release — ~100 bytes, fast on any filesystem
         if should_write {
-            let path = self.path.clone();
-            let key = key.to_string();
-            std::thread::spawn(move || {
-                Self::append_to_file(&path, &key, &hash);
-            });
+            Self::append_to_file(&self.path, key, &hash);
         }
     }
 
@@ -117,18 +113,14 @@ impl HashPinStore {
 
     /// Remove a pin entry. Called on `delete()`.
     ///
-    /// File I/O is dispatched to a separate thread.
+    /// The write lock is released before file I/O.
     pub fn remove(&self, key: &str) {
         let removed = {
             let mut pins = self.pins.write();
             pins.remove(key).is_some()
         };
         if removed {
-            let path = self.path.clone();
-            let key = key.to_string();
-            std::thread::spawn(move || {
-                Self::append_to_file(&path, &key, "");
-            });
+            Self::append_to_file(&self.path, key, "");
         }
     }
 
@@ -287,6 +279,9 @@ mod tests {
         // Same data twice — should not append duplicate
         store.record("key", b"data");
         store.record("key", b"data");
+
+        // Wait for background I/O thread to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

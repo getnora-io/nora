@@ -961,12 +961,12 @@ async fn run_server(config: Config, storage: Storage) {
             metrics_state.auth_failures.cleanup();
 
             // Every 60s (every other tick): refresh S3 total_size cache
-            if tick_count % 2 == 0 {
+            if tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_total_size_cache().await;
             }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
-            if tick_count % 10 == 0 {
+            if tick_count.is_multiple_of(10) {
                 let mut locks = metrics_state.publish_locks.lock();
                 locks.retain(|_, arc| Arc::strong_count(arc) > 1);
             }

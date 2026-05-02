@@ -150,6 +150,7 @@ impl S3Storage {
 
     fn parse_s3_keys(xml: &str, prefix: &str) -> Vec<String> {
         xml.split("<Key>")
+            .skip(1) // first element is the preamble before any <Key>
             .filter_map(|part| part.split("</Key>").next())
             .filter(|key| key.starts_with(prefix))
             .map(String::from)
@@ -255,7 +256,6 @@ impl S3Storage {
             _ => None,
         }
     }
-
 }
 
 /// URL-encode a string for S3 canonical URI (encode all except A-Za-z0-9-_.~/)
@@ -345,8 +345,7 @@ impl StorageBackend for S3Storage {
                 None => break,
             };
 
-            let (keys, is_truncated, next_token) =
-                Self::parse_s3_list_response(&xml, prefix);
+            let (keys, is_truncated, next_token) = Self::parse_s3_list_response(&xml, prefix);
             all_keys.extend(keys);
 
             if !is_truncated {
@@ -520,8 +519,7 @@ mod tests {
             <Contents><Key>docker/a</Key></Contents>
             <Contents><Key>docker/b</Key></Contents>
         </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) =
-            S3Storage::parse_s3_list_response(xml, "docker/");
+        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "docker/");
         assert_eq!(keys, vec!["docker/a", "docker/b"]);
         assert!(!is_truncated);
         assert!(next_token.is_none());
@@ -535,8 +533,7 @@ mod tests {
             <NextContinuationToken>abc123</NextContinuationToken>
             <Contents><Key>docker/a</Key></Contents>
         </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) =
-            S3Storage::parse_s3_list_response(xml, "docker/");
+        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "docker/");
         assert_eq!(keys, vec!["docker/a"]);
         assert!(is_truncated);
         assert_eq!(next_token, Some("abc123".to_string()));
@@ -548,8 +545,7 @@ mod tests {
         <ListBucketResult>
             <IsTruncated>false</IsTruncated>
         </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) =
-            S3Storage::parse_s3_list_response(xml, "");
+        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "");
         assert!(keys.is_empty());
         assert!(!is_truncated);
         assert!(next_token.is_none());

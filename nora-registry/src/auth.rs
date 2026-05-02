@@ -163,10 +163,7 @@ fn extract_client_ip(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
 
-    let peer = match peer_ip {
-        Some(ip) => ip,
-        None => return None,
-    };
+    let peer = peer_ip?;
 
     // Only trust forwarding headers from known proxies
     if !trusted_proxies.contains(peer) {
@@ -779,9 +776,10 @@ mod tests {
             .header("x-forwarded-for", "1.2.3.4, 127.0.0.1")
             .body(Body::empty())
             .unwrap();
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new("127.0.0.1".parse().unwrap(), 1234)));
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            1234,
+        )));
         let ip = extract_client_ip(&request, &proxies);
         assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
     }
@@ -796,9 +794,10 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         // Peer is NOT in trusted list
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new("5.6.7.8".parse().unwrap(), 1234)));
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "5.6.7.8".parse().unwrap(),
+            1234,
+        )));
         let ip = extract_client_ip(&request, &proxies);
         assert_eq!(ip, Some("5.6.7.8".parse().unwrap()));
     }
@@ -807,13 +806,11 @@ mod tests {
     fn test_xff_no_header_uses_peer_ip() {
         use crate::config::TrustedProxies;
         let proxies = TrustedProxies::parse("127.0.0.1,::1");
-        let mut request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new("127.0.0.1".parse().unwrap(), 1234)));
+        let mut request = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            1234,
+        )));
         let ip = extract_client_ip(&request, &proxies);
         assert_eq!(ip, Some("127.0.0.1".parse().unwrap()));
     }

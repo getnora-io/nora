@@ -272,10 +272,7 @@ async fn download_blob(
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
-                (
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                ),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             ],
             data,
         )
@@ -551,17 +548,23 @@ async fn upload_blob(
                 )
                     .into_response();
             }
-            // Chunked upload: read temp file, append any final body data
-            let mut session_data = match std::fs::read(&session.temp_path) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to read upload temp file");
-                    let _ = std::fs::remove_file(&session.temp_path);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            // Read temp file if it exists (may not exist for monolithic uploads
+            // where no PATCH was sent before the final PUT)
+            let mut session_data = if session.temp_path.exists() {
+                match std::fs::read(&session.temp_path) {
+                    Ok(data) => {
+                        let _ = std::fs::remove_file(&session.temp_path);
+                        data
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to read upload temp file");
+                        let _ = std::fs::remove_file(&session.temp_path);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                 }
+            } else {
+                Vec::new()
             };
-            // Clean up temp file
-            let _ = std::fs::remove_file(&session.temp_path);
             if !body.is_empty() {
                 session_data.extend_from_slice(&body);
             }

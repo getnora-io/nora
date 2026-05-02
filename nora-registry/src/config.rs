@@ -529,7 +529,10 @@ impl TrustedProxies {
                 continue;
             }
             if let Some((addr_str, prefix_str)) = item.split_once('/') {
-                if let (Ok(addr), Ok(prefix)) = (addr_str.parse::<std::net::IpAddr>(), prefix_str.parse::<u8>()) {
+                if let (Ok(addr), Ok(prefix)) = (
+                    addr_str.parse::<std::net::IpAddr>(),
+                    prefix_str.parse::<u8>(),
+                ) {
                     let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
                     if prefix <= max_prefix {
                         entries.push((addr, prefix));
@@ -596,21 +599,30 @@ impl Default for TrustedProxies {
 // TrustedProxies doesn't need serde — it's parsed from a string.
 // Provide a dummy Serialize/Deserialize so AuthConfig can derive them.
 impl Serialize for TrustedProxies {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let parts: Vec<String> = self.entries.iter().map(|(addr, prefix)| {
-            let max = if addr.is_ipv4() { 32 } else { 128 };
-            if *prefix == max {
-                addr.to_string()
-            } else {
-                format!("{}/{}", addr, prefix)
-            }
-        }).collect();
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(addr, prefix)| {
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                if *prefix == max {
+                    addr.to_string()
+                } else {
+                    format!("{}/{}", addr, prefix)
+                }
+            })
+            .collect();
         parts.join(",").serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for TrustedProxies {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Ok(Self::parse(&s))
     }
