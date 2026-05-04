@@ -615,4 +615,16 @@ mod tests {
         assert_eq!(uri_encode("%"), "%25");
         assert_eq!(uri_encode("100%done"), "100%25done");
     }
+
+    #[test]
+    fn test_uri_encode_colon_for_docker_digests() {
+        // Colon must NOT be encoded — reqwest sends raw ':' in URL paths.
+        // Encoding ':' to '%3A' causes SigV4 signature mismatch with strict
+        // S3 implementations (e.g. Garage) that verify canonical URI byte-for-byte.
+        assert_eq!(uri_encode("sha256:abc123def"), "sha256:abc123def");
+        assert_eq!(
+            uri_encode("docker/sha256:abc/blobs/sha256:def456"),
+            "docker/sha256:abc/blobs/sha256:def456"
+        );
+    }
 }
