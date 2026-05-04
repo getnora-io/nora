@@ -924,23 +924,33 @@ pub async fn get_generic_detail(storage: &Storage, registry: &str, name: &str) -
 }
 
 async fn get_nuget_detail(storage: &Storage, name: &str) -> PackageDetail {
+    // Load registration index for real published dates from upstream metadata
+    let reg_key = format!("nuget/registration/{}/index.json", name);
+    let reg_meta = load_nuget_registration_meta(storage, &reg_key).await;
+
     let key = format!("nuget/flatcontainer/{}/index.json", name);
     if let Ok(data) = storage.get(&key).await {
         if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&data) {
             if let Some(versions) = index.get("versions").and_then(|v| v.as_array()) {
-                let meta = storage.stat(&key).await;
-                let published = meta
-                    .as_ref()
+                let fallback_ts = storage
+                    .stat(&key)
+                    .await
                     .map(|m| format_timestamp(m.modified))
                     .unwrap_or_else(|| "N/A".to_string());
                 let version_list: Vec<VersionInfo> = versions
                     .iter()
                     .rev()
                     .filter_map(|v| v.as_str())
-                    .map(|v| VersionInfo {
-                        version: v.to_string(),
-                        size: 0,
-                        published: published.clone(),
+                    .map(|v| {
+                        let (published, size) = reg_meta
+                            .get(v)
+                            .map(|(p, s)| (p.clone(), *s))
+                            .unwrap_or_else(|| (fallback_ts.clone(), 0));
+                        VersionInfo {
+                            version: v.to_string(),
+                            size,
+                            published,
+                        }
                     })
                     .collect();
                 return PackageDetail {
@@ -950,6 +960,49 @@ async fn get_nuget_detail(storage: &Storage, name: &str) -> PackageDetail {
         }
     }
     PackageDetail { versions: vec![] }
+}
+
+/// Extract per-version (published, packageSize) from cached NuGet registration index.
+async fn load_nuget_registration_meta(
+    storage: &Storage,
+    key: &str,
+) -> HashMap<String, (String, u64)> {
+    let mut map = HashMap::new();
+    let data = match storage.get(key).await {
+        Ok(d) => d,
+        Err(_) => return map,
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(v) => v,
+        Err(_) => return map,
+    };
+    if let Some(pages) = json.get("items").and_then(|v| v.as_array()) {
+        for page in pages {
+            if let Some(items) = page.get("items").and_then(|v| v.as_array()) {
+                for item in items {
+                    if let Some(entry) = item.get("catalogEntry") {
+                        let ver = entry
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let published = entry
+                            .get("published")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.split('T').next().unwrap_or(s).to_string())
+                            .unwrap_or_else(|| "N/A".to_string());
+                        let size = entry
+                            .get("packageSize")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if !ver.is_empty() {
+                            map.insert(ver.to_string(), (published, size));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
 }
 
 async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
