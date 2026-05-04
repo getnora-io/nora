@@ -47,6 +47,12 @@ struct LangQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct DetailQuery {
+    lang: Option<String>,
+    prerelease: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ListQuery {
     lang: Option<String>,
     page: Option<usize>,
@@ -237,19 +243,15 @@ async fn maven_list(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_repos = state.repo_index.get("maven", &state.storage).await;
-    let (repos, total) = paginate(&all_repos, page, limit);
+    // Show top-level namespace directories (com, org, io, etc.)
+    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
+    let total = entries.len();
 
-    Html(render_registry_list_paginated(
-        "maven",
-        "Maven Repository",
-        &repos,
-        page,
-        limit,
+    Html(templates::render_maven_dir(
+        "",
+        &entries,
         total,
         lang,
         auth_enabled,
@@ -267,8 +269,25 @@ async fn maven_detail(
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let auth_enabled = state.auth.is_some();
-    let detail = get_maven_detail(&state.storage, &path).await;
-    Html(render_maven_detail(&path, &detail, lang, auth_enabled))
+
+    // Try hierarchical browsing: check if this is a directory or leaf artifact
+    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+
+    if is_leaf || entries.is_empty() {
+        // Leaf artifact — show files (JARs, POMs, etc.)
+        let detail = get_maven_detail(&state.storage, &path).await;
+        Html(render_maven_detail(&path, &detail, lang, auth_enabled))
+    } else {
+        // Namespace directory — show children
+        let total = entries.len();
+        Html(templates::render_maven_dir(
+            &path,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    }
 }
 
 // npm pages
@@ -575,16 +594,22 @@ async fn generic_registry_list(
 async fn generic_registry_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
+    let show_prerelease = query.prerelease.unwrap_or(false);
 
     // Extract registry type from URI: /ui/{type}/{name}
     let registry_key = uri
@@ -593,7 +618,7 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(&state.storage, registry_key, &name).await;
+    let detail = get_generic_detail(&state.storage, registry_key, &name, show_prerelease).await;
     Html(render_package_detail(
         registry_key,
         &name,

@@ -59,11 +59,13 @@ pub struct VersionInfo {
     pub version: String,
     pub size: u64,
     pub published: String,
+    pub cached: bool,
 }
 
 #[derive(Serialize)]
 pub struct PackageDetail {
     pub versions: Vec<VersionInfo>,
+    pub prerelease_count: usize,
 }
 
 #[derive(Serialize)]
@@ -628,6 +630,63 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
+/// List immediate children of a Maven namespace path for hierarchical browsing.
+/// Returns (entries, is_leaf_artifact). A leaf artifact has maven-metadata.xml.
+pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+    let prefix = if path.is_empty() {
+        "maven/".to_string()
+    } else {
+        format!("maven/{}/", path)
+    };
+    let keys = storage.list(&prefix).await;
+
+    if keys.is_empty() {
+        return (vec![], false);
+    }
+
+    // Leaf = no subdirectories (only direct files like JARs, POMs, checksums)
+    let has_subdirs = keys.iter().any(|k| {
+        k.strip_prefix(&prefix)
+            .is_some_and(|r| !r.is_empty() && r.contains('/'))
+    });
+    if !has_subdirs {
+        return (vec![], true);
+    }
+
+    // Group by immediate child segment (skip direct files like maven-metadata.xml)
+    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.is_empty() || !rest.contains('/') {
+                continue;
+            }
+            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
+            let entry = groups.entry(child_name).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<RepoInfo> = groups
+        .into_iter()
+        .map(|(name, (count, size, modified))| RepoInfo {
+            name,
+            versions: count,
+            size,
+            updated: format_timestamp(modified),
+            ..Default::default()
+        })
+        .collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+
+    (result, false)
+}
+
 #[allow(dead_code)]
 pub async fn get_npm_packages(storage: &Storage) -> Vec<RepoInfo> {
     let keys = storage.list("npm/").await;
@@ -723,6 +782,7 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                         version: version.clone(),
                         size,
                         published,
+                        cached: true,
                     });
                 }
             }
@@ -744,7 +804,10 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
         b_parts.cmp(&a_parts)
     });
 
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 #[allow(dead_code)]
@@ -808,12 +871,16 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
                     version: parts[0].to_string(),
                     size,
                     published,
+                    cached: true,
                 });
             }
         }
     }
 
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 #[allow(dead_code)]
@@ -876,54 +943,96 @@ pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
                     version,
                     size,
                     published,
+                    cached: true,
                 });
             }
         }
     }
 
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
     let prefix = format!("go/{}/@v/", module);
-    let keys = storage.list(&prefix).await;
 
-    let mut versions = Vec::new();
-    for key in keys.iter().filter(|k| k.ends_with(".zip")) {
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if let Some(version) = rest.strip_suffix(".zip") {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
-                versions.push(VersionInfo {
-                    version: version.to_string(),
-                    size,
-                    published,
-                });
+    // Read version list file (populated by go proxy on list requests)
+    let list_key = format!("{}list", prefix);
+    let mut known_versions: Vec<String> = Vec::new();
+    if let Ok(data) = storage.get(&list_key).await {
+        if let Ok(text) = String::from_utf8(data.to_vec()) {
+            for line in text.lines() {
+                let v = line.trim();
+                if !v.is_empty() {
+                    known_versions.push(v.to_string());
+                }
             }
         }
     }
 
+    // Also scan for .zip files that might exist without being in the list
+    let keys = storage.list(&prefix).await;
+    for key in keys.iter().filter(|k| k.ends_with(".zip")) {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if let Some(version) = rest.strip_suffix(".zip") {
+                if !known_versions.iter().any(|v| v == version) {
+                    known_versions.push(version.to_string());
+                }
+            }
+        }
+    }
+
+    let list_ts = storage
+        .stat(&list_key)
+        .await
+        .map(|m| format_timestamp(m.modified))
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let mut versions = Vec::new();
+    for v in &known_versions {
+        let zip_key = format!("{}{}.zip", prefix, v);
+        let (size, published, cached) = if let Some(meta) = storage.stat(&zip_key).await {
+            (meta.size, format_timestamp(meta.modified), true)
+        } else {
+            (0, list_ts.clone(), false)
+        };
+        versions.push(VersionInfo {
+            version: v.clone(),
+            size,
+            published,
+            cached,
+        });
+    }
+
     versions.sort_by(|a, b| b.version.cmp(&a.version));
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 /// Generic detail for new-format registries (NuGet, Gems, Terraform, Ansible, Pub, Conan).
 /// Reads version info from storage using registry-specific paths.
-pub async fn get_generic_detail(storage: &Storage, registry: &str, name: &str) -> PackageDetail {
+pub async fn get_generic_detail(
+    storage: &Storage,
+    registry: &str,
+    name: &str,
+    show_prerelease: bool,
+) -> PackageDetail {
     let name_lower = name.to_lowercase();
 
     match registry {
-        "nuget" => get_nuget_detail(storage, &name_lower).await,
+        "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease).await,
         "conan" => get_conan_detail(storage, &name_lower).await,
+        "gems" => get_gems_detail(storage, &name_lower).await,
         "pub" => get_pub_detail(storage, &name_lower).await,
         _ => get_storage_scan_detail(storage, registry, &name_lower).await,
     }
 }
 
-async fn get_nuget_detail(storage: &Storage, name: &str) -> PackageDetail {
+async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) -> PackageDetail {
     // Load registration index for real published dates from upstream metadata
     let reg_key = format!("nuget/registration/{}/index.json", name);
     let reg_meta = load_nuget_registration_meta(storage, &reg_key).await;
@@ -937,29 +1046,60 @@ async fn get_nuget_detail(storage: &Storage, name: &str) -> PackageDetail {
                     .await
                     .map(|m| format_timestamp(m.modified))
                     .unwrap_or_else(|| "N/A".to_string());
-                let version_list: Vec<VersionInfo> = versions
-                    .iter()
-                    .rev()
-                    .filter_map(|v| v.as_str())
-                    .map(|v| {
-                        let (published, size) = reg_meta
-                            .get(v)
-                            .map(|(p, s)| (p.clone(), *s))
-                            .unwrap_or_else(|| (fallback_ts.clone(), 0));
-                        VersionInfo {
-                            version: v.to_string(),
-                            size,
-                            published,
+
+                let mut stable_versions = Vec::new();
+                let mut prerelease_count: usize = 0;
+
+                for v in versions.iter().rev().filter_map(|v| v.as_str()) {
+                    let is_prerelease = v.contains('-');
+
+                    // Get published date from registration metadata
+                    let (published, _upstream_size) = reg_meta
+                        .get(v)
+                        .map(|(p, s)| (p.clone(), *s))
+                        .unwrap_or_else(|| (fallback_ts.clone(), 0));
+
+                    // Skip unlisted (NuGet convention: published=1900-01-01)
+                    if published.starts_with("1900") {
+                        continue;
+                    }
+
+                    // Count pre-release, skip unless toggled
+                    if is_prerelease {
+                        prerelease_count += 1;
+                        if !show_prerelease {
+                            continue;
                         }
-                    })
-                    .collect();
+                    }
+
+                    // Check if .nupkg is cached locally
+                    let nupkg_key =
+                        format!("nuget/flatcontainer/{}/{}/{}.{}.nupkg", name, v, name, v);
+                    let (size, cached) = if let Some(meta) = storage.stat(&nupkg_key).await {
+                        (meta.size, true)
+                    } else {
+                        (0, false)
+                    };
+
+                    stable_versions.push(VersionInfo {
+                        version: v.to_string(),
+                        size,
+                        published,
+                        cached,
+                    });
+                }
+
                 return PackageDetail {
-                    versions: version_list,
+                    versions: stable_versions,
+                    prerelease_count,
                 };
             }
         }
     }
-    PackageDetail { versions: vec![] }
+    PackageDetail {
+        versions: vec![],
+        prerelease_count: 0,
+    }
 }
 
 /// Extract per-version (published, packageSize) from cached NuGet registration index.
@@ -1006,36 +1146,96 @@ async fn load_nuget_registration_meta(
 }
 
 async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
-    // Conan: conan/{name}/{version}/_/_/revisions.json
+    // Conan: conan/{name}/{version}/_/_/revisions.json (metadata)
+    // Actual files: conan/{name}/{version}/_/_/{rrev}/export/* or /packages/*/
     let prefix = format!("conan/{}/", name);
     let keys = storage.list(&prefix).await;
-    let mut versions = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut version_data: HashMap<String, (u64, u64, bool)> = HashMap::new(); // (size, mtime, has_content)
 
     for key in &keys {
-        if !key.ends_with("/revisions.json") {
-            continue;
-        }
-        // Extract version from conan/{name}/{version}/_/_/revisions.json
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.split('/').next() {
-                if seen.insert(version.to_string()) {
-                    let (size, published) = if let Some(meta) = storage.stat(key).await {
-                        (meta.size, format_timestamp(meta.modified))
-                    } else {
-                        (0, "N/A".to_string())
-                    };
-                    versions.push(VersionInfo {
-                        version: version.to_string(),
-                        size,
-                        published,
-                    });
+                let entry = version_data
+                    .entry(version.to_string())
+                    .or_insert((0, 0, false));
+                let is_content = !key.ends_with("/revisions.json");
+                if let Some(meta) = storage.stat(key).await {
+                    if is_content {
+                        entry.0 += meta.size;
+                        entry.2 = true;
+                    }
+                    if meta.modified > entry.1 {
+                        entry.1 = meta.modified;
+                    }
                 }
             }
         }
     }
+
+    let mut versions: Vec<VersionInfo> = version_data
+        .into_iter()
+        .map(|(version, (size, modified, has_content))| VersionInfo {
+            version,
+            size,
+            published: format_timestamp(modified),
+            cached: has_content,
+        })
+        .collect();
     versions.sort_by(|a, b| b.version.cmp(&a.version));
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
+}
+
+async fn get_gems_detail(storage: &Storage, name: &str) -> PackageDetail {
+    // Read compact index: gems/info/{name}
+    // Format: "VERSION DEPS|checksum:HEX" per line, first line is "---"
+    let info_key = format!("gems/info/{}", name);
+    let info_ts = storage
+        .stat(&info_key)
+        .await
+        .map(|m| format_timestamp(m.modified))
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let mut versions = Vec::new();
+
+    if let Ok(data) = storage.get(&info_key).await {
+        if let Ok(text) = String::from_utf8(data.to_vec()) {
+            for line in text.lines() {
+                if line.starts_with('-') || line.is_empty() {
+                    continue;
+                }
+                // "1.3.0 deps...|checksum:..." — version is first token
+                let version = match line.split_whitespace().next() {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    _ => continue,
+                };
+
+                // Check if .gem is cached
+                let gem_key = format!("gems/gems/{}-{}.gem", name, version);
+                let (size, published, cached) = if let Some(meta) = storage.stat(&gem_key).await {
+                    (meta.size, format_timestamp(meta.modified), true)
+                } else {
+                    (0, info_ts.clone(), false)
+                };
+
+                versions.push(VersionInfo {
+                    version,
+                    size,
+                    published,
+                    cached,
+                });
+            }
+        }
+    }
+
+    // Reverse: newest first (compact index is chronological)
+    versions.reverse();
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
@@ -1060,12 +1260,16 @@ async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
                     version,
                     size,
                     published,
+                    cached: true,
                 });
             }
         }
     }
     versions.sort_by(|a, b| b.version.cmp(&a.version));
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 /// Fallback: scan storage for files matching {registry}/{name}/*
@@ -1091,12 +1295,16 @@ async fn get_storage_scan_detail(storage: &Storage, registry: &str, name: &str) 
                     version,
                     size,
                     published,
+                    cached: true,
                 });
             }
         }
     }
     versions.sort_by(|a, b| b.version.cmp(&a.version));
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
@@ -1137,8 +1345,12 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
                 version: group.to_string(),
                 size: meta.size,
                 published: format_timestamp(meta.modified),
+                cached: true,
             });
-            return PackageDetail { versions };
+            return PackageDetail {
+                versions,
+                prerelease_count: 0,
+            };
         }
     }
 
@@ -1153,11 +1365,15 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
                 version: filename.to_string(),
                 size,
                 published,
+                cached: true,
             });
         }
     }
 
-    PackageDetail { versions }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+    }
 }
 
 /// List immediate children (subfolders + files) of a raw directory path.

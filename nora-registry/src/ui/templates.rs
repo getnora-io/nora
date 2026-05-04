@@ -774,6 +774,125 @@ pub fn render_raw_dir(
     )
 }
 
+/// Renders a Maven namespace directory browser with breadcrumbs
+pub fn render_maven_dir(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+
+    // Build breadcrumbs: Maven Repository / com / example / webapp
+    let mut breadcrumbs =
+        r#"<a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven</a>"#.to_string();
+    if !path.is_empty() {
+        let segments: Vec<&str> = path.split('/').collect();
+        for (i, seg) in segments.iter().enumerate() {
+            let crumb_path = segments[..=i].join("/");
+            if i == segments.len() - 1 {
+                breadcrumbs.push_str(&format!(
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    html_escape(seg)
+                ));
+            } else {
+                breadcrumbs.push_str(&format!(
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    crumb_path,
+                    html_escape(seg)
+                ));
+            }
+        }
+    }
+
+    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
+
+    let rows: String = entries
+        .iter()
+        .map(|entry| {
+            let href = if path.is_empty() {
+                format!("/ui/maven/{}", encode_uri_component(&entry.name))
+            } else {
+                format!("/ui/maven/{}/{}", path, encode_uri_component(&entry.name))
+            };
+            format!(
+                r##"
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                    </td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
+                </tr>
+            "##,
+                href,
+                folder_icon,
+                href,
+                html_escape(&entry.name),
+                entry.versions,
+                format_size(entry.size),
+                &entry.updated,
+            )
+        })
+        .collect();
+
+    let title_display = if path.is_empty() {
+        "Maven Repository".to_string()
+    } else {
+        html_escape(path.rsplit('/').next().unwrap_or(path))
+    };
+    let showing = t.showing_all.replace("{count}", &total.to_string());
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        icon = icons::MAVEN,
+        title = title_display,
+        col_name = t.name,
+        col_items = t.items,
+        col_size = t.size,
+        col_updated = t.updated,
+        rows = rows,
+        showing = showing,
+    );
+
+    layout_dark(
+        &format!("Maven — {}", if path.is_empty() { "Browse" } else { path }),
+        &content,
+        Some("maven"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -803,11 +922,21 @@ pub fn render_package_detail(
             .versions
             .iter()
             .map(|v| {
+                let size_display = if v.cached {
+                    format_size(v.size)
+                } else {
+                    "\u{2014}".to_string() // em dash
+                };
+                let cached_badge = if v.cached {
+                    r#"<span class="ml-2 px-1.5 py-0.5 text-xs font-medium text-green-400 bg-green-900/30 border border-green-800 rounded">cached</span>"#
+                } else {
+                    ""
+                };
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700">
                     <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-2">{}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span></div>
+                        <div class="flex items-center gap-2">{}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>{}</div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
@@ -815,12 +944,24 @@ pub fn render_package_detail(
             "##,
                     file_icon,
                     html_escape(&v.version),
-                    format_size(v.size),
+                    cached_badge,
+                    size_display,
                     &v.published
                 )
             })
             .collect::<Vec<_>>()
             .join("")
+    };
+
+    let prerelease_toggle = if detail.prerelease_count > 0 {
+        format!(
+            r##"<a href="/ui/{}/{}?prerelease=true" class="text-sm text-blue-400 hover:text-blue-300">+ {} pre-release</a>"##,
+            registry_type,
+            encode_uri_component(name),
+            detail.prerelease_count
+        )
+    } else {
+        String::new()
     };
 
     let install_cmd = match registry_type {
@@ -923,8 +1064,9 @@ pub fn render_package_detail(
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <div class="px-3 md:px-6 py-4 border-b border-slate-700">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between">
                 <h2 class="text-lg font-semibold text-slate-200">{} ({} {})</h2>
+                {}
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
@@ -953,6 +1095,7 @@ pub fn render_package_detail(
         },
         detail.versions.len(),
         _t.total,
+        prerelease_toggle,
         if registry_type == "raw" {
             _t.filename
         } else {
@@ -1016,28 +1159,44 @@ pub fn render_maven_detail(
         parts.last().unwrap_or(&"")
     );
 
+    // Build breadcrumbs: Maven / com / example / webapp / 2.0.0
+    let mut breadcrumbs =
+        r#"<a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven</a>"#.to_string();
+    let segments: Vec<&str> = path.split('/').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        let crumb_path = segments[..=i].join("/");
+        if i == segments.len() - 1 {
+            breadcrumbs.push_str(&format!(
+                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                html_escape(seg)
+            ));
+        } else {
+            breadcrumbs.push_str(&format!(
+                r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                crumb_path,
+                html_escape(seg)
+            ));
+        }
+    }
+
     let content = format!(
         r##"
         <div class="mb-6">
-            <div class="flex items-center mb-2">
-                <a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven Repository</a>
-                <span class="mx-2 text-slate-500">/</span>
-                <span class="text-slate-200 font-medium">{}</span>
-            </div>
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
             <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
             </div>
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">Maven Dependency</h2>
-            <pre class="bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">{}</pre>
+            <pre class="bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">{dep_xml}</pre>
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <div class="px-3 md:px-6 py-4 border-b border-slate-700">
-                <h2 class="text-lg font-semibold text-slate-200">Artifacts ({} files)</h2>
+                <h2 class="text-lg font-semibold text-slate-200">Artifacts ({count} files)</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
@@ -1047,17 +1206,17 @@ pub fn render_maven_detail(
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
-                    {}
+                    {rows}
                 </tbody>
             </table>
         </div>
     "##,
-        html_escape(path),
-        icons::MAVEN,
-        html_escape(path),
-        html_escape(&dep_cmd),
-        detail.artifacts.len(),
-        artifact_rows
+        breadcrumbs = breadcrumbs,
+        icon = icons::MAVEN,
+        title = html_escape(path),
+        dep_xml = html_escape(&dep_cmd),
+        count = detail.artifacts.len(),
+        rows = artifact_rows
     );
 
     layout_dark(
@@ -1363,7 +1522,10 @@ mod tests {
     use crate::ui::api::PackageDetail;
 
     fn empty_detail() -> PackageDetail {
-        PackageDetail { versions: vec![] }
+        PackageDetail {
+            versions: vec![],
+            prerelease_count: 0,
+        }
     }
 
     #[test]
@@ -1495,7 +1657,9 @@ mod tests {
                 version: "myfile.txt".to_string(),
                 size: 42,
                 published: "2026-04-29".to_string(),
+                cached: true,
             }],
+            prerelease_count: 0,
         };
         let html = render_package_detail("raw", "myfile.txt", &detail, Lang::En, base_url, false);
         assert!(
@@ -1514,13 +1678,16 @@ mod tests {
                     version: "a.txt".to_string(),
                     size: 10,
                     published: "2026-04-29".to_string(),
+                    cached: true,
                 },
                 crate::ui::api::VersionInfo {
                     version: "b.txt".to_string(),
                     size: 20,
                     published: "2026-04-29".to_string(),
+                    cached: true,
                 },
             ],
+            prerelease_count: 0,
         };
         let html =
             render_package_detail("raw", "subdir", &subdir_detail, Lang::En, base_url, false);
