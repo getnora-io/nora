@@ -836,6 +836,24 @@ pub fn render_package_detail(
                 format!("curl -O {}/raw/{}/<file>", base_url, name)
             }
         }
+        "nuget" => format!(
+            "dotnet add package {} --source {}/nuget/v3/index.json",
+            name, base_url
+        ),
+        "gems" => format!("gem install {} --source {}/gems", name, base_url),
+        "terraform" => format!(
+            "# In required_providers block:\n  source = \"{}/terraform/{}\"",
+            base_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://"),
+            name
+        ),
+        "ansible" => format!("ansible-galaxy collection install {}", name),
+        "pub" => format!(
+            "# pubspec.yaml:\n  hosted: {}/pub\n  # then: dart pub get",
+            base_url
+        ),
+        "conan" => format!("conan install --requires={}/ -r nora", name),
         _ => String::new(),
     };
 

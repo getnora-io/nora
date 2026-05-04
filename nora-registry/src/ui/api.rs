@@ -915,32 +915,109 @@ pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
 pub async fn get_generic_detail(storage: &Storage, registry: &str, name: &str) -> PackageDetail {
     let name_lower = name.to_lowercase();
 
-    // NuGet stores versions in flatcontainer/{name}/index.json
-    if registry == "nuget" {
-        let key = format!("nuget/flatcontainer/{}/index.json", name_lower);
-        if let Ok(data) = storage.get(&key).await {
-            if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(versions) = index.get("versions").and_then(|v| v.as_array()) {
-                    let version_list: Vec<VersionInfo> = versions
-                        .iter()
-                        .rev()
-                        .filter_map(|v| v.as_str())
-                        .map(|v| VersionInfo {
-                            version: v.to_string(),
-                            size: 0,
-                            published: "N/A".to_string(),
-                        })
-                        .collect();
-                    return PackageDetail {
-                        versions: version_list,
+    match registry {
+        "nuget" => get_nuget_detail(storage, &name_lower).await,
+        "conan" => get_conan_detail(storage, &name_lower).await,
+        "pub" => get_pub_detail(storage, &name_lower).await,
+        _ => get_storage_scan_detail(storage, registry, &name_lower).await,
+    }
+}
+
+async fn get_nuget_detail(storage: &Storage, name: &str) -> PackageDetail {
+    let key = format!("nuget/flatcontainer/{}/index.json", name);
+    if let Ok(data) = storage.get(&key).await {
+        if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(versions) = index.get("versions").and_then(|v| v.as_array()) {
+                let meta = storage.stat(&key).await;
+                let published = meta
+                    .as_ref()
+                    .map(|m| format_timestamp(m.modified))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let version_list: Vec<VersionInfo> = versions
+                    .iter()
+                    .rev()
+                    .filter_map(|v| v.as_str())
+                    .map(|v| VersionInfo {
+                        version: v.to_string(),
+                        size: 0,
+                        published: published.clone(),
+                    })
+                    .collect();
+                return PackageDetail {
+                    versions: version_list,
+                };
+            }
+        }
+    }
+    PackageDetail { versions: vec![] }
+}
+
+async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
+    // Conan: conan/{name}/{version}/_/_/revisions.json
+    let prefix = format!("conan/{}/", name);
+    let keys = storage.list(&prefix).await;
+    let mut versions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for key in &keys {
+        if !key.ends_with("/revisions.json") {
+            continue;
+        }
+        // Extract version from conan/{name}/{version}/_/_/revisions.json
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if let Some(version) = rest.split('/').next() {
+                if seen.insert(version.to_string()) {
+                    let (size, published) = if let Some(meta) = storage.stat(key).await {
+                        (meta.size, format_timestamp(meta.modified))
+                    } else {
+                        (0, "N/A".to_string())
                     };
+                    versions.push(VersionInfo {
+                        version: version.to_string(),
+                        size,
+                        published,
+                    });
                 }
             }
         }
     }
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    PackageDetail { versions }
+}
 
-    // For other registries, scan storage for files matching the package name
-    let prefix = format!("{}/{}/", registry, name_lower);
+async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
+    // Pub: pub/packages/{name}/versions/{version}.tar.gz
+    let prefix = format!("pub/packages/{}/versions/", name);
+    let keys = storage.list(&prefix).await;
+    let mut versions = Vec::new();
+
+    for key in &keys {
+        if key.ends_with(".sha256") {
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            let version = rest.trim_end_matches(".tar.gz").to_string();
+            if !version.is_empty() {
+                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                    (meta.size, format_timestamp(meta.modified))
+                } else {
+                    (0, "N/A".to_string())
+                };
+                versions.push(VersionInfo {
+                    version,
+                    size,
+                    published,
+                });
+            }
+        }
+    }
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    PackageDetail { versions }
+}
+
+/// Fallback: scan storage for files matching {registry}/{name}/*
+async fn get_storage_scan_detail(storage: &Storage, registry: &str, name: &str) -> PackageDetail {
+    let prefix = format!("{}/{}/", registry, name);
     let keys = storage.list(&prefix).await;
     let mut versions = Vec::new();
     for key in &keys {
