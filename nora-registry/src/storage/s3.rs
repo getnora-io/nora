@@ -258,12 +258,12 @@ impl S3Storage {
     }
 }
 
-/// URL-encode a string for S3 canonical URI (encode all except A-Za-z0-9-_.~/)
+/// URL-encode a string for S3 canonical URI (encode all except A-Za-z0-9-_.~/:)
 fn uri_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 3);
     for c in s.chars() {
         match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' => result.push(c),
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' | ':' => result.push(c),
             _ => {
                 for b in c.to_string().as_bytes() {
                     result.push_str(&format!("%{:02X}", b));
