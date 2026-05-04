@@ -66,6 +66,8 @@ pub struct VersionInfo {
 pub struct PackageDetail {
     pub versions: Vec<VersionInfo>,
     pub prerelease_count: usize,
+    /// Total stable versions available (may be > versions.len() if truncated)
+    pub total_stable: usize,
 }
 
 #[derive(Serialize)]
@@ -817,6 +819,7 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -890,6 +893,7 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -962,6 +966,7 @@ pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1020,6 +1025,7 @@ pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1099,9 +1105,19 @@ async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) 
                     });
                 }
 
+                let total_stable = stable_versions
+                    .iter()
+                    .filter(|v| !v.version.contains('-'))
+                    .count();
+                // Limit default view to 20 versions when not showing all
+                if !show_prerelease && stable_versions.len() > 20 {
+                    stable_versions.truncate(20);
+                }
+
                 return PackageDetail {
                     versions: stable_versions,
                     prerelease_count,
+                    total_stable,
                 };
             }
         }
@@ -1109,6 +1125,7 @@ async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) 
     PackageDetail {
         versions: vec![],
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1195,6 +1212,7 @@ async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1245,6 +1263,7 @@ async fn get_gems_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1279,6 +1298,7 @@ async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1314,6 +1334,7 @@ async fn get_storage_scan_detail(storage: &Storage, registry: &str, name: &str) 
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 
@@ -1360,6 +1381,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
             return PackageDetail {
                 versions,
                 prerelease_count: 0,
+                total_stable: 0,
             };
         }
     }
@@ -1383,6 +1405,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
     PackageDetail {
         versions,
         prerelease_count: 0,
+        total_stable: 0,
     }
 }
 

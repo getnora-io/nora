@@ -50,6 +50,7 @@ struct LangQuery {
 struct DetailQuery {
     lang: Option<String>,
     prerelease: Option<bool>,
+    all: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -610,6 +611,7 @@ async fn generic_registry_detail(
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
 
     // Extract registry type from URI: /ui/{type}/{name}
     let registry_key = uri
@@ -618,7 +620,13 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(&state.storage, registry_key, &name, show_prerelease).await;
+    let detail = get_generic_detail(
+        &state.storage,
+        registry_key,
+        &name,
+        show_prerelease || show_all,
+    )
+    .await;
     Html(render_package_detail(
         registry_key,
         &name,

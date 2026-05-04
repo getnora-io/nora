@@ -934,19 +934,19 @@ pub fn render_package_detail(
                 };
                 format!(
                     r##"
-                <tr class="hover:bg-slate-700">
+                <tr class="hover:bg-slate-700 cursor-pointer version-row" data-version="{ver}">
                     <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-2">{}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{}</span>{}</div>
+                        <div class="flex items-center gap-2">{icon}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{ver}</span>{badge}</div>
                     </td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{size}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{pub_date}</td>
                 </tr>
             "##,
-                    file_icon,
-                    html_escape(&v.version),
-                    cached_badge,
-                    size_display,
-                    &v.published
+                    ver = html_escape(&v.version),
+                    icon = file_icon,
+                    badge = cached_badge,
+                    size = size_display,
+                    pub_date = &v.published
                 )
             })
             .collect::<Vec<_>>()
@@ -959,6 +959,18 @@ pub fn render_package_detail(
             registry_type,
             encode_uri_component(name),
             detail.prerelease_count
+        )
+    } else {
+        String::new()
+    };
+
+    // "Show all N stable versions" link when list is truncated
+    let show_all_link = if detail.total_stable > detail.versions.len() {
+        format!(
+            r##"<a href="/ui/{}/{}?all=true" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700">Show all {} stable versions</a>"##,
+            registry_type,
+            encode_uri_component(name),
+            detail.total_stable
         )
     } else {
         String::new()
@@ -1039,23 +1051,58 @@ pub fn render_package_detail(
         html_escape(name)
     };
 
+    // Total versions displayed in header
+    let display_total = if detail.total_stable > 0 {
+        detail.total_stable
+    } else {
+        detail.versions.len()
+    };
+
+    // JavaScript for per-version install command (NuGet-specific)
+    let version_js = if registry_type == "nuget" {
+        format!(
+            r##"<script>
+document.querySelectorAll('.version-row').forEach(function(row) {{
+    row.addEventListener('click', function() {{
+        var ver = this.getAttribute('data-version');
+        var cmd = 'dotnet add package {name} --version ' + ver + ' --source {base}/nuget/v3/index.json';
+        var el = document.getElementById('install-cmd');
+        if (el) {{ el.textContent = cmd; }}
+        var btn = document.getElementById('copy-btn');
+        if (btn) {{ btn.setAttribute('data-cmd', cmd); }}
+        document.querySelectorAll('.version-row').forEach(function(r) {{ r.classList.remove('bg-slate-700/50'); }});
+        this.classList.add('bg-slate-700/50');
+    }});
+}});
+var copyBtn = document.getElementById('copy-btn');
+if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
+    navigator.clipboard.writeText(this.getAttribute('data-cmd') || this.closest('.bg-\\[\\#1e293b\\]').querySelector('code').textContent);
+}}); }}
+</script>"##,
+            name = html_escape(name),
+            base = html_escape(base_url),
+        )
+    } else {
+        String::new()
+    };
+
     let content = format!(
         r##"
         <div class="mb-6">
             <div class="flex items-center mb-2 text-sm">
-                {}
+                {breadcrumbs}
             </div>
             <div class="flex items-center">
-                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1>
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
             </div>
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-200 mb-3">{}</h2>
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">{install_label}</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
-                <code class="flex-1 whitespace-nowrap">{}</code>
-                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
+                <code id="install-cmd" class="flex-1 whitespace-nowrap">{cmd}</code>
+                <button id="copy-btn" data-cmd="{cmd}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
@@ -1065,45 +1112,48 @@ pub fn render_package_detail(
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between">
-                <h2 class="text-lg font-semibold text-slate-200">{} ({} {})</h2>
-                {}
+                <h2 class="text-lg font-semibold text-slate-200">{versions_label} ({total} {total_word})</h2>
+                {prerelease}
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_version}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_size}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_published}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
-                    {}
+                    {rows}
                 </tbody>
             </table>
+            {show_all}
         </div>
+        {js}
     "##,
-        breadcrumb_html,
-        icon,
-        detail_title,
-        _t.install_command,
-        install_cmd,
-        install_cmd,
-        if registry_type == "raw" {
+        breadcrumbs = breadcrumb_html,
+        icon = icon,
+        title = detail_title,
+        install_label = _t.install_command,
+        cmd = install_cmd,
+        versions_label = if registry_type == "raw" {
             _t.files
         } else {
             _t.versions
         },
-        detail.versions.len(),
-        _t.total,
-        prerelease_toggle,
-        if registry_type == "raw" {
+        total = display_total,
+        total_word = _t.total,
+        prerelease = prerelease_toggle,
+        col_version = if registry_type == "raw" {
             _t.filename
         } else {
             _t.versions
         },
-        _t.size,
-        _t.published,
-        versions_rows
+        col_size = _t.size,
+        col_published = _t.published,
+        rows = versions_rows,
+        show_all = show_all_link,
+        js = version_js,
     );
 
     layout_dark(
@@ -1525,6 +1575,7 @@ mod tests {
         PackageDetail {
             versions: vec![],
             prerelease_count: 0,
+            total_stable: 0,
         }
     }
 
@@ -1660,6 +1711,7 @@ mod tests {
                 cached: true,
             }],
             prerelease_count: 0,
+            total_stable: 0,
         };
         let html = render_package_detail("raw", "myfile.txt", &detail, Lang::En, base_url, false);
         assert!(
@@ -1688,6 +1740,7 @@ mod tests {
                 },
             ],
             prerelease_count: 0,
+            total_stable: 0,
         };
         let html =
             render_package_detail("raw", "subdir", &subdir_detail, Lang::En, base_url, false);
