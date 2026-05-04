@@ -139,8 +139,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/terraform", get(generic_registry_list))
         .route("/ui/ansible", get(generic_registry_list))
         .route("/ui/nuget", get(generic_registry_list))
+        .route("/ui/nuget/{name}", get(generic_registry_detail))
         .route("/ui/pub", get(generic_registry_list))
+        .route("/ui/pub/{name}", get(generic_registry_detail))
         .route("/ui/conan", get(generic_registry_list))
+        .route("/ui/conan/{name}", get(generic_registry_detail))
+        .route("/ui/gems/{name}", get(generic_registry_detail))
+        .route("/ui/terraform/{name}", get(generic_registry_detail))
+        .route("/ui/ansible/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
         // Token management API (HTMX endpoints)
@@ -562,6 +568,38 @@ async fn generic_registry_list(
         limit,
         total,
         lang,
+        auth_enabled,
+    ))
+}
+
+async fn generic_registry_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+
+    // Extract registry type from URI: /ui/{type}/{name}
+    let registry_key = uri
+        .path()
+        .strip_prefix("/ui/")
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("raw");
+
+    let detail = get_generic_detail(&state.storage, registry_key, &name).await;
+    Html(render_package_detail(
+        registry_key,
+        &name,
+        &detail,
+        lang,
+        &base_url,
         auth_enabled,
     ))
 }

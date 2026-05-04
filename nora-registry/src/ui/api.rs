@@ -910,6 +910,65 @@ pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
     PackageDetail { versions }
 }
 
+/// Generic detail for new-format registries (NuGet, Gems, Terraform, Ansible, Pub, Conan).
+/// Reads version info from storage using registry-specific paths.
+pub async fn get_generic_detail(storage: &Storage, registry: &str, name: &str) -> PackageDetail {
+    let name_lower = name.to_lowercase();
+
+    // NuGet stores versions in flatcontainer/{name}/index.json
+    if registry == "nuget" {
+        let key = format!("nuget/flatcontainer/{}/index.json", name_lower);
+        if let Ok(data) = storage.get(&key).await {
+            if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(versions) = index.get("versions").and_then(|v| v.as_array()) {
+                    let version_list: Vec<VersionInfo> = versions
+                        .iter()
+                        .rev()
+                        .filter_map(|v| v.as_str())
+                        .map(|v| VersionInfo {
+                            version: v.to_string(),
+                            size: 0,
+                            published: "N/A".to_string(),
+                        })
+                        .collect();
+                    return PackageDetail {
+                        versions: version_list,
+                    };
+                }
+            }
+        }
+    }
+
+    // For other registries, scan storage for files matching the package name
+    let prefix = format!("{}/{}/", registry, name_lower);
+    let keys = storage.list(&prefix).await;
+    let mut versions = Vec::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            let version = rest
+                .trim_end_matches(".tar.gz")
+                .trim_end_matches(".gem")
+                .trim_end_matches(".zip")
+                .trim_end_matches(".tgz")
+                .to_string();
+            if !version.is_empty() && !version.contains('/') {
+                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                    (meta.size, format_timestamp(meta.modified))
+                } else {
+                    (0, "N/A".to_string())
+                };
+                versions.push(VersionInfo {
+                    version,
+                    size,
+                    published,
+                });
+            }
+        }
+    }
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    PackageDetail { versions }
+}
+
 fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
     // Handle both .tar.gz and .whl files
     let clean_name = name.replace('-', "_");
