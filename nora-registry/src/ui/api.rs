@@ -277,6 +277,7 @@ pub async fn api_search(
         </td></tr>"#
             .to_string()
     } else {
+        let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
         filtered
             .iter()
             .map(|repo| {
@@ -284,16 +285,17 @@ pub async fn api_search(
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
                 format!(
                     r#"
-                <tr class="hover:bg-slate-50 cursor-pointer" onclick="window.location='{}'">
-                    <td class="px-6 py-4">
-                        <a href="{}" class="text-blue-600 hover:text-blue-800 font-medium">{}</a>
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
-                    <td class="px-6 py-4 text-slate-600">{}</td>
-                    <td class="px-6 py-4 text-slate-500 text-sm">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "#,
                     detail_url,
+                    folder_icon,
                     detail_url,
                     html_escape(&repo.name),
                     repo.versions,
@@ -766,7 +768,7 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                 let time_obj = metadata.get("time").and_then(|t| t.as_object());
 
                 for (version, info) in versions_obj {
-                    let size = info
+                    let meta_size = info
                         .get("dist")
                         .and_then(|d| d.get("unpackedSize"))
                         .and_then(|s| s.as_u64())
@@ -778,11 +780,19 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                         .map(|s| s[..10].to_string())
                         .unwrap_or_else(|| "N/A".to_string());
 
+                    // Check if tarball is actually cached on disk
+                    let tarball_key = format!("npm/{}/tarballs/{}-{}.tgz", name, name, version);
+                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
+                        (meta.size, true)
+                    } else {
+                        (meta_size, false)
+                    };
+
                     versions.push(VersionInfo {
                         version: version.clone(),
                         size,
                         published,
-                        cached: true,
+                        cached,
                     });
                 }
             }

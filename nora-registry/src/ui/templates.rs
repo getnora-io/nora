@@ -227,11 +227,12 @@ pub fn render_registry_list(
             .map(|repo| {
                 let detail_url =
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
+                let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
                     <td class="px-3 md:px-6 py-3 md:py-4">
-                        <a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a>
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
@@ -239,6 +240,7 @@ pub fn render_registry_list(
                 </tr>
             "##,
                     detail_url,
+                    folder_icon,
                     detail_url,
                     html_escape(&repo.name),
                     repo.versions,
@@ -355,10 +357,8 @@ pub fn render_registry_list_paginated(
                 // For raw registry: show folder/file icons
                 let icon = if repo.is_file {
                     r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
-                } else if registry_type == "raw" {
-                    r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#
                 } else {
-                    ""
+                    r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#
                 };
                 let versions_display = if repo.is_file {
                     String::new()
