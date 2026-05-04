@@ -326,7 +326,10 @@ async fn flatcontainer_download(
         ));
         return (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type)],
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
             data.to_vec(),
         )
             .into_response();
@@ -375,7 +378,10 @@ async fn flatcontainer_download(
             state.repo_index.invalidate("nuget");
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                ],
                 bytes.to_vec(),
             )
                 .into_response()
@@ -454,10 +460,16 @@ fn is_within_ttl(modified_unix: u64, ttl_secs: u64) -> bool {
 fn with_json(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60, must-revalidate"),
+            ),
+        ],
         data,
     )
         .into_response()
