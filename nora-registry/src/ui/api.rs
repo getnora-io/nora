@@ -4,6 +4,7 @@
 use super::components::{format_size, format_timestamp, html_escape};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
+use crate::registry_type::RegistryType;
 use crate::repo_index::RepoInfo;
 use crate::AppState;
 use crate::Storage;
@@ -26,6 +27,13 @@ pub struct RegistryStats {
     pub pypi: usize,
     pub go: usize,
     pub raw: usize,
+    pub nuget: usize,
+    pub gems: usize,
+    pub terraform: usize,
+    pub ansible: usize,
+    #[serde(rename = "pub")]
+    pub pub_dart: usize,
+    pub conan: usize,
 }
 
 #[derive(Serialize)]
@@ -117,27 +125,32 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
         let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
     }
 
-    let (docker, maven, npm, cargo, pypi, go, raw) = state.repo_index.counts();
+    let counts = state.repo_index.counts();
+    let get = |rt: RegistryType| counts.get(&rt).copied().unwrap_or(0);
     Json(RegistryStats {
-        docker,
-        maven,
-        npm,
-        cargo,
-        pypi,
-        go,
-        raw,
+        docker: get(RegistryType::Docker),
+        maven: get(RegistryType::Maven),
+        npm: get(RegistryType::Npm),
+        cargo: get(RegistryType::Cargo),
+        pypi: get(RegistryType::PyPI),
+        go: get(RegistryType::Go),
+        raw: get(RegistryType::Raw),
+        nuget: get(RegistryType::Nuget),
+        gems: get(RegistryType::Gems),
+        terraform: get(RegistryType::Terraform),
+        ansible: get(RegistryType::Ansible),
+        pub_dart: get(RegistryType::PubDart),
+        conan: get(RegistryType::Conan),
     })
 }
 
 pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
-    use crate::registry_type::RegistryType;
-
     let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
     let mut registry_card_stats = Vec::new();
     let mut mount_points = Vec::new();
 
-    for reg in RegistryType::all_v1() {
+    for reg in RegistryType::all() {
         if !state.enabled_registries.contains(reg) {
             continue;
         }
@@ -167,59 +180,16 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
                 .first()
                 .map(|p| p.url().to_string()),
             RegistryType::Npm => state.config.npm.proxy.clone(),
+            RegistryType::Cargo => state.config.cargo.proxy.clone(),
             RegistryType::PyPI => state.config.pypi.proxy.clone(),
             RegistryType::Go => state.config.go.proxy.clone(),
-            RegistryType::Gems => state.config.gems.proxy.clone(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone(),
-            _ => None,
-        };
-
-        mount_points.push(MountPoint {
-            registry: reg.display_name().to_string(),
-            mount_path: reg.mount_point().to_string(),
-            proxy_upstream,
-        });
-    }
-
-    // Also include new format registries if enabled
-    for reg in &[
-        RegistryType::Gems,
-        RegistryType::Terraform,
-        RegistryType::Ansible,
-        RegistryType::Nuget,
-        RegistryType::PubDart,
-        RegistryType::Conan,
-    ] {
-        if !state.enabled_registries.contains(reg) {
-            continue;
-        }
-
-        let name = reg.as_str();
-        let repos = state.repo_index.get(name, &state.storage).await;
-        let size: u64 = repos.iter().map(|r| r.size).sum();
-        let versions: usize = repos.iter().map(|r| r.versions).sum();
-
-        total_storage += size;
-        total_artifacts += versions;
-
-        registry_card_stats.push(RegistryCardStats {
-            name: name.to_string(),
-            artifact_count: versions,
-            downloads: state.metrics.get_registry_downloads(name),
-            uploads: state.metrics.get_registry_uploads(name),
-            size_bytes: size,
-        });
-
-        let proxy_upstream = match reg {
+            RegistryType::Raw => None,
             RegistryType::Gems => state.config.gems.proxy.clone(),
             RegistryType::Terraform => state.config.terraform.proxy.clone(),
             RegistryType::Ansible => state.config.ansible.proxy.clone(),
             RegistryType::Nuget => state.config.nuget.proxy.clone(),
             RegistryType::PubDart => state.config.pub_dart.proxy.clone(),
             RegistryType::Conan => state.config.conan.proxy.clone(),
-            _ => None,
         };
 
         mount_points.push(MountPoint {
@@ -408,6 +378,12 @@ pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
         pypi,
         go,
         raw,
+        nuget: 0,
+        gems: 0,
+        terraform: 0,
+        ansible: 0,
+        pub_dart: 0,
+        conan: 0,
     }
 }
 

@@ -12,7 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -158,6 +158,8 @@ async fn handle(
             &upstream_url,
             timeout,
             state.config.go.proxy_auth.as_deref(),
+            &state.circuit_breaker,
+            "go",
         )
         .await
     } else {
@@ -167,6 +169,8 @@ async fn handle(
             timeout,
             state.config.go.proxy_auth.as_deref(),
             None,
+            &state.circuit_breaker,
+            "go",
         )
         .await
         .map(|s| s.into_bytes())
@@ -216,6 +220,7 @@ async fn handle(
             with_content_type(bytes, content_type)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(
                 module = module_encoded,

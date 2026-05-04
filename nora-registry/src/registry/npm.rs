@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::proxy_fetch;
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -185,61 +185,68 @@ async fn handle_request(
     if let Some(proxy_url) = &state.config.npm.proxy {
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-        if let Ok(data) = proxy_fetch(
+        match proxy_fetch(
             &state.http_client,
             &url,
             state.config.npm.proxy_timeout,
             state.config.npm.proxy_auth.as_deref(),
+            &state.circuit_breaker,
+            "npm",
         )
         .await
         {
-            let data_to_cache;
-            let data_to_serve;
+            Ok(data) => {
+                let data_to_cache;
+                let data_to_serve;
 
-            if is_tarball {
-                // Compute and store sha256
-                let hash = hex::encode(sha2::Sha256::digest(&data));
-                let hash_key = format!("{}.sha256", key);
+                if is_tarball {
+                    // Compute and store sha256
+                    let hash = hex::encode(sha2::Sha256::digest(&data));
+                    let hash_key = format!("{}.sha256", key);
+                    let storage = state.storage.clone();
+                    tokio::spawn(async move {
+                        let _ = storage.put(&hash_key, hash.as_bytes()).await;
+                    });
+
+                    state.metrics.record_download("npm");
+                    state.metrics.record_cache_miss();
+                    state.activity.push(ActivityEntry::new(
+                        ActionType::ProxyFetch,
+                        package_name,
+                        "npm",
+                        "PROXY",
+                    ));
+                    state
+                        .audit
+                        .log(AuditEntry::new("proxy_fetch", "api", "", "npm", ""));
+
+                    data_to_cache = data.clone();
+                    data_to_serve = data;
+                } else {
+                    // Metadata: rewrite tarball URLs to point to NORA
+                    let nora_base = nora_base_url(&state);
+                    let rewritten =
+                        rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
+
+                    data_to_cache = rewritten.clone();
+                    data_to_serve = rewritten;
+                }
+
+                // Cache in background
                 let storage = state.storage.clone();
+                let key_clone = key.clone();
                 tokio::spawn(async move {
-                    let _ = storage.put(&hash_key, hash.as_bytes()).await;
+                    let _ = storage.put(&key_clone, &data_to_cache).await;
                 });
 
-                state.metrics.record_download("npm");
-                state.metrics.record_cache_miss();
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    package_name,
-                    "npm",
-                    "PROXY",
-                ));
-                state
-                    .audit
-                    .log(AuditEntry::new("proxy_fetch", "api", "", "npm", ""));
+                if is_tarball {
+                    state.repo_index.invalidate("npm");
+                }
 
-                data_to_cache = data.clone();
-                data_to_serve = data;
-            } else {
-                // Metadata: rewrite tarball URLs to point to NORA
-                let nora_base = nora_base_url(&state);
-                let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
-
-                data_to_cache = rewritten.clone();
-                data_to_serve = rewritten;
+                return with_content_type(is_tarball, data_to_serve.into()).into_response();
             }
-
-            // Cache in background
-            let storage = state.storage.clone();
-            let key_clone = key.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &data_to_cache).await;
-            });
-
-            if is_tarball {
-                state.repo_index.invalidate("npm");
-            }
-
-            return with_content_type(is_tarball, data_to_serve.into()).into_response();
+            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+            Err(_) => {}
         }
     }
 
@@ -257,6 +264,8 @@ async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Optio
         &url,
         state.config.npm.proxy_timeout,
         state.config.npm.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "npm",
     )
     .await
     .ok()?;

@@ -11,7 +11,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text};
 use crate::AppState;
 use axum::{
     extract::{Multipart, Path, State},
@@ -156,17 +156,25 @@ async fn package_versions(
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = proxy_fetch_text(
+        match proxy_fetch_text(
             &state.http_client,
             &url,
             state.config.pypi.proxy_timeout,
             state.config.pypi.proxy_auth.as_deref(),
             Some(("Accept", "text/html")),
+            &state.circuit_breaker,
+            "pypi",
         )
         .await
         {
-            let rewritten = rewrite_pypi_links(&html, &normalized, &base_url);
-            return (StatusCode::OK, Html(rewritten)).into_response();
+            Ok(html) => {
+                let rewritten = rewrite_pypi_links(&html, &normalized, &base_url);
+                return (StatusCode::OK, Html(rewritten)).into_response();
+            }
+            Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
+                return circuit_open_response(&reg)
+            }
+            Err(_) => {}
         }
     }
 
@@ -251,55 +259,71 @@ async fn download_file(
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let page_url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
-        if let Ok(html) = proxy_fetch_text(
+        match proxy_fetch_text(
             &state.http_client,
             &page_url,
             state.config.pypi.proxy_timeout,
             state.config.pypi.proxy_auth.as_deref(),
             Some(("Accept", "text/html")),
+            &state.circuit_breaker,
+            "pypi",
         )
         .await
         {
-            if let Some(file_url) = find_file_url(&html, &filename) {
-                if let Ok(data) = proxy_fetch(
-                    &state.http_client,
-                    &file_url,
-                    state.config.pypi.proxy_timeout,
-                    state.config.pypi.proxy_auth.as_deref(),
-                )
-                .await
-                {
-                    state.metrics.record_download("pypi");
-                    state.metrics.record_cache_miss();
-                    state.activity.push(ActivityEntry::new(
-                        ActionType::ProxyFetch,
-                        format!("{}/{}", name, filename),
+            Ok(html) => {
+                if let Some(file_url) = find_file_url(&html, &filename) {
+                    match proxy_fetch(
+                        &state.http_client,
+                        &file_url,
+                        state.config.pypi.proxy_timeout,
+                        state.config.pypi.proxy_auth.as_deref(),
+                        &state.circuit_breaker,
                         "pypi",
-                        "PROXY",
-                    ));
-                    state
-                        .audit
-                        .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
+                    )
+                    .await
+                    {
+                        Ok(data) => {
+                            state.metrics.record_download("pypi");
+                            state.metrics.record_cache_miss();
+                            state.activity.push(ActivityEntry::new(
+                                ActionType::ProxyFetch,
+                                format!("{}/{}", name, filename),
+                                "pypi",
+                                "PROXY",
+                            ));
+                            state
+                                .audit
+                                .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
 
-                    // Cache in background + compute hash
-                    let storage = state.storage.clone();
-                    let key_clone = key.clone();
-                    let data_clone = data.clone();
-                    tokio::spawn(async move {
-                        let _ = storage.put(&key_clone, &data_clone).await;
-                        let hash = hex::encode(sha2::Sha256::digest(&data_clone));
-                        let _ = storage
-                            .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                            .await;
-                    });
+                            // Cache in background + compute hash
+                            let storage = state.storage.clone();
+                            let key_clone = key.clone();
+                            let data_clone = data.clone();
+                            tokio::spawn(async move {
+                                let _ = storage.put(&key_clone, &data_clone).await;
+                                let hash = hex::encode(sha2::Sha256::digest(&data_clone));
+                                let _ = storage
+                                    .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                    .await;
+                            });
 
-                    state.repo_index.invalidate("pypi");
+                            state.repo_index.invalidate("pypi");
 
-                    let content_type = pypi_content_type(&filename);
-                    return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
-                        .into_response();
+                            let content_type = pypi_content_type(&filename);
+                            return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
+                                .into_response();
+                        }
+                        Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
+                            return circuit_open_response(&reg)
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
+            Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
+                return circuit_open_response(&reg)
+            }
+            Err(_) => {}
         }
     }
 

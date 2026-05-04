@@ -58,6 +58,10 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub curation: CurationConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
     /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
     #[serde(default)]
     pub registries: Option<RegistriesSection>,
@@ -77,6 +81,14 @@ pub struct ServerConfig {
 
 fn default_body_limit_mb() -> usize {
     2048 // 2GB - enough for any Docker image
+}
+
+/// TLS configuration for outbound connections to upstream registries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Path to PEM-encoded CA certificate bundle (appended to system CAs)
+    #[serde(default)]
+    pub ca_cert: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -414,10 +426,17 @@ pub struct NugetConfig {
     /// Metadata cache TTL in seconds (default: 300 = 5 min)
     #[serde(default = "default_metadata_ttl")]
     pub metadata_ttl: u64,
+    /// Upstream NuGet search service URL
+    #[serde(default = "default_nuget_search")]
+    pub search_service: String,
 }
 
 fn default_nuget_proxy() -> Option<String> {
     Some("https://api.nuget.org".to_string())
+}
+
+fn default_nuget_search() -> String {
+    "https://azuresearch-usnc.nuget.org/query".to_string()
 }
 
 impl Default for NugetConfig {
@@ -428,6 +447,7 @@ impl Default for NugetConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            search_service: default_nuget_search(),
         }
     }
 }
@@ -1037,6 +1057,47 @@ impl Default for CurationConfig {
 }
 
 // ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+fn default_cb_enabled() -> bool {
+    false
+}
+fn default_cb_threshold() -> u32 {
+    5
+}
+fn default_cb_reset_timeout() -> u64 {
+    30
+}
+
+/// Upstream proxy circuit breaker configuration.
+///
+/// Experimental — disabled by default. When enabled, tracks per-registry
+/// upstream failures and fails fast (503) when a registry is known to be down.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Enable circuit breaker (default: false)
+    #[serde(default = "default_cb_enabled")]
+    pub enabled: bool,
+    /// Number of consecutive failures before opening the circuit (default: 5)
+    #[serde(default = "default_cb_threshold")]
+    pub failure_threshold: u32,
+    /// Seconds to wait before probing a failed upstream (default: 30)
+    #[serde(default = "default_cb_reset_timeout")]
+    pub reset_timeout: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cb_enabled(),
+            failure_threshold: default_cb_threshold(),
+            reset_timeout: default_cb_reset_timeout(),
+        }
+    }
+}
+
+// ============================================================================
 // Registries Section (nginx-style enable)
 // ============================================================================
 
@@ -1578,6 +1639,11 @@ impl Config {
             }
         }
 
+        // TLS config
+        if let Ok(val) = env::var("NORA_TLS_CA_CERT") {
+            self.tls.ca_cert = if val.is_empty() { None } else { Some(val) };
+        }
+
         // Storage config
         if let Ok(val) = env::var("NORA_STORAGE_MODE") {
             self.storage.mode = match val.to_lowercase().as_str() {
@@ -1866,6 +1932,11 @@ impl Config {
                 self.nuget.metadata_ttl = ttl;
             }
         }
+        if let Ok(val) = env::var("NORA_NUGET_SEARCH_SERVICE") {
+            if !val.is_empty() {
+                self.nuget.search_service = val;
+            }
+        }
 
         // pub.dev config
         if let Ok(val) = env::var("NORA_PUB_PROXY") {
@@ -2014,6 +2085,21 @@ impl Config {
             self.curation.min_release_age = if val.is_empty() { None } else { Some(val) };
         }
 
+        // Circuit breaker config
+        if let Ok(val) = env::var("NORA_CB_ENABLED") {
+            self.circuit_breaker.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_CB_THRESHOLD") {
+            if let Ok(v) = val.parse() {
+                self.circuit_breaker.failure_threshold = v;
+            }
+        }
+        if let Ok(val) = env::var("NORA_CB_RESET_TIMEOUT") {
+            if let Ok(v) = val.parse() {
+                self.circuit_breaker.reset_timeout = v;
+            }
+        }
+
         // Per-registry curation overrides
         for (env_suffix, field) in [
             ("NPM", &mut self.curation.npm),
@@ -2073,6 +2159,8 @@ impl Default for Config {
             gc: GcConfig::default(),
             retention: RetentionConfig::default(),
             curation: CurationConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            tls: TlsConfig::default(),
             registries: None,
         }
     }

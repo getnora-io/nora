@@ -10,7 +10,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::proxy_fetch;
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -185,6 +185,8 @@ async fn download(
             &url,
             state.config.maven.proxy_timeout,
             proxy.auth(),
+            &state.circuit_breaker,
+            "maven",
         )
         .await
         {
@@ -212,6 +214,7 @@ async fn download(
 
                 return with_content_type(&path, data.into()).into_response();
             }
+            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(_) => continue,
         }
     }

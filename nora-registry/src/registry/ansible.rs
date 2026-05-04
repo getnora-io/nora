@@ -15,7 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -27,6 +27,9 @@ use axum::{
 use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
+
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("ansible/", ".tar.gz");
 const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -226,6 +229,8 @@ async fn download_tarball(
         &url,
         state.config.ansible.proxy_timeout,
         state.config.ansible.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "ansible",
     )
     .await
     {
@@ -255,6 +260,7 @@ async fn download_tarball(
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Ansible Galaxy download error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -271,6 +277,8 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
         state.config.ansible.proxy_timeout,
         state.config.ansible.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "ansible",
     )
     .await
     {
@@ -291,6 +299,7 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Ansible Galaxy upstream error");
             StatusCode::BAD_GATEWAY.into_response()

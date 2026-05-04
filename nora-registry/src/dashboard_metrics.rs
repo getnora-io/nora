@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+use crate::registry_type::RegistryType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,12 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Known registry names for per-registry metrics
-const REGISTRIES: &[&str] = &["docker", "maven", "npm", "cargo", "pypi", "raw", "go"];
+/// Registry names derived from RegistryType (single source of truth).
+fn registry_names() -> Vec<&'static str> {
+    RegistryType::all().iter().map(|rt| rt.as_str()).collect()
+}
 
 /// Serializable snapshot of metrics for persistence.
 /// Uses HashMap for per-registry counters — adding a new registry only
-/// requires adding its name to REGISTRIES (one line).
+/// requires adding it to RegistryType enum (single source of truth).
 #[derive(Serialize, Deserialize, Default)]
 struct MetricsSnapshot {
     downloads: u64,
@@ -89,8 +92,8 @@ impl DashboardMetrics {
             uploads: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
-            registry_downloads: CounterMap::new(REGISTRIES),
-            registry_uploads: CounterMap::new(REGISTRIES),
+            registry_downloads: CounterMap::new(&registry_names()),
+            registry_uploads: CounterMap::new(&registry_names()),
             start_time: Instant::now(),
             persist_path: None,
         }

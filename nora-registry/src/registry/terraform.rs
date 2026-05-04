@@ -19,7 +19,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -31,6 +31,9 @@ use axum::{
 use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://registry.terraform.io";
+
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("terraform/", ".zip");
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -123,6 +126,8 @@ async fn provider_versions(
         state.config.terraform.proxy_timeout,
         state.config.terraform.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "terraform",
     )
     .await
     {
@@ -150,6 +155,7 @@ async fn provider_versions(
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -225,6 +231,8 @@ async fn provider_download_meta(
         state.config.terraform.proxy_timeout,
         state.config.terraform.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "terraform",
     )
     .await
     {
@@ -255,6 +263,7 @@ async fn provider_download_meta(
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform download metadata error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -308,6 +317,8 @@ async fn provider_download_binary(
         &url,
         state.config.terraform.proxy_timeout_download,
         state.config.terraform.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "terraform",
     )
     .await
     {
@@ -338,6 +349,7 @@ async fn provider_download_binary(
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform binary download error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -386,6 +398,8 @@ async fn module_versions(
         state.config.terraform.proxy_timeout,
         state.config.terraform.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "terraform",
     )
     .await
     {
@@ -413,6 +427,7 @@ async fn module_versions(
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module versions error");
             StatusCode::BAD_GATEWAY.into_response()

@@ -27,7 +27,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -147,6 +147,8 @@ async fn search(
         state.config.conan.proxy_timeout,
         state.config.conan.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "conan",
     )
     .await
     {
@@ -160,6 +162,7 @@ async fn search(
             ));
             with_json(text.into_bytes())
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(error = ?e, "Conan search error");
@@ -354,6 +357,8 @@ async fn recipe_file_download(
         &url,
         state.config.conan.proxy_timeout,
         state.config.conan.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "conan",
     )
     .await
     {
@@ -383,6 +388,7 @@ async fn recipe_file_download(
             state.repo_index.invalidate("conan");
             with_binary(bytes)
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(error = ?e, "Conan recipe file download error");
@@ -636,6 +642,8 @@ async fn package_file_download(
         &url,
         state.config.conan.proxy_timeout_download,
         state.config.conan.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "conan",
     )
     .await
     {
@@ -665,6 +673,7 @@ async fn package_file_download(
             state.repo_index.invalidate("conan");
             with_binary(bytes)
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(error = ?e, "Conan package file download error");
@@ -688,6 +697,8 @@ async fn fetch_and_cache_json(
         state.config.conan.proxy_timeout,
         state.config.conan.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "conan",
     )
     .await
     {
@@ -714,6 +725,7 @@ async fn fetch_and_cache_json(
             state.repo_index.invalidate("conan");
             with_json(text.into_bytes())
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(url, error = ?e, "Conan upstream error");
@@ -735,6 +747,8 @@ async fn fetch_and_cache_immutable_json(
         state.config.conan.proxy_timeout,
         state.config.conan.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "conan",
     )
     .await
     {
@@ -763,6 +777,7 @@ async fn fetch_and_cache_immutable_json(
             state.repo_index.invalidate("conan");
             with_json(text.into_bytes())
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(url, error = ?e, "Conan upstream error");

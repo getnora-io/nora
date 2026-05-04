@@ -6,6 +6,7 @@ mod activity_log;
 mod audit;
 mod auth;
 mod backup;
+mod circuit_breaker;
 mod config;
 mod curation;
 mod dashboard_metrics;
@@ -44,7 +45,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use activity_log::ActivityLog;
 use audit::AuditLog;
 use auth::HtpasswdAuth;
-use config::{Config, CurationMode, StorageMode};
+use config::{Config, CurationMode, StorageMode, TlsConfig};
 use dashboard_metrics::DashboardMetrics;
 use registry_type::RegistryType;
 use repo_index::RepoIndex;
@@ -158,6 +159,7 @@ pub struct AppState {
     pub curation: curation::CurationEngine,
     /// Per-IP failed auth attempt tracker for brute-force protection
     pub auth_failures: auth::AuthFailureTracker,
+    pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
 }
 
 impl AppState {
@@ -169,6 +171,35 @@ impl AppState {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
+}
+
+/// Build HTTP client with optional custom CA certificate support.
+fn build_http_client(tls: &TlsConfig) -> reqwest::Client {
+    let mut builder = reqwest::ClientBuilder::new();
+
+    if let Some(ref ca_path) = tls.ca_cert {
+        match std::fs::read(ca_path) {
+            Ok(pem) => match reqwest::tls::Certificate::from_pem(&pem) {
+                Ok(cert) => {
+                    builder = builder.add_root_certificate(cert);
+                    info!(path = %ca_path, "Custom CA certificate loaded");
+                }
+                Err(e) => {
+                    error!(path = %ca_path, error = %e, "Failed to parse CA certificate");
+                    panic!("Cannot start with invalid CA certificate: {}", ca_path);
+                }
+            },
+            Err(e) => {
+                error!(path = %ca_path, error = %e, "Failed to read CA certificate file");
+                panic!(
+                    "Cannot start: CA certificate file not readable: {}",
+                    ca_path
+                );
+            }
+        }
+    }
+
+    builder.build().expect("Failed to build HTTP client")
 }
 
 #[tokio::main]
@@ -682,7 +713,7 @@ async fn run_server(config: Config, storage: Storage) {
     // Initialize Docker auth with proxy timeout
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
-    let http_client = reqwest::Client::new();
+    let http_client = build_http_client(&config.tls);
 
     // Initialize curation engine
     let mut curation_engine = curation::CurationEngine::new(config.curation.clone());
@@ -824,6 +855,8 @@ async fn run_server(config: Config, storage: Storage) {
 
     let startup_duration_ms = start_time.elapsed().as_millis() as u64;
 
+    let cb_config = config.circuit_breaker.clone();
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -842,6 +875,7 @@ async fn run_server(config: Config, storage: Storage) {
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
         auth_failures: auth::AuthFailureTracker::new(5, 900),
+        circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
@@ -1026,7 +1060,7 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     if covered.contains("*") {
         return;
     }
-    let all_registries = RegistryType::all_v1()
+    let all_registries = RegistryType::all()
         .iter()
         .map(|r| r.as_str())
         .collect::<Vec<_>>();

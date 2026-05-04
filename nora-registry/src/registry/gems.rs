@@ -16,7 +16,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -29,6 +29,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
+
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("gems/gems/", ".gem");
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -96,6 +99,8 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         &url,
         state.config.gems.proxy_timeout,
         state.config.gems.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "gems",
     )
     .await
     {
@@ -124,6 +129,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
             with_binary(bytes, "application/gzip")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(filename, error = ?e, "RubyGems upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -183,6 +189,8 @@ async fn compact_index(
         state.config.gems.proxy_timeout,
         state.config.gems.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "gems",
     )
     .await
     {
@@ -210,6 +218,7 @@ async fn compact_index(
             with_text(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "RubyGems compact index error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -293,6 +302,8 @@ async fn download_gem(
         &url,
         state.config.gems.proxy_timeout,
         state.config.gems.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "gems",
     )
     .await
     {
@@ -323,6 +334,7 @@ async fn download_gem(
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "RubyGems download error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -377,6 +389,8 @@ async fn download_gemspec(
         &url,
         state.config.gems.proxy_timeout,
         state.config.gems.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "gems",
     )
     .await
     {
@@ -406,6 +420,7 @@ async fn download_gemspec(
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "RubyGems gemspec error");
             StatusCode::BAD_GATEWAY.into_response()

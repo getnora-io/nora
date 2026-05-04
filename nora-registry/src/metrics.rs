@@ -56,6 +56,20 @@ lazy_static! {
         "Total artifacts stored",
         &["registry"]
     ).expect("failed to create ARTIFACTS_TOTAL metric at startup");
+
+    /// Circuit breaker state per registry (0=closed, 1=open, 2=half_open)
+    pub static ref CIRCUIT_BREAKER_STATE: prometheus::IntGaugeVec = prometheus::register_int_gauge_vec!(
+        "nora_circuit_breaker_state",
+        "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+        &["registry"]
+    ).expect("failed to create CIRCUIT_BREAKER_STATE metric at startup");
+
+    /// Total requests rejected by circuit breaker
+    pub static ref CIRCUIT_BREAKER_REJECTIONS: IntCounterVec = register_int_counter_vec!(
+        "nora_circuit_breaker_rejections_total",
+        "Total requests rejected by circuit breaker",
+        &["registry"]
+    ).expect("failed to create CIRCUIT_BREAKER_REJECTIONS metric at startup");
 }
 
 /// Routes for metrics endpoint

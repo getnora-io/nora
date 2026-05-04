@@ -15,7 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -28,10 +28,15 @@ use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", "index.json");
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Service index
         .route("/nuget/v3/index.json", get(service_index))
+        // Search (proxy to upstream SearchQueryService)
+        .route("/nuget/v3/query", get(search_query))
         // Registration index
         .route(
             "/nuget/v3/registration/{id}/index.json",
@@ -57,6 +62,8 @@ async fn service_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         state.config.nuget.proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "nuget",
     )
     .await
     {
@@ -76,8 +83,50 @@ async fn service_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet service index error");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+// ── Search query (proxy to upstream SearchQueryService) ───────────────
+
+async fn search_query(
+    State(state): State<Arc<AppState>>,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    // Forward query string as-is to upstream search
+    let qs = raw_query.0.unwrap_or_default();
+    let url = format!("{}?{}", state.config.nuget.search_service, qs);
+
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        state.config.nuget.proxy_timeout,
+        None, // search endpoint is public
+        None,
+        &state.circuit_breaker,
+        "nuget",
+    )
+    .await
+    {
+        Ok(text) => {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_miss();
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                format!("search?{}", qs.chars().take(50).collect::<String>()),
+                "nuget",
+                "PROXY",
+            ));
+            with_json(text.into_bytes())
+        }
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        Err(e) => {
+            tracing::debug!(error = ?e, "NuGet search error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -134,6 +183,8 @@ async fn registration_index(
         state.config.nuget.proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "nuget",
     )
     .await
     {
@@ -161,6 +212,7 @@ async fn registration_index(
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -222,6 +274,8 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
         state.config.nuget.proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "nuget",
     )
     .await
     {
@@ -249,6 +303,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet version list error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -347,6 +402,8 @@ async fn flatcontainer_download(
         &url,
         state.config.nuget.proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "nuget",
     )
     .await
     {
@@ -381,6 +438,7 @@ async fn flatcontainer_download(
                 .into_response()
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet download error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -463,12 +521,13 @@ fn with_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// Rewrite NuGet service index: replace upstream @id URLs with NORA URLs.
-/// This is a simplified rewrite — full NuGet v3 has many @id fields.
+/// Rewrite known Microsoft NuGet service index URLs with NORA endpoints.
+/// Targets api.nuget.org and azuresearch-{usnc,ussc}.nuget.org specifically.
 fn rewrite_service_index(json_text: &str, host: &str) -> String {
     let nora_base = format!("http://{}/nuget", host);
+    let nora_query = format!("{}/v3/query", nora_base);
 
-    // Simple string replacement approach for the major services
+    // Rewrite major service URLs to route through NORA
     json_text
         .replace(
             "https://api.nuget.org/v3-flatcontainer/",
@@ -478,6 +537,9 @@ fn rewrite_service_index(json_text: &str, host: &str) -> String {
             "https://api.nuget.org/v3/registration5-gz-semver2/",
             &format!("{}/v3/registration/", nora_base),
         )
+        // Rewrite search endpoints to proxy through NORA
+        .replace("https://azuresearch-usnc.nuget.org/query", &nora_query)
+        .replace("https://azuresearch-ussc.nuget.org/query", &nora_query)
 }
 
 fn is_valid_package_id(id: &str) -> bool {
@@ -526,6 +588,15 @@ mod tests {
         let result = rewrite_service_index(input, "nora:4000");
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(!result.contains("api.nuget.org/v3-flatcontainer/"));
+    }
+
+    #[test]
+    fn test_rewrite_service_index_search_urls() {
+        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/query","@type":"SearchQueryService"},{"@id":"https://azuresearch-ussc.nuget.org/query","@type":"SearchQueryService"}]}"#;
+        let result = rewrite_service_index(input, "nora:4000");
+        assert!(result.contains("http://nora:4000/nuget/v3/query"));
+        assert!(!result.contains("azuresearch-usnc.nuget.org"));
+        assert!(!result.contains("azuresearch-ussc.nuget.org"));
     }
 }
 
