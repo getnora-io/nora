@@ -12,7 +12,7 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -336,154 +336,6 @@ pub async fn api_search(
     axum::response::Html(html)
 }
 
-// ============ Data Fetching Functions ============
-// NOTE: Legacy functions below - kept for reference, will be removed in future cleanup
-
-#[allow(dead_code)]
-pub async fn get_registry_stats(storage: &Storage) -> RegistryStats {
-    let all_keys = storage.list("").await;
-
-    let docker = all_keys
-        .iter()
-        .filter(|k| k.starts_with("docker/") && k.contains("/manifests/"))
-        .filter_map(|k| k.split('/').nth(1))
-        .collect::<HashSet<_>>()
-        .len();
-
-    let maven = all_keys
-        .iter()
-        .filter(|k| k.starts_with("maven/"))
-        .filter_map(|k| {
-            // Extract groupId/artifactId from maven path
-            let parts: Vec<_> = k.strip_prefix("maven/")?.split('/').collect();
-            if parts.len() >= 2 {
-                Some(parts[..parts.len() - 1].join("/"))
-            } else {
-                None
-            }
-        })
-        .collect::<HashSet<_>>()
-        .len();
-
-    let npm = all_keys
-        .iter()
-        .filter(|k| k.starts_with("npm/") && k.ends_with("/metadata.json"))
-        .count();
-
-    let cargo = all_keys
-        .iter()
-        .filter(|k| k.starts_with("cargo/") && k.ends_with("/metadata.json"))
-        .count();
-
-    let pypi = all_keys
-        .iter()
-        .filter(|k| k.starts_with("pypi/"))
-        .filter_map(|k| k.strip_prefix("pypi/")?.split('/').next())
-        .collect::<HashSet<_>>()
-        .len();
-
-    let go = all_keys
-        .iter()
-        .filter(|k| k.starts_with("go/") && k.ends_with(".zip"))
-        .filter_map(|k| {
-            let rest = k.strip_prefix("go/")?;
-            let pos = rest.rfind("/@v/")?;
-            Some(rest[..pos].to_string())
-        })
-        .collect::<HashSet<_>>()
-        .len();
-
-    let raw = all_keys
-        .iter()
-        .filter(|k| k.starts_with("raw/"))
-        .filter_map(|k| k.strip_prefix("raw/")?.split('/').next())
-        .collect::<HashSet<_>>()
-        .len();
-
-    RegistryStats {
-        docker,
-        maven,
-        npm,
-        cargo,
-        pypi,
-        go,
-        raw,
-    }
-}
-
-#[allow(dead_code)]
-pub async fn get_docker_repos(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("docker/").await;
-
-    let mut repos: HashMap<String, (RepoInfo, u64)> = HashMap::new(); // (info, latest_modified)
-
-    for key in &keys {
-        // Skip .meta.json files
-        if key.ends_with(".meta.json") {
-            continue;
-        }
-
-        if let Some(rest) = key.strip_prefix("docker/") {
-            let parts: Vec<_> = rest.split('/').collect();
-            if parts.len() >= 3 {
-                let name = parts[0].to_string();
-                let entry = repos.entry(name.clone()).or_insert_with(|| {
-                    (
-                        RepoInfo {
-                            name,
-                            versions: 0,
-                            size: 0,
-                            updated: "N/A".to_string(),
-                            ..Default::default()
-                        },
-                        0,
-                    )
-                });
-
-                if parts[1] == "manifests" && key.ends_with(".json") {
-                    entry.0.versions += 1;
-
-                    // Parse manifest to get actual image size (config + layers)
-                    if let Ok(manifest_data) = storage.get(key).await {
-                        if let Ok(manifest) =
-                            serde_json::from_slice::<serde_json::Value>(&manifest_data)
-                        {
-                            let config_size = manifest
-                                .get("config")
-                                .and_then(|c| c.get("size"))
-                                .and_then(|s| s.as_u64())
-                                .unwrap_or(0);
-                            let layers_size: u64 = manifest
-                                .get("layers")
-                                .and_then(|l| l.as_array())
-                                .map(|layers| {
-                                    layers
-                                        .iter()
-                                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
-                                        .sum()
-                                })
-                                .unwrap_or(0);
-                            entry.0.size += config_size + layers_size;
-                        }
-                    }
-
-                    // Update timestamp
-                    if let Some(meta) = storage.stat(key).await {
-                        if meta.modified > entry.1 {
-                            entry.1 = meta.modified;
-                            entry.0.updated = format_timestamp(meta.modified);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<_> = repos.into_values().map(|(r, _)| r).collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
-}
-
 pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     let prefix = format!("docker/{}/manifests/", name);
     let keys = state.storage.list(&prefix).await;
@@ -591,46 +443,6 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
-#[allow(dead_code)]
-pub async fn get_maven_repos(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("maven/").await;
-
-    let mut repos: HashMap<String, (RepoInfo, u64)> = HashMap::new();
-
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix("maven/") {
-            let parts: Vec<_> = rest.split('/').collect();
-            if parts.len() >= 2 {
-                let artifact_path = parts[..parts.len() - 1].join("/");
-                let entry = repos.entry(artifact_path.clone()).or_insert_with(|| {
-                    (
-                        RepoInfo {
-                            name: artifact_path,
-                            versions: 0,
-                            size: 0,
-                            updated: "N/A".to_string(),
-                            ..Default::default()
-                        },
-                        0,
-                    )
-                });
-                entry.0.versions += 1;
-                if let Some(meta) = storage.stat(key).await {
-                    entry.0.size += meta.size;
-                    if meta.modified > entry.1 {
-                        entry.1 = meta.modified;
-                        entry.0.updated = format_timestamp(meta.modified);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<_> = repos.into_values().map(|(r, _)| r).collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
-}
-
 pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     let prefix = format!("maven/{}/", path);
     let keys = storage.list(&prefix).await;
@@ -650,73 +462,6 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     }
 
     MavenDetail { artifacts }
-}
-
-#[allow(dead_code)]
-pub async fn get_npm_packages(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("npm/").await;
-
-    let mut packages: HashMap<String, RepoInfo> = HashMap::new();
-
-    // Find all metadata.json files
-    for key in &keys {
-        if key.ends_with("/metadata.json") {
-            if let Some(name) = key
-                .strip_prefix("npm/")
-                .and_then(|s| s.strip_suffix("/metadata.json"))
-            {
-                // Parse metadata to get version count and info
-                if let Ok(data) = storage.get(key).await {
-                    if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let versions_count = metadata
-                            .get("versions")
-                            .and_then(|v| v.as_object())
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-
-                        // Calculate total size from dist.unpackedSize or estimate
-                        let total_size: u64 = metadata
-                            .get("versions")
-                            .and_then(|v| v.as_object())
-                            .map(|versions| {
-                                versions
-                                    .values()
-                                    .filter_map(|v| {
-                                        v.get("dist")
-                                            .and_then(|d| d.get("unpackedSize"))
-                                            .and_then(|s| s.as_u64())
-                                    })
-                                    .sum()
-                            })
-                            .unwrap_or(0);
-
-                        // Get latest version time for "updated"
-                        let updated = metadata
-                            .get("time")
-                            .and_then(|t| t.get("modified"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s[..10].to_string()) // Take just date part
-                            .unwrap_or_else(|| "N/A".to_string());
-
-                        packages.insert(
-                            name.to_string(),
-                            RepoInfo {
-                                name: name.to_string(),
-                                versions: versions_count,
-                                size: total_size,
-                                updated,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<_> = packages.into_values().collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
 }
 
 pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
@@ -771,49 +516,6 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
     PackageDetail { versions }
 }
 
-#[allow(dead_code)]
-pub async fn get_cargo_crates(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("cargo/").await;
-
-    let mut crates: HashMap<String, (RepoInfo, u64)> = HashMap::new();
-
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix("cargo/") {
-            let parts: Vec<_> = rest.split('/').collect();
-            if !parts.is_empty() {
-                let name = parts[0].to_string();
-                let entry = crates.entry(name.clone()).or_insert_with(|| {
-                    (
-                        RepoInfo {
-                            name,
-                            versions: 0,
-                            size: 0,
-                            updated: "N/A".to_string(),
-                            ..Default::default()
-                        },
-                        0,
-                    )
-                });
-
-                if parts.len() >= 3 && key.ends_with(".crate") {
-                    entry.0.versions += 1;
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.0.size += meta.size;
-                        if meta.modified > entry.1 {
-                            entry.1 = meta.modified;
-                            entry.0.updated = format_timestamp(meta.modified);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<_> = crates.into_values().map(|(r, _)| r).collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
-}
-
 pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
     let prefix = format!("cargo/{}/", name);
     let keys = storage.list(&prefix).await;
@@ -838,49 +540,6 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
     }
 
     PackageDetail { versions }
-}
-
-#[allow(dead_code)]
-pub async fn get_pypi_packages(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("pypi/").await;
-
-    let mut packages: HashMap<String, (RepoInfo, u64)> = HashMap::new();
-
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix("pypi/") {
-            let parts: Vec<_> = rest.split('/').collect();
-            if !parts.is_empty() {
-                let name = parts[0].to_string();
-                let entry = packages.entry(name.clone()).or_insert_with(|| {
-                    (
-                        RepoInfo {
-                            name,
-                            versions: 0,
-                            size: 0,
-                            updated: "N/A".to_string(),
-                            ..Default::default()
-                        },
-                        0,
-                    )
-                });
-
-                if parts.len() >= 2 {
-                    entry.0.versions += 1;
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.0.size += meta.size;
-                        if meta.modified > entry.1 {
-                            entry.1 = meta.modified;
-                            entry.0.updated = format_timestamp(meta.modified);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<_> = packages.into_values().map(|(r, _)| r).collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
 }
 
 pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {

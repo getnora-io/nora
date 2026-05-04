@@ -547,7 +547,6 @@ pub struct CurationMetrics {
     pub blocked: AtomicU64,
     pub allowed: AtomicU64,
     pub without_integrity: AtomicU64,
-    pub cve_cache_miss: AtomicU64,
 }
 
 impl CurationMetrics {
@@ -556,7 +555,6 @@ impl CurationMetrics {
             blocked: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
             without_integrity: AtomicU64::new(0),
-            cve_cache_miss: AtomicU64::new(0),
         }
     }
 }

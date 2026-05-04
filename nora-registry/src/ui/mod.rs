@@ -4,7 +4,7 @@
 pub(crate) mod api;
 pub mod components;
 pub mod i18n;
-mod logo;
+
 mod static_assets;
 mod templates;
 
