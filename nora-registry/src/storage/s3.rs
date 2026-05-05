@@ -253,7 +253,28 @@ impl S3Storage {
 
         match request.send().await {
             Ok(response) if response.status().is_success() => response.text().await.ok(),
-            _ => None,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    %status,
+                    prefix = %prefix,
+                    bucket = %self.bucket,
+                    response_body = %body,
+                    "S3 ListObjectsV2 failed"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    prefix = %prefix,
+                    bucket = %self.bucket,
+                    s3_url = %self.s3_url,
+                    "S3 ListObjectsV2 request error"
+                );
+                None
+            }
         }
     }
 }
