@@ -283,58 +283,10 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
     Ok(stats)
 }
 
-/// Format bytes for human-readable display
-#[allow(dead_code)]
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
-    }
-
-    #[test]
-    fn test_format_bytes_bytes() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1023), "1023 B");
-    }
-
-    #[test]
-    fn test_format_bytes_kilobytes() {
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(10240), "10.00 KB");
-    }
-
-    #[test]
-    fn test_format_bytes_megabytes() {
-        assert_eq!(format_bytes(1048576), "1.00 MB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MB");
-    }
-
-    #[test]
-    fn test_format_bytes_gigabytes() {
-        assert_eq!(format_bytes(1073741824), "1.00 GB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
-    }
 
     #[test]
     fn test_backup_metadata_serialization() {

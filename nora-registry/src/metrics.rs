@@ -158,27 +158,6 @@ fn detect_registry(path: &str) -> String {
     }
 }
 
-/// Record cache hit
-#[allow(dead_code)]
-pub fn record_cache_hit(registry: &str) {
-    CACHE_REQUESTS.with_label_values(&[registry, "hit"]).inc();
-}
-
-/// Record cache miss
-#[allow(dead_code)]
-pub fn record_cache_miss(registry: &str) {
-    CACHE_REQUESTS.with_label_values(&[registry, "miss"]).inc();
-}
-
-/// Record storage operation
-#[allow(dead_code)]
-pub fn record_storage_op(operation: &str, success: bool) {
-    let status = if success { "success" } else { "error" };
-    STORAGE_OPERATIONS
-        .with_label_values(&[operation, status])
-        .inc();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,26 +227,5 @@ mod tests {
         assert_eq!(detect_registry("/raw/data/file.bin"), "raw");
         // Bare prefix without trailing slash should not match
         assert_eq!(detect_registry("/rawdata/file"), "other");
-    }
-
-    #[test]
-    fn test_record_cache_hit() {
-        record_cache_hit("docker");
-        // Doesn't panic — metric is recorded
-    }
-
-    #[test]
-    fn test_record_cache_miss() {
-        record_cache_miss("npm");
-    }
-
-    #[test]
-    fn test_record_storage_op_success() {
-        record_storage_op("get", true);
-    }
-
-    #[test]
-    fn test_record_storage_op_error() {
-        record_storage_op("put", false);
     }
 }

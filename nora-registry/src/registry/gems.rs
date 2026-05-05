@@ -442,7 +442,13 @@ fn upstream_url(state: &AppState) -> String {
 fn with_binary(data: Vec<u8>, content_type: &'static str) -> Response {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
         data,
     )
         .into_response()
@@ -451,10 +457,16 @@ fn with_binary(data: Vec<u8>, content_type: &'static str) -> Response {
 fn with_text(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60, must-revalidate"),
+            ),
+        ],
         data,
     )
         .into_response()

@@ -10,7 +10,7 @@ mod circuit_breaker;
 mod config;
 mod curation;
 mod dashboard_metrics;
-mod error;
+
 mod gc;
 mod hash_pin_store;
 mod health;

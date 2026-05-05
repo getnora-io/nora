@@ -349,12 +349,6 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
         .into_response()
 }
 
-/// Generate bcrypt hash for password (for CLI user management)
-#[allow(dead_code)]
-pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
-    bcrypt::hash(password, bcrypt::DEFAULT_COST)
-}
-
 // Token management API routes
 use axum::{routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -645,13 +639,6 @@ mod tests {
             "/maven2/com/example/artifact/1.0/artifact.jar"
         ));
         assert!(!is_public_path("/npm/lodash"));
-    }
-
-    #[test]
-    fn test_hash_password() {
-        let hash = hash_password("test123").unwrap();
-        assert!(hash.starts_with("$2"));
-        assert!(bcrypt::verify("test123", &hash).unwrap());
     }
 
     #[test]

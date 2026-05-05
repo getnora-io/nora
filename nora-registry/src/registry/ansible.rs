@@ -350,10 +350,16 @@ fn upstream_url(state: &AppState) -> String {
 fn with_json(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60, must-revalidate"),
+            ),
+        ],
         data,
     )
         .into_response()
@@ -362,10 +368,16 @@ fn with_json(data: Vec<u8>) -> Response {
 fn with_binary(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/gzip"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/gzip"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
         data,
     )
         .into_response()
