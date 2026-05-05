@@ -34,28 +34,57 @@ const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/i
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Collection listing
+        // Galaxy API discovery (ansible-galaxy CLI hits this first)
+        .route("/ansible/", get(api_discovery))
+        .route("/ansible/api/", get(api_discovery))
+        // Short v3 paths (ansible-galaxy --api-version 3 format)
+        .route("/ansible/v3/collections/", get(collection_list))
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/",
+            get(collection_detail),
+        )
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/versions/",
+            get(version_list),
+        )
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/versions/{ver}/",
+            get(version_detail),
+        )
+        // Full pulp-style paths (direct API access)
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/",
             get(collection_list),
         )
-        // Collection detail
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/",
             get(collection_detail),
         )
-        // Version listing
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/",
             get(version_list),
         )
-        // Version detail
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/{ver}/",
             get(version_detail),
         )
         // Collection tarball download (immutable)
         .route("/ansible/download/{filename}", get(download_tarball))
+}
+
+// ── API discovery ─────────────────────────────────────────────────────
+
+async fn api_discovery() -> Response {
+    let body = r#"{"available_versions":{"v3":"v3/"}}"#;
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 // ── Collection list ────────────────────────────────────────────────────
@@ -461,5 +490,52 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_ansible_api_discovery() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+        // /ansible/ discovery
+        let resp = send(&ctx.app, Method::GET, "/ansible/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available_versions"]["v3"], "v3/");
+
+        // /ansible/api/ discovery
+        let resp = send(&ctx.app, Method::GET, "/ansible/api/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available_versions"]["v3"], "v3/");
+    }
+
+    #[tokio::test]
+    async fn test_ansible_short_v3_path_tarball() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "ansible/download/community-general-7.0.0.tar.gz",
+                b"tarball-v3",
+            )
+            .await
+            .unwrap();
+
+        // Short v3 path should still serve downloads
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/download/community-general-7.0.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"tarball-v3");
     }
 }
