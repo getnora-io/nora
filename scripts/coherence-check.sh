@@ -95,6 +95,29 @@ else
 fi
 echo ""
 
+# ── 6. Silent error swallowing: _ => None without logging ─────────────────
+
+echo "--- Silent Error Check (storage/handlers) ---"
+SILENT_ERRORS=0
+# Find `_ => None` or `_ => { None }` patterns in critical paths without tracing nearby
+while IFS=: read -r file line content; do
+    # Check 3 lines above for tracing/log
+    start=$((line > 3 ? line - 3 : 1))
+    context=$(sed -n "${start},${line}p" "$file")
+    if ! echo "$context" | grep -qE 'tracing::|log::|error!|warn!'; then
+        warn "Silent error at $file:$line — consider adding tracing"
+        SILENT_ERRORS=$((SILENT_ERRORS + 1))
+    fi
+done < <(grep -rn '_ => None\|_ => {\s*None' \
+    "$REPO_ROOT/nora-registry/src/storage/" \
+    "$REPO_ROOT/nora-registry/src/handlers/" \
+    2>/dev/null || true)
+
+if [ "$SILENT_ERRORS" -eq 0 ]; then
+    ok "No silent error swallowing in storage/handlers"
+fi
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────
 
 echo "=== Summary ==="
