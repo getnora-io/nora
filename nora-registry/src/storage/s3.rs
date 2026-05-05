@@ -183,9 +183,9 @@ impl S3Storage {
         prefix: &str,
         continuation_token: Option<&str>,
     ) -> Option<String> {
-        let mut query = format!("list-type=2&prefix={}", uri_encode(prefix));
+        let mut query = format!("list-type=2&prefix={}", uri_encode_query(prefix));
         if let Some(token) = continuation_token {
-            query.push_str(&format!("&continuation-token={}", uri_encode(token)));
+            query.push_str(&format!("&continuation-token={}", uri_encode_query(token)));
         }
         let url = format!("{}/{}?{}", self.s3_url, self.bucket, query);
         let now = Utc::now();
@@ -221,7 +221,7 @@ impl S3Storage {
             params.sort_by_key(|(k, _)| *k);
             let canonical_query: Vec<String> = params
                 .iter()
-                .map(|(k, v)| format!("{}={}", uri_encode(k), uri_encode(v)))
+                .map(|(k, v)| format!("{}={}", uri_encode_query(k), uri_encode_query(v)))
                 .collect();
             let canonical_query_str = canonical_query.join("&");
 
@@ -253,7 +253,28 @@ impl S3Storage {
 
         match request.send().await {
             Ok(response) if response.status().is_success() => response.text().await.ok(),
-            _ => None,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    %status,
+                    prefix = %prefix,
+                    bucket = %self.bucket,
+                    response_body = %body,
+                    "S3 ListObjectsV2 failed"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    prefix = %prefix,
+                    bucket = %self.bucket,
+                    s3_url = %self.s3_url,
+                    "S3 ListObjectsV2 request error"
+                );
+                None
+            }
         }
     }
 }
@@ -264,6 +285,25 @@ fn uri_encode(s: &str) -> String {
     for c in s.chars() {
         match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' | ':' => result.push(c),
+            _ => {
+                for b in c.to_string().as_bytes() {
+                    result.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Encode a string for use in S3 query parameter values.
+/// Per AWS SigV4 spec, query values must percent-encode everything
+/// except unreserved characters (A-Za-z0-9 - _ . ~).
+/// Unlike `uri_encode`, this does NOT preserve `/` or `:`.
+fn uri_encode_query(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 3);
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
             _ => {
                 for b in c.to_string().as_bytes() {
                     result.push_str(&format!("%{:02X}", b));
@@ -614,5 +654,52 @@ mod tests {
     fn test_uri_encode_percent() {
         assert_eq!(uri_encode("%"), "%25");
         assert_eq!(uri_encode("100%done"), "100%25done");
+    }
+
+    #[test]
+    fn test_uri_encode_colon_for_docker_digests() {
+        // Colon must NOT be encoded — reqwest sends raw ':' in URL paths.
+        // Encoding ':' to '%3A' causes SigV4 signature mismatch with strict
+        // S3 implementations (e.g. Garage) that verify canonical URI byte-for-byte.
+        assert_eq!(uri_encode("sha256:abc123def"), "sha256:abc123def");
+        assert_eq!(
+            uri_encode("docker/sha256:abc/blobs/sha256:def456"),
+            "docker/sha256:abc/blobs/sha256:def456"
+        );
+    }
+
+    #[test]
+    fn test_uri_encode_query_encodes_slash() {
+        // Query values must encode '/' as %2F per AWS SigV4 spec.
+        // This is the fix for issue #255.
+        assert_eq!(
+            uri_encode_query("maven/com/example"),
+            "maven%2Fcom%2Fexample"
+        );
+        assert_eq!(
+            uri_encode_query("docker/library/nginx"),
+            "docker%2Flibrary%2Fnginx"
+        );
+    }
+
+    #[test]
+    fn test_uri_encode_query_encodes_colon() {
+        // Query values must also encode ':' — unlike path encoding.
+        assert_eq!(uri_encode_query("sha256:abc"), "sha256%3Aabc");
+    }
+
+    #[test]
+    fn test_uri_encode_query_preserves_unreserved() {
+        // Unreserved chars (A-Za-z0-9 - _ . ~) are NOT encoded.
+        assert_eq!(uri_encode_query("hello"), "hello");
+        assert_eq!(uri_encode_query("test-file_v1.0"), "test-file_v1.0");
+        assert_eq!(uri_encode_query("a~b"), "a~b");
+    }
+
+    #[test]
+    fn test_uri_encode_query_special_chars() {
+        assert_eq!(uri_encode_query("a=b"), "a%3Db");
+        assert_eq!(uri_encode_query("a&b"), "a%26b");
+        assert_eq!(uri_encode_query("hello world"), "hello%20world");
     }
 }

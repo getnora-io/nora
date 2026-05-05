@@ -15,7 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -27,32 +27,64 @@ use axum::{
 use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
+
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("ansible/", ".tar.gz");
 const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Collection listing
+        // Galaxy API discovery (ansible-galaxy CLI hits this first)
+        .route("/ansible/", get(api_discovery))
+        .route("/ansible/api/", get(api_discovery))
+        // Short v3 paths (ansible-galaxy --api-version 3 format)
+        .route("/ansible/v3/collections/", get(collection_list))
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/",
+            get(collection_detail),
+        )
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/versions/",
+            get(version_list),
+        )
+        .route(
+            "/ansible/v3/collections/{ns}/{name}/versions/{ver}/",
+            get(version_detail),
+        )
+        // Full pulp-style paths (direct API access)
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/",
             get(collection_list),
         )
-        // Collection detail
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/",
             get(collection_detail),
         )
-        // Version listing
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/",
             get(version_list),
         )
-        // Version detail
         .route(
             "/ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/{ver}/",
             get(version_detail),
         )
         // Collection tarball download (immutable)
         .route("/ansible/download/{filename}", get(download_tarball))
+}
+
+// ── API discovery ─────────────────────────────────────────────────────
+
+async fn api_discovery() -> Response {
+    let body = r#"{"available_versions":{"v3":"v3/"}}"#;
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 // ── Collection list ────────────────────────────────────────────────────
@@ -226,6 +258,8 @@ async fn download_tarball(
         &url,
         state.config.ansible.proxy_timeout,
         state.config.ansible.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "ansible",
     )
     .await
     {
@@ -255,6 +289,7 @@ async fn download_tarball(
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Ansible Galaxy download error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -271,6 +306,8 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
         state.config.ansible.proxy_timeout,
         state.config.ansible.proxy_auth.as_deref(),
         None,
+        &state.circuit_breaker,
+        "ansible",
     )
     .await
     {
@@ -291,6 +328,7 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Ansible Galaxy upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -464,5 +502,52 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_ansible_api_discovery() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+        // /ansible/ discovery
+        let resp = send(&ctx.app, Method::GET, "/ansible/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available_versions"]["v3"], "v3/");
+
+        // /ansible/api/ discovery
+        let resp = send(&ctx.app, Method::GET, "/ansible/api/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available_versions"]["v3"], "v3/");
+    }
+
+    #[tokio::test]
+    async fn test_ansible_short_v3_path_tarball() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "ansible/download/community-general-7.0.0.tar.gz",
+                b"tarball-v3",
+            )
+            .await
+            .unwrap();
+
+        // Short v3 path should still serve downloads
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/download/community-general-7.0.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"tarball-v3");
     }
 }

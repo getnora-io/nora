@@ -9,6 +9,7 @@
 //! - Arc<Vec> for zero-cost reads
 //! - Single rebuild at a time per registry (rebuild_lock)
 
+use crate::registry_type::RegistryType;
 use crate::storage::Storage;
 use crate::ui::components::format_timestamp;
 use parking_lot::RwLock;
@@ -78,53 +79,36 @@ impl Default for RegistryIndex {
 
 /// Main repository index for all registries
 pub struct RepoIndex {
-    pub docker: RegistryIndex,
-    pub maven: RegistryIndex,
-    pub npm: RegistryIndex,
-    pub cargo: RegistryIndex,
-    pub pypi: RegistryIndex,
-    pub go: RegistryIndex,
-    pub raw: RegistryIndex,
+    indexes: HashMap<RegistryType, RegistryIndex>,
 }
 
 impl RepoIndex {
     pub fn new() -> Self {
-        Self {
-            docker: RegistryIndex::new(),
-            maven: RegistryIndex::new(),
-            npm: RegistryIndex::new(),
-            cargo: RegistryIndex::new(),
-            pypi: RegistryIndex::new(),
-            go: RegistryIndex::new(),
-            raw: RegistryIndex::new(),
+        let mut indexes = HashMap::new();
+        for rt in RegistryType::all() {
+            indexes.insert(*rt, RegistryIndex::new());
         }
+        Self { indexes }
     }
 
     /// Invalidate a specific registry index
     pub fn invalidate(&self, registry: &str) {
-        match registry {
-            "docker" => self.docker.invalidate(),
-            "maven" => self.maven.invalidate(),
-            "npm" => self.npm.invalidate(),
-            "cargo" => self.cargo.invalidate(),
-            "pypi" => self.pypi.invalidate(),
-            "go" => self.go.invalidate(),
-            "raw" => self.raw.invalidate(),
-            _ => {}
+        if let Some(rt) = RegistryType::from_str_opt(registry) {
+            if let Some(idx) = self.indexes.get(&rt) {
+                idx.invalidate();
+            }
         }
     }
 
     /// Get index with double-checked locking (prevents race condition)
     pub async fn get(&self, registry: &str, storage: &Storage) -> Arc<Vec<RepoInfo>> {
-        let index = match registry {
-            "docker" => &self.docker,
-            "maven" => &self.maven,
-            "npm" => &self.npm,
-            "cargo" => &self.cargo,
-            "pypi" => &self.pypi,
-            "go" => &self.go,
-            "raw" => &self.raw,
-            _ => return Arc::new(Vec::new()),
+        let reg_type = match RegistryType::from_str_opt(registry) {
+            Some(rt) => rt,
+            None => return Arc::new(Vec::new()),
+        };
+        let index = match self.indexes.get(&reg_type) {
+            Some(idx) => idx,
+            None => return Arc::new(Vec::new()),
         };
 
         // Fast path: not dirty, return cached
@@ -137,15 +121,35 @@ impl RepoIndex {
 
         // Double-check under lock (another thread may have rebuilt)
         if index.is_dirty() {
-            let data = match registry {
-                "docker" => build_docker_index(storage).await,
-                "maven" => build_maven_index(storage).await,
-                "npm" => build_npm_index(storage).await,
-                "cargo" => build_cargo_index(storage).await,
-                "pypi" => build_pypi_index(storage).await,
-                "go" => build_go_index(storage).await,
-                "raw" => build_raw_index(storage).await,
-                _ => Vec::new(),
+            let data = match reg_type {
+                RegistryType::Docker => build_docker_index(storage).await,
+                RegistryType::Maven => build_maven_index(storage).await,
+                RegistryType::Npm => build_npm_index(storage).await,
+                RegistryType::Cargo => build_cargo_index(storage).await,
+                RegistryType::PyPI => build_pypi_index(storage).await,
+                RegistryType::Go => build_go_index(storage).await,
+                RegistryType::Raw => build_raw_index(storage).await,
+                RegistryType::Nuget => {
+                    let (p, s) = crate::registry::nuget::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
+                RegistryType::Gems => {
+                    let (p, s) = crate::registry::gems::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
+                RegistryType::Terraform => {
+                    let (p, s) = crate::registry::terraform::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
+                RegistryType::Ansible => {
+                    let (p, s) = crate::registry::ansible::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
+                RegistryType::PubDart => {
+                    let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
+                RegistryType::Conan => build_conan_index(storage).await,
             };
             info!(registry = registry, count = data.len(), "Index rebuilt");
             index.set(data);
@@ -155,16 +159,11 @@ impl RepoIndex {
     }
 
     /// Get counts for stats (no rebuild, just current state)
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
-        (
-            self.docker.count(),
-            self.maven.count(),
-            self.npm.count(),
-            self.cargo.count(),
-            self.pypi.count(),
-            self.go.count(),
-            self.raw.count(),
-        )
+    pub fn counts(&self) -> HashMap<RegistryType, usize> {
+        self.indexes
+            .iter()
+            .map(|(rt, idx)| (*rt, idx.count()))
+            .collect()
     }
 }
 
@@ -413,6 +412,61 @@ async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
     result
 }
 
+/// Generic index builder: groups files under `prefix` by first path segment.
+/// Only counts files matching `suffix` (e.g. ".gem", ".tar.gz", "index.json").
+async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> Vec<RepoInfo> {
+    let keys = storage.list(prefix).await;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &keys {
+        if !key.ends_with(suffix) {
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix(prefix) {
+            let name = rest.split('/').next().unwrap_or(rest).to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let entry = packages.entry(name).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    to_sorted_vec(packages)
+}
+
+/// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
+async fn build_conan_index(storage: &Storage) -> Vec<RepoInfo> {
+    let keys = storage.list("conan/").await;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix("conan/") {
+            // First segment is the package name
+            let name = rest.split('/').next().unwrap_or(rest).to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let entry = packages.entry(name).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    to_sorted_vec(packages)
+}
+
 /// Convert HashMap to sorted Vec<RepoInfo>
 fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
     let mut result: Vec<_> = map
@@ -570,28 +624,39 @@ mod tests {
     #[test]
     fn test_repo_index_new() {
         let idx = RepoIndex::new();
-        let (d, m, n, c, p, g, r) = idx.counts();
-        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
+        let counts = idx.counts();
+        for rt in RegistryType::all() {
+            assert_eq!(
+                counts.get(rt).copied().unwrap_or(0),
+                0,
+                "non-zero for {}",
+                rt
+            );
+        }
     }
 
     #[test]
     fn test_repo_index_invalidate() {
         let idx = RepoIndex::new();
-        // Should not panic for any registry
-        idx.invalidate("docker");
-        idx.invalidate("maven");
-        idx.invalidate("npm");
-        idx.invalidate("cargo");
-        idx.invalidate("pypi");
-        idx.invalidate("raw");
+        // Should not panic for any registry (all 13 + unknown)
+        for rt in RegistryType::all() {
+            idx.invalidate(rt.as_str());
+        }
         idx.invalidate("unknown"); // should be a no-op
     }
 
     #[test]
     fn test_repo_index_default() {
         let idx = RepoIndex::default();
-        let (d, m, n, c, p, g, r) = idx.counts();
-        assert_eq!((d, m, n, c, p, g, r), (0, 0, 0, 0, 0, 0, 0));
+        let counts = idx.counts();
+        for rt in RegistryType::all() {
+            assert_eq!(
+                counts.get(rt).copied().unwrap_or(0),
+                0,
+                "non-zero for {}",
+                rt
+            );
+        }
     }
 
     #[test]

@@ -150,6 +150,8 @@ fn build_context(
         gc: crate::config::GcConfig::default(),
         retention: crate::config::RetentionConfig::default(),
         curation: CurationConfig::default(),
+        circuit_breaker: crate::config::CircuitBreakerConfig::default(),
+        tls: crate::config::TlsConfig::default(),
         registries: None,
     };
 
@@ -201,6 +203,7 @@ fn build_context(
     }
 
     let enabled_registries = config.enabled_registries();
+    let cb_config = config.circuit_breaker.clone();
 
     let state = Arc::new(AppState {
         storage,
@@ -220,6 +223,7 @@ fn build_context(
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
+        circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

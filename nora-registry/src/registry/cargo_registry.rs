@@ -12,7 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::proxy_fetch;
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -131,6 +131,8 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
         &upstream_index_url,
         state.config.cargo.proxy_timeout,
         state.config.cargo.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "cargo",
     )
     .await
     {
@@ -158,6 +160,7 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
             state.repo_index.invalidate("cargo");
             sparse_index_response(data)
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(crate::registry::ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::debug!(
@@ -206,6 +209,8 @@ async fn get_metadata(
         &url,
         state.config.cargo.proxy_timeout,
         state.config.cargo.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "cargo",
     )
     .await
     {
@@ -218,6 +223,7 @@ async fn get_metadata(
             });
             (StatusCode::OK, data).into_response()
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -316,6 +322,8 @@ async fn download(
         &url,
         state.config.cargo.proxy_timeout,
         state.config.cargo.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "cargo",
     )
     .await
     {
@@ -353,6 +361,7 @@ async fn download(
             )
                 .into_response()
         }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

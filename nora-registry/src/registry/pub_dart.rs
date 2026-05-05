@@ -16,7 +16,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -30,6 +30,9 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{Map, Value};
 use sha2::Digest;
 use std::sync::Arc;
+
+/// Storage prefix and file suffix for repo index scanning.
+pub const INDEX_PATTERN: (&str, &str) = ("pub/", ".tar.gz");
 
 const PUB_CONTENT_TYPE: &str = "application/vnd.pub.v2+json";
 const PUB_ARCHIVE_CONTENT_TYPE: &str = "application/octet-stream";
@@ -97,7 +100,7 @@ async fn search_packages(
         )
     };
 
-    match fetch_pub_api(&state, &url).await {
+    match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
             let nora_base = nora_base_url(&state);
             let rewritten = rewrite_search_response(&data, &nora_base, proxy_url).unwrap_or(data);
@@ -105,6 +108,7 @@ async fn search_packages(
             pub_json_response(rewritten)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, query = raw_query, "pub search upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -153,7 +157,7 @@ async fn package_listing(
         encode_segment(&package)
     );
 
-    match fetch_pub_api(&state, &url).await {
+    match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
             let nora_base = nora_base_url(&state);
             let rewritten = rewrite_package_response(&data, &nora_base, &package).unwrap_or(data);
@@ -162,6 +166,7 @@ async fn package_listing(
             pub_json_response(rewritten)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, package, "pub package upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -197,7 +202,7 @@ async fn version_metadata(
         encode_segment(&version)
     );
 
-    match fetch_pub_api(&state, &url).await {
+    match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
             let nora_base = nora_base_url(&state);
             let rewritten = rewrite_version_response(&data, &nora_base, &package).unwrap_or(data);
@@ -205,6 +210,7 @@ async fn version_metadata(
             pub_json_response(rewritten)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, package, version, "pub version upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -239,12 +245,13 @@ async fn package_advisories(
         encode_segment(&package)
     );
 
-    match fetch_pub_api(&state, &url).await {
+    match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
             cache_bytes(&state, key, data.clone()).await;
             pub_json_response(data)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, package, "pub advisories upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -353,6 +360,8 @@ async fn download_archive(
         &url,
         state.config.pub_dart.proxy_timeout,
         state.config.pub_dart.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "pub",
     )
     .await
     {
@@ -377,6 +386,7 @@ async fn download_archive(
             archive_response(data)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, package, version, "pub archive upstream error");
             StatusCode::BAD_GATEWAY.into_response()
@@ -384,7 +394,11 @@ async fn download_archive(
     }
 }
 
-async fn fetch_pub_api(state: &AppState, url: &str) -> Result<Vec<u8>, ProxyError> {
+async fn fetch_pub_api(
+    state: &AppState,
+    url: &str,
+    cb: &crate::circuit_breaker::CircuitBreakerRegistry,
+) -> Result<Vec<u8>, ProxyError> {
     super::proxy_fetch_core(
         &state.http_client,
         url,
@@ -392,6 +406,8 @@ async fn fetch_pub_api(state: &AppState, url: &str) -> Result<Vec<u8>, ProxyErro
         state.config.pub_dart.proxy_auth.as_deref(),
         Some(("Accept", PUB_CONTENT_TYPE)),
         |response| async { response.bytes().await.map(|b| b.to_vec()) },
+        cb,
+        "pub",
     )
     .await
 }
