@@ -205,7 +205,9 @@ async fn handle_request(
                     let hash_key = format!("{}.sha256", key);
                     let storage = state.storage.clone();
                     tokio::spawn(async move {
-                        let _ = storage.put(&hash_key, hash.as_bytes()).await;
+                        if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
+                            tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
+                        }
                     });
 
                     state.metrics.record_download("npm");
@@ -236,7 +238,9 @@ async fn handle_request(
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 tokio::spawn(async move {
-                    let _ = storage.put(&key_clone, &data_to_cache).await;
+                    if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
+                        tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
+                    }
                 });
 
                 if is_tarball {
@@ -277,7 +281,9 @@ async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Optio
     let key_clone = key.to_string();
     let cache_data = rewritten.clone();
     tokio::spawn(async move {
-        let _ = storage.put(&key_clone, &cache_data).await;
+        if let Err(e) = storage.put(&key_clone, &cache_data).await {
+            tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
+        }
     });
 
     Some(rewritten)
@@ -387,19 +393,17 @@ async fn handle_publish(
         };
 
         let tarball_key = format!("npm/{}/tarballs/{}", package_name, filename);
-        if state
-            .storage
-            .put(&tarball_key, &tarball_bytes)
-            .await
-            .is_err()
-        {
+        if let Err(e) = state.storage.put(&tarball_key, &tarball_bytes).await {
+            tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
         // Store sha256
         let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
         let hash_key = format!("{}.sha256", tarball_key);
-        let _ = state.storage.put(&hash_key, hash.as_bytes()).await;
+        if let Err(e) = state.storage.put(&hash_key, hash.as_bytes()).await {
+            tracing::warn!(key = %hash_key, error = ?e, "npm publish: failed to store hash sidecar");
+        }
     }
 
     // Merge versions
@@ -451,11 +455,15 @@ async fn handle_publish(
     // Store metadata
     match serde_json::to_vec(&metadata) {
         Ok(bytes) => {
-            if state.storage.put(&metadata_key, &bytes).await.is_err() {
+            if let Err(e) = state.storage.put(&metadata_key, &bytes).await {
+                tracing::error!(key = %metadata_key, error = ?e, "npm publish: failed to store metadata");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "npm publish: failed to serialize metadata");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     state.metrics.record_upload("npm");
