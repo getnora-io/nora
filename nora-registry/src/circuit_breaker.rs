@@ -69,6 +69,11 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Create a disabled (no-op) circuit breaker registry.
+    pub(crate) fn noop() -> Self {
+        Self::new(CircuitBreakerConfig::default())
+    }
+
     /// Check if a request to `registry` should proceed.
     /// Returns `Err(ProxyError::CircuitOpen)` if the breaker is open.
     pub(crate) fn check(&self, registry: &str) -> Result<(), ProxyError> {
