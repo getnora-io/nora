@@ -3,22 +3,16 @@
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use chrono::Utc;
-use hmac::{digest::KeyInit, Hmac, Mac};
-use sha2::{Digest, Sha256};
+use futures::TryStreamExt;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// S3-compatible storage backend (AWS S3, Ceph RGW, etc.)
+/// S3-compatible storage backend using the `object_store` crate.
 pub struct S3Storage {
-    s3_url: String,
-    bucket: String,
-    region: String,
-    access_key: Option<String>,
-    secret_key: Option<String>,
-    client: reqwest::Client,
+    store: AmazonS3,
     /// Cached total size in bytes, refreshed by background task.
     cached_total_size: std::sync::atomic::AtomicU64,
     /// Whether cached_total_size has been initialized at least once.
@@ -26,7 +20,7 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
-    /// Create new S3 storage with optional credentials
+    /// Create new S3 storage with optional credentials.
     pub fn new(
         s3_url: &str,
         bucket: &str,
@@ -34,462 +28,121 @@ impl S3Storage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Self {
+        let url = s3_url.trim_end_matches('/');
+        let allow_http = url.starts_with("http://");
+
+        let mut builder = AmazonS3Builder::new()
+            .with_endpoint(url)
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_allow_http(allow_http)
+            .with_virtual_hosted_style_request(false);
+
+        match (access_key, secret_key) {
+            (Some(ak), Some(sk)) => {
+                builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
+            }
+            _ => {
+                builder = builder.with_skip_signature(true);
+            }
+        }
+
+        let store = builder.build().expect("Failed to build S3 client");
+
         Self {
-            s3_url: s3_url.trim_end_matches('/').to_string(),
-            bucket: bucket.to_string(),
-            region: region.to_string(),
-            access_key: access_key.map(String::from),
-            secret_key: secret_key.map(String::from),
-            client: reqwest::Client::new(),
+            store,
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
         }
     }
-
-    /// Sign a request using AWS Signature v4
-    fn sign_request(
-        &self,
-        method: &str,
-        path: &str,
-        payload_hash: &str,
-        timestamp: &str,
-        date: &str,
-    ) -> Option<String> {
-        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
-            (Some(ak), Some(sk)) => (ak.as_str(), sk.as_str()),
-            _ => return None,
-        };
-
-        // Parse host from URL
-        let host = self
-            .s3_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-
-        // Canonical request
-        // URI must be URL-encoded (except /)
-        let encoded_path = uri_encode(path);
-        let canonical_uri = format!("/{}/{}", self.bucket, encoded_path);
-        let canonical_query = "";
-        let canonical_headers = format!(
-            "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-            host, payload_hash, timestamp
-        );
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-
-        // AWS Signature v4 canonical request format:
-        // HTTPMethod\nCanonicalURI\nCanonicalQueryString\nCanonicalHeaders\n\nSignedHeaders\nHashedPayload
-        // Note: CanonicalHeaders already ends with \n, plus blank line before SignedHeaders
-        let canonical_request = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
-            method, canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash
-        );
-
-        let canonical_request_hash =
-            hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
-
-        // String to sign
-        let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            timestamp, credential_scope, canonical_request_hash
-        );
-
-        // Calculate signature
-        let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date.as_bytes());
-        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
-        let k_service = hmac_sha256(&k_region, b"s3");
-        let k_signing = hmac_sha256(&k_service, b"aws4_request");
-        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
-
-        // Authorization header
-        Some(format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-            access_key, credential_scope, signed_headers, signature
-        ))
-    }
-
-    /// Make a signed request
-    async fn signed_request(
-        &self,
-        method: reqwest::Method,
-        key: &str,
-        body: Option<&[u8]>,
-    ) -> std::result::Result<reqwest::Response, StorageError> {
-        let url = format!("{}/{}/{}", self.s3_url, self.bucket, key);
-        let now = Utc::now();
-        let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
-
-        let payload_hash = match body {
-            Some(data) => hex::encode(Sha256::digest(data)),
-            None => hex::encode(Sha256::digest(b"")),
-        };
-
-        let mut request = self
-            .client
-            .request(method.clone(), &url)
-            .header("x-amz-date", &timestamp)
-            .header("x-amz-content-sha256", &payload_hash);
-
-        if let Some(auth) =
-            self.sign_request(method.as_str(), key, &payload_hash, &timestamp, &date)
-        {
-            request = request.header("Authorization", auth);
-        }
-
-        if let Some(data) = body {
-            request = request.body(data.to_vec());
-        }
-
-        request
-            .send()
-            .await
-            .map_err(|e| StorageError::Network(e.to_string()))
-    }
-
-    fn parse_s3_keys(xml: &str, prefix: &str) -> Vec<String> {
-        xml.split("<Key>")
-            .skip(1) // first element is the preamble before any <Key>
-            .filter_map(|part| part.split("</Key>").next())
-            .filter(|key| key.starts_with(prefix))
-            .map(String::from)
-            .collect()
-    }
-
-    /// Parse S3 ListObjectsV2 response, returning (keys, is_truncated, next_continuation_token).
-    fn parse_s3_list_response(xml: &str, prefix: &str) -> (Vec<String>, bool, Option<String>) {
-        let keys = Self::parse_s3_keys(xml, prefix);
-
-        let is_truncated = xml
-            .split("<IsTruncated>")
-            .nth(1)
-            .and_then(|part| part.split("</IsTruncated>").next())
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-        let next_token = xml
-            .split("<NextContinuationToken>")
-            .nth(1)
-            .and_then(|part| part.split("</NextContinuationToken>").next())
-            .map(String::from);
-
-        (keys, is_truncated, next_token)
-    }
-
-    /// Make a signed ListObjectsV2 request with optional continuation token.
-    async fn list_objects_page(
-        &self,
-        prefix: &str,
-        continuation_token: Option<&str>,
-    ) -> Option<String> {
-        let mut query = format!("list-type=2&prefix={}", uri_encode_query(prefix));
-        if let Some(token) = continuation_token {
-            query.push_str(&format!("&continuation-token={}", uri_encode_query(token)));
-        }
-        let url = format!("{}/{}?{}", self.s3_url, self.bucket, query);
-        let now = Utc::now();
-        let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
-        let payload_hash = hex::encode(Sha256::digest(b""));
-
-        let host = self
-            .s3_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-
-        let mut request = self
-            .client
-            .get(&url)
-            .header("x-amz-date", &timestamp)
-            .header("x-amz-content-sha256", &payload_hash);
-
-        if let (Some(access_key), Some(secret_key)) = (&self.access_key, &self.secret_key) {
-            let canonical_uri = format!("/{}", self.bucket);
-            let canonical_headers = format!(
-                "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-                host, payload_hash, timestamp
-            );
-            let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-
-            // Canonical query string must be sorted by param name
-            let mut params: Vec<(&str, &str)> = vec![("list-type", "2")];
-            params.push(("prefix", prefix));
-            if let Some(token) = continuation_token {
-                params.push(("continuation-token", token));
-            }
-            params.sort_by_key(|(k, _)| *k);
-            let canonical_query: Vec<String> = params
-                .iter()
-                .map(|(k, v)| format!("{}={}", uri_encode_query(k), uri_encode_query(v)))
-                .collect();
-            let canonical_query_str = canonical_query.join("&");
-
-            let canonical_request = format!(
-                "GET\n{}\n{}\n{}\n{}\n{}",
-                canonical_uri, canonical_query_str, canonical_headers, signed_headers, payload_hash
-            );
-
-            let canonical_request_hash =
-                hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
-            let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
-            let string_to_sign = format!(
-                "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-                timestamp, credential_scope, canonical_request_hash
-            );
-
-            let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date.as_bytes());
-            let k_region = hmac_sha256(&k_date, self.region.as_bytes());
-            let k_service = hmac_sha256(&k_region, b"s3");
-            let k_signing = hmac_sha256(&k_service, b"aws4_request");
-            let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
-
-            let auth = format!(
-                "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-                access_key, credential_scope, signed_headers, signature
-            );
-            request = request.header("Authorization", auth);
-        }
-
-        match request.send().await {
-            Ok(response) if response.status().is_success() => response.text().await.ok(),
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                tracing::error!(
-                    %status,
-                    prefix = %prefix,
-                    bucket = %self.bucket,
-                    response_body = %body,
-                    "S3 ListObjectsV2 failed"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    prefix = %prefix,
-                    bucket = %self.bucket,
-                    s3_url = %self.s3_url,
-                    "S3 ListObjectsV2 request error"
-                );
-                None
-            }
-        }
-    }
 }
 
-/// URL-encode a string for S3 canonical URI (encode all except A-Za-z0-9-_.~/:)
-fn uri_encode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() * 3);
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' | ':' => result.push(c),
-            _ => {
-                for b in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-    }
-    result
+/// Encode `@` in S3 keys to `_at_` for SeaweedFS compatibility.
+///
+/// SeaweedFS returns 500 on GET/PUT for keys containing `@`
+/// (e.g. npm scoped packages like `npm/@babel/core/...`).
+fn encode_s3_key(key: &str) -> String {
+    key.replace('@', "_at_")
 }
 
-/// Encode a string for use in S3 query parameter values.
-/// Per AWS SigV4 spec, query values must percent-encode everything
-/// except unreserved characters (A-Za-z0-9 - _ . ~).
-/// Unlike `uri_encode`, this does NOT preserve `/` or `:`.
-fn uri_encode_query(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() * 3);
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
-            _ => {
-                for b in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-    }
-    result
+/// Decode `_at_` back to `@` in S3 keys.
+fn decode_s3_key(key: &str) -> String {
+    key.replace("_at_", "@")
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+/// Map object_store errors to StorageError.
+fn map_err(e: object_store::Error) -> StorageError {
+    match e {
+        object_store::Error::NotFound { .. } => StorageError::NotFound,
+        other => StorageError::Network(other.to_string()),
+    }
 }
 
 #[async_trait]
 impl StorageBackend for S3Storage {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        let response = self
-            .signed_request(reqwest::Method::PUT, key, Some(data))
-            .await?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(StorageError::Network(format!(
-                "PUT failed: {}",
-                response.status()
-            )))
-        }
+        let encoded = encode_s3_key(key);
+        let path = Path::from(encoded);
+        let payload = PutPayload::from(data.to_vec());
+        self.store.put(&path, payload).await.map_err(map_err)?;
+        Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
-        let response = self.signed_request(reqwest::Method::GET, key, None).await?;
-
-        if response.status().is_success() {
-            response
-                .bytes()
-                .await
-                .map_err(|e| StorageError::Network(e.to_string()))
-        } else if response.status().as_u16() == 404 {
-            Err(StorageError::NotFound)
-        } else {
-            Err(StorageError::Network(format!(
-                "GET failed: {}",
-                response.status()
-            )))
-        }
+        let encoded = encode_s3_key(key);
+        let path = Path::from(encoded);
+        let result = self.store.get(&path).await.map_err(map_err)?;
+        let bytes = result.bytes().await.map_err(map_err)?;
+        Ok(bytes)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let response = self
-            .signed_request(reqwest::Method::DELETE, key, None)
-            .await?;
-
-        if response.status().is_success() || response.status().as_u16() == 204 {
-            Ok(())
-        } else if response.status().as_u16() == 404 {
-            Err(StorageError::NotFound)
-        } else {
-            Err(StorageError::Network(format!(
-                "DELETE failed: {}",
-                response.status()
-            )))
-        }
+        let encoded = encode_s3_key(key);
+        let path = Path::from(encoded);
+        self.store.delete(&path).await.map_err(map_err)?;
+        Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Vec<String> {
-        let mut all_keys = Vec::new();
-        let mut continuation_token: Option<String> = None;
+        let encoded = encode_s3_key(prefix);
+        let prefix_path = Path::from(encoded);
+        let list_prefix = if prefix.is_empty() {
+            None
+        } else {
+            Some(&prefix_path)
+        };
 
-        loop {
-            let xml = match self
-                .list_objects_page(prefix, continuation_token.as_deref())
-                .await
-            {
-                Some(xml) => xml,
-                None => break,
-            };
+        // Collect all objects from the listing stream.
+        let result: std::result::Result<Vec<_>, _> =
+            self.store.list(list_prefix).try_collect().await;
 
-            let (keys, is_truncated, next_token) = Self::parse_s3_list_response(&xml, prefix);
-            all_keys.extend(keys);
-
-            if !is_truncated {
-                break;
-            }
-            continuation_token = next_token;
-            // Safety: if truncated but no token, break to avoid infinite loop
-            if continuation_token.is_none() {
-                break;
-            }
+        match result {
+            Ok(objects) => objects
+                .into_iter()
+                .map(|meta| decode_s3_key(meta.location.as_ref()))
+                .collect(),
+            Err(_) => Vec::new(),
         }
-
-        all_keys
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
-        let response = self
-            .signed_request(reqwest::Method::HEAD, key, None)
-            .await
-            .ok()?;
+        let encoded = encode_s3_key(key);
+        let path = Path::from(encoded);
+        let meta = self.store.head(&path).await.ok()?;
 
-        if !response.status().is_success() {
-            return None;
-        }
+        let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
 
-        let size = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let modified = response
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| httpdate::parse_http_date(v).ok())
-            .map(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            })
-            .unwrap_or(0);
-
-        Some(FileMeta { size, modified })
+        Some(FileMeta {
+            size: meta.size,
+            modified,
+        })
     }
 
     async fn health_check(&self) -> bool {
-        // Try HEAD on the bucket
-        let url = format!("{}/{}", self.s3_url, self.bucket);
-        let now = Utc::now();
-        let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
-        let payload_hash = hex::encode(Sha256::digest(b""));
-
-        let host = self
-            .s3_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-
-        let mut request = self
-            .client
-            .head(&url)
-            .header("x-amz-date", &timestamp)
-            .header("x-amz-content-sha256", &payload_hash);
-
-        if let (Some(access_key), Some(secret_key)) = (&self.access_key, &self.secret_key) {
-            let canonical_uri = format!("/{}", self.bucket);
-            let canonical_headers = format!(
-                "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-                host, payload_hash, timestamp
-            );
-            let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-
-            let canonical_request = format!(
-                "HEAD\n{}\n\n{}\n{}\n{}",
-                canonical_uri, canonical_headers, signed_headers, payload_hash
-            );
-
-            let canonical_request_hash =
-                hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
-            let credential_scope = format!("{}/{}/s3/aws4_request", date, self.region);
-            let string_to_sign = format!(
-                "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-                timestamp, credential_scope, canonical_request_hash
-            );
-
-            let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date.as_bytes());
-            let k_region = hmac_sha256(&k_date, self.region.as_bytes());
-            let k_service = hmac_sha256(&k_region, b"s3");
-            let k_signing = hmac_sha256(&k_service, b"aws4_request");
-            let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
-
-            let auth = format!(
-                "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-                access_key, credential_scope, signed_headers, signature
-            );
-            request = request.header("Authorization", auth);
-        }
-
-        match request.send().await {
-            Ok(response) => response.status().is_success() || response.status().as_u16() == 404,
-            Err(_) => false,
-        }
+        // Try listing with no prefix — if the store responds, it's healthy.
+        // Even an empty bucket or a 404 on prefix is fine.
+        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
+        result.is_ok()
     }
 
     async fn total_size(&self) -> u64 {
@@ -502,17 +155,15 @@ impl StorageBackend for S3Storage {
     }
 
     async fn refresh_total_size(&self) {
-        let keys = self.list("").await;
-        let mut total: u64 = 0;
-        for key in &keys {
-            if let Some(meta) = self.stat(key).await {
-                total += meta.size;
-            }
+        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
+
+        if let Ok(objects) = result {
+            let total: u64 = objects.iter().map(|m| m.size).sum();
+            self.cached_total_size
+                .store(total, std::sync::atomic::Ordering::Relaxed);
+            self.size_cache_initialized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.cached_total_size
-            .store(total, std::sync::atomic::Ordering::Relaxed);
-        self.size_cache_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -545,53 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_s3_keys() {
-        let xml = r#"<Key>docker/a</Key><Key>docker/b</Key><Key>maven/c</Key>"#;
-        let keys = S3Storage::parse_s3_keys(xml, "docker/");
-        assert_eq!(keys, vec!["docker/a", "docker/b"]);
-    }
-
-    #[test]
-    fn test_parse_s3_list_response_single_page() {
-        let xml = r#"<?xml version="1.0"?>
-        <ListBucketResult>
-            <IsTruncated>false</IsTruncated>
-            <Contents><Key>docker/a</Key></Contents>
-            <Contents><Key>docker/b</Key></Contents>
-        </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "docker/");
-        assert_eq!(keys, vec!["docker/a", "docker/b"]);
-        assert!(!is_truncated);
-        assert!(next_token.is_none());
-    }
-
-    #[test]
-    fn test_parse_s3_list_response_truncated() {
-        let xml = r#"<?xml version="1.0"?>
-        <ListBucketResult>
-            <IsTruncated>true</IsTruncated>
-            <NextContinuationToken>abc123</NextContinuationToken>
-            <Contents><Key>docker/a</Key></Contents>
-        </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "docker/");
-        assert_eq!(keys, vec!["docker/a"]);
-        assert!(is_truncated);
-        assert_eq!(next_token, Some("abc123".to_string()));
-    }
-
-    #[test]
-    fn test_parse_s3_list_response_empty() {
-        let xml = r#"<?xml version="1.0"?>
-        <ListBucketResult>
-            <IsTruncated>false</IsTruncated>
-        </ListBucketResult>"#;
-        let (keys, is_truncated, next_token) = S3Storage::parse_s3_list_response(xml, "");
-        assert!(keys.is_empty());
-        assert!(!is_truncated);
-        assert!(next_token.is_none());
-    }
-
-    #[test]
     fn test_s3_total_size_returns_zero_before_init() {
         let storage = S3Storage::new(
             "http://localhost:9000",
@@ -600,106 +204,71 @@ mod tests {
             Some("access"),
             Some("secret"),
         );
-        // Before any refresh, cached total_size is 0
         assert!(!storage
             .size_cache_initialized
             .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
-    fn test_hmac_sha256() {
-        let result = hmac_sha256(b"key", b"data");
-        assert!(!result.is_empty());
+    fn test_error_mapping_not_found() {
+        let err = object_store::Error::NotFound {
+            path: "test/key".to_string(),
+            source: "not found".into(),
+        };
+        match map_err(err) {
+            StorageError::NotFound => {}
+            other => panic!("Expected NotFound, got: {:?}", other),
+        }
     }
 
     #[test]
-    fn test_uri_encode_safe_chars() {
-        assert_eq!(uri_encode("hello"), "hello");
-        assert_eq!(uri_encode("foo/bar"), "foo/bar");
-        assert_eq!(uri_encode("test-file_v1.0"), "test-file_v1.0");
-        assert_eq!(uri_encode("a~b"), "a~b");
+    fn test_error_mapping_network() {
+        let err = object_store::Error::Generic {
+            store: "S3",
+            source: "connection refused".into(),
+        };
+        match map_err(err) {
+            StorageError::Network(msg) => {
+                assert!(msg.contains("connection refused"));
+            }
+            other => panic!("Expected Network, got: {:?}", other),
+        }
     }
 
     #[test]
-    fn test_uri_encode_special_chars() {
-        assert_eq!(uri_encode("hello world"), "hello%20world");
-        assert_eq!(uri_encode("file name.txt"), "file%20name.txt");
-    }
-
-    #[test]
-    fn test_uri_encode_query_chars() {
-        assert_eq!(uri_encode("key=value"), "key%3Dvalue");
-        assert_eq!(uri_encode("a&b"), "a%26b");
-        assert_eq!(uri_encode("a+b"), "a%2Bb");
-    }
-
-    #[test]
-    fn test_uri_encode_empty() {
-        assert_eq!(uri_encode(""), "");
-    }
-
-    #[test]
-    fn test_uri_encode_all_safe_ranges() {
-        // A-Z
-        assert_eq!(uri_encode("ABCXYZ"), "ABCXYZ");
-        // a-z
-        assert_eq!(uri_encode("abcxyz"), "abcxyz");
-        // 0-9
-        assert_eq!(uri_encode("0123456789"), "0123456789");
-        // Special safe: - _ . ~ /
-        assert_eq!(uri_encode("-_.~/"), "-_.~/");
-    }
-
-    #[test]
-    fn test_uri_encode_percent() {
-        assert_eq!(uri_encode("%"), "%25");
-        assert_eq!(uri_encode("100%done"), "100%25done");
-    }
-
-    #[test]
-    fn test_uri_encode_colon_for_docker_digests() {
-        // Colon must NOT be encoded — reqwest sends raw ':' in URL paths.
-        // Encoding ':' to '%3A' causes SigV4 signature mismatch with strict
-        // S3 implementations (e.g. Garage) that verify canonical URI byte-for-byte.
-        assert_eq!(uri_encode("sha256:abc123def"), "sha256:abc123def");
+    fn test_encode_s3_key() {
+        assert_eq!(encode_s3_key("npm/@scope/pkg"), "npm/_at_scope/pkg");
         assert_eq!(
-            uri_encode("docker/sha256:abc/blobs/sha256:def456"),
-            "docker/sha256:abc/blobs/sha256:def456"
+            encode_s3_key("npm/@babel/core/metadata.json"),
+            "npm/_at_babel/core/metadata.json"
         );
     }
 
     #[test]
-    fn test_uri_encode_query_encodes_slash() {
-        // Query values must encode '/' as %2F per AWS SigV4 spec.
-        // This is the fix for issue #255.
+    fn test_decode_s3_key() {
+        assert_eq!(decode_s3_key("npm/_at_scope/pkg"), "npm/@scope/pkg");
         assert_eq!(
-            uri_encode_query("maven/com/example"),
-            "maven%2Fcom%2Fexample"
-        );
-        assert_eq!(
-            uri_encode_query("docker/library/nginx"),
-            "docker%2Flibrary%2Fnginx"
+            decode_s3_key("npm/_at_babel/core/metadata.json"),
+            "npm/@babel/core/metadata.json"
         );
     }
 
     #[test]
-    fn test_uri_encode_query_encodes_colon() {
-        // Query values must also encode ':' — unlike path encoding.
-        assert_eq!(uri_encode_query("sha256:abc"), "sha256%3Aabc");
+    fn test_encode_decode_roundtrip() {
+        let keys = [
+            "npm/@scope/pkg",
+            "npm/@babel/core/metadata.json",
+            "simple/key/no-at",
+            "raw/@org/file.txt",
+        ];
+        for key in keys {
+            assert_eq!(decode_s3_key(&encode_s3_key(key)), key);
+        }
     }
 
     #[test]
-    fn test_uri_encode_query_preserves_unreserved() {
-        // Unreserved chars (A-Za-z0-9 - _ . ~) are NOT encoded.
-        assert_eq!(uri_encode_query("hello"), "hello");
-        assert_eq!(uri_encode_query("test-file_v1.0"), "test-file_v1.0");
-        assert_eq!(uri_encode_query("a~b"), "a~b");
-    }
-
-    #[test]
-    fn test_uri_encode_query_special_chars() {
-        assert_eq!(uri_encode_query("a=b"), "a%3Db");
-        assert_eq!(uri_encode_query("a&b"), "a%26b");
-        assert_eq!(uri_encode_query("hello world"), "hello%20world");
+    fn test_encode_no_at() {
+        let key = "npm/chalk/metadata.json";
+        assert_eq!(encode_s3_key(key), key);
     }
 }

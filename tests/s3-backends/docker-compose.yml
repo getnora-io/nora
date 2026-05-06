@@ -1,0 +1,167 @@
+# S3-backends integration test environment
+# Usage: docker compose up -d && ./test.sh
+#
+# Three S3-compatible backends + three NORA instances:
+#   - RustFS     (MinIO image as stand-in, S3-compatible reference)
+#   - SeaweedFS  (distributed, known issue with @ in keys)
+#   - Garage     (lightweight, self-hosted)
+
+services:
+  # ============================================================
+  # S3 Backends
+  # ============================================================
+
+  rustfs:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://rustfs:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/nora-test
+      "
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: server -s3 -s3.port=8333 -master.volumeSizeLimitMB=100
+    ports:
+      - "8333:8333"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9333/cluster/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  seaweedfs-init:
+    image: minio/mc:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set sw http://seaweedfs:8333 '' '' --api S3v4 &&
+        mc mb --ignore-existing sw/nora-test
+      "
+
+  garage:
+    image: dxflrs/garage:v1.0.1
+    environment:
+      GARAGE_ALLOW_WORLD_READABLE_SECRETS: "true"
+    ports:
+      - "3900:3900"
+    volumes:
+      - garage-data:/var/lib/garage/data
+      - garage-meta:/var/lib/garage/meta
+      - ./garage.toml:/etc/garage.toml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3903/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  garage-init:
+    image: dxflrs/garage:v1.0.1
+    depends_on:
+      garage:
+        condition: service_healthy
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+    entrypoint: >
+      sh -c "
+        export GARAGE_RPC_HOST=garage:3901 &&
+        sleep 2 &&
+        NODE_ID=$$(garage node id 2>/dev/null | head -1 | cut -d@ -f1) &&
+        garage layout assign -z dc1 -c 1G $$NODE_ID &&
+        garage layout apply --version 1 &&
+        garage key create nora-test-key &&
+        garage bucket create nora-test &&
+        garage bucket allow --read --write --owner nora-test --key nora-test-key
+      "
+
+  # ============================================================
+  # NORA instances (one per backend)
+  # ============================================================
+
+  nora-rustfs:
+    image: nora:local
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      NORA_HOST: "0.0.0.0"
+      NORA_PORT: "5000"
+      NORA_STORAGE_MODE: s3
+      NORA_STORAGE_S3_URL: http://rustfs:9000
+      NORA_STORAGE_BUCKET: nora-test
+      NORA_STORAGE_S3_REGION: us-east-1
+      NORA_STORAGE_S3_ACCESS_KEY: minioadmin
+      NORA_STORAGE_S3_SECRET_KEY: minioadmin
+      NORA_RATE_LIMIT_ENABLED: "false"
+      NORA_PUBLIC_URL: http://localhost:15001
+    ports:
+      - "15001:5000"
+
+  nora-seaweedfs:
+    image: nora:local
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+    environment:
+      NORA_HOST: "0.0.0.0"
+      NORA_PORT: "5000"
+      NORA_STORAGE_MODE: s3
+      NORA_STORAGE_S3_URL: http://seaweedfs:8333
+      NORA_STORAGE_BUCKET: nora-test
+      NORA_STORAGE_S3_REGION: us-east-1
+      NORA_RATE_LIMIT_ENABLED: "false"
+      NORA_PUBLIC_URL: http://localhost:15002
+    ports:
+      - "15002:5000"
+
+  nora-garage:
+    image: nora:local
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      garage-init:
+        condition: service_completed_successfully
+    environment:
+      NORA_HOST: "0.0.0.0"
+      NORA_PORT: "5000"
+      NORA_STORAGE_MODE: s3
+      NORA_STORAGE_S3_URL: http://garage:3900
+      NORA_STORAGE_BUCKET: nora-test
+      NORA_STORAGE_S3_REGION: garage
+      # Garage credentials populated by garage-init; override here if needed
+      NORA_STORAGE_S3_ACCESS_KEY: ""
+      NORA_STORAGE_S3_SECRET_KEY: ""
+      NORA_RATE_LIMIT_ENABLED: "false"
+      NORA_PUBLIC_URL: http://localhost:15003
+    ports:
+      - "15003:5000"
+
+volumes:
+  garage-data:
+  garage-meta:
