@@ -200,10 +200,11 @@ pub async fn mirror_npm_packages(
     let mut handles = Vec::new();
 
     for target in targets {
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed — stop scheduling
-        };
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed unexpectedly");
         let client = client.clone();
         let pb = pb.clone();
         let fetched = fetched.clone();

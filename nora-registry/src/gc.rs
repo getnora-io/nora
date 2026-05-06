@@ -24,7 +24,6 @@ use prometheus::{
 use tracing::info;
 
 use crate::storage::Storage;
-use crate::validation::ends_with_ci;
 
 // ============================================================================
 // Prometheus metrics
@@ -203,10 +202,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
 
     // Parse manifests for referenced digests
     for key in &keys {
-        if !key.contains("/manifests/")
-            || !ends_with_ci(key, ".json")
-            || ends_with_ci(key, ".meta.json")
-        {
+        if !key.contains("/manifests/") || !key.ends_with(".json") || key.ends_with(".meta.json") {
             continue;
         }
 
@@ -261,7 +257,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
 const CHECKSUM_EXTENSIONS: &[&str] = &[".md5", ".sha1", ".sha256", ".sha512"];
 
 fn is_checksum_sidecar(key: &str) -> bool {
-    CHECKSUM_EXTENSIONS.iter().any(|ext| ends_with_ci(key, ext))
+    CHECKSUM_EXTENSIONS.iter().any(|ext| key.ends_with(ext))
 }
 
 fn primary_key_for_checksum(key: &str) -> Option<&str> {
@@ -330,8 +326,8 @@ async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
     let mut orphans = Vec::new();
     for (version_key, files) in &versions {
         // A complete version has at least .info and .zip (.mod is optional for some modules)
-        let has_info = files.iter().any(|f| ends_with_ci(f, ".info"));
-        let has_zip = files.iter().any(|f| ends_with_ci(f, ".zip"));
+        let has_info = files.iter().any(|f| f.ends_with(".info"));
+        let has_zip = files.iter().any(|f| f.ends_with(".zip"));
         if !has_info || !has_zip {
             info!(
                 "Go incomplete version: {} (has {} of 3 expected files)",
@@ -368,7 +364,7 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
                 index_entries.insert(name.to_string());
                 index_keys.push(key.clone());
             }
-        } else if ends_with_ci(key, ".crate") {
+        } else if key.ends_with(".crate") {
             // cargo/name/version/name-version.crate
             let parts: Vec<&str> = key
                 .strip_prefix("cargo/")
@@ -434,7 +430,7 @@ async fn detect_and_clean_metadata_phantoms(storage: &Storage, dry_run: bool) ->
     let mut npm_tarball_keys: HashSet<String> = HashSet::new();
 
     for key in &npm_keys {
-        if ends_with_ci(key, "/metadata.json") {
+        if key.ends_with("/metadata.json") {
             npm_meta_keys.push(key.clone());
         } else if key.contains("/tarballs/") {
             npm_tarball_keys.insert(key.clone());
@@ -455,12 +451,12 @@ async fn detect_and_clean_metadata_phantoms(storage: &Storage, dry_run: bool) ->
     let mut pypi_file_keys: HashSet<String> = HashSet::new();
 
     for key in &pypi_keys {
-        if ends_with_ci(key, "/metadata.json") {
+        if key.ends_with("/metadata.json") {
             pypi_meta_keys.push(key.clone());
-        } else if !ends_with_ci(key, ".sha256")
-            && !ends_with_ci(key, ".md5")
-            && !ends_with_ci(key, ".sha1")
-            && !ends_with_ci(key, ".sha512")
+        } else if !key.ends_with(".sha256")
+            && !key.ends_with(".md5")
+            && !key.ends_with(".sha1")
+            && !key.ends_with(".sha512")
         {
             pypi_file_keys.insert(key.clone());
         }

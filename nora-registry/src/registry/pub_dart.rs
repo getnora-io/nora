@@ -16,9 +16,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{
-    circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
-};
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -596,7 +594,13 @@ fn nora_version_url(nora_base: &str, package: &str, version: &str) -> String {
 
 /// Build NORA base URL with /pub prefix for URL rewriting.
 fn nora_base_url(state: &AppState) -> String {
-    format!("{}/pub", nora_base_url_shared(state))
+    if let Some(url) = &state.config.server.public_url {
+        return format!("{}/pub", url.trim_end_matches('/'));
+    }
+    format!(
+        "http://{}:{}/pub",
+        state.config.server.host, state.config.server.port
+    )
 }
 
 fn encode_segment(value: &str) -> String {

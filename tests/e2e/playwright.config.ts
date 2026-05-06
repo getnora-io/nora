@@ -6,6 +6,7 @@ export default defineConfig({
   retries: 1,
   use: {
     baseURL: process.env.NORA_URL || 'http://localhost:4000',
+    ignoreHTTPSErrors: true,
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
   },
