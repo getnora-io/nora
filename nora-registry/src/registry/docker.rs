@@ -311,11 +311,12 @@ async fn download_blob(
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
+                let state_clone = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _ = storage.put(&key_clone, &data_clone).await;
+                    if storage.put(&key_clone, &data_clone).await.is_ok() {
+                        state_clone.repo_index.invalidate("docker");
+                    }
                 });
-
-                state.repo_index.invalidate("docker");
 
                 return (
                     StatusCode::OK,
@@ -326,6 +327,45 @@ async fn download_blob(
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(_) => continue,
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            match fetch_blob_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &digest,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok(data) => {
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let data_clone = data.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                        }
+                    });
+
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        Bytes::from(data),
+                    )
+                        .into_response();
+                }
+                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+                Err(_) => continue,
+            }
         }
     }
 

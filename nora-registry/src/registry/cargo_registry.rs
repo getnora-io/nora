@@ -153,11 +153,13 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
             let storage = state.storage.clone();
             let key = index_key;
             let data_clone = data.clone();
+            let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
-                let _ = storage.put(&key, &data_clone).await;
+                if storage.put(&key, &data_clone).await.is_ok() {
+                    state_clone.repo_index.invalidate("cargo");
+                }
             });
 
-            state.repo_index.invalidate("cargo");
             sparse_index_response(data)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),

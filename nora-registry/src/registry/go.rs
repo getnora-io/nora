@@ -206,18 +206,23 @@ async fn handle(
             let storage = state.storage.clone();
             let key = storage_key.clone();
             let data_clone = bytes.clone();
+            let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
-                if is_immutable {
+                let written = if is_immutable {
                     // Only write if not already cached (immutability guarantee)
                     if storage.stat(&key).await.is_none() {
-                        let _ = storage.put(&key, &data_clone).await;
+                        storage.put(&key, &data_clone).await.is_ok()
+                    } else {
+                        true // already exists
                     }
                 } else {
-                    let _ = storage.put(&key, &data_clone).await;
+                    storage.put(&key, &data_clone).await.is_ok()
+                };
+                if written {
+                    state_clone.repo_index.invalidate("go");
                 }
             });
 
-            state.repo_index.invalidate("go");
             with_content_type(bytes, content_type)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),

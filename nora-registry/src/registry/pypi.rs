@@ -280,19 +280,20 @@ async fn download_file(
                                 .audit
                                 .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
 
-                            // Cache in background + compute hash
+                            // Cache in background + compute hash, invalidate AFTER write
                             let storage = state.storage.clone();
                             let key_clone = key.clone();
                             let data_clone = data.clone();
+                            let state_clone = Arc::clone(&state);
                             tokio::spawn(async move {
-                                let _ = storage.put(&key_clone, &data_clone).await;
-                                let hash = hex::encode(sha2::Sha256::digest(&data_clone));
-                                let _ = storage
-                                    .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                                    .await;
+                                if storage.put(&key_clone, &data_clone).await.is_ok() {
+                                    let hash = hex::encode(sha2::Sha256::digest(&data_clone));
+                                    let _ = storage
+                                        .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                        .await;
+                                    state_clone.repo_index.invalidate("pypi");
+                                }
                             });
-
-                            state.repo_index.invalidate("pypi");
 
                             let content_type = pypi_content_type(&filename);
                             return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
