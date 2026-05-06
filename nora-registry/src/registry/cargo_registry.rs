@@ -12,7 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -153,11 +153,13 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
             let storage = state.storage.clone();
             let key = index_key;
             let data_clone = data.clone();
+            let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
-                let _ = storage.put(&key, &data_clone).await;
+                if storage.put(&key, &data_clone).await.is_ok() {
+                    state_clone.repo_index.invalidate("cargo");
+                }
             });
 
-            state.repo_index.invalidate("cargo");
             sparse_index_response(data)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -607,6 +609,17 @@ fn is_valid_crate_name(name: &str) -> bool {
     // Only alphanumeric, `-`, `_`
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Construct NORA base URL from config.
+fn nora_base_url(state: &AppState) -> String {
+    if let Some(url) = &state.config.server.public_url {
+        return url.clone();
+    }
+    format!(
+        "http://{}:{}",
+        state.config.server.host, state.config.server.port
+    )
 }
 
 /// Build response with sparse index content-type.

@@ -12,7 +12,6 @@
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
 use crate::ui::components::format_timestamp;
-use crate::validation::ends_with_ci;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -183,7 +182,7 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
-        if ends_with_ci(key, ".meta.json") {
+        if key.ends_with(".meta.json") {
             continue;
         }
 
@@ -194,7 +193,7 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
             let parts: Vec<_> = rest.split('/').collect();
             let manifest_pos = parts.iter().position(|&p| p == "manifests");
             if let Some(pos) = manifest_pos {
-                if pos >= 1 && ends_with_ci(key, ".json") {
+                if pos >= 1 && key.ends_with(".json") {
                     let name = parts[..pos].join("/");
                     let entry = repos.entry(name).or_insert((0, 0, 0));
                     entry.0 += 1;
@@ -266,7 +265,7 @@ async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
         if let Some(rest) = key.strip_prefix("npm/") {
             // Pattern: npm/{package}/tarballs/{file}.tgz
             // Scoped:  npm/@scope/package/tarballs/{file}.tgz
-            if rest.contains("/tarballs/") && ends_with_ci(key, ".tgz") {
+            if rest.contains("/tarballs/") && key.ends_with(".tgz") {
                 let parts: Vec<_> = rest.split('/').collect();
                 if !parts.is_empty() {
                     // Scoped packages: @scope/package → parts[0]="@scope", parts[1]="package"
@@ -297,7 +296,7 @@ async fn build_cargo_index(storage: &Storage) -> Vec<RepoInfo> {
     let mut crates: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
-        if ends_with_ci(key, ".crate") {
+        if key.ends_with(".crate") {
             if let Some(rest) = key.strip_prefix("cargo/") {
                 let parts: Vec<_> = rest.split('/').collect();
                 if !parts.is_empty() {
@@ -352,7 +351,7 @@ async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
         if let Some(rest) = key.strip_prefix("go/") {
             // Pattern: go/{module}/@v/{version}.zip
             // Count .zip files as versions (authoritative artifacts)
-            if rest.contains("/@v/") && ends_with_ci(key, ".zip") {
+            if rest.contains("/@v/") && key.ends_with(".zip") {
                 // Extract module path: everything before /@v/
                 if let Some(pos) = rest.rfind("/@v/") {
                     let module = &rest[..pos];

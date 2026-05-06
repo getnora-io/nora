@@ -6,7 +6,6 @@ use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
 use crate::registry_type::RegistryType;
 use crate::repo_index::RepoInfo;
-use crate::validation::ends_with_ci;
 use crate::AppState;
 use crate::Storage;
 use axum::{
@@ -326,7 +325,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     let mut tags = Vec::new();
     for key in &keys {
         // Skip .meta.json files
-        if ends_with_ci(key, ".meta.json") {
+        if key.ends_with(".meta.json") {
             continue;
         }
 
@@ -568,7 +567,7 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
     let keys = storage.list(&prefix).await;
 
     let mut versions = Vec::new();
-    for key in keys.iter().filter(|k| ends_with_ci(k, ".crate")) {
+    for key in keys.iter().filter(|k| k.ends_with(".crate")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             let parts: Vec<_> = rest.split('/').collect();
             if !parts.is_empty() {
@@ -643,7 +642,7 @@ pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
 
     // Also scan for .zip files that might exist without being in the list
     let keys = storage.list(&prefix).await;
-    for key in keys.iter().filter(|k| ends_with_ci(k, ".zip")) {
+    for key in keys.iter().filter(|k| k.ends_with(".zip")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.strip_suffix(".zip") {
                 if !known_versions.iter().any(|v| v == version) {
@@ -839,7 +838,7 @@ async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
                 let entry = version_data
                     .entry(version.to_string())
                     .or_insert((0, 0, false));
-                let is_content = !ends_with_ci(key, "/revisions.json");
+                let is_content = !key.ends_with("/revisions.json");
                 if let Some(meta) = storage.stat(key).await {
                     if is_content {
                         entry.0 += meta.size;
@@ -928,7 +927,7 @@ async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
     let mut versions = Vec::new();
 
     for key in &keys {
-        if ends_with_ci(key, ".sha256") {
+        if key.ends_with(".sha256") {
             continue;
         }
         if let Some(rest) = key.strip_prefix(&prefix) {
@@ -996,14 +995,14 @@ fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
     // Handle both .tar.gz and .whl files
     let clean_name = name.replace('-', "_");
 
-    if ends_with_ci(filename, ".tar.gz") {
+    if filename.ends_with(".tar.gz") {
         // package-1.0.0.tar.gz
         let base = filename.strip_suffix(".tar.gz")?;
         let version = base
             .strip_prefix(&format!("{}-", name))
             .or_else(|| base.strip_prefix(&format!("{}-", clean_name)))?;
         Some(version.to_string())
-    } else if ends_with_ci(filename, ".whl") {
+    } else if filename.ends_with(".whl") {
         // package-1.0.0-py3-none-any.whl
         let parts: Vec<_> = filename.split('-').collect();
         if parts.len() >= 2 {
