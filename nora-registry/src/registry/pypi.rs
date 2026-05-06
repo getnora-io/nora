@@ -12,6 +12,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text};
+use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     extract::{Multipart, Path, State},
@@ -21,6 +22,7 @@ use axum::{
     Router,
 };
 use sha2::Digest;
+use std::fmt::Write;
 use std::sync::Arc;
 
 /// PEP 691 JSON content type
@@ -81,7 +83,7 @@ async fn list_packages(
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
         for pkg in pkg_list {
-            html.push_str(&format!("<a href=\"/simple/{}/\">{}</a><br>\n", pkg, pkg));
+            let _ = writeln!(html, "<a href=\"/simple/{}/\">{}</a><br>", pkg, pkg);
         }
         html.push_str("</body></html>");
         (
@@ -112,7 +114,7 @@ async fn package_versions(
     let mut files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            if !filename.is_empty() && !filename.ends_with(".sha256") {
+            if !filename.is_empty() && !ends_with_ci(filename, ".sha256") {
                 let sha256 = state
                     .storage
                     .get(&format!("{}.sha256", key))
@@ -494,10 +496,11 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             .as_ref()
             .map(|h| format!("#sha256={}", h))
             .unwrap_or_default();
-        html.push_str(&format!(
-            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>\n",
+        let _ = writeln!(
+            html,
+            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
             base_url, normalized, f.filename, hash_fragment, f.filename
-        ));
+        );
     }
     html.push_str("</body></html>");
 
@@ -542,9 +545,9 @@ fn wants_json(headers: &HeaderMap) -> bool {
 
 /// Content-type for PyPI files.
 fn pypi_content_type(filename: &str) -> &'static str {
-    if filename.ends_with(".whl") {
+    if ends_with_ci(filename, ".whl") {
         "application/zip"
-    } else if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+    } else if ends_with_ci(filename, ".tar.gz") || ends_with_ci(filename, ".tgz") {
         "application/gzip"
     } else {
         "application/octet-stream"
@@ -558,11 +561,11 @@ fn is_valid_pypi_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && (name.ends_with(".tar.gz")
-            || name.ends_with(".tgz")
-            || name.ends_with(".whl")
-            || name.ends_with(".zip")
-            || name.ends_with(".egg"))
+        && (ends_with_ci(name, ".tar.gz")
+            || ends_with_ci(name, ".tgz")
+            || ends_with_ci(name, ".whl")
+            || ends_with_ci(name, ".zip")
+            || ends_with_ci(name, ".egg"))
 }
 
 /// Rewrite PyPI links to point to our registry.
@@ -580,10 +583,11 @@ fn rewrite_pypi_links(html: &str, package_name: &str, base_url: &str) -> String 
             if let Some(filename) = extract_filename(url) {
                 // Extract hash fragment from original URL
                 let hash_fragment = url.find('#').map(|pos| &url[pos..]).unwrap_or("");
-                result.push_str(&format!(
+                let _ = write!(
+                    result,
                     "{}/simple/{}/{}{}",
                     base_url, package_name, filename, hash_fragment
-                ));
+                );
             } else {
                 result.push_str(url);
             }
@@ -621,11 +625,11 @@ fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
     let filename = url.rsplit('/').next()?;
 
-    if filename.ends_with(".tar.gz")
-        || filename.ends_with(".tgz")
-        || filename.ends_with(".whl")
-        || filename.ends_with(".zip")
-        || filename.ends_with(".egg")
+    if ends_with_ci(filename, ".tar.gz")
+        || ends_with_ci(filename, ".tgz")
+        || ends_with_ci(filename, ".whl")
+        || ends_with_ci(filename, ".zip")
+        || ends_with_ci(filename, ".egg")
     {
         Some(filename)
     } else {

@@ -18,6 +18,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
+use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -328,14 +329,14 @@ async fn flatcontainer_download(
     }
 
     // Only serve .nupkg and .nuspec files
-    if !filename.ends_with(".nupkg") && !filename.ends_with(".nuspec") {
+    if !ends_with_ci(filename, ".nupkg") && !ends_with_ci(filename, ".nuspec") {
         return StatusCode::NOT_FOUND.into_response();
     }
 
     let id_lower = id.to_lowercase();
 
     // Curation check for .nupkg downloads
-    if filename.ends_with(".nupkg") {
+    if ends_with_ci(filename, ".nupkg") {
         // Extract publish date from cached registration index
         let publish_date = extract_nuget_publish_date(&state.storage, &id_lower, ver).await;
 
@@ -353,7 +354,7 @@ async fn flatcontainer_download(
     }
 
     let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
-    let content_type = if filename.ends_with(".nuspec") {
+    let content_type = if ends_with_ci(filename, ".nuspec") {
         "application/xml"
     } else {
         "application/octet-stream"
@@ -361,7 +362,7 @@ async fn flatcontainer_download(
 
     // Immutable cache
     if let Ok(data) = state.storage.get(&storage_key).await {
-        if filename.ends_with(".nupkg") {
+        if ends_with_ci(filename, ".nupkg") {
             if let Some(response) = crate::curation::verify_integrity(
                 &state.curation,
                 crate::curation::RegistryType::Nuget,

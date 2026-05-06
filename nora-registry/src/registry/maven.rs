@@ -11,6 +11,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
+use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -84,10 +85,10 @@ fn classify_path(path: &str) -> MavenPathKind {
 }
 
 fn is_checksum_file(filename: &str) -> bool {
-    filename.ends_with(".md5")
-        || filename.ends_with(".sha1")
-        || filename.ends_with(".sha256")
-        || filename.ends_with(".sha512")
+    ends_with_ci(filename, ".md5")
+        || ends_with_ci(filename, ".sha1")
+        || ends_with_ci(filename, ".sha256")
+        || ends_with_ci(filename, ".sha512")
 }
 
 fn is_snapshot(version: &str) -> bool {
@@ -486,16 +487,16 @@ fn with_content_type(
     path: &str,
     data: Bytes,
 ) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
-    let content_type = if path.ends_with(".pom") {
+    let content_type = if ends_with_ci(path, ".pom") {
         "application/xml"
-    } else if path.ends_with(".jar") {
+    } else if ends_with_ci(path, ".jar") {
         "application/java-archive"
-    } else if path.ends_with(".xml") {
+    } else if ends_with_ci(path, ".xml") {
         "application/xml"
-    } else if path.ends_with(".sha1")
-        || path.ends_with(".md5")
-        || path.ends_with(".sha256")
-        || path.ends_with(".sha512")
+    } else if ends_with_ci(path, ".sha1")
+        || ends_with_ci(path, ".md5")
+        || ends_with_ci(path, ".sha256")
+        || ends_with_ci(path, ".sha512")
     {
         "text/plain"
     } else {
@@ -503,9 +504,9 @@ fn with_content_type(
     };
 
     // maven-metadata.xml is mutable; release artifacts are immutable
-    let cache_control = if path.ends_with("maven-metadata.xml")
-        || path.ends_with("maven-metadata.xml.sha1")
-        || path.ends_with("maven-metadata.xml.md5")
+    let cache_control = if ends_with_ci(path, "maven-metadata.xml")
+        || ends_with_ci(path, "maven-metadata.xml.sha1")
+        || ends_with_ci(path, "maven-metadata.xml.md5")
     {
         "public, max-age=60, must-revalidate"
     } else {

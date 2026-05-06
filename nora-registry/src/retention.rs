@@ -17,6 +17,7 @@ use tracing::info;
 
 use crate::config::RetentionRule;
 use crate::storage::Storage;
+use crate::validation::ends_with_ci;
 
 // ============================================================================
 // Prometheus metrics
@@ -244,7 +245,7 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if tag_file.ends_with(".json") && !tag_file.ends_with(".meta.json") {
+                if ends_with_ci(tag_file, ".json") && !ends_with_ci(tag_file, ".meta.json") {
                     let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
                     repos
                         .entry(repo.to_string())
@@ -285,7 +286,7 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
     for key in &all_keys {
         // npm/{package}/tarballs/{file} — each tarball is a "version"
         if let Some(rest) = key.strip_prefix("npm/") {
-            if rest.contains("/tarballs/") && !key.ends_with(".sha256") {
+            if rest.contains("/tarballs/") && !ends_with_ci(key, ".sha256") {
                 let pkg = rest.split("/tarballs/").next().unwrap_or("");
                 if !pkg.is_empty() {
                     packages
@@ -329,7 +330,7 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
 
     for key in &all_keys {
         if let Some(rest) = key.strip_prefix("pypi/") {
-            if !key.ends_with(".sha256") {
+            if !ends_with_ci(key, ".sha256") {
                 let pkg = rest.split('/').next().unwrap_or("");
                 if !pkg.is_empty() {
                     packages

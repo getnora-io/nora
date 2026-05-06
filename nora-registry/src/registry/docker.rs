@@ -6,7 +6,9 @@ use crate::audit::AuditEntry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::storage::Storage;
-use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
+use crate::validation::{
+    ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
+};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -932,7 +934,7 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
-        .filter(|t| !t.ends_with(".meta") && !t.contains(".meta."))
+        .filter(|t| !ends_with_ci(t, ".meta") && !t.contains(".meta."))
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }
