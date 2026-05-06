@@ -11,7 +11,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text};
+use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text};
 use crate::AppState;
 use axum::{
     extract::{Multipart, Path, State},
@@ -97,23 +97,6 @@ async fn list_packages(
 // Package versions
 // ============================================================================
 
-/// Returns base URL for PyPI download links.
-/// Uses public_url if set, otherwise http://host:port.
-fn pypi_base_url(state: &AppState) -> String {
-    state
-        .config
-        .server
-        .public_url
-        .as_deref()
-        .map(|u| u.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "http://{}:{}",
-                state.config.server.host, state.config.server.port
-            )
-        })
-}
-
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 async fn package_versions(
     State(state): State<Arc<AppState>>,
@@ -123,7 +106,7 @@ async fn package_versions(
     let normalized = normalize_name(&name);
     let prefix = format!("pypi/{}/", normalized);
     let keys = state.storage.list(&prefix).await;
-    let base_url = pypi_base_url(&state);
+    let base_url = nora_base_url(&state);
 
     // Collect files with their hashes
     let mut files: Vec<FileEntry> = Vec::new();

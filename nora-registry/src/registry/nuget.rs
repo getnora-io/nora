@@ -15,11 +15,13 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -51,8 +53,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 // ── Service index ──────────────────────────────────────────────────────
 
-async fn service_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let host = extract_host(&state, &headers);
+async fn service_index(State(state): State<Arc<AppState>>) -> Response {
+    let base_url = nora_base_url(&state);
     let proxy_url = upstream_url(&state);
     let url = format!("{}/v3/index.json", proxy_url.trim_end_matches('/'));
 
@@ -69,7 +71,7 @@ async fn service_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     {
         Ok(text) => {
             // Rewrite @id URLs to point through NORA
-            let rewritten = rewrite_service_index(&text, &host);
+            let rewritten = rewrite_service_index(&text, &base_url);
 
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
@@ -454,20 +456,6 @@ async fn flatcontainer_download(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn extract_host(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(public_url) = &state.config.server.public_url {
-        return public_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
-    }
-    headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:4000")
-        .to_string()
-}
-
 /// Extract publish date from cached NuGet registration index.
 ///
 /// NuGet registration index JSON has nested items:
@@ -534,20 +522,21 @@ fn with_json(data: Vec<u8>) -> Response {
 }
 
 /// Rewrite known Microsoft NuGet service index URLs with NORA endpoints.
+/// `base_url` is the full NORA base URL including scheme (e.g. `https://artifact.company.local`).
 /// Targets api.nuget.org and azuresearch-{usnc,ussc}.nuget.org specifically.
-fn rewrite_service_index(json_text: &str, host: &str) -> String {
-    let nora_base = format!("http://{}/nuget", host);
-    let nora_query = format!("{}/v3/query", nora_base);
+fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
+    let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
+    let nora_query = format!("{}/v3/query", nora_nuget);
 
     // Rewrite major service URLs to route through NORA
     json_text
         .replace(
             "https://api.nuget.org/v3-flatcontainer/",
-            &format!("{}/v3/flatcontainer/", nora_base),
+            &format!("{}/v3/flatcontainer/", nora_nuget),
         )
         .replace(
             "https://api.nuget.org/v3/registration5-gz-semver2/",
-            &format!("{}/v3/registration/", nora_base),
+            &format!("{}/v3/registration/", nora_nuget),
         )
         // Rewrite search endpoints to proxy through NORA
         .replace("https://azuresearch-usnc.nuget.org/query", &nora_query)
@@ -595,9 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_service_index() {
+    fn test_rewrite_service_index_http() {
         let input = r#"{"resources":[{"@id":"https://api.nuget.org/v3-flatcontainer/","@type":"PackageBaseAddress/3.0.0"}]}"#;
-        let result = rewrite_service_index(input, "nora:4000");
+        let result = rewrite_service_index(input, "http://nora:4000");
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(!result.contains("api.nuget.org/v3-flatcontainer/"));
     }
@@ -605,10 +594,20 @@ mod tests {
     #[test]
     fn test_rewrite_service_index_search_urls() {
         let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/query","@type":"SearchQueryService"},{"@id":"https://azuresearch-ussc.nuget.org/query","@type":"SearchQueryService"}]}"#;
-        let result = rewrite_service_index(input, "nora:4000");
+        let result = rewrite_service_index(input, "http://nora:4000");
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
         assert!(!result.contains("azuresearch-usnc.nuget.org"));
         assert!(!result.contains("azuresearch-ussc.nuget.org"));
+    }
+
+    #[test]
+    fn test_rewrite_service_index_https() {
+        let input = r#"{"resources":[{"@id":"https://api.nuget.org/v3-flatcontainer/","@type":"PackageBaseAddress/3.0.0"},{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/3.6.0"}]}"#;
+        let result = rewrite_service_index(input, "https://artifact.company.local");
+        assert!(result.contains("https://artifact.company.local/nuget/v3/flatcontainer/"));
+        assert!(result.contains("https://artifact.company.local/nuget/v3/registration/"));
+        assert!(!result.contains("http://artifact.company.local"));
+        assert!(!result.contains("api.nuget.org"));
     }
 }
 
