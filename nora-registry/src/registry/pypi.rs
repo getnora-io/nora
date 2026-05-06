@@ -11,8 +11,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text};
-use crate::validation::ends_with_ci;
+use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text};
 use crate::AppState;
 use axum::{
     extract::{Multipart, Path, State},
@@ -22,7 +21,6 @@ use axum::{
     Router,
 };
 use sha2::Digest;
-use std::fmt::Write;
 use std::sync::Arc;
 
 /// PEP 691 JSON content type
@@ -83,7 +81,7 @@ async fn list_packages(
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
         for pkg in pkg_list {
-            let _ = writeln!(html, "<a href=\"/simple/{}/\">{}</a><br>", pkg, pkg);
+            html.push_str(&format!("<a href=\"/simple/{}/\">{}</a><br>\n", pkg, pkg));
         }
         html.push_str("</body></html>");
         (
@@ -99,6 +97,23 @@ async fn list_packages(
 // Package versions
 // ============================================================================
 
+/// Returns base URL for PyPI download links.
+/// Uses public_url if set, otherwise http://host:port.
+fn pypi_base_url(state: &AppState) -> String {
+    state
+        .config
+        .server
+        .public_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                state.config.server.host, state.config.server.port
+            )
+        })
+}
+
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
 async fn package_versions(
     State(state): State<Arc<AppState>>,
@@ -108,13 +123,13 @@ async fn package_versions(
     let normalized = normalize_name(&name);
     let prefix = format!("pypi/{}/", normalized);
     let keys = state.storage.list(&prefix).await;
-    let base_url = nora_base_url(&state);
+    let base_url = pypi_base_url(&state);
 
     // Collect files with their hashes
     let mut files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            if !filename.is_empty() && !ends_with_ci(filename, ".sha256") {
+            if !filename.is_empty() && !filename.ends_with(".sha256") {
                 let sha256 = state
                     .storage
                     .get(&format!("{}.sha256", key))
@@ -280,19 +295,20 @@ async fn download_file(
                                 .audit
                                 .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
 
-                            // Cache in background + compute hash
+                            // Cache in background + compute hash, invalidate AFTER write
                             let storage = state.storage.clone();
                             let key_clone = key.clone();
                             let data_clone = data.clone();
+                            let state_clone = Arc::clone(&state);
                             tokio::spawn(async move {
-                                let _ = storage.put(&key_clone, &data_clone).await;
-                                let hash = hex::encode(sha2::Sha256::digest(&data_clone));
-                                let _ = storage
-                                    .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                                    .await;
+                                if storage.put(&key_clone, &data_clone).await.is_ok() {
+                                    let hash = hex::encode(sha2::Sha256::digest(&data_clone));
+                                    let _ = storage
+                                        .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                                        .await;
+                                    state_clone.repo_index.invalidate("pypi");
+                                }
                             });
-
-                            state.repo_index.invalidate("pypi");
 
                             let content_type = pypi_content_type(&filename);
                             return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
@@ -496,11 +512,10 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             .as_ref()
             .map(|h| format!("#sha256={}", h))
             .unwrap_or_default();
-        let _ = writeln!(
-            html,
-            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
+        html.push_str(&format!(
+            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>\n",
             base_url, normalized, f.filename, hash_fragment, f.filename
-        );
+        ));
     }
     html.push_str("</body></html>");
 
@@ -545,9 +560,9 @@ fn wants_json(headers: &HeaderMap) -> bool {
 
 /// Content-type for PyPI files.
 fn pypi_content_type(filename: &str) -> &'static str {
-    if ends_with_ci(filename, ".whl") {
+    if filename.ends_with(".whl") {
         "application/zip"
-    } else if ends_with_ci(filename, ".tar.gz") || ends_with_ci(filename, ".tgz") {
+    } else if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
         "application/gzip"
     } else {
         "application/octet-stream"
@@ -561,11 +576,11 @@ fn is_valid_pypi_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && (ends_with_ci(name, ".tar.gz")
-            || ends_with_ci(name, ".tgz")
-            || ends_with_ci(name, ".whl")
-            || ends_with_ci(name, ".zip")
-            || ends_with_ci(name, ".egg"))
+        && (name.ends_with(".tar.gz")
+            || name.ends_with(".tgz")
+            || name.ends_with(".whl")
+            || name.ends_with(".zip")
+            || name.ends_with(".egg"))
 }
 
 /// Rewrite PyPI links to point to our registry.
@@ -583,11 +598,10 @@ fn rewrite_pypi_links(html: &str, package_name: &str, base_url: &str) -> String 
             if let Some(filename) = extract_filename(url) {
                 // Extract hash fragment from original URL
                 let hash_fragment = url.find('#').map(|pos| &url[pos..]).unwrap_or("");
-                let _ = write!(
-                    result,
+                result.push_str(&format!(
                     "{}/simple/{}/{}{}",
                     base_url, package_name, filename, hash_fragment
-                );
+                ));
             } else {
                 result.push_str(url);
             }
@@ -625,11 +639,11 @@ fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
     let filename = url.rsplit('/').next()?;
 
-    if ends_with_ci(filename, ".tar.gz")
-        || ends_with_ci(filename, ".tgz")
-        || ends_with_ci(filename, ".whl")
-        || ends_with_ci(filename, ".zip")
-        || ends_with_ci(filename, ".egg")
+    if filename.ends_with(".tar.gz")
+        || filename.ends_with(".tgz")
+        || filename.ends_with(".whl")
+        || filename.ends_with(".zip")
+        || filename.ends_with(".egg")
     {
         Some(filename)
     } else {

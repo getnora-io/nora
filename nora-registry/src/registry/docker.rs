@@ -6,9 +6,7 @@ use crate::audit::AuditEntry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::storage::Storage;
-use crate::validation::{
-    ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
-};
+use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -307,11 +305,12 @@ async fn download_blob(
             let storage = state.storage.clone();
             let key_clone = key.clone();
             let data_clone = data.clone();
+            let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &data_clone).await;
+                if storage.put(&key_clone, &data_clone).await.is_ok() {
+                    state_clone.repo_index.invalidate("docker");
+                }
             });
-
-            state.repo_index.invalidate("docker");
 
             return (
                 StatusCode::OK,
@@ -934,7 +933,7 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
-        .filter(|t| !ends_with_ci(t, ".meta") && !t.contains(".meta."))
+        .filter(|t| !t.ends_with(".meta") && !t.contains(".meta."))
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }

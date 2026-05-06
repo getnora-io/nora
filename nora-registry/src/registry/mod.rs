@@ -33,29 +33,9 @@ pub use terraform::routes as terraform_routes;
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
-use crate::AppState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::time::Duration;
-
-/// Build NORA base URL from config (for URL rewriting).
-///
-/// Returns `public_url` (trimmed trailing slash) if set,
-/// otherwise constructs `http://host:port`.
-pub(crate) fn nora_base_url(state: &AppState) -> String {
-    state
-        .config
-        .server
-        .public_url
-        .as_deref()
-        .map(|u| u.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "http://{}:{}",
-                state.config.server.host, state.config.server.port
-            )
-        })
-}
 
 #[derive(Debug)]
 #[allow(dead_code)]

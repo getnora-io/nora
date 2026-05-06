@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -21,6 +21,16 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/npm/{*path}", get(handle_request))
         .route("/npm/{*path}", put(handle_publish))
+}
+
+/// Build NORA base URL from config (for URL rewriting)
+fn nora_base_url(state: &AppState) -> String {
+    state.config.server.public_url.clone().unwrap_or_else(|| {
+        format!(
+            "http://{}:{}",
+            state.config.server.host, state.config.server.port
+        )
+    })
 }
 
 /// Rewrite tarball URLs in npm metadata to point to NORA.
@@ -224,18 +234,18 @@ async fn handle_request(
                     data_to_serve = rewritten;
                 }
 
-                // Cache in background
+                // Cache in background, invalidate index AFTER write completes
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
+                let invalidate_npm = is_tarball;
+                let state_clone = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
                         tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
+                    } else if invalidate_npm {
+                        state_clone.repo_index.invalidate("npm");
                     }
                 });
-
-                if is_tarball {
-                    state.repo_index.invalidate("npm");
-                }
 
                 return with_content_type(is_tarball, data_to_serve.into()).into_response();
             }
