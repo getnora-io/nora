@@ -382,6 +382,21 @@ async fn flatcontainer_download(
             "nuget",
             "CACHE",
         ));
+
+        // Track last download time for .nupkg files
+        if ends_with_ci(filename, ".nupkg") {
+            let storage = state.storage.clone();
+            let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
+            tokio::spawn(async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let meta = format!(r#"{{"last_downloaded_at":{}}}"#, now);
+                let _ = storage.put(&meta_key, meta.as_bytes()).await;
+            });
+        }
+
         return (
             StatusCode::OK,
             [
@@ -434,6 +449,42 @@ async fn flatcontainer_download(
                     let _ = storage.put(&key, &data).await;
                 }
             });
+
+            // Best-effort: fetch flatcontainer index.json if missing (for local search)
+            if ends_with_ci(filename, ".nupkg") {
+                let index_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
+                let state2 = Arc::clone(&state);
+                let proxy_url2 = proxy_url.clone();
+                let id2 = id_lower.clone();
+                tokio::spawn(async move {
+                    if state2.storage.stat(&index_key).await.is_none() {
+                        let url = format!(
+                            "{}/v3-flatcontainer/{}/index.json",
+                            proxy_url2.trim_end_matches('/'),
+                            id2
+                        );
+                        let client = reqwest::Client::new();
+                        if let Ok(resp) = client.get(&url).send().await {
+                            if let Ok(body) = resp.bytes().await {
+                                let _ = state2.storage.put(&index_key, &body).await;
+                                state2.repo_index.invalidate("nuget");
+                            }
+                        }
+                    }
+                });
+
+                // Track last download time
+                let storage3 = state.storage.clone();
+                let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
+                tokio::spawn(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let meta = format!(r#"{{"last_downloaded_at":{}}}"#, now);
+                    let _ = storage3.put(&meta_key, meta.as_bytes()).await;
+                });
+            }
 
             state.repo_index.invalidate("nuget");
             (
