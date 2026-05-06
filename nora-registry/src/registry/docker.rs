@@ -3,10 +3,14 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
+use crate::registry::{circuit_open_response, ProxyError};
 use crate::storage::Storage;
-use crate::validation::{validate_digest, validate_docker_name, validate_docker_reference};
+use crate::validation::{
+    ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
+};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -281,7 +285,7 @@ async fn download_blob(
 
     // Try upstream proxies
     for upstream in &state.config.docker.upstreams {
-        if let Ok(data) = fetch_blob_from_upstream(
+        match fetch_blob_from_upstream(
             &state.http_client,
             &upstream.url,
             &name,
@@ -289,59 +293,28 @@ async fn download_blob(
             &state.docker_auth,
             state.config.docker.proxy_timeout,
             upstream.auth.as_deref(),
+            &state.circuit_breaker,
         )
         .await
         {
-            state.metrics.record_download("docker");
-            state.metrics.record_cache_miss();
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                format!("{}@{}", name, &digest[..19.min(digest.len())]),
-                "docker",
-                "PROXY",
-            ));
+            Ok(data) => {
+                state.metrics.record_download("docker");
+                state.metrics.record_cache_miss();
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                    "docker",
+                    "PROXY",
+                ));
 
-            // Cache in storage (fire and forget)
-            let storage = state.storage.clone();
-            let key_clone = key.clone();
-            let data_clone = data.clone();
-            let state_clone = Arc::clone(&state);
-            tokio::spawn(async move {
-                if storage.put(&key_clone, &data_clone).await.is_ok() {
-                    state_clone.repo_index.invalidate("docker");
-                }
-            });
-
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                Bytes::from(data),
-            )
-                .into_response();
-        }
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
-            if let Ok(data) = fetch_blob_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &digest,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-            )
-            .await
-            {
+                // Cache in storage (fire and forget)
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
+                let state_clone = Arc::clone(&state);
                 tokio::spawn(async move {
-                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                        tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                    if storage.put(&key_clone, &data_clone).await.is_ok() {
+                        state_clone.repo_index.invalidate("docker");
                     }
                 });
 
@@ -351,6 +324,86 @@ async fn download_blob(
                     Bytes::from(data),
                 )
                     .into_response();
+            }
+            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+            Err(_) => continue,
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            match fetch_blob_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &digest,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok(data) => {
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let data_clone = data.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                        }
+                    });
+
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        Bytes::from(data),
+                    )
+                        .into_response();
+                }
+                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            match fetch_blob_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &digest,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok(data) => {
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let data_clone = data.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                        }
+                    });
+
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        Bytes::from(data),
+                    )
+                        .into_response();
+                }
+                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+                Err(_) => continue,
             }
         }
     }
@@ -731,7 +784,7 @@ async fn get_manifest(
     );
     for upstream in &state.config.docker.upstreams {
         tracing::debug!(upstream_url = %upstream.url, "Trying upstream");
-        if let Ok((data, content_type)) = fetch_manifest_from_upstream(
+        match fetch_manifest_from_upstream(
             &state.http_client,
             &upstream.url,
             &name,
@@ -739,80 +792,11 @@ async fn get_manifest(
             &state.docker_auth,
             state.config.docker.proxy_timeout,
             upstream.auth.as_deref(),
+            &state.circuit_breaker,
         )
         .await
         {
-            state.metrics.record_download("docker");
-            state.metrics.record_cache_miss();
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                format!("{}:{}", name, reference),
-                "docker",
-                "PROXY",
-            ));
-
-            // Calculate digest for Docker-Content-Digest header
-            use sha2::Digest;
-            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-
-            // Cache manifest and create metadata (fire and forget)
-            let storage = state.storage.clone();
-            let key_clone = key.clone();
-            let data_clone = data.clone();
-            let name_clone = name.clone();
-            let reference_clone = reference.clone();
-            let digest_clone = digest.clone();
-            tokio::spawn(async move {
-                // Store manifest by tag and digest
-                let _ = storage.put(&key_clone, &data_clone).await;
-                let digest_key = format!("docker/{}/manifests/{}.json", name_clone, digest_clone);
-                let _ = storage.put(&digest_key, &data_clone).await;
-
-                // Extract and save metadata
-                let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
-                if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-                    let meta_key = format!(
-                        "docker/{}/manifests/{}.meta.json",
-                        name_clone, reference_clone
-                    );
-                    let _ = storage.put(&meta_key, &meta_json).await;
-
-                    let digest_meta_key =
-                        format!("docker/{}/manifests/{}.meta.json", name_clone, digest_clone);
-                    let _ = storage.put(&digest_meta_key, &meta_json).await;
-                }
-            });
-
-            state.repo_index.invalidate("docker");
-
-            return (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (HeaderName::from_static("docker-content-digest"), digest),
-                ],
-                Bytes::from(data),
-            )
-                .into_response();
-        }
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
-            if let Ok((data, content_type)) = fetch_manifest_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &reference,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-            )
-            .await
-            {
+            Ok((data, content_type)) => {
                 state.metrics.record_download("docker");
                 state.metrics.record_cache_miss();
                 state.activity.push(ActivityEntry::new(
@@ -822,16 +806,36 @@ async fn get_manifest(
                     "PROXY",
                 ));
 
+                // Calculate digest for Docker-Content-Digest header
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
-                // Cache under original name for future local hits
+                // Cache manifest and create metadata (fire and forget)
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
+                let name_clone = name.clone();
+                let reference_clone = reference.clone();
+                let digest_clone = digest.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                        tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                    // Store manifest by tag and digest
+                    let _ = storage.put(&key_clone, &data_clone).await;
+                    let digest_key =
+                        format!("docker/{}/manifests/{}.json", name_clone, digest_clone);
+                    let _ = storage.put(&digest_key, &data_clone).await;
+
+                    // Extract and save metadata
+                    let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
+                    if let Ok(meta_json) = serde_json::to_vec(&metadata) {
+                        let meta_key = format!(
+                            "docker/{}/manifests/{}.meta.json",
+                            name_clone, reference_clone
+                        );
+                        let _ = storage.put(&meta_key, &meta_json).await;
+
+                        let digest_meta_key =
+                            format!("docker/{}/manifests/{}.meta.json", name_clone, digest_clone);
+                        let _ = storage.put(&digest_meta_key, &meta_json).await;
                     }
                 });
 
@@ -846,6 +850,66 @@ async fn get_manifest(
                     Bytes::from(data),
                 )
                     .into_response();
+            }
+            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+            Err(_) => continue,
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            match fetch_manifest_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &reference,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok((data, content_type)) => {
+                    state.metrics.record_download("docker");
+                    state.metrics.record_cache_miss();
+                    state.activity.push(ActivityEntry::new(
+                        ActionType::ProxyFetch,
+                        format!("{}:{}", name, reference),
+                        "docker",
+                        "PROXY",
+                    ));
+
+                    use sha2::Digest;
+                    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+
+                    // Cache under original name for future local hits
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let data_clone = data.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
+                        }
+                    });
+
+                    state.repo_index.invalidate("docker");
+
+                    return (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (HeaderName::from_static("docker-content-digest"), digest),
+                        ],
+                        Bytes::from(data),
+                    )
+                        .into_response();
+                }
+                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+                Err(_) => continue,
             }
         }
     }
@@ -933,7 +997,7 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
-        .filter(|t| !t.ends_with(".meta") && !t.contains(".meta."))
+        .filter(|t| !ends_with_ci(t, ".meta") && !t.contains(".meta."))
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }
@@ -1133,6 +1197,7 @@ async fn delete_blob_ns(
 }
 
 /// Fetch a blob from an upstream Docker registry
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_blob_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -1141,7 +1206,11 @@ pub async fn fetch_blob_from_upstream(
     docker_auth: &DockerAuth,
     timeout: u64,
     basic_auth: Option<&str>,
-) -> Result<Vec<u8>, ()> {
+    cb: &CircuitBreakerRegistry,
+) -> Result<Vec<u8>, ProxyError> {
+    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    cb.check(&cb_key)?;
+
     let url = format!(
         "{}/v2/{}/blobs/{}",
         upstream_url.trim_end_matches('/'),
@@ -1154,7 +1223,10 @@ pub async fn fetch_blob_from_upstream(
     if let Some(credentials) = basic_auth {
         request = request.header("Authorization", basic_auth_header(credentials));
     }
-    let response = request.send().await.map_err(|_| ())?;
+    let response = request.send().await.map_err(|e| {
+        cb.record_failure(&cb_key);
+        ProxyError::Network(e.to_string())
+    })?;
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Get Www-Authenticate header and fetch token
@@ -1173,23 +1245,35 @@ pub async fn fetch_blob_from_upstream(
                 .header("Authorization", format!("Bearer {}", token))
                 .send()
                 .await
-                .map_err(|_| ())?
+                .map_err(|e| {
+                    cb.record_failure(&cb_key);
+                    ProxyError::Network(e.to_string())
+                })?
         } else {
-            return Err(());
+            // Auth issue (token fetch failed), not upstream down
+            return Err(ProxyError::Network("token fetch failed".into()));
         }
     } else {
         response
     };
 
     if !response.status().is_success() {
-        return Err(());
+        let status = response.status().as_u16();
+        cb.record_failure(&cb_key);
+        return Err(ProxyError::Upstream(status));
     }
 
-    response.bytes().await.map(|b| b.to_vec()).map_err(|_| ())
+    let bytes = response.bytes().await.map_err(|e| {
+        cb.record_failure(&cb_key);
+        ProxyError::Network(e.to_string())
+    })?;
+    cb.record_success(&cb_key);
+    Ok(bytes.to_vec())
 }
 
 /// Fetch a manifest from an upstream Docker registry
 /// Returns (manifest_bytes, content_type)
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_manifest_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -1198,7 +1282,11 @@ pub async fn fetch_manifest_from_upstream(
     docker_auth: &DockerAuth,
     timeout: u64,
     basic_auth: Option<&str>,
-) -> Result<(Vec<u8>, String), ()> {
+    cb: &CircuitBreakerRegistry,
+) -> Result<(Vec<u8>, String), ProxyError> {
+    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    cb.check(&cb_key)?;
+
     let url = format!(
         "{}/v2/{}/manifests/{}",
         upstream_url.trim_end_matches('/'),
@@ -1224,6 +1312,8 @@ pub async fn fetch_manifest_from_upstream(
     }
     let response = request.send().await.map_err(|e| {
         tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
+        cb.record_failure(&cb_key);
+        ProxyError::Network(e.to_string())
     })?;
 
     tracing::debug!(status = %response.status(), "Initial upstream response");
@@ -1251,10 +1341,13 @@ pub async fn fetch_manifest_from_upstream(
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Failed to send authenticated request");
+                    cb.record_failure(&cb_key);
+                    ProxyError::Network(e.to_string())
                 })?
         } else {
             tracing::error!("Failed to acquire token");
-            return Err(());
+            // Auth issue (token fetch failed), not upstream down
+            return Err(ProxyError::Network("token fetch failed".into()));
         }
     } else {
         response
@@ -1263,8 +1356,10 @@ pub async fn fetch_manifest_from_upstream(
     tracing::debug!(status = %response.status(), "Final upstream response");
 
     if !response.status().is_success() {
+        let status = response.status().as_u16();
         tracing::warn!(status = %response.status(), "Upstream returned non-success status");
-        return Err(());
+        cb.record_failure(&cb_key);
+        return Err(ProxyError::Upstream(status));
     }
 
     let content_type = response
@@ -1274,8 +1369,12 @@ pub async fn fetch_manifest_from_upstream(
         .unwrap_or("application/vnd.docker.distribution.manifest.v2+json")
         .to_string();
 
-    let bytes = response.bytes().await.map_err(|_| ())?;
+    let bytes = response.bytes().await.map_err(|e| {
+        cb.record_failure(&cb_key);
+        ProxyError::Network(e.to_string())
+    })?;
 
+    cb.record_success(&cb_key);
     Ok((bytes.to_vec(), content_type))
 }
 
@@ -2166,5 +2265,96 @@ mod integration_tests {
         )
         .await;
         assert!(result.is_none());
+    }
+
+    /// Circuit breaker open on Docker upstream MUST return 503 + Retry-After.
+    #[tokio::test]
+    async fn test_docker_circuit_breaker_trips() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            // Unreachable upstream
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+            }];
+        });
+
+        // Trip the breaker for this upstream
+        ctx.state
+            .circuit_breaker
+            .record_failure("docker:http://127.0.0.1:1");
+        ctx.state
+            .circuit_breaker
+            .record_failure("docker:http://127.0.0.1:1");
+
+        // Request a manifest NOT in local storage → proxy path → cb.check() → 503
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/nonexistent/manifests/latest",
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+        let body = body_bytes(response).await;
+        assert!(String::from_utf8_lossy(&body).contains("temporarily unavailable"));
+    }
+
+    /// Per-upstream circuit breaker isolation: upstream A down, upstream B serves.
+    #[tokio::test]
+    async fn test_docker_circuit_breaker_per_upstream() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.upstreams = vec![
+                DockerUpstream {
+                    url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
+                    auth: None,
+                },
+                DockerUpstream {
+                    url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
+                    auth: None,
+                },
+            ];
+        });
+
+        // Trip only upstream A
+        ctx.state
+            .circuit_breaker
+            .record_failure("docker:http://127.0.0.1:1");
+        ctx.state
+            .circuit_breaker
+            .record_failure("docker:http://127.0.0.1:1");
+
+        // Upstream A should be open
+        assert!(ctx
+            .state
+            .circuit_breaker
+            .check("docker:http://127.0.0.1:1")
+            .is_err());
+
+        // Upstream B should still be closed (requests allowed)
+        assert!(ctx
+            .state
+            .circuit_breaker
+            .check("docker:http://127.0.0.1:2")
+            .is_ok());
     }
 }

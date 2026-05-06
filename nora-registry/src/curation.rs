@@ -13,6 +13,7 @@
 //! - [`CurationMetrics`] for raw counters
 
 use crate::config::{CurationConfig, CurationMode};
+use crate::validation::ends_with_ci;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -473,7 +474,7 @@ pub fn parse_pypi_version(normalized_name: &str, filename: &str) -> Option<Strin
     // For sdist: rest is just "VERSION"
     // Heuristic: version chars are digits, dots, letters (rc, alpha, beta, post, dev)
     // Split at first '-' followed by non-digit (wheel tags like py3, cp39)
-    let version = if filename.ends_with(".whl") {
+    let version = if ends_with_ci(filename, ".whl") {
         rest.split('-').next()?
     } else {
         rest

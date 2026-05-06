@@ -45,6 +45,14 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Case-insensitive suffix check for file extensions.
+///
+/// Avoids allocating a lowercased copy of the whole string.
+pub fn ends_with_ci(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 /// Maximum allowed storage key length
 const MAX_KEY_LENGTH: usize = 1024;
 

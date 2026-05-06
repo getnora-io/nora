@@ -12,7 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -609,17 +609,6 @@ fn is_valid_crate_name(name: &str) -> bool {
     // Only alphanumeric, `-`, `_`
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// Construct NORA base URL from config.
-fn nora_base_url(state: &AppState) -> String {
-    if let Some(url) = &state.config.server.public_url {
-        return url.clone();
-    }
-    format!(
-        "http://{}:{}",
-        state.config.server.host, state.config.server.port
-    )
 }
 
 /// Build response with sparse index content-type.

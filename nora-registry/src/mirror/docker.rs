@@ -4,6 +4,7 @@
 //! Docker image mirroring — fetch images from upstream registries and push to NORA.
 
 use super::{create_progress_bar, MirrorResult};
+use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::registry::docker_auth::DockerAuth;
 use reqwest::Client;
 use std::time::Duration;
@@ -154,6 +155,9 @@ async fn mirror_single_image(
 ) -> Result<u64, String> {
     let mut bytes = 0u64;
 
+    // Mirror uses a no-op circuit breaker — it's a background sync job, not user-facing.
+    let noop_cb = CircuitBreakerRegistry::noop();
+
     // 1. Fetch manifest from upstream
     let (manifest_bytes, content_type) = crate::registry::docker::fetch_manifest_from_upstream(
         client,
@@ -163,9 +167,10 @@ async fn mirror_single_image(
         docker_auth,
         DEFAULT_TIMEOUT,
         None,
+        &noop_cb,
     )
     .await
-    .map_err(|()| format!("Failed to fetch manifest for {}", image.name))?;
+    .map_err(|e| format!("Failed to fetch manifest for {}: {:?}", image.name, e))?;
 
     bytes += manifest_bytes.len() as u64;
 
@@ -211,9 +216,10 @@ async fn mirror_single_image(
                 docker_auth,
                 DEFAULT_TIMEOUT,
                 None,
+                &noop_cb,
             )
             .await
-            .map_err(|()| format!("Failed to fetch blob {}", digest))?;
+            .map_err(|e| format!("Failed to fetch blob {}: {:?}", digest, e))?;
 
             bytes += blob_data.len() as u64;
             push_blob(client, nora_base, &image.name, digest, &blob_data).await?;
@@ -290,6 +296,7 @@ async fn resolve_platform_manifest(
         .and_then(|d| d.as_str())
         .ok_or("Manifest entry missing digest")?;
 
+    let noop_cb = CircuitBreakerRegistry::noop();
     let (mf_bytes, mf_ct) = crate::registry::docker::fetch_manifest_from_upstream(
         client,
         upstream_url,
@@ -298,9 +305,10 @@ async fn resolve_platform_manifest(
         docker_auth,
         DEFAULT_TIMEOUT,
         None,
+        &noop_cb,
     )
     .await
-    .map_err(|()| format!("Failed to fetch platform manifest {}", digest))?;
+    .map_err(|e| format!("Failed to fetch platform manifest {}: {:?}", digest, e))?;
 
     let mf_json: serde_json::Value = serde_json::from_slice(&mf_bytes)
         .map_err(|e| format!("Invalid platform manifest: {}", e))?;
