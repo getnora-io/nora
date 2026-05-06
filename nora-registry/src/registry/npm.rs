@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -21,16 +21,6 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/npm/{*path}", get(handle_request))
         .route("/npm/{*path}", put(handle_publish))
-}
-
-/// Build NORA base URL from config (for URL rewriting)
-fn nora_base_url(state: &AppState) -> String {
-    state.config.server.public_url.clone().unwrap_or_else(|| {
-        format!(
-            "http://{}:{}",
-            state.config.server.host, state.config.server.port
-        )
-    })
 }
 
 /// Rewrite tarball URLs in npm metadata to point to NORA.

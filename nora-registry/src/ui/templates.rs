@@ -6,6 +6,7 @@ use super::components::*;
 use super::i18n::{get_translations, Lang};
 use crate::repo_index::RepoInfo;
 use crate::tokens::TokenListEntry;
+use std::fmt::Write;
 
 /// Renders the main dashboard page with dark theme
 pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool) -> String {
@@ -293,10 +294,13 @@ pub fn render_registry_list_paginated(
 
         // Previous button
         if page > 1 {
-            pages_html.push_str(&format!(
+            let _ = write!(
+                pages_html,
                 r##"<a href="/ui/{}?page={}&limit={}" class="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">←</a>"##,
-                registry_type, page - 1, limit
-            ));
+                registry_type,
+                page - 1,
+                limit
+            );
         } else {
             pages_html.push_str(r##"<span class="px-3 py-1 rounded bg-slate-800 text-slate-600 cursor-not-allowed">←</span>"##);
         }
@@ -306,10 +310,11 @@ pub fn render_registry_list_paginated(
         let end_page = (start_page + 6).min(total_pages);
 
         if start_page > 1 {
-            pages_html.push_str(&format!(
+            let _ = write!(
+                pages_html,
                 r##"<a href="/ui/{}?page=1&limit={}" class="px-3 py-1 rounded hover:bg-slate-700 text-slate-400">1</a>"##,
                 registry_type, limit
-            ));
+            );
             if start_page > 2 {
                 pages_html.push_str(r##"<span class="px-2 text-slate-600">...</span>"##);
             }
@@ -317,15 +322,17 @@ pub fn render_registry_list_paginated(
 
         for p in start_page..=end_page {
             if p == page {
-                pages_html.push_str(&format!(
+                let _ = write!(
+                    pages_html,
                     r##"<span class="px-3 py-1 rounded bg-blue-600 text-white font-medium">{}</span>"##,
                     p
-                ));
+                );
             } else {
-                pages_html.push_str(&format!(
+                let _ = write!(
+                    pages_html,
                     r##"<a href="/ui/{}?page={}&limit={}" class="px-3 py-1 rounded hover:bg-slate-700 text-slate-400">{}</a>"##,
                     registry_type, p, limit, p
-                ));
+                );
             }
         }
 
@@ -333,18 +340,22 @@ pub fn render_registry_list_paginated(
             if end_page < total_pages - 1 {
                 pages_html.push_str(r##"<span class="px-2 text-slate-600">...</span>"##);
             }
-            pages_html.push_str(&format!(
+            let _ = write!(
+                pages_html,
                 r##"<a href="/ui/{}?page={}&limit={}" class="px-3 py-1 rounded hover:bg-slate-700 text-slate-400">{}</a>"##,
                 registry_type, total_pages, limit, total_pages
-            ));
+            );
         }
 
         // Next button
         if page < total_pages {
-            pages_html.push_str(&format!(
+            let _ = write!(
+                pages_html,
                 r##"<a href="/ui/{}?page={}&limit={}" class="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">→</a>"##,
-                registry_type, page + 1, limit
-            ));
+                registry_type,
+                page + 1,
+                limit
+            );
         } else {
             pages_html.push_str(r##"<span class="px-3 py-1 rounded bg-slate-800 text-slate-600 cursor-not-allowed">→</span>"##);
         }
@@ -560,16 +571,18 @@ pub fn render_raw_dir(
             .collect::<Vec<_>>()
             .join("/");
         if i == segments.len() - 1 {
-            breadcrumbs.push_str(&format!(
+            let _ = write!(
+                breadcrumbs,
                 r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                 html_escape(seg)
-            ));
+            );
         } else {
-            breadcrumbs.push_str(&format!(
+            let _ = write!(
+                breadcrumbs,
                 r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                 crumb_path,
                 html_escape(seg)
-            ));
+            );
         }
     }
 
@@ -676,16 +689,18 @@ pub fn render_maven_dir(
         for (i, seg) in segments.iter().enumerate() {
             let crumb_path = segments[..=i].join("/");
             if i == segments.len() - 1 {
-                breadcrumbs.push_str(&format!(
+                let _ = write!(
+                    breadcrumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                     html_escape(seg)
-                ));
+                );
             } else {
-                breadcrumbs.push_str(&format!(
+                let _ = write!(
+                    breadcrumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                     crumb_path,
                     html_escape(seg)
-                ));
+                );
             }
         }
     }
@@ -907,16 +922,18 @@ pub fn render_package_detail(
                 .collect::<Vec<_>>()
                 .join("/");
             if i == segments.len() - 1 {
-                crumbs.push_str(&format!(
+                let _ = write!(
+                    crumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                     html_escape(seg)
-                ));
+                );
             } else {
-                crumbs.push_str(&format!(
+                let _ = write!(
+                    crumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                     crumb_path,
                     html_escape(seg)
-                ));
+                );
             }
         }
         crumbs
@@ -1100,16 +1117,18 @@ pub fn render_maven_detail(
     for (i, seg) in segments.iter().enumerate() {
         let crumb_path = segments[..=i].join("/");
         if i == segments.len() - 1 {
-            breadcrumbs.push_str(&format!(
+            let _ = write!(
+                breadcrumbs,
                 r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                 html_escape(seg)
-            ));
+            );
         } else {
-            breadcrumbs.push_str(&format!(
+            let _ = write!(
+                breadcrumbs,
                 r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                 crumb_path,
                 html_escape(seg)
-            ));
+            );
         }
     }
 
@@ -1442,7 +1461,7 @@ pub fn encode_uri_component(s: &str) -> String {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
             _ => {
                 for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", byte));
+                    let _ = write!(result, "%{:02X}", byte);
                 }
             }
         }

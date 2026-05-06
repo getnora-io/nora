@@ -13,6 +13,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -58,7 +59,7 @@ async fn handle(
     };
 
     // Parse curation coords for .zip downloads (used in both pre-download and integrity checks)
-    let go_curation = if file.ends_with(".zip") {
+    let go_curation = if ends_with_ci(&file, ".zip") {
         let module_name =
             decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
         let version = file
@@ -145,14 +146,14 @@ async fn handle(
     );
 
     // Use longer timeout for .zip files
-    let timeout = if file.ends_with(".zip") {
+    let timeout = if ends_with_ci(&file, ".zip") {
         state.config.go.proxy_timeout_zip
     } else {
         state.config.go.proxy_timeout
     };
 
     // Fetch: binary for .zip, text for everything else
-    let data = if file.ends_with(".zip") {
+    let data = if ends_with_ci(&file, ".zip") {
         proxy_fetch(
             &state.http_client,
             &upstream_url,
@@ -179,7 +180,7 @@ async fn handle(
     match data {
         Ok(bytes) => {
             // Enforce size limit for .zip
-            if file.ends_with(".zip") && bytes.len() as u64 > state.config.go.max_zip_size {
+            if ends_with_ci(&file, ".zip") && bytes.len() as u64 > state.config.go.max_zip_size {
                 tracing::warn!(
                     module = module_encoded,
                     size = bytes.len(),
@@ -332,9 +333,9 @@ fn is_safe_path(path: &str) -> bool {
 
 /// Content-Type for Go proxy responses
 fn content_type_for(file: &str) -> &'static str {
-    if file.ends_with(".info") || file == "@latest" {
+    if ends_with_ci(file, ".info") || file == "@latest" {
         "application/json"
-    } else if file.ends_with(".zip") {
+    } else if ends_with_ci(file, ".zip") {
         "application/zip"
     } else {
         // .mod, @v/list

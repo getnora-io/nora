@@ -24,7 +24,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 sha2 = "0.11"
 async-trait = "0.1"
-hmac = "0.13"
 hex = "0.4"
 
 [workspace.lints.clippy]
