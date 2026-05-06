@@ -36,9 +36,9 @@ FROM scratch AS binary
 COPY --from=builder /nora /nora
 
 # ── RED OS (FSTEC-certified, RPM-based) ───────────────────────────────────
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.4 AS redos
+FROM registry.red-soft.ru/ubi8/ubi-minimal AS redos
 
-RUN microdnf install -y ca-certificates shadow-utils \
+RUN microdnf install -y ca-certificates shadow-utils curl \
     && microdnf clean all \
     && groupadd -r nora && useradd -r -g nora -d /data -s /sbin/nologin nora \
     && mkdir -p /data && chown nora:nora /data
@@ -62,7 +62,7 @@ ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
 
 # ── Astra Linux SE (FSTEC-certified, Debian-based) ────────────────────────
-FROM debian:bookworm-slim AS astra
+FROM registry.astralinux.ru/library/astra/ubi17:latest AS astra
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
