@@ -21,15 +21,26 @@ use crate::registry::{
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
+const SEARCH_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    skip: Option<usize>,
+    take: Option<usize>,
+    #[allow(dead_code)]
+    prerelease: Option<bool>,
+}
 
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", "index.json");
@@ -94,20 +105,32 @@ async fn service_index(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-// ── Search query (proxy to upstream SearchQueryService) ───────────────
+// ── Search query (proxy to upstream SearchQueryService, local fallback) ──
 
 async fn search_query(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
-    // Forward query string as-is to upstream search
+    let query = params.q.unwrap_or_default();
+    let skip = params.skip.unwrap_or(0);
+    let take = params.take.unwrap_or(20);
+
+    // No upstream proxy configured → local search directly
+    if state.config.nuget.proxy.is_none() {
+        let data = local_search_results(&state, &headers, &query, skip, take).await;
+        return with_json(data);
+    }
+
+    // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
     let url = format!("{}?{}", state.config.nuget.search_service, qs);
 
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.proxy_timeout,
+        SEARCH_TIMEOUT_SECS,
         None, // search endpoint is public
         None,
         &state.circuit_breaker,
@@ -126,11 +149,11 @@ async fn search_query(
             ));
             with_json(text.into_bytes())
         }
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(e) => {
-            tracing::debug!(error = ?e, "NuGet search error");
-            StatusCode::BAD_GATEWAY.into_response()
+        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+            tracing::info!("NuGet search: upstream unavailable, using local index");
+            let data = local_search_results(&state, &headers, &query, skip, take).await;
+            with_json(data)
         }
     }
 }
@@ -573,6 +596,95 @@ fn with_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
+// ── Local search helpers ───────────────────────────────────────────────
+
+/// Read cached version list from flatcontainer index.json.
+async fn get_cached_versions(storage: &crate::storage::Storage, id: &str) -> Vec<String> {
+    let key = format!("nuget/flatcontainer/{}/index.json", id.to_lowercase());
+    let data = match storage.get(&key).await {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    json.get("versions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build one NuGet V3 search result entry.
+fn build_search_entry(
+    base_url: &str,
+    pkg: &crate::repo_index::RepoInfo,
+    versions: &[String],
+) -> serde_json::Value {
+    let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
+    let id = &pkg.name;
+    let latest = versions.last().map(|s| s.as_str()).unwrap_or("0.0.0");
+
+    let version_entries: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "version": v,
+                "downloads": 0,
+                "@id": format!("{}/v3/registration/{}/{}.json", nora_nuget, id.to_lowercase(), v)
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "id": id,
+        "version": latest,
+        "versions": version_entries,
+        "description": "",
+        "totalDownloads": 0,
+        "packageTypes": [{"name": "Dependency"}],
+        "registration": format!("{}/v3/registration/{}/index.json", nora_nuget, id.to_lowercase())
+    })
+}
+
+/// Build local search results from the in-memory repo index.
+async fn local_search_results(
+    state: &AppState,
+    _headers: &HeaderMap,
+    query: &str,
+    skip: usize,
+    take: usize,
+) -> Vec<u8> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let base_url = nora_base_url(state);
+
+    let query_lower = query.to_lowercase();
+    let filtered: Vec<&crate::repo_index::RepoInfo> = packages
+        .iter()
+        .filter(|pkg| query_lower.is_empty() || pkg.name.to_lowercase().contains(&query_lower))
+        .collect();
+
+    let total_hits = filtered.len();
+    let page: Vec<&crate::repo_index::RepoInfo> =
+        filtered.into_iter().skip(skip).take(take).collect();
+
+    let mut data = Vec::with_capacity(page.len());
+    for pkg in &page {
+        let versions = get_cached_versions(&state.storage, &pkg.name).await;
+        data.push(build_search_entry(&base_url, pkg, &versions));
+    }
+
+    let result = serde_json::json!({
+        "totalHits": total_hits,
+        "data": data,
+    });
+    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+}
+
 /// Rewrite known Microsoft NuGet service index URLs with NORA endpoints.
 /// `base_url` is the full NORA base URL including scheme (e.g. `https://artifact.company.local`).
 /// Targets api.nuget.org and azuresearch-{usnc,ussc}.nuget.org specifically.
@@ -774,5 +886,151 @@ mod integration_tests {
 
         let result = super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0").await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_local_search_empty_query() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        // Populate index for two packages
+        for id in &["packagea", "packageb"] {
+            let index = serde_json::json!({"versions": ["1.0.0"]});
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{}/index.json", id),
+                    serde_json::to_vec(&index).unwrap().as_slice(),
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["totalHits"].as_u64().unwrap() >= 2);
+        assert!(json["data"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_local_search_substring_match() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        let index = serde_json::json!({"versions": ["13.0.1"]});
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/newtonsoft.json/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=Newton", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["totalHits"].as_u64().unwrap(), 1);
+        assert_eq!(json["data"][0]["id"].as_str().unwrap(), "newtonsoft.json");
+    }
+
+    #[tokio::test]
+    async fn test_local_search_case_insensitive() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        let index = serde_json::json!({"versions": ["13.0.1"]});
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/newtonsoft.json/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=newton", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["totalHits"].as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_local_search_pagination() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        for id in &["alpha", "beta", "gamma"] {
+            let index = serde_json::json!({"versions": ["1.0.0"]});
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{}/index.json", id),
+                    serde_json::to_vec(&index).unwrap().as_slice(),
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?skip=1&take=1", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["totalHits"].as_u64().unwrap(), 3);
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
+        // Sorted alphabetically: alpha, beta, gamma — skip 1 = beta
+        assert_eq!(json["data"][0]["id"].as_str().unwrap(), "beta");
+    }
+
+    #[tokio::test]
+    async fn test_search_response_format() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        let index = serde_json::json!({"versions": ["1.0.0", "2.0.0"]});
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/testpkg/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Validate top-level structure
+        assert!(json["totalHits"].is_number());
+        assert!(json["data"].is_array());
+
+        // Validate entry structure
+        let entry = &json["data"][0];
+        assert!(entry["id"].is_string());
+        assert!(entry["version"].is_string());
+        assert!(entry["versions"].is_array());
+        assert_eq!(entry["version"].as_str().unwrap(), "2.0.0");
+        assert_eq!(entry["versions"].as_array().unwrap().len(), 2);
     }
 }
