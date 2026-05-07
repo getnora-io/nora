@@ -347,14 +347,7 @@ async fn download_blob(
             .await
             {
                 Ok(data) => {
-                    let storage = state.storage.clone();
-                    let key_clone = key.clone();
-                    let data_clone = data.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
-                        }
-                    });
+                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
 
                     return (
                         StatusCode::OK,
@@ -386,14 +379,7 @@ async fn download_blob(
             .await
             {
                 Ok(data) => {
-                    let storage = state.storage.clone();
-                    let key_clone = key.clone();
-                    let data_clone = data.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
-                        }
-                    });
+                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
 
                     return (
                         StatusCode::OK,
@@ -817,6 +803,7 @@ async fn get_manifest(
                 let name_clone = name.clone();
                 let reference_clone = reference.clone();
                 let digest_clone = digest.clone();
+                let state_clone = Arc::clone(&state);
                 tokio::spawn(async move {
                     // Store manifest by tag and digest
                     let _ = storage.put(&key_clone, &data_clone).await;
@@ -837,9 +824,8 @@ async fn get_manifest(
                             format!("docker/{}/manifests/{}.meta.json", name_clone, digest_clone);
                         let _ = storage.put(&digest_meta_key, &meta_json).await;
                     }
+                    state_clone.repo_index.invalidate("docker");
                 });
-
-                state.repo_index.invalidate("docker");
 
                 return (
                     StatusCode::OK,

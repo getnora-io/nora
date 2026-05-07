@@ -6,6 +6,7 @@ mod activity_log;
 mod audit;
 mod auth;
 mod backup;
+mod cache_ttl;
 mod circuit_breaker;
 mod config;
 mod curation;
@@ -33,7 +34,7 @@ mod validation;
 #[cfg(test)]
 mod test_helpers;
 
-use axum::{extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
+use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,6 +171,37 @@ impl AppState {
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Background-cache proxy data and invalidate the registry index.
+    ///
+    /// Use for ALL proxy caching instead of manual `tokio::spawn` + `storage.put`.
+    /// Guarantees that `repo_index.invalidate()` is called AFTER the write completes,
+    /// avoiding the race condition where invalidation fires before the file lands on S3.
+    pub fn spawn_cache(self: &Arc<Self>, registry: &'static str, key: String, data: Bytes) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if state.storage.put(&key, &data).await.is_ok() {
+                state.repo_index.invalidate(registry);
+            }
+        });
+    }
+
+    /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
+    pub fn spawn_cache_immutable(
+        self: &Arc<Self>,
+        registry: &'static str,
+        key: String,
+        data: Bytes,
+    ) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if state.storage.stat(&key).await.is_none() {
+                if state.storage.put(&key, &data).await.is_ok() {
+                    state.repo_index.invalidate(registry);
+                }
+            }
+        });
     }
 }
 

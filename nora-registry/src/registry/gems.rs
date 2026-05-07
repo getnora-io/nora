@@ -19,6 +19,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -26,7 +27,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
 
@@ -47,14 +47,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/gems/quick/Marshal.4.8/{filename}", get(download_gemspec))
 }
 
-/// Check if a cached entry is within TTL based on unix timestamp
-fn is_within_ttl(modified_unix: u64, ttl_secs: u64) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(modified_unix) < ttl_secs
-}
+use crate::cache_ttl::is_within_ttl;
 
 // ── Index endpoints (mutable, TTL cached) ─────────────────────────────
 
@@ -70,13 +63,13 @@ async fn prerelease_specs_index(State(state): State<Arc<AppState>>) -> Response 
     fetch_index(&state, "prerelease_specs.4.8.gz").await
 }
 
-async fn fetch_index(state: &AppState, filename: &str) -> Response {
+async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
     let storage_key = format!("gems/{}", filename);
 
     // Check TTL: if cached and fresh, serve from cache
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.index_ttl) {
+            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit();
                 state.activity.push(ActivityEntry::new(
@@ -118,14 +111,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
             // Cache in background (overwrite — mutable content)
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, &data).await;
-            });
-
-            state.repo_index.invalidate("gems");
+            state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes, "application/gzip")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -166,7 +152,7 @@ async fn compact_index(
     // Check TTL cache
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, state.config.gems.index_ttl) {
+            if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit();
                 state.activity.push(ActivityEntry::new(
@@ -207,14 +193,7 @@ async fn compact_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("gems");
+            state.spawn_cache("gems", storage_key, Bytes::from(text.clone()));
             with_text(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -321,16 +300,7 @@ async fn download_gem(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
             // Immutable cache: put_if_absent
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("gems");
+            state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -407,16 +377,7 @@ async fn download_gemspec(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("gems");
+            state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -529,6 +490,7 @@ fn is_valid_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_valid_gem_names() {
@@ -712,7 +674,7 @@ mod integration_tests {
     async fn test_gems_cached_compact_index() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.gems.enabled = true;
-            cfg.gems.index_ttl = 3600; // 1 hour
+            cfg.gems.metadata_ttl = 3600; // 1 hour
         });
 
         ctx.state

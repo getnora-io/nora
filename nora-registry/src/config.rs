@@ -166,9 +166,10 @@ pub struct NpmConfig {
     pub proxy_auth: Option<String>, // "user:pass" for basic auth
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
-    /// Metadata cache TTL in seconds (default: 300 = 5 min). Set to 0 to cache forever.
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
-    pub metadata_ttl: u64,
+    pub metadata_ttl: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,9 +329,10 @@ pub struct GemsConfig {
     pub proxy_auth: Option<String>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
-    /// Index cache TTL in seconds (default: 300 = 5 min)
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
-    pub index_ttl: u64,
+    pub metadata_ttl: i64,
 }
 
 fn default_gems_proxy() -> Option<String> {
@@ -344,7 +346,7 @@ impl Default for GemsConfig {
             proxy: default_gems_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
-            index_ttl: 300,
+            metadata_ttl: 300,
         }
     }
 }
@@ -364,6 +366,10 @@ pub struct TerraformConfig {
     /// Separate timeout for binary downloads (default: 120s)
     #[serde(default = "default_go_zip_timeout")]
     pub proxy_timeout_download: u64,
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
+    #[serde(default = "default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 fn default_terraform_proxy() -> Option<String> {
@@ -378,6 +384,7 @@ impl Default for TerraformConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             proxy_timeout_download: 120,
+            metadata_ttl: 300,
         }
     }
 }
@@ -423,9 +430,10 @@ pub struct NugetConfig {
     pub proxy_auth: Option<String>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
-    /// Metadata cache TTL in seconds (default: 300 = 5 min)
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
-    pub metadata_ttl: u64,
+    pub metadata_ttl: i64,
     /// Upstream NuGet search service URL
     #[serde(default = "default_nuget_search")]
     pub search_service: String,
@@ -504,9 +512,10 @@ pub struct ConanConfig {
     /// Separate timeout for binary downloads (default: 120s)
     #[serde(default = "default_go_zip_timeout")]
     pub proxy_timeout_download: u64,
-    /// Metadata cache TTL in seconds (default: 300 = 5 min)
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
-    pub metadata_ttl: u64,
+    pub metadata_ttl: i64,
 }
 
 fn default_conan_proxy() -> Option<String> {
@@ -686,8 +695,8 @@ fn default_timeout() -> u64 {
     30
 }
 
-fn default_metadata_ttl() -> u64 {
-    300 // 5 minutes
+fn default_metadata_ttl() -> i64 {
+    300 // 5 minutes; -1 = cache forever, 0 = always refetch
 }
 
 impl Default for MavenConfig {
@@ -1886,9 +1895,9 @@ impl Config {
                 self.gems.proxy_timeout = timeout;
             }
         }
-        if let Ok(val) = env::var("NORA_GEMS_INDEX_TTL") {
+        if let Ok(val) = env::var("NORA_GEMS_METADATA_TTL") {
             if let Ok(ttl) = val.parse() {
-                self.gems.index_ttl = ttl;
+                self.gems.metadata_ttl = ttl;
             }
         }
 
@@ -1907,6 +1916,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_TIMEOUT_DOWNLOAD") {
             if let Ok(timeout) = val.parse() {
                 self.terraform.proxy_timeout_download = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_TERRAFORM_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.terraform.metadata_ttl = ttl;
             }
         }
 

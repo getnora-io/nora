@@ -18,6 +18,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -276,16 +277,7 @@ async fn download_tarball(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("ansible");
+            state.spawn_cache_immutable("ansible", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),

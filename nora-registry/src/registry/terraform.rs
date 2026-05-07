@@ -22,6 +22,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -110,7 +111,7 @@ async fn provider_versions(
     // TTL cache
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, 300) {
+            if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit();
                 return with_json(data.to_vec());
@@ -150,14 +151,7 @@ async fn provider_versions(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("terraform");
+            state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -212,7 +206,7 @@ async fn provider_download_meta(
     // TTL cache for metadata
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, 300) {
+            if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit();
                 return with_json(data.to_vec());
@@ -258,14 +252,7 @@ async fn provider_download_meta(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = rewritten.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("terraform");
+            state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -342,16 +329,7 @@ async fn provider_download_binary(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
 
             // Immutable cache
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("terraform");
+            state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -381,7 +359,7 @@ async fn module_versions(
     // TTL cache
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
-            if is_within_ttl(meta.modified, 300) {
+            if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit();
                 return with_json(data.to_vec());
@@ -422,14 +400,7 @@ async fn module_versions(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("terraform");
+            state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -566,13 +537,7 @@ fn upstream_url(state: &AppState) -> String {
         .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
 }
 
-fn is_within_ttl(modified_unix: u64, ttl_secs: u64) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(modified_unix) < ttl_secs
-}
+use crate::cache_ttl::is_within_ttl;
 
 fn with_json(data: Vec<u8>) -> Response {
     (

@@ -21,6 +21,7 @@ use crate::registry::{
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -272,14 +273,7 @@ async fn registration_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("nuget");
+            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -363,14 +357,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("nuget");
+            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -509,14 +496,7 @@ async fn flatcontainer_download(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
+            state.spawn_cache_immutable("nuget", storage_key, Bytes::from(bytes.clone()));
 
             // Best-effort: fetch flatcontainer index.json if missing (for local search)
             if ends_with_ci(filename, ".nupkg") {
@@ -553,8 +533,6 @@ async fn flatcontainer_download(
                     let _ = storage3.put(&meta_key, meta.as_bytes()).await;
                 });
             }
-
-            state.repo_index.invalidate("nuget");
             (
                 StatusCode::OK,
                 [
@@ -615,13 +593,7 @@ fn upstream_url(state: &AppState) -> String {
         .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
 }
 
-fn is_within_ttl(modified_unix: u64, ttl_secs: u64) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(modified_unix) < ttl_secs
-}
+use crate::cache_ttl::is_within_ttl;
 
 fn with_json(data: Vec<u8>) -> Response {
     (

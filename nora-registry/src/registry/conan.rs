@@ -30,6 +30,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -38,7 +39,6 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
 
@@ -376,16 +376,7 @@ async fn recipe_file_download(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
             // Immutable cache: put_if_absent
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("conan");
+            state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -661,16 +652,7 @@ async fn package_file_download(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
             // Immutable cache
-            let storage = state.storage.clone();
-            let key = storage_key;
-            let data = bytes.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, &data).await;
-                }
-            });
-
-            state.repo_index.invalidate("conan");
+            state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
             with_binary(bytes)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -686,7 +668,7 @@ async fn package_file_download(
 
 /// Fetch JSON from upstream, cache with TTL (mutable content).
 async fn fetch_and_cache_json(
-    state: &AppState,
+    state: &Arc<AppState>,
     url: &str,
     storage_key: &str,
     artifact: &str,
@@ -715,14 +697,7 @@ async fn fetch_and_cache_json(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key.to_string();
-            let data = text.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key, data.as_bytes()).await;
-            });
-
-            state.repo_index.invalidate("conan");
+            state.spawn_cache("conan", storage_key.to_string(), Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -736,7 +711,7 @@ async fn fetch_and_cache_json(
 
 /// Fetch JSON from upstream, cache immutably (content scoped to revision, never changes).
 async fn fetch_and_cache_immutable_json(
-    state: &AppState,
+    state: &Arc<AppState>,
     url: &str,
     storage_key: &str,
     artifact: &str,
@@ -765,16 +740,7 @@ async fn fetch_and_cache_immutable_json(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
-            let storage = state.storage.clone();
-            let key = storage_key.to_string();
-            let data = text.clone();
-            tokio::spawn(async move {
-                if storage.stat(&key).await.is_none() {
-                    let _ = storage.put(&key, data.as_bytes()).await;
-                }
-            });
-
-            state.repo_index.invalidate("conan");
+            state.spawn_cache_immutable("conan", storage_key.to_string(), Bytes::from(text.clone()));
             with_json(text.into_bytes())
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -819,13 +785,7 @@ fn upstream_url(state: &AppState) -> String {
         .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
 }
 
-fn is_within_ttl(modified_unix: u64, ttl_secs: u64) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(modified_unix) < ttl_secs
-}
+use crate::cache_ttl::is_within_ttl;
 
 fn with_json(data: Vec<u8>) -> Response {
     (
@@ -901,6 +861,7 @@ fn is_valid_filename(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_valid_refs() {

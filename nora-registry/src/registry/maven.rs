@@ -204,14 +204,7 @@ async fn download(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "api", "", "maven", ""));
 
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let data_clone = data.clone();
-                tokio::spawn(async move {
-                    let _ = storage.put(&key_clone, &data_clone).await;
-                });
-
-                state.repo_index.invalidate("maven");
+                state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
 
                 return with_content_type(&path, data.into()).into_response();
             }

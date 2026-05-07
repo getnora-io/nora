@@ -112,18 +112,12 @@ async fn handle_request(
         // Metadata TTL: if stale, try to refetch from upstream
         if !is_tarball {
             let ttl = state.config.npm.metadata_ttl;
-            if ttl > 0 {
-                if let Some(meta) = state.storage.stat(&key).await {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if now.saturating_sub(meta.modified) > ttl {
-                        if let Some(fresh) = refetch_metadata(&state, &path, &key).await {
-                            return with_content_type(false, fresh.into()).into_response();
-                        }
-                        // Upstream failed — serve stale cache
+            if let Some(meta) = state.storage.stat(&key).await {
+                if !crate::cache_ttl::is_within_ttl(meta.modified, ttl) {
+                    if let Some(fresh) = refetch_metadata(&state, &path, &key).await {
+                        return with_content_type(false, fresh.into()).into_response();
                     }
+                    // Upstream failed — serve stale cache
                 }
             }
             return with_content_type(false, data).into_response();

@@ -330,12 +330,7 @@ async fn download(
     .await
     {
         Ok(data) => {
-            let storage = state.storage.clone();
-            let key_clone = key.clone();
-            let data_clone = data.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &data_clone).await;
-            });
+            state.spawn_cache("cargo", key.clone(), Bytes::from(data.clone()));
             state.metrics.record_download("cargo");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
