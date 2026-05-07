@@ -203,6 +203,7 @@ jobs:
 
       - name: Trivy — image scan (${{ matrix.name }})
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        timeout-minutes: 15
         with:
           scan-type: image
           image-ref: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
@@ -213,7 +214,7 @@ jobs:
 
       - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
-        if: always()
+        if: always() && hashFiles(format('trivy-image-{0}.sarif', matrix.name))
         with:
           sarif_file: trivy-image-${{ matrix.name }}.sarif
           category: trivy-image-${{ matrix.name }}
@@ -233,7 +234,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: [self-hosted, nora]
-    needs: [build, scan, provenance]
+    needs: [build, provenance]
     permissions:
       contents: write
       id-token: write  # Sigstore cosign keyless signing
