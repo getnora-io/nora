@@ -839,13 +839,16 @@ async fn run_server(config: Config, storage: Storage) {
         let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
         let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
 
-        let auth_routes = auth::token_routes().layer(auth_limiter);
+        // Auth routes: auth_limiter (strict 1rps) + general_limiter
+        let auth_routes = auth::token_routes()
+            .layer(auth_limiter)
+            .layer(general_limiter);
+        // Registry routes: upload_limiter only (200rps/500burst)
+        // No general_limiter — avoids double-limiting that causes 429
+        // during cache warming (dotnet restore with many packages)
         let limited_registry = registry_routes.layer(upload_limiter);
 
-        Router::new()
-            .merge(auth_routes)
-            .merge(limited_registry)
-            .layer(general_limiter)
+        Router::new().merge(auth_routes).merge(limited_registry)
     } else {
         info!("Rate limiting DISABLED");
         Router::new()
