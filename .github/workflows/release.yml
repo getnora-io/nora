@@ -332,3 +332,12 @@ jobs:
             ## Changelog
 
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+
+      - name: Notify helm-charts repo
+        if: success()
+        run: |
+          gh api repos/getnora-io/helm-charts/dispatches \
+            -f event_type=nora-release \
+            -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'
+        env:
+          GH_TOKEN: ${{ secrets.HELM_CHARTS_PAT }}
