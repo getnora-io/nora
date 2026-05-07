@@ -51,6 +51,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/nuget/v3/index.json", get(service_index))
         // Search (proxy to upstream SearchQueryService)
         .route("/nuget/v3/query", get(search_query))
+        // Autocomplete (proxy to upstream SearchAutocompleteService)
+        .route("/nuget/v3/autocomplete", get(autocomplete_query))
         // Registration index
         .route(
             "/nuget/v3/registration/{id}/index.json",
@@ -154,6 +156,49 @@ async fn search_query(
             tracing::info!("NuGet search: upstream unavailable, using local index");
             let data = local_search_results(&state, &headers, &query, skip, take).await;
             with_json(data)
+        }
+    }
+}
+
+// ── Autocomplete (proxy to upstream SearchAutocompleteService) ─────────
+
+async fn autocomplete_query(
+    State(state): State<Arc<AppState>>,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    // No upstream proxy configured → return empty results
+    if state.config.nuget.proxy.is_none() {
+        return with_json(br#"{"totalHits":0,"data":[]}"#.to_vec());
+    }
+
+    let qs = raw_query.0.unwrap_or_default();
+    let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
+
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        SEARCH_TIMEOUT_SECS,
+        None, // autocomplete endpoint is public
+        None,
+        &state.circuit_breaker,
+        "nuget",
+    )
+    .await
+    {
+        Ok(text) => {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_miss();
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                format!("autocomplete?{}", qs.chars().take(50).collect::<String>()),
+                "nuget",
+                "PROXY",
+            ));
+            with_json(text.into_bytes())
+        }
+        Err(_) => {
+            // Autocomplete is UX convenience, not correctness-critical
+            with_json(br#"{"totalHits":0,"data":[]}"#.to_vec())
         }
     }
 }
@@ -691,6 +736,7 @@ async fn local_search_results(
 fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
     let nora_query = format!("{}/v3/query", nora_nuget);
+    let nora_autocomplete = format!("{}/v3/autocomplete", nora_nuget);
 
     // Rewrite major service URLs to route through NORA
     json_text
@@ -705,6 +751,15 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
         // Rewrite search endpoints to proxy through NORA
         .replace("https://azuresearch-usnc.nuget.org/query", &nora_query)
         .replace("https://azuresearch-ussc.nuget.org/query", &nora_query)
+        // Rewrite autocomplete endpoints to proxy through NORA
+        .replace(
+            "https://azuresearch-usnc.nuget.org/autocomplete",
+            &nora_autocomplete,
+        )
+        .replace(
+            "https://azuresearch-ussc.nuget.org/autocomplete",
+            &nora_autocomplete,
+        )
 }
 
 fn is_valid_package_id(id: &str) -> bool {
@@ -772,6 +827,15 @@ mod tests {
         assert!(result.contains("https://artifact.company.local/nuget/v3/registration/"));
         assert!(!result.contains("http://artifact.company.local"));
         assert!(!result.contains("api.nuget.org"));
+    }
+
+    #[test]
+    fn test_rewrite_service_index_autocomplete_urls() {
+        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/autocomplete","@type":"SearchAutocompleteService"},{"@id":"https://azuresearch-ussc.nuget.org/autocomplete","@type":"SearchAutocompleteService/3.5.0"}]}"#;
+        let result = rewrite_service_index(input, "http://nora:4000");
+        assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
+        assert!(!result.contains("azuresearch-usnc.nuget.org/autocomplete"));
+        assert!(!result.contains("azuresearch-ussc.nuget.org/autocomplete"));
     }
 }
 
@@ -1032,5 +1096,49 @@ mod integration_tests {
         assert!(entry["versions"].is_array());
         assert_eq!(entry["version"].as_str().unwrap(), "2.0.0");
         assert_eq!(entry["versions"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_autocomplete_no_upstream_returns_empty() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?q=Newtonsoft&take=5",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["totalHits"].as_u64().unwrap(), 0);
+        assert!(json["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_autocomplete_unreachable_upstream_returns_empty() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.autocomplete = "http://127.0.0.1:1/autocomplete".to_string();
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?q=Newtonsoft&take=5",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["totalHits"].as_u64().unwrap(), 0);
+        assert!(json["data"].as_array().unwrap().is_empty());
     }
 }

@@ -111,6 +111,7 @@ All three must pass. CI will enforce this.
 - Follow Rust naming conventions
 - Keep functions short and focused
 - Add tests for new functionality
+- Environment variable names follow `NORA_{SECTION}_{FIELD}` pattern. Use short abbreviations for long compound words (e.g. `NORA_CB_*` instead of `NORA_CIRCUIT_BREAKER_*`). Aim for under 30 characters total.
 
 ## Pull Request Process
 
