@@ -55,6 +55,21 @@ jobs:
           echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
           file ./nora-linux-amd64
 
+      - name: Smoke test binary
+        run: |
+          echo "--- Verifying binary is a valid static executable ---"
+          file ./nora-linux-amd64 | grep -q "ELF 64-bit" || { echo "::error::Binary is not a valid ELF 64-bit executable"; exit 1; }
+          ldd ./nora-linux-amd64 2>&1 | grep -q "not a dynamic executable\|statically linked" || echo "::warning::Binary is dynamically linked"
+          echo "--- Verifying binary runs ---"
+          ./nora-linux-amd64 --version || { echo "::error::Binary failed to execute --version"; exit 1; }
+          echo "--- Verifying binary starts and serves health endpoint ---"
+          ./nora-linux-amd64 &
+          NORA_PID=$!
+          sleep 3
+          curl -sf http://localhost:4000/health || { echo "::error::Binary health check failed"; kill $NORA_PID 2>/dev/null; exit 1; }
+          kill $NORA_PID 2>/dev/null
+          echo "Binary smoke test passed"
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -258,6 +273,11 @@ jobs:
           sha256sum ./nora-linux-amd64 > nora-linux-amd64.sha256
           echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
           cat nora-linux-amd64.sha256
+
+      - name: Validate binary artifact
+        run: |
+          file ./nora-linux-amd64 | grep -q "ELF 64-bit" || { echo "::error::Downloaded binary is not a valid ELF 64-bit executable"; exit 1; }
+          ./nora-linux-amd64 --version || { echo "::error::Downloaded binary failed to execute"; exit 1; }
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
