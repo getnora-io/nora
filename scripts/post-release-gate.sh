@@ -76,8 +76,6 @@ fi
 EXPECTED_ASSETS=(
     "nora-linux-amd64"
     "nora-linux-amd64.sha256"
-    "nora-linux-amd64.sig"
-    "nora-linux-amd64.cert"
     "nora-linux-amd64.bundle"
     "nora-${TAG}.sbom.spdx.json"
     "nora-${TAG}.sbom.cdx.json"
@@ -123,10 +121,10 @@ if [ -f "$WORK_DIR/nora-linux-amd64" ] && [ -f "$WORK_DIR/nora-linux-amd64.sha25
     CLI_VERSION=$("$WORK_DIR/nora-linux-amd64" --version 2>/dev/null | awk '{print $2}' || echo "")
     if [ "$CLI_VERSION" = "$VERSION" ]; then
         pass "Binary --version = $VERSION"
-        VERSIONS_COLLECTED+=("binary-cli:$CLI_VERSION")
+        VERSIONS_COLLECTED+=("binary-cli=$CLI_VERSION")
     else
         fail "Binary --version = '$CLI_VERSION', expected '$VERSION'"
-        [ -n "$CLI_VERSION" ] && VERSIONS_COLLECTED+=("binary-cli:$CLI_VERSION")
+        [ -n "$CLI_VERSION" ] && VERSIONS_COLLECTED+=("binary-cli=$CLI_VERSION")
     fi
 
     # Health check via serve
@@ -151,10 +149,10 @@ if [ -f "$WORK_DIR/nora-linux-amd64" ] && [ -f "$WORK_DIR/nora-linux-amd64.sha25
         HEALTH_VERSION=$(echo "$HEALTH_JSON" | jq -r '.version // empty' 2>/dev/null || echo "")
         if [ "$HEALTH_VERSION" = "$VERSION" ]; then
             pass "Binary /health version = $VERSION"
-            VERSIONS_COLLECTED+=("binary-health:$HEALTH_VERSION")
+            VERSIONS_COLLECTED+=("binary-health=$HEALTH_VERSION")
         else
             fail "Binary /health version = '$HEALTH_VERSION', expected '$VERSION'"
-            [ -n "$HEALTH_VERSION" ] && VERSIONS_COLLECTED+=("binary-health:$HEALTH_VERSION")
+            [ -n "$HEALTH_VERSION" ] && VERSIONS_COLLECTED+=("binary-health=$HEALTH_VERSION")
         fi
     else
         fail "Binary serve did not become healthy"
@@ -175,7 +173,8 @@ echo "--- Phase C: Docker Images ---"
 for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
     for variant in "${VARIANTS[@]}"; do
         IMAGE="${registry}:${VERSION}${variant}"
-        LABEL="${registry##*/}${variant:-:alpine}"
+        SUFFIX="${variant:+${variant#-}}"
+        LABEL="${registry##*/}/${SUFFIX:-alpine}"
 
         if docker pull "$IMAGE" >/dev/null 2>&1; then
             pass "Pull $IMAGE"
@@ -206,10 +205,10 @@ for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
             DOCKER_VERSION=$(echo "$DOCKER_HEALTH" | jq -r '.version // empty' 2>/dev/null || echo "")
             if [ "$DOCKER_VERSION" = "$VERSION" ]; then
                 pass "Docker $LABEL /health version = $VERSION"
-                VERSIONS_COLLECTED+=("docker-${LABEL}:$DOCKER_VERSION")
+                VERSIONS_COLLECTED+=("docker-${LABEL}=$DOCKER_VERSION")
             else
                 fail "Docker $LABEL /health version = '$DOCKER_VERSION', expected '$VERSION'"
-                [ -n "$DOCKER_VERSION" ] && VERSIONS_COLLECTED+=("docker-${LABEL}:$DOCKER_VERSION")
+                [ -n "$DOCKER_VERSION" ] && VERSIONS_COLLECTED+=("docker-${LABEL}=$DOCKER_VERSION")
             fi
         else
             fail "Docker $LABEL did not become healthy"
@@ -229,17 +228,14 @@ echo ""
 
 echo "--- Phase D: Signature Verification ---"
 
-# Download signature artifacts
+# Download signature bundle
 gh release download "$TAG" --repo "$REPO" \
-    --pattern "nora-linux-amd64.sig" \
-    --pattern "nora-linux-amd64.cert" \
     --pattern "nora-linux-amd64.bundle" \
     --dir "$WORK_DIR" --clobber 2>/dev/null || true
 
-if [ -f "$WORK_DIR/nora-linux-amd64.sig" ] && [ -f "$WORK_DIR/nora-linux-amd64.cert" ]; then
+if [ -f "$WORK_DIR/nora-linux-amd64.bundle" ]; then
     if cosign verify-blob \
-        --signature "$WORK_DIR/nora-linux-amd64.sig" \
-        --certificate "$WORK_DIR/nora-linux-amd64.cert" \
+        --bundle "$WORK_DIR/nora-linux-amd64.bundle" \
         --certificate-identity-regexp "github.com/getnora-io/nora" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "$WORK_DIR/nora-linux-amd64" >/dev/null 2>&1; then
@@ -248,7 +244,7 @@ if [ -f "$WORK_DIR/nora-linux-amd64.sig" ] && [ -f "$WORK_DIR/nora-linux-amd64.c
         fail "cosign verify-blob binary signature"
     fi
 else
-    fail "Signature artifacts (sig/cert) not available"
+    fail "Signature bundle not available"
 fi
 
 # Verify GHCR alpine image signature
@@ -269,8 +265,8 @@ echo "--- Phase E: Version Consistency ---"
 
 ALL_MATCH=true
 for entry in "${VERSIONS_COLLECTED[@]}"; do
-    source_name="${entry%%:*}"
-    source_ver="${entry#*:}"
+    source_name="${entry%%=*}"
+    source_ver="${entry#*=}"
     if [ "$source_ver" != "$VERSION" ]; then
         fail "Version mismatch: $source_name=$source_ver (expected $VERSION)"
         ALL_MATCH=false
