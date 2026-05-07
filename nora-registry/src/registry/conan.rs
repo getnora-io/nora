@@ -740,7 +740,11 @@ async fn fetch_and_cache_immutable_json(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
-            state.spawn_cache_immutable("conan", storage_key.to_string(), Bytes::from(text.clone()));
+            state.spawn_cache_immutable(
+                "conan",
+                storage_key.to_string(),
+                Bytes::from(text.clone()),
+            );
             with_json(text.into_bytes())
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),

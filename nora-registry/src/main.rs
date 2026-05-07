@@ -196,10 +196,10 @@ impl AppState {
     ) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            if state.storage.stat(&key).await.is_none() {
-                if state.storage.put(&key, &data).await.is_ok() {
-                    state.repo_index.invalidate(registry);
-                }
+            if state.storage.stat(&key).await.is_none()
+                && state.storage.put(&key, &data).await.is_ok()
+            {
+                state.repo_index.invalidate(registry);
             }
         });
     }
