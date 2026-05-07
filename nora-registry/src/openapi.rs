@@ -290,6 +290,7 @@ pub async fn dashboard_metrics() {}
     tag = "docker",
     responses(
         (status = 200, description = "Registry is available", body = DockerVersion),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Authentication required")
     )
 )]
@@ -316,6 +317,7 @@ pub async fn docker_catalog() {}
     ),
     responses(
         (status = 200, description = "Tag list", body = DockerTags),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Repository not found")
     )
 )]
@@ -332,6 +334,7 @@ pub async fn docker_tags() {}
     ),
     responses(
         (status = 200, description = "Manifest content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Manifest not found")
     )
 )]
@@ -348,6 +351,7 @@ pub async fn docker_manifest_get() {}
     ),
     responses(
         (status = 200, description = "Blob exists, Content-Length header contains size"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Blob not found")
     )
 )]
@@ -364,6 +368,7 @@ pub async fn docker_blob_head() {}
     ),
     responses(
         (status = 200, description = "Blob content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Blob not found")
     )
 )]
@@ -398,6 +403,7 @@ pub async fn docker_manifest_put() {}
     ),
     responses(
         (status = 202, description = "Manifest deleted"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Manifest not found")
     )
 )]
@@ -414,7 +420,8 @@ pub async fn docker_manifest_delete() {}
         ("name" = String, Path, description = "Repository name")
     ),
     responses(
-        (status = 202, description = "Upload started, Location header contains upload URL")
+        (status = 202, description = "Upload started, Location header contains upload URL"),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
     )
 )]
 pub async fn docker_blob_upload_start() {}
@@ -431,7 +438,8 @@ pub async fn docker_blob_upload_start() {}
         ("uuid" = String, Path, description = "Upload session UUID")
     ),
     responses(
-        (status = 202, description = "Chunk accepted, Range header indicates bytes received")
+        (status = 202, description = "Chunk accepted, Range header indicates bytes received"),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
     )
 )]
 pub async fn docker_blob_upload_patch() {}
@@ -467,6 +475,7 @@ pub async fn docker_blob_upload_put() {}
     ),
     responses(
         (status = 200, description = "Artifact content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Artifact not found, trying upstream proxies")
     )
 )]
@@ -552,6 +561,7 @@ pub async fn cargo_index_config() {}
     ),
     responses(
         (status = 200, description = "Crate index entries (one JSON per line)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Crate not found in index")
     )
 )]
@@ -567,6 +577,7 @@ pub async fn cargo_sparse_index() {}
     ),
     responses(
         (status = 200, description = "Crate metadata (JSON)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Crate not found")
     )
 )]
@@ -583,6 +594,7 @@ pub async fn cargo_metadata() {}
     ),
     responses(
         (status = 200, description = "Crate file (.crate)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Crate version not found")
     )
 )]
@@ -658,6 +670,7 @@ pub async fn pypi_upload() {}
     ),
     responses(
         (status = 200, description = "Latest version info (JSON)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Module not found")
     )
 )]
@@ -674,6 +687,7 @@ pub async fn go_module_latest() {}
     ),
     responses(
         (status = 200, description = "Version info (JSON)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Version not found")
     )
 )]
@@ -690,6 +704,7 @@ pub async fn go_module_info() {}
     ),
     responses(
         (status = 200, description = "go.mod file content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Version not found")
     )
 )]
@@ -706,6 +721,7 @@ pub async fn go_module_mod() {}
     ),
     responses(
         (status = 200, description = "Module zip archive"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Version not found")
     )
 )]
@@ -723,6 +739,7 @@ pub async fn go_module_zip() {}
     ),
     responses(
         (status = 200, description = "File content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "File not found")
     )
 )]
@@ -758,6 +775,7 @@ pub async fn raw_file_put() {}
     ),
     responses(
         (status = 200, description = "Compact index for gem"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Gem not found")
     )
 )]
@@ -802,6 +820,7 @@ pub async fn terraform_service_discovery() {}
     ),
     responses(
         (status = 200, description = "Version list"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Provider not found")
     )
 )]
@@ -831,6 +850,7 @@ pub async fn ansible_collection_list() {}
     ),
     responses(
         (status = 200, description = "Collection tarball"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Collection not found")
     )
 )]
@@ -876,6 +896,7 @@ pub async fn nuget_download() {}
     ),
     responses(
         (status = 200, description = "Package metadata with versions"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Package not found")
     )
 )]
@@ -892,6 +913,7 @@ pub async fn pub_package_list() {}
     ),
     responses(
         (status = 200, description = "Package archive (.tar.gz)"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Package not found")
     )
 )]
@@ -925,6 +947,7 @@ pub async fn conan_ping() {}
     ),
     responses(
         (status = 200, description = "File content"),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "File not found")
     )
 )]
@@ -955,7 +978,8 @@ pub async fn create_token() {}
     request_body = TokenRequest,
     responses(
         (status = 200, description = "Token list", body = TokenListResponse),
-        (status = 401, description = "Invalid credentials", body = ErrorResponse)
+        (status = 401, description = "Invalid credentials", body = ErrorResponse),
+        (status = 422, description = "Invalid request body", body = ErrorResponse)
     )
 )]
 pub async fn list_tokens() {}
@@ -968,7 +992,8 @@ pub async fn list_tokens() {}
     responses(
         (status = 200, description = "Token revoked"),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
-        (status = 404, description = "Token not found", body = ErrorResponse)
+        (status = 404, description = "Token not found", body = ErrorResponse),
+        (status = 415, description = "Unsupported Content-Type")
     )
 )]
 pub async fn revoke_token() {}
