@@ -760,6 +760,16 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
             "https://azuresearch-ussc.nuget.org/autocomplete",
             &nora_autocomplete,
         )
+        // Rewrite remaining azuresearch root URLs (SearchGalleryQueryService)
+        // Must come AFTER query/autocomplete replaces to avoid partial matches
+        .replace(
+            "https://azuresearch-usnc.nuget.org/",
+            &format!("{}/v3/", nora_nuget),
+        )
+        .replace(
+            "https://azuresearch-ussc.nuget.org/",
+            &format!("{}/v3/", nora_nuget),
+        )
 }
 
 fn is_valid_package_id(id: &str) -> bool {
@@ -836,6 +846,17 @@ mod tests {
         assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
         assert!(!result.contains("azuresearch-usnc.nuget.org/autocomplete"));
         assert!(!result.contains("azuresearch-ussc.nuget.org/autocomplete"));
+    }
+
+    #[test]
+    fn test_rewrite_service_index_gallery_urls() {
+        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/query","@type":"SearchQueryService"},{"@id":"https://azuresearch-usnc.nuget.org/autocomplete","@type":"SearchAutocompleteService"},{"@id":"https://azuresearch-usnc.nuget.org/","@type":"SearchGalleryQueryService/3.0.0-rc"},{"@id":"https://azuresearch-ussc.nuget.org/","@type":"SearchGalleryQueryService/3.0.0-rc"}]}"#;
+        let result = rewrite_service_index(input, "http://nora:4000");
+        assert!(!result.contains("azuresearch-usnc.nuget.org"));
+        assert!(!result.contains("azuresearch-ussc.nuget.org"));
+        assert!(result.contains("http://nora:4000/nuget/v3/query"));
+        assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
+        assert!(result.contains("http://nora:4000/nuget/v3/"));
     }
 }
 

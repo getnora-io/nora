@@ -1,6 +1,29 @@
 # Changelog
 ## [Unreleased]
 
+## [0.8.2] - 2026-05-07
+
+### Fixed
+- **NuGet autocomplete leak** — `SearchAutocompleteService` URLs in service index now rewrite to NORA instead of leaking to `azuresearch-*.nuget.org`. New `/nuget/v3/autocomplete` proxy endpoint with graceful fallback (#262)
+- **NuGet gallery leak** — `SearchGalleryQueryService` root URLs (`azuresearch-{usnc,ussc}.nuget.org/`) now rewrite to NORA. Zero azuresearch URLs remain in service index
+- **NuGet 429 during cache warming** — registry proxy routes no longer double-limited by `general_limiter` + `upload_limiter`. Removes 429 errors during `dotnet restore` with many packages while keeping auth rate limiting active
+- **E2E test paths** — NuGet smoke tests used wrong paths (`/v3/flat/` → `/v3/flatcontainer/`, `/v3/search` → `/v3/query`)
+
+### Added
+- **NuGet search fallback** — local search from repo index when upstream is unavailable, download tracking for proxied packages (#261)
+- **Env var naming guideline** — `CONTRIBUTING.md` documents `NORA_{SECTION}_{FIELD}` pattern with abbreviation convention (`NORA_CB_*`)
+- 910 total tests (up from 909)
+
+### Changed
+- Docker base images switched to real RED OS and Astra Linux images (#260)
+- NuGet autocomplete config: env var `NORA_NUGET_AUTOCOMPLETE`, config field `autocomplete`
+
+## [0.8.1] - 2026-05-06
+
+### Fixed
+- **UI polish** — improved dashboard layout and proxy index reliability
+- **Error logging** — better error messages for proxy failures (#259)
+
 ## [0.8.0] - 2026-05-02
 
 ### Added
