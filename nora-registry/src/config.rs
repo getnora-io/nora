@@ -429,6 +429,9 @@ pub struct NugetConfig {
     /// Upstream NuGet search service URL
     #[serde(default = "default_nuget_search")]
     pub search_service: String,
+    /// Upstream NuGet autocomplete service URL
+    #[serde(default = "default_nuget_autocomplete")]
+    pub autocomplete: String,
 }
 
 fn default_nuget_proxy() -> Option<String> {
@@ -437,6 +440,10 @@ fn default_nuget_proxy() -> Option<String> {
 
 fn default_nuget_search() -> String {
     "https://azuresearch-usnc.nuget.org/query".to_string()
+}
+
+fn default_nuget_autocomplete() -> String {
+    "https://azuresearch-usnc.nuget.org/autocomplete".to_string()
 }
 
 impl Default for NugetConfig {
@@ -448,6 +455,7 @@ impl Default for NugetConfig {
             proxy_timeout: 30,
             metadata_ttl: 300,
             search_service: default_nuget_search(),
+            autocomplete: default_nuget_autocomplete(),
         }
     }
 }
@@ -1935,6 +1943,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_NUGET_SEARCH_SERVICE") {
             if !val.is_empty() {
                 self.nuget.search_service = val;
+            }
+        }
+        if let Ok(val) = env::var("NORA_NUGET_AUTOCOMPLETE") {
+            if !val.is_empty() {
+                self.nuget.autocomplete = val;
             }
         }
 
