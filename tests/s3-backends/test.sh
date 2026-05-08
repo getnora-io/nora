@@ -131,6 +131,79 @@ test_backend() {
     else
         fail "${name}: binary size expected ~8192, got ${bin_size}"
     fi
+
+    # 9. Reindex after direct S3 upload
+    # Upload a file directly to S3 (bypassing NORA API), then verify
+    # that POST /raw/-/reindex makes it appear in the index listing.
+    # Note: NORA encodes @ → _at_ in S3 keys (SeaweedFS compat), so we
+    # use a plain path without @ for this test.
+    local reindex_key="raw/s3-direct/reindex-test.txt"
+    local reindex_data="direct-upload-$(date +%s)"
+    local uploaded=false
+
+    case "$name" in
+        RustFS)
+            # Upload via mc in s3-tools container
+            if echo "$reindex_data" | docker compose exec -T s3-tools \
+                mc pipe "rustfs/nora-test/${reindex_key}" >/dev/null 2>&1; then
+                uploaded=true
+            fi
+            ;;
+        SeaweedFS)
+            # SeaweedFS allows anonymous PUT via mapped port
+            if echo "$reindex_data" | curl -sf -T - \
+                "http://localhost:8333/nora-test/${reindex_key}" >/dev/null 2>&1; then
+                uploaded=true
+            fi
+            ;;
+        Garage)
+            # Garage requires dynamic credentials from garage-init; skip
+            skip "${name}: reindex (direct S3 upload requires dynamic Garage credentials)"
+            uploaded=""
+            ;;
+    esac
+
+    if [ "$uploaded" = "" ]; then
+        # Already handled (skipped)
+        :
+    elif [ "$uploaded" = "true" ]; then
+        # 9a. File should be readable via NORA storage (direct read, no index needed)
+        content=$(curl -sf "${base}/raw/s3-direct/reindex-test.txt" 2>/dev/null || echo "")
+        if [ "$content" = "$reindex_data" ]; then
+            pass "${name}: direct S3 file readable via NORA"
+        else
+            fail "${name}: direct S3 file not readable via NORA (got '${content}')"
+        fi
+
+        # 9b. File should NOT be in the index listing yet (index is stale)
+        local list_before
+        list_before=$(curl -sf "${base}/api/ui/raw/list" 2>/dev/null || echo "[]")
+        if echo "$list_before" | grep -q "s3-direct"; then
+            # Index may have been rebuilt already (lazy rebuild); not a hard failure
+            skip "${name}: reindex pre-check (index already contains s3-direct, lazy rebuild)"
+        else
+            pass "${name}: reindex pre-check (s3-direct not in stale index)"
+        fi
+
+        # 9c. POST /raw/-/reindex → 200
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${base}/raw/-/reindex")
+        if [ "$http_code" = "200" ]; then
+            pass "${name}: POST /raw/-/reindex returns 200"
+        else
+            fail "${name}: POST /raw/-/reindex returned ${http_code}"
+        fi
+
+        # 9d. After reindex, file should appear in the index listing
+        local list_after
+        list_after=$(curl -sf "${base}/api/ui/raw/list" 2>/dev/null || echo "[]")
+        if echo "$list_after" | grep -q "s3-direct"; then
+            pass "${name}: reindex updated index (s3-direct found in listing)"
+        else
+            fail "${name}: reindex did not update index (s3-direct not in listing)"
+        fi
+    else
+        fail "${name}: direct S3 upload failed"
+    fi
 }
 
 echo "=============================="
