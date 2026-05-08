@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::registry::method_not_allowed;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -20,7 +21,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         get(download)
             .put(upload)
             .delete(delete_file)
-            .head(check_exists),
+            .head(check_exists)
+            .fallback(|| async { method_not_allowed("GET, PUT, DELETE, HEAD") }),
     )
 }
 

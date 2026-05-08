@@ -1,6 +1,15 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **OpenAPI 429 documentation** — all rate-limited endpoints (44 total) now document `429` response with `Retry-After` header in OpenAPI spec. Eliminates false positives from API fuzz tools like Schemathesis (#267)
+- **405 Method Not Allowed with Allow header** — unsupported HTTP methods on multi-method routes now return `405` with RFC 9110 `Allow` header instead of axum's default headerless 405. Affected registries: Docker, Raw, Maven, npm, PyPI, Cargo (#268)
+
+### Changed
+- Docker and Maven/npm route definitions merged from separate `.route()` calls into explicit method chains for correctness and clarity
+- Raw registry docs corrected: files are immutable by default (409 on re-upload), not overwrite-only. Conditional overwrite via `If-Match`/`If-None-Match` documented
+- Raw `PUT` OpenAPI spec updated with `200` (conditional overwrite) and `412` (precondition failed) responses
+
 ## [0.8.2] - 2026-05-07
 
 ### Fixed

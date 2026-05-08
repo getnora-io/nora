@@ -6,7 +6,7 @@ use crate::audit::AuditEntry;
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
-use crate::registry::{circuit_open_response, ProxyError};
+use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
 use crate::storage::Storage;
 use crate::validation::{
     ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
@@ -17,7 +17,7 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderName, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, head, patch, put},
+    routing::{get, head, patch},
     Json, Router,
 };
 use parking_lot::RwLock;
@@ -116,48 +116,62 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/v2/", get(check))
+        .route(
+            "/v2/",
+            get(check).fallback(|| async { method_not_allowed("GET") }),
+        )
         .route("/v2/_catalog", get(catalog))
         // Single-segment name routes (e.g., /v2/alpine/...)
-        .route("/v2/{name}/blobs/{digest}", head(check_blob))
-        .route("/v2/{name}/blobs/{digest}", get(download_blob))
+        .route(
+            "/v2/{name}/blobs/{digest}",
+            head(check_blob)
+                .get(download_blob)
+                .delete(delete_blob)
+                .fallback(|| async { method_not_allowed("GET, HEAD, DELETE") }),
+        )
         .route(
             "/v2/{name}/blobs/uploads/",
-            axum::routing::post(start_upload),
+            axum::routing::post(start_upload).fallback(|| async { method_not_allowed("POST") }),
         )
         .route(
             "/v2/{name}/blobs/uploads/{uuid}",
-            patch(patch_blob).put(upload_blob),
+            patch(patch_blob)
+                .put(upload_blob)
+                .fallback(|| async { method_not_allowed("PATCH, PUT") }),
         )
-        .route("/v2/{name}/manifests/{reference}", get(get_manifest))
-        .route("/v2/{name}/manifests/{reference}", put(put_manifest))
-        .route("/v2/{name}/manifests/{reference}", delete(delete_manifest))
-        .route("/v2/{name}/blobs/{digest}", delete(delete_blob))
+        .route(
+            "/v2/{name}/manifests/{reference}",
+            get(get_manifest)
+                .put(put_manifest)
+                .delete(delete_manifest)
+                .fallback(|| async { method_not_allowed("GET, PUT, DELETE") }),
+        )
         .route("/v2/{name}/tags/list", get(list_tags))
         // Two-segment name routes (e.g., /v2/library/alpine/...)
-        .route("/v2/{ns}/{name}/blobs/{digest}", head(check_blob_ns))
-        .route("/v2/{ns}/{name}/blobs/{digest}", get(download_blob_ns))
+        .route(
+            "/v2/{ns}/{name}/blobs/{digest}",
+            head(check_blob_ns)
+                .get(download_blob_ns)
+                .delete(delete_blob_ns)
+                .fallback(|| async { method_not_allowed("GET, HEAD, DELETE") }),
+        )
         .route(
             "/v2/{ns}/{name}/blobs/uploads/",
-            axum::routing::post(start_upload_ns),
+            axum::routing::post(start_upload_ns).fallback(|| async { method_not_allowed("POST") }),
         )
         .route(
             "/v2/{ns}/{name}/blobs/uploads/{uuid}",
-            patch(patch_blob_ns).put(upload_blob_ns),
+            patch(patch_blob_ns)
+                .put(upload_blob_ns)
+                .fallback(|| async { method_not_allowed("PATCH, PUT") }),
         )
         .route(
             "/v2/{ns}/{name}/manifests/{reference}",
-            get(get_manifest_ns),
+            get(get_manifest_ns)
+                .put(put_manifest_ns)
+                .delete(delete_manifest_ns)
+                .fallback(|| async { method_not_allowed("GET, PUT, DELETE") }),
         )
-        .route(
-            "/v2/{ns}/{name}/manifests/{reference}",
-            put(put_manifest_ns),
-        )
-        .route(
-            "/v2/{ns}/{name}/manifests/{reference}",
-            delete(delete_manifest_ns),
-        )
-        .route("/v2/{ns}/{name}/blobs/{digest}", delete(delete_blob_ns))
         .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
 }
 

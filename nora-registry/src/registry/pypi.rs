@@ -11,7 +11,9 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text};
+use crate::registry::{
+    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
+};
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -30,7 +32,12 @@ const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/simple/", get(list_packages).post(upload))
+        .route(
+            "/simple/",
+            get(list_packages)
+                .post(upload)
+                .fallback(|| async { method_not_allowed("GET, POST") }),
+        )
         .route("/simple/{name}/", get(package_versions))
         .route("/simple/{name}/{filename}", get(download_file))
 }

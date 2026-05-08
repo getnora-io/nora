@@ -291,7 +291,8 @@ pub async fn dashboard_metrics() {}
     responses(
         (status = 200, description = "Registry is available", body = DockerVersion),
         (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Authentication required")
+        (status = 401, description = "Authentication required"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_version() {}
@@ -302,7 +303,8 @@ pub async fn docker_version() {}
     path = "/v2/_catalog",
     tag = "docker",
     responses(
-        (status = 200, description = "Repository list", body = DockerCatalog)
+        (status = 200, description = "Repository list", body = DockerCatalog),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_catalog() {}
@@ -318,7 +320,8 @@ pub async fn docker_catalog() {}
     responses(
         (status = 200, description = "Tag list", body = DockerTags),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Repository not found")
+        (status = 404, description = "Repository not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_tags() {}
@@ -335,7 +338,8 @@ pub async fn docker_tags() {}
     responses(
         (status = 200, description = "Manifest content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Manifest not found")
+        (status = 404, description = "Manifest not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_manifest_get() {}
@@ -352,7 +356,8 @@ pub async fn docker_manifest_get() {}
     responses(
         (status = 200, description = "Blob exists, Content-Length header contains size"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Blob not found")
+        (status = 404, description = "Blob not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_blob_head() {}
@@ -369,7 +374,8 @@ pub async fn docker_blob_head() {}
     responses(
         (status = 200, description = "Blob content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Blob not found")
+        (status = 404, description = "Blob not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_blob_get() {}
@@ -387,7 +393,8 @@ pub async fn docker_blob_get() {}
     ),
     responses(
         (status = 201, description = "Manifest created, Docker-Content-Digest header contains digest"),
-        (status = 400, description = "Invalid manifest")
+        (status = 400, description = "Invalid manifest"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_manifest_put() {}
@@ -404,7 +411,8 @@ pub async fn docker_manifest_put() {}
     responses(
         (status = 202, description = "Manifest deleted"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Manifest not found")
+        (status = 404, description = "Manifest not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_manifest_delete() {}
@@ -421,7 +429,8 @@ pub async fn docker_manifest_delete() {}
     ),
     responses(
         (status = 202, description = "Upload started, Location header contains upload URL"),
-        (status = 400, description = "Invalid input", body = ErrorResponse)
+        (status = 400, description = "Invalid input", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_blob_upload_start() {}
@@ -439,7 +448,8 @@ pub async fn docker_blob_upload_start() {}
     ),
     responses(
         (status = 202, description = "Chunk accepted, Range header indicates bytes received"),
-        (status = 400, description = "Invalid input", body = ErrorResponse)
+        (status = 400, description = "Invalid input", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_blob_upload_patch() {}
@@ -458,7 +468,8 @@ pub async fn docker_blob_upload_patch() {}
     ),
     responses(
         (status = 201, description = "Blob created"),
-        (status = 400, description = "Digest mismatch or missing")
+        (status = 400, description = "Digest mismatch or missing"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn docker_blob_upload_put() {}
@@ -476,7 +487,8 @@ pub async fn docker_blob_upload_put() {}
     responses(
         (status = 200, description = "Artifact content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Artifact not found, trying upstream proxies")
+        (status = 404, description = "Artifact not found, trying upstream proxies"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn maven_artifact_get() {}
@@ -493,6 +505,7 @@ pub async fn maven_artifact_get() {}
         (status = 201, description = "Artifact uploaded"),
         (status = 400, description = "Invalid path (non-ASCII characters)"),
         (status = 409, description = "Version already exists (immutable releases)"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
         (status = 500, description = "Storage error")
     )
 )]
@@ -510,7 +523,8 @@ pub async fn maven_artifact_put() {}
     ),
     responses(
         (status = 200, description = "Package metadata (JSON)"),
-        (status = 404, description = "Package not found")
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn npm_package() {}
@@ -528,7 +542,8 @@ pub async fn npm_package() {}
     responses(
         (status = 200, description = "Package published"),
         (status = 409, description = "Version already exists"),
-        (status = 400, description = "Invalid package data")
+        (status = 400, description = "Invalid package data"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn npm_publish() {}
@@ -543,7 +558,8 @@ pub async fn npm_publish() {}
     path = "/cargo/index/config.json",
     tag = "cargo",
     responses(
-        (status = 200, description = "Sparse index configuration (JSON)")
+        (status = 200, description = "Sparse index configuration (JSON)"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn cargo_index_config() {}
@@ -562,7 +578,8 @@ pub async fn cargo_index_config() {}
     responses(
         (status = 200, description = "Crate index entries (one JSON per line)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Crate not found in index")
+        (status = 404, description = "Crate not found in index"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn cargo_sparse_index() {}
@@ -578,7 +595,8 @@ pub async fn cargo_sparse_index() {}
     responses(
         (status = 200, description = "Crate metadata (JSON)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Crate not found")
+        (status = 404, description = "Crate not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn cargo_metadata() {}
@@ -595,7 +613,8 @@ pub async fn cargo_metadata() {}
     responses(
         (status = 200, description = "Crate file (.crate)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Crate version not found")
+        (status = 404, description = "Crate version not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn cargo_download() {}
@@ -610,7 +629,8 @@ pub async fn cargo_download() {}
     responses(
         (status = 200, description = "Crate published"),
         (status = 409, description = "Version already exists"),
-        (status = 400, description = "Invalid crate data")
+        (status = 400, description = "Invalid crate data"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn cargo_publish() {}
@@ -623,7 +643,8 @@ pub async fn cargo_publish() {}
     path = "/simple/",
     tag = "pypi",
     responses(
-        (status = 200, description = "HTML list of packages")
+        (status = 200, description = "HTML list of packages"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn pypi_simple() {}
@@ -638,7 +659,8 @@ pub async fn pypi_simple() {}
     ),
     responses(
         (status = 200, description = "HTML list of package files"),
-        (status = 404, description = "Package not found")
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn pypi_package() {}
@@ -653,7 +675,8 @@ pub async fn pypi_package() {}
     responses(
         (status = 200, description = "Package uploaded"),
         (status = 409, description = "Version already exists"),
-        (status = 400, description = "Invalid upload data")
+        (status = 400, description = "Invalid upload data"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn pypi_upload() {}
@@ -671,7 +694,8 @@ pub async fn pypi_upload() {}
     responses(
         (status = 200, description = "Latest version info (JSON)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Module not found")
+        (status = 404, description = "Module not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn go_module_latest() {}
@@ -688,7 +712,8 @@ pub async fn go_module_latest() {}
     responses(
         (status = 200, description = "Version info (JSON)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Version not found")
+        (status = 404, description = "Version not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn go_module_info() {}
@@ -705,7 +730,8 @@ pub async fn go_module_info() {}
     responses(
         (status = 200, description = "go.mod file content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Version not found")
+        (status = 404, description = "Version not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn go_module_mod() {}
@@ -722,7 +748,8 @@ pub async fn go_module_mod() {}
     responses(
         (status = 200, description = "Module zip archive"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Version not found")
+        (status = 404, description = "Version not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn go_module_zip() {}
@@ -740,7 +767,8 @@ pub async fn go_module_zip() {}
     responses(
         (status = 200, description = "File content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "File not found")
+        (status = 404, description = "File not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn raw_file_get() {}
@@ -754,10 +782,13 @@ pub async fn raw_file_get() {}
         ("path" = String, Path, description = "File path")
     ),
     responses(
+        (status = 200, description = "File overwritten (conditional PUT with If-Match)"),
         (status = 201, description = "File uploaded"),
         (status = 400, description = "Invalid path (non-ASCII characters)"),
         (status = 409, description = "File already exists (immutable)"),
+        (status = 412, description = "Precondition failed (ETag mismatch or resource state)"),
         (status = 413, description = "File too large"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
         (status = 500, description = "Storage error")
     )
 )]
@@ -776,7 +807,8 @@ pub async fn raw_file_put() {}
     responses(
         (status = 200, description = "Compact index for gem"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Gem not found")
+        (status = 404, description = "Gem not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn gems_info() {}
@@ -791,7 +823,8 @@ pub async fn gems_info() {}
     ),
     responses(
         (status = 200, description = "Gem binary"),
-        (status = 404, description = "Gem not found")
+        (status = 404, description = "Gem not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn gems_download() {}
@@ -804,7 +837,8 @@ pub async fn gems_download() {}
     path = "/terraform/.well-known/terraform.json",
     tag = "terraform",
     responses(
-        (status = 200, description = "Service discovery JSON")
+        (status = 200, description = "Service discovery JSON"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn terraform_service_discovery() {}
@@ -821,7 +855,8 @@ pub async fn terraform_service_discovery() {}
     responses(
         (status = 200, description = "Version list"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Provider not found")
+        (status = 404, description = "Provider not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn terraform_provider_versions() {}
@@ -835,6 +870,7 @@ pub async fn terraform_provider_versions() {}
     tag = "ansible",
     responses(
         (status = 200, description = "Collection list"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
         (status = 502, description = "Upstream unreachable")
     )
 )]
@@ -851,7 +887,8 @@ pub async fn ansible_collection_list() {}
     responses(
         (status = 200, description = "Collection tarball"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Collection not found")
+        (status = 404, description = "Collection not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn ansible_download() {}
@@ -864,7 +901,8 @@ pub async fn ansible_download() {}
     path = "/nuget/v3/index.json",
     tag = "nuget",
     responses(
-        (status = 200, description = "Service index JSON with @id URLs rewritten")
+        (status = 200, description = "Service index JSON with @id URLs rewritten"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn nuget_service_index() {}
@@ -879,7 +917,8 @@ pub async fn nuget_service_index() {}
     ),
     responses(
         (status = 200, description = "Package file (.nupkg or .nuspec)"),
-        (status = 404, description = "Package not found")
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn nuget_download() {}
@@ -897,7 +936,8 @@ pub async fn nuget_download() {}
     responses(
         (status = 200, description = "Package metadata with versions"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Package not found")
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn pub_package_list() {}
@@ -914,7 +954,8 @@ pub async fn pub_package_list() {}
     responses(
         (status = 200, description = "Package archive (.tar.gz)"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Package not found")
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn pub_archive_download() {}
@@ -927,7 +968,8 @@ pub async fn pub_archive_download() {}
     path = "/conan/v2/ping",
     tag = "conan",
     responses(
-        (status = 200, description = "Ping response with X-Conan-Server-Capabilities header")
+        (status = 200, description = "Ping response with X-Conan-Server-Capabilities header"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn conan_ping() {}
@@ -948,7 +990,8 @@ pub async fn conan_ping() {}
     responses(
         (status = 200, description = "File content"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "File not found")
+        (status = 404, description = "File not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn conan_recipe_file() {}
@@ -965,6 +1008,7 @@ pub async fn conan_recipe_file() {}
         (status = 200, description = "Token created", body = TokenResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
         (status = 422, description = "Missing required fields", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
         (status = 503, description = "Auth not configured", body = ErrorResponse)
     )
 )]
@@ -979,7 +1023,8 @@ pub async fn create_token() {}
     responses(
         (status = 200, description = "Token list", body = TokenListResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
-        (status = 422, description = "Invalid request body", body = ErrorResponse)
+        (status = 422, description = "Invalid request body", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn list_tokens() {}
@@ -993,7 +1038,8 @@ pub async fn list_tokens() {}
         (status = 200, description = "Token revoked"),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
         (status = 404, description = "Token not found", body = ErrorResponse),
-        (status = 415, description = "Unsupported Content-Type")
+        (status = 415, description = "Unsupported Content-Type"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
 pub async fn revoke_token() {}
