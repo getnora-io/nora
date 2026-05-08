@@ -9,19 +9,30 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route(
+    Router::new().route("/raw/-/reindex", post(reindex)).route(
         "/raw/{*path}",
         get(download)
             .put(upload)
             .delete(delete_file)
             .head(check_exists),
     )
+}
+
+/// Invalidate the raw index so it rebuilds on next read.
+/// Useful after uploading files directly to S3/storage bypassing the API.
+async fn reindex(State(state): State<Arc<AppState>>) -> Response {
+    if !state.config.raw.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    state.repo_index.invalidate("raw");
+    tracing::info!("raw index invalidated via API");
+    StatusCode::OK.into_response()
 }
 
 async fn download(
@@ -393,6 +404,20 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
         let put = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
         assert_eq!(put.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_raw_reindex_endpoint() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::POST, "/raw/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_raw_reindex_disabled() {
+        let ctx = create_test_context_with_raw_disabled();
+        let resp = send(&ctx.app, Method::POST, "/raw/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
