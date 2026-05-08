@@ -11,6 +11,8 @@ services:
       - NORA_HOST=0.0.0.0
       - NORA_PORT=4000
       - NORA_AUTH_ENABLED=false
+      # Required when behind reverse proxy — used for download URLs
+      - NORA_PUBLIC_URL=https://demo.getnora.io
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/health"]
       interval: 10s

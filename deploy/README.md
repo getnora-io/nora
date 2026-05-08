@@ -67,6 +67,42 @@ cd nora/deploy
 docker compose up -d
 ```
 
+### Reverse Proxy
+
+When running NORA behind a reverse proxy (Caddy, Traefik, Nginx, etc.),
+set `NORA_PUBLIC_URL` to your external domain. Without it, NORA generates
+download URLs pointing to `http://0.0.0.0:4000`, which clients cannot reach.
+
+```yaml
+# docker-compose.yml
+environment:
+  - NORA_PUBLIC_URL=https://registry.example.com
+```
+
+**PyPI index URL** — use `/simple/`, not `/pypi/simple/`:
+
+```bash
+pip install --index-url https://registry.example.com/simple/ requests
+```
+
+**Self-signed TLS** — pip silently fails with "No matching distribution found"
+unless you specify `--trusted-host` or `--cert`:
+
+```bash
+pip install \
+  --index-url https://registry.example.com/simple/ \
+  --trusted-host registry.example.com \
+  requests
+```
+
+To make these settings permanent, create `~/.pip/pip.conf`:
+
+```ini
+[global]
+index-url = https://registry.example.com/simple/
+trusted-host = registry.example.com
+```
+
 ### URLs
 
 | URL | Description |
@@ -148,6 +184,42 @@ pip install --index-url http://localhost:4000/simple/ requests
 git clone https://github.com/getnora-io/nora.git
 cd nora/deploy
 docker compose up -d
+```
+
+### Reverse Proxy
+
+При работе NORA за reverse proxy (Caddy, Traefik, Nginx и др.)
+установите `NORA_PUBLIC_URL` на ваш внешний домен. Без этой переменной NORA
+генерирует download-ссылки с `http://0.0.0.0:4000`, которые клиенты не могут достичь.
+
+```yaml
+# docker-compose.yml
+environment:
+  - NORA_PUBLIC_URL=https://registry.example.com
+```
+
+**URL для PyPI** — используйте `/simple/`, а не `/pypi/simple/`:
+
+```bash
+pip install --index-url https://registry.example.com/simple/ requests
+```
+
+**Самоподписанный TLS** — pip молча падает с ошибкой "No matching distribution found",
+если не указать `--trusted-host` или `--cert`:
+
+```bash
+pip install \
+  --index-url https://registry.example.com/simple/ \
+  --trusted-host registry.example.com \
+  requests
+```
+
+Для постоянной настройки создайте `~/.pip/pip.conf`:
+
+```ini
+[global]
+index-url = https://registry.example.com/simple/
+trusted-host = registry.example.com
 ```
 
 ### Эндпоинты
