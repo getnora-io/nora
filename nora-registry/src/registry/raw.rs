@@ -61,6 +61,20 @@ async fn download(
     ) {
         return response;
     }
+
+    // Conditional GET — If-None-Match
+    if let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(stored_hash) = state.storage.get_pin_hash(&key) {
+            let etag_val = format!("\"{}\"", stored_hash);
+            if inm.trim() == etag_val || inm.trim() == "*" {
+                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag_val)]).into_response();
+            }
+        }
+    }
+
     match state.storage.get(&key).await {
         Ok(data) => {
             state.metrics.record_download("raw");
@@ -73,14 +87,16 @@ async fn download(
 
             // Guess content type from extension
             let content_type = guess_content_type(&key);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-                ],
-                data,
-            )
+            let mut builder = axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+            if let Some(hash) = state.storage.get_pin_hash(&key) {
+                builder = builder.header(header::ETAG, format!("\"{}\"", hash));
+            }
+            builder
+                .body(axum::body::Body::from(data))
+                .expect("valid response")
                 .into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -90,6 +106,7 @@ async fn download(
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     if !state.config.raw.enabled {
@@ -116,20 +133,90 @@ async fn upload(
             .into_response();
     }
 
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let if_match = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string());
+
     let key = format!("raw/{}", path);
 
-    // Immutable: reject overwrite of existing files
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
-    if state.storage.stat(&key).await.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            format!("File already exists: {}", path),
-        )
-            .into_response();
+    let file_exists = state.storage.stat(&key).await.is_some();
+
+    match (file_exists, if_none_match.as_deref(), if_match.as_deref()) {
+        // No conditional headers, file exists → 409 (backward compat)
+        (true, None, None) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("File already exists: {}", path),
+            )
+                .into_response();
+        }
+
+        // No conditional headers, file doesn't exist → create
+        (false, None, None) => {
+            // fall through to create
+        }
+
+        // If-None-Match: * → create only if not exists
+        (true, Some("*"), _) => {
+            return (StatusCode::PRECONDITION_FAILED, "Resource already exists").into_response();
+        }
+        (false, Some("*"), _) => {
+            // fall through to create
+        }
+
+        // If-None-Match with a specific ETag value (not useful for PUT, but handle gracefully)
+        (_, Some(_), None) => {
+            // Non-* If-None-Match on PUT: not meaningful per RFC 9110, reject
+            return (
+                StatusCode::BAD_REQUEST,
+                "If-None-Match on PUT only supports * value",
+            )
+                .into_response();
+        }
+
+        // If-Match: * → update only if resource exists
+        (true, _, Some("*")) => {
+            return do_overwrite(&state, &key, &path, &body).await;
+        }
+        (false, _, Some("*")) => {
+            return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
+        }
+
+        // If-Match: "<etag>" → update only if ETag matches
+        (true, _, Some(etag)) => {
+            let stored_hash = state.storage.get_pin_hash(&key);
+            match stored_hash {
+                Some(hash) => {
+                    let expected = format!("\"{}\"", hash);
+                    if etag == expected {
+                        return do_overwrite(&state, &key, &path, &body).await;
+                    }
+                    return (StatusCode::PRECONDITION_FAILED, "ETag mismatch").into_response();
+                }
+                None => {
+                    // No pin hash available (e.g. S3 backend) — cannot verify
+                    return (
+                        StatusCode::PRECONDITION_FAILED,
+                        "ETag not available for this resource",
+                    )
+                        .into_response();
+                }
+            }
+        }
+        (false, _, Some(_)) => {
+            return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
+        }
     }
 
+    // Create new file
     match state.storage.put(&key, &body).await {
         Ok(()) => {
             state.metrics.record_upload("raw");
@@ -141,6 +228,31 @@ async fn upload(
                 .log(AuditEntry::new("push", "api", "", "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Overwrite an existing file (conditional PUT with If-Match).
+async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8]) -> Response {
+    // Delete old, write new (within publish_lock — atomic from NORA's perspective)
+    if state.storage.delete(key).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match state.storage.put(key, body).await {
+        Ok(()) => {
+            state.metrics.record_upload("raw");
+            state.activity.push(ActivityEntry::new(
+                ActionType::Push,
+                path.to_string(),
+                "raw",
+                "LOCAL",
+            ));
+            state
+                .audit
+                .log(AuditEntry::new("overwrite", "api", "", "raw", ""));
+            state.repo_index.invalidate("raw");
+            StatusCode::OK.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -169,15 +281,34 @@ async fn check_exists(State(state): State<Arc<AppState>>, Path(path): Path<Strin
 
     let key = format!("raw/{}", path);
     match state.storage.stat(&key).await {
-        Some(meta) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_LENGTH, meta.size.to_string()),
-                (header::CONTENT_TYPE, guess_content_type(&key).to_string()),
-            ],
-        )
-            .into_response(),
+        Some(meta) => {
+            let mut builder = axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, meta.size.to_string())
+                .header(header::CONTENT_TYPE, guess_content_type(&key))
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+            if let Some(hash) = state.storage.get_pin_hash(&key) {
+                builder = builder.header(header::ETAG, format!("\"{}\"", hash));
+            }
+            if meta.modified > 0 {
+                builder = builder.header(header::LAST_MODIFIED, format_http_date(meta.modified));
+            }
+            builder
+                .body(axum::body::Body::empty())
+                .expect("valid response")
+                .into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Format a Unix timestamp as an HTTP-date (RFC 7231 §7.1.1.1).
+fn format_http_date(timestamp: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    let dt = Utc.timestamp_opt(timestamp as i64, 0).single();
+    match dt {
+        Some(dt) => dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+        None => String::new(),
     }
 }
 
@@ -299,6 +430,7 @@ mod integration_tests {
     use crate::storage::{Storage, StorageError};
     use crate::test_helpers::{
         body_bytes, create_test_context, create_test_context_with_raw_disabled, send,
+        send_with_headers,
     };
     use axum::http::{Method, StatusCode};
 
@@ -466,5 +598,218 @@ mod integration_tests {
             }
             other => panic!("expected Validation(PathTraversal), got {:?}", other),
         }
+    }
+
+    // --- RFC 9110 conditional request tests ---
+
+    #[tokio::test]
+    async fn test_raw_head_returns_etag() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/etag.txt", b"hello".to_vec()).await;
+
+        let head = send(&ctx.app, Method::HEAD, "/raw/etag.txt", "").await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let etag = head.headers().get("etag").expect("HEAD must return ETag");
+        let val = etag.to_str().unwrap();
+        assert!(
+            val.starts_with('"') && val.ends_with('"'),
+            "ETag must be quoted"
+        );
+        assert!(val.len() > 2, "ETag must contain a hash");
+    }
+
+    #[tokio::test]
+    async fn test_raw_head_returns_last_modified() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/lm.txt", b"hello".to_vec()).await;
+
+        let head = send(&ctx.app, Method::HEAD, "/raw/lm.txt", "").await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let lm = head
+            .headers()
+            .get("last-modified")
+            .expect("HEAD must return Last-Modified");
+        let val = lm.to_str().unwrap();
+        assert!(val.contains("GMT"), "Last-Modified must be HTTP-date");
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_none_match_star_creates() {
+        let ctx = create_test_context();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/new.txt",
+            vec![("if-none-match", "*")],
+            b"content".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_none_match_star_rejects_existing() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/exists.txt", b"v1".to_vec()).await;
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/exists.txt",
+            vec![("if-none-match", "*")],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_match_etag_overwrites() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/up.txt", b"v1".to_vec()).await;
+
+        // Get the ETag
+        let head = send(&ctx.app, Method::HEAD, "/raw/up.txt", "").await;
+        let etag = head
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/up.txt",
+            vec![("if-match", &etag)],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_match_etag_wrong_rejects() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/wrong.txt", b"v1".to_vec()).await;
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/wrong.txt",
+            vec![(
+                "if-match",
+                "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+            )],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_match_star_overwrites_existing() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/star.txt", b"v1".to_vec()).await;
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/star.txt",
+            vec![("if-match", "*")],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_if_match_star_rejects_missing() {
+        let ctx = create_test_context();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/ghost.txt",
+            vec![("if-match", "*")],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_no_headers_still_409() {
+        let ctx = create_test_context();
+        let put1 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v1".to_vec()).await;
+        assert_eq!(put1.status(), StatusCode::CREATED);
+
+        let put2 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v2".to_vec()).await;
+        assert_eq!(put2.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_raw_get_if_none_match_returns_304() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/cached.txt", b"hello".to_vec()).await;
+
+        // Get the ETag
+        let head = send(&ctx.app, Method::HEAD, "/raw/cached.txt", "").await;
+        let etag = head
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/cached.txt",
+            vec![("if-none-match", &etag)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_raw_overwrite_updates_content() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/update.txt",
+            b"original".to_vec(),
+        )
+        .await;
+
+        // Get ETag for conditional overwrite
+        let head = send(&ctx.app, Method::HEAD, "/raw/update.txt", "").await;
+        let etag = head
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Overwrite
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/update.txt",
+            vec![("if-match", &etag)],
+            b"updated".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify new content
+        let get = send(&ctx.app, Method::GET, "/raw/update.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], b"updated");
     }
 }

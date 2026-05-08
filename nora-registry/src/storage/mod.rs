@@ -148,6 +148,11 @@ impl Storage {
         self.inner.backend_name()
     }
 
+    /// Look up the pinned SHA-256 hash for a storage key (None if pin store is disabled or key is unknown).
+    pub fn get_pin_hash(&self, key: &str) -> Option<String> {
+        self.pin_store.as_ref().and_then(|p| p.get(key))
+    }
+
     /// Number of pinned hashes (0 if pin store is disabled).
     pub fn pinned_count(&self) -> usize {
         self.pin_store.as_ref().map_or(0, |p| p.len())

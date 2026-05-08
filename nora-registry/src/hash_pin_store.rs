@@ -124,6 +124,11 @@ impl HashPinStore {
         }
     }
 
+    /// Look up the stored SHA-256 hash for a key, if pinned.
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.pins.read().get(key).cloned()
+    }
+
     /// Number of pinned entries.
     pub fn len(&self) -> usize {
         self.pins.read().len()

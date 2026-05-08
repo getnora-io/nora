@@ -323,6 +323,25 @@ always active when configured, regardless of curation mode. The goal
 is: a default NORA deployment should be harder to attack than a default
 Nexus/Artifactory deployment.
 
+### ADR-9: Conditional Requests are Per-Protocol
+
+**Decision:** Conditional request semantics (ETag, If-Match, If-None-Match)
+are implemented per-registry following each format's upstream specification.
+There is no shared conditional-request middleware.
+
+**Context:** RFC 9110 defines conditional requests for HTTP. Each registry
+protocol has its own immutability model: Docker uses content-addressable
+digests, Maven/npm/Cargo/PyPI enforce version immutability at publish time,
+Raw has no upstream spec. Implementing a generic conditional-request layer
+would either be too narrow (not matching protocol-specific semantics) or too
+broad (imposing HTTP semantics on protocols that don't need them).
+
+**Rationale:** Raw is the only format that benefits from RFC 9110 conditional
+PUT because it's a plain file store with no versioning scheme. Other formats
+already have protocol-defined immutability. Adding ETag/If-Match to Maven or
+npm would conflict with their publish APIs. The per-protocol approach follows
+ADR-4: each handler owns its full request lifecycle.
+
 ## Adding a New Registry
 
 Adding a new registry format requires 24 insertion points across
