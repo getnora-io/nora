@@ -10,7 +10,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
+use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -18,7 +18,7 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::get,
     Router,
 };
 use sha2::Digest;
@@ -26,9 +26,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/maven2/{*path}", get(download))
-        .route("/maven2/{*path}", put(upload))
+    Router::new().route(
+        "/maven2/{*path}",
+        get(download)
+            .put(upload)
+            .fallback(|| async { method_not_allowed("GET, PUT") }),
+    )
 }
 
 // ============================================================================

@@ -34,9 +34,14 @@ pub use terraform::routes as terraform_routes;
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::AppState;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::time::Duration;
+
+/// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
+pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, allow)]).into_response()
+}
 
 /// Build NORA base URL from config (for URL rewriting).
 ///

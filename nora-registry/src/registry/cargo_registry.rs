@@ -12,7 +12,9 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
+use crate::registry::{
+    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
+};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -35,7 +37,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/cargo/api/v1/crates/{crate_name}/{version}/download",
             get(download),
         )
-        .route("/cargo/api/v1/crates/new", put(publish))
+        .route(
+            "/cargo/api/v1/crates/new",
+            put(publish).fallback(|| async { method_not_allowed("PUT") }),
+        )
 }
 
 // ============================================================================

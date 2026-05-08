@@ -119,8 +119,10 @@ This document describes which parts of each registry protocol are implemented in
 | Delete (DELETE) | Full | |
 | Exists check (HEAD) | Full | Returns size + Content-Type |
 | Max file size | Full | Configurable (default 1MB) |
+| Conditional overwrite (`If-Match`) | Full | ETag-based, returns 200 on success |
+| Create-only (`If-None-Match: *`) | Full | Returns 412 if resource exists |
 | Directory listing | — | Not implemented |
-| Versioning | — | Overwrite-only |
+| Immutability | Full | Default; re-upload returns 409 unless conditional headers used |
 
 ## RubyGems
 
@@ -236,7 +238,8 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 |---------|--------|-------|
 | Authentication (Bearer/Basic) | Full | Per-request token validation |
 | Anonymous read | Full | `NORA_AUTH_ANONYMOUS_READ=true` |
-| Rate limiting | Full | `tower_governor`, per-IP |
+| Rate limiting (429 + Retry-After) | Full | `tower_governor`, per-IP, documented in OpenAPI |
+| 405 Method Not Allowed + Allow | Full | RFC 9110 §15.5.6, multi-method routes return Allow header |
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |

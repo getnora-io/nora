@@ -3,14 +3,16 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch, ProxyError};
+use crate::registry::{
+    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
+};
 use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::get,
     Router,
 };
 use base64::Engine;
@@ -18,9 +20,12 @@ use sha2::Digest;
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/npm/{*path}", get(handle_request))
-        .route("/npm/{*path}", put(handle_publish))
+    Router::new().route(
+        "/npm/{*path}",
+        get(handle_request)
+            .put(handle_publish)
+            .fallback(|| async { method_not_allowed("GET, PUT") }),
+    )
 }
 
 /// Rewrite tarball URLs in npm metadata to point to NORA.
