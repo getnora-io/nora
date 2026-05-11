@@ -231,6 +231,9 @@ fn build_context(
         curation: curation_engine,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
         circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        digest_store: std::sync::Arc::new(crate::digest_quarantine::DigestStore::empty(
+            &storage_path,
+        )),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

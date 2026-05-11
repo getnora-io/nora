@@ -114,6 +114,78 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Resolve effective quarantine mode and TTL (seconds) for Docker.
+///
+/// Returns `(QuarantineMode, quarantine_secs)`. Per-registry override takes
+/// precedence over global curation config. Returns `(Off, 0)` when disabled.
+fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    use crate::digest_quarantine::QuarantineMode;
+
+    let mode_str = state
+        .config
+        .curation
+        .docker
+        .quarantine
+        .as_deref()
+        .or(state.config.curation.quarantine.as_deref())
+        .unwrap_or("off");
+
+    let mode = QuarantineMode::from_str_lossy(mode_str);
+    if matches!(mode, QuarantineMode::Off) {
+        return (QuarantineMode::Off, 0);
+    }
+
+    let ttl_str = state
+        .config
+        .curation
+        .docker
+        .quarantine_ttl
+        .as_deref()
+        .or(state.config.curation.quarantine_ttl.as_deref())
+        .unwrap_or("14d");
+
+    let secs = crate::curation::parse_duration(ttl_str).unwrap_or(14 * 86400);
+    (mode, secs)
+}
+
+/// Build an HTTP 403 response for a quarantined digest.
+fn quarantine_forbidden(
+    digest: &str,
+    status: &crate::digest_quarantine::QuarantineStatus,
+    quarantine_secs: i64,
+) -> Response {
+    let remaining = match status {
+        crate::digest_quarantine::QuarantineStatus::New => quarantine_secs,
+        crate::digest_quarantine::QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
+        crate::digest_quarantine::QuarantineStatus::Mature => 0,
+    };
+    let quarantine_until = chrono::Utc::now().timestamp() + remaining;
+
+    let body = json!({
+        "errors": [{
+            "code": "DENIED",
+            "message": "digest is in quarantine",
+            "detail": {
+                "digest": digest,
+                "quarantine_until": quarantine_until,
+            }
+        }]
+    });
+
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (
+                HeaderName::from_static("x-nora-quarantine"),
+                status.header_value(),
+            ),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -779,6 +851,26 @@ async fn get_manifest(
         use sha2::Digest;
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
+        // Quarantine check (local cache hit may still be pending)
+        let (q_mode, q_secs) = resolve_quarantine(&state);
+        if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+            let q_status = state.digest_store.check("docker", &digest, q_secs);
+            match &q_status {
+                crate::digest_quarantine::QuarantineStatus::Mature => {}
+                _ => {
+                    tracing::warn!(
+                        digest = %digest,
+                        status = %q_status.header_value(),
+                        mode = ?q_mode,
+                        "Quarantine: cached manifest"
+                    );
+                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+                        return quarantine_forbidden(&digest, &q_status, q_secs);
+                    }
+                }
+            }
+        }
+
         // Detect manifest media type from content
         let content_type = detect_manifest_media_type(&data);
 
@@ -835,6 +927,39 @@ async fn get_manifest(
                 // Calculate digest for Docker-Content-Digest header
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+
+                // Quarantine: record digest, check status
+                let (q_mode, q_secs) = resolve_quarantine(&state);
+                if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                    state.digest_store.record("docker", &digest, &upstream.url);
+                    let q_status = state.digest_store.check("docker", &digest, q_secs);
+                    match &q_status {
+                        crate::digest_quarantine::QuarantineStatus::Mature => {}
+                        _ => {
+                            tracing::warn!(
+                                digest = %digest,
+                                upstream = %upstream.url,
+                                status = %q_status.header_value(),
+                                mode = ?q_mode,
+                                "Quarantine: proxy-fetched manifest"
+                            );
+                        }
+                    }
+                    // In enforce mode, still cache but block the client
+                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+                        && !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
+                    {
+                        // Cache manifest so it's ready after quarantine expires
+                        let storage = state.storage.clone();
+                        let key_clone = key.clone();
+                        let state_clone = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let _ = storage.put(&key_clone, &data).await;
+                            state_clone.repo_index.invalidate("docker");
+                        });
+                        return quarantine_forbidden(&digest, &q_status, q_secs);
+                    }
+                }
 
                 // Cache manifest and create metadata (fire and forget)
                 let storage = state.storage.clone();
@@ -915,6 +1040,39 @@ async fn get_manifest(
                     use sha2::Digest;
                     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
+                    // Quarantine: record digest, check status
+                    let (q_mode, q_secs) = resolve_quarantine(&state);
+                    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                        state.digest_store.record("docker", &digest, &upstream.url);
+                        let q_status = state.digest_store.check("docker", &digest, q_secs);
+                        match &q_status {
+                            crate::digest_quarantine::QuarantineStatus::Mature => {}
+                            _ => {
+                                tracing::warn!(
+                                    digest = %digest,
+                                    upstream = %upstream.url,
+                                    status = %q_status.header_value(),
+                                    mode = ?q_mode,
+                                    "Quarantine: proxy-fetched manifest (library/)"
+                                );
+                            }
+                        }
+                        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+                            && !matches!(
+                                q_status,
+                                crate::digest_quarantine::QuarantineStatus::Mature
+                            )
+                        {
+                            // Cache even though quarantined
+                            let storage = state.storage.clone();
+                            let key_clone = key.clone();
+                            tokio::spawn(async move {
+                                let _ = storage.put(&key_clone, &data).await;
+                            });
+                            return quarantine_forbidden(&digest, &q_status, q_secs);
+                        }
+                    }
+
                     // Cache under original name for future local hits
                     let storage = state.storage.clone();
                     let key_clone = key.clone();
@@ -967,6 +1125,12 @@ async fn put_manifest(
     // Calculate digest
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
+
+    // Local push → mark as immediately mature in quarantine store
+    let (q_mode, q_secs) = resolve_quarantine(&state);
+    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        state.digest_store.record_trusted("docker", &digest, q_secs);
+    }
 
     // Store by tag/reference
     let key = format!("docker/{}/manifests/{}.json", name, reference);

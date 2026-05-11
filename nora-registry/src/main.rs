@@ -11,7 +11,6 @@ mod circuit_breaker;
 mod config;
 mod curation;
 mod dashboard_metrics;
-#[allow(dead_code)] // Used in integration commit
 mod digest_quarantine;
 mod gc;
 mod hash_pin_store;
@@ -162,6 +161,7 @@ pub struct AppState {
     /// Per-IP failed auth attempt tracker for brute-force protection
     pub auth_failures: auth::AuthFailureTracker,
     pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
+    pub digest_store: std::sync::Arc<digest_quarantine::DigestStore>,
 }
 
 impl AppState {
@@ -895,6 +895,13 @@ async fn run_server(config: Config, storage: Storage) {
     let cb_config = config.circuit_breaker.clone();
     let audit_mode = config.audit.mode.clone();
 
+    // Initialize digest quarantine store
+    let digest_store = if config.curation.quarantine.is_some() {
+        Arc::new(digest_quarantine::DigestStore::load(&storage_path))
+    } else {
+        Arc::new(digest_quarantine::DigestStore::empty(&storage_path))
+    };
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -914,6 +921,7 @@ async fn run_server(config: Config, storage: Storage) {
         curation: curation_engine,
         auth_failures: auth::AuthFailureTracker::new(5, 900),
         circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        digest_store,
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
