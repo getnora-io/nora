@@ -152,6 +152,7 @@ fn build_context(
         curation: CurationConfig::default(),
         circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         tls: crate::config::TlsConfig::default(),
+        audit: crate::config::AuditConfig::default(),
         registries: None,
     };
 
@@ -215,7 +216,7 @@ fn build_context(
         tokens,
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path),
+        audit: AuditLog::new(&storage_path, crate::audit::AuditMode::Off),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client: reqwest::Client::new(),

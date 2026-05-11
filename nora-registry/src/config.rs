@@ -62,6 +62,8 @@ pub struct Config {
     pub circuit_breaker: CircuitBreakerConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
     /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
     #[serde(default)]
     pub registries: Option<RegistriesSection>,
@@ -1257,6 +1259,29 @@ impl EnableSpec {
     }
 }
 
+/// Audit log configuration.
+///
+/// Controls where audit events are written:
+/// - `file`   — write to {storage_path}/audit.jsonl (default)
+/// - `stdout` — write JSONL to stderr (12-factor compatible)
+/// - `both`   — write to file AND stderr
+/// - `off`    — disable audit logging
+///
+/// ENV: `NORA_AUDIT_LOG=file|stdout|both|off`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub mode: crate::audit::AuditMode,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::audit::AuditMode::File,
+        }
+    }
+}
+
 impl Config {
     /// Returns the set of enabled registry types.
     ///
@@ -2146,6 +2171,11 @@ impl Config {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };
             }
         }
+
+        // Audit config
+        if let Ok(val) = env::var("NORA_AUDIT_LOG") {
+            self.audit.mode = crate::audit::AuditMode::from_str_lossy(&val);
+        }
     }
 }
 
@@ -2188,6 +2218,7 @@ impl Default for Config {
             curation: CurationConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             tls: TlsConfig::default(),
+            audit: AuditConfig::default(),
             registries: None,
         }
     }

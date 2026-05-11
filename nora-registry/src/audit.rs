@@ -1,19 +1,45 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! Persistent audit log — append-only JSONL file
+//! Structured audit log — append-only JSONL output.
 //!
-//! Records who/when/what for every registry operation.
-//! File: {storage_path}/audit.jsonl
+//! Records who/when/what for every registry write operation.
+//! Output modes (NORA_AUDIT_LOG):
+//!   - `file`   — write to {storage_path}/audit.jsonl (default)
+//!   - `stdout`  — write JSONL to stderr (12-factor compatible)
+//!   - `both`   — write to file AND stderr
+//!   - `off`    — disable audit logging
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Audit output mode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditMode {
+    #[default]
+    File,
+    Stdout,
+    Both,
+    Off,
+}
+
+impl AuditMode {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "stdout" | "stderr" => Self::Stdout,
+            "both" => Self::Both,
+            "off" | "none" | "false" | "0" => Self::Off,
+            _ => Self::File,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
@@ -41,41 +67,77 @@ impl AuditEntry {
 pub struct AuditLog {
     path: PathBuf,
     writer: Arc<Mutex<Option<fs::File>>>,
+    mode: AuditMode,
 }
 
 impl AuditLog {
-    pub fn new(storage_path: &str) -> Self {
-        let path = PathBuf::from(storage_path).join("audit.jsonl");
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+    pub fn new(storage_path: &str, mode: AuditMode) -> Self {
+        if mode == AuditMode::Off {
+            info!("Audit log disabled (mode=off)");
+            return Self {
+                path: PathBuf::from(storage_path).join("audit.jsonl"),
+                writer: Arc::new(Mutex::new(None)),
+                mode,
+            };
         }
-        let writer = match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => {
-                info!(path = %path.display(), "Audit log initialized");
-                Arc::new(Mutex::new(Some(f)))
+
+        let path = PathBuf::from(storage_path).join("audit.jsonl");
+        let writer = if mode == AuditMode::File || mode == AuditMode::Both {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
             }
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "Failed to open audit log, auditing disabled");
-                Arc::new(Mutex::new(None))
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => {
+                    info!(path = %path.display(), mode = ?mode, "Audit log initialized");
+                    Arc::new(Mutex::new(Some(f)))
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to open audit log file");
+                    Arc::new(Mutex::new(None))
+                }
             }
+        } else {
+            info!(mode = ?mode, "Audit log initialized (stderr only)");
+            Arc::new(Mutex::new(None))
         };
-        Self { path, writer }
+
+        Self { path, writer, mode }
     }
 
     pub fn log(&self, entry: AuditEntry) {
+        if self.mode == AuditMode::Off {
+            return;
+        }
+
         let writer = Arc::clone(&self.writer);
+        let mode = self.mode.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(ref mut file) = *writer.lock() {
-                if let Ok(json) = serde_json::to_string(&entry) {
+            let json = match serde_json::to_string(&entry) {
+                Ok(j) => j,
+                Err(_) => return,
+            };
+
+            // Write to file if mode is file or both
+            if mode == AuditMode::File || mode == AuditMode::Both {
+                if let Some(ref mut file) = *writer.lock() {
                     let _ = writeln!(file, "{}", json);
                     let _ = file.flush();
                 }
+            }
+
+            // Write to stderr if mode is stdout or both
+            if mode == AuditMode::Stdout || mode == AuditMode::Both {
+                eprintln!("{}", json);
             }
         });
     }
 
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    pub fn mode(&self) -> &AuditMode {
+        &self.mode
     }
 }
 
@@ -104,14 +166,14 @@ mod tests {
     #[test]
     fn test_audit_log_new_and_path() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap());
+        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
         assert!(log.path().ends_with("audit.jsonl"));
     }
 
     #[tokio::test]
     async fn test_audit_log_write_entry() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap());
+        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
 
         let entry = AuditEntry::new("pull", "user1", "lodash", "npm", "downloaded");
         log.log(entry);
@@ -135,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_multiple_entries() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap());
+        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
 
         log.log(AuditEntry::new("push", "admin", "a", "docker", ""));
         log.log(AuditEntry::new("pull", "user", "b", "npm", ""));
@@ -163,5 +225,24 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains(r#""action":"push""#));
         assert!(json.contains(r#""ts":""#));
+    }
+
+    #[test]
+    fn test_audit_mode_from_str_lossy() {
+        assert_eq!(AuditMode::from_str_lossy("stdout"), AuditMode::Stdout);
+        assert_eq!(AuditMode::from_str_lossy("stderr"), AuditMode::Stdout);
+        assert_eq!(AuditMode::from_str_lossy("both"), AuditMode::Both);
+        assert_eq!(AuditMode::from_str_lossy("off"), AuditMode::Off);
+        assert_eq!(AuditMode::from_str_lossy("none"), AuditMode::Off);
+        assert_eq!(AuditMode::from_str_lossy("false"), AuditMode::Off);
+        assert_eq!(AuditMode::from_str_lossy("file"), AuditMode::File);
+        assert_eq!(AuditMode::from_str_lossy("anything"), AuditMode::File);
+    }
+
+    #[test]
+    fn test_audit_log_off_mode() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::Off);
+        assert_eq!(log.mode(), &AuditMode::Off);
     }
 }
