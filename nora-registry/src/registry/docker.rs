@@ -687,7 +687,10 @@ async fn upload_blob(
             )
                 .into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, "Failed to store blob");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1061,7 +1064,10 @@ async fn delete_manifest(
             })),
         )
             .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, reference = %reference, "Failed to delete manifest");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1101,7 +1107,10 @@ async fn delete_blob(
             })),
         )
             .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, digest = %digest, "Failed to delete blob");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
