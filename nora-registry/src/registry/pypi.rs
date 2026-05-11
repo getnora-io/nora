@@ -464,15 +464,16 @@ async fn upload(State(state): State<Arc<AppState>>, mut multipart: Multipart) ->
     let _ = state.storage.put(&hash_key, computed_hash.as_bytes()).await;
 
     state.metrics.record_upload("pypi");
+    let artifact = format!("{}-{}", name, version);
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", &artifact, "pypi", ""));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
-        format!("{}-{}", name, version),
+        artifact,
         "pypi",
         "LOCAL",
     ));
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", "", "pypi", ""));
     state.repo_index.invalidate("pypi");
 
     StatusCode::OK.into_response()

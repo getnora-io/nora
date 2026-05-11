@@ -227,11 +227,11 @@ async fn upload(
         Ok(()) => {
             state.metrics.record_upload("raw");
             state
+                .audit
+                .log(AuditEntry::new("push", "api", &path, "raw", ""));
+            state
                 .activity
                 .push(ActivityEntry::new(ActionType::Push, path, "raw", "LOCAL"));
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", "", "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
         }
@@ -260,7 +260,7 @@ async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8])
             ));
             state
                 .audit
-                .log(AuditEntry::new("overwrite", "api", "", "raw", ""));
+                .log(AuditEntry::new("overwrite", "api", path, "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::OK.into_response()
         }
@@ -279,6 +279,9 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String
     let key = format!("raw/{}", path);
     match state.storage.delete(&key).await {
         Ok(()) => {
+            state
+                .audit
+                .log(AuditEntry::new("delete", "api", &path, "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::NO_CONTENT.into_response()
         }

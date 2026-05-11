@@ -683,6 +683,13 @@ async fn upload_blob(
     match state.storage.put(&key, &data).await {
         Ok(()) => {
             state.metrics.record_upload("docker");
+            state.audit.log(AuditEntry::new(
+                "push",
+                "api",
+                &format!("{}@{}", name, digest),
+                "docker",
+                "blob",
+            ));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 format!("{}@{}", name, &digest[..19.min(digest.len())]),

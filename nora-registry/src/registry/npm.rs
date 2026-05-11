@@ -459,15 +459,15 @@ async fn handle_publish(
     }
 
     state.metrics.record_upload("npm");
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", &package_name, "npm", ""));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         package_name,
         "npm",
         "LOCAL",
     ));
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", "", "npm", ""));
     state.repo_index.invalidate("npm");
 
     StatusCode::CREATED.into_response()

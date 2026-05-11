@@ -558,15 +558,16 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     }
 
     state.metrics.record_upload("cargo");
+    let artifact = format!("{}@{}", name, vers);
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", &artifact, "cargo", ""));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
-        format!("{}@{}", name, vers),
+        artifact,
         "cargo",
         "LOCAL",
     ));
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", "", "cargo", ""));
     state.repo_index.invalidate("cargo");
 
     // Cargo expects a JSON response with warnings array
