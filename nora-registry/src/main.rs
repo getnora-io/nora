@@ -11,7 +11,8 @@ mod circuit_breaker;
 mod config;
 mod curation;
 mod dashboard_metrics;
-
+#[allow(dead_code)] // Used in integration commit
+mod digest_quarantine;
 mod gc;
 mod hash_pin_store;
 mod health;
