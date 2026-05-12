@@ -8,9 +8,15 @@
 
 #![allow(clippy::unwrap_used)] // tests may use .unwrap() freely
 
-use axum::{body::Body, extract::DefaultBodyLimit, http::Request, middleware, Router};
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, DefaultBodyLimit},
+    http::Request,
+    middleware, Router,
+};
 use http_body_util::BodyExt;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -316,11 +322,14 @@ pub async fn send(
 ) -> axum::http::Response<Body> {
     use tower::ServiceExt;
 
-    let request = Request::builder()
+    let mut request = Request::builder()
         .method(method)
         .uri(uri)
         .body(body.into())
         .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
 
     app.clone().oneshot(request).await.unwrap()
 }
@@ -339,7 +348,10 @@ pub async fn send_with_headers(
     for (k, v) in headers {
         builder = builder.header(k, v);
     }
-    let request = builder.body(body.into()).unwrap();
+    let mut request = builder.body(body.into()).unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
 
     app.clone().oneshot(request).await.unwrap()
 }
