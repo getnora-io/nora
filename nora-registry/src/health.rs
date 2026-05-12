@@ -22,7 +22,6 @@ pub struct HealthStatus {
 pub struct StorageHealth {
     pub backend: String,
     pub reachable: bool,
-    pub endpoint: String,
     pub total_size_bytes: u64,
 }
 
@@ -57,10 +56,6 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
         storage: StorageHealth {
             backend: state.storage.backend_name().to_string(),
             reachable: storage_reachable,
-            endpoint: match state.storage.backend_name() {
-                "s3" => state.config.storage.s3_url.clone(),
-                _ => state.config.storage.path.clone(),
-            },
             total_size_bytes: total_size,
         },
         registries,
