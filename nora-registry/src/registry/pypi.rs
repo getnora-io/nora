@@ -14,6 +14,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
+use crate::ui::components::html_escape;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -90,7 +91,12 @@ async fn list_packages(
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
         for pkg in pkg_list {
-            let _ = writeln!(html, "<a href=\"/simple/{}/\">{}</a><br>", pkg, pkg);
+            let _ = writeln!(
+                html,
+                "<a href=\"/simple/{}/\">{}</a><br>",
+                html_escape(&pkg),
+                html_escape(&pkg)
+            );
         }
         html.push_str("</body></html>");
         (
@@ -532,7 +538,11 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
         let _ = writeln!(
             html,
             "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
-            base_url, normalized, f.filename, hash_fragment, f.filename
+            base_url,
+            normalized,
+            html_escape(&f.filename),
+            hash_fragment,
+            html_escape(&f.filename)
         );
     }
     html.push_str("</body></html>");
