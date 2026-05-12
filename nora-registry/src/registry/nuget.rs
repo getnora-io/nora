@@ -44,7 +44,8 @@ struct SearchParams {
 }
 
 /// Storage prefix and file suffix for repo index scanning.
-pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", "index.json");
+/// Count .nupkg files (not index.json) so size reflects actual packages.
+pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", ".nupkg");
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -952,7 +953,7 @@ mod integration_tests {
             cfg.nuget.proxy = None;
         });
 
-        // Populate index for two packages
+        // Populate index for two packages (index.json + .nupkg)
         for id in &["packagea", "packageb"] {
             let index = serde_json::json!({"versions": ["1.0.0"]});
             ctx.state
@@ -960,6 +961,14 @@ mod integration_tests {
                 .put(
                     &format!("nuget/flatcontainer/{}/index.json", id),
                     serde_json::to_vec(&index).unwrap().as_slice(),
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{}/1.0.0/{}.1.0.0.nupkg", id, id),
+                    b"fake-nupkg",
                 )
                 .await
                 .unwrap();
@@ -990,6 +999,14 @@ mod integration_tests {
             )
             .await
             .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+                b"fake-nupkg",
+            )
+            .await
+            .unwrap();
         ctx.state.repo_index.invalidate("nuget");
 
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=Newton", "").await;
@@ -1016,6 +1033,14 @@ mod integration_tests {
             )
             .await
             .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+                b"fake-nupkg",
+            )
+            .await
+            .unwrap();
         ctx.state.repo_index.invalidate("nuget");
 
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=newton", "").await;
@@ -1039,6 +1064,14 @@ mod integration_tests {
                 .put(
                     &format!("nuget/flatcontainer/{}/index.json", id),
                     serde_json::to_vec(&index).unwrap().as_slice(),
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{}/1.0.0/{}.1.0.0.nupkg", id, id),
+                    b"fake-nupkg",
                 )
                 .await
                 .unwrap();
@@ -1071,6 +1104,16 @@ mod integration_tests {
             )
             .await
             .unwrap();
+        for ver in &["1.0.0", "2.0.0"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/testpkg/{}/testpkg.{}.nupkg", ver, ver),
+                    b"fake-nupkg",
+                )
+                .await
+                .unwrap();
+        }
         ctx.state.repo_index.invalidate("nuget");
 
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=testpkg", "").await;
