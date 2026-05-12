@@ -724,6 +724,7 @@ async fn run_server(config: Config, storage: Storage) {
             }
         }
     } else {
+        warn!("Authentication is DISABLED — all endpoints are publicly accessible. Set [auth] enabled=true for production.");
         None
     };
 
