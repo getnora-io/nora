@@ -231,7 +231,10 @@ async fn get_metadata(
             (StatusCode::OK, data).into_response()
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::debug!(error = ?e, crate_name = %crate_name, "Cargo metadata proxy fetch failed");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -364,7 +367,10 @@ async fn download(
                 .into_response()
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::debug!(error = ?e, crate_name = %crate_name, version = %version, "Cargo crate proxy fetch failed");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 

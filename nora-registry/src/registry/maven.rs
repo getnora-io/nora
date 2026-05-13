@@ -212,7 +212,10 @@ async fn download(
                 return with_content_type(&path, data.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %proxy.url(), path = %path, "Maven proxy fetch failed, trying next");
+                continue;
+            }
         }
     }
 
@@ -268,7 +271,10 @@ async fn upload(
             }
             match state.storage.put(&key, &body).await {
                 Ok(()) => StatusCode::CREATED.into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, key = %key, "Failed to store Maven checksum");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
         }
 
@@ -300,7 +306,8 @@ async fn upload(
                     .into_response();
             }
 
-            if state.storage.put(&key, &body).await.is_err() {
+            if let Err(e) = state.storage.put(&key, &body).await {
+                tracing::error!(error = %e, key = %key, "Failed to store Maven artifact");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
 
@@ -331,7 +338,10 @@ async fn upload(
                     state.metrics.record_upload("maven");
                     StatusCode::CREATED.into_response()
                 }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, key = %key, "Failed to store Maven metadata");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
         }
 
@@ -350,7 +360,10 @@ async fn upload(
                 state.repo_index.invalidate("maven");
                 StatusCode::CREATED.into_response()
             }
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, key = %key, "Failed to store Maven artifact");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         },
     }
 }
