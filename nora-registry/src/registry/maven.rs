@@ -219,6 +219,9 @@ async fn download(
         }
     }
 
+    if !state.config.maven.proxies.is_empty() {
+        tracing::warn!(registry = "maven", path = %path, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 

@@ -421,6 +421,9 @@ async fn download_blob(
         }
     }
 
+    if !state.config.docker.upstreams.is_empty() {
+        tracing::warn!(registry = "docker", name = %name, digest = %digest, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -936,6 +939,9 @@ async fn get_manifest(
         }
     }
 
+    if !state.config.docker.upstreams.is_empty() {
+        tracing::warn!(registry = "docker", name = %name, reference = %reference, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 

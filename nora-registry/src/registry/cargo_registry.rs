@@ -233,6 +233,7 @@ async fn get_metadata(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, crate_name = %crate_name, "Cargo metadata proxy fetch failed");
+            tracing::warn!(registry = "cargo", crate_name = %crate_name, "Proxy failed, returning 404");
             StatusCode::NOT_FOUND.into_response()
         }
     }
@@ -369,6 +370,7 @@ async fn download(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, crate_name = %crate_name, version = %version, "Cargo crate proxy fetch failed");
+            tracing::warn!(registry = "cargo", crate_name = %crate_name, version = %version, "Proxy failed, returning 404");
             StatusCode::NOT_FOUND.into_response()
         }
     }
