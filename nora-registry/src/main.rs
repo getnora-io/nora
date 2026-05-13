@@ -206,6 +206,47 @@ impl AppState {
     }
 }
 
+/// Mask credentials in a proxy URL for safe logging.
+///
+/// `http://user:pass@proxy:3128` → `http://***@proxy:3128`
+fn sanitize_proxy_url(url: &str) -> String {
+    // Try to find userinfo (anything before @ in authority)
+    if let Some(at_pos) = url.find('@') {
+        // Find the scheme separator
+        let scheme_end = url.find("://").map(|p| p + 3).unwrap_or(0);
+        if at_pos > scheme_end {
+            return format!("{}***@{}", &url[..scheme_end], &url[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// Log detected outbound proxy configuration from environment variables.
+fn log_outbound_proxy() {
+    let vars = [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ];
+    for var in &vars {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                info!(var = %var, proxy = %sanitize_proxy_url(&val), "Outbound proxy detected from environment");
+                break;
+            }
+        }
+    }
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    if !no_proxy.is_empty() {
+        info!(no_proxy = %no_proxy, "NO_PROXY exclusions configured");
+    }
+}
+
 /// Build HTTP client with optional custom CA certificate support.
 fn build_http_client(tls: &TlsConfig) -> reqwest::Client {
     let mut builder = reqwest::ClientBuilder::new();
@@ -748,6 +789,7 @@ async fn run_server(config: Config, storage: Storage) {
     let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
 
     let http_client = build_http_client(&config.tls);
+    log_outbound_proxy();
 
     // Initialize curation engine
     let mut curation_engine = curation::CurationEngine::new(config.curation.clone());
@@ -1124,5 +1166,44 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     }
     if !uncovered.is_empty() {
         println!("\nNote: No retention rules for: {}", uncovered.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::sanitize_proxy_url;
+
+    #[test]
+    fn sanitize_with_credentials() {
+        assert_eq!(
+            sanitize_proxy_url("http://user:p%40ss@proxy:3128"),
+            "http://***@proxy:3128"
+        );
+    }
+
+    #[test]
+    fn sanitize_user_only() {
+        assert_eq!(
+            sanitize_proxy_url("http://admin@proxy:3128"),
+            "http://***@proxy:3128"
+        );
+    }
+
+    #[test]
+    fn sanitize_no_credentials() {
+        assert_eq!(sanitize_proxy_url("http://proxy:3128"), "http://proxy:3128");
+    }
+
+    #[test]
+    fn sanitize_socks5() {
+        assert_eq!(
+            sanitize_proxy_url("socks5://user:pass@proxy:1080"),
+            "socks5://***@proxy:1080"
+        );
+    }
+
+    #[test]
+    fn sanitize_empty() {
+        assert_eq!(sanitize_proxy_url(""), "");
     }
 }
