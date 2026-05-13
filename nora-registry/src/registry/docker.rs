@@ -458,41 +458,6 @@ async fn download_blob(
         }
     }
 
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
-            match fetch_blob_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &digest,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-                &state.circuit_breaker,
-            )
-            .await
-            {
-                Ok(data) => {
-                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
-
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        Bytes::from(data),
-                    )
-                        .into_response();
-                }
-                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(e) => {
-                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, "Docker blob proxy fetch failed, trying next");
-                    continue;
-                }
-            }
-        }
-    }
-
     if !state.config.docker.upstreams.is_empty() {
         tracing::warn!(registry = "docker", name = %name, digest = %digest, "Proxy failed, returning 404");
     }
