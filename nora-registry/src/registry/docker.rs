@@ -234,7 +234,11 @@ async fn check_blob(
             [(header::CONTENT_LENGTH, data.len().to_string())],
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to check blob existence");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -340,38 +344,9 @@ async fn download_blob(
                     .into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
-        }
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
-            match fetch_blob_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &digest,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-                &state.circuit_breaker,
-            )
-            .await
-            {
-                Ok(data) => {
-                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
-
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        Bytes::from(data),
-                    )
-                        .into_response();
-                }
-                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, "Docker blob proxy fetch failed, trying next");
+                continue;
             }
         }
     }
@@ -403,7 +378,45 @@ async fn download_blob(
                         .into_response();
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, "Docker blob proxy fetch failed, trying next");
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        for upstream in &state.config.docker.upstreams {
+            match fetch_blob_from_upstream(
+                &state.http_client,
+                &upstream.url,
+                &library_name,
+                &digest,
+                &state.docker_auth,
+                state.config.docker.proxy_timeout,
+                upstream.auth.as_deref(),
+                &state.circuit_breaker,
+            )
+            .await
+            {
+                Ok(data) => {
+                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
+
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        Bytes::from(data),
+                    )
+                        .into_response();
+                }
+                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+                Err(e) => {
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, "Docker blob proxy fetch failed, trying next");
+                    continue;
+                }
             }
         }
     }
@@ -855,7 +868,10 @@ async fn get_manifest(
                     .into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
+                continue;
+            }
         }
     }
 
@@ -912,7 +928,10 @@ async fn get_manifest(
                         .into_response();
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
+                    continue;
+                }
             }
         }
     }

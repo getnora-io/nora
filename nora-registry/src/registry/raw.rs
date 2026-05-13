@@ -101,7 +101,11 @@ async fn download(
                 .expect("valid response")
                 .into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to read raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -231,14 +235,18 @@ async fn upload(
             state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
-/// Overwrite an existing file (conditional PUT with If-Match).
+/// Overwrite an existing file (conditional PUT with `If-Match`).
 async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8]) -> Response {
     // Delete old, write new (within publish_lock — atomic from NORA's perspective)
-    if state.storage.delete(key).await.is_err() {
+    if let Err(e) = state.storage.delete(key).await {
+        tracing::error!(error = %e, key = %key, "Failed to delete raw artifact before overwrite");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     match state.storage.put(key, body).await {
@@ -256,7 +264,10 @@ async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8])
             state.repo_index.invalidate("raw");
             StatusCode::OK.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -272,7 +283,10 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String
             StatusCode::NO_CONTENT.into_response()
         }
         Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to delete raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

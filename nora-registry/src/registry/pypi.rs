@@ -173,7 +173,9 @@ async fn package_versions(
             Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
                 return circuit_open_response(&reg)
             }
-            Err(_) => {} // Upstream unavailable — fall through to local-only
+            Err(e) => {
+                tracing::debug!(error = ?e, package = %normalized, "PyPI versions proxy fetch failed, falling through to local-only");
+            }
         }
     }
 
@@ -325,14 +327,18 @@ async fn download_file(
                         Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
                             return circuit_open_response(&reg)
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            tracing::debug!(error = ?e, package = %normalized, filename = %filename, "PyPI file proxy fetch failed");
+                        }
                     }
                 }
             }
             Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
                 return circuit_open_response(&reg)
             }
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!(error = ?e, package = %normalized, "PyPI page proxy fetch failed");
+            }
         }
     }
 
