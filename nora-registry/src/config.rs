@@ -990,6 +990,8 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_REQUIRE_INTEGRITY` — require integrity metadata (default: false)
 /// - `NORA_CURATION_INTERNAL_NAMESPACES` — comma-separated glob patterns
 /// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
+/// - `NORA_CURATION_QUARANTINE` — quarantine mode: off/observe/enforce (default: off)
+/// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurationConfig {
     #[serde(default)]
@@ -1013,6 +1015,13 @@ pub struct CurationConfig {
     /// Packages published less than this duration ago are blocked.
     #[serde(default)]
     pub min_release_age: Option<String>,
+    /// Digest quarantine mode: "off" (default), "observe", or "enforce".
+    /// Tracks first-seen timestamps for proxy-fetched content digests.
+    #[serde(default)]
+    pub quarantine: Option<String>,
+    /// How long new digests are held in quarantine (e.g., "14d", "24h", "1w").
+    #[serde(default)]
+    pub quarantine_ttl: Option<String>,
     /// Per-registry curation overrides. Overrides `min_release_age` per registry.
     #[serde(default)]
     pub npm: RegistryCurationOverride,
@@ -1046,6 +1055,12 @@ pub struct RegistryCurationOverride {
     /// Override min_release_age for this specific registry.
     #[serde(default)]
     pub min_release_age: Option<String>,
+    /// Override quarantine mode for this specific registry.
+    #[serde(default)]
+    pub quarantine: Option<String>,
+    /// Override quarantine TTL for this specific registry.
+    #[serde(default)]
+    pub quarantine_ttl: Option<String>,
 }
 
 impl Default for CurationConfig {
@@ -1059,6 +1074,8 @@ impl Default for CurationConfig {
             require_integrity: false,
             internal_namespaces: Vec::new(),
             min_release_age: None,
+            quarantine: None,
+            quarantine_ttl: None,
             npm: RegistryCurationOverride::default(),
             pypi: RegistryCurationOverride::default(),
             cargo: RegistryCurationOverride::default(),
@@ -2136,6 +2153,12 @@ impl Config {
         if let Ok(val) = env::var("NORA_CURATION_MIN_RELEASE_AGE") {
             self.curation.min_release_age = if val.is_empty() { None } else { Some(val) };
         }
+        if let Ok(val) = env::var("NORA_CURATION_QUARANTINE") {
+            self.curation.quarantine = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_CURATION_QUARANTINE_TTL") {
+            self.curation.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
+        }
 
         // Circuit breaker config
         if let Ok(val) = env::var("NORA_CB_ENABLED") {
@@ -2169,6 +2192,12 @@ impl Config {
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };
+            }
+            if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE", env_suffix)) {
+                field.quarantine = if val.is_empty() { None } else { Some(val) };
+            }
+            if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE_TTL", env_suffix)) {
+                field.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
             }
         }
 
@@ -2973,6 +3002,41 @@ mod tests {
         assert_eq!(config.curation.mode, CurationMode::Audit);
         assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
         assert!(config.curation.require_integrity);
+        assert_eq!(config.curation.quarantine, None);
+    }
+
+    #[test]
+    fn test_curation_quarantine_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            quarantine = "enforce"
+            quarantine_ttl = "14d"
+
+            [curation.docker]
+            quarantine = "observe"
+            quarantine_ttl = "7d"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.quarantine, Some("enforce".to_string()));
+        assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
+        assert_eq!(
+            config.curation.docker.quarantine,
+            Some("observe".to_string())
+        );
+        assert_eq!(
+            config.curation.docker.quarantine_ttl,
+            Some("7d".to_string())
+        );
+        // Other registries should be None
+        assert_eq!(config.curation.npm.quarantine, None);
     }
 
     #[test]
@@ -3058,6 +3122,44 @@ mod tests {
         config.apply_env_overrides();
         assert!(config.curation.require_integrity);
         std::env::remove_var("NORA_CURATION_REQUIRE_INTEGRITY");
+    }
+
+    #[test]
+    fn test_curation_env_override_quarantine() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE", "observe");
+        config.apply_env_overrides();
+        assert_eq!(config.curation.quarantine, Some("observe".to_string()));
+        std::env::remove_var("NORA_CURATION_QUARANTINE");
+    }
+
+    #[test]
+    fn test_curation_env_override_quarantine_ttl() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE_TTL", "14d");
+        config.apply_env_overrides();
+        assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
+        std::env::remove_var("NORA_CURATION_QUARANTINE_TTL");
+    }
+
+    #[test]
+    fn test_curation_env_override_per_registry_quarantine() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
+        std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.curation.docker.quarantine,
+            Some("enforce".to_string())
+        );
+        assert_eq!(
+            config.curation.docker.quarantine_ttl,
+            Some("7d".to_string())
+        );
+        // Global should remain None
+        assert_eq!(config.curation.quarantine, None);
+        std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE");
+        std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_TTL");
     }
 
     #[test]
