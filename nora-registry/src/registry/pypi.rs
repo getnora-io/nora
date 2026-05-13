@@ -592,58 +592,6 @@ fn is_valid_pypi_filename(name: &str) -> bool {
             || ends_with_ci(name, ".egg"))
 }
 
-/// Rewrite PyPI links to point to our registry.
-fn rewrite_pypi_links(html: &str, package_name: &str, base_url: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut remaining = html;
-
-    while let Some(href_start) = remaining.find("href=\"") {
-        result.push_str(&remaining[..href_start + 6]);
-        remaining = &remaining[href_start + 6..];
-
-        if let Some(href_end) = remaining.find('"') {
-            let url = &remaining[..href_end];
-
-            if let Some(filename) = extract_filename(url) {
-                // Extract hash fragment from original URL
-                let hash_fragment = url.find('#').map(|pos| &url[pos..]).unwrap_or("");
-                let _ = write!(
-                    result,
-                    "{}/simple/{}/{}{}",
-                    base_url, package_name, filename, hash_fragment
-                );
-            } else {
-                result.push_str(url);
-            }
-
-            remaining = &remaining[href_end..];
-        }
-    }
-    result.push_str(remaining);
-
-    // Remove data-core-metadata and data-dist-info-metadata attributes
-    let result = remove_attribute(&result, "data-core-metadata");
-    remove_attribute(&result, "data-dist-info-metadata")
-}
-
-/// Remove an HTML attribute from all tags.
-fn remove_attribute(html: &str, attr_name: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut remaining = html;
-    let pattern = format!(" {}=\"", attr_name);
-
-    while let Some(attr_start) = remaining.find(&pattern) {
-        result.push_str(&remaining[..attr_start]);
-        remaining = &remaining[attr_start + pattern.len()..];
-
-        if let Some(attr_end) = remaining.find('"') {
-            remaining = &remaining[attr_end + 1..];
-        }
-    }
-    result.push_str(remaining);
-    result
-}
-
 /// Extract filename from PyPI download URL.
 fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
@@ -883,63 +831,6 @@ mod tests {
             extract_filename("package-1.0.tar.gz"),
             Some("package-1.0.tar.gz")
         );
-    }
-
-    #[test]
-    fn test_remove_attribute_present() {
-        let html = r#"<a href="url" data-core-metadata="true">link</a>"#;
-        let result = remove_attribute(html, "data-core-metadata");
-        assert_eq!(result, r#"<a href="url">link</a>"#);
-    }
-
-    #[test]
-    fn test_remove_attribute_absent() {
-        let html = r#"<a href="url">link</a>"#;
-        let result = remove_attribute(html, "data-core-metadata");
-        assert_eq!(result, html);
-    }
-
-    #[test]
-    fn test_remove_attribute_multiple() {
-        let html =
-            r#"<a data-core-metadata="true">one</a><a data-core-metadata="sha256=abc">two</a>"#;
-        let result = remove_attribute(html, "data-core-metadata");
-        assert_eq!(result, r#"<a>one</a><a>two</a>"#);
-    }
-
-    #[test]
-    fn test_rewrite_pypi_links_basic() {
-        let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = rewrite_pypi_links(html, "flask", "https://registry.example.com");
-        assert!(result
-            .contains("https://registry.example.com/simple/flask/flask-2.0.tar.gz#sha256=abc"));
-    }
-
-    #[test]
-    fn test_rewrite_pypi_links_preserves_hash() {
-        let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
-        let result = rewrite_pypi_links(html, "pkg", "http://localhost:4000");
-        assert!(result.contains("#sha256=deadbeef"));
-    }
-
-    #[test]
-    fn test_rewrite_pypi_links_unknown_ext() {
-        let html = r#"<a href="https://example.com/readme.txt">readme</a>"#;
-        let result = rewrite_pypi_links(html, "test", "http://localhost:4000");
-        assert!(result.contains("https://example.com/readme.txt"));
-    }
-
-    #[test]
-    fn test_rewrite_pypi_links_removes_metadata_attrs() {
-        let html = r#"<a href="https://example.com/pkg-1.0.whl" data-core-metadata="sha256=abc" data-dist-info-metadata="sha256=def">pkg</a>"#;
-        let result = rewrite_pypi_links(html, "pkg", "http://localhost:4000");
-        assert!(!result.contains("data-core-metadata"));
-        assert!(!result.contains("data-dist-info-metadata"));
-    }
-
-    #[test]
-    fn test_rewrite_pypi_links_empty() {
-        assert_eq!(rewrite_pypi_links("", "pkg", "http://localhost:4000"), "");
     }
 
     #[test]
