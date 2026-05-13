@@ -107,6 +107,11 @@ async fn list_packages(
 // ============================================================================
 
 /// GET /simple/{name}/ — list files for a package (PEP 503 HTML or PEP 691 JSON).
+///
+/// When proxy is configured, always fetches the upstream index and merges with
+/// locally cached/uploaded files. This ensures pip sees all available wheels
+/// (e.g. both cp310 and cp314) regardless of which were cached first.
+/// Falls back to local-only when upstream is unavailable.
 async fn package_versions(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -114,11 +119,11 @@ async fn package_versions(
 ) -> Response {
     let normalized = normalize_name(&name);
     let prefix = format!("pypi/{}/", normalized);
-    let keys = state.storage.list(&prefix).await;
     let base_url = nora_base_url(&state);
 
-    // Collect files with their hashes
-    let mut files: Vec<FileEntry> = Vec::new();
+    // Collect local files with their hashes
+    let keys = state.storage.list(&prefix).await;
+    let mut local_files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
             if !filename.is_empty() && !ends_with_ci(filename, ".sha256") {
@@ -128,7 +133,7 @@ async fn package_versions(
                     .await
                     .ok()
                     .and_then(|d| String::from_utf8(d.to_vec()).ok());
-                files.push(FileEntry {
+                local_files.push(FileEntry {
                     filename: filename.to_string(),
                     sha256,
                 });
@@ -136,15 +141,9 @@ async fn package_versions(
         }
     }
 
-    if !files.is_empty() {
-        return if wants_json(&headers) {
-            versions_json_response(&normalized, &files, &base_url)
-        } else {
-            versions_html_response(&normalized, &files, &base_url)
-        };
-    }
-
-    // Try proxy if configured
+    // When proxy is configured, fetch upstream index and merge with local files.
+    // This fixes the case where a cp314 wheel is cached but pip 3.10 needs to
+    // see the full upstream file list to find a compatible cp310 wheel.
     if let Some(proxy_url) = &state.config.pypi.proxy {
         let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
 
@@ -160,14 +159,31 @@ async fn package_versions(
         .await
         {
             Ok(html) => {
-                let rewritten = rewrite_pypi_links(&html, &normalized, &base_url);
-                return (StatusCode::OK, Html(rewritten)).into_response();
+                let upstream_files = parse_upstream_files(&html);
+                let merged = merge_file_lists(upstream_files, &local_files);
+
+                if !merged.is_empty() {
+                    return if wants_json(&headers) {
+                        versions_json_response(&normalized, &merged, &base_url)
+                    } else {
+                        versions_html_response(&normalized, &merged, &base_url)
+                    };
+                }
             }
             Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
                 return circuit_open_response(&reg)
             }
-            Err(_) => {}
+            Err(_) => {} // Upstream unavailable — fall through to local-only
         }
+    }
+
+    // No proxy configured, or proxy failed — return local files only
+    if !local_files.is_empty() {
+        return if wants_json(&headers) {
+            versions_json_response(&normalized, &local_files, &base_url)
+        } else {
+            versions_html_response(&normalized, &local_files, &base_url)
+        };
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -645,6 +661,56 @@ fn extract_filename(url: &str) -> Option<&str> {
     }
 }
 
+/// Parse upstream PyPI simple index HTML into file entries.
+///
+/// Extracts filenames and optional `#sha256=` fragments from `<a href="...">` links.
+fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
+    let mut files = Vec::new();
+    let mut remaining = html;
+
+    while let Some(href_start) = remaining.find("href=\"") {
+        remaining = &remaining[href_start + 6..];
+        if let Some(href_end) = remaining.find('"') {
+            let url = &remaining[..href_end];
+            if let Some(filename) = extract_filename(url) {
+                let sha256 = url
+                    .find("#sha256=")
+                    .map(|pos| url[pos + 8..].to_string());
+                files.push(FileEntry {
+                    filename: filename.to_string(),
+                    sha256,
+                });
+            }
+            remaining = &remaining[href_end..];
+        }
+    }
+    files
+}
+
+/// Merge upstream and local file lists.
+///
+/// Local entries take precedence (they have verified hashes from storage).
+/// Upstream entries are added only if no local file with the same name exists.
+fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEntry> {
+    let seen: std::collections::HashSet<&str> = local.iter().map(|f| f.filename.as_str()).collect();
+    let mut result = Vec::with_capacity(upstream.len() + local.len());
+
+    for f in local {
+        result.push(FileEntry {
+            filename: f.filename.clone(),
+            sha256: f.sha256.clone(),
+        });
+    }
+
+    for f in upstream {
+        if !seen.contains(f.filename.as_str()) {
+            result.push(f);
+        }
+    }
+
+    result
+}
+
 /// Find the download URL for a specific file in the HTML.
 fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
     let mut remaining = html;
@@ -934,6 +1000,104 @@ mod tests {
     fn test_wants_json_no_header() {
         let headers = HeaderMap::new();
         assert!(!wants_json(&headers));
+    }
+
+    // --- parse_upstream_files ---
+
+    #[test]
+    fn test_parse_upstream_files_basic() {
+        let html = r#"<a href="https://files.example.com/pkg-1.0-cp310-cp310-linux_x86_64.whl#sha256=aaa">pkg</a>
+<a href="https://files.example.com/pkg-1.0-cp314-cp314-linux_x86_64.whl#sha256=bbb">pkg</a>"#;
+        let files = parse_upstream_files(html);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename, "pkg-1.0-cp310-cp310-linux_x86_64.whl");
+        assert_eq!(files[0].sha256.as_deref(), Some("aaa"));
+        assert_eq!(files[1].filename, "pkg-1.0-cp314-cp314-linux_x86_64.whl");
+        assert_eq!(files[1].sha256.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn test_parse_upstream_files_no_hash() {
+        let html = r#"<a href="https://example.com/pkg-1.0.tar.gz">pkg</a>"#;
+        let files = parse_upstream_files(html);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "pkg-1.0.tar.gz");
+        assert!(files[0].sha256.is_none());
+    }
+
+    #[test]
+    fn test_parse_upstream_files_empty() {
+        assert!(parse_upstream_files("").is_empty());
+        assert!(parse_upstream_files("<html><body></body></html>").is_empty());
+    }
+
+    #[test]
+    fn test_parse_upstream_files_skips_non_package_links() {
+        let html = r#"<a href="https://example.com/readme.txt">readme</a>
+<a href="https://example.com/pkg-1.0.whl#sha256=abc">pkg</a>"#;
+        let files = parse_upstream_files(html);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "pkg-1.0.whl");
+    }
+
+    // --- merge_file_lists ---
+
+    #[test]
+    fn test_merge_disjoint() {
+        let upstream = vec![FileEntry {
+            filename: "pkg-1.0-cp314-cp314-linux_x86_64.whl".to_string(),
+            sha256: Some("uuu".to_string()),
+        }];
+        let local = vec![FileEntry {
+            filename: "pkg-1.0-cp310-cp310-linux_x86_64.whl".to_string(),
+            sha256: Some("lll".to_string()),
+        }];
+        let merged = merge_file_lists(upstream, &local);
+        assert_eq!(merged.len(), 2);
+        // Local first
+        assert_eq!(merged[0].filename, "pkg-1.0-cp310-cp310-linux_x86_64.whl");
+        assert_eq!(merged[1].filename, "pkg-1.0-cp314-cp314-linux_x86_64.whl");
+    }
+
+    #[test]
+    fn test_merge_local_wins_on_duplicate() {
+        let upstream = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".to_string(),
+            sha256: Some("upstream-hash".to_string()),
+        }];
+        let local = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".to_string(),
+            sha256: Some("local-verified-hash".to_string()),
+        }];
+        let merged = merge_file_lists(upstream, &local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].sha256.as_deref(), Some("local-verified-hash"));
+    }
+
+    #[test]
+    fn test_merge_empty_upstream() {
+        let local = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".to_string(),
+            sha256: None,
+        }];
+        let merged = merge_file_lists(vec![], &local);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_empty_local() {
+        let upstream = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".to_string(),
+            sha256: Some("hash".to_string()),
+        }];
+        let merged = merge_file_lists(upstream, &[]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_both_empty() {
+        let merged = merge_file_lists(vec![], &[]);
+        assert!(merged.is_empty());
     }
 }
 
