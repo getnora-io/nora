@@ -142,7 +142,7 @@ impl DigestStore {
                                 }
                             }
                             Err(e) => {
-                                warn!(error = %e, "Skipping unparseable quarantine entry");
+                                warn!(error = %e, "Skipping unparsable quarantine entry");
                                 skipped += 1;
                             }
                         }
