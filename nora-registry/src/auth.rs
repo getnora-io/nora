@@ -398,8 +398,22 @@ pub struct TokenListResponse {
 /// Create a new API token (requires Basic auth)
 async fn create_token(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
+    let client_ip = addr.ip();
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            format!(
+                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                retry_after
+            ),
+        )
+            .into_response();
+    }
+
     // Verify user credentials first
     let auth = match &state.auth {
         Some(auth) => auth,
@@ -407,8 +421,11 @@ async fn create_token(
     };
 
     if !auth.authenticate(&req.username, &req.password) {
+        state.auth_failures.record_failure(client_ip);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
+
+    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -446,16 +463,33 @@ async fn create_token(
 /// List tokens for authenticated user
 async fn list_tokens(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
+    let client_ip = addr.ip();
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            format!(
+                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                retry_after
+            ),
+        )
+            .into_response();
+    }
+
     let auth = match &state.auth {
         Some(auth) => auth,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
     };
 
     if !auth.authenticate(&req.username, &req.password) {
+        state.auth_failures.record_failure(client_ip);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
+
+    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -494,16 +528,33 @@ pub struct RevokeRequest {
 /// Revoke a token
 async fn revoke_token(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RevokeRequest>,
 ) -> Response {
+    let client_ip = addr.ip();
+    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            format!(
+                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                retry_after
+            ),
+        )
+            .into_response();
+    }
+
     let auth = match &state.auth {
         Some(auth) => auth,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
     };
 
     if !auth.authenticate(&req.username, &req.password) {
+        state.auth_failures.record_failure(client_ip);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
+
+    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
