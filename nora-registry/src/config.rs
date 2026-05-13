@@ -317,6 +317,8 @@ pub struct RawConfig {
     pub enabled: bool,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64, // in bytes
+    #[serde(default = "default_raw_cache_control")]
+    pub cache_control: String,
 }
 
 /// RubyGems proxy configuration
@@ -549,6 +551,10 @@ fn default_max_file_size() -> u64 {
     104_857_600 // 100MB
 }
 
+fn default_raw_cache_control() -> String {
+    "no-cache".to_string()
+}
+
 /// CIDR-aware trusted proxy list for X-Forwarded-For validation.
 ///
 /// Only connections from trusted proxies have their XFF/X-Real-IP headers
@@ -756,6 +762,7 @@ impl Default for RawConfig {
         Self {
             enabled: true,
             max_file_size: 104_857_600, // 100MB
+            cache_control: default_raw_cache_control(),
         }
     }
 }
@@ -1924,6 +1931,9 @@ impl Config {
                 self.raw.max_file_size = size;
             }
         }
+        if let Ok(val) = env::var("NORA_RAW_CACHE_CONTROL") {
+            self.raw.cache_control = val;
+        }
 
         // Gems config
         if let Ok(val) = env::var("NORA_GEMS_PROXY") {
@@ -2547,11 +2557,14 @@ mod tests {
         let mut config = Config::default();
         std::env::set_var("NORA_RAW_ENABLED", "false");
         std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
+        std::env::set_var("NORA_RAW_CACHE_CONTROL", "no-cache");
         config.apply_env_overrides();
         assert!(!config.raw.enabled);
         assert_eq!(config.raw.max_file_size, 524288000);
+        assert_eq!(config.raw.cache_control, "no-cache");
         std::env::remove_var("NORA_RAW_ENABLED");
         std::env::remove_var("NORA_RAW_MAX_FILE_SIZE");
+        std::env::remove_var("NORA_RAW_CACHE_CONTROL");
     }
 
     #[test]

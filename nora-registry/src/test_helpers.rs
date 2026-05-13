@@ -134,6 +134,7 @@ fn build_context(
         raw: RawConfig {
             enabled: true,
             max_file_size: 1_048_576, // 1 MB
+            cache_control: "no-cache".to_string(),
         },
         gems: GemsConfig::default(),
         terraform: TerraformConfig::default(),
