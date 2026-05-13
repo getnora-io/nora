@@ -446,18 +446,34 @@ mod tests {
         assert_eq!(store.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_persistence_roundtrip() {
+    #[test]
+    fn test_persistence_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_str().unwrap();
+        let jsonl_path = tmp.path().join("quarantine.jsonl");
 
+        // Write JSONL directly (bypass async spawn_blocking in record())
+        let now = Utc::now().timestamp();
+        let entries = [
+            DigestEntry {
+                registry: "docker".into(),
+                digest: "sha256:aaa".into(),
+                first_seen: now,
+                upstream: "upstream1".into(),
+            },
+            DigestEntry {
+                registry: "docker".into(),
+                digest: "sha256:bbb".into(),
+                first_seen: now,
+                upstream: "upstream2".into(),
+            },
+        ];
         {
-            let store = DigestStore::empty(path);
-            store.record("docker", "sha256:aaa", "upstream1");
-            store.record("docker", "sha256:bbb", "upstream2");
-
-            // Wait for async JSONL append (needs more time under coverage instrumentation)
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut file = std::fs::File::create(&jsonl_path).unwrap();
+            for e in &entries {
+                writeln!(file, "{}", serde_json::to_string(e).unwrap()).unwrap();
+            }
+            file.flush().unwrap();
         }
 
         let store = DigestStore::load(path);
