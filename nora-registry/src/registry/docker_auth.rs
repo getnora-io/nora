@@ -81,6 +81,13 @@ impl DockerAuth {
         let params = parse_www_authenticate(www_authenticate)?;
 
         let realm = params.get("realm")?;
+
+        // Validate realm URL scheme — only HTTP(S) allowed
+        if !realm.starts_with("https://") && !realm.starts_with("http://") {
+            tracing::warn!(realm = %realm, "Rejecting auth realm with non-HTTP(S) scheme");
+            return None;
+        }
+
         let service = params.get("service").map(|s| s.as_str()).unwrap_or("");
 
         // Build token request URL
