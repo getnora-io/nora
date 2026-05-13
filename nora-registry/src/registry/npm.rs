@@ -239,7 +239,9 @@ async fn handle_request(
                 return with_content_type(is_tarball, data_to_serve.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!(error = ?e, path = %path, "npm proxy fetch failed");
+            }
         }
     }
 
