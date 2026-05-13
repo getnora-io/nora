@@ -456,8 +456,8 @@ mod tests {
             store.record("docker", "sha256:aaa", "upstream1");
             store.record("docker", "sha256:bbb", "upstream2");
 
-            // Wait for async JSONL append
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Wait for async JSONL append (needs more time under coverage instrumentation)
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
 
         let store = DigestStore::load(path);
