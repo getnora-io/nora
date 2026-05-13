@@ -243,6 +243,7 @@ async fn handle_request(
                 tracing::debug!(error = ?e, path = %path, "npm proxy fetch failed");
             }
         }
+        tracing::warn!(registry = "npm", path = %path, "Proxy failed, returning 404");
     }
 
     StatusCode::NOT_FOUND.into_response()

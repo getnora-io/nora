@@ -177,6 +177,7 @@ async fn package_versions(
                 tracing::debug!(error = ?e, package = %normalized, "PyPI versions proxy fetch failed, falling through to local-only");
             }
         }
+        tracing::warn!(registry = "pypi", package = %normalized, "Proxy failed, returning 404");
     }
 
     // No proxy configured, or proxy failed — return local files only
@@ -340,6 +341,7 @@ async fn download_file(
                 tracing::debug!(error = ?e, package = %normalized, "PyPI page proxy fetch failed");
             }
         }
+        tracing::warn!(registry = "pypi", package = %normalized, filename = %filename, "Proxy failed, returning 404");
     }
 
     StatusCode::NOT_FOUND.into_response()
