@@ -319,15 +319,15 @@ async fn upload(
             update_artifact_metadata(&state, &coords.group_path, &coords.artifact_id).await;
 
             state.metrics.record_upload("maven");
+            state
+                .audit
+                .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 artifact_name,
                 "maven",
                 "LOCAL",
             ));
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", "", "maven", ""));
             state.repo_index.invalidate("maven");
 
             StatusCode::CREATED.into_response()
@@ -351,15 +351,15 @@ async fn upload(
         MavenPathKind::Opaque => match state.storage.put(&key, &body).await {
             Ok(()) => {
                 state.metrics.record_upload("maven");
+                state
+                    .audit
+                    .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
                 state.activity.push(ActivityEntry::new(
                     ActionType::Push,
                     artifact_name,
                     "maven",
                     "LOCAL",
                 ));
-                state
-                    .audit
-                    .log(AuditEntry::new("push", "api", "", "maven", ""));
                 state.repo_index.invalidate("maven");
                 StatusCode::CREATED.into_response()
             }

@@ -367,7 +367,7 @@ async fn main() {
                 println!("  Keys deleted:       {}", result.deleted_keys);
                 println!("  Bytes freed:        {}", result.bytes_freed);
                 if result.planned > 0 {
-                    let audit = AuditLog::new(&config.storage.path);
+                    let audit = AuditLog::new(&config.storage.path, config.audit.mode.clone());
                     audit.log(audit::AuditEntry::new(
                         "retention-apply",
                         "cli",
@@ -891,6 +891,7 @@ async fn run_server(config: Config, storage: Storage) {
     let startup_duration_ms = start_time.elapsed().as_millis() as u64;
 
     let cb_config = config.circuit_breaker.clone();
+    let audit_mode = config.audit.mode.clone();
 
     let state = Arc::new(AppState {
         storage,
@@ -902,7 +903,7 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
         metrics: DashboardMetrics::with_persistence(&storage_path),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path),
+        audit: AuditLog::new(&storage_path, audit_mode.clone()),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,
@@ -938,7 +939,10 @@ async fn run_server(config: Config, storage: Storage) {
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,
-            Some(std::sync::Arc::new(audit::AuditLog::new(&storage_path))),
+            Some(std::sync::Arc::new(audit::AuditLog::new(
+                &storage_path,
+                audit_mode,
+            ))),
             cleanup_lock.clone(),
         );
         info!(
