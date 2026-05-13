@@ -673,9 +673,7 @@ fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
         if let Some(href_end) = remaining.find('"') {
             let url = &remaining[..href_end];
             if let Some(filename) = extract_filename(url) {
-                let sha256 = url
-                    .find("#sha256=")
-                    .map(|pos| url[pos + 8..].to_string());
+                let sha256 = url.find("#sha256=").map(|pos| url[pos + 8..].to_string());
                 files.push(FileEntry {
                     filename: filename.to_string(),
                     sha256,
