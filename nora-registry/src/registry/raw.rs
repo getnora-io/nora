@@ -92,7 +92,7 @@ async fn download(
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
             if let Some(hash) = state.storage.get_pin_hash(&key) {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -305,7 +305,7 @@ async fn check_exists(State(state): State<Arc<AppState>>, Path(path): Path<Strin
                 .status(StatusCode::OK)
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
                 .header(header::CONTENT_TYPE, guess_content_type(&key))
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
             if let Some(hash) = state.storage.get_pin_hash(&key) {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -830,5 +830,21 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], b"updated");
+    }
+
+    #[tokio::test]
+    async fn test_raw_cache_control_default() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/cc.txt", b"data".to_vec()).await;
+
+        let get = send(&ctx.app, Method::GET, "/raw/cc.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let cc = get
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "no-cache");
     }
 }
