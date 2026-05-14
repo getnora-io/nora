@@ -244,11 +244,8 @@ async fn upload(
 
 /// Overwrite an existing file (conditional PUT with `If-Match`).
 async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8]) -> Response {
-    // Delete old, write new (within publish_lock — atomic from NORA's perspective)
-    if let Err(e) = state.storage.delete(key).await {
-        tracing::error!(error = %e, key = %key, "Failed to delete raw artifact before overwrite");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    // Direct put() — both filesystem and S3 backends overwrite in-place,
+    // avoiding the 404 window that delete-then-put created for concurrent readers.
     match state.storage.put(key, body).await {
         Ok(()) => {
             state.metrics.record_upload("raw");

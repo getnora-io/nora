@@ -437,18 +437,38 @@ async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_i
 }
 
 fn sort_maven_versions(versions: &mut [String]) {
-    versions.sort_by(|a, b| {
-        let a_base = a.strip_suffix("-SNAPSHOT").unwrap_or(a);
-        let b_base = b.strip_suffix("-SNAPSHOT").unwrap_or(b);
-        match a_base.cmp(b_base) {
-            std::cmp::Ordering::Equal => {
-                let a_snap = a.ends_with("-SNAPSHOT");
-                let b_snap = b.ends_with("-SNAPSHOT");
-                a_snap.cmp(&b_snap)
-            }
-            other => other,
+    versions.sort_by(|a, b| compare_maven_versions(a, b));
+}
+
+/// Compare Maven versions: split on `.`/`-`, compare numeric segments numerically.
+/// SNAPSHOT sorts before release for the same base version.
+fn compare_maven_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_base = a.strip_suffix("-SNAPSHOT").unwrap_or(a);
+    let b_base = b.strip_suffix("-SNAPSHOT").unwrap_or(b);
+
+    let a_parts: Vec<&str> = a_base.split(['.', '-']).collect();
+    let b_parts: Vec<&str> = b_base.split(['.', '-']).collect();
+
+    for (ap, bp) in a_parts.iter().zip(b_parts.iter()) {
+        let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
+            (Ok(an), Ok(bn)) => an.cmp(&bn),
+            _ => ap.cmp(bp),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
         }
-    });
+    }
+
+    // If all compared parts equal, shorter version is less (1.0 < 1.0.1)
+    let base_ord = a_parts.len().cmp(&b_parts.len());
+    if base_ord != std::cmp::Ordering::Equal {
+        return base_ord;
+    }
+
+    // Same base: SNAPSHOT before release (1.0-SNAPSHOT < 1.0)
+    let a_snap = a.ends_with("-SNAPSHOT");
+    let b_snap = b.ends_with("-SNAPSHOT");
+    b_snap.cmp(&a_snap)
 }
 
 /// Escape XML special characters in interpolated values.
@@ -716,10 +736,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_snapshot_after_release() {
+    fn test_sort_snapshot_before_release() {
         let mut v = vec!["1.0.0-SNAPSHOT".into(), "1.0.0".into(), "0.9.0".into()];
         sort_maven_versions(&mut v);
-        assert_eq!(v, vec!["0.9.0", "1.0.0", "1.0.0-SNAPSHOT"]);
+        assert_eq!(v, vec!["0.9.0", "1.0.0-SNAPSHOT", "1.0.0"]);
+    }
+
+    #[test]
+    fn test_sort_numeric_segments() {
+        let mut v = vec!["10.0.0".into(), "9.0.0".into(), "2.1.0".into()];
+        sort_maven_versions(&mut v);
+        assert_eq!(v, vec!["2.1.0", "9.0.0", "10.0.0"]);
     }
 
     // ── Metadata XML generation ─────────────────────────────────────────
