@@ -53,6 +53,7 @@ use repo_index::RepoIndex;
 pub use storage::Storage;
 use tokens::TokenStore;
 
+use futures::FutureExt;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
@@ -181,11 +182,19 @@ impl AppState {
     /// avoiding the race condition where invalidation fires before the file lands on S3.
     pub fn spawn_cache(self: &Arc<Self>, registry: &'static str, key: String, data: Bytes) {
         let state = Arc::clone(self);
-        tokio::spawn(async move {
-            if state.storage.put(&key, &data).await.is_ok() {
-                state.repo_index.invalidate(registry);
-            }
-        });
+        tokio::spawn(
+            std::panic::AssertUnwindSafe(async move {
+                if state.storage.put(&key, &data).await.is_ok() {
+                    state.repo_index.invalidate(registry);
+                }
+            })
+            .catch_unwind()
+            .map(|r| {
+                if let Err(e) = r {
+                    tracing::error!(panic = ?e, "background cache task panicked");
+                }
+            }),
+        );
     }
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
@@ -196,13 +205,21 @@ impl AppState {
         data: Bytes,
     ) {
         let state = Arc::clone(self);
-        tokio::spawn(async move {
-            if state.storage.stat(&key).await.is_none()
-                && state.storage.put(&key, &data).await.is_ok()
-            {
-                state.repo_index.invalidate(registry);
-            }
-        });
+        tokio::spawn(
+            std::panic::AssertUnwindSafe(async move {
+                if state.storage.stat(&key).await.is_none()
+                    && state.storage.put(&key, &data).await.is_ok()
+                {
+                    state.repo_index.invalidate(registry);
+                }
+            })
+            .catch_unwind()
+            .map(|r| {
+                if let Err(e) = r {
+                    tracing::error!(panic = ?e, "background cache task panicked");
+                }
+            }),
+        );
     }
 }
 
