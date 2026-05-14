@@ -534,7 +534,9 @@ pub fn render_mount_points_table(
                     <td class="px-4 py-3 text-slate-400">{}</td>
                 </tr>
                 "##,
-                registry, mount_path, proxy_display
+                html_escape(registry),
+                html_escape(mount_path),
+                html_escape(proxy_display)
             )
         })
         .collect();
@@ -591,12 +593,12 @@ pub fn render_activity_row(
             <td class="px-4 py-2 text-slate-500">{}</td>
         </tr>
         "##,
-        timestamp,
+        html_escape(timestamp),
         action_color,
-        action,
+        html_escape(action),
         html_escape(artifact),
-        registry,
-        source
+        html_escape(registry),
+        html_escape(source)
     )
 }
 

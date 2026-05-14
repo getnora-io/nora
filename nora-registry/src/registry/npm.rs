@@ -309,9 +309,10 @@ async fn handle_publish(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
     };
 
-    // Security: verify payload name matches URL path
-    if let Some(payload_name) = payload.get("name").and_then(|n| n.as_str()) {
-        if payload_name != package_name {
+    // Security: verify payload name matches URL path (required field)
+    match payload.get("name").and_then(|n| n.as_str()) {
+        Some(payload_name) if payload_name == package_name => {}
+        Some(payload_name) => {
             tracing::warn!(
                 url_name = %package_name,
                 payload_name = %payload_name,
@@ -320,6 +321,13 @@ async fn handle_publish(
             return (
                 StatusCode::BAD_REQUEST,
                 "Package name in URL does not match payload",
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Missing required 'name' field in publish payload",
             )
                 .into_response();
         }

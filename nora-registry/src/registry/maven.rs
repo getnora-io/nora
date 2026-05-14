@@ -234,12 +234,8 @@ async fn upload(
     Path(path): Path<String>,
     body: Bytes,
 ) -> Response {
-    if !path.is_ascii() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Path must contain only ASCII characters",
-        )
-            .into_response();
+    if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
     let key = format!("maven/{}", path);
@@ -455,6 +451,14 @@ fn sort_maven_versions(versions: &mut [String]) {
     });
 }
 
+/// Escape XML special characters in interpolated values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String]) -> String {
     let latest = versions.last().map(|s| s.as_str()).unwrap_or("");
     let release = versions
@@ -468,7 +472,7 @@ fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String])
 
     let version_elements: String = versions
         .iter()
-        .map(|v| format!("      <version>{}</version>", v))
+        .map(|v| format!("      <version>{}</version>", xml_escape(v)))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -487,7 +491,12 @@ fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String])
   </versioning>
 </metadata>
 "#,
-        group_id, artifact_id, latest, release, version_elements, now
+        xml_escape(group_id),
+        xml_escape(artifact_id),
+        xml_escape(latest),
+        xml_escape(release),
+        version_elements,
+        now
     )
 }
 
