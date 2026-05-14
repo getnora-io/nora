@@ -467,7 +467,9 @@ async fn upload(State(state): State<Arc<AppState>>, mut multipart: Multipart) ->
 
     // Store SHA-256 hash
     let hash_key = format!("{}.sha256", file_key);
-    let _ = state.storage.put(&hash_key, computed_hash.as_bytes()).await;
+    if let Err(e) = state.storage.put(&hash_key, computed_hash.as_bytes()).await {
+        tracing::warn!(key = %hash_key, error = %e, "pypi: failed to store hash sidecar");
+    }
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
