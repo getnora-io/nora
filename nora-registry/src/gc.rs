@@ -111,6 +111,15 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
         total_candidates
     );
 
+    // Sort orphans: delete blobs before manifests so that if GC is interrupted
+    // mid-run, we only leave harmless orphan blobs — never broken manifests
+    // pointing to already-deleted blobs (#305).
+    all_orphans.sort_by(|a, b| {
+        let a_is_manifest = a.contains("/manifests/");
+        let b_is_manifest = b.contains("/manifests/");
+        a_is_manifest.cmp(&b_is_manifest)
+    });
+
     let mut deleted = 0usize;
     let mut bytes_freed = 0u64;
 
