@@ -114,14 +114,21 @@ impl AuditLog {
         tokio::task::spawn_blocking(move || {
             let json = match serde_json::to_string(&entry) {
                 Ok(j) => j,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::error!(error = %e, "Audit log serialization failed");
+                    return;
+                }
             };
 
             // Write to file if mode is file or both
             if mode == AuditMode::File || mode == AuditMode::Both {
                 if let Some(ref mut file) = *writer.lock() {
-                    let _ = writeln!(file, "{}", json);
-                    let _ = file.flush();
+                    if let Err(e) = writeln!(file, "{}", json) {
+                        tracing::error!(error = %e, "Audit log write failed");
+                    }
+                    if let Err(e) = file.flush() {
+                        tracing::error!(error = %e, "Audit log flush failed");
+                    }
                 }
             }
 
