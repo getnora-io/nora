@@ -4,7 +4,7 @@
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{header, Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -154,42 +154,49 @@ fn is_docker_auth_challenge_path(path: &str) -> bool {
 /// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
 /// ignored and the peer IP is returned. This prevents attackers from spoofing
 /// their IP to bypass `AuthFailureTracker` lockout.
-fn extract_client_ip(
-    request: &Request<Body>,
+/// Resolve the real client IP from peer address and forwarding headers.
+/// If the peer is a trusted proxy, checks X-Forwarded-For and X-Real-IP.
+/// Otherwise returns the peer IP directly (prevents spoofing).
+fn resolve_client_ip(
+    peer: IpAddr,
+    headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
-) -> Option<IpAddr> {
-    let peer_ip = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
-
-    let peer = peer_ip?;
-
-    // Only trust forwarding headers from known proxies
+) -> IpAddr {
     if !trusted_proxies.contains(peer) {
-        return Some(peer);
+        return peer;
     }
 
     // Try X-Forwarded-For first (first IP in chain is the client)
-    if let Some(xff) = request.headers().get("x-forwarded-for") {
+    if let Some(xff) = headers.get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
             if let Some(first) = s.split(',').next() {
                 if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
+                    return ip;
                 }
             }
         }
     }
     // Try X-Real-IP
-    if let Some(xri) = request.headers().get("x-real-ip") {
+    if let Some(xri) = headers.get("x-real-ip") {
         if let Ok(s) = xri.to_str() {
             if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return Some(ip);
+                return ip;
             }
         }
     }
     // No forwarding headers — use peer IP
-    Some(peer)
+    peer
+}
+
+fn extract_client_ip(
+    request: &Request<Body>,
+    trusted_proxies: &crate::config::TrustedProxies,
+) -> Option<IpAddr> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())?;
+    Some(resolve_client_ip(peer, request.headers(), trusted_proxies))
 }
 
 /// Auth middleware - supports Basic auth and Bearer tokens
@@ -399,9 +406,10 @@ pub struct TokenListResponse {
 async fn create_token(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
-    let client_ip = addr.ip();
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
     if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -464,9 +472,10 @@ async fn create_token(
 async fn list_tokens(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
-    let client_ip = addr.ip();
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
     if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -529,9 +538,10 @@ pub struct RevokeRequest {
 async fn revoke_token(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
 ) -> Response {
-    let client_ip = addr.ip();
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
     if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,

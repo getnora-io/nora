@@ -525,8 +525,8 @@ async fn patch_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Append data to temp file and get total size
-    let total_size = {
+    // Phase 1: Validate session under lock, extract temp_path (no file I/O)
+    let (temp_path, new_size) = {
         let mut sessions = state.upload_sessions.write();
         let session = match sessions.get_mut(&uuid) {
             Some(s) => s,
@@ -569,32 +569,43 @@ async fn patch_blob(
                 .into_response();
         }
 
-        // Append to temp file
-        use std::io::Write;
-        let temp_path = session.temp_path.clone();
-        match std::fs::OpenOptions::new()
+        (session.temp_path.clone(), new_size)
+    }; // lock released before file I/O
+
+    // Phase 2: Append to temp file outside lock (non-blocking)
+    {
+        use tokio::io::AsyncWriteExt;
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&temp_path)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(&body) {
+            .await;
+        match file {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&body).await {
                     tracing::error!(error = %e, "Failed to write to upload temp file");
-                    let _ = std::fs::remove_file(&temp_path);
-                    sessions.remove(&uuid);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    state.upload_sessions.write().remove(&uuid);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to open upload temp file");
-                sessions.remove(&uuid);
+                state.upload_sessions.write().remove(&uuid);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
+    }
 
-        session.size = new_size as u64;
-        new_size
-    };
+    // Phase 3: Update session size (brief lock, no I/O)
+    {
+        let mut sessions = state.upload_sessions.write();
+        if let Some(session) = sessions.get_mut(&uuid) {
+            session.size = new_size as u64;
+        }
+    }
+
+    let total_size = new_size;
 
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
     // Range header indicates bytes 0 to (total_size - 1) have been received
@@ -637,49 +648,48 @@ async fn upload_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Get data from chunked session (temp file) if exists, otherwise use body directly
-    let data = {
+    // Remove session from map under brief lock, then do file I/O outside
+    let session_opt = {
         let mut sessions = state.upload_sessions.write();
-        if let Some(session) = sessions.remove(&uuid) {
-            // Verify session belongs to this repository
-            if session.name != name {
-                tracing::warn!(
-                    session_name = %session.name,
-                    request_name = %name,
-                    "SECURITY: upload finalization name mismatch"
-                );
-                let _ = std::fs::remove_file(&session.temp_path);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Session does not belong to this repository",
-                )
-                    .into_response();
-            }
-            // Read temp file if it exists (may not exist for monolithic uploads
-            // where no PATCH was sent before the final PUT)
-            let mut session_data = if session.temp_path.exists() {
-                match std::fs::read(&session.temp_path) {
-                    Ok(data) => {
-                        let _ = std::fs::remove_file(&session.temp_path);
-                        data
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to read upload temp file");
-                        let _ = std::fs::remove_file(&session.temp_path);
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            if !body.is_empty() {
-                session_data.extend_from_slice(&body);
-            }
-            session_data
-        } else {
-            // Monolithic upload: use body directly
-            body.to_vec()
+        sessions.remove(&uuid)
+    }; // lock released before file I/O
+
+    let data = if let Some(session) = session_opt {
+        // Verify session belongs to this repository
+        if session.name != name {
+            tracing::warn!(
+                session_name = %session.name,
+                request_name = %name,
+                "SECURITY: upload finalization name mismatch"
+            );
+            let _ = tokio::fs::remove_file(&session.temp_path).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                "Session does not belong to this repository",
+            )
+                .into_response();
         }
+        // Read temp file if it exists (may not exist for monolithic uploads
+        // where no PATCH was sent before the final PUT)
+        let mut session_data = match tokio::fs::read(&session.temp_path).await {
+            Ok(data) => {
+                let _ = tokio::fs::remove_file(&session.temp_path).await;
+                data
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read upload temp file");
+                let _ = tokio::fs::remove_file(&session.temp_path).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if !body.is_empty() {
+            session_data.extend_from_slice(&body);
+        }
+        session_data
+    } else {
+        // Monolithic upload: use body directly
+        body.to_vec()
     };
 
     // Only sha256 digests are supported for verification
