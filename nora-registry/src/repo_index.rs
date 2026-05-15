@@ -414,7 +414,7 @@ async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 /// Generic index builder: groups files under `prefix` by first path segment.
-/// Only counts files matching `suffix` (e.g. ".gem", ".tar.gz", "index.json").
+/// Only counts files matching `suffix` (e.g. ".gem", ".nupkg", ".tar.gz").
 async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> Vec<RepoInfo> {
     let keys = storage.list(prefix).await;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();

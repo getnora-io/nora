@@ -114,6 +114,78 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Resolve effective quarantine mode and TTL (seconds) for Docker.
+///
+/// Returns `(QuarantineMode, quarantine_secs)`. Per-registry override takes
+/// precedence over global curation config. Returns `(Off, 0)` when disabled.
+fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    use crate::digest_quarantine::QuarantineMode;
+
+    let mode_str = state
+        .config
+        .curation
+        .docker
+        .quarantine
+        .as_deref()
+        .or(state.config.curation.quarantine.as_deref())
+        .unwrap_or("off");
+
+    let mode = QuarantineMode::from_str_lossy(mode_str);
+    if matches!(mode, QuarantineMode::Off) {
+        return (QuarantineMode::Off, 0);
+    }
+
+    let ttl_str = state
+        .config
+        .curation
+        .docker
+        .quarantine_ttl
+        .as_deref()
+        .or(state.config.curation.quarantine_ttl.as_deref())
+        .unwrap_or("14d");
+
+    let secs = crate::curation::parse_duration(ttl_str).unwrap_or(14 * 86400);
+    (mode, secs)
+}
+
+/// Build an HTTP 403 response for a quarantined digest.
+fn quarantine_forbidden(
+    digest: &str,
+    status: &crate::digest_quarantine::QuarantineStatus,
+    quarantine_secs: i64,
+) -> Response {
+    let remaining = match status {
+        crate::digest_quarantine::QuarantineStatus::New => quarantine_secs,
+        crate::digest_quarantine::QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
+        crate::digest_quarantine::QuarantineStatus::Mature => 0,
+    };
+    let quarantine_until = chrono::Utc::now().timestamp() + remaining;
+
+    let body = json!({
+        "errors": [{
+            "code": "DENIED",
+            "message": "digest is in quarantine",
+            "detail": {
+                "digest": digest,
+                "quarantine_until": quarantine_until,
+            }
+        }]
+    });
+
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (
+                HeaderName::from_static("x-nora-quarantine"),
+                status.header_value(),
+            ),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -234,7 +306,11 @@ async fn check_blob(
             [(header::CONTENT_LENGTH, data.len().to_string())],
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to check blob existence");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -340,38 +416,9 @@ async fn download_blob(
                     .into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
-        }
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
-            match fetch_blob_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &digest,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-                &state.circuit_breaker,
-            )
-            .await
-            {
-                Ok(data) => {
-                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
-
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        Bytes::from(data),
-                    )
-                        .into_response();
-                }
-                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, "Docker blob proxy fetch failed, trying next");
+                continue;
             }
         }
     }
@@ -403,11 +450,17 @@ async fn download_blob(
                         .into_response();
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, "Docker blob proxy fetch failed, trying next");
+                    continue;
+                }
             }
         }
     }
 
+    if !state.config.docker.upstreams.is_empty() {
+        tracing::warn!(registry = "docker", name = %name, digest = %digest, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -667,6 +720,13 @@ async fn upload_blob(
     match state.storage.put(&key, &data).await {
         Ok(()) => {
             state.metrics.record_upload("docker");
+            state.audit.log(AuditEntry::new(
+                "push",
+                "api",
+                &format!("{}@{}", name, digest),
+                "docker",
+                "blob",
+            ));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 format!("{}@{}", name, &digest[..19.min(digest.len())]),
@@ -687,7 +747,10 @@ async fn upload_blob(
             )
                 .into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, "Failed to store blob");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -753,6 +816,26 @@ async fn get_manifest(
         use sha2::Digest;
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
+        // Quarantine check (local cache hit may still be pending)
+        let (q_mode, q_secs) = resolve_quarantine(&state);
+        if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+            let q_status = state.digest_store.check("docker", &digest, q_secs);
+            match &q_status {
+                crate::digest_quarantine::QuarantineStatus::Mature => {}
+                _ => {
+                    tracing::warn!(
+                        digest = %digest,
+                        status = %q_status.header_value(),
+                        mode = ?q_mode,
+                        "Quarantine: cached manifest"
+                    );
+                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+                        return quarantine_forbidden(&digest, &q_status, q_secs);
+                    }
+                }
+            }
+        }
+
         // Detect manifest media type from content
         let content_type = detect_manifest_media_type(&data);
 
@@ -810,6 +893,39 @@ async fn get_manifest(
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
+                // Quarantine: record digest, check status
+                let (q_mode, q_secs) = resolve_quarantine(&state);
+                if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                    state.digest_store.record("docker", &digest, &upstream.url);
+                    let q_status = state.digest_store.check("docker", &digest, q_secs);
+                    match &q_status {
+                        crate::digest_quarantine::QuarantineStatus::Mature => {}
+                        _ => {
+                            tracing::warn!(
+                                digest = %digest,
+                                upstream = %upstream.url,
+                                status = %q_status.header_value(),
+                                mode = ?q_mode,
+                                "Quarantine: proxy-fetched manifest"
+                            );
+                        }
+                    }
+                    // In enforce mode, still cache but block the client
+                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+                        && !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
+                    {
+                        // Cache manifest so it's ready after quarantine expires
+                        let storage = state.storage.clone();
+                        let key_clone = key.clone();
+                        let state_clone = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let _ = storage.put(&key_clone, &data).await;
+                            state_clone.repo_index.invalidate("docker");
+                        });
+                        return quarantine_forbidden(&digest, &q_status, q_secs);
+                    }
+                }
+
                 // Cache manifest and create metadata (fire and forget)
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
@@ -852,7 +968,10 @@ async fn get_manifest(
                     .into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
+                continue;
+            }
         }
     }
 
@@ -886,6 +1005,39 @@ async fn get_manifest(
                     use sha2::Digest;
                     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
 
+                    // Quarantine: record digest, check status
+                    let (q_mode, q_secs) = resolve_quarantine(&state);
+                    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                        state.digest_store.record("docker", &digest, &upstream.url);
+                        let q_status = state.digest_store.check("docker", &digest, q_secs);
+                        match &q_status {
+                            crate::digest_quarantine::QuarantineStatus::Mature => {}
+                            _ => {
+                                tracing::warn!(
+                                    digest = %digest,
+                                    upstream = %upstream.url,
+                                    status = %q_status.header_value(),
+                                    mode = ?q_mode,
+                                    "Quarantine: proxy-fetched manifest (library/)"
+                                );
+                            }
+                        }
+                        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+                            && !matches!(
+                                q_status,
+                                crate::digest_quarantine::QuarantineStatus::Mature
+                            )
+                        {
+                            // Cache even though quarantined
+                            let storage = state.storage.clone();
+                            let key_clone = key.clone();
+                            tokio::spawn(async move {
+                                let _ = storage.put(&key_clone, &data).await;
+                            });
+                            return quarantine_forbidden(&digest, &q_status, q_secs);
+                        }
+                    }
+
                     // Cache under original name for future local hits
                     let storage = state.storage.clone();
                     let key_clone = key.clone();
@@ -909,11 +1061,17 @@ async fn get_manifest(
                         .into_response();
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
+                    continue;
+                }
             }
         }
     }
 
+    if !state.config.docker.upstreams.is_empty() {
+        tracing::warn!(registry = "docker", name = %name, reference = %reference, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -932,6 +1090,12 @@ async fn put_manifest(
     // Calculate digest
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
+
+    // Local push → mark as immediately mature in quarantine store
+    let (q_mode, q_secs) = resolve_quarantine(&state);
+    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        state.digest_store.record_trusted("docker", &digest, q_secs);
+    }
 
     // Store by tag/reference
     let key = format!("docker/{}/manifests/{}.json", name, reference);
@@ -1061,7 +1225,10 @@ async fn delete_manifest(
             })),
         )
             .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, reference = %reference, "Failed to delete manifest");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1101,7 +1268,10 @@ async fn delete_blob(
             })),
         )
             .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, name = %name, digest = %digest, "Failed to delete blob");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

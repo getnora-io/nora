@@ -239,8 +239,11 @@ async fn handle_request(
                 return with_content_type(is_tarball, data_to_serve.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!(error = ?e, path = %path, "npm proxy fetch failed");
+            }
         }
+        tracing::warn!(registry = "npm", path = %path, "Proxy failed, returning 404");
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -456,15 +459,15 @@ async fn handle_publish(
     }
 
     state.metrics.record_upload("npm");
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", &package_name, "npm", ""));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         package_name,
         "npm",
         "LOCAL",
     ));
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", "", "npm", ""));
     state.repo_index.invalidate("npm");
 
     StatusCode::CREATED.into_response()

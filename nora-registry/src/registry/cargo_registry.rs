@@ -231,7 +231,11 @@ async fn get_metadata(
             (StatusCode::OK, data).into_response()
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::debug!(error = ?e, crate_name = %crate_name, "Cargo metadata proxy fetch failed");
+            tracing::warn!(registry = "cargo", crate_name = %crate_name, "Proxy failed, returning 404");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -364,7 +368,11 @@ async fn download(
                 .into_response()
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::debug!(error = ?e, crate_name = %crate_name, version = %version, "Cargo crate proxy fetch failed");
+            tracing::warn!(registry = "cargo", crate_name = %crate_name, version = %version, "Proxy failed, returning 404");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -550,15 +558,16 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     }
 
     state.metrics.record_upload("cargo");
+    let artifact = format!("{}@{}", name, vers);
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", &artifact, "cargo", ""));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
-        format!("{}@{}", name, vers),
+        artifact,
         "cargo",
         "LOCAL",
     ));
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", "", "cargo", ""));
     state.repo_index.invalidate("cargo");
 
     // Cargo expects a JSON response with warnings array

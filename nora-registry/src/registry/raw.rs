@@ -92,7 +92,7 @@ async fn download(
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
             if let Some(hash) = state.storage.get_pin_hash(&key) {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -101,7 +101,11 @@ async fn download(
                 .expect("valid response")
                 .into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to read raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -223,22 +227,26 @@ async fn upload(
         Ok(()) => {
             state.metrics.record_upload("raw");
             state
+                .audit
+                .log(AuditEntry::new("push", "api", &path, "raw", ""));
+            state
                 .activity
                 .push(ActivityEntry::new(ActionType::Push, path, "raw", "LOCAL"));
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", "", "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
-/// Overwrite an existing file (conditional PUT with If-Match).
+/// Overwrite an existing file (conditional PUT with `If-Match`).
 async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8]) -> Response {
     // Delete old, write new (within publish_lock — atomic from NORA's perspective)
-    if state.storage.delete(key).await.is_err() {
+    if let Err(e) = state.storage.delete(key).await {
+        tracing::error!(error = %e, key = %key, "Failed to delete raw artifact before overwrite");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     match state.storage.put(key, body).await {
@@ -252,11 +260,14 @@ async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8])
             ));
             state
                 .audit
-                .log(AuditEntry::new("overwrite", "api", "", "raw", ""));
+                .log(AuditEntry::new("overwrite", "api", path, "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::OK.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -268,11 +279,17 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String
     let key = format!("raw/{}", path);
     match state.storage.delete(&key).await {
         Ok(()) => {
+            state
+                .audit
+                .log(AuditEntry::new("delete", "api", &path, "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::NO_CONTENT.into_response()
         }
         Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "Failed to delete raw artifact");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -288,7 +305,7 @@ async fn check_exists(State(state): State<Arc<AppState>>, Path(path): Path<Strin
                 .status(StatusCode::OK)
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
                 .header(header::CONTENT_TYPE, guess_content_type(&key))
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+                .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
             if let Some(hash) = state.storage.get_pin_hash(&key) {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -813,5 +830,21 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], b"updated");
+    }
+
+    #[tokio::test]
+    async fn test_raw_cache_control_default() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/raw/cc.txt", b"data".to_vec()).await;
+
+        let get = send(&ctx.app, Method::GET, "/raw/cc.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let cc = get
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "no-cache");
     }
 }

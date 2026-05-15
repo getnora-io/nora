@@ -212,10 +212,16 @@ async fn download(
                 return with_content_type(&path, data.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %proxy.url(), path = %path, "Maven proxy fetch failed, trying next");
+                continue;
+            }
         }
     }
 
+    if !state.config.maven.proxies.is_empty() {
+        tracing::warn!(registry = "maven", path = %path, "Proxy failed, returning 404");
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -268,7 +274,10 @@ async fn upload(
             }
             match state.storage.put(&key, &body).await {
                 Ok(()) => StatusCode::CREATED.into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, key = %key, "Failed to store Maven checksum");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
         }
 
@@ -300,7 +309,8 @@ async fn upload(
                     .into_response();
             }
 
-            if state.storage.put(&key, &body).await.is_err() {
+            if let Err(e) = state.storage.put(&key, &body).await {
+                tracing::error!(error = %e, key = %key, "Failed to store Maven artifact");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
 
@@ -309,15 +319,15 @@ async fn upload(
             update_artifact_metadata(&state, &coords.group_path, &coords.artifact_id).await;
 
             state.metrics.record_upload("maven");
+            state
+                .audit
+                .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 artifact_name,
                 "maven",
                 "LOCAL",
             ));
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", "", "maven", ""));
             state.repo_index.invalidate("maven");
 
             StatusCode::CREATED.into_response()
@@ -331,26 +341,32 @@ async fn upload(
                     state.metrics.record_upload("maven");
                     StatusCode::CREATED.into_response()
                 }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, key = %key, "Failed to store Maven metadata");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
         }
 
         MavenPathKind::Opaque => match state.storage.put(&key, &body).await {
             Ok(()) => {
                 state.metrics.record_upload("maven");
+                state
+                    .audit
+                    .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
                 state.activity.push(ActivityEntry::new(
                     ActionType::Push,
                     artifact_name,
                     "maven",
                     "LOCAL",
                 ));
-                state
-                    .audit
-                    .log(AuditEntry::new("push", "api", "", "maven", ""));
                 state.repo_index.invalidate("maven");
                 StatusCode::CREATED.into_response()
             }
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, key = %key, "Failed to store Maven artifact");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         },
     }
 }

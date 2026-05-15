@@ -134,6 +134,7 @@ fn build_context(
         raw: RawConfig {
             enabled: true,
             max_file_size: 1_048_576, // 1 MB
+            cache_control: "no-cache".to_string(),
         },
         gems: GemsConfig::default(),
         terraform: TerraformConfig::default(),
@@ -158,6 +159,7 @@ fn build_context(
         curation: CurationConfig::default(),
         circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         tls: crate::config::TlsConfig::default(),
+        audit: crate::config::AuditConfig::default(),
         registries: None,
     };
 
@@ -221,7 +223,7 @@ fn build_context(
         tokens,
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path),
+        audit: AuditLog::new(&storage_path, crate::audit::AuditMode::Off),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client: reqwest::Client::new(),
@@ -230,6 +232,9 @@ fn build_context(
         curation: curation_engine,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
         circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        digest_store: std::sync::Arc::new(crate::digest_quarantine::DigestStore::empty(
+            &storage_path,
+        )),
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

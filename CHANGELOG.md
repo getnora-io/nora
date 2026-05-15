@@ -2,13 +2,28 @@
 ## [Unreleased]
 
 ### Fixed
-- **OpenAPI 429 documentation** — all rate-limited endpoints (44 total) now document `429` response with `Retry-After` header in OpenAPI spec. Eliminates false positives from API fuzz tools like Schemathesis (#267)
-- **405 Method Not Allowed with Allow header** — unsupported HTTP methods on multi-method routes now return `405` with RFC 9110 `Allow` header instead of axum's default headerless 405. Affected registries: Docker, Raw, Maven, npm, PyPI, Cargo (#268)
+- Raw registry Cache-Control changed from `immutable` to configurable `no-cache` default (#300, #302)
+
+## [0.8.3] - 2026-05-13
+
+### Added
+- Outbound HTTP/SOCKS5 proxy support (#296)
+- Structured audit log with configurable output (#286)
+- Raw registry RFC 9110 conditional PUT (#278)
+- Raw registry POST /raw/-/reindex endpoint (#276)
+- Reverse proxy setup guide (#275)
+
+### Fixed
+- Duplicate library/ prefix block in Docker download_blob (#297, #285)
+- Security hardening: HTML escape, brute-force, realm validation (#292)
+- Warn-level log when all proxy upstreams fail (#284)
+- Log all silent storage and proxy errors (#282)
+- PyPI: merge upstream and local files in simple index (#295)
+- Flaky quarantine persistence test under tarpaulin (#299)
+- OpenAPI 429 docs, 405 with Allow header (#279)
 
 ### Changed
-- Docker and Maven/npm route definitions merged from separate `.route()` calls into explicit method chains for correctness and clarity
-- Raw registry docs corrected: files are immutable by default (409 on re-upload), not overwrite-only. Conditional overwrite via `If-Match`/`If-None-Match` documented
-- Raw `PUT` OpenAPI spec updated with `200` (conditional overwrite) and `412` (precondition failed) responses
+- 994 total tests (up from 910)
 
 ## [0.8.2] - 2026-05-07
 
