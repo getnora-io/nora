@@ -73,8 +73,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 // ── Service discovery ──────────────────────────────────────────────────
 
 async fn service_discovery(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let host = extract_host(&state, &headers);
-    let base = format!("http://{}", host);
+    let base = extract_base_url(&state, &headers);
     let json = serde_json::json!({
         "providers.v1": format!("{}/terraform/v1/providers/", base),
         "modules.v1": format!("{}/terraform/v1/modules/", base)
@@ -179,7 +178,7 @@ async fn provider_download_meta(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let host = extract_host(&state, &headers);
+    let base_url = extract_base_url(&state, &headers);
     let artifact = format!("{}/{} v{} {}/{}", ns, ptype, ver, os, arch);
 
     // Extract publish date from cached metadata
@@ -238,7 +237,7 @@ async fn provider_download_meta(
     {
         Ok(text) => {
             // Rewrite download_url to point through NORA
-            let rewritten = rewrite_download_url(&text, &host, &ns, &ptype, &ver);
+            let rewritten = rewrite_download_url(&text, &base_url, &ns, &ptype, &ver);
 
             state.metrics.record_download("terraform");
             state.metrics.record_cache_miss();
@@ -476,20 +475,20 @@ async fn module_download(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Extract Host from request headers, fallback to config or default
-fn extract_host(state: &AppState, headers: &HeaderMap) -> String {
+/// Extract base URL (scheme + host) from config or request headers.
+fn extract_base_url(state: &AppState, headers: &HeaderMap) -> String {
     if let Some(public_url) = &state.config.server.public_url {
-        // Strip protocol prefix
-        return public_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
+        return public_url.trim_end_matches('/').to_string();
     }
-    headers
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:4000")
-        .to_string()
+        .unwrap_or("localhost:4000");
+    format!("{}://{}", scheme, host)
 }
 
 /// Extract publish date from cached Terraform provider versions metadata.
@@ -576,7 +575,13 @@ fn with_binary(data: Vec<u8>) -> Response {
 }
 
 /// Rewrite download_url in provider metadata JSON to point through NORA.
-fn rewrite_download_url(json_text: &str, host: &str, ns: &str, ptype: &str, ver: &str) -> String {
+fn rewrite_download_url(
+    json_text: &str,
+    base_url: &str,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+) -> String {
     // Parse JSON, find download_url, rewrite it
     if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(json_text) {
         if let Some(obj) = json.as_object_mut() {
@@ -585,8 +590,8 @@ fn rewrite_download_url(json_text: &str, host: &str, ns: &str, ptype: &str, ver:
                     // Extract filename from original URL
                     let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
                     let new_url = format!(
-                        "http://{}/terraform/v1/providers/download/{}/{}/{}/{}",
-                        host, ns, ptype, ver, filename
+                        "{}/terraform/v1/providers/download/{}/{}/{}/{}",
+                        base_url, ns, ptype, ver, filename
                     );
                     obj.insert(
                         "download_url".to_string(),
@@ -666,8 +671,8 @@ mod tests {
     #[test]
     fn test_rewrite_download_url() {
         let input = r#"{"download_url":"https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip","shasum":"abc123"}"#;
-        let result = rewrite_download_url(input, "nora:4000", "hashicorp", "aws", "5.0.0");
-        assert!(result.contains("http://nora:4000/terraform/v1/providers/download/hashicorp/aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip"));
+        let result = rewrite_download_url(input, "https://nora:4000", "hashicorp", "aws", "5.0.0");
+        assert!(result.contains("https://nora:4000/terraform/v1/providers/download/hashicorp/aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip"));
         // Other fields preserved
         assert!(result.contains("abc123"));
     }
@@ -675,14 +680,14 @@ mod tests {
     #[test]
     fn test_rewrite_download_url_no_url() {
         let input = r#"{"shasum":"abc123"}"#;
-        let result = rewrite_download_url(input, "nora:4000", "hashicorp", "aws", "5.0.0");
+        let result = rewrite_download_url(input, "http://nora:4000", "hashicorp", "aws", "5.0.0");
         assert_eq!(result, input);
     }
 
     #[test]
     fn test_rewrite_download_url_invalid_json() {
         let input = "not json";
-        let result = rewrite_download_url(input, "nora:4000", "hashicorp", "aws", "5.0.0");
+        let result = rewrite_download_url(input, "http://nora:4000", "hashicorp", "aws", "5.0.0");
         assert_eq!(result, input);
     }
 
