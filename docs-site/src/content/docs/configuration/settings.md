@@ -41,6 +41,17 @@ Config file resolution order:
 | `NORA_STORAGE_S3_SECRET_KEY` | *(none)* | S3 secret key |
 | `NORA_STORAGE_S3_REGION` | `us-east-1` | S3 region |
 
+### Outbound Proxy
+
+These are standard environment variables — not prefixed with `NORA_`. See [Outbound Proxy](/configuration/http-proxy/) for details.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HTTP_PROXY` | *(none)* | Proxy for outbound HTTP requests |
+| `HTTPS_PROXY` | *(none)* | Proxy for outbound HTTPS requests |
+| `ALL_PROXY` | *(none)* | Proxy for all protocols (supports `socks5://`) |
+| `NO_PROXY` | *(none)* | Hosts/CIDRs to bypass proxy |
+
 ### Authentication
 
 | Variable | Default | Description |
