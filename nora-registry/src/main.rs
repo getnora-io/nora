@@ -151,7 +151,7 @@ pub struct AppState {
     pub tokens: Option<TokenStore>,
     pub metrics: DashboardMetrics,
     pub activity: ActivityLog,
-    pub audit: AuditLog,
+    pub audit: Arc<AuditLog>,
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
@@ -971,7 +971,7 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
         metrics: DashboardMetrics::with_persistence(&storage_path),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path, audit_mode.clone()),
+        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,
@@ -1008,10 +1008,7 @@ async fn run_server(config: Config, storage: Storage) {
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,
-            Some(std::sync::Arc::new(audit::AuditLog::new(
-                &storage_path,
-                audit_mode,
-            ))),
+            Some(state.audit.clone()),
             cleanup_lock.clone(),
         );
         info!(

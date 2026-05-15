@@ -223,7 +223,7 @@ fn build_context(
         tokens,
         metrics: DashboardMetrics::new(),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path, crate::audit::AuditMode::Off),
+        audit: Arc::new(AuditLog::new(&storage_path, crate::audit::AuditMode::Off)),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client: reqwest::Client::new(),
