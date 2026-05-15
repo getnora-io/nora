@@ -526,9 +526,10 @@ fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str)
 }
 
 fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
+    let escaped = html_escape(normalized);
     let mut html = format!(
         "<!DOCTYPE html>\n<html><head><title>Links for {}</title></head><body><h1>Links for {}</h1>\n",
-        normalized, normalized
+        escaped, escaped
     );
 
     for f in files {
