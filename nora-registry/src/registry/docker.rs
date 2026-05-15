@@ -1150,11 +1150,13 @@ async fn get_manifest(
 
                     state.repo_index.invalidate("docker");
 
+                    let content_length = data.len().to_string();
                     return (
                         StatusCode::OK,
                         [
                             (header::CONTENT_TYPE, content_type),
                             (HeaderName::from_static("docker-content-digest"), digest),
+                            (header::CONTENT_LENGTH, content_length),
                         ],
                         Bytes::from(data),
                     )
