@@ -15,9 +15,9 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderName, StatusCode},
+    http::{header, HeaderName, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, head, patch},
+    routing::get,
     Json, Router,
 };
 use parking_lot::RwLock;
@@ -186,6 +186,9 @@ fn quarantine_forbidden(
         .into_response()
 }
 
+/// Docker v2 routes.
+/// Uses a `{*rest}` wildcard to support image names with arbitrary path depth
+/// (e.g., `library/astra/ubi18-cpp122`), per OCI Distribution spec.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -193,58 +196,140 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(check).fallback(|| async { method_not_allowed("GET") }),
         )
         .route("/v2/_catalog", get(catalog))
-        // Single-segment name routes (e.g., /v2/alpine/...)
-        .route(
-            "/v2/{name}/blobs/{digest}",
-            head(check_blob)
-                .get(download_blob)
-                .delete(delete_blob)
-                .fallback(|| async { method_not_allowed("GET, HEAD, DELETE") }),
-        )
-        .route(
-            "/v2/{name}/blobs/uploads/",
-            axum::routing::post(start_upload).fallback(|| async { method_not_allowed("POST") }),
-        )
-        .route(
-            "/v2/{name}/blobs/uploads/{uuid}",
-            patch(patch_blob)
-                .put(upload_blob)
-                .fallback(|| async { method_not_allowed("PATCH, PUT") }),
-        )
-        .route(
-            "/v2/{name}/manifests/{reference}",
-            get(get_manifest)
-                .put(put_manifest)
-                .delete(delete_manifest)
-                .fallback(|| async { method_not_allowed("GET, PUT, DELETE") }),
-        )
-        .route("/v2/{name}/tags/list", get(list_tags))
-        // Two-segment name routes (e.g., /v2/library/alpine/...)
-        .route(
-            "/v2/{ns}/{name}/blobs/{digest}",
-            head(check_blob_ns)
-                .get(download_blob_ns)
-                .delete(delete_blob_ns)
-                .fallback(|| async { method_not_allowed("GET, HEAD, DELETE") }),
-        )
-        .route(
-            "/v2/{ns}/{name}/blobs/uploads/",
-            axum::routing::post(start_upload_ns).fallback(|| async { method_not_allowed("POST") }),
-        )
-        .route(
-            "/v2/{ns}/{name}/blobs/uploads/{uuid}",
-            patch(patch_blob_ns)
-                .put(upload_blob_ns)
-                .fallback(|| async { method_not_allowed("PATCH, PUT") }),
-        )
-        .route(
-            "/v2/{ns}/{name}/manifests/{reference}",
-            get(get_manifest_ns)
-                .put(put_manifest_ns)
-                .delete(delete_manifest_ns)
-                .fallback(|| async { method_not_allowed("GET, PUT, DELETE") }),
-        )
-        .route("/v2/{ns}/{name}/tags/list", get(list_tags_ns))
+        .route("/v2/{*rest}", axum::routing::any(docker_v2_dispatch))
+}
+
+/// Unified dispatcher for all Docker v2 image endpoints.
+/// Parses the image name (arbitrary depth) and operation from the wildcard path,
+/// then delegates to the appropriate handler with correct method routing.
+async fn docker_v2_dispatch(
+    state: State<Arc<AppState>>,
+    method: Method,
+    Path(wildcard): Path<String>,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let rest = wildcard.trim_start_matches('/');
+    if rest.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Parse endpoint pattern from right — handles names containing "blobs", "manifests", etc.
+    // Order matters: check blob uploads before blobs (substring overlap).
+
+    // 1. Blob uploads: {name}/blobs/uploads/ or {name}/blobs/uploads/{uuid}
+    if let Some((name, after)) = rest.rsplit_once("/blobs/uploads/") {
+        if name.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if validate_docker_name(name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        return if after.is_empty() {
+            match method {
+                Method::POST => start_upload(state, Path(name.to_string())).await,
+                _ => method_not_allowed("POST"),
+            }
+        } else {
+            match method {
+                Method::PATCH => {
+                    patch_blob(state, Path((name.to_string(), after.to_string())), body).await
+                }
+                Method::PUT => {
+                    let params = parse_query_string(uri.query());
+                    upload_blob(
+                        state,
+                        Path((name.to_string(), after.to_string())),
+                        axum::extract::Query(params),
+                        body,
+                    )
+                    .await
+                }
+                _ => method_not_allowed("PATCH, PUT"),
+            }
+        };
+    }
+
+    // 2. Blobs: {name}/blobs/{digest}
+    if let Some((name, digest)) = rest.rsplit_once("/blobs/") {
+        if name.is_empty() || digest.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if validate_docker_name(name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        return match method {
+            Method::HEAD => {
+                check_blob(state, Path((name.to_string(), digest.to_string()))).await
+            }
+            Method::GET => {
+                download_blob(state, headers, Path((name.to_string(), digest.to_string()))).await
+            }
+            Method::DELETE => {
+                delete_blob(state, Path((name.to_string(), digest.to_string()))).await
+            }
+            _ => method_not_allowed("GET, HEAD, DELETE"),
+        };
+    }
+
+    // 3. Manifests: {name}/manifests/{reference}
+    if let Some((name, reference)) = rest.rsplit_once("/manifests/") {
+        if name.is_empty() || reference.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if validate_docker_name(name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        return match method {
+            Method::GET | Method::HEAD => {
+                let resp =
+                    get_manifest(state, headers, Path((name.to_string(), reference.to_string())))
+                        .await;
+                if method == Method::HEAD {
+                    let (parts, _) = resp.into_parts();
+                    Response::from_parts(parts, axum::body::Body::empty())
+                } else {
+                    resp
+                }
+            }
+            Method::PUT => {
+                put_manifest(state, Path((name.to_string(), reference.to_string())), body).await
+            }
+            Method::DELETE => {
+                delete_manifest(state, Path((name.to_string(), reference.to_string()))).await
+            }
+            _ => method_not_allowed("GET, HEAD, PUT, DELETE"),
+        };
+    }
+
+    // 4. Tags list: {name}/tags/list
+    if let Some(name) = rest.strip_suffix("/tags/list") {
+        if name.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if validate_docker_name(name).is_err() {
+            return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        return match method {
+            Method::GET => list_tags(state, Path(name.to_string())).await,
+            _ => method_not_allowed("GET"),
+        };
+    }
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 async fn check() -> impl IntoResponse {
@@ -1287,95 +1372,6 @@ async fn delete_blob(
 }
 
 // ============================================================================
-// Namespace handlers (for two-segment names like library/alpine)
-// These combine ns/name into a single name and delegate to the main handlers
-// ============================================================================
-
-async fn check_blob_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, digest)): Path<(String, String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    check_blob(state, Path((full_name, digest))).await
-}
-
-async fn download_blob_ns(
-    state: State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Path((ns, name, digest)): Path<(String, String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    download_blob(state, headers, Path((full_name, digest))).await
-}
-
-async fn start_upload_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name)): Path<(String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    start_upload(state, Path(full_name)).await
-}
-
-async fn patch_blob_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, uuid)): Path<(String, String, String)>,
-    body: Bytes,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    patch_blob(state, Path((full_name, uuid)), body).await
-}
-
-async fn upload_blob_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, uuid)): Path<(String, String, String)>,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    upload_blob(state, Path((full_name, uuid)), query, body).await
-}
-
-async fn get_manifest_ns(
-    state: State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Path((ns, name, reference)): Path<(String, String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    get_manifest(state, headers, Path((full_name, reference))).await
-}
-
-async fn put_manifest_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, reference)): Path<(String, String, String)>,
-    body: Bytes,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    put_manifest(state, Path((full_name, reference)), body).await
-}
-
-async fn list_tags_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name)): Path<(String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    list_tags(state, Path(full_name)).await
-}
-
-async fn delete_manifest_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, reference)): Path<(String, String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    delete_manifest(state, Path((full_name, reference))).await
-}
-
-async fn delete_blob_ns(
-    state: State<Arc<AppState>>,
-    Path((ns, name, digest)): Path<(String, String, String)>,
-) -> Response {
-    let full_name = format!("{}/{}", ns, name);
-    delete_blob(state, Path((full_name, digest))).await
-}
 
 /// Fetch a blob from an upstream Docker registry
 #[allow(clippy::too_many_arguments)]
