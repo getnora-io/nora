@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- Raw registry Cache-Control changed from `immutable` to configurable `no-cache` default (#300, #302)
+
 ## [0.8.3] - 2026-05-13
 
 ### Added
