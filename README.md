@@ -1,6 +1,6 @@
 # NORA
 
-**The artifact registry that grows with you.** Starts with `docker run`, scales to enterprise.
+**The artifact registry that grows with you.** Starts with `docker run`, scales with your needs.
 
 ```bash
 docker run -d -p 4000:4000 -v nora-data:/data getnora/nora:latest
@@ -16,7 +16,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
 - **13 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++).
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 900+ tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 990+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -140,13 +140,16 @@ docker run -d -p 4000:4000 \
 - ~~Garbage Collection & Retention~~ ✅ v0.6.0
 - ~~Helm Chart~~ ✅ v0.6.1
 - ~~Signed releases & SBOM~~ ✅ v0.6.4
-- ~~Curation layer~~ ✅ v0.7.0
-- ~~13 registry formats~~ ✅ v0.7.0
+- ~~Curation layer & 13 registry formats~~ ✅ v0.7.0
 - ~~Min Release Age~~ ✅ v0.7.1
-- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions, GitLab CI
+- ~~Hash Pin Store, auth rate limiting, Cache-Control~~ ✅ v0.8.0
+- ~~Outbound proxy, structured audit log, 994 tests~~ ✅ v0.8.3
+- **Circuit breaker** — per-registry upstream resilience ([#339](https://github.com/getnora-io/nora/issues/339))
+- **OIDC / Workload Identity** — zero-secret auth for CI systems ([#342](https://github.com/getnora-io/nora/issues/342))
+- **Hot reload** — config and curation policy changes without restart ([#343](https://github.com/getnora-io/nora/issues/343))
 - **Image Signing Policy** — cosign verification on upstream pulls
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+See [ROADMAP.md](ROADMAP.md) for the full roadmap and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Security & Trust
 
