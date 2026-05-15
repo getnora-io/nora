@@ -260,9 +260,7 @@ async fn docker_v2_dispatch(
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
         }
         return match method {
-            Method::HEAD => {
-                check_blob(state, Path((name.to_string(), digest.to_string()))).await
-            }
+            Method::HEAD => check_blob(state, Path((name.to_string(), digest.to_string()))).await,
             Method::GET => {
                 download_blob(state, headers, Path((name.to_string(), digest.to_string()))).await
             }
@@ -283,9 +281,12 @@ async fn docker_v2_dispatch(
         }
         return match method {
             Method::GET | Method::HEAD => {
-                let resp =
-                    get_manifest(state, headers, Path((name.to_string(), reference.to_string())))
-                        .await;
+                let resp = get_manifest(
+                    state,
+                    headers,
+                    Path((name.to_string(), reference.to_string())),
+                )
+                .await;
                 if method == Method::HEAD {
                     let (parts, _) = resp.into_parts();
                     Response::from_parts(parts, axum::body::Body::empty())

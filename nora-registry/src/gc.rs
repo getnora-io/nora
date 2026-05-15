@@ -635,19 +635,31 @@ async fn clean_pypi_metadata(
 
 /// Spawn a background GC task that runs periodically.
 /// Accepts a shared cleanup lock to prevent concurrent runs with retention scheduler.
+/// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
 pub fn spawn_gc_scheduler(
     storage: Storage,
     interval_secs: u64,
     dry_run: bool,
     cleanup_lock: Arc<tokio::sync::Mutex<()>>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // First tick fires immediately — skip it so GC doesn't run on startup
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("GC scheduler: cancellation requested, stopping");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
 
             // Cross-scheduler lock: skip if GC or retention is already running
             let guard = cleanup_lock.try_lock();
@@ -666,7 +678,7 @@ pub fn spawn_gc_scheduler(
 
             drop(guard);
         }
-    });
+    })
 }
 
 // ============================================================================
