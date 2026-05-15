@@ -551,7 +551,9 @@ async fn clean_npm_metadata(
         }
         // Rewrite metadata
         if let Ok(new_data) = serde_json::to_vec(&json) {
-            let _ = storage.put(meta_key, &new_data).await;
+            if let Err(e) = storage.put(meta_key, &new_data).await {
+                tracing::warn!(key = %meta_key, error = %e, "Failed to rewrite npm metadata after phantom cleanup");
+            }
         }
     }
 
@@ -622,7 +624,9 @@ async fn clean_pypi_metadata(
             }
         }
         if let Ok(new_data) = serde_json::to_vec(&json) {
-            let _ = storage.put(meta_key, &new_data).await;
+            if let Err(e) = storage.put(meta_key, &new_data).await {
+                tracing::warn!(key = %meta_key, error = %e, "Failed to rewrite PyPI metadata after phantom cleanup");
+            }
         }
     }
 

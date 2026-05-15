@@ -487,16 +487,8 @@ async fn download_blob(
                     "PROXY",
                 ));
 
-                // Cache in storage (fire and forget)
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let data_clone = data.clone();
-                let state_clone = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if storage.put(&key_clone, &data_clone).await.is_ok() {
-                        state_clone.repo_index.invalidate("docker");
-                    }
-                });
+                // Cache in storage (fire and forget, panic-safe)
+                state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
 
                 return (
                     StatusCode::OK,
