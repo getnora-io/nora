@@ -111,6 +111,15 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
         total_candidates
     );
 
+    // Sort orphans: delete blobs before manifests so that if GC is interrupted
+    // mid-run, we only leave harmless orphan blobs — never broken manifests
+    // pointing to already-deleted blobs (#305).
+    all_orphans.sort_by(|a, b| {
+        let a_is_manifest = a.contains("/manifests/");
+        let b_is_manifest = b.contains("/manifests/");
+        a_is_manifest.cmp(&b_is_manifest)
+    });
+
     let mut deleted = 0usize;
     let mut bytes_freed = 0u64;
 
@@ -626,19 +635,31 @@ async fn clean_pypi_metadata(
 
 /// Spawn a background GC task that runs periodically.
 /// Accepts a shared cleanup lock to prevent concurrent runs with retention scheduler.
+/// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
 pub fn spawn_gc_scheduler(
     storage: Storage,
     interval_secs: u64,
     dry_run: bool,
     cleanup_lock: Arc<tokio::sync::Mutex<()>>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // First tick fires immediately — skip it so GC doesn't run on startup
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("GC scheduler: cancellation requested, stopping");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
 
             // Cross-scheduler lock: skip if GC or retention is already running
             let guard = cleanup_lock.try_lock();
@@ -657,7 +678,7 @@ pub fn spawn_gc_scheduler(
 
             drop(guard);
         }
-    });
+    })
 }
 
 // ============================================================================

@@ -605,6 +605,7 @@ fn find_matching_rule<'a>(
 
 /// Spawn a background retention task that runs periodically.
 /// Accepts a shared cleanup lock to prevent concurrent runs with GC scheduler.
+/// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
 pub fn spawn_retention_scheduler(
     storage: Storage,
     rules: Vec<RetentionRule>,
@@ -612,14 +613,25 @@ pub fn spawn_retention_scheduler(
     dry_run: bool,
     audit: Option<Arc<crate::audit::AuditLog>>,
     cleanup_lock: Arc<tokio::sync::Mutex<()>>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         // First tick fires immediately — skip it so retention doesn't run on startup
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("Retention scheduler: cancellation requested, stopping");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
 
             // Cross-scheduler lock: skip if GC or retention is already running
             let guard = cleanup_lock.try_lock();
@@ -655,7 +667,7 @@ pub fn spawn_retention_scheduler(
 
             drop(guard);
         }
-    });
+    })
 }
 
 // ============================================================================

@@ -151,7 +151,7 @@ pub struct AppState {
     pub tokens: Option<TokenStore>,
     pub metrics: DashboardMetrics,
     pub activity: ActivityLog,
-    pub audit: AuditLog,
+    pub audit: Arc<AuditLog>,
     pub docker_auth: registry::DockerAuth,
     pub repo_index: RepoIndex,
     pub http_client: reqwest::Client,
@@ -971,7 +971,7 @@ async fn run_server(config: Config, storage: Storage) {
         tokens,
         metrics: DashboardMetrics::with_persistence(&storage_path),
         activity: ActivityLog::new(50),
-        audit: AuditLog::new(&storage_path, audit_mode.clone()),
+        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth,
         repo_index: RepoIndex::new(),
         http_client,
@@ -986,14 +986,20 @@ async fn run_server(config: Config, storage: Storage) {
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Cancellation token for graceful shutdown of background schedulers (#306)
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Spawn background GC scheduler if enabled
     if state.config.gc.enabled {
-        gc::spawn_gc_scheduler(
+        let handle = gc::spawn_gc_scheduler(
             state.storage.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
             cleanup_lock.clone(),
+            cancel_token.clone(),
         );
+        scheduler_handles.push(handle);
         info!(
             interval_secs = state.config.gc.interval,
             dry_run = state.config.gc.dry_run,
@@ -1003,17 +1009,16 @@ async fn run_server(config: Config, storage: Storage) {
 
     // Spawn background retention scheduler if enabled
     if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
-        retention::spawn_retention_scheduler(
+        let handle = retention::spawn_retention_scheduler(
             state.storage.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,
-            Some(std::sync::Arc::new(audit::AuditLog::new(
-                &storage_path,
-                audit_mode,
-            ))),
+            Some(state.audit.clone()),
             cleanup_lock.clone(),
+            cancel_token.clone(),
         );
+        scheduler_handles.push(handle);
         info!(
             interval_secs = state.config.retention.interval,
             rules = state.config.retention.rules.len(),
@@ -1123,6 +1128,19 @@ async fn run_server(config: Config, storage: Storage) {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("Server error");
+
+    // Signal background schedulers to stop and wait for them (#306)
+    cancel_token.cancel();
+    if !scheduler_handles.is_empty() {
+        info!("Waiting for background schedulers to finish (10s timeout)...");
+        let join_all = futures::future::join_all(scheduler_handles);
+        if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
+            .await
+            .is_err()
+        {
+            warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
+        }
+    }
 
     // Save metrics on shutdown
     state.metrics.save().await;
