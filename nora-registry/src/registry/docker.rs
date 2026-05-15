@@ -937,17 +937,15 @@ async fn get_manifest(
             meta_key,
         ));
 
-        let content_length = data.len().to_string();
-        return (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, content_type),
-                (HeaderName::from_static("docker-content-digest"), digest),
-                (header::CONTENT_LENGTH, content_length),
-            ],
-            data,
-        )
-            .into_response();
+        return match build_manifest_response(&content_type, &digest, data.len())
+            .body(axum::body::Body::from(data))
+        {
+            Ok(resp) => resp.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, name = %name, reference = %reference, "Failed to build manifest response");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
     }
 
     // Try upstream proxies
@@ -1047,17 +1045,15 @@ async fn get_manifest(
                     state_clone.repo_index.invalidate("docker");
                 });
 
-                let content_length = data.len().to_string();
-                return (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (HeaderName::from_static("docker-content-digest"), digest),
-                        (header::CONTENT_LENGTH, content_length),
-                    ],
-                    Bytes::from(data),
-                )
-                    .into_response();
+                return match build_manifest_response(&content_type, &digest, data.len())
+                    .body(axum::body::Body::from(data))
+                {
+                    Ok(resp) => resp.into_response(),
+                    Err(e) => {
+                        tracing::error!(error = %e, name = %name, reference = %reference, "Failed to build manifest response");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
@@ -1142,17 +1138,15 @@ async fn get_manifest(
 
                     state.repo_index.invalidate("docker");
 
-                    let content_length = data.len().to_string();
-                    return (
-                        StatusCode::OK,
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (HeaderName::from_static("docker-content-digest"), digest),
-                            (header::CONTENT_LENGTH, content_length),
-                        ],
-                        Bytes::from(data),
-                    )
-                        .into_response();
+                    return match build_manifest_response(&content_type, &digest, data.len())
+                        .body(axum::body::Body::from(data))
+                    {
+                        Ok(resp) => resp.into_response(),
+                        Err(e) => {
+                            tracing::error!(error = %e, name = %name, reference = %reference, "Failed to build manifest response");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                    };
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
                 Err(e) => {
@@ -1556,6 +1550,22 @@ pub async fn fetch_manifest_from_upstream(
 
     cb.record_success(&cb_key);
     Ok((bytes.to_vec(), content_type))
+}
+
+/// Build a Docker manifest HTTP response with standard headers.
+///
+/// Returns a `ResponseBuilder` (not a final `Response`) so that call sites
+/// can append extra headers before calling `.body()`.
+pub(crate) fn build_manifest_response(
+    content_type: &str,
+    digest: &str,
+    content_length: usize,
+) -> axum::http::response::Builder {
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("Docker-Content-Digest", digest)
+        .header(header::CONTENT_LENGTH, content_length)
 }
 
 /// Detect manifest media type from its JSON content
@@ -2095,13 +2105,45 @@ mod integration_tests {
         )
         .await;
         assert_eq!(get_resp.status(), StatusCode::OK);
-        let get_digest = get_resp
+
+        // Verify standard manifest response headers (build_manifest_response contract)
+        let get_content_type = get_resp
             .headers()
-            .get("docker-content-digest")
-            .unwrap()
+            .get("content-type")
+            .expect("manifest response must have Content-Type")
             .to_str()
             .unwrap()
             .to_string();
+        assert!(
+            get_content_type.contains("vnd.docker.distribution.manifest")
+                || get_content_type.contains("vnd.oci.image"),
+            "unexpected Content-Type: {}",
+            get_content_type
+        );
+        let get_content_length = get_resp
+            .headers()
+            .get("content-length")
+            .expect("manifest response must have Content-Length")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            get_content_length,
+            manifest_bytes.len().to_string(),
+            "Content-Length must match body size"
+        );
+
+        let get_digest = get_resp
+            .headers()
+            .get("docker-content-digest")
+            .expect("manifest response must have Docker-Content-Digest")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get_digest.starts_with("sha256:"),
+            "Docker-Content-Digest must start with sha256:"
+        );
         assert_eq!(get_digest, digest_header);
         let body = body_bytes(get_resp).await;
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
