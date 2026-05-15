@@ -1127,6 +1127,11 @@ async fn run_server(config: Config, storage: Storage) {
     // Save metrics on shutdown
     state.metrics.save().await;
 
+    // Flush token last_used timestamps to disk
+    if let Some(ref token_store) = state.tokens {
+        token_store.flush_last_used().await;
+    }
+
     info!(
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
