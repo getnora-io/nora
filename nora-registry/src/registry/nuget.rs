@@ -505,6 +505,7 @@ async fn flatcontainer_download(
                 let state2 = Arc::clone(&state);
                 let proxy_url2 = proxy_url.clone();
                 let id2 = id_lower.clone();
+                let client2 = state.http_client.clone();
                 tokio::spawn(async move {
                     if state2.storage.stat(&index_key).await.is_none() {
                         let url = format!(
@@ -512,8 +513,7 @@ async fn flatcontainer_download(
                             proxy_url2.trim_end_matches('/'),
                             id2
                         );
-                        let client = reqwest::Client::new();
-                        if let Ok(resp) = client.get(&url).send().await {
+                        if let Ok(resp) = client2.get(&url).send().await {
                             if let Ok(body) = resp.bytes().await {
                                 let _ = state2.storage.put(&index_key, &body).await;
                                 state2.repo_index.invalidate("nuget");
