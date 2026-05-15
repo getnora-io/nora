@@ -14,18 +14,23 @@ For completed milestones, see [CHANGELOG.md](CHANGELOG.md).
 - **v0.7.1** — Min-release-age filter for supply chain protection
 - **v0.7.3** — Docker auth fix, raw directory browser, version consistency gate
 - **v0.8.0** — Hash Pin Store, auth rate limiting, trusted proxies, Cache-Control
+- **v0.8.3** — Outbound HTTP/SOCKS5 proxy, structured audit log, 994 tests
 
-## v0.9 — Resilience & Enterprise Auth
+## v0.9 — Resilience & Auth
 
 Focus: upstream resilience, production-grade authentication, operational maturity.
 
-- **Circuit breaker** — per-registry circuit breaker for upstream proxy connections (503+Retry-After on failures, half-open recovery)
-- **Cache-Control completeness** — extend caching headers to remaining registries (Ansible, Conan, Gems, NuGet, Terraform)
-- **Streaming read_timeout** — per-chunk timeout for large blob downloads instead of total request timeout
-- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions and GitLab CI JWT
-- **Hot reload** — apply curation policy and configuration changes without restart
-- **Audit log to stdout** — structured JSON logs for multi-replica deployments and SIEM integration ([#175](https://github.com/getnora-io/nora/issues/175))
+- **Circuit breaker** — per-registry circuit breaker for upstream proxy connections ([#339](https://github.com/getnora-io/nora/issues/339))
+- **Cache-Control completeness** — extend caching headers to remaining registries ([#340](https://github.com/getnora-io/nora/issues/340))
+- **Streaming read_timeout** — per-chunk timeout for large blob downloads ([#341](https://github.com/getnora-io/nora/issues/341))
+- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions and GitLab CI JWT ([#342](https://github.com/getnora-io/nora/issues/342))
+- **Hot reload** — apply curation policy and configuration changes without restart ([#343](https://github.com/getnora-io/nora/issues/343))
+- **Audit log to stdout** — structured JSON logs for multi-replica deployments ([#175](https://github.com/getnora-io/nora/issues/175))
 - **arm64 support** — Linux arm64 binary and multi-arch Docker image ([#193](https://github.com/getnora-io/nora/issues/193))
+- **Docker namespacing** — configurable namespace mapping for mirror mode ([#323](https://github.com/getnora-io/nora/issues/323))
+- **Docker metadata TTL** — stale-while-error for proxy cache ([#311](https://github.com/getnora-io/nora/issues/311))
+- **docker-compose + systemd** — production deployment templates ([#307](https://github.com/getnora-io/nora/issues/307))
+- **thiserror v2** — dependency migration ([#226](https://github.com/getnora-io/nora/issues/226))
 
 ## v1.0 — Stability
 
