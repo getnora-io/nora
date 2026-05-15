@@ -322,13 +322,17 @@ async fn docker_v2_dispatch(
 }
 
 fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
+    use percent_encoding::percent_decode_str;
     query
         .unwrap_or_default()
         .split('&')
         .filter(|s| !s.is_empty())
         .filter_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
+            Some((
+                percent_decode_str(k).decode_utf8_lossy().into_owned(),
+                percent_decode_str(v).decode_utf8_lossy().into_owned(),
+            ))
         })
         .collect()
 }
@@ -941,11 +945,13 @@ async fn get_manifest(
             meta_key,
         ));
 
+        let content_length = data.len().to_string();
         return (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, content_type),
                 (HeaderName::from_static("docker-content-digest"), digest),
+                (header::CONTENT_LENGTH, content_length),
             ],
             data,
         )
@@ -1049,11 +1055,13 @@ async fn get_manifest(
                     state_clone.repo_index.invalidate("docker");
                 });
 
+                let content_length = data.len().to_string();
                 return (
                     StatusCode::OK,
                     [
                         (header::CONTENT_TYPE, content_type),
                         (HeaderName::from_static("docker-content-digest"), digest),
+                        (header::CONTENT_LENGTH, content_length),
                     ],
                     Bytes::from(data),
                 )
