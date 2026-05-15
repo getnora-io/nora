@@ -469,9 +469,15 @@ async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<Strin
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Enforce max concurrent sessions
+    let uuid = uuid::Uuid::new_v4().to_string();
+
+    // Create temp file for blob data
+    let temp_dir = upload_temp_dir(&state.config.storage.path);
+    let temp_path = temp_dir.join(&uuid);
+
+    // Single write lock: check limit + insert atomically (no TOCTOU)
     {
-        let sessions = state.upload_sessions.read();
+        let mut sessions = state.upload_sessions.write();
         let max_sessions = max_upload_sessions();
         if sessions.len() >= max_sessions {
             tracing::warn!(
@@ -481,17 +487,6 @@ async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<Strin
             );
             return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response();
         }
-    }
-
-    let uuid = uuid::Uuid::new_v4().to_string();
-
-    // Create temp file for blob data
-    let temp_dir = upload_temp_dir(&state.config.storage.path);
-    let temp_path = temp_dir.join(&uuid);
-
-    // Create session with metadata
-    {
-        let mut sessions = state.upload_sessions.write();
         sessions.insert(
             uuid.clone(),
             UploadSession {
@@ -591,6 +586,7 @@ async fn patch_blob(
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to open upload temp file");
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 state.upload_sessions.write().remove(&uuid);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -1192,6 +1188,11 @@ async fn delete_manifest(
     }
 
     let key = format!("docker/{}/manifests/{}.json", name, reference);
+
+    // Serialize tag delete with put_manifest via publish_lock to prevent
+    // concurrent put from updating the tag between our read and delete
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
 
     // If reference is a tag, also delete digest-keyed copy
     let is_tag = !reference.starts_with("sha256:");
