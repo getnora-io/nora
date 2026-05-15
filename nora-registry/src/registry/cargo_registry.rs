@@ -226,7 +226,9 @@ async fn get_metadata(
             let key_clone = key.clone();
             let data_clone = data.clone();
             tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &data_clone).await;
+                if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                    tracing::warn!(key = %key_clone, error = %e, "cargo: failed to cache proxy metadata");
+                }
             });
             (StatusCode::OK, data).into_response()
         }

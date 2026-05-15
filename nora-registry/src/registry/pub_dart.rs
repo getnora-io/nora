@@ -415,7 +415,9 @@ async fn fetch_pub_api(
 }
 
 async fn cache_bytes(state: &Arc<AppState>, key: String, data: Vec<u8>) {
-    let _ = state.storage.put(&key, &data).await;
+    if let Err(e) = state.storage.put(&key, &data).await {
+        tracing::warn!(key = %key, error = %e, "pub: failed to cache proxy data");
+    }
 }
 
 fn pub_json_response(data: Vec<u8>) -> Response {
