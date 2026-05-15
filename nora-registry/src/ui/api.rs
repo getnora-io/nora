@@ -119,7 +119,7 @@ pub struct RegistryCardStats {
 pub struct MountPoint {
     pub registry: String,
     pub mount_path: String,
-    pub proxy_upstream: Option<String>,
+    pub proxy_upstreams: Vec<String>,
 }
 
 // ============ API Handlers ============
@@ -176,31 +176,38 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
             size_bytes: size,
         });
 
-        let proxy_upstream = match reg {
-            RegistryType::Docker => state.config.docker.upstreams.first().map(|u| u.url.clone()),
+        let proxy_upstreams: Vec<String> = match reg {
+            RegistryType::Docker => state
+                .config
+                .docker
+                .upstreams
+                .iter()
+                .map(|u| u.url.clone())
+                .collect(),
             RegistryType::Maven => state
                 .config
                 .maven
                 .proxies
-                .first()
-                .map(|p| p.url().to_string()),
-            RegistryType::Npm => state.config.npm.proxy.clone(),
-            RegistryType::Cargo => state.config.cargo.proxy.clone(),
-            RegistryType::PyPI => state.config.pypi.proxy.clone(),
-            RegistryType::Go => state.config.go.proxy.clone(),
-            RegistryType::Raw => None,
-            RegistryType::Gems => state.config.gems.proxy.clone(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone(),
-            RegistryType::PubDart => state.config.pub_dart.proxy.clone(),
-            RegistryType::Conan => state.config.conan.proxy.clone(),
+                .iter()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
+            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+            RegistryType::PyPI => state.config.pypi.proxy.clone().into_iter().collect(),
+            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+            RegistryType::Raw => vec![],
+            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
+            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
         };
 
         mount_points.push(MountPoint {
             registry: reg.display_name().to_string(),
             mount_path: reg.mount_point().to_string(),
-            proxy_upstream,
+            proxy_upstreams,
         });
     }
 

@@ -42,14 +42,14 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         .collect();
 
     // Render mount points
-    let mount_data: Vec<(String, String, Option<String>)> = data
+    let mount_data: Vec<(String, String, Vec<String>)> = data
         .mount_points
         .iter()
         .map(|m| {
             (
                 m.registry.clone(),
                 m.mount_path.clone(),
-                m.proxy_upstream.clone(),
+                m.proxy_upstreams.clone(),
             )
         })
         .collect();

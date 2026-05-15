@@ -519,13 +519,21 @@ pub fn render_registry_card(
 
 /// Render mount points table
 pub fn render_mount_points_table(
-    mount_points: &[(String, String, Option<String>)],
+    mount_points: &[(String, String, Vec<String>)],
     t: &Translations,
 ) -> String {
     let rows: String = mount_points
         .iter()
-        .map(|(registry, mount_path, proxy)| {
-            let proxy_display = proxy.as_deref().unwrap_or("-");
+        .map(|(registry, mount_path, upstreams)| {
+            let proxy_display = if upstreams.is_empty() {
+                "-".to_string()
+            } else {
+                upstreams
+                    .iter()
+                    .map(|u| html_escape(u))
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
             format!(
                 r##"
                 <tr class="border-b border-slate-700">
@@ -536,7 +544,7 @@ pub fn render_mount_points_table(
                 "##,
                 html_escape(registry),
                 html_escape(mount_path),
-                html_escape(proxy_display)
+                proxy_display
             )
         })
         .collect();
