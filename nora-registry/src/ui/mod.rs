@@ -684,8 +684,19 @@ async fn tokens_create(
         }
     };
 
-    // Get authenticated user from Basic Auth header
-    let user = extract_basic_auth_user(&headers).unwrap_or_else(|| "admin".to_string());
+    // Get authenticated user from Basic Auth header — token creation requires
+    // knowing who created it, so we reject requests without Basic auth identity.
+    let user = match extract_basic_auth_user(&headers) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(
+                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token creation requires Basic authentication to identify the owner</div>"##.to_string(),
+                ),
+            );
+        }
+    };
 
     let role = match form.role.as_str() {
         "read" => Role::Read,
