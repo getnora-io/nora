@@ -15,6 +15,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::validation::ends_with_ci;
 use crate::AppState;
+use axum::body::Bytes;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderValue, StatusCode},
@@ -203,25 +204,11 @@ async fn handle(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "go", ""));
 
             // Background cache: immutable = put_if_absent, mutable = always overwrite
-            let storage = state.storage.clone();
-            let key = storage_key.clone();
-            let data_clone = bytes.clone();
-            let state_clone = Arc::clone(&state);
-            tokio::spawn(async move {
-                let written = if is_immutable {
-                    // Only write if not already cached (immutability guarantee)
-                    if storage.stat(&key).await.is_none() {
-                        storage.put(&key, &data_clone).await.is_ok()
-                    } else {
-                        true // already exists
-                    }
-                } else {
-                    storage.put(&key, &data_clone).await.is_ok()
-                };
-                if written {
-                    state_clone.repo_index.invalidate("go");
-                }
-            });
+            if is_immutable {
+                state.spawn_cache_immutable("go", storage_key, Bytes::from(bytes.clone()));
+            } else {
+                state.spawn_cache("go", storage_key, Bytes::from(bytes.clone()));
+            }
 
             with_content_type(bytes, content_type)
         }
