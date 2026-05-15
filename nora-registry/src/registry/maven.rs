@@ -377,18 +377,17 @@ async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &st
     let sha256_hex = hex::encode(sha2::Sha256::digest(data));
     let sha512_hex = hex::encode(sha2::Sha512::digest(data));
 
-    let _ = storage
-        .put(&format!("{}.md5", key), md5_hex.as_bytes())
-        .await;
-    let _ = storage
-        .put(&format!("{}.sha1", key), sha1_hex.as_bytes())
-        .await;
-    let _ = storage
-        .put(&format!("{}.sha256", key), sha256_hex.as_bytes())
-        .await;
-    let _ = storage
-        .put(&format!("{}.sha512", key), sha512_hex.as_bytes())
-        .await;
+    for (suffix, hash) in [
+        ("md5", md5_hex.as_str()),
+        ("sha1", sha1_hex.as_str()),
+        ("sha256", sha256_hex.as_str()),
+        ("sha512", sha512_hex.as_str()),
+    ] {
+        let ck = format!("{}.{}", key, suffix);
+        if let Err(e) = storage.put(&ck, hash.as_bytes()).await {
+            tracing::warn!(key = %ck, error = %e, "maven: failed to store checksum");
+        }
+    }
 }
 
 // ============================================================================
