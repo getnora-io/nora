@@ -550,12 +550,15 @@ async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     index_content.extend_from_slice(entry_line.as_bytes());
     index_content.push(b'\n');
 
-    if state.storage.put(&index_key, &index_content).await.is_err() {
+    // Store .crate tarball FIRST — if this fails, index remains unchanged
+    if state.storage.put(&crate_key, crate_data).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Store .crate tarball SECOND
-    if state.storage.put(&crate_key, crate_data).await.is_err() {
+    // Update sparse index SECOND — only after tarball is safely persisted
+    if state.storage.put(&index_key, &index_content).await.is_err() {
+        // Tarball written but index failed — remove tarball to avoid orphan
+        let _ = state.storage.delete(&crate_key).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
