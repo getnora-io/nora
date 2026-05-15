@@ -157,9 +157,11 @@ test_backend() {
             fi
             ;;
         Garage)
-            # Garage requires dynamic credentials from garage-init; skip
-            skip "${name}: reindex (direct S3 upload requires dynamic Garage credentials)"
-            uploaded=""
+            # Garage credentials are injected via shared volume from garage-init
+            if echo "$reindex_data" | docker compose exec -T s3-tools \
+                mc pipe "garage/nora-test/${reindex_key}" >/dev/null 2>&1; then
+                uploaded=true
+            fi
             ;;
     esac
 

@@ -1,8 +1,32 @@
 # Changelog
 ## [Unreleased]
 
+## [0.8.4] - 2026-05-15
+
 ### Fixed
-- Raw registry Cache-Control changed from `immutable` to configurable `no-cache` default (#300, #302)
+- Add Content-Length header to `library/` fallback manifest response (#337)
+- Docker 3+ path segments (`org/team/app`) routed correctly (#309)
+- GC blob ordering — blobs deleted before manifests to prevent dangling references (#305)
+- GC graceful SIGTERM — flush pending deletions on shutdown (#306)
+- AuditLog singleton — single instance instead of duplicate per registry (#308)
+- UI mount points table shows all configured upstreams (#312)
+- Token owner set to real authenticated user instead of "admin" (#322)
+- Race conditions, non-atomic writes, and version sorting (#318, #334)
+- Log storage write failures instead of silently discarding (#317, #332)
+- Security hardening — health endpoint sanitization, auth warning, Docker realm validation (#330)
+- Security hardening — XSS protection, injection prevention, input validation (#319, #335)
+- Raw registry Cache-Control changed from `immutable` to configurable `no-cache` default (#302, #329)
+- NuGet: use shared http_client for flatcontainer index fetch (#331)
+- Catch panics in background cache tasks, consolidate Go registry spawns (#333)
+- Log audit write and serialization failures instead of swallowing (#321, #327)
+- Write `.crate` tarball before sparse index to prevent zombie versions (#316, #328)
+- Move blocking file I/O out of upload session lock scope (#313, #326)
+- Use proxy-aware client IP in token API rate limiting (#314, #325)
+- Flush token `last_used` on graceful shutdown (#304, #324)
+
+### Changed
+- README and ROADMAP synced with current state (#344)
+- Configuration reference updated with raw `cache_control` docs (#303)
 
 ## [0.8.3] - 2026-05-13
 

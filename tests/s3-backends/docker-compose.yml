@@ -82,6 +82,7 @@ services:
         condition: service_healthy
     volumes:
       - ./garage-init.sh:/garage-init.sh:ro
+      - garage-creds:/creds
     entrypoint: ["/bin/sh", "/garage-init.sh"]
 
   # ============================================================
@@ -138,6 +139,11 @@ services:
     depends_on:
       garage-init:
         condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -f /creds/env ]; then . /creds/env; fi
+        exec /usr/local/bin/nora serve
     environment:
       NORA_HOST: "0.0.0.0"
       NORA_PORT: "5000"
@@ -145,11 +151,10 @@ services:
       NORA_STORAGE_S3_URL: http://garage:3900
       NORA_STORAGE_BUCKET: nora-test
       NORA_STORAGE_S3_REGION: garage
-      # Garage credentials populated by garage-init; override here if needed
-      NORA_STORAGE_S3_ACCESS_KEY: ""
-      NORA_STORAGE_S3_SECRET_KEY: ""
       NORA_RATE_LIMIT_ENABLED: "false"
       NORA_PUBLIC_URL: http://localhost:15003
+    volumes:
+      - garage-creds:/creds:ro
     ports:
       - "15003:5000"
 
@@ -163,14 +168,23 @@ services:
       sh -c "
         mc alias set rustfs http://rustfs:9000 minioadmin minioadmin &&
         mc alias set seaweedfs http://seaweedfs:8333 '' '' --api S3v4 &&
+        if [ -f /creds/env ]; then
+          . /creds/env &&
+          mc alias set garage http://garage:3900 $$GARAGE_ACCESS_KEY $$GARAGE_SECRET_KEY --api S3v4;
+        fi &&
         sleep infinity
       "
+    volumes:
+      - garage-creds:/creds:ro
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
       seaweedfs-init:
         condition: service_completed_successfully
+      garage-init:
+        condition: service_completed_successfully
 
 volumes:
   garage-data:
   garage-meta:
+  garage-creds:
