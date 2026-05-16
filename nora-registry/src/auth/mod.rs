@@ -1149,7 +1149,12 @@ Jd74nq6dNCjpWG4drIsyhqX+
             http_client: reqwest::Client::new(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            curation: crate::curation::CurationEngine::new(crate::config::CurationConfig::default()),
+            reloadable: Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
+                curation_engine: crate::curation::CurationEngine::new(
+                    crate::config::CurationConfig::default(),
+                ),
+                bypass_token: None,
+            })),
             auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
             oidc: Some(oidc_validator),
             circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(
