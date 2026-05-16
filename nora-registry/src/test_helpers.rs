@@ -148,6 +148,7 @@ fn build_context(
             htpasswd_file: String::new(),
             token_storage: tempdir.path().join("tokens").to_str().unwrap().to_string(),
             trusted_proxies: crate::config::TrustedProxies::default_loopback(),
+            oidc: crate::config::OidcConfig::default(),
         },
         rate_limit: RateLimitConfig {
             enabled: false,

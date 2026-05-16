@@ -689,6 +689,111 @@ pub struct AuthConfig {
     /// ENV: NORA_AUTH_TRUSTED_PROXIES=127.0.0.1,::1,10.0.0.0/8
     #[serde(default)]
     pub trusted_proxies: TrustedProxies,
+    /// OIDC providers for workload identity (CI/CD zero-secret auth)
+    #[serde(default)]
+    pub oidc: OidcConfig,
+}
+
+/// OIDC configuration — multiple providers for workload identity auth.
+///
+/// ```toml
+/// [auth.oidc]
+/// enabled = true
+///
+/// [[auth.oidc.providers]]
+/// name = "github-actions"
+/// issuer = "https://token.actions.githubusercontent.com"
+/// audience = "nora"
+/// algorithms = ["RS256", "ES256"]
+/// max_token_lifetime_secs = 900
+/// namespace_scope = ["*"]
+///
+/// [auth.oidc.providers.role_rules]
+/// "repo:myorg/*:ref:refs/heads/main" = "write"
+/// "repo:myorg/*" = "read"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Clock skew leeway for token validation (seconds)
+    #[serde(default = "default_oidc_leeway")]
+    pub leeway_secs: u64,
+    /// JWKS cache TTL (seconds). Stale keys served on fetch failure.
+    #[serde(default = "default_oidc_jwks_cache_secs")]
+    pub jwks_cache_secs: u64,
+    /// OIDC identity providers
+    #[serde(default)]
+    pub providers: Vec<OidcProvider>,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            leeway_secs: default_oidc_leeway(),
+            jwks_cache_secs: default_oidc_jwks_cache_secs(),
+            providers: Vec::new(),
+        }
+    }
+}
+
+/// A single OIDC identity provider (e.g., GitHub Actions, GitLab CI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcProvider {
+    /// Human-readable name for logs/debugging
+    pub name: String,
+    /// OIDC issuer URL (must match `iss` claim exactly)
+    pub issuer: String,
+    /// Expected audience (`aud` claim). If empty, audience is not validated.
+    #[serde(default)]
+    pub audience: String,
+    /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
+    #[serde(default = "default_oidc_algorithms")]
+    pub algorithms: Vec<String>,
+    /// Maximum token lifetime in seconds. Tokens with longer exp-iat are rejected.
+    #[serde(default = "default_oidc_max_lifetime")]
+    pub max_token_lifetime_secs: u64,
+    /// Namespace scope — which NORA namespaces this issuer can access.
+    /// ["*"] = all, ["github/*"] = only repos under github/ prefix.
+    #[serde(default = "default_namespace_scope")]
+    pub namespace_scope: Vec<String>,
+    /// Kill switch — disable this provider without removing config
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Role rules: glob pattern on `sub` claim → role (read/write/admin).
+    /// First match wins. No match = deny.
+    #[serde(default)]
+    pub role_rules: Vec<OidcRoleRule>,
+}
+
+/// Maps a subject pattern to a NORA role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcRoleRule {
+    /// Glob pattern matched against the JWT `sub` claim
+    pub pattern: String,
+    /// Role to assign: "read", "write", or "admin"
+    pub role: String,
+}
+
+fn default_oidc_leeway() -> u64 {
+    60
+}
+
+fn default_oidc_jwks_cache_secs() -> u64 {
+    3600
+}
+
+fn default_oidc_algorithms() -> Vec<String> {
+    vec!["RS256".to_string(), "ES256".to_string()]
+}
+
+fn default_oidc_max_lifetime() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_namespace_scope() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 fn default_htpasswd_file() -> String {
@@ -775,6 +880,7 @@ impl Default for AuthConfig {
             htpasswd_file: "users.htpasswd".to_string(),
             token_storage: "data/tokens".to_string(),
             trusted_proxies: TrustedProxies::default_loopback(),
+            oidc: OidcConfig::default(),
         }
     }
 }
@@ -1748,6 +1854,9 @@ impl Config {
         }
         if let Ok(val) = env::var("NORA_AUTH_TRUSTED_PROXIES") {
             self.auth.trusted_proxies = TrustedProxies::parse(&val);
+        }
+        if let Ok(val) = env::var("NORA_AUTH_OIDC_ENABLED") {
+            self.auth.oidc.enabled = val.to_lowercase() == "true" || val == "1";
         }
 
         // Registry enabled flags
