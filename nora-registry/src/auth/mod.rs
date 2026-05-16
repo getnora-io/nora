@@ -1111,6 +1111,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 providers: vec![OidcProvider {
                     name: "test-ci".to_string(),
                     issuer: issuer.clone(),
+                    jwks_uri: None,
                     audience: "nora".to_string(),
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,

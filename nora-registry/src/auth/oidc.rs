@@ -74,6 +74,13 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+/// Minimal OIDC discovery document (only the fields we need).
+#[derive(Deserialize)]
+struct OidcDiscoveryDoc {
+    #[serde(default)]
+    jwks_uri: String,
+}
+
 /// OIDC validator — thread-safe, holds cached JWKS per issuer.
 pub struct OidcValidator {
     config: OidcConfig,
@@ -225,11 +232,8 @@ impl OidcValidator {
             }
         }
 
-        // Fetch fresh JWKS
-        let jwks_uri = format!(
-            "{}/.well-known/jwks.json",
-            provider.issuer.trim_end_matches('/')
-        );
+        // Resolve JWKS URI: explicit config > OIDC discovery > legacy fallback
+        let jwks_uri = self.resolve_jwks_uri(provider).await?;
 
         match self.fetch_jwks(&jwks_uri).await {
             Ok(jwks) => {
@@ -258,6 +262,44 @@ impl OidcValidator {
                 Err(format!("JWKS fetch failed for {}: {}", provider.name, e))
             }
         }
+    }
+
+    /// Resolve the JWKS URI for a provider using (in order):
+    /// 1. Explicit `jwks_uri` from config
+    /// 2. OIDC discovery via `.well-known/openid-configuration`
+    /// 3. Fallback to `{issuer}/.well-known/jwks.json`
+    async fn resolve_jwks_uri(&self, provider: &OidcProvider) -> Result<String, String> {
+        // 1. Explicit override
+        if let Some(ref uri) = provider.jwks_uri {
+            return Ok(uri.clone());
+        }
+
+        // 2. OIDC discovery
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            provider.issuer.trim_end_matches('/')
+        );
+
+        if let Ok(resp) = self.http_client.get(&discovery_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(config) = resp.json::<OidcDiscoveryDoc>().await {
+                    if !config.jwks_uri.is_empty() {
+                        tracing::debug!(
+                            provider = %provider.name,
+                            jwks_uri = %config.jwks_uri,
+                            "Discovered JWKS URI via openid-configuration"
+                        );
+                        return Ok(config.jwks_uri);
+                    }
+                }
+            }
+        }
+
+        // 3. Legacy fallback
+        Ok(format!(
+            "{}/.well-known/jwks.json",
+            provider.issuer.trim_end_matches('/')
+        ))
     }
 
     /// HTTP fetch of JWKS from provider.
@@ -387,6 +429,7 @@ mod tests {
         let provider = OidcProvider {
             name: "test".to_string(),
             issuer: "https://test".to_string(),
+            jwks_uri: None,
             audience: "nora".to_string(),
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 900,
