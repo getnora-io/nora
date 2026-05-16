@@ -1,6 +1,21 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+//! Authentication module — middleware, providers, and token routes.
+//!
+//! Supports:
+//! - Basic auth via htpasswd files
+//! - Bearer token auth (opaque tokens with Argon2 verification)
+//! - Brute-force protection with exponential backoff
+
+mod htpasswd;
+pub mod oidc;
+mod token_routes;
+
+pub use htpasswd::HtpasswdAuth;
+pub use oidc::OidcValidator;
+pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -11,11 +26,9 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::tokens::Role;
 use crate::AppState;
 
 /// Tracks failed authentication attempts per IP for brute-force protection.
@@ -78,50 +91,6 @@ impl AuthFailureTracker {
     }
 }
 
-/// Htpasswd-based authentication
-#[derive(Clone)]
-pub struct HtpasswdAuth {
-    users: HashMap<String, String>, // username -> bcrypt hash
-}
-
-impl HtpasswdAuth {
-    /// Load users from htpasswd file
-    pub fn from_file(path: &Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
-        let mut users = HashMap::new();
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((username, hash)) = line.split_once(':') {
-                users.insert(username.to_string(), hash.to_string());
-            }
-        }
-
-        if users.is_empty() {
-            None
-        } else {
-            Some(Self { users })
-        }
-    }
-
-    /// Verify username and password
-    pub fn authenticate(&self, username: &str, password: &str) -> bool {
-        if let Some(hash) = self.users.get(username) {
-            bcrypt::verify(password, hash).unwrap_or(false)
-        } else {
-            false
-        }
-    }
-
-    /// Get list of usernames
-    pub fn list_users(&self) -> Vec<&str> {
-        self.users.keys().map(|s| s.as_str()).collect()
-    }
-}
-
 /// Check if path is public (no auth required)
 fn is_public_path(path: &str) -> bool {
     // Token UI pages require auth — exclude before wildcard match
@@ -154,10 +123,7 @@ fn is_docker_auth_challenge_path(path: &str) -> bool {
 /// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
 /// ignored and the peer IP is returned. This prevents attackers from spoofing
 /// their IP to bypass `AuthFailureTracker` lockout.
-/// Resolve the real client IP from peer address and forwarding headers.
-/// If the peer is a trusted proxy, checks X-Forwarded-For and X-Real-IP.
-/// Otherwise returns the peer IP directly (prevents spoofing).
-fn resolve_client_ip(
+pub(crate) fn resolve_client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
@@ -199,17 +165,16 @@ fn extract_client_ip(
     Some(resolve_client_ip(peer, request.headers(), trusted_proxies))
 }
 
-/// Auth middleware - supports Basic auth and Bearer tokens
+/// Auth middleware - supports Basic auth, Bearer tokens, and OIDC JWT
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Skip auth if disabled
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return next.run(request).await,
-    };
+    // Skip auth if disabled (neither htpasswd nor OIDC configured)
+    if !state.config.auth.enabled {
+        return next.run(request).await;
+    }
 
     // Skip auth for public endpoints
     if is_public_path(request.uri().path()) {
@@ -274,8 +239,9 @@ pub async fn auth_middleware(
         None => return unauthorized_response("Authentication required", realm),
     };
 
-    // Try Bearer token first
+    // Try Bearer token first (opaque nra_ tokens, then OIDC JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((_user, role)) => {
@@ -294,21 +260,61 @@ pub async fn auth_middleware(
                     return next.run(request).await;
                 }
                 Err(_) => {
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_failure(ip);
-                    }
-                    return unauthorized_response("Invalid or expired token", realm);
+                    // Token verification failed — fall through to OIDC
                 }
             }
-        } else {
-            return unauthorized_response("Token authentication not configured", realm);
         }
+
+        // 2. Try OIDC JWT validation
+        if let Some(ref oidc_validator) = state.oidc {
+            if oidc_validator.is_active() {
+                match oidc_validator.validate_token(token).await {
+                    Ok(identity) => {
+                        if let Some(ip) = client_ip {
+                            state.auth_failures.record_success(&ip);
+                        }
+                        tracing::debug!(
+                            provider = %identity.provider,
+                            subject = %identity.subject,
+                            role = ?identity.role,
+                            "OIDC authentication successful"
+                        );
+                        let method = request.method().clone();
+                        if (method == axum::http::Method::PUT
+                            || method == axum::http::Method::POST
+                            || method == axum::http::Method::DELETE
+                            || method == axum::http::Method::PATCH)
+                            && !identity.role.can_write()
+                        {
+                            return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
+                                .into_response();
+                        }
+                        return next.run(request).await;
+                    }
+                    Err(_) => {
+                        // OIDC also failed
+                    }
+                }
+            }
+        }
+
+        // Both token and OIDC failed
+        if let Some(ip) = client_ip {
+            state.auth_failures.record_failure(ip);
+        }
+        return unauthorized_response("Invalid or expired token", realm);
     }
 
     // Parse Basic auth
     if !auth_header.starts_with("Basic ") {
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
+
+    // htpasswd provider required for Basic auth
+    let auth = match &state.auth {
+        Some(auth) => auth,
+        None => return unauthorized_response("Basic auth not configured", realm),
+    };
 
     let encoded = &auth_header[6..];
     let decoded = match STANDARD.decode(encoded) {
@@ -356,312 +362,10 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
         .into_response()
 }
 
-// Token management API routes
-use axum::{routing::post, Json, Router};
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
-
-#[derive(Deserialize)]
-pub struct CreateTokenRequest {
-    pub username: String,
-    pub password: String,
-    #[serde(default = "default_ttl")]
-    pub ttl_days: u64,
-    pub description: Option<String>,
-    #[serde(default = "default_role_str")]
-    pub role: String,
-}
-
-fn default_role_str() -> String {
-    "read".to_string()
-}
-
-fn default_ttl() -> u64 {
-    30
-}
-
-#[derive(Serialize)]
-pub struct CreateTokenResponse {
-    pub token: String,
-    pub expires_in_days: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-#[schema(as = TokenInfo)]
-pub struct TokenListItem {
-    pub hash_prefix: String,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub last_used: Option<u64>,
-    pub description: Option<String>,
-    pub role: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct TokenListResponse {
-    pub tokens: Vec<TokenListItem>,
-}
-
-/// Create a new API token (requires Basic auth)
-async fn create_token(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(req): Json<CreateTokenRequest>,
-) -> Response {
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
-    }
-
-    // Verify user credentials first
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
-
-    let token_store = match &state.tokens {
-        Some(ts) => ts,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Token storage not configured",
-            )
-                .into_response()
-        }
-    };
-
-    let role = match req.role.as_str() {
-        "read" => Role::Read,
-        "write" => Role::Write,
-        "admin" => Role::Admin,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Invalid role. Use: read, write, admin",
-            )
-                .into_response()
-        }
-    };
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
-        Ok(token) => Json(CreateTokenResponse {
-            token,
-            expires_in_days: req.ttl_days,
-        })
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-/// List tokens for authenticated user
-async fn list_tokens(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(req): Json<CreateTokenRequest>,
-) -> Response {
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
-    }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
-
-    let token_store = match &state.tokens {
-        Some(ts) => ts,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Token storage not configured",
-            )
-                .into_response()
-        }
-    };
-
-    let tokens: Vec<TokenListItem> = token_store
-        .list_tokens(&req.username)
-        .into_iter()
-        .map(|t| TokenListItem {
-            hash_prefix: t.file_id,
-            created_at: t.created_at,
-            expires_at: t.expires_at,
-            last_used: t.last_used,
-            description: t.description,
-            role: t.role.to_string(),
-        })
-        .collect();
-
-    Json(TokenListResponse { tokens }).into_response()
-}
-
-#[derive(Deserialize)]
-pub struct RevokeRequest {
-    pub username: String,
-    pub password: String,
-    pub hash_prefix: String,
-}
-
-/// Revoke a token
-async fn revoke_token(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(req): Json<RevokeRequest>,
-) -> Response {
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
-    }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
-
-    let token_store = match &state.tokens {
-        Some(ts) => ts,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Token storage not configured",
-            )
-                .into_response()
-        }
-    };
-
-    match token_store.revoke_token(&req.hash_prefix) {
-        Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
-    }
-}
-
-/// Token management routes
-pub fn token_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/tokens", post(create_token))
-        .route("/api/tokens/list", post(list_tokens))
-        .route("/api/tokens/revoke", post(revoke_token))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    fn create_test_htpasswd(entries: &[(&str, &str)]) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        for (username, password) in entries {
-            let hash = bcrypt::hash(password, 4).unwrap(); // cost=4 for speed in tests
-            writeln!(file, "{}:{}", username, hash).unwrap();
-        }
-        file.flush().unwrap();
-        file
-    }
-
-    #[test]
-    fn test_htpasswd_loading() {
-        let file = create_test_htpasswd(&[("admin", "secret"), ("user", "password")]);
-
-        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
-        let users = auth.list_users();
-        assert_eq!(users.len(), 2);
-        assert!(users.contains(&"admin"));
-        assert!(users.contains(&"user"));
-    }
-
-    #[test]
-    fn test_htpasswd_loading_empty_file() {
-        let file = NamedTempFile::new().unwrap();
-        let auth = HtpasswdAuth::from_file(file.path());
-        assert!(auth.is_none());
-    }
-
-    #[test]
-    fn test_htpasswd_loading_with_comments() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# This is a comment").unwrap();
-        writeln!(file).unwrap();
-        let hash = bcrypt::hash("secret", 4).unwrap();
-        writeln!(file, "admin:{}", hash).unwrap();
-        file.flush().unwrap();
-
-        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
-        assert_eq!(auth.list_users().len(), 1);
-    }
-
-    #[test]
-    fn test_authenticate_valid() {
-        let file = create_test_htpasswd(&[("test", "secret")]);
-        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
-
-        assert!(auth.authenticate("test", "secret"));
-    }
-
-    #[test]
-    fn test_authenticate_invalid_password() {
-        let file = create_test_htpasswd(&[("test", "secret")]);
-        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
-
-        assert!(!auth.authenticate("test", "wrong"));
-    }
-
-    #[test]
-    fn test_authenticate_unknown_user() {
-        let file = create_test_htpasswd(&[("test", "secret")]);
-        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
-
-        assert!(!auth.authenticate("unknown", "secret"));
-    }
 
     #[test]
     fn test_is_public_path() {
@@ -762,47 +466,6 @@ mod tests {
         assert!(!is_public_path("/admin"));
         assert!(!is_public_path("/secret"));
         assert!(!is_public_path("/api/data"));
-    }
-
-    #[test]
-    fn test_default_role_str() {
-        assert_eq!(default_role_str(), "read");
-    }
-
-    #[test]
-    fn test_default_ttl() {
-        assert_eq!(default_ttl(), 30);
-    }
-
-    #[test]
-    fn test_create_token_request_defaults() {
-        let json = r#"{"username":"admin","password":"pass"}"#;
-        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.username, "admin");
-        assert_eq!(req.password, "pass");
-        assert_eq!(req.ttl_days, 30);
-        assert_eq!(req.role, "read");
-        assert!(req.description.is_none());
-    }
-
-    #[test]
-    fn test_create_token_request_custom() {
-        let json = r#"{"username":"admin","password":"pass","ttl_days":90,"role":"write","description":"CI token"}"#;
-        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.ttl_days, 90);
-        assert_eq!(req.role, "write");
-        assert_eq!(req.description, Some("CI token".to_string()));
-    }
-
-    #[test]
-    fn test_create_token_response_serialization() {
-        let resp = CreateTokenResponse {
-            token: "nora_abc123".to_string(),
-            expires_in_days: 30,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("nora_abc123"));
-        assert!(json.contains("30"));
     }
 
     #[test]
@@ -1357,5 +1020,570 @@ mod integration_tests {
         // Verify token is gone
         let tokens = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
         assert_eq!(tokens.len(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OIDC Integration Tests — full middleware flow with mock JWKS server
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod oidc_integration_tests {
+    use crate::auth::oidc::OidcValidator;
+    use crate::config::{OidcConfig, OidcProvider, OidcRoleRule};
+    use crate::test_helpers::*;
+    use axum::http::{Method, StatusCode};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Test RSA private key (2048-bit, for test JWT signing only)
+    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7657FVL7gwmjj
+PEfl4A+ajG3DFj6YHmS9gargHMChpdLMbt8ybqu1hHPUNKQyndUvFJ6q+xJFEds3
+eBtjB5GLLtlj9lScvGPsV7386rypeHq30IErgm2beQJyF9ldtrVHBBPbz7eAo4+i
+wCJ/m5IsuoLCYZPQrDUdpax0dUEa/eP6badqjZ2r0recnHw1+zGyozzSHNvPtK9I
+PsKwBcbGjt5n5+9nWN322/mISAuLNwtv7l3Lja8U7m0ixH0ZLwFSgTLtzEfJISux
++ngGR4k2PBVeo+yDOZtuatx7Aixa1FerOwiq2xsoGOs2dhXagwFGdwbs8x/MvEj0
+67Mm3OrLAgMBAAECggEAHXZkjyWpQ43XagESeKz3ZVCtCNAdAjaJrth8lOSNIwrf
+kOO1JLALRcs9acDTGYh7WwVNlxsEE0Yoa3ruOEmAfSTcOnrtayFyPSTIibW33I4i
+F12eUtcBHkYLpx2sG7BAnaC7CFR5vbZnF6ot/nnCojaft6Aaz7WgIkTOU/fqPDPb
+WOSn4PQmgZS34non7y0NWmxxeIwqJk3aBeeEKisO2AS0YCHOgx2uBTIt2lcIzjK8
+RHwQjLRRfhzxuhHuQtz/hMVQ17W3l7ehYTnW0D+UJJTXBjPgElICmWdGm9NMX9YH
+HzVSBdH+tzTZ/hUhKe+nEZ5vrWT2wqx/h0med2P3eQKBgQDYNURqK7dfo2QBsy/F
+pdUg7UaXfWe+c6guu32aZhnxYsHUE68cuV7Bz/awjMJYvF9VKhoJ+iuHI0myo9In
+HITzbSDwFrWCme7DAIPbfbQU9nQqJLK/g3nUpYSpjFQEnIPJSr1aS/fVpUURAoBg
+RSktyRTY3ak7+6x1I54HLxPk3QKBgQDegZEqK6B28fQklCPgdimwnNr92oJe5hoY
+9cHUDz3A1Uyek40LQ1yR7W/imDCJMcQXqM7Lo54+55eHEkBvh6H/TTmnGMzj5L7t
+HoKYMjYdBK7waFYGM6ULfVXqs6JqVmKFU7LX+ZVmOB5kgcQMQrAhio0GrG97iDqz
+aKHqOthfxwKBgQDKa+SnulIumlzRMqAxXfdSopOK1YBB0SrOxf7shVcYpitukRdL
+v0m2DyyZUs/KIGLo60gBu1TxatpfA/2HXK4k8jD6V2iM4+2kaGELKH9neO59Xmpz
+33Y63tR7oMQwpRDFbtIlLibUwa0OJddnSpkpIq//8le1rwVhjn0voKXxiQKBgQDS
+2qPO+6LHtQewdjX9atydAjfAooYzGgkXKCTzKTJS/47pI1hgmQgrPX9uktxD1sZF
+yXGWpsm6QMtmc5ReXIDWp77/q0/WkpmfqO8G/WYsX5jMN4N1wxEfbzmw/WPnM0+P
+mz56zoiWYo3intpC6Bty3ZJBBb1rqjA+feQaTINpVwKBgF/M0Lj9Sq9G2Ec7yBnm
+xhBlLwCNzAk33Fy+6w6ANXTsGRwMm0zGdTjC3e6LHMrD0ZtF0M2blWAUh3sZ6ItQ
+2Ak5ScO0q3MRQvo4HZkFK2wuZvNLYExq6gGy3P6l8xXbvQTzg5nl9UWDKfY1gifz
+Jd74nq6dNCjpWG4drIsyhqX+
+-----END PRIVATE KEY-----"#;
+
+    // Corresponding JWKS (public key in JWK format)
+    const TEST_JWKS_JSON: &str = r#"{"keys":[{"kty":"RSA","kid":"test-key-1","use":"sig","alg":"RS256","n":"u-uexVS-4MJo4zxH5eAPmoxtwxY-mB5kvYGq4BzAoaXSzG7fMm6rtYRz1DSkMp3VLxSeqvsSRRHbN3gbYweRiy7ZY_ZUnLxj7Fe9_Oq8qXh6t9CBK4Jtm3kCchfZXba1RwQT28-3gKOPosAif5uSLLqCwmGT0Kw1HaWsdHVBGv3j-m2nao2dq9K3nJx8NfsxsqM80hzbz7SvSD7CsAXGxo7eZ-fvZ1jd9tv5iEgLizcLb-5dy42vFO5tIsR9GS8BUoEy7cxHySErsfp4BkeJNjwVXqPsgzmbbmrcewIsWtRXqzsIqtsbKBjrNnYV2oMBRncG7PMfzLxI9OuzJtzqyw","e":"AQAB"}]}"#;
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Create a signed JWT with given claims.
+    fn make_jwt(issuer: &str, subject: &str, audience: &str, iat: u64, exp: u64) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+
+        let claims = json!({
+            "iss": issuer,
+            "sub": subject,
+            "aud": audience,
+            "iat": iat,
+            "exp": exp,
+        });
+
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        encode(&header, &claims, &key).unwrap()
+    }
+
+    /// Build a TestContext with OIDC enabled, pointing at the given mock JWKS URL.
+    fn create_oidc_test_context(mock_issuer_url: &str) -> TestContext {
+        let issuer = mock_issuer_url.to_string();
+        let mut ctx = create_test_context_with_config(move |cfg| {
+            cfg.auth.enabled = true;
+            cfg.auth.anonymous_read = false;
+            cfg.auth.oidc = OidcConfig {
+                enabled: true,
+                leeway_secs: 60,
+                jwks_cache_secs: 300,
+                providers: vec![OidcProvider {
+                    name: "test-ci".to_string(),
+                    issuer: issuer.clone(),
+                    audience: "nora".to_string(),
+                    algorithms: vec!["RS256".to_string()],
+                    max_token_lifetime_secs: 900,
+                    namespace_scope: vec!["*".to_string()],
+                    enabled: true,
+                    role_rules: vec![
+                        OidcRoleRule {
+                            pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
+                            role: "write".to_string(),
+                        },
+                        OidcRoleRule {
+                            pattern: "repo:myorg/*".to_string(),
+                            role: "read".to_string(),
+                        },
+                    ],
+                }],
+            };
+        });
+
+        // Wire up the OidcValidator on the existing state
+        let oidc_validator = OidcValidator::new(ctx.state.config.auth.oidc.clone());
+        // We need to rebuild the state with oidc set — use Arc::get_mut or rebuild
+        let state = Arc::new(crate::AppState {
+            storage: ctx.state.storage.clone(),
+            config: ctx.state.config.clone(),
+            enabled_registries: ctx.state.enabled_registries.clone(),
+            start_time: ctx.state.start_time,
+            startup_duration_ms: ctx.state.startup_duration_ms,
+            auth: ctx.state.auth.clone(),
+            tokens: ctx.state.tokens.clone(),
+            metrics: crate::dashboard_metrics::DashboardMetrics::new(),
+            activity: crate::activity_log::ActivityLog::new(50),
+            audit: ctx.state.audit.clone(),
+            docker_auth: crate::registry::DockerAuth::new(5),
+            repo_index: crate::repo_index::RepoIndex::new(),
+            http_client: reqwest::Client::new(),
+            upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            publish_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            curation: crate::curation::CurationEngine::new(crate::config::CurationConfig::default()),
+            auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
+            oidc: Some(oidc_validator),
+            circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(
+                ctx.state.config.circuit_breaker.clone(),
+            ),
+            digest_store: ctx.state.digest_store.clone(),
+        });
+
+        // Rebuild router with new state
+        use axum::{extract::DefaultBodyLimit, middleware, Router};
+        let mut registry_routes = Router::new();
+        for reg in &state.enabled_registries {
+            match reg {
+                crate::registry_type::RegistryType::Raw => {
+                    registry_routes = registry_routes.merge(crate::registry::raw_routes());
+                }
+                _ => {}
+            }
+        }
+        let public_routes = Router::new().merge(crate::health::routes());
+        let app_routes = Router::new()
+            .merge(crate::auth::token_routes())
+            .merge(crate::ui::routes())
+            .merge(registry_routes);
+        let app = Router::new()
+            .merge(public_routes)
+            .merge(app_routes)
+            .layer(DefaultBodyLimit::max(
+                state.config.server.body_limit_mb * 1024 * 1024,
+            ))
+            .layer(middleware::from_fn(
+                crate::request_id::request_id_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state.clone());
+
+        ctx.state = state;
+        ctx.app = app;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn test_oidc_valid_jwt_write_access() {
+        let mock_server = MockServer::start().await;
+
+        // Serve JWKS at /.well-known/jwks.json
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/oidc-test.txt",
+            vec![("authorization", &bearer)],
+            b"hello from ci".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "Write with main-branch OIDC token should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_valid_jwt_read_only_blocks_write() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // dev branch → read-only role
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/dev",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/oidc-test.txt",
+            vec![("authorization", &bearer)],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "Write with read-only OIDC token should be forbidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_valid_jwt_read_only_allows_get() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/dev",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        // GET should succeed (even if file doesn't exist — 404 not 401/403)
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/nonexistent.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Read with valid OIDC token should not be 401"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "Read with read-only OIDC token should not be 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_expired_token_rejected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        // Token expired 2 minutes ago (beyond 60s leeway)
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now - 600,
+            now - 120,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Expired OIDC token should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_wrong_issuer_rejected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Token has a different issuer than configured
+        let token = make_jwt(
+            "https://evil-issuer.example.com",
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Token with wrong issuer should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_wrong_audience_rejected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Token has wrong audience
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "wrong-audience",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Token with wrong audience should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_no_matching_role_rejected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Subject from a different org → no role_rules match
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:otherorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Token with no matching role should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_token_lifetime_exceeded() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Token lifetime = 2000s, exceeds max_token_lifetime_secs = 900
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 2000,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Token exceeding max lifetime should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_jwks_fetch_failure_returns_401() {
+        let mock_server = MockServer::start().await;
+
+        // Don't mount any mock → JWKS fetch will 404
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Should fail gracefully when JWKS cannot be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_symmetric_algorithm_rejected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+
+        // Create token signed with HS256 (symmetric) — should be rejected
+        // even before JWKS fetch because of algorithm whitelist
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test-key-1".to_string());
+        let claims = json!({
+            "iss": mock_server.uri(),
+            "sub": "repo:myorg/app:ref:refs/heads/main",
+            "aud": "nora",
+            "iat": now,
+            "exp": now + 600,
+        });
+        let key = EncodingKey::from_secret(b"fake-secret");
+        let token = encode(&header, &claims, &key).unwrap();
+
+        let bearer = format!("Bearer {}", token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &bearer)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "HS256 tokens must be rejected for OIDC"
+        );
     }
 }

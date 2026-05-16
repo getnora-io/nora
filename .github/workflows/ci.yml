@@ -166,8 +166,8 @@ jobs:
 
       - name: cargo audit — RustSec advisory database
         run: |
-          cargo audit --ignore RUSTSEC-2025-0119
-          cargo audit --ignore RUSTSEC-2025-0119 --json > /tmp/audit.json || true
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --json > /tmp/audit.json || true
 
       - name: Upload cargo-audit results as SARIF
         if: always()
@@ -208,6 +208,7 @@ jobs:
           output: trivy-fs.sarif
           severity: HIGH,CRITICAL
           exit-code: 1
+          trivyignores: .trivyignore
 
       - name: Upload Trivy fs results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4

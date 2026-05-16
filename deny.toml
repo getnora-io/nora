@@ -4,7 +4,11 @@
 [advisories]
 # Vulnerability database (RustSec)
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # rsa crate Marvin Attack (timing sidechannel). No upstream fix.
+    # jsonwebtoken uses rsa for JWK decoding; NORA only verifies signatures.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 unused-allowed-license = "allow"
