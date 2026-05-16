@@ -6,6 +6,8 @@ flate = "flate"
 # grep pattern fragments in lint scripts
 validat = "validat"
 registr = "registr"
+# base64-encoded RSA key data in OIDC test constants
+NLY = "NLY"
 
 [files]
 extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]

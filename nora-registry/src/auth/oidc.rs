@@ -125,10 +125,7 @@ impl OidcValidator {
             .map_err(|e| format!("Cannot decode claims: {}", e))?
             .claims;
 
-        let issuer = unverified
-            .iss
-            .as_deref()
-            .ok_or("Token missing iss claim")?;
+        let issuer = unverified.iss.as_deref().ok_or("Token missing iss claim")?;
 
         // Find matching provider
         let provider = self
@@ -156,8 +153,7 @@ impl OidcValidator {
             .keys
             .iter()
             .find(|k| {
-                k.common.key_id.as_deref() == Some(kid)
-                    || (kid.is_empty() && jwks.keys.len() == 1)
+                k.common.key_id.as_deref() == Some(kid) || (kid.is_empty() && jwks.keys.len() == 1)
             })
             .ok_or_else(|| {
                 format!(
@@ -167,8 +163,8 @@ impl OidcValidator {
             })?;
 
         // Build decoding key from JWK
-        let decoding_key = DecodingKey::from_jwk(jwk)
-            .map_err(|e| format!("Cannot build key from JWK: {}", e))?;
+        let decoding_key =
+            DecodingKey::from_jwk(jwk).map_err(|e| format!("Cannot build key from JWK: {}", e))?;
 
         // Full validation
         let mut validation = Validation::new(header.alg);
@@ -199,14 +195,12 @@ impl OidcValidator {
 
         // Map claims to role via role_rules
         let subject = claims.sub.unwrap_or_default();
-        let role = self
-            .match_role(provider, &subject)
-            .ok_or_else(|| {
-                format!(
-                    "No role rule matches sub='{}' for provider {}",
-                    subject, provider.name
-                )
-            })?;
+        let role = self.match_role(provider, &subject).ok_or_else(|| {
+            format!(
+                "No role rule matches sub='{}' for provider {}",
+                subject, provider.name
+            )
+        })?;
 
         Ok(OidcIdentity {
             provider: provider.name.clone(),
@@ -359,7 +353,10 @@ mod tests {
     #[test]
     fn test_glob_match_wildcard() {
         assert!(glob_match("repo:org/*", "repo:org/myrepo"));
-        assert!(glob_match("repo:org/*", "repo:org/myrepo:ref:refs/heads/main"));
+        assert!(glob_match(
+            "repo:org/*",
+            "repo:org/myrepo:ref:refs/heads/main"
+        ));
         assert!(!glob_match("repo:org/*", "repo:other/myrepo"));
     }
 
@@ -371,8 +368,14 @@ mod tests {
 
     #[test]
     fn test_glob_match_middle() {
-        assert!(glob_match("repo:*:ref:refs/heads/main", "repo:org/myrepo:ref:refs/heads/main"));
-        assert!(!glob_match("repo:*:ref:refs/heads/main", "repo:org/myrepo:ref:refs/heads/dev"));
+        assert!(glob_match(
+            "repo:*:ref:refs/heads/main",
+            "repo:org/myrepo:ref:refs/heads/main"
+        ));
+        assert!(!glob_match(
+            "repo:*:ref:refs/heads/main",
+            "repo:org/myrepo:ref:refs/heads/dev"
+        ));
     }
 
     #[test]

@@ -1149,9 +1149,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             http_client: reqwest::Client::new(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            curation: crate::curation::CurationEngine::new(
-                crate::config::CurationConfig::default(),
-            ),
+            curation: crate::curation::CurationEngine::new(crate::config::CurationConfig::default()),
             auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
             oidc: Some(oidc_validator),
             circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(
@@ -1166,8 +1164,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         for reg in &state.enabled_registries {
             match reg {
                 crate::registry_type::RegistryType::Raw => {
-                    registry_routes =
-                        registry_routes.merge(crate::registry::raw_routes());
+                    registry_routes = registry_routes.merge(crate::registry::raw_routes());
                 }
                 _ => {}
             }
@@ -1205,8 +1202,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1244,8 +1240,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1284,8 +1279,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1329,8 +1323,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1369,8 +1362,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1409,8 +1401,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1449,8 +1440,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1489,8 +1479,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
@@ -1560,8 +1549,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(TEST_JWKS_JSON, "application/json"),
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
             )
             .mount(&mock_server)
             .await;
