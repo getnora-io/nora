@@ -2,3 +2,8 @@
 # No fix available upstream. jsonwebtoken uses rsa for JWK decoding.
 # Risk mitigated: NORA verifies signatures, does not perform RSA decryption.
 CVE-2023-49092
+GHSA-c38w-74pg-36hr
+RUSTSEC-2023-0071
+
+# Test RSA private key in OIDC integration tests (not a real credential)
+private-key
