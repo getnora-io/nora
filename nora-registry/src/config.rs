@@ -800,6 +800,11 @@ pub struct OidcProvider {
     pub name: String,
     /// OIDC issuer URL (must match `iss` claim exactly)
     pub issuer: String,
+    /// Explicit JWKS URI override. If not set, NORA discovers it via
+    /// `{issuer}/.well-known/openid-configuration`. Use when the provider's
+    /// JWKS endpoint doesn't follow the standard `/.well-known/jwks.json` path.
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
     /// Expected audience (`aud` claim). If empty, audience is not validated.
     #[serde(default)]
     pub audience: String,
@@ -1859,6 +1864,29 @@ impl Config {
         }
 
         config
+    }
+
+    /// Non-panicking config reload for SIGHUP handler.
+    /// Returns Err on invalid file/TOML/validation instead of panicking.
+    pub fn try_load() -> Result<Self, String> {
+        let mut config: Config = if let Ok(config_path) = env::var("NORA_CONFIG_PATH") {
+            let content = fs::read_to_string(&config_path)
+                .map_err(|e| format!("Cannot read {}: {}", config_path, e))?;
+            toml::from_str(&content)
+                .map_err(|e| format!("Invalid TOML in {}: {}", config_path, e))?
+        } else {
+            match fs::read_to_string("config.toml") {
+                Ok(content) => toml::from_str(&content)
+                    .map_err(|e| format!("Invalid TOML in config.toml: {}", e))?,
+                Err(_) => Config::default(),
+            }
+        };
+        config.apply_env_overrides();
+        let (_, errors) = config.validate();
+        if !errors.is_empty() {
+            return Err(format!("Validation errors: {}", errors.join("; ")));
+        }
+        Ok(config)
     }
 
     /// Apply environment variable overrides
