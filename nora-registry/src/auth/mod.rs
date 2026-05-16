@@ -9,9 +9,11 @@
 //! - Brute-force protection with exponential backoff
 
 mod htpasswd;
+pub mod oidc;
 mod token_routes;
 
 pub use htpasswd::HtpasswdAuth;
+pub use oidc::OidcValidator;
 pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 
 use axum::{
@@ -238,8 +240,9 @@ pub async fn auth_middleware(
         None => return unauthorized_response("Authentication required", realm),
     };
 
-    // Try Bearer token first
+    // Try Bearer token first (opaque nra_ tokens, then OIDC JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((_user, role)) => {
@@ -258,15 +261,49 @@ pub async fn auth_middleware(
                     return next.run(request).await;
                 }
                 Err(_) => {
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_failure(ip);
-                    }
-                    return unauthorized_response("Invalid or expired token", realm);
+                    // Token verification failed — fall through to OIDC
                 }
             }
-        } else {
-            return unauthorized_response("Token authentication not configured", realm);
         }
+
+        // 2. Try OIDC JWT validation
+        if let Some(ref oidc_validator) = state.oidc {
+            if oidc_validator.is_active() {
+                match oidc_validator.validate_token(token).await {
+                    Ok(identity) => {
+                        if let Some(ip) = client_ip {
+                            state.auth_failures.record_success(&ip);
+                        }
+                        tracing::debug!(
+                            provider = %identity.provider,
+                            subject = %identity.subject,
+                            role = ?identity.role,
+                            "OIDC authentication successful"
+                        );
+                        let method = request.method().clone();
+                        if (method == axum::http::Method::PUT
+                            || method == axum::http::Method::POST
+                            || method == axum::http::Method::DELETE
+                            || method == axum::http::Method::PATCH)
+                            && !identity.role.can_write()
+                        {
+                            return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
+                                .into_response();
+                        }
+                        return next.run(request).await;
+                    }
+                    Err(_) => {
+                        // OIDC also failed
+                    }
+                }
+            }
+        }
+
+        // Both token and OIDC failed
+        if let Some(ip) = client_ip {
+            state.auth_failures.record_failure(ip);
+        }
+        return unauthorized_response("Invalid or expired token", realm);
     }
 
     // Parse Basic auth

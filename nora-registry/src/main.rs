@@ -161,6 +161,8 @@ pub struct AppState {
     pub curation: curation::CurationEngine,
     /// Per-IP failed auth attempt tracker for brute-force protection
     pub auth_failures: auth::AuthFailureTracker,
+    /// OIDC validator for workload identity (CI/CD)
+    pub oidc: Option<auth::OidcValidator>,
     pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
     pub digest_store: std::sync::Arc<digest_quarantine::DigestStore>,
 }
@@ -961,6 +963,12 @@ async fn run_server(config: Config, storage: Storage) {
         Arc::new(digest_quarantine::DigestStore::empty(&storage_path))
     };
 
+    let oidc_validator = if config.auth.oidc.enabled {
+        Some(auth::OidcValidator::new(config.auth.oidc.clone()))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -979,6 +987,7 @@ async fn run_server(config: Config, storage: Storage) {
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
         auth_failures: auth::AuthFailureTracker::new(5, 900),
+        oidc: oidc_validator,
         circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
         digest_store,
     });

@@ -232,6 +232,7 @@ fn build_context(
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
         curation: curation_engine,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
+        oidc: None,
         circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
         digest_store: std::sync::Arc::new(crate::digest_quarantine::DigestStore::empty(
             &storage_path,
