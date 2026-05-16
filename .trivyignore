@@ -1,0 +1,4 @@
+# rsa crate: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
+# No fix available upstream. jsonwebtoken uses rsa for JWK decoding.
+# Risk mitigated: NORA verifies signatures, does not perform RSA decryption.
+CVE-2023-49092

@@ -59,6 +59,7 @@ enum Audience {
 }
 
 impl Audience {
+    #[cfg(test)]
     fn contains(&self, expected: &str) -> bool {
         match self {
             Audience::Single(s) => s == expected,
