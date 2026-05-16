@@ -219,8 +219,8 @@ async fn registration_index(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Nuget,
         &id_lower,
@@ -397,8 +397,8 @@ async fn flatcontainer_download(
         let publish_date = extract_nuget_publish_date(&state.storage, &id_lower, ver).await;
 
         if let Some(response) = crate::curation::check_download(
-            &state.curation,
-            state.config.curation.bypass_token.as_deref(),
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
             &headers,
             crate::curation::RegistryType::Nuget,
             &id_lower,
@@ -420,7 +420,7 @@ async fn flatcontainer_download(
     if let Ok(data) = state.storage.get(&storage_key).await {
         if ends_with_ci(filename, ".nupkg") {
             if let Some(response) = crate::curation::verify_integrity(
-                &state.curation,
+                &state.curation().curation_engine,
                 crate::curation::RegistryType::Nuget,
                 &id_lower,
                 Some(ver),

@@ -260,8 +260,8 @@ async fn download(
 
     // Curation check — before storage access
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Cargo,
         &crate_name,
@@ -280,7 +280,7 @@ async fn download(
     if let Ok(data) = state.storage.get(&key).await {
         // Post-download integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::Cargo,
             &crate_name,
             Some(&version),

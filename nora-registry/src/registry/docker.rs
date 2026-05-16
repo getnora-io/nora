@@ -20,12 +20,89 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use futures::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// Namespaced key builders (issue #323)
+// ============================================================================
+
+/// Build a namespaced storage key for Docker blobs.
+///
+/// With namespace: `docker/{ns}/{name}/blobs/{digest}`
+/// Without (local push): `docker/{name}/blobs/{digest}`
+fn blob_key(namespace: Option<&str>, name: &str, digest: &str) -> String {
+    match namespace {
+        Some(ns) => format!("docker/{}/{}/blobs/{}", ns, name, digest),
+        None => format!("docker/{}/blobs/{}", name, digest),
+    }
+}
+
+/// Build a namespaced storage key for Docker manifests.
+fn manifest_key(namespace: Option<&str>, name: &str, reference: &str) -> String {
+    match namespace {
+        Some(ns) => format!("docker/{}/{}/manifests/{}.json", ns, name, reference),
+        None => format!("docker/{}/manifests/{}.json", name, reference),
+    }
+}
+
+/// Build a namespaced storage key for Docker manifest metadata.
+fn manifest_meta_key(namespace: Option<&str>, name: &str, reference: &str) -> String {
+    match namespace {
+        Some(ns) => format!("docker/{}/{}/manifests/{}.meta.json", ns, name, reference),
+        None => format!("docker/{}/manifests/{}.meta.json", name, reference),
+    }
+}
+
+/// Build a namespaced storage key prefix for listing manifests.
+fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(ns) => format!("docker/{}/{}/manifests/", ns, name),
+        None => format!("docker/{}/manifests/", name),
+    }
+}
+
+/// Resolve the namespace for a given name by finding the matching upstream.
+fn resolve_namespace(config: &crate::config::DockerConfig, _name: &str) -> Option<String> {
+    // For now, use the first upstream's namespace (single-upstream is the common case).
+    // Multi-upstream namespace routing can be refined later by matching name patterns.
+    config.upstreams.first().map(|u| u.resolved_namespace())
+}
+
+/// Try to get content from namespaced key, falling back to legacy (non-namespaced) key.
+///
+/// This provides backward compatibility during migration from flat to namespaced storage.
+async fn storage_get_with_fallback(
+    storage: &Storage,
+    ns_key: &str,
+    legacy_key: &str,
+) -> Result<Bytes, crate::storage::StorageError> {
+    match storage.get(ns_key).await {
+        Ok(data) => Ok(data),
+        Err(_) if ns_key != legacy_key => storage.get(legacy_key).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Check if a key exists in namespaced or legacy location.
+async fn storage_stat_with_fallback(
+    storage: &Storage,
+    ns_key: &str,
+    legacy_key: &str,
+) -> Option<crate::storage::FileMeta> {
+    if let Some(meta) = storage.stat(ns_key).await {
+        return Some(meta);
+    }
+    if ns_key != legacy_key {
+        return storage.stat(legacy_key).await;
+    }
+    None
+}
 
 /// Metadata for a Docker image stored alongside manifests
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -389,8 +466,10 @@ async fn check_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = format!("docker/{}/blobs/{}", name, digest);
-    match state.storage.get(&key).await {
+    let ns = resolve_namespace(&state.config.docker, &name);
+    let key = blob_key(ns.as_deref(), &name, &digest);
+    let legacy_key = blob_key(None, &name, &digest);
+    match storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
         Ok(data) => (
             StatusCode::OK,
             [(header::CONTENT_LENGTH, data.len().to_string())],
@@ -418,8 +497,8 @@ async fn download_blob(
 
     // Curation check — defense in depth: check blobs too
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Docker,
         &name,
@@ -429,13 +508,15 @@ async fn download_blob(
         return response;
     }
 
-    let key = format!("docker/{}/blobs/{}", name, digest);
+    let ns = resolve_namespace(&state.config.docker, &name);
+    let key = blob_key(ns.as_deref(), &name, &digest);
+    let legacy_key = blob_key(None, &name, &digest);
 
-    // Try local storage first
-    if let Ok(data) = state.storage.get(&key).await {
+    // Try local storage first (namespaced key, then legacy fallback)
+    if let Ok(data) = storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
         // Curation integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::Docker,
             &name,
             Some(&digest),
@@ -472,6 +553,7 @@ async fn download_blob(
             &digest,
             &state.docker_auth,
             state.config.docker.proxy_timeout,
+            state.config.docker.read_timeout,
             upstream.auth.as_deref(),
             &state.circuit_breaker,
         )
@@ -516,6 +598,7 @@ async fn download_blob(
                 &digest,
                 &state.docker_auth,
                 state.config.docker.proxy_timeout,
+                state.config.docker.read_timeout,
                 upstream.auth.as_deref(),
                 &state.circuit_breaker,
             )
@@ -854,19 +937,22 @@ async fn get_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    let ns = resolve_namespace(&state.config.docker, &name);
+
     // Extract publish date from .meta.json sidecar
     let publish_date = extract_docker_publish_date(
         &state.storage,
         &name,
         &reference,
         state.config.docker.upstreams.is_empty(),
+        ns.as_deref(),
     )
     .await;
 
     // Curation check — manifests carry the image identity
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Docker,
         &name,
@@ -876,81 +962,29 @@ async fn get_manifest(
         return response;
     }
 
-    let key = format!("docker/{}/manifests/{}.json", name, reference);
+    let key = manifest_key(ns.as_deref(), &name, &reference);
+    let legacy_key = manifest_key(None, &name, &reference);
 
-    // Try local storage first
-    if let Ok(data) = state.storage.get(&key).await {
-        // Curation integrity verification (issue #189)
-        if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
-            crate::curation::RegistryType::Docker,
-            &name,
-            Some(&reference),
-            &data,
-        ) {
-            return response;
+    // Try local storage first, with TTL-based revalidation (namespaced key, then legacy fallback)
+    let cached = storage_get_with_fallback(&state.storage, &key, &legacy_key)
+        .await
+        .ok();
+    let cache_fresh = if cached.is_some() {
+        let meta = storage_stat_with_fallback(&state.storage, &key, &legacy_key).await;
+        meta.map(|m| crate::cache_ttl::is_within_ttl(m.modified, state.config.docker.metadata_ttl))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Serve fresh cache immediately
+    if let Some(ref data) = cached {
+        if cache_fresh {
+            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
         }
-
-        state.metrics.record_download("docker");
-        state.metrics.record_cache_hit();
-        state.activity.push(ActivityEntry::new(
-            ActionType::Pull,
-            format!("{}:{}", name, reference),
-            "docker",
-            "LOCAL",
-        ));
-
-        // Calculate digest for Docker-Content-Digest header
-        use sha2::Digest;
-        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-
-        // Quarantine check (local cache hit may still be pending)
-        let (q_mode, q_secs) = resolve_quarantine(&state);
-        if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-            let q_status = state.digest_store.check("docker", &digest, q_secs);
-            match &q_status {
-                crate::digest_quarantine::QuarantineStatus::Mature => {}
-                _ => {
-                    tracing::warn!(
-                        digest = %digest,
-                        status = %q_status.header_value(),
-                        mode = ?q_mode,
-                        "Quarantine: cached manifest"
-                    );
-                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
-                        return quarantine_forbidden(&digest, &q_status, q_secs);
-                    }
-                }
-            }
-        }
-
-        // Detect manifest media type from content
-        let content_type = detect_manifest_media_type(&data);
-
-        // Update metadata (downloads, last_pulled) in background
-        let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
-        let state_clone = state.clone();
-        let storage_clone = state.storage.clone();
-        tokio::spawn(update_metadata_on_pull(
-            state_clone,
-            storage_clone,
-            meta_key,
-        ));
-
-        let content_length = data.len().to_string();
-        return (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, content_type),
-                (HeaderName::from_static("docker-content-digest"), digest),
-                (header::CONTENT_LENGTH, content_length),
-            ],
-            data,
-        )
-            .into_response();
     }
 
-    // Try upstream proxies
+    // Try upstream proxies (always if no cache, or if cache is stale)
     tracing::debug!(
         upstreams_count = state.config.docker.upstreams.len(),
         "Trying upstream proxies"
@@ -1017,6 +1051,7 @@ async fn get_manifest(
                 }
 
                 // Cache manifest and create metadata (fire and forget)
+                let upstream_ns = Some(upstream.resolved_namespace());
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
@@ -1025,39 +1060,30 @@ async fn get_manifest(
                 let digest_clone = digest.clone();
                 let state_clone = Arc::clone(&state);
                 tokio::spawn(async move {
-                    // Store manifest by tag and digest
+                    // Store manifest by tag and digest (namespaced)
                     let _ = storage.put(&key_clone, &data_clone).await;
                     let digest_key =
-                        format!("docker/{}/manifests/{}.json", name_clone, digest_clone);
+                        manifest_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
                     let _ = storage.put(&digest_key, &data_clone).await;
 
                     // Extract and save metadata
                     let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
                     if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-                        let meta_key = format!(
-                            "docker/{}/manifests/{}.meta.json",
-                            name_clone, reference_clone
+                        let meta_key = manifest_meta_key(
+                            upstream_ns.as_deref(),
+                            &name_clone,
+                            &reference_clone,
                         );
                         let _ = storage.put(&meta_key, &meta_json).await;
 
                         let digest_meta_key =
-                            format!("docker/{}/manifests/{}.meta.json", name_clone, digest_clone);
+                            manifest_meta_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
                         let _ = storage.put(&digest_meta_key, &meta_json).await;
                     }
                     state_clone.repo_index.invalidate("docker");
                 });
 
-                let content_length = data.len().to_string();
-                return (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (HeaderName::from_static("docker-content-digest"), digest),
-                        (header::CONTENT_LENGTH, content_length),
-                    ],
-                    Bytes::from(data),
-                )
-                    .into_response();
+                return manifest_response(data, content_type, digest);
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
@@ -1142,17 +1168,7 @@ async fn get_manifest(
 
                     state.repo_index.invalidate("docker");
 
-                    let content_length = data.len().to_string();
-                    return (
-                        StatusCode::OK,
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (HeaderName::from_static("docker-content-digest"), digest),
-                            (header::CONTENT_LENGTH, content_length),
-                        ],
-                        Bytes::from(data),
-                    )
-                        .into_response();
+                    return manifest_response(data, content_type, digest);
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
                 Err(e) => {
@@ -1163,10 +1179,91 @@ async fn get_manifest(
         }
     }
 
+    // Stale-while-error: serve stale cached manifest when upstream is unreachable
+    if let Some(ref data) = cached {
+        if state.config.docker.stale_while_error {
+            tracing::warn!(
+                registry = "docker",
+                name = %name,
+                reference = %reference,
+                "Upstream failed, serving stale cached manifest"
+            );
+            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+        }
+    }
+
     if !state.config.docker.upstreams.is_empty() {
         tracing::warn!(registry = "docker", name = %name, reference = %reference, "Proxy failed, returning 404");
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Serve a manifest from local cache with all required headers and side-effects.
+fn serve_cached_manifest(
+    state: &Arc<AppState>,
+    data: &[u8],
+    name: &str,
+    reference: &str,
+    ns: Option<&str>,
+) -> Response {
+    // Curation integrity verification (issue #189)
+    if let Some(response) = crate::curation::verify_integrity(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Docker,
+        name,
+        Some(reference),
+        data,
+    ) {
+        return response;
+    }
+
+    state.metrics.record_download("docker");
+    state.metrics.record_cache_hit();
+    state.activity.push(ActivityEntry::new(
+        ActionType::Pull,
+        format!("{}:{}", name, reference),
+        "docker",
+        "LOCAL",
+    ));
+
+    // Calculate digest for Docker-Content-Digest header
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+
+    // Quarantine check (local cache hit may still be pending)
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        let q_status = state.digest_store.check("docker", &digest, q_secs);
+        match &q_status {
+            crate::digest_quarantine::QuarantineStatus::Mature => {}
+            _ => {
+                tracing::warn!(
+                    digest = %digest,
+                    status = %q_status.header_value(),
+                    mode = ?q_mode,
+                    "Quarantine: cached manifest"
+                );
+                if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+                    return quarantine_forbidden(&digest, &q_status, q_secs);
+                }
+            }
+        }
+    }
+
+    // Detect manifest media type from content
+    let content_type = detect_manifest_media_type(data);
+
+    // Update metadata (downloads, last_pulled) in background
+    let meta_key = manifest_meta_key(ns, name, reference);
+    let state_clone = state.clone();
+    let storage_clone = state.storage.clone();
+    tokio::spawn(update_metadata_on_pull(
+        state_clone,
+        storage_clone,
+        meta_key,
+    ));
+
+    manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
 
 async fn put_manifest(
@@ -1246,12 +1343,21 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let prefix = format!("docker/{}/manifests/", name);
-    let keys = state.storage.list(&prefix).await;
+    let ns = resolve_namespace(&state.config.docker, &name);
+    let prefix = manifest_prefix(ns.as_deref(), &name);
+    let legacy_prefix = manifest_prefix(None, &name);
+    let mut keys = state.storage.list(&prefix).await;
+    // Also include legacy non-namespaced keys during migration
+    if prefix != legacy_prefix {
+        keys.extend(state.storage.list(&legacy_prefix).await);
+        keys.sort();
+        keys.dedup();
+    }
     let tags: Vec<String> = keys
         .iter()
         .filter_map(|k| {
             k.strip_prefix(&prefix)
+                .or_else(|| k.strip_prefix(&legacy_prefix))
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
@@ -1275,7 +1381,9 @@ async fn delete_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = format!("docker/{}/manifests/{}.json", name, reference);
+    let ns = resolve_namespace(&state.config.docker, &name);
+    let key = manifest_key(ns.as_deref(), &name, &reference);
+    let legacy_key = manifest_key(None, &name, &reference);
 
     // Serialize tag delete with put_manifest via publish_lock to prevent
     // concurrent put from updating the tag between our read and delete
@@ -1285,21 +1393,38 @@ async fn delete_manifest(
     // If reference is a tag, also delete digest-keyed copy
     let is_tag = !reference.starts_with("sha256:");
     if is_tag {
-        if let Ok(data) = state.storage.get(&key).await {
+        if let Ok(data) = storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
             use sha2::Digest;
             let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-            let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
-            let _ = state.storage.delete(&digest_key).await;
-            let digest_meta = format!("docker/{}/manifests/{}.meta.json", name, digest);
-            let _ = state.storage.delete(&digest_meta).await;
+            // Delete from both namespaced and legacy locations
+            let _ = state
+                .storage
+                .delete(&manifest_key(ns.as_deref(), &name, &digest))
+                .await;
+            let _ = state
+                .storage
+                .delete(&manifest_key(None, &name, &digest))
+                .await;
+            let _ = state
+                .storage
+                .delete(&manifest_meta_key(ns.as_deref(), &name, &digest))
+                .await;
+            let _ = state
+                .storage
+                .delete(&manifest_meta_key(None, &name, &digest))
+                .await;
         }
     }
 
-    // Delete manifest
+    // Delete manifest — try namespaced key first, then legacy fallback
     match state.storage.delete(&key).await {
         Ok(()) => {
             // Delete associated metadata
-            let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
+            let meta_key = manifest_meta_key(ns.as_deref(), &name, &reference);
+            let _ = state
+                .storage
+                .delete(&manifest_meta_key(None, &name, &reference))
+                .await;
             let _ = state.storage.delete(&meta_key).await;
 
             state.audit.log(AuditEntry::new(
@@ -1312,6 +1437,38 @@ async fn delete_manifest(
             state.repo_index.invalidate("docker");
             tracing::info!(name = %name, reference = %reference, "Docker manifest deleted");
             StatusCode::ACCEPTED.into_response()
+        }
+        Err(crate::storage::StorageError::NotFound) if key != legacy_key => {
+            // Try legacy (non-namespaced) key
+            match state.storage.delete(&legacy_key).await {
+                Ok(()) => {
+                    let _ = state
+                        .storage
+                        .delete(&manifest_meta_key(None, &name, &reference))
+                        .await;
+                    state.audit.log(AuditEntry::new(
+                        "delete",
+                        "api",
+                        &format!("{}:{}", name, reference),
+                        "docker",
+                        "manifest",
+                    ));
+                    state.repo_index.invalidate("docker");
+                    tracing::info!(name = %name, reference = %reference, "Docker manifest deleted (legacy key)");
+                    StatusCode::ACCEPTED.into_response()
+                }
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "errors": [{
+                            "code": "MANIFEST_UNKNOWN",
+                            "message": "manifest unknown",
+                            "detail": { "name": name, "reference": reference }
+                        }]
+                    })),
+                )
+                    .into_response(),
+            }
         }
         Err(crate::storage::StorageError::NotFound) => (
             StatusCode::NOT_FOUND,
@@ -1342,7 +1499,13 @@ async fn delete_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = format!("docker/{}/blobs/{}", name, digest);
+    let ns = resolve_namespace(&state.config.docker, &name);
+    let key = blob_key(ns.as_deref(), &name, &digest);
+    let legacy_key = blob_key(None, &name, &digest);
+    // Delete from both locations during migration
+    if key != legacy_key {
+        let _ = state.storage.delete(&legacy_key).await;
+    }
     match state.storage.delete(&key).await {
         Ok(()) => {
             state.audit.log(AuditEntry::new(
@@ -1376,7 +1539,11 @@ async fn delete_blob(
 
 // ============================================================================
 
-/// Fetch a blob from an upstream Docker registry
+/// Fetch a blob from an upstream Docker registry.
+///
+/// Uses per-chunk `read_timeout` instead of a total request timeout so that
+/// large blob downloads (multi-GB images) don't time out on slow connections.
+/// The `timeout` parameter is kept as the connection/header timeout.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_blob_from_upstream(
     client: &reqwest::Client,
@@ -1385,6 +1552,7 @@ pub async fn fetch_blob_from_upstream(
     digest: &str,
     docker_auth: &DockerAuth,
     timeout: u64,
+    read_timeout: u64,
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<Vec<u8>, ProxyError> {
@@ -1398,7 +1566,7 @@ pub async fn fetch_blob_from_upstream(
         digest
     );
 
-    // First try — with basic auth if configured
+    // Connection timeout only — body is read with per-chunk timeout below
     let mut request = client.get(&url).timeout(Duration::from_secs(timeout));
     if let Some(credentials) = basic_auth {
         request = request.header("Authorization", basic_auth_header(credentials));
@@ -1443,12 +1611,32 @@ pub async fn fetch_blob_from_upstream(
         return Err(ProxyError::Upstream(status));
     }
 
-    let bytes = response.bytes().await.map_err(|e| {
-        cb.record_failure(&cb_key);
-        ProxyError::Network(e.to_string())
-    })?;
+    // Stream body with per-chunk read timeout
+    let content_length = response.content_length().unwrap_or(0) as usize;
+    let mut stream = response.bytes_stream();
+    let mut data = Vec::with_capacity(content_length);
+    let chunk_timeout = Duration::from_secs(read_timeout);
+
+    loop {
+        match tokio::time::timeout(chunk_timeout, stream.next()).await {
+            Ok(Some(Ok(chunk))) => data.extend_from_slice(&chunk),
+            Ok(Some(Err(e))) => {
+                cb.record_failure(&cb_key);
+                return Err(ProxyError::Network(format!("chunk read error: {}", e)));
+            }
+            Ok(None) => break, // stream finished
+            Err(_) => {
+                cb.record_failure(&cb_key);
+                return Err(ProxyError::Network(format!(
+                    "read timeout ({}s per chunk)",
+                    read_timeout
+                )));
+            }
+        }
+    }
+
     cb.record_success(&cb_key);
-    Ok(bytes.to_vec())
+    Ok(data)
 }
 
 /// Fetch a manifest from an upstream Docker registry
@@ -1559,6 +1747,22 @@ pub async fn fetch_manifest_from_upstream(
 }
 
 /// Detect manifest media type from its JSON content
+/// Build a standard Docker manifest response with Content-Type and Docker-Content-Digest headers.
+fn manifest_response(data: impl Into<Bytes>, content_type: String, digest: String) -> Response {
+    let body: Bytes = data.into();
+    let content_length = body.len().to_string();
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (HeaderName::from_static("docker-content-digest"), digest),
+            (header::CONTENT_LENGTH, content_length),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 fn detect_manifest_media_type(data: &[u8]) -> String {
     // Try to parse as JSON and extract mediaType
     if let Ok(json) = serde_json::from_slice::<Value>(data) {
@@ -1604,10 +1808,12 @@ async fn extract_docker_publish_date(
     name: &str,
     reference: &str,
     upstreams_empty: bool,
+    ns: Option<&str>,
 ) -> Option<i64> {
-    // Try .meta.json sidecar (has push_timestamp)
-    let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
-    if let Ok(data) = storage.get(&meta_key).await {
+    // Try .meta.json sidecar (has push_timestamp) — namespaced, then legacy
+    let meta = manifest_meta_key(ns, name, reference);
+    let legacy_meta = manifest_meta_key(None, name, reference);
+    if let Ok(data) = storage_get_with_fallback(storage, &meta, &legacy_meta).await {
         if let Ok(meta) = serde_json::from_slice::<ImageMetadata>(&data) {
             if meta.push_timestamp > 0 {
                 return Some(meta.push_timestamp as i64);
@@ -1617,8 +1823,15 @@ async fn extract_docker_publish_date(
 
     // mtime fallback — only for hosted mode (no upstreams configured)
     if upstreams_empty {
-        let manifest_key = format!("docker/{}/manifests/{}.json", name, reference);
-        return crate::curation::extract_mtime_as_publish_date(storage, &manifest_key).await;
+        let key = manifest_key(ns, name, reference);
+        let legacy = manifest_key(None, name, reference);
+        // Try namespaced first, then legacy
+        if let Some(date) = crate::curation::extract_mtime_as_publish_date(storage, &key).await {
+            return Some(date);
+        }
+        if key != legacy {
+            return crate::curation::extract_mtime_as_publish_date(storage, &legacy).await;
+        }
     }
 
     None
@@ -2399,6 +2612,7 @@ mod integration_tests {
             "library/nginx",
             "latest",
             true, // no upstreams
+            None, // no namespace
         )
         .await;
         assert_eq!(result, Some(1700000000));
@@ -2420,6 +2634,7 @@ mod integration_tests {
             "library/nginx",
             "latest",
             true, // hosted mode (no upstreams)
+            None, // no namespace
         )
         .await;
         assert!(result.is_some());
@@ -2442,6 +2657,7 @@ mod integration_tests {
             "library/nginx",
             "latest",
             false, // proxy mode (has upstreams)
+            None,  // no namespace
         )
         .await;
         assert!(result.is_none());
@@ -2461,6 +2677,7 @@ mod integration_tests {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
+                namespace: None,
             }];
         });
 
@@ -2507,10 +2724,12 @@ mod integration_tests {
                 DockerUpstream {
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
+                    namespace: None,
                 },
                 DockerUpstream {
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
+                    namespace: None,
                 },
             ];
         });

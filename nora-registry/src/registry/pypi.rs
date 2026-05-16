@@ -222,8 +222,8 @@ async fn download_file(
     };
 
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::PyPI,
         &normalized,
@@ -239,7 +239,7 @@ async fn download_file(
     if let Ok(data) = state.storage.get(&key).await {
         // Curation integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::PyPI,
             &normalized,
             version.as_deref(),

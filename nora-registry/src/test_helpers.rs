@@ -129,6 +129,9 @@ fn build_context(
         docker: DockerConfig {
             enabled: true,
             proxy_timeout: 5,
+            read_timeout: 60,
+            metadata_ttl: -1,
+            stale_while_error: true,
             upstreams: vec![],
         },
         raw: RawConfig {
@@ -214,6 +217,12 @@ fn build_context(
     let enabled_registries = config.enabled_registries();
     let cb_config = config.circuit_breaker.clone();
 
+    let bypass_token = config.curation.bypass_token.clone();
+    let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
+        curation_engine: curation_engine,
+        bypass_token,
+    }));
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -230,7 +239,7 @@ fn build_context(
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
-        curation: curation_engine,
+        reloadable,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
         oidc: None,
         circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),

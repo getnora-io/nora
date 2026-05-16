@@ -133,8 +133,8 @@ async fn package_listing(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::PubDart,
         &package,
@@ -287,8 +287,8 @@ async fn download_archive(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::PubDart,
         &package,
@@ -303,7 +303,7 @@ async fn download_archive(
     if let Ok(data) = state.storage.get(&key).await {
         // Integrity verification (curation allowlist)
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::PubDart,
             &package,
             Some(version),

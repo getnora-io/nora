@@ -57,6 +57,7 @@ tower-http = { version = "0.6", features = ["set-header"] }
 percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"
+arc-swap = "1"
 
 [dev-dependencies]
 proptest = "1"

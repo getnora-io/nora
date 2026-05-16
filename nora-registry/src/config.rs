@@ -3,7 +3,7 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 
@@ -267,6 +267,17 @@ pub struct DockerConfig {
     pub enabled: bool,
     #[serde(default = "default_docker_timeout")]
     pub proxy_timeout: u64,
+    /// Per-chunk read timeout in seconds for streaming blob downloads (default: 60).
+    /// Applies to each chunk individually, not the total transfer.
+    #[serde(default = "default_docker_read_timeout")]
+    pub read_timeout: u64,
+    /// Metadata cache TTL in seconds (default: -1 = cache forever).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
+    #[serde(default = "default_docker_metadata_ttl")]
+    pub metadata_ttl: i64,
+    /// Serve stale cached manifests when upstream is unreachable (default: true).
+    #[serde(default = "default_true")]
+    pub stale_while_error: bool,
     #[serde(default)]
     pub upstreams: Vec<DockerUpstream>,
 }
@@ -277,6 +288,42 @@ pub struct DockerUpstream {
     pub url: String,
     #[serde(default)]
     pub auth: Option<String>, // "user:pass" for basic auth
+    /// Storage namespace prefix (e.g. "docker.io"). Derived from URL host if omitted.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+impl DockerUpstream {
+    /// Resolved namespace: explicit config or derived from URL host.
+    pub fn resolved_namespace(&self) -> String {
+        if let Some(ref ns) = self.namespace {
+            return ns.clone();
+        }
+        // Derive from URL host: "https://registry-1.docker.io" → "docker.io"
+        extract_docker_namespace(&self.url)
+    }
+}
+
+/// Derive a storage namespace from a Docker registry URL.
+///
+/// Strips scheme and common prefixes:
+/// - `https://registry-1.docker.io` → `docker.io`
+/// - `https://ghcr.io` → `ghcr.io`
+/// - `https://registry.example.com` → `example.com`
+pub fn extract_docker_namespace(url: &str) -> String {
+    let host = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("default")
+        .split(':')
+        .next()
+        .unwrap_or("default");
+    let host = host.strip_prefix("registry-1.").unwrap_or(host);
+    let host = host.strip_prefix("registry.").unwrap_or(host);
+    host.to_string()
 }
 
 /// Maven upstream proxy configuration
@@ -541,6 +588,14 @@ impl Default for ConanConfig {
 
 fn default_docker_timeout() -> u64 {
     300
+}
+
+fn default_docker_read_timeout() -> u64 {
+    60
+}
+
+fn default_docker_metadata_ttl() -> i64 {
+    -1
 }
 
 fn default_raw_enabled() -> bool {
@@ -854,9 +909,13 @@ impl Default for DockerConfig {
         Self {
             enabled: true,
             proxy_timeout: 300,
+            read_timeout: 60,
+            metadata_ttl: -1,
+            stale_while_error: true,
             upstreams: vec![DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
+                namespace: None,
             }],
         }
     }
@@ -1234,6 +1293,16 @@ pub struct CircuitBreakerConfig {
     /// Seconds to wait before probing a failed upstream (default: 30)
     #[serde(default = "default_cb_reset_timeout")]
     pub reset_timeout: u64,
+    /// Per-registry overrides keyed by circuit breaker key (e.g. "docker:https://registry-1.docker.io").
+    #[serde(default)]
+    pub overrides: HashMap<String, CircuitBreakerOverride>,
+}
+
+/// Per-registry circuit breaker threshold overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerOverride {
+    pub failure_threshold: Option<u32>,
+    pub reset_timeout: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -1242,6 +1311,7 @@ impl Default for CircuitBreakerConfig {
             enabled: default_cb_enabled(),
             failure_threshold: default_cb_threshold(),
             reset_timeout: default_cb_reset_timeout(),
+            overrides: HashMap::new(),
         }
     }
 }
@@ -1968,6 +2038,19 @@ impl Config {
                 self.docker.proxy_timeout = timeout;
             }
         }
+        if let Ok(val) = env::var("NORA_DOCKER_READ_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.docker.read_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.docker.metadata_ttl = ttl;
+            }
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_STALE_WHILE_ERROR") {
+            self.docker.stale_while_error = !matches!(val.as_str(), "false" | "0");
+        }
         // NORA_DOCKER_PROXIES format: "url1,url2" or "url1|auth1,url2|auth2"
         // Backward compat: NORA_DOCKER_UPSTREAMS still works but is deprecated
         if let Ok(val) =
@@ -1984,6 +2067,7 @@ impl Config {
                     DockerUpstream {
                         url: parts[0].to_string(),
                         auth: parts.get(1).map(|a| a.to_string()),
+                        namespace: None,
                     }
                 })
                 .collect();

@@ -136,8 +136,8 @@ async fn compact_index(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Gems,
         &name,
@@ -237,8 +237,8 @@ async fn download_gem(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Gems,
         &name,
@@ -252,7 +252,7 @@ async fn download_gem(
     if let Ok(data) = state.storage.get(&storage_key).await {
         // Curation integrity
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::Gems,
             &name,
             Some(&version),

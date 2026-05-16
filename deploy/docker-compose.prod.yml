@@ -1,0 +1,51 @@
+# Production Docker Compose for NORA Registry
+# Usage: NORA_VERSION=0.9.0 docker compose -f deploy/docker-compose.prod.yml up -d
+#
+# Required env vars (set in .env or shell):
+#   NORA_VERSION        — image tag (default: 0.9.0)
+#   NORA_PUBLIC_URL     — external URL for download links
+#   NORA_AUTH_ENABLED   — enable authentication (default: true)
+
+services:
+  nora:
+    image: ghcr.io/getnora-io/nora:${NORA_VERSION:-0.9.0}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    ports:
+      - "${NORA_PORT:-4000}:4000"
+    volumes:
+      - nora-data:/data
+      - ./config.toml:/etc/nora/config.toml:ro
+    environment:
+      - RUST_LOG=info
+      - NORA_HOST=0.0.0.0
+      - NORA_PORT=4000
+      - NORA_STORAGE_PATH=/data
+      - NORA_AUTH_ENABLED=${NORA_AUTH_ENABLED:-true}
+      - NORA_PUBLIC_URL=${NORA_PUBLIC_URL:-}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  nora-data:
