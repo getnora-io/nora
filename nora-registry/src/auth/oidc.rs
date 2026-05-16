@@ -14,7 +14,8 @@
 //! - Stale JWKS cache on fetch failure (availability over freshness)
 
 use jsonwebtoken::{
-    decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, TokenData, Validation,
+    dangerous::insecure_decode, decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey,
+    TokenData, Validation,
 };
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -120,15 +121,9 @@ impl OidcValidator {
         }
 
         // Peek at claims to find issuer (unverified — for routing only)
-        let unverified: Claims = {
-            let mut validation = Validation::default();
-            validation.insecure_disable_signature_validation();
-            validation.validate_exp = false;
-            validation.validate_aud = false;
-            decode::<Claims>(token, &DecodingKey::from_secret(&[]), &validation)
-                .map_err(|e| format!("Cannot decode claims: {}", e))?
-                .claims
-        };
+        let unverified: Claims = insecure_decode::<Claims>(token)
+            .map_err(|e| format!("Cannot decode claims: {}", e))?
+            .claims;
 
         let issuer = unverified
             .iss
