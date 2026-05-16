@@ -215,6 +215,7 @@ async fn mirror_single_image(
                 digest,
                 docker_auth,
                 DEFAULT_TIMEOUT,
+                60, // per-chunk read timeout
                 None,
                 &noop_cb,
             )

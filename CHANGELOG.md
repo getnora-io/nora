@@ -1,6 +1,21 @@
 # Changelog
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-16
+
+### Added
+- **Docker metadata TTL + stale-while-error** — cached manifests revalidate against upstream after configurable TTL; serve stale on upstream failure (#311)
+- **Docker/OCI mirror namespacing** — per-upstream namespace prefix isolates storage keys, with lazy migration from legacy flat layout (#323)
+- **Per-registry circuit breaker overrides** — `[circuit_breaker.overrides."registry:url"]` allows custom thresholds per upstream (#339)
+- **Streaming read_timeout for Docker blobs** — per-chunk timeout prevents stuck connections on large layer downloads (#341)
+- **Hot reload for curation policy** — SIGHUP reloads blocklist/allowlist without restart using lock-free ArcSwap (#343)
+- **linux/arm64 support** — multi-platform Docker images and binary releases for ARM64 (#193)
+- **Production deployment files** — `deploy/docker-compose.prod.yml` and `deploy/nora.service` systemd unit (#307)
+
+### Changed
+- **Manifest response builder** — extracted `manifest_response()` helper, removing 3 duplicate return paths in Docker registry (#338)
+- 957 total tests (unchanged)
+
 ## [0.8.4] - 2026-05-15
 
 ### Fixed

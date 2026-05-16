@@ -41,31 +41,46 @@ jobs:
             exit 1
           fi
 
+      - name: Set up QEMU for multi-platform builds
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
         with:
           driver-opts: network=host
 
-      - name: Extract binary from multi-stage build
+      - name: Extract binary from multi-stage build (amd64)
         run: |
-          docker buildx build --target binary --output type=local,dest=./dist .
-          cp ./dist/nora ./nora
-          cp ./dist/nora ./nora-linux-amd64
+          docker buildx build --platform linux/amd64 --target binary --output type=local,dest=./dist-amd64 .
+          cp ./dist-amd64/nora ./nora
+          cp ./dist-amd64/nora ./nora-linux-amd64
           chmod +x ./nora-linux-amd64
-          echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
+          echo "Binary size (amd64): $(du -sh nora-linux-amd64 | cut -f1)"
           file ./nora-linux-amd64
+
+      - name: Extract binary from multi-stage build (arm64)
+        run: |
+          docker buildx build --platform linux/arm64 --target binary --output type=local,dest=./dist-arm64 .
+          cp ./dist-arm64/nora ./nora-linux-arm64
+          chmod +x ./nora-linux-arm64
+          echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
+          file ./nora-linux-arm64
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nora-binary-${{ github.run_id }}
-          path: ./nora
+          path: |
+            ./nora
+            ./nora-linux-arm64
           retention-days: 1
 
       - name: Compute binary hash for SLSA provenance
         id: hash
         run: |
-          sha256sum nora-linux-amd64 | base64 -w0 > hash.txt
+          sha256sum nora-linux-amd64 nora-linux-arm64 | base64 -w0 > hash.txt
           echo "hash=$(cat hash.txt)" >> $GITHUB_OUTPUT
 
       - name: Log in to GitHub Container Registry
@@ -99,7 +114,7 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
           labels: ${{ steps.meta-alpine.outputs.labels }}
@@ -252,13 +267,19 @@ jobs:
           name: nora-binary-${{ github.run_id }}
           path: ./artifacts
 
-      - name: Prepare binary
+      - name: Prepare binaries
         run: |
           cp ./artifacts/nora ./nora-linux-amd64
           chmod +x ./nora-linux-amd64
           sha256sum ./nora-linux-amd64 > nora-linux-amd64.sha256
-          echo "Binary size: $(du -sh nora-linux-amd64 | cut -f1)"
+          echo "Binary size (amd64): $(du -sh nora-linux-amd64 | cut -f1)"
           cat nora-linux-amd64.sha256
+
+          cp ./artifacts/nora-linux-arm64 ./nora-linux-arm64
+          chmod +x ./nora-linux-arm64
+          sha256sum ./nora-linux-arm64 > nora-linux-arm64.sha256
+          echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
+          cat nora-linux-arm64.sha256
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
@@ -275,13 +296,18 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
 
-      - name: Sign binary with cosign (keyless Sigstore)
+      - name: Sign binaries with cosign (keyless Sigstore)
         run: |
           cosign sign-blob --yes \
             --output-signature nora-linux-amd64.sig \
             --output-certificate nora-linux-amd64.cert \
             --bundle nora-linux-amd64.bundle \
             ./nora-linux-amd64
+          cosign sign-blob --yes \
+            --output-signature nora-linux-arm64.sig \
+            --output-certificate nora-linux-arm64.cert \
+            --bundle nora-linux-arm64.bundle \
+            ./nora-linux-arm64
 
       - name: Generate changelog with git-cliff
         id: changelog
@@ -303,6 +329,11 @@ jobs:
             nora-linux-amd64.sig
             nora-linux-amd64.cert
             nora-linux-amd64.bundle
+            nora-linux-arm64
+            nora-linux-arm64.sha256
+            nora-linux-arm64.sig
+            nora-linux-arm64.cert
+            nora-linux-arm64.bundle
             nora-${{ github.ref_name }}.sbom.spdx.json
             nora-${{ github.ref_name }}.sbom.cdx.json
           body: |
@@ -311,9 +342,15 @@ jobs:
             ## Install
 
             ```bash
+            # x86_64
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-linux-amd64
             chmod +x nora-linux-amd64
             sudo mv nora-linux-amd64 /usr/local/bin/nora
+
+            # ARM64 (Apple Silicon, Graviton, Ampere)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-linux-arm64
+            chmod +x nora-linux-arm64
+            sudo mv nora-linux-arm64 /usr/local/bin/nora
             ```
 
             ## Docker
@@ -322,12 +359,12 @@ jobs:
             docker pull getnora/nora:${{ steps.ver.outputs.tag }}
             ```
 
-            | Variant | Image |
-            |---------|-------|
-            | Alpine (default) | `getnora/nora:${{ steps.ver.outputs.tag }}` |
-            | RED OS | `getnora/nora:${{ steps.ver.outputs.tag }}-redos` |
-            | Astra Linux SE | `getnora/nora:${{ steps.ver.outputs.tag }}-astra` |
-            | GHCR | `ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}` |
+            | Variant | Image | Platforms |
+            |---------|-------|-----------|
+            | Alpine (default) | `getnora/nora:${{ steps.ver.outputs.tag }}` | amd64, arm64 |
+            | RED OS | `getnora/nora:${{ steps.ver.outputs.tag }}-redos` | amd64 |
+            | Astra Linux SE | `getnora/nora:${{ steps.ver.outputs.tag }}-astra` | amd64 |
+            | GHCR | `ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}` | amd64, arm64 |
 
             ## Changelog
 

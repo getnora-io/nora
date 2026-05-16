@@ -74,6 +74,24 @@ impl CircuitBreakerRegistry {
         Self::new(CircuitBreakerConfig::default())
     }
 
+    /// Resolve the failure threshold for a given registry key, checking overrides first.
+    fn threshold_for(&self, registry: &str) -> u32 {
+        self.config
+            .overrides
+            .get(registry)
+            .and_then(|o| o.failure_threshold)
+            .unwrap_or(self.config.failure_threshold)
+    }
+
+    /// Resolve the reset timeout for a given registry key, checking overrides first.
+    fn reset_timeout_for(&self, registry: &str) -> u64 {
+        self.config
+            .overrides
+            .get(registry)
+            .and_then(|o| o.reset_timeout)
+            .unwrap_or(self.config.reset_timeout)
+    }
+
     /// Check if a request to `registry` should proceed.
     /// Returns `Err(ProxyError::CircuitOpen)` if the breaker is open.
     pub(crate) fn check(&self, registry: &str) -> Result<(), ProxyError> {
@@ -93,7 +111,7 @@ impl CircuitBreakerRegistry {
                     .last_failure
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX);
-                if elapsed >= self.config.reset_timeout {
+                if elapsed >= self.reset_timeout_for(registry) {
                     // Transition to HalfOpen — allow one probe
                     breaker.state = BreakerState::HalfOpen;
                     breaker.half_open_in_flight = true;
@@ -170,7 +188,7 @@ impl CircuitBreakerRegistry {
             BreakerState::Closed => {
                 breaker.failures += 1;
                 breaker.last_failure = Some(now);
-                if breaker.failures >= self.config.failure_threshold {
+                if breaker.failures >= self.threshold_for(registry) {
                     breaker.state = BreakerState::Open;
                     CIRCUIT_BREAKER_STATE
                         .with_label_values(&[registry])
@@ -178,7 +196,7 @@ impl CircuitBreakerRegistry {
                     tracing::warn!(
                         registry = registry,
                         failures = breaker.failures,
-                        threshold = self.config.failure_threshold,
+                        threshold = self.threshold_for(registry),
                         "Circuit breaker OPEN — upstream failing"
                     );
                 }
@@ -214,6 +232,7 @@ mod tests {
             enabled: true,
             failure_threshold: threshold,
             reset_timeout,
+            overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -222,6 +241,7 @@ mod tests {
             enabled: false,
             failure_threshold: 5,
             reset_timeout: 30,
+            overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -353,6 +373,45 @@ mod tests {
         }
 
         // No panics = success
+    }
+
+    #[test]
+    fn test_per_registry_override_threshold() {
+        use crate::config::CircuitBreakerOverride;
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "docker:https://registry-1.docker.io".to_string(),
+            CircuitBreakerOverride {
+                failure_threshold: Some(10),
+                reset_timeout: Some(120),
+            },
+        );
+        let config = CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 2,
+            reset_timeout: 30,
+            overrides,
+        };
+        let cb = CircuitBreakerRegistry::new(config);
+
+        // Default key trips after 2 failures
+        cb.record_failure("npm");
+        cb.record_failure("npm");
+        assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
+
+        // Docker Hub override requires 10 failures
+        let docker_key = "docker:https://registry-1.docker.io";
+        for _ in 0..9 {
+            cb.record_failure(docker_key);
+        }
+        assert!(cb.check(docker_key).is_ok());
+        // 10th trips it
+        cb.record_failure(docker_key);
+        assert!(matches!(
+            cb.check(docker_key),
+            Err(ProxyError::CircuitOpen(_))
+        ));
     }
 }
 

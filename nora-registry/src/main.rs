@@ -34,6 +34,7 @@ mod validation;
 #[cfg(test)]
 mod test_helpers;
 
+use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -141,6 +142,12 @@ enum CurationCommand {
     },
 }
 
+/// Curation-related config that can be hot-reloaded via SIGHUP.
+pub struct ReloadableConfig {
+    pub curation_engine: curation::CurationEngine,
+    pub bypass_token: Option<String>,
+}
+
 pub struct AppState {
     pub storage: Storage,
     pub config: Config,
@@ -158,7 +165,8 @@ pub struct AppState {
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    pub curation: curation::CurationEngine,
+    /// Hot-reloadable curation config (swapped atomically on SIGHUP).
+    pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
     pub auth_failures: auth::AuthFailureTracker,
     /// OIDC validator for workload identity (CI/CD)
@@ -168,6 +176,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Load a snapshot of the current curation engine (lock-free read via ArcSwap).
+    pub fn curation(&self) -> arc_swap::Guard<Arc<ReloadableConfig>> {
+        self.reloadable.load()
+    }
+
+    /// Shorthand for the curation bypass token from the reloadable config.
+    pub fn bypass_token(&self) -> Option<String> {
+        self.reloadable.load().bypass_token.clone()
+    }
+
     /// Get or create a per-key publish lock for TOCTOU protection.
     pub fn publish_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.publish_locks.lock();
@@ -810,76 +828,37 @@ async fn run_server(config: Config, storage: Storage) {
     let http_client = build_http_client(&config.tls);
     log_outbound_proxy();
 
-    // Initialize curation engine
-    let mut curation_engine = curation::CurationEngine::new(config.curation.clone());
+    // Validate curation config at startup — panic in enforce mode on errors
+    if config.curation.mode == CurationMode::Enforce {
+        if let Some(ref path) = config.curation.blocklist_path {
+            if curation::BlocklistFilter::from_file(path).is_err() {
+                panic!("Cannot start in enforce mode with invalid blocklist");
+            }
+        }
+        if let Some(ref path) = config.curation.allowlist_path {
+            if curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
+                .is_err()
+            {
+                panic!("Cannot start in enforce mode with invalid allowlist");
+            }
+        }
+        if let Some(ref age_str) = config.curation.min_release_age {
+            if curation::parse_duration(age_str).is_err() {
+                panic!(
+                    "Cannot start in enforce mode with invalid min_release_age: {}",
+                    age_str
+                );
+            }
+        }
+    }
+
+    // Build curation engine (shared helper, also used by SIGHUP reload)
+    let curation_engine = build_curation_engine(&config);
     if curation_engine.is_active() {
         info!(
             mode = %config.curation.mode,
             "Curation layer active"
         );
-    }
-
-    // Load blocklist filter if configured
-    if let Some(ref path) = config.curation.blocklist_path {
-        match curation::BlocklistFilter::from_file(path) {
-            Ok(filter) => {
-                let count = filter.rule_count();
-                curation_engine.add_filter(Box::new(filter));
-                info!(path = %path, rules = count, "Blocklist filter loaded");
-            }
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to load blocklist");
-                if config.curation.mode == CurationMode::Enforce {
-                    panic!("Cannot start in enforce mode with invalid blocklist");
-                }
-            }
-        }
-    }
-
-    // Load allowlist filter if configured (after blocklist — blocklist wins on overlap)
-    if let Some(ref path) = config.curation.allowlist_path {
-        match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
-            Ok(filter) => {
-                let count = filter.entry_count();
-                curation_engine.add_filter(Box::new(filter));
-                info!(path = %path, entries = count, "Allowlist filter loaded");
-            }
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to load allowlist");
-                if config.curation.mode == CurationMode::Enforce {
-                    panic!("Cannot start in enforce mode with invalid allowlist");
-                }
-            }
-        }
-    }
-
-    // Load namespace isolation filter if configured (always active, even in mode=Off)
-    if !config.curation.internal_namespaces.is_empty() {
-        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
-        let count = ns_filter.pattern_count();
-        curation_engine.set_namespace_filter(Box::new(ns_filter));
-        info!(patterns = count, "Namespace isolation filter loaded");
-    }
-
-    // Load min-release-age filter if configured
-    if let Some(ref age_str) = config.curation.min_release_age {
-        match curation::parse_duration(age_str) {
-            Ok(secs) => {
-                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
-                load_registry_overrides(&mut filter, &config.curation);
-                curation_engine.add_filter(Box::new(filter));
-                info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
-            }
-            Err(e) => {
-                error!(value = %age_str, error = %e, "Invalid min_release_age");
-                if config.curation.mode == CurationMode::Enforce {
-                    panic!(
-                        "Cannot start in enforce mode with invalid min_release_age: {}",
-                        e
-                    );
-                }
-            }
-        }
     }
 
     // Determine enabled registries from config
@@ -969,6 +948,12 @@ async fn run_server(config: Config, storage: Storage) {
         None
     };
 
+    let bypass_token = config.curation.bypass_token.clone();
+    let reloadable = Arc::new(ArcSwap::from_pointee(ReloadableConfig {
+        curation_engine,
+        bypass_token,
+    }));
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -985,7 +970,7 @@ async fn run_server(config: Config, storage: Storage) {
         http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: parking_lot::Mutex::new(HashMap::new()),
-        curation: curation_engine,
+        reloadable,
         auth_failures: auth::AuthFailureTracker::new(5, 900),
         oidc: oidc_validator,
         circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
@@ -1129,6 +1114,26 @@ async fn run_server(config: Config, storage: Storage) {
         }
     });
 
+    // SIGHUP handler: hot-reload curation policy
+    #[cfg(unix)]
+    {
+        let reload_state = state.clone();
+        tokio::spawn(async move {
+            let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
+                .expect("Failed to install SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                info!("SIGHUP received — reloading curation policy");
+                match reload_curation(&reload_state) {
+                    Ok(()) => info!("Curation policy reloaded successfully"),
+                    Err(e) => {
+                        error!(error = %e, "Curation policy reload failed, keeping previous config")
+                    }
+                }
+            }
+        });
+    }
+
     // Graceful shutdown on SIGTERM/SIGINT
     axum::serve(
         listener,
@@ -1192,6 +1197,81 @@ async fn shutdown_signal() {
             info!("Received SIGTERM, starting graceful shutdown...");
         }
     }
+}
+
+/// Reload curation policy from disk (triggered by SIGHUP).
+///
+/// Re-reads config.toml, rebuilds the CurationEngine with new filters,
+/// and atomically swaps the old config via ArcSwap.
+/// Storage, auth, port, and other settings are NOT reloaded — only curation.
+fn reload_curation(state: &Arc<AppState>) -> Result<(), String> {
+    let config = Config::load();
+    let engine = build_curation_engine(&config);
+
+    state.reloadable.store(Arc::new(ReloadableConfig {
+        curation_engine: engine,
+        bypass_token: config.curation.bypass_token,
+    }));
+
+    Ok(())
+}
+
+/// Build a CurationEngine from the given config (used at startup and reload).
+fn build_curation_engine(config: &Config) -> curation::CurationEngine {
+    let mut engine = curation::CurationEngine::new(config.curation.clone());
+
+    // Load blocklist filter if configured
+    if let Some(ref path) = config.curation.blocklist_path {
+        match curation::BlocklistFilter::from_file(path) {
+            Ok(filter) => {
+                let count = filter.rule_count();
+                engine.add_filter(Box::new(filter));
+                info!(path = %path, rules = count, "Blocklist filter loaded");
+            }
+            Err(e) => {
+                error!(path = %path, error = %e, "Failed to load blocklist");
+            }
+        }
+    }
+
+    // Load allowlist filter if configured
+    if let Some(ref path) = config.curation.allowlist_path {
+        match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
+            Ok(filter) => {
+                let count = filter.entry_count();
+                engine.add_filter(Box::new(filter));
+                info!(path = %path, entries = count, "Allowlist filter loaded");
+            }
+            Err(e) => {
+                error!(path = %path, error = %e, "Failed to load allowlist");
+            }
+        }
+    }
+
+    // Load namespace isolation filter if configured
+    if !config.curation.internal_namespaces.is_empty() {
+        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
+        let count = ns_filter.pattern_count();
+        engine.set_namespace_filter(Box::new(ns_filter));
+        info!(patterns = count, "Namespace isolation filter loaded");
+    }
+
+    // Load min-release-age filter if configured
+    if let Some(ref age_str) = config.curation.min_release_age {
+        match curation::parse_duration(age_str) {
+            Ok(secs) => {
+                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
+                load_registry_overrides(&mut filter, &config.curation);
+                engine.add_filter(Box::new(filter));
+                info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
+            }
+            Err(e) => {
+                error!(value = %age_str, error = %e, "Invalid min_release_age");
+            }
+        }
+    }
+
+    engine
 }
 
 /// Print note about registries that have data but no retention rules configured.

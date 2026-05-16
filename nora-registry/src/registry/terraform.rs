@@ -186,8 +186,8 @@ async fn provider_download_meta(
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Terraform,
         &format!("{}/{}", ns, ptype),

@@ -53,8 +53,8 @@ async fn download(
 
     // Curation check — raw files are treated as name=path, no version
     if let Some(response) = crate::curation::check_download(
-        &state.curation,
-        state.config.curation.bypass_token.as_deref(),
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Raw,
         &path,

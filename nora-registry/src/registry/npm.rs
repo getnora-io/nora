@@ -100,8 +100,8 @@ async fn handle_request(
         };
 
         if let Some(response) = crate::curation::check_download(
-            &state.curation,
-            state.config.curation.bypass_token.as_deref(),
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
             &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
@@ -147,7 +147,7 @@ async fn handle_request(
 
         // Curation integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
-            &state.curation,
+            &state.curation().curation_engine,
             crate::curation::RegistryType::Npm,
             &package_name,
             tarball_version.as_deref(),
