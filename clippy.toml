@@ -2,6 +2,8 @@
 cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 7
 type-complexity-threshold = 300
+stack-size-threshold = 512000
+future-size-threshold = 16384
 
 # NOTE: SystemTime::now and env::var rules are enforced via semgrep
 # (~/nora-private-tests/semgrep-rules/) which supports path exclusions.

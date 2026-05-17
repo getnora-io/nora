@@ -288,21 +288,18 @@ async fn provider_download_binary(
         return with_binary(data.to_vec());
     }
 
-    // Try upstream — reconstruct original URL from path
+    // Try upstream — resolve the real download URL from cached metadata.
     // Path format: {ns}/{type}/{ver}/{filename}
     let parts: Vec<&str> = path.splitn(4, '/').collect();
     if parts.len() < 4 {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let (ns, ptype, ver, filename) = (parts[0], parts[1], parts[2], parts[3]);
 
-    let proxy_url = upstream_url(&state);
-    // The download URL from registry.terraform.io is typically a direct URL
-    // We proxy the binary from releases.hashicorp.com or similar
-    let url = format!(
-        "{}/v1/providers/download/{}",
-        proxy_url.trim_end_matches('/'),
-        path
-    );
+    // Resolve the real upstream URL from cached provider metadata.
+    // The metadata JSON (cached by provider_download_meta) stores the
+    // original download_url in `_nora_upstream_url`.
+    let url = resolve_upstream_download_url(&state, ns, ptype, ver, filename).await;
 
     match proxy_fetch(
         &state.http_client,
@@ -527,6 +524,53 @@ async fn extract_terraform_publish_date(
     None
 }
 
+/// Resolve the real upstream download URL for a provider binary.
+///
+/// Looks up the cached metadata JSON (`_nora_upstream_url` field saved by
+/// `rewrite_download_url`) to find the original URL (typically on
+/// releases.hashicorp.com). Falls back to constructing a
+/// releases.hashicorp.com URL from the path components.
+async fn resolve_upstream_download_url(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+    filename: &str,
+) -> String {
+    // Try every os/arch combo that might have cached metadata.
+    // The filename encodes os/arch: terraform-provider-{ptype}_{ver}_{os}_{arch}.zip
+    // Parse it to find the right metadata file directly.
+    if let Some((os, arch)) = parse_os_arch_from_filename(filename) {
+        let meta_key = format!(
+            "terraform/providers/{}/{}/{}/{}_{}.json",
+            ns, ptype, ver, os, arch
+        );
+        if let Ok(data) = state.storage.get(&meta_key).await {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(url) = json.get("_nora_upstream_url").and_then(|v| v.as_str()) {
+                    return url.to_string();
+                }
+            }
+        }
+    }
+
+    // Fallback: construct releases.hashicorp.com URL from path parts
+    format!(
+        "https://releases.hashicorp.com/terraform-provider-{}/{}/{}",
+        ptype, ver, filename
+    )
+}
+
+/// Extract OS and arch from a terraform provider filename.
+/// e.g. `terraform-provider-null_3.2.3_linux_amd64.zip` -> Some(("linux", "amd64"))
+fn parse_os_arch_from_filename(filename: &str) -> Option<(&str, &str)> {
+    let name = filename.strip_suffix(".zip")?;
+    // Split from the right: ..._os_arch
+    let (rest, arch) = name.rsplit_once('_')?;
+    let (_, os) = rest.rsplit_once('_')?;
+    Some((os, arch))
+}
+
 fn upstream_url(state: &AppState) -> String {
     state
         .config
@@ -575,6 +619,10 @@ fn with_binary(data: Vec<u8>) -> Response {
 }
 
 /// Rewrite download_url in provider metadata JSON to point through NORA.
+///
+/// Also stores the original upstream URL in `_nora_upstream_url` so the
+/// binary download handler can fetch from the real host (e.g.
+/// releases.hashicorp.com) instead of the registry API endpoint.
 fn rewrite_download_url(
     json_text: &str,
     base_url: &str,
@@ -585,8 +633,13 @@ fn rewrite_download_url(
     // Parse JSON, find download_url, rewrite it
     if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(json_text) {
         if let Some(obj) = json.as_object_mut() {
-            if let Some(download_url) = obj.get("download_url") {
+            if let Some(download_url) = obj.get("download_url").cloned() {
                 if let Some(url_str) = download_url.as_str() {
+                    // Preserve original upstream URL for the binary download handler
+                    obj.insert(
+                        "_nora_upstream_url".to_string(),
+                        serde_json::Value::String(url_str.to_string()),
+                    );
                     // Extract filename from original URL
                     let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
                     let new_url = format!(
@@ -673,6 +726,9 @@ mod tests {
         let input = r#"{"download_url":"https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip","shasum":"abc123"}"#;
         let result = rewrite_download_url(input, "https://nora:4000", "hashicorp", "aws", "5.0.0");
         assert!(result.contains("https://nora:4000/terraform/v1/providers/download/hashicorp/aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip"));
+        // Original upstream URL preserved
+        assert!(result.contains("_nora_upstream_url"));
+        assert!(result.contains("https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip"));
         // Other fields preserved
         assert!(result.contains("abc123"));
     }
