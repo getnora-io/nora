@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail};
+use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata};
 use super::components::*;
 use super::i18n::{get_translations, Lang};
 use crate::repo_index::RepoInfo;
@@ -987,6 +987,8 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         String::new()
     };
 
+    let metadata_panel = render_metadata_panel(&detail.metadata);
+
     let content = format!(
         r##"
         <div class="mb-6">
@@ -1010,6 +1012,8 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
                 </button>
             </div>
         </div>
+
+        {metadata_panel}
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between">
@@ -1037,6 +1041,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         title = detail_title,
         install_label = _t.install_command,
         cmd = install_cmd,
+        metadata_panel = metadata_panel,
         versions_label = if registry_type == "raw" {
             _t.files
         } else {
@@ -1453,6 +1458,84 @@ fn get_registry_title(registry_type: &str) -> &'static str {
     }
 }
 
+/// Renders a metadata panel for package detail pages.
+/// Returns empty string if no metadata fields are populated.
+fn render_metadata_panel(meta: &PackageMetadata) -> String {
+    if !meta.has_any() {
+        return String::new();
+    }
+
+    let mut inner = String::new();
+
+    // Description
+    if let Some(ref desc) = meta.description {
+        let _ = write!(
+            inner,
+            r#"<p class="text-slate-300 mb-3">{}</p>"#,
+            html_escape(desc)
+        );
+    }
+
+    // Info grid: license, author, homepage, repository
+    let mut info_items = Vec::new();
+
+    if let Some(ref license) = meta.license {
+        info_items.push(format!(
+            r#"<span class="text-slate-500">License:</span> <span class="text-slate-300">{}</span>"#,
+            html_escape(license)
+        ));
+    }
+
+    if let Some(ref author) = meta.author {
+        info_items.push(format!(
+            r#"<span class="text-slate-500">Author:</span> <span class="text-slate-300">{}</span>"#,
+            html_escape(author)
+        ));
+    }
+
+    if let Some(ref homepage) = meta.homepage {
+        info_items.push(format!(
+            r#"<span class="text-slate-500">Homepage:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+            html_escape(homepage),
+            html_escape(homepage)
+        ));
+    }
+
+    if let Some(ref repo) = meta.repository {
+        info_items.push(format!(
+            r#"<span class="text-slate-500">Repository:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+            html_escape(repo),
+            html_escape(repo)
+        ));
+    }
+
+    if !info_items.is_empty() {
+        inner.push_str(r#"<div class="flex flex-wrap gap-x-6 gap-y-1 text-sm">"#);
+        for item in &info_items {
+            let _ = write!(inner, r#"<div>{}</div>"#, item);
+        }
+        inner.push_str("</div>");
+    }
+
+    // Keywords
+    if !meta.keywords.is_empty() {
+        inner.push_str(r#"<div class="flex flex-wrap gap-2 mt-3">"#);
+        for kw in &meta.keywords {
+            let _ = write!(
+                inner,
+                r#"<span class="text-xs text-blue-400 bg-blue-900/30 border border-blue-800 rounded px-2 py-0.5">{}</span>"#,
+                html_escape(kw)
+            );
+        }
+        inner.push_str("</div>");
+    }
+
+    format!(
+        r##"<div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">{}</div>"##,
+        inner
+    )
+}
+
 /// Simple URL encoding for path components
 pub fn encode_uri_component(s: &str) -> String {
     let mut result = String::new();
@@ -1479,6 +1562,7 @@ mod tests {
             versions: vec![],
             prerelease_count: 0,
             total_stable: 0,
+            metadata: PackageMetadata::default(),
         }
     }
 
@@ -1615,6 +1699,7 @@ mod tests {
             }],
             prerelease_count: 0,
             total_stable: 0,
+            metadata: PackageMetadata::default(),
         };
         let html = render_package_detail("raw", "myfile.txt", &detail, Lang::En, base_url, false);
         assert!(
@@ -1644,6 +1729,7 @@ mod tests {
             ],
             prerelease_count: 0,
             total_stable: 0,
+            metadata: PackageMetadata::default(),
         };
         let html =
             render_package_detail("raw", "subdir", &subdir_detail, Lang::En, base_url, false);

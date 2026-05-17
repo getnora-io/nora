@@ -320,16 +320,23 @@ async fn npm_list(
 async fn npm_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let detail = get_npm_detail(&state.storage, &name).await;
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_npm_detail(&state.storage, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "npm",
         &name,
@@ -369,16 +376,23 @@ async fn cargo_list(
 async fn cargo_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let detail = get_cargo_detail(&state.storage, &name).await;
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_cargo_detail(&state.storage, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "cargo",
         &name,
@@ -418,16 +432,23 @@ async fn pypi_list(
 async fn pypi_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let detail = get_pypi_detail(&state.storage, &name).await;
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_pypi_detail(&state.storage, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "pypi",
         &name,
@@ -467,16 +488,23 @@ async fn go_list(
 async fn go_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let detail = get_go_detail(&state.storage, &name).await;
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "go",
         &name,
@@ -624,7 +652,8 @@ async fn generic_registry_detail(
         &state.storage,
         registry_key,
         &name,
-        show_prerelease || show_all,
+        show_prerelease,
+        show_all,
     )
     .await;
     Html(render_package_detail(

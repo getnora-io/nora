@@ -63,12 +63,40 @@ pub struct VersionInfo {
     pub cached: bool,
 }
 
+#[derive(Serialize, Default)]
+pub struct PackageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+}
+
+impl PackageMetadata {
+    pub fn has_any(&self) -> bool {
+        self.description.is_some()
+            || self.license.is_some()
+            || self.author.is_some()
+            || self.homepage.is_some()
+            || self.repository.is_some()
+            || !self.keywords.is_empty()
+    }
+}
+
 #[derive(Serialize)]
 pub struct PackageDetail {
     pub versions: Vec<VersionInfo>,
     pub prerelease_count: usize,
     /// Total stable versions available (may be > versions.len() if truncated)
     pub total_stable: usize,
+    pub metadata: PackageMetadata,
 }
 
 #[derive(Serialize)]
@@ -250,11 +278,11 @@ pub async fn api_detail(
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         "npm" => {
-            let detail = get_npm_detail(&state.storage, &name).await;
+            let detail = get_npm_detail(&state.storage, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         "cargo" => {
-            let detail = get_cargo_detail(&state.storage, &name).await;
+            let detail = get_cargo_detail(&state.storage, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         _ => Json(serde_json::json!({})),
@@ -505,10 +533,16 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
-pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
+pub async fn get_npm_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     let metadata_key = format!("npm/{}/metadata.json", name);
 
-    let mut versions = Vec::new();
+    let mut stable_versions = Vec::new();
+    let mut prerelease_count: usize = 0;
 
     // Parse metadata.json for version info
     if let Ok(data) = storage.get(&metadata_key).await {
@@ -517,6 +551,8 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                 let time_obj = metadata.get("time").and_then(|t| t.as_object());
 
                 for (version, info) in versions_obj {
+                    let is_prerelease = version.contains('-');
+
                     let meta_size = info
                         .get("dist")
                         .and_then(|d| d.get("unpackedSize"))
@@ -529,6 +565,14 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                         .map(|s| s[..10].to_string())
                         .unwrap_or_else(|| "N/A".to_string());
 
+                    // Count pre-release, skip unless toggled
+                    if is_prerelease {
+                        prerelease_count += 1;
+                        if !show_prerelease {
+                            continue;
+                        }
+                    }
+
                     // Check if tarball is actually cached on disk
                     let tarball_key = format!("npm/{}/tarballs/{}-{}.tgz", name, name, version);
                     let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
@@ -537,7 +581,7 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
                         (meta_size, false)
                     };
 
-                    versions.push(VersionInfo {
+                    stable_versions.push(VersionInfo {
                         version: version.clone(),
                         size,
                         published,
@@ -549,28 +593,94 @@ pub async fn get_npm_detail(storage: &Storage, name: &str) -> PackageDetail {
     }
 
     // Sort by version (semver-like, newest first)
-    versions.sort_by(|a, b| {
+    stable_versions.sort_by(|a, b| {
         let a_parts: Vec<u32> = a
             .version
-            .split('.')
+            .split(|c: char| !c.is_ascii_digit())
             .filter_map(|s| s.parse().ok())
             .collect();
         let b_parts: Vec<u32> = b
             .version
-            .split('.')
+            .split(|c: char| !c.is_ascii_digit())
             .filter_map(|s| s.parse().ok())
             .collect();
         b_parts.cmp(&a_parts)
     });
 
+    let total_stable = stable_versions
+        .iter()
+        .filter(|v| !v.version.contains('-'))
+        .count();
+
+    // Limit default view to 20 versions when not showing all
+    if !show_prerelease && !show_all && stable_versions.len() > 20 {
+        stable_versions.truncate(20);
+    }
+
+    // Extract package-level metadata from the same JSON
+    let mut metadata = PackageMetadata::default();
+    if let Ok(data) = storage.get(&metadata_key).await {
+        if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+            metadata.description = meta_json
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            metadata.license = meta_json
+                .get("license")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            metadata.author = meta_json.get("author").and_then(|v| {
+                // author can be a string or { name: "..." }
+                v.as_str().map(|s| s.to_string()).or_else(|| {
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+            });
+            metadata.homepage = meta_json
+                .get("homepage")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            metadata.repository = meta_json
+                .get("repository")
+                .and_then(|v| {
+                    // repository can be a string or { url: "..." }
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                })
+                .map(|s| {
+                    s.trim_start_matches("git+")
+                        .trim_end_matches(".git")
+                        .to_string()
+                });
+            metadata.keywords = meta_json
+                .get("keywords")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+    }
+
     PackageDetail {
-        versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        versions: stable_versions,
+        prerelease_count,
+        total_stable,
+        metadata,
     }
 }
 
-pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
+pub async fn get_cargo_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     let prefix = format!("cargo/{}/", name);
     let keys = storage.list(&prefix).await;
 
@@ -594,14 +704,74 @@ pub async fn get_cargo_detail(storage: &Storage, name: &str) -> PackageDetail {
         }
     }
 
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
+
+    // Extract crate metadata from cached metadata.json
+    let mut metadata = PackageMetadata::default();
+    let cargo_meta_key = format!("cargo/{}/metadata.json", name);
+    if let Ok(data) = storage.get(&cargo_meta_key).await {
+        if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+            let crate_obj = meta_json.get("crate").unwrap_or(&meta_json);
+            metadata.description = crate_obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            metadata.homepage = crate_obj
+                .get("homepage")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            metadata.repository = crate_obj
+                .get("repository")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            // Cargo uses documentation field as well; use homepage fallback
+            if metadata.homepage.is_none() {
+                metadata.homepage = crate_obj
+                    .get("documentation")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+            }
+            metadata.keywords = crate_obj
+                .get("keywords")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Merge categories into keywords for cargo
+            if let Some(cats) = crate_obj.get("categories").and_then(|v| v.as_array()) {
+                for cat in cats {
+                    if let Some(s) = cat.as_str() {
+                        if !metadata.keywords.contains(&s.to_string()) {
+                            metadata.keywords.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata,
     }
 }
 
-pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
+pub async fn get_pypi_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     let prefix = format!("pypi/{}/", name);
     let keys = storage.list(&prefix).await;
 
@@ -624,14 +794,23 @@ pub async fn get_pypi_detail(storage: &Storage, name: &str) -> PackageDetail {
         }
     }
 
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
 }
 
-pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
+pub async fn get_go_detail(
+    storage: &Storage,
+    module: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     let prefix = format!("go/{}/@v/", module);
 
     // Read version list file (populated by go proxy on list requests)
@@ -683,10 +862,13 @@ pub async fn get_go_detail(storage: &Storage, module: &str) -> PackageDetail {
     }
 
     versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
 }
 
@@ -697,22 +879,33 @@ pub async fn get_generic_detail(
     registry: &str,
     name: &str,
     show_prerelease: bool,
+    show_all: bool,
 ) -> PackageDetail {
     let name_lower = name.to_lowercase();
 
     match registry {
-        "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease).await,
-        "conan" => get_conan_detail(storage, &name_lower).await,
-        "gems" => get_gems_detail(storage, &name_lower).await,
-        "pub" => get_pub_detail(storage, &name_lower).await,
-        _ => get_storage_scan_detail(storage, registry, &name_lower).await,
+        "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await,
+        "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
+        "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
+        "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
+        _ => {
+            get_storage_scan_detail(storage, registry, &name_lower, show_prerelease, show_all).await
+        }
     }
 }
 
-async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) -> PackageDetail {
+async fn get_nuget_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     // Load registration index for real published dates from upstream metadata
     let reg_key = format!("nuget/registration/{}/index.json", name);
     let reg_meta = load_nuget_registration_meta(storage, &reg_key).await;
+
+    // Extract package-level metadata from the registration index
+    let metadata = load_nuget_package_metadata(storage, &reg_key).await;
 
     let key = format!("nuget/flatcontainer/{}/index.json", name);
     if let Ok(data) = storage.get(&key).await {
@@ -771,7 +964,7 @@ async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) 
                     .filter(|v| !v.version.contains('-'))
                     .count();
                 // Limit default view to 20 versions when not showing all
-                if !show_prerelease && stable_versions.len() > 20 {
+                if !show_prerelease && !show_all && stable_versions.len() > 20 {
                     stable_versions.truncate(20);
                 }
 
@@ -779,6 +972,7 @@ async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) 
                     versions: stable_versions,
                     prerelease_count,
                     total_stable,
+                    metadata,
                 };
             }
         }
@@ -787,6 +981,7 @@ async fn get_nuget_detail(storage: &Storage, name: &str, show_prerelease: bool) 
         versions: vec![],
         prerelease_count: 0,
         total_stable: 0,
+        metadata,
     }
 }
 
@@ -833,7 +1028,70 @@ async fn load_nuget_registration_meta(
     map
 }
 
-async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
+/// Extract package-level metadata (description, authors, tags) from NuGet registration index.
+/// Uses the latest catalogEntry in the index.
+async fn load_nuget_package_metadata(storage: &Storage, key: &str) -> PackageMetadata {
+    let mut metadata = PackageMetadata::default();
+    let data = match storage.get(key).await {
+        Ok(d) => d,
+        Err(_) => return metadata,
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(v) => v,
+        Err(_) => return metadata,
+    };
+    // Walk pages → items → catalogEntry, take the last (newest) entry with data
+    if let Some(pages) = json.get("items").and_then(|v| v.as_array()) {
+        for page in pages.iter().rev() {
+            if let Some(items) = page.get("items").and_then(|v| v.as_array()) {
+                for item in items.iter().rev() {
+                    if let Some(entry) = item.get("catalogEntry") {
+                        if metadata.description.is_none() {
+                            metadata.description = entry
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                        }
+                        if metadata.author.is_none() {
+                            metadata.author = entry
+                                .get("authors")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                        }
+                        if metadata.keywords.is_empty() {
+                            if let Some(tags) = entry.get("tags").and_then(|v| v.as_array()) {
+                                metadata.keywords = tags
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect();
+                            } else if let Some(tags_str) =
+                                entry.get("tags").and_then(|v| v.as_str())
+                            {
+                                // NuGet sometimes stores tags as space-separated string
+                                metadata.keywords =
+                                    tags_str.split_whitespace().map(|s| s.to_string()).collect();
+                            }
+                        }
+                        // Once we have all fields, stop iterating
+                        if metadata.description.is_some() && metadata.author.is_some() {
+                            return metadata;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    metadata
+}
+
+async fn get_conan_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     // Conan: conan/{name}/{version}/_/_/revisions.json (metadata)
     // Actual files: conan/{name}/{version}/_/_/{rrev}/export/* or /packages/*/
     let prefix = format!("conan/{}/", name);
@@ -870,14 +1128,22 @@ async fn get_conan_detail(storage: &Storage, name: &str) -> PackageDetail {
         })
         .collect();
     versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
 }
 
-async fn get_gems_detail(storage: &Storage, name: &str) -> PackageDetail {
+async fn get_gems_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     // Read compact index: gems/info/{name}
     // Format: "VERSION DEPS|checksum:HEX" per line, first line is "---"
     let info_key = format!("gems/info/{}", name);
@@ -921,14 +1187,22 @@ async fn get_gems_detail(storage: &Storage, name: &str) -> PackageDetail {
 
     // Reverse: newest first (compact index is chronological)
     versions.reverse();
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
 }
 
-async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
+async fn get_pub_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     // Pub: pub/packages/{name}/versions/{version}.tar.gz
     let prefix = format!("pub/packages/{}/versions/", name);
     let keys = storage.list(&prefix).await;
@@ -956,15 +1230,24 @@ async fn get_pub_detail(storage: &Storage, name: &str) -> PackageDetail {
         }
     }
     versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
 }
 
 /// Fallback: scan storage for files matching {registry}/{name}/*
-async fn get_storage_scan_detail(storage: &Storage, registry: &str, name: &str) -> PackageDetail {
+async fn get_storage_scan_detail(
+    storage: &Storage,
+    registry: &str,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
     let prefix = format!("{}/{}/", registry, name);
     let keys = storage.list(&prefix).await;
     let mut versions = Vec::new();
@@ -992,11 +1275,89 @@ async fn get_storage_scan_detail(storage: &Storage, registry: &str, name: &str) 
         }
     }
     versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
     PackageDetail {
         versions,
-        prerelease_count: 0,
-        total_stable: 0,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
     }
+}
+
+/// Detect pre-release versions across registry ecosystems.
+/// Covers semver (`-alpha`), PyPI (`1.0a1`, `.dev`), and RubyGems (`.pre`).
+fn is_prerelease_version(version: &str) -> bool {
+    // Semver: 1.0.0-alpha.1 (cargo, npm, nuget, go)
+    if version.contains('-') {
+        return true;
+    }
+    let lower = version.to_lowercase();
+    // RubyGems: 1.0.0.pre.1, 1.0.0.alpha, 1.0.0.beta, 1.0.0.rc1
+    if lower.contains(".pre")
+        || lower.contains(".alpha")
+        || lower.contains(".beta")
+        || lower.contains(".rc")
+    {
+        return true;
+    }
+    // PyPI PEP 440: 1.0a1, 1.0b2, 1.0rc1, 1.0.dev3
+    if lower.contains(".dev") {
+        return true;
+    }
+    // PyPI short: digit followed by 'a' or 'b' followed by digit (e.g., 1.0a1, 2.3b4)
+    let bytes = lower.as_bytes();
+    for window in bytes.windows(3) {
+        if window[0].is_ascii_digit()
+            && (window[1] == b'a' || window[1] == b'b')
+            && window[2].is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    // PyPI: digit followed by 'rc' followed by digit (e.g., 1.0rc1)
+    for window in bytes.windows(4) {
+        if window[0].is_ascii_digit()
+            && window[1] == b'r'
+            && window[2] == b'c'
+            && window[3].is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply prerelease filtering, counting, and pagination to a version list.
+///
+/// - `show_prerelease`: include pre-release versions in output
+/// - `show_all`: disable top-20 truncation (show all stable versions)
+///
+/// Returns `(filtered_versions, prerelease_count, total_stable)`.
+fn apply_prerelease_filter(
+    mut versions: Vec<VersionInfo>,
+    show_prerelease: bool,
+    show_all: bool,
+) -> (Vec<VersionInfo>, usize, usize) {
+    let prerelease_count = versions
+        .iter()
+        .filter(|v| is_prerelease_version(&v.version))
+        .count();
+
+    if !show_prerelease {
+        versions.retain(|v| !is_prerelease_version(&v.version));
+    }
+
+    let total_stable = versions
+        .iter()
+        .filter(|v| !is_prerelease_version(&v.version))
+        .count();
+
+    if !show_prerelease && !show_all && versions.len() > 20 {
+        versions.truncate(20);
+    }
+
+    (versions, prerelease_count, total_stable)
 }
 
 fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
@@ -1043,6 +1404,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
                 versions,
                 prerelease_count: 0,
                 total_stable: 0,
+                metadata: PackageMetadata::default(),
             };
         }
     }
@@ -1067,6 +1429,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
         versions,
         prerelease_count: 0,
         total_stable: 0,
+        metadata: PackageMetadata::default(),
     }
 }
 
