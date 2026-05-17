@@ -134,10 +134,7 @@ impl RepoIndex {
                     let (p, s) = crate::registry::nuget::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
                 }
-                RegistryType::Gems => {
-                    let (p, s) = crate::registry::gems::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
+                RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
                     let (p, s) = crate::registry::terraform::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
@@ -425,6 +422,39 @@ async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> V
         }
         if let Some(rest) = key.strip_prefix(prefix) {
             let name = rest.split('/').next().unwrap_or(rest).to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let entry = packages.entry(name).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    to_sorted_vec(packages)
+}
+
+/// Gems index: keys like gems/gems/{name}-{version}.gem
+/// Uses split_gem_filename to extract package name from flat file layout.
+async fn build_gems_index(storage: &Storage) -> Vec<RepoInfo> {
+    let keys = storage.list("gems/gems/").await;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &keys {
+        if !key.ends_with(".gem") {
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("gems/gems/") {
+            let stem = rest.strip_suffix(".gem").unwrap_or(rest);
+            let name = match crate::registry::gems::split_gem_filename(stem) {
+                Some((n, _)) => n,
+                None => stem.to_string(),
+            };
             if name.is_empty() {
                 continue;
             }
