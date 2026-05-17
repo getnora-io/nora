@@ -748,6 +748,17 @@ async fn patch_blob(
                     state.upload_sessions.write().remove(&uuid);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
+                // Flush to ensure data is visible to subsequent reads (e.g.
+                // the PUT handler that finalizes this upload). Without an
+                // explicit flush, data may remain in OS page cache only and
+                // can be invisible on overlay-fs / CI runners under I/O
+                // pressure.
+                if let Err(e) = f.flush().await {
+                    tracing::error!(error = %e, "Failed to flush upload temp file");
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    state.upload_sessions.write().remove(&uuid);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to open upload temp file");
