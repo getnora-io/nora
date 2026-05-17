@@ -1510,7 +1510,7 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
     }
 
     if !info_items.is_empty() {
-        inner.push_str(r#"<div class="flex flex-wrap gap-x-6 gap-y-1 text-sm">"#);
+        inner.push_str(r#"<div class="grid gap-1 text-sm">"#);
         for item in &info_items {
             let _ = write!(inner, r#"<div>{}</div>"#, item);
         }
