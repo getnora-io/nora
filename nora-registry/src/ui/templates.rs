@@ -1037,11 +1037,13 @@ pub fn render_package_detail(
         _ => String::new(),
     };
 
-    // Build breadcrumbs — for raw, make each path segment clickable
-    let breadcrumb_html = if registry_type == "raw" && name.contains('/') {
+    // Build breadcrumbs — make each path segment clickable for hierarchical names
+    let breadcrumb_html = if name.contains('/') {
         let segments: Vec<&str> = name.split('/').collect();
-        let mut crumbs =
-            r#"<a href="/ui/raw" class="text-blue-400 hover:text-blue-300">Raw</a>"#.to_string();
+        let mut crumbs = format!(
+            r#"<a href="/ui/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+            registry_type, registry_title
+        );
         for (i, seg) in segments.iter().enumerate() {
             let crumb_path = segments[..=i]
                 .iter()
@@ -1058,7 +1060,8 @@ pub fn render_package_detail(
             } else {
                 let _ = write!(
                     crumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/{}/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    registry_type,
                     crumb_path,
                     html_escape(seg)
                 );
