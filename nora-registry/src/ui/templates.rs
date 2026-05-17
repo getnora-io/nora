@@ -792,6 +792,134 @@ pub fn render_maven_dir(
     )
 }
 
+/// Renders a Go module namespace browser with breadcrumbs and folder listing
+pub fn render_go_dir(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+
+    // Build breadcrumbs: Go Modules / github.com / gin-gonic
+    let mut breadcrumbs =
+        r#"<a href="/ui/go" class="text-blue-400 hover:text-blue-300">Go Modules</a>"#.to_string();
+    if !path.is_empty() {
+        let segments: Vec<&str> = path.split('/').collect();
+        for (i, seg) in segments.iter().enumerate() {
+            let crumb_path = segments[..=i].join("/");
+            if i == segments.len() - 1 {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    html_escape(seg)
+                );
+            } else {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/go/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    crumb_path,
+                    html_escape(seg)
+                );
+            }
+        }
+    }
+
+    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
+
+    let rows: String = entries
+        .iter()
+        .map(|entry| {
+            let href = if path.is_empty() {
+                format!("/ui/go/{}", encode_uri_component(&entry.name))
+            } else {
+                format!(
+                    "/ui/go/{}/{}",
+                    path,
+                    encode_uri_component(&entry.name)
+                )
+            };
+            format!(
+                r##"
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                    </td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
+                </tr>
+            "##,
+                href,
+                folder_icon,
+                href,
+                html_escape(&entry.name),
+                entry.versions,
+                format_size(entry.size),
+                &entry.updated,
+            )
+        })
+        .collect();
+
+    let title_display = if path.is_empty() {
+        "Go Modules".to_string()
+    } else {
+        html_escape(path.rsplit('/').next().unwrap_or(path))
+    };
+    let showing = t.showing_all.replace("{count}", &total.to_string());
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        icon = icons::GO,
+        title = title_display,
+        col_name = t.name,
+        col_items = t.items,
+        col_size = t.size,
+        col_updated = t.updated,
+        rows = rows,
+        showing = showing,
+    );
+
+    layout_dark(
+        &format!(
+            "Go Modules — {}",
+            if path.is_empty() { "Browse" } else { path }
+        ),
+        &content,
+        Some("go"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -909,11 +1037,13 @@ pub fn render_package_detail(
         _ => String::new(),
     };
 
-    // Build breadcrumbs — for raw, make each path segment clickable
-    let breadcrumb_html = if registry_type == "raw" && name.contains('/') {
+    // Build breadcrumbs — make each path segment clickable for hierarchical names
+    let breadcrumb_html = if name.contains('/') {
         let segments: Vec<&str> = name.split('/').collect();
-        let mut crumbs =
-            r#"<a href="/ui/raw" class="text-blue-400 hover:text-blue-300">Raw</a>"#.to_string();
+        let mut crumbs = format!(
+            r#"<a href="/ui/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+            registry_type, registry_title
+        );
         for (i, seg) in segments.iter().enumerate() {
             let crumb_path = segments[..=i]
                 .iter()
@@ -930,7 +1060,8 @@ pub fn render_package_detail(
             } else {
                 let _ = write!(
                     crumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/raw/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/{}/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    registry_type,
                     crumb_path,
                     html_escape(seg)
                 );

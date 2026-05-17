@@ -466,19 +466,15 @@ async fn go_list(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
     let auth_enabled = state.auth.is_some();
 
-    let all_modules = state.repo_index.get("go", &state.storage).await;
-    let (modules, total) = paginate(&all_modules, page, limit);
+    // Show top-level namespace directories (github.com, golang.org, etc.)
+    let (entries, _) = api::get_go_dir_listing(&state.storage, "").await;
+    let total = entries.len();
 
-    Html(render_registry_list_paginated(
-        "go",
-        "Go Modules",
-        &modules,
-        page,
-        limit,
+    Html(templates::render_go_dir(
+        "",
+        &entries,
         total,
         lang,
         auth_enabled,
@@ -500,19 +496,36 @@ async fn go_detail(
             headers.get("cookie").and_then(|v| v.to_str().ok()),
         )
     };
-    let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
-    let show_prerelease = query.prerelease.unwrap_or(false);
-    let show_all = query.all.unwrap_or(false);
-    let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
-    Html(render_package_detail(
-        "go",
-        &name,
-        &detail,
-        lang,
-        &base_url,
-        auth_enabled,
-    ))
+
+    // Try hierarchical browsing: check if this is a directory or leaf module
+    let (entries, is_leaf) = api::get_go_dir_listing(&state.storage, &name).await;
+
+    if is_leaf || entries.is_empty() {
+        // Leaf module — show version detail page
+        let base_url = resolve_base_url(&state);
+        let show_prerelease = query.prerelease.unwrap_or(false);
+        let show_all = query.all.unwrap_or(false);
+        let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
+        Html(render_package_detail(
+            "go",
+            &name,
+            &detail,
+            lang,
+            &base_url,
+            auth_enabled,
+        ))
+    } else {
+        // Namespace directory — show children
+        let total = entries.len();
+        Html(templates::render_go_dir(
+            &name,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    }
 }
 
 // Raw pages
