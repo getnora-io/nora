@@ -1629,6 +1629,9 @@ pub async fn fetch_blob_from_upstream(
     let chunk_timeout = Duration::from_secs(read_timeout);
 
     loop {
+        // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout,
+        // the partial chunk is discarded and we return a ProxyError — no
+        // accumulated state is lost since `data` is local and the error aborts.
         match tokio::time::timeout(chunk_timeout, stream.next()).await {
             Ok(Some(Ok(chunk))) => data.extend_from_slice(&chunk),
             Ok(Some(Err(e))) => {

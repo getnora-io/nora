@@ -653,6 +653,9 @@ pub fn spawn_gc_scheduler(
         interval.tick().await;
 
         loop {
+            // CANCEL-SAFETY: interval.tick() holds no state between polls.
+            // cancel.cancelled() is a CancellationToken — safe to drop at any point.
+            // GC work happens entirely within the tick handler below, not across awaits.
             tokio::select! {
                 _ = cancel.cancelled() => {
                     info!("GC scheduler: cancellation requested, stopping");

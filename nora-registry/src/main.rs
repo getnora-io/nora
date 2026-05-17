@@ -1149,6 +1149,9 @@ async fn run_server(config: Config, storage: Storage) {
     if !scheduler_handles.is_empty() {
         info!("Waiting for background schedulers to finish (10s timeout)...");
         let join_all = futures::future::join_all(scheduler_handles);
+        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout,
+        // the JoinHandles are dropped which cancels the spawned tasks — this is
+        // intentional since we're shutting down and don't need their results.
         if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
             .await
             .is_err()
@@ -1190,6 +1193,9 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // CANCEL-SAFETY: Both futures (ctrl_c and terminate) are signal listeners
+    // with no intermediate state. Dropping either loses nothing — the process
+    // is about to shut down regardless.
     tokio::select! {
         _ = ctrl_c => {
             info!("Received SIGINT, starting graceful shutdown...");
