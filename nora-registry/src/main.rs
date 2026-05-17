@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
 #![forbid(unsafe_code)]
+#![warn(clippy::large_stack_frames, clippy::large_futures)]
 mod activity_log;
 mod audit;
 mod auth;
