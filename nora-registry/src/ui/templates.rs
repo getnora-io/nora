@@ -1517,19 +1517,6 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
         inner.push_str("</div>");
     }
 
-    // Keywords
-    if !meta.keywords.is_empty() {
-        inner.push_str(r#"<div class="flex flex-wrap gap-2 mt-3">"#);
-        for kw in &meta.keywords {
-            let _ = write!(
-                inner,
-                r#"<span class="text-xs text-blue-400 bg-blue-900/30 border border-blue-800 rounded px-2 py-0.5">{}</span>"#,
-                html_escape(kw)
-            );
-        }
-        inner.push_str("</div>");
-    }
-
     format!(
         r##"<div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">{}</div>"##,
         inner
