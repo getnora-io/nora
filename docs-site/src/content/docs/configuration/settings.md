@@ -60,6 +60,13 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_AUTH_ANONYMOUS_READ` | `false` | Allow unauthenticated read (pull) access |
 | `NORA_AUTH_HTPASSWD_FILE` | `users.htpasswd` | Path to htpasswd file |
 | `NORA_AUTH_TOKEN_STORAGE` | `data/tokens` | Directory for API token storage |
+| `NORA_AUTH_TRUSTED_PROXIES` | `127.0.0.1,::1` | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted |
+
+### Registry Selection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NORA_REGISTRIES_ENABLE` | *(none)* | Comma-separated list of registries to enable (e.g., `docker,npm,pypi`) or `all`. Overrides per-registry `NORA_*_ENABLED` flags when set. |
 
 ### Registry Enable/Disable
 
@@ -73,7 +80,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_GO_ENABLED` | `true` | Enable Go module proxy |
 | `NORA_RAW_ENABLED` | `true` | Enable raw file storage |
 | `NORA_GEMS_ENABLED` | `false` | Enable RubyGems registry |
-| `NORA_TERRAFORM_ENABLED` | `false` | Enable Terraform provider registry |
+| `NORA_TF_ENABLED` | `false` | Enable Terraform provider registry |
 | `NORA_ANSIBLE_ENABLED` | `false` | Enable Ansible Galaxy registry |
 | `NORA_NUGET_ENABLED` | `false` | Enable NuGet registry |
 | `NORA_PUB_ENABLED` | `false` | Enable Dart/Flutter pub registry |
@@ -111,6 +118,9 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 |----------|---------|-------------|
 | `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Upstream registries. Format: `url1,url2` or `url1\|auth1,url2\|auth2` |
 | `NORA_DOCKER_PROXY_TIMEOUT` | `60` | Proxy timeout in seconds |
+| `NORA_DOCKER_READ_TIMEOUT` | `60` | Per-chunk read timeout for streaming blob downloads |
+| `NORA_DOCKER_METADATA_TTL` | `-1` | Metadata cache TTL in seconds (-1 = forever, 0 = always refetch) |
+| `NORA_DOCKER_SERVE_STALE` | `true` | Serve stale cached manifests when upstream is unreachable |
 
 ### Go
 
@@ -150,10 +160,10 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NORA_TERRAFORM_PROXY` | `https://registry.terraform.io` | Upstream Terraform registry |
-| `NORA_TERRAFORM_PROXY_AUTH` | *(none)* | Upstream auth (`user:pass`) |
-| `NORA_TERRAFORM_PROXY_TIMEOUT` | `30` | Proxy timeout in seconds |
-| `NORA_TERRAFORM_PROXY_TIMEOUT_DOWNLOAD` | `120` | Timeout for binary downloads in seconds |
+| `NORA_TF_PROXY` | `https://registry.terraform.io` | Upstream Terraform registry |
+| `NORA_TF_PROXY_AUTH` | *(none)* | Upstream auth (`user:pass`) |
+| `NORA_TF_PROXY_TIMEOUT` | `30` | Proxy timeout in seconds |
+| `NORA_TF_PROXY_TIMEOUT_DL` | `120` | Timeout for binary downloads in seconds |
 
 ### Ansible Galaxy
 
@@ -187,7 +197,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_CONAN_PROXY` | `https://center2.conan.io` | Upstream Conan registry |
 | `NORA_CONAN_PROXY_AUTH` | *(none)* | Upstream auth (`user:pass`) |
 | `NORA_CONAN_PROXY_TIMEOUT` | `30` | Proxy timeout in seconds |
-| `NORA_CONAN_PROXY_TIMEOUT_DOWNLOAD` | `120` | Timeout for binary downloads in seconds |
+| `NORA_CONAN_PROXY_TIMEOUT_DL` | `120` | Timeout for binary downloads in seconds |
 | `NORA_CONAN_METADATA_TTL` | `300` | Metadata cache TTL in seconds |
 
 ### Rate Limiting
@@ -228,7 +238,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_CURATION_BLOCKLIST_PATH` | *(none)* | Path to blocklist JSON file |
 | `NORA_CURATION_BYPASS_TOKEN` | *(none)* | Token to bypass curation checks |
 | `NORA_CURATION_REQUIRE_INTEGRITY` | `false` | Require integrity metadata in allowlist entries |
-| `NORA_CURATION_INTERNAL_NAMESPACES` | *(none)* | Comma-separated glob patterns for internal namespaces |
+| `NORA_CURATION_INTERNAL_NS` | *(none)* | Comma-separated glob patterns for internal namespaces |
 | `NORA_CURATION_MIN_RELEASE_AGE` | *(none)* | Global min release age (`7d`, `12h`, `2w`) |
 | `NORA_CURATION_NPM_MIN_RELEASE_AGE` | *(none)* | npm-specific min release age override |
 | `NORA_CURATION_PYPI_MIN_RELEASE_AGE` | *(none)* | PyPI-specific min release age override |
@@ -242,6 +252,20 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 |----------|---------|-------------|
 | `NORA_SECRETS_PROVIDER` | `env` | Secrets provider: `env`, `aws-secrets`, `vault`, `k8s` |
 | `NORA_SECRETS_CLEAR_ENV` | `false` | Clear env vars after reading (env provider) |
+
+### TLS
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NORA_TLS_CA_CERT` | *(none)* | Path to PEM-encoded CA certificate bundle (appended to system CAs) |
+
+### Circuit Breaker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NORA_CB_ENABLED` | `false` | Enable upstream circuit breaker |
+| `NORA_CB_THRESHOLD` | `5` | Consecutive failures before opening the circuit |
+| `NORA_CB_RESET_TIMEOUT` | `30` | Seconds before probing a failed upstream |
 
 ---
 
@@ -281,6 +305,7 @@ enabled = false
 anonymous_read = false
 htpasswd_file = "users.htpasswd"
 token_storage = "data/tokens"
+# trusted_proxies = "127.0.0.1,::1"  # IPs/CIDRs whose X-Forwarded-For is trusted
 
 # =============================================================================
 # Secrets
@@ -307,6 +332,9 @@ general_burst = 200
 [docker]
 enabled = true
 proxy_timeout = 60
+read_timeout = 60
+metadata_ttl = -1              # -1 = forever, 0 = always refetch, >0 = seconds
+serve_stale = true
 
 [[docker.upstreams]]
 url = "https://registry-1.docker.io"
@@ -392,7 +420,7 @@ enabled = false
 proxy = "https://registry.terraform.io"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-proxy_timeout_download = 120
+proxy_timeout_dl = 120
 
 # =============================================================================
 # Ansible Galaxy Registry
@@ -430,7 +458,7 @@ enabled = false
 proxy = "https://center2.conan.io"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-proxy_timeout_download = 120
+proxy_timeout_dl = 120
 metadata_ttl = 300
 
 # =============================================================================
@@ -459,6 +487,25 @@ dry_run = false
 # [[retention.rules]]
 # registry = "*"
 # older_than_days = 180
+
+# =============================================================================
+# TLS (Custom CA Certificates)
+# =============================================================================
+[tls]
+# ca_cert = "/etc/nora/ca-bundle.pem"  # PEM-encoded CA bundle (appended to system CAs)
+
+# =============================================================================
+# Circuit Breaker
+# =============================================================================
+[circuit_breaker]
+enabled = false
+failure_threshold = 5
+reset_timeout = 30
+
+# Per-registry overrides:
+# [circuit_breaker.overrides."docker:https://registry-1.docker.io"]
+# failure_threshold = 10
+# reset_timeout = 120
 
 # =============================================================================
 # Curation (Package Access Control)
@@ -505,6 +552,8 @@ In Kubernetes, mount credentials from a Secret into the container environment in
 ## See Also
 
 - [Authentication](/configuration/authentication/) -- user management and API tokens
+- [Circuit Breaker](/configuration/circuit-breaker/) -- upstream failure detection
 - [Curation](/configuration/curation/) -- package access control
-- [Rate Limits](/configuration/rate-limits/) -- rate limiting tuning
+- [Docker Proxy](/configuration/docker-proxy/) -- upstream Docker registry configuration
+- [TLS / HTTPS](/configuration/tls/) -- custom CA certificates
 - [Production Deployment](/deployment/production/) -- production deployment guide

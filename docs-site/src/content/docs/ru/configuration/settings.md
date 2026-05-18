@@ -62,7 +62,7 @@ NORA использует многоуровневую модель конфиг
 | `NORA_GO_ENABLED` | `true` | Включить прокси модулей Go |
 | `NORA_RAW_ENABLED` | `true` | Включить хранилище необработанных файлов |
 | `NORA_GEMS_ENABLED` | `false` | Включить реестр RubyGems |
-| `NORA_TERRAFORM_ENABLED` | `false` | Включить реестр провайдеров Terraform |
+| `NORA_TF_ENABLED` | `false` | Включить реестр провайдеров Terraform |
 | `NORA_ANSIBLE_ENABLED` | `false` | Включить реестр Ansible Galaxy |
 | `NORA_NUGET_ENABLED` | `false` | Включить реестр NuGet |
 | `NORA_PUB_ENABLED` | `false` | Включить реестр Dart/Flutter pub |
@@ -139,10 +139,10 @@ NORA использует многоуровневую модель конфиг
 
 | Переменная | По умолчанию | Описание |
 |----------|---------|-------------|
-| `NORA_TERRAFORM_PROXY` | `https://registry.terraform.io` | Вышестоящий реестр Terraform |
-| `NORA_TERRAFORM_PROXY_AUTH` | *(нет)* | Аутентификация вышестоящего реестра (`user:pass`) |
-| `NORA_TERRAFORM_PROXY_TIMEOUT` | `30` | Таймаут прокси в секундах |
-| `NORA_TERRAFORM_PROXY_TIMEOUT_DOWNLOAD` | `120` | Таймаут загрузки бинарных файлов в секундах |
+| `NORA_TF_PROXY` | `https://registry.terraform.io` | Вышестоящий реестр Terraform |
+| `NORA_TF_PROXY_AUTH` | *(нет)* | Аутентификация вышестоящего реестра (`user:pass`) |
+| `NORA_TF_PROXY_TIMEOUT` | `30` | Таймаут прокси в секундах |
+| `NORA_TF_PROXY_TIMEOUT_DL` | `120` | Таймаут загрузки бинарных файлов в секундах |
 
 ### Ansible Galaxy
 
@@ -176,7 +176,7 @@ NORA использует многоуровневую модель конфиг
 | `NORA_CONAN_PROXY` | `https://center2.conan.io` | Вышестоящий реестр Conan |
 | `NORA_CONAN_PROXY_AUTH` | *(нет)* | Аутентификация вышестоящего реестра (`user:pass`) |
 | `NORA_CONAN_PROXY_TIMEOUT` | `30` | Таймаут прокси в секундах |
-| `NORA_CONAN_PROXY_TIMEOUT_DOWNLOAD` | `120` | Таймаут загрузки бинарных файлов в секундах |
+| `NORA_CONAN_PROXY_TIMEOUT_DL` | `120` | Таймаут загрузки бинарных файлов в секундах |
 | `NORA_CONAN_METADATA_TTL` | `300` | TTL кэша метаданных в секундах |
 
 ### Ограничение частоты запросов
@@ -217,7 +217,7 @@ NORA использует многоуровневую модель конфиг
 | `NORA_CURATION_BLOCKLIST_PATH` | *(нет)* | Путь к JSON-файлу списка блокировки |
 | `NORA_CURATION_BYPASS_TOKEN` | *(нет)* | Токен для обхода проверок курирования |
 | `NORA_CURATION_REQUIRE_INTEGRITY` | `false` | Требовать метаданные целостности в записях списка разрешений |
-| `NORA_CURATION_INTERNAL_NAMESPACES` | *(нет)* | Разделённые запятой glob-паттерны для внутренних пространств имён |
+| `NORA_CURATION_INTERNAL_NS` | *(нет)* | Разделённые запятой glob-паттерны для внутренних пространств имён |
 | `NORA_CURATION_MIN_RELEASE_AGE` | *(нет)* | Глобальный мин. возраст релиза (`7d`, `12h`, `2w`) |
 | `NORA_CURATION_NPM_MIN_RELEASE_AGE` | *(нет)* | Мин. возраст релиза для npm |
 | `NORA_CURATION_PYPI_MIN_RELEASE_AGE` | *(нет)* | Мин. возраст релиза для PyPI |
@@ -381,7 +381,7 @@ enabled = false
 proxy = "https://registry.terraform.io"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-proxy_timeout_download = 120
+proxy_timeout_dl = 120
 
 # =============================================================================
 # Ansible Galaxy Registry
@@ -419,7 +419,7 @@ enabled = false
 proxy = "https://center2.conan.io"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-proxy_timeout_download = 120
+proxy_timeout_dl = 120
 metadata_ttl = 300
 
 # =============================================================================

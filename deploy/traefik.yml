@@ -1,0 +1,87 @@
+# =============================================================================
+# Traefik reverse proxy configuration for NORA
+# =============================================================================
+#
+# Two files are needed:
+#   1. traefik.yml    -- static configuration (entry points, providers)
+#   2. dynamic.yml    -- dynamic configuration (routers, services)
+#
+# Usage with Docker Compose:
+#
+#   services:
+#     traefik:
+#       image: traefik:v3
+#       ports:
+#         - "80:80"
+#         - "443:443"
+#       volumes:
+#         - ./traefik.yml:/etc/traefik/traefik.yml:ro
+#         - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+#         - /var/run/docker.sock:/var/run/docker.sock:ro
+#         - certs:/etc/traefik/certs
+#
+#     nora:
+#       image: getnora/nora:latest
+#       environment:
+#         NORA_HOST: "0.0.0.0"
+#         NORA_PUBLIC_URL: "https://registry.example.com"
+#         NORA_AUTH_TRUSTED_PROXIES: "172.16.0.0/12"
+#       expose:
+#         - "4000"
+#
+# =============================================================================
+
+# --- traefik.yml (static configuration) ---
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+api:
+  dashboard: false
+
+log:
+  level: WARN
+
+# --- dynamic.yml (dynamic configuration) ---
+# Save this section as a separate file: /etc/traefik/dynamic.yml
+#
+# http:
+#   routers:
+#     nora:
+#       rule: "Host(`registry.example.com`)"
+#       service: nora
+#       entryPoints:
+#         - websecure
+#       tls:
+#         certResolver: letsencrypt
+#
+#   services:
+#     nora:
+#       loadBalancer:
+#         servers:
+#           - url: "http://nora:4000"
+#         healthCheck:
+#           path: /health
+#           interval: 10s
+#           timeout: 3s
+#
+# tls:
+#   certResolver:
+#     letsencrypt:
+#       acme:
+#         email: admin@example.com
+#         storage: /etc/traefik/certs/acme.json
+#         httpChallenge:
+#           entryPoint: web

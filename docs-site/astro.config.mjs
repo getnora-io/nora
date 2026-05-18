@@ -72,6 +72,7 @@ export default defineConfig({
 						{ label: 'TLS / HTTPS', slug: 'configuration/tls' },
 						{ label: 'Outbound Proxy', translations: { ru: 'Исходящий прокси' }, slug: 'configuration/http-proxy' },
 						{ label: 'Curation', translations: { ru: 'Курирование' }, slug: 'configuration/curation' },
+						{ label: 'Circuit Breaker', translations: { ru: 'Автоматический выключатель' }, slug: 'configuration/circuit-breaker' },
 						{ label: 'Rate Limits', translations: { ru: 'Ограничение запросов' }, slug: 'configuration/rate-limits' },
 					],
 				},
