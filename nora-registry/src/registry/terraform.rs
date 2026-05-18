@@ -304,7 +304,7 @@ async fn provider_download_binary(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.terraform.proxy_timeout_download,
+        state.config.terraform.proxy_timeout_dl,
         state.config.terraform.proxy_auth.as_deref(),
         &state.circuit_breaker,
         "terraform",

@@ -131,7 +131,7 @@ fn build_context(
             proxy_timeout: 5,
             read_timeout: 60,
             metadata_ttl: -1,
-            stale_while_error: true,
+            serve_stale: true,
             upstreams: vec![],
         },
         raw: RawConfig {

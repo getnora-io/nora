@@ -277,7 +277,7 @@ pub struct DockerConfig {
     pub metadata_ttl: i64,
     /// Serve stale cached manifests when upstream is unreachable (default: true).
     #[serde(default = "default_true")]
-    pub stale_while_error: bool,
+    pub serve_stale: bool,
     #[serde(default)]
     pub upstreams: Vec<DockerUpstream>,
 }
@@ -421,7 +421,7 @@ pub struct TerraformConfig {
     pub proxy_timeout: u64,
     /// Separate timeout for binary downloads (default: 120s)
     #[serde(default = "default_go_zip_timeout")]
-    pub proxy_timeout_download: u64,
+    pub proxy_timeout_dl: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
     /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
@@ -439,7 +439,7 @@ impl Default for TerraformConfig {
             proxy: default_terraform_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
-            proxy_timeout_download: 120,
+            proxy_timeout_dl: 120,
             metadata_ttl: 300,
         }
     }
@@ -567,7 +567,7 @@ pub struct ConanConfig {
     pub proxy_timeout: u64,
     /// Separate timeout for binary downloads (default: 120s)
     #[serde(default = "default_go_zip_timeout")]
-    pub proxy_timeout_download: u64,
+    pub proxy_timeout_dl: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
     /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
@@ -585,7 +585,7 @@ impl Default for ConanConfig {
             proxy: default_conan_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
-            proxy_timeout_download: 120,
+            proxy_timeout_dl: 120,
             metadata_ttl: 300,
         }
     }
@@ -921,7 +921,7 @@ impl Default for DockerConfig {
             proxy_timeout: 300,
             read_timeout: 60,
             metadata_ttl: -1,
-            stale_while_error: true,
+            serve_stale: true,
             upstreams: vec![DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
@@ -1171,7 +1171,7 @@ pub enum CurationOnFailure {
 /// - `NORA_CURATION_BLOCKLIST_PATH` — path to blocklist JSON file
 /// - `NORA_CURATION_BYPASS_TOKEN` — token to bypass curation checks
 /// - `NORA_CURATION_REQUIRE_INTEGRITY` — require integrity metadata (default: false)
-/// - `NORA_CURATION_INTERNAL_NAMESPACES` — comma-separated glob patterns
+/// - `NORA_CURATION_INTERNAL_NS` — comma-separated glob patterns
 /// - `NORA_CURATION_MIN_RELEASE_AGE` — minimum release age (e.g., "7d", "24h", "1w")
 /// - `NORA_CURATION_QUARANTINE` — quarantine mode: off/observe/enforce (default: off)
 /// - `NORA_CURATION_QUARANTINE_TTL` — quarantine hold duration (e.g., "14d", "24h")
@@ -1607,7 +1607,7 @@ impl Config {
             "NORA_GO_ENABLED",
             "NORA_RAW_ENABLED",
             "NORA_GEMS_ENABLED",
-            "NORA_TERRAFORM_ENABLED",
+            "NORA_TF_ENABLED",
             "NORA_ANSIBLE_ENABLED",
             "NORA_NUGET_ENABLED",
             "NORA_PUB_ENABLED",
@@ -2022,7 +2022,7 @@ impl Config {
         if let Ok(val) = env::var("NORA_GEMS_ENABLED") {
             self.gems.enabled = val.to_lowercase() == "true" || val == "1";
         }
-        if let Ok(val) = env::var("NORA_TERRAFORM_ENABLED") {
+        if let Ok(val) = env::var("NORA_TF_ENABLED") {
             self.terraform.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_ENABLED") {
@@ -2119,8 +2119,8 @@ impl Config {
                 self.docker.metadata_ttl = ttl;
             }
         }
-        if let Ok(val) = env::var("NORA_DOCKER_STALE_WHILE_ERROR") {
-            self.docker.stale_while_error = !matches!(val.as_str(), "false" | "0");
+        if let Ok(val) = env::var("NORA_DOCKER_SERVE_STALE") {
+            self.docker.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
         // NORA_DOCKER_PROXIES format: "url1,url2" or "url1|auth1,url2|auth2"
         // or "url1|auth1|prefix1,url2||prefix2" (empty auth with prefix)
@@ -2234,23 +2234,23 @@ impl Config {
         }
 
         // Terraform config
-        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY") {
+        if let Ok(val) = env::var("NORA_TF_PROXY") {
             self.terraform.proxy = if val.is_empty() { None } else { Some(val) };
         }
-        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_AUTH") {
+        if let Ok(val) = env::var("NORA_TF_PROXY_AUTH") {
             self.terraform.proxy_auth = if val.is_empty() { None } else { Some(val) };
         }
-        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_TIMEOUT") {
+        if let Ok(val) = env::var("NORA_TF_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
                 self.terraform.proxy_timeout = timeout;
             }
         }
-        if let Ok(val) = env::var("NORA_TERRAFORM_PROXY_TIMEOUT_DOWNLOAD") {
+        if let Ok(val) = env::var("NORA_TF_PROXY_TIMEOUT_DL") {
             if let Ok(timeout) = val.parse() {
-                self.terraform.proxy_timeout_download = timeout;
+                self.terraform.proxy_timeout_dl = timeout;
             }
         }
-        if let Ok(val) = env::var("NORA_TERRAFORM_METADATA_TTL") {
+        if let Ok(val) = env::var("NORA_TF_METADATA_TTL") {
             if let Ok(ttl) = val.parse() {
                 self.terraform.metadata_ttl = ttl;
             }
@@ -2322,9 +2322,9 @@ impl Config {
                 self.conan.proxy_timeout = timeout;
             }
         }
-        if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT_DOWNLOAD") {
+        if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT_DL") {
             if let Ok(timeout) = val.parse() {
-                self.conan.proxy_timeout_download = timeout;
+                self.conan.proxy_timeout_dl = timeout;
             }
         }
         if let Ok(val) = env::var("NORA_CONAN_METADATA_TTL") {
@@ -2433,7 +2433,7 @@ impl Config {
         if let Ok(val) = env::var("NORA_CURATION_REQUIRE_INTEGRITY") {
             self.curation.require_integrity = val.to_lowercase() == "true" || val == "1";
         }
-        if let Ok(val) = env::var("NORA_CURATION_INTERNAL_NAMESPACES") {
+        if let Ok(val) = env::var("NORA_CURATION_INTERNAL_NS") {
             self.curation.internal_namespaces = if val.is_empty() {
                 Vec::new()
             } else {
