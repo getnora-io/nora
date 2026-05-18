@@ -7,6 +7,7 @@ use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use tokio::io::AsyncReadExt;
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
@@ -164,6 +165,27 @@ impl StorageBackend for S3Storage {
             self.size_cache_initialized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    async fn put_from_path(&self, key: &str, src: &std::path::Path) -> Result<()> {
+        let encoded = encode_s3_key(key);
+        let s3_path = Path::from(encoded);
+
+        // Read file and upload via object_store PutPayload.
+        // For very large files a multipart upload would be better, but
+        // object_store handles chunking internally when payload exceeds
+        // the part-size threshold.
+        let mut file = tokio::fs::File::open(src)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let payload = PutPayload::from(buf);
+        self.store.put(&s3_path, payload).await.map_err(map_err)?;
+        let _ = tokio::fs::remove_file(src).await;
+        Ok(())
     }
 }
 

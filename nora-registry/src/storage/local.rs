@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
@@ -163,6 +163,61 @@ impl StorageBackend for LocalStorage {
 
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+        let dest = self.key_to_path(key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+        // Try atomic rename first; fall back to streaming copy on EXDEV
+        // (cross-device link — src and dest on different filesystems).
+        match fs::rename(src, &dest).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
+                let mut reader = fs::File::open(src)
+                    .await
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let tmp = dest.with_extension("tmp");
+                let mut writer = fs::File::create(&tmp)
+                    .await
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
+                let copy_result: Result<()> = async {
+                    loop {
+                        let n = reader
+                            .read(&mut buf)
+                            .await
+                            .map_err(|e| StorageError::Io(e.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        writer
+                            .write_all(&buf[..n])
+                            .await
+                            .map_err(|e| StorageError::Io(e.to_string()))?;
+                    }
+                    writer
+                        .flush()
+                        .await
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    fs::rename(&tmp, &dest)
+                        .await
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    Ok(())
+                }
+                .await;
+                if copy_result.is_err() {
+                    let _ = fs::remove_file(&tmp).await;
+                }
+                copy_result?;
+                let _ = fs::remove_file(src).await;
+                Ok(())
+            }
+            Err(e) => Err(StorageError::Io(e.to_string())),
+        }
     }
 }
 

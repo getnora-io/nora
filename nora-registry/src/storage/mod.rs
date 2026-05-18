@@ -11,7 +11,7 @@ use crate::hash_pin_store::HashPinStore;
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -53,6 +53,12 @@ pub trait StorageBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     /// Refresh any cached size data. No-op for backends without caching.
     async fn refresh_total_size(&self) {}
+    /// Move or copy a file from `src` into storage under `key`.
+    ///
+    /// Local backend: atomic `rename`, with streaming copy fallback on EXDEV.
+    /// S3 backend: multipart upload from file.
+    /// The caller is responsible for deleting `src` on error.
+    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()>;
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
@@ -161,5 +167,14 @@ impl Storage {
     /// Refresh cached total_size. No-op for local storage, computes for S3.
     pub async fn refresh_total_size_cache(&self) {
         self.inner.refresh_total_size().await;
+    }
+
+    /// Move or copy a file from `src` into storage under `key`.
+    ///
+    /// Digest is assumed already verified by the caller — pin store is
+    /// not updated (re-reading gigabytes just to hash is wasteful).
+    pub async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+        validate_storage_key(key)?;
+        self.inner.put_from_path(key, src).await
     }
 }

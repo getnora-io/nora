@@ -871,7 +871,17 @@ async fn upload_blob(
         sessions.remove(&uuid)
     }; // lock released before file I/O
 
-    let data = if let Some(session) = session_opt {
+    // Only sha256 digests are supported for verification
+    if !digest.starts_with("sha256:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Only sha256 digests are supported for blob uploads",
+        )
+            .into_response();
+    }
+
+    // Resolve temp file path: either from a PATCH session or write body to a new temp file
+    let temp_path = if let Some(session) = session_opt {
         // Verify session belongs to this repository
         if session.name != name {
             tracing::warn!(
@@ -886,42 +896,76 @@ async fn upload_blob(
             )
                 .into_response();
         }
-        // Read temp file if it exists (may not exist for monolithic uploads
-        // where no PATCH was sent before the final PUT)
-        let mut session_data = match tokio::fs::read(&session.temp_path).await {
-            Ok(data) => {
-                let _ = tokio::fs::remove_file(&session.temp_path).await;
-                data
+        // If PUT body is non-empty, append it to the temp file
+        if !body.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            match tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&session.temp_path)
+                .await
+            {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(&body).await {
+                        tracing::error!(error = %e, "Failed to append PUT body to temp file");
+                        let _ = tokio::fs::remove_file(&session.temp_path).await;
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    let _ = f.flush().await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No temp file (no PATCH was sent) — create one with body
+                    if let Err(e) = tokio::fs::write(&session.temp_path, &body).await {
+                        tracing::error!(error = %e, "Failed to write temp file for PUT body");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to open temp file for append");
+                    let _ = tokio::fs::remove_file(&session.temp_path).await;
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        }
+        session.temp_path
+    } else {
+        // Monolithic upload (no session): write body to a temp file
+        let temp_dir = upload_temp_dir(&state.config.storage.path);
+        let temp_path = temp_dir.join(format!("mono-{}", uuid));
+        if let Err(e) = tokio::fs::write(&temp_path, &body).await {
+            tracing::error!(error = %e, "Failed to write monolithic upload temp file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        temp_path
+    };
+
+    // Verify digest by streaming SHA-256 — O(chunk_size) memory, not O(blob_size)
+    {
+        use sha2::Digest as _;
+        use tokio::io::AsyncReadExt;
+        let file = match tokio::fs::File::open(&temp_path).await {
+            Ok(f) => f,
             Err(e) => {
-                tracing::error!(error = %e, "Failed to read upload temp file");
-                let _ = tokio::fs::remove_file(&session.temp_path).await;
+                tracing::error!(error = %e, "Failed to open temp file for digest verification");
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        if !body.is_empty() {
-            session_data.extend_from_slice(&body);
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024]; // 256 KiB read chunks
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to read temp file for digest");
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            hasher.update(&buf[..n]);
         }
-        session_data
-    } else {
-        // Monolithic upload: use body directly
-        body.to_vec()
-    };
-
-    // Only sha256 digests are supported for verification
-    if !digest.starts_with("sha256:") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Only sha256 digests are supported for blob uploads",
-        )
-            .into_response();
-    }
-
-    // Verify digest matches uploaded content (Docker Distribution Spec)
-    {
-        use sha2::Digest as _;
-        let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+        let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
         if computed != *digest {
             tracing::warn!(
                 expected = %digest,
@@ -929,6 +973,7 @@ async fn upload_blob(
                 name = %name,
                 "SECURITY: blob digest mismatch — rejecting upload"
             );
+            let _ = tokio::fs::remove_file(&temp_path).await;
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -943,8 +988,9 @@ async fn upload_blob(
         }
     }
 
+    // Move temp file into storage — no RAM copy of the blob
     let key = format!("docker/{}/blobs/{}", name, digest);
-    match state.storage.put(&key, &data).await {
+    match state.storage.put_from_path(&key, &temp_path).await {
         Ok(()) => {
             state.metrics.record_upload("docker");
             state.audit.log(AuditEntry::new(
