@@ -13,7 +13,7 @@ NORA can proxy Docker (OCI) images from multiple upstream registries simultaneou
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Upstream registries. Format: `url1,url2` or `url1\|auth1,url2\|auth2` |
-| `NORA_DOCKER_PROXY_TIMEOUT` | `60` | Connection timeout in seconds |
+| `NORA_DOCKER_PROXY_TIMEOUT` | `300` | Connection timeout in seconds |
 | `NORA_DOCKER_READ_TIMEOUT` | `60` | Per-chunk read timeout for streaming blob downloads |
 | `NORA_DOCKER_METADATA_TTL` | `-1` | Metadata cache TTL in seconds (-1 = forever, 0 = always refetch) |
 | `NORA_DOCKER_SERVE_STALE` | `true` | Serve stale cached manifests when upstream is unreachable |
@@ -27,7 +27,7 @@ Configure multiple upstream registries using `[[docker.upstreams]]` in config.to
 ```toml
 [docker]
 enabled = true
-proxy_timeout = 60
+proxy_timeout = 300
 read_timeout = 60
 metadata_ttl = -1
 serve_stale = true

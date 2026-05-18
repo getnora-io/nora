@@ -56,7 +56,12 @@ docker run -d -p 4000:4000 -v nora-data:/data getnora/nora:latest
 ### Binary
 
 ```bash
+# x86_64
 curl -fsSL https://github.com/getnora-io/nora/releases/latest/download/nora-linux-amd64 -o nora
+
+# ARM64 (Raspberry Pi, Graviton, Apple Silicon VMs)
+curl -fsSL https://github.com/getnora-io/nora/releases/latest/download/nora-linux-arm64 -o nora
+
 chmod +x nora && ./nora
 ```
 

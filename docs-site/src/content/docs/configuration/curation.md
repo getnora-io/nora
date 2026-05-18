@@ -38,24 +38,29 @@ Start with `audit` mode to observe what would be blocked before switching to `en
 A blocklist blocks specific packages by name, version, or pattern. Create a JSON file:
 
 ```json
-[
-  {
-    "registry": "npm",
-    "name": "event-stream",
-    "reason": "Known supply-chain attack (CVE-2018-16492)"
-  },
-  {
-    "registry": "npm",
-    "name": "colors",
-    "versions": [">=1.4.1"],
-    "reason": "Intentional sabotage in 1.4.1+"
-  },
-  {
-    "registry": "pypi",
-    "name": "jeIlyfish",
-    "reason": "Typosquat of jellyfish"
-  }
-]
+{
+  "version": 1,
+  "rules": [
+    {
+      "registry": "npm",
+      "name": "event-stream",
+      "version": "*",
+      "reason": "Known supply-chain attack (CVE-2018-16492)"
+    },
+    {
+      "registry": "npm",
+      "name": "colors",
+      "version": ">=1.4.1",
+      "reason": "Intentional sabotage in 1.4.1+"
+    },
+    {
+      "registry": "pypi",
+      "name": "jeIlyfish",
+      "version": "*",
+      "reason": "Typosquat of jellyfish"
+    }
+  ]
+}
 ```
 
 Configure the path:
@@ -76,22 +81,27 @@ blocklist_path = "/etc/nora/blocklist.json"
 An allowlist restricts installations to only approved packages. When an allowlist is active, any package not on the list is blocked.
 
 ```json
-[
-  {
-    "registry": "npm",
-    "name": "express"
-  },
-  {
-    "registry": "npm",
-    "name": "lodash",
-    "versions": ["4.17.21"]
-  },
-  {
-    "registry": "pypi",
-    "name": "requests",
-    "integrity": "sha256:abcdef1234567890..."
-  }
-]
+{
+  "version": 1,
+  "entries": [
+    {
+      "registry": "npm",
+      "name": "express",
+      "version": "*"
+    },
+    {
+      "registry": "npm",
+      "name": "lodash",
+      "version": "4.17.21"
+    },
+    {
+      "registry": "pypi",
+      "name": "requests",
+      "version": "*",
+      "integrity": "sha256:abcdef1234567890..."
+    }
+  ]
+}
 ```
 
 ```bash
@@ -158,12 +168,12 @@ For emergency access when curation is blocking a critical package, set a bypass 
 export NORA_CURATION_BYPASS_TOKEN="emergency-token-keep-secret"
 ```
 
-Clients pass the token in the `X-Nora-Bypass` header:
+Clients pass the token in the `X-Nora-Bypass-Token` header:
 
 ```bash
 # npm
 npm install express --registry http://nora:4000/npm/ \
-  --header "X-Nora-Bypass: emergency-token-keep-secret"
+  --header "X-Nora-Bypass-Token: emergency-token-keep-secret"
 ```
 
 :::danger[Security]

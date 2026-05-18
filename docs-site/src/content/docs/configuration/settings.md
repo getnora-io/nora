@@ -267,6 +267,12 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_CB_THRESHOLD` | `5` | Consecutive failures before opening the circuit |
 | `NORA_CB_RESET_TIMEOUT` | `30` | Seconds before probing a failed upstream |
 
+### Audit
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NORA_AUDIT_LOG` | `file` | Audit log output: `file`, `stdout`, `both`, or `off` |
+
 ---
 
 ## config.toml Reference
@@ -518,6 +524,12 @@ on_failure = "closed"       # "closed" (fail-safe) or "open" (fail-open)
 # bypass_token = ""         # prefer NORA_CURATION_BYPASS_TOKEN env var
 require_integrity = false
 internal_namespaces = []    # e.g., ["@mycompany/**", "com.mycompany.**"]
+
+# =============================================================================
+# Audit
+# =============================================================================
+[audit]
+mode = "file"               # "file", "stdout", "both", "off"
 ```
 
 ---
@@ -557,3 +569,6 @@ In Kubernetes, mount credentials from a Secret into the container environment in
 - [Docker Proxy](/configuration/docker-proxy/) -- upstream Docker registry configuration
 - [TLS / HTTPS](/configuration/tls/) -- custom CA certificates
 - [Production Deployment](/deployment/production/) -- production deployment guide
+- [Prometheus Metrics](/observability/prometheus-metrics/) -- complete metrics reference
+- [Audit Log](/observability/audit-log/) -- structured audit logging
+- [Upgrade Guide](/deployment/upgrade-guide/) -- v0.8 to v0.9 migration
