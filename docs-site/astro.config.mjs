@@ -72,6 +72,7 @@ export default defineConfig({
 						{ label: 'TLS / HTTPS', slug: 'configuration/tls' },
 						{ label: 'Outbound Proxy', translations: { ru: 'Исходящий прокси' }, slug: 'configuration/http-proxy' },
 						{ label: 'Curation', translations: { ru: 'Курирование' }, slug: 'configuration/curation' },
+						{ label: 'Circuit Breaker', translations: { ru: 'Автоматический выключатель' }, slug: 'configuration/circuit-breaker' },
 						{ label: 'Rate Limits', translations: { ru: 'Ограничение запросов' }, slug: 'configuration/rate-limits' },
 					],
 				},
@@ -81,6 +82,15 @@ export default defineConfig({
 					items: [
 						{ label: 'Production Guide', translations: { ru: 'Руководство по продакшену' }, slug: 'deployment/production' },
 						{ label: 'Helm Chart', slug: 'deployment/helm' },
+						{ label: 'Upgrade Guide', translations: { ru: 'Руководство по обновлению' }, slug: 'deployment/upgrade-guide' },
+					],
+				},
+				{
+					label: 'Observability',
+					translations: { ru: 'Наблюдаемость' },
+					items: [
+						{ label: 'Prometheus Metrics', translations: { ru: 'Метрики Prometheus' }, slug: 'observability/prometheus-metrics' },
+						{ label: 'Audit Log', translations: { ru: 'Журнал аудита' }, slug: 'observability/audit-log' },
 					],
 				},
 				{

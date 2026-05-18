@@ -1289,7 +1289,7 @@ async fn get_manifest(
 
     // Stale-while-error: serve stale cached manifest when upstream is unreachable
     if let Some(ref data) = cached {
-        if state.config.docker.stale_while_error {
+        if state.config.docker.serve_stale {
             tracing::warn!(
                 registry = "docker",
                 name = %name,

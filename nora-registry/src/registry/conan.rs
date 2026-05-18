@@ -631,7 +631,7 @@ async fn package_file_download(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.conan.proxy_timeout_download,
+        state.config.conan.proxy_timeout_dl,
         state.config.conan.proxy_auth.as_deref(),
         &state.circuit_breaker,
         "conan",
