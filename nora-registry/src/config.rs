@@ -291,6 +291,11 @@ pub struct DockerUpstream {
     /// Storage namespace prefix (e.g. "docker.io"). Derived from URL host if omitted.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Path-based routing prefix (e.g. "docker-hub"). When set, requests to
+    /// `/v2/docker-hub/library/nginx/manifests/latest` route to this upstream
+    /// with the prefix stripped (name becomes `library/nginx`).
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 impl DockerUpstream {
@@ -921,6 +926,7 @@ impl Default for DockerConfig {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 namespace: None,
+                prefix: None,
             }],
         }
     }
@@ -1796,7 +1802,44 @@ impl Config {
             );
         }
 
-        // 9. [registries].enable validation
+        // 9. Docker upstream prefix validation
+        {
+            const RESERVED_PREFIXES: &[&str] =
+                &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
+            let mut seen_prefixes = std::collections::HashSet::new();
+            for (i, upstream) in self.docker.upstreams.iter().enumerate() {
+                if let Some(ref prefix) = upstream.prefix {
+                    if prefix.is_empty() {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix must not be empty (omit the field instead)",
+                            i
+                        ));
+                    } else if prefix.contains('/') {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" must not contain '/'",
+                            i, prefix
+                        ));
+                    } else if prefix != &prefix.to_lowercase() {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" must be lowercase (Docker names are lowercase)",
+                            i, prefix
+                        ));
+                    } else if RESERVED_PREFIXES.contains(&prefix.as_str()) {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" is a reserved Docker API path segment",
+                            i, prefix
+                        ));
+                    } else if !seen_prefixes.insert(prefix.clone()) {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: duplicate prefix \"{}\"",
+                            i, prefix
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 10. [registries].enable validation
         if let Some(ref section) = self.registries {
             if let Some(ref spec) = section.enable {
                 if let Err(e) = spec.resolve() {
@@ -2080,6 +2123,7 @@ impl Config {
             self.docker.stale_while_error = !matches!(val.as_str(), "false" | "0");
         }
         // NORA_DOCKER_PROXIES format: "url1,url2" or "url1|auth1,url2|auth2"
+        // or "url1|auth1|prefix1,url2||prefix2" (empty auth with prefix)
         // Backward compat: NORA_DOCKER_UPSTREAMS still works but is deprecated
         if let Ok(val) =
             env::var("NORA_DOCKER_PROXIES").or_else(|_| env::var("NORA_DOCKER_UPSTREAMS"))
@@ -2091,11 +2135,26 @@ impl Config {
                 .split(',')
                 .filter(|s| !s.is_empty())
                 .map(|s| {
-                    let parts: Vec<&str> = s.trim().splitn(2, '|').collect();
+                    let parts: Vec<&str> = s.trim().splitn(3, '|').collect();
+                    let auth = parts.get(1).and_then(|a| {
+                        if a.is_empty() {
+                            None
+                        } else {
+                            Some(a.to_string())
+                        }
+                    });
+                    let prefix = parts.get(2).and_then(|p| {
+                        if p.is_empty() {
+                            None
+                        } else {
+                            Some(p.to_string())
+                        }
+                    });
                     DockerUpstream {
                         url: parts[0].to_string(),
-                        auth: parts.get(1).map(|a| a.to_string()),
+                        auth,
                         namespace: None,
+                        prefix,
                     }
                 })
                 .collect();

@@ -67,11 +67,42 @@ fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
-/// Resolve the namespace for a given name by finding the matching upstream.
-fn resolve_namespace(config: &crate::config::DockerConfig, _name: &str) -> Option<String> {
-    // For now, use the first upstream's namespace (single-upstream is the common case).
-    // Multi-upstream namespace routing can be refined later by matching name patterns.
-    config.upstreams.first().map(|u| u.resolved_namespace())
+/// Resolve upstream and namespace for a Docker image name.
+///
+/// Returns `(matched_upstream, stripped_name, namespace)`:
+/// - If `raw_name` starts with a configured prefix (e.g. `docker-hub/library/nginx`),
+///   returns the matching upstream, the name with prefix stripped (`library/nginx`),
+///   and that upstream's namespace.
+/// - Otherwise falls back to the first upstream (existing behavior).
+fn resolve_upstream<'c, 'n>(
+    config: &'c crate::config::DockerConfig,
+    raw_name: &'n str,
+) -> (
+    Option<&'c crate::config::DockerUpstream>,
+    &'n str,
+    Option<String>,
+) {
+    // Check for prefix-based routing: first path segment matches an upstream prefix
+    if let Some((first_segment, rest)) = raw_name.split_once('/') {
+        for upstream in &config.upstreams {
+            if let Some(ref prefix) = upstream.prefix {
+                if first_segment == prefix {
+                    tracing::debug!(
+                        prefix = %prefix,
+                        upstream = %upstream.url,
+                        stripped_name = %rest,
+                        routing = "prefix",
+                        "Docker path-based upstream routing"
+                    );
+                    return (Some(upstream), rest, Some(upstream.resolved_namespace()));
+                }
+            }
+        }
+    }
+
+    // Fallback: first upstream (existing behavior for single-upstream setups)
+    let ns = config.upstreams.first().map(|u| u.resolved_namespace());
+    (None, raw_name, ns)
 }
 
 /// Try to get content from namespaced key, falling back to legacy (non-namespaced) key.
@@ -459,6 +490,8 @@ async fn check_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
+    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -466,7 +499,6 @@ async fn check_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let ns = resolve_namespace(&state.config.docker, &name);
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
     match storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
@@ -488,6 +520,8 @@ async fn download_blob(
     headers: axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
+    let (matched_upstream, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -508,7 +542,6 @@ async fn download_blob(
         return response;
     }
 
-    let ns = resolve_namespace(&state.config.docker, &name);
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
 
@@ -544,8 +577,14 @@ async fn download_blob(
             .into_response();
     }
 
+    // Select upstreams: prefix-matched → single upstream, otherwise → fallback chain
+    let upstreams_to_try: Vec<&crate::config::DockerUpstream> = match matched_upstream {
+        Some(u) => vec![u],
+        None => state.config.docker.upstreams.iter().collect(),
+    };
+
     // Try upstream proxies
-    for upstream in &state.config.docker.upstreams {
+    for upstream in &upstreams_to_try {
         match fetch_blob_from_upstream(
             &state.http_client,
             &upstream.url,
@@ -590,7 +629,7 @@ async fn download_blob(
     // Auto-prepend library/ for single-segment names (Docker Hub official images)
     if !name.contains('/') {
         let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
+        for upstream in &upstreams_to_try {
             match fetch_blob_from_upstream(
                 &state.http_client,
                 &upstream.url,
@@ -630,6 +669,8 @@ async fn download_blob(
 }
 
 async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -681,6 +722,8 @@ async fn patch_blob(
     Path((name, uuid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -807,6 +850,8 @@ async fn upload_blob(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
+    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -941,14 +986,14 @@ async fn get_manifest(
     headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
+    let (matched_upstream, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     if let Err(e) = validate_docker_reference(&reference) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-
-    let ns = resolve_namespace(&state.config.docker, &name);
 
     // Extract publish date from .meta.json sidecar
     let publish_date = extract_docker_publish_date(
@@ -995,12 +1040,18 @@ async fn get_manifest(
         }
     }
 
+    // Select upstreams: prefix-matched → single upstream, otherwise → fallback chain
+    let upstreams_to_try: Vec<&crate::config::DockerUpstream> = match matched_upstream {
+        Some(u) => vec![u],
+        None => state.config.docker.upstreams.iter().collect(),
+    };
+
     // Try upstream proxies (always if no cache, or if cache is stale)
     tracing::debug!(
-        upstreams_count = state.config.docker.upstreams.len(),
+        upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    for upstream in &state.config.docker.upstreams {
+    for upstream in &upstreams_to_try {
         tracing::debug!(upstream_url = %upstream.url, "Trying upstream");
         match fetch_manifest_from_upstream(
             &state.http_client,
@@ -1108,7 +1159,7 @@ async fn get_manifest(
     // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
     if !name.contains('/') {
         let library_name = format!("library/{}", name);
-        for upstream in &state.config.docker.upstreams {
+        for upstream in &upstreams_to_try {
             match fetch_manifest_from_upstream(
                 &state.http_client,
                 &upstream.url,
@@ -1282,6 +1333,8 @@ async fn put_manifest(
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1350,11 +1403,11 @@ async fn put_manifest(
 }
 
 async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-
-    let ns = resolve_namespace(&state.config.docker, &name);
     let prefix = manifest_prefix(ns.as_deref(), &name);
     let legacy_prefix = manifest_prefix(None, &name);
     let mut keys = state.storage.list(&prefix).await;
@@ -1385,6 +1438,8 @@ async fn delete_manifest(
     State(state): State<Arc<AppState>>,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
+    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1392,7 +1447,6 @@ async fn delete_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let ns = resolve_namespace(&state.config.docker, &name);
     let key = manifest_key(ns.as_deref(), &name, &reference);
     let legacy_key = manifest_key(None, &name, &reference);
 
@@ -1503,6 +1557,8 @@ async fn delete_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
+    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
+    let name = name.to_string();
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1510,7 +1566,6 @@ async fn delete_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let ns = resolve_namespace(&state.config.docker, &name);
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
     // Delete from both locations during migration
@@ -2692,6 +2747,7 @@ mod integration_tests {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: None,
+                prefix: None,
             }];
         });
 
@@ -2739,11 +2795,13 @@ mod integration_tests {
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
                     namespace: None,
+                    prefix: None,
                 },
                 DockerUpstream {
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     namespace: None,
+                    prefix: None,
                 },
             ];
         });
