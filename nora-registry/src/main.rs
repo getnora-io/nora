@@ -1212,7 +1212,7 @@ async fn shutdown_signal() {
 /// and atomically swaps the old config via ArcSwap.
 /// Storage, auth, port, and other settings are NOT reloaded — only curation.
 fn reload_curation(state: &Arc<AppState>) -> Result<(), String> {
-    let config = Config::load();
+    let config = Config::try_load()?;
     let engine = build_curation_engine(&config);
 
     state.reloadable.store(Arc::new(ReloadableConfig {
