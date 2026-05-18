@@ -21,3 +21,23 @@ doc = false
 name = "fuzz_docker_manifest"
 path = "fuzz_targets/fuzz_docker_manifest.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_npm_metadata"
+path = "fuzz_targets/fuzz_npm_metadata.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_maven_path"
+path = "fuzz_targets/fuzz_maven_path.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pypi_parse"
+path = "fuzz_targets/fuzz_pypi_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_toml"
+path = "fuzz_targets/fuzz_config_toml.rs"
+doc = false

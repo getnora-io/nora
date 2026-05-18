@@ -30,9 +30,6 @@ use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
 
-/// Storage prefix and file suffix for repo index scanning.
-pub const INDEX_PATTERN: (&str, &str) = ("gems/gems/", ".gem");
-
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Index files (mutable)
@@ -439,7 +436,7 @@ fn with_text(data: Vec<u8>) -> Response {
 ///   "rails-7.0.0"      → ("rails", "7.0.0")
 ///   "rack-test-1.0.0"  → ("rack-test", "1.0.0")
 ///   "rspec-core-3.12"  → ("rspec-core", "3.12")
-fn split_gem_filename(stem: &str) -> Option<(String, String)> {
+pub fn split_gem_filename(stem: &str) -> Option<(String, String)> {
     // Find the last '-' that is followed by a digit (start of version)
     let mut split_pos = None;
     for (i, c) in stem.char_indices() {

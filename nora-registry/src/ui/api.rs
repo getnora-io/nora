@@ -805,6 +805,67 @@ pub async fn get_pypi_detail(
     }
 }
 
+/// List immediate children of a Go namespace path for hierarchical browsing.
+/// Returns (entries, is_leaf_module). A leaf module has an `@v/` subdirectory.
+pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+    let prefix = if path.is_empty() {
+        "go/".to_string()
+    } else {
+        format!("go/{}/", path)
+    };
+    let keys = storage.list(&prefix).await;
+
+    if keys.is_empty() {
+        return (vec![], false);
+    }
+
+    // Leaf detection: if any key under this prefix contains /@v/ → this is a module
+    let is_module = keys.iter().any(|k| {
+        k.strip_prefix(&prefix)
+            .is_some_and(|r| r.starts_with("@v/"))
+    });
+    if is_module {
+        return (vec![], true);
+    }
+
+    // Group by immediate child segment (skip @latest and other direct files)
+    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.is_empty() || !rest.contains('/') {
+                continue;
+            }
+            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
+            // Skip @v and @latest markers — they are not namespace directories
+            if child_name.starts_with('@') {
+                continue;
+            }
+            let entry = groups.entry(child_name).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<RepoInfo> = groups
+        .into_iter()
+        .map(|(name, (count, size, modified))| RepoInfo {
+            name,
+            versions: count,
+            size,
+            updated: format_timestamp(modified),
+            ..Default::default()
+        })
+        .collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+
+    (result, false)
+}
+
 pub async fn get_go_detail(
     storage: &Storage,
     module: &str,

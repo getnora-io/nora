@@ -621,6 +621,9 @@ pub fn spawn_retention_scheduler(
         interval.tick().await;
 
         loop {
+            // CANCEL-SAFETY: Same as GC — interval.tick() is stateless between polls,
+            // cancel.cancelled() is a CancellationToken. Retention work runs to
+            // completion within each tick iteration, no partial state on drop.
             tokio::select! {
                 _ = cancel.cancelled() => {
                     info!("Retention scheduler: cancellation requested, stopping");

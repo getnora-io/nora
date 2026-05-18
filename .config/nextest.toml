@@ -1,0 +1,30 @@
+# nextest configuration for NORA
+# Usage: cargo nextest run --profile ci
+
+[profile.default]
+# Fail fast on first failure during local development
+fail-fast = true
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+
+[profile.ci]
+# CI: run all tests, retry flaky ones, produce JUnit XML
+fail-fast = false
+retries = 2
+slow-timeout = { period = "30s", terminate-after = 3 }
+status-level = "all"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"
+report-name = "nora-tests"
+
+# Filter out fuzz targets (they hang — infinite loops)
+[[profile.default.overrides]]
+filter = "package(nora-fuzz)"
+run = "ignored"
+
+[[profile.ci.overrides]]
+filter = "package(nora-fuzz)"
+run = "ignored"

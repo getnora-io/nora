@@ -158,6 +158,37 @@ else
 fi
 echo ""
 
+# ── 8. CANCEL-SAFETY annotations ─────────────────────────────────────────
+
+echo "--- Cancel-Safety Annotations ---"
+SRC="$REPO_ROOT/nora-registry/src"
+
+# Check select! macros (exclude comments and test code)
+SELECT_MISSING=0
+while IFS=: read -r file lineno _content; do
+    # Check if CANCEL-SAFETY appears within 5 lines before
+    start=$((lineno > 5 ? lineno - 5 : 1))
+    if ! sed -n "${start},${lineno}p" "$file" | grep -q 'CANCEL-SAFETY'; then
+        warn "select! without CANCEL-SAFETY at $file:$lineno"
+        SELECT_MISSING=$((SELECT_MISSING + 1))
+    fi
+done < <(grep -rn 'tokio::select!' "$SRC" --include='*.rs' | grep -v '//.*select!' | grep -v '_test\|#\[test\|#\[cfg(test' || true)
+
+# Check tokio::time::timeout (same requirement per CLAUDE.md)
+while IFS=: read -r file lineno _content; do
+    start=$((lineno > 5 ? lineno - 5 : 1))
+    if ! sed -n "${start},${lineno}p" "$file" | grep -q 'CANCEL-SAFETY'; then
+        warn "tokio::time::timeout without CANCEL-SAFETY at $file:$lineno"
+        SELECT_MISSING=$((SELECT_MISSING + 1))
+    fi
+done < <(grep -rn 'tokio::time::timeout' "$SRC" --include='*.rs' | grep -v '//.*timeout' | grep -v '_test\|#\[test\|#\[cfg(test' || true)
+
+if [ "$SELECT_MISSING" -eq 0 ]; then
+    SELECT_TOTAL=$(grep -rc 'tokio::select!\|tokio::time::timeout' "$SRC" --include='*.rs' 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+    ok "All select!/timeout macros have CANCEL-SAFETY annotations ($SELECT_TOTAL total)"
+fi
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────
 
 echo "=== Summary ==="
