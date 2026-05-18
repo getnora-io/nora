@@ -4,6 +4,10 @@
 ## [0.9.0] - 2026-05-16
 
 ### Added
+- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions and GitLab CI JWT tokens (#342)
+- **Cache-Control completeness** — extend caching headers to all remaining registries (#340)
+- **Docker streaming blob uploads** — chunked upload processing eliminates OOM on large images (#368)
+- **Docker path-based upstream routing** — route pulls to specific upstreams by image path prefix (#365)
 - **Docker metadata TTL + stale-while-error** — cached manifests revalidate against upstream after configurable TTL; serve stale on upstream failure (#311)
 - **Docker/OCI mirror namespacing** — per-upstream namespace prefix isolates storage keys, with lazy migration from legacy flat layout (#323)
 - **Per-registry circuit breaker overrides** — `[circuit_breaker.overrides."registry:url"]` allows custom thresholds per upstream (#339)
@@ -14,7 +18,7 @@
 
 ### Changed
 - **Manifest response builder** — extracted `manifest_response()` helper, removing 3 duplicate return paths in Docker registry (#338)
-- 957 total tests (unchanged)
+- **Env var naming convention** — shortened 7 environment variables to follow `NORA_{SECTION}_{FIELD}` convention under 30 chars (see [Upgrade Guide](https://getnora.dev/deployment/upgrade-guide/) for the rename table)
 
 ## [0.8.4] - 2026-05-15
 

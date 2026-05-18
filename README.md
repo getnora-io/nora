@@ -149,10 +149,9 @@ docker run -d -p 4000:4000 \
 - ~~Min Release Age~~ ✅ v0.7.1
 - ~~Hash Pin Store, auth rate limiting, Cache-Control~~ ✅ v0.8.0
 - ~~Outbound proxy, structured audit log, 994 tests~~ ✅ v0.8.3
-- **Circuit breaker** — per-registry upstream resilience ([#339](https://github.com/getnora-io/nora/issues/339))
-- **OIDC / Workload Identity** — zero-secret auth for CI systems ([#342](https://github.com/getnora-io/nora/issues/342))
-- **Hot reload** — config and curation policy changes without restart ([#343](https://github.com/getnora-io/nora/issues/343))
+- ~~Circuit breaker, OIDC, hot reload, arm64, streaming uploads~~ ✅ v0.9.0
 - **Image Signing Policy** — cosign verification on upstream pulls
+- **Semver contract** — stable API, configuration format, and storage layout
 
 See [ROADMAP.md](ROADMAP.md) for the full roadmap and [CHANGELOG.md](CHANGELOG.md) for release history.
 
