@@ -12,5 +12,5 @@ expression: ids
   "http://nora:4000/nuget/v3/autocomplete",
   "http://nora:4000/nuget/v3/",
   "http://nora:4000/nuget/v3/",
-  "https://api.nuget.org/v3/catalog0/index.json"
+  "http://nora:4000/nuget/v3/catalog0/index.json"
 ]
