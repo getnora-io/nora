@@ -505,7 +505,7 @@ fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str)
                 "url": format!("{}/simple/{}/{}", base_url, normalized, f.filename),
             });
             if let Some(hash) = &f.sha256 {
-                entry["digests"] = serde_json::json!({"sha256": hash});
+                entry["hashes"] = serde_json::json!({"sha256": hash});
             }
             entry
         })
@@ -1151,9 +1151,9 @@ mod integration_tests {
         let body = body_bytes(response).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], "flask");
-        assert!(json["files"].as_array().unwrap().len() == 1);
+        assert_eq!(json["files"].as_array().unwrap().len(), 1);
         assert_eq!(json["files"][0]["filename"], "flask-2.0.tar.gz");
-        assert_eq!(json["files"][0]["digests"]["sha256"], "deadbeef");
+        assert_eq!(json["files"][0]["hashes"]["sha256"], "deadbeef");
     }
 
     #[tokio::test]
