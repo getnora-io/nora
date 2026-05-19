@@ -876,3 +876,233 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+// ── Spec conformance tests (#390) ─────────────────────────────────────
+//
+// Invariant: after tarball URL rewriting, no upstream registry domains
+// remain in the response. Uses golden fixtures from testdata/npm/.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spec_conformance_tests {
+    use super::*;
+
+    const NPM_UPSTREAM_DOMAIN: &str = "registry.npmjs.org";
+
+    /// Assert that no upstream URLs remain in rewritten response body.
+    fn assert_no_upstream_urls(body: &str, context: &str) {
+        assert!(
+            !body.contains(NPM_UPSTREAM_DOMAIN),
+            "upstream domain '{}' leaked in {}: {}",
+            NPM_UPSTREAM_DOMAIN,
+            context,
+            &body[..body.len().min(500)]
+        );
+    }
+
+    fn load_fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/testdata/npm/{}", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("failed to load fixture {}: {}", path, e))
+    }
+
+    // ── Regular package rewrite ──
+
+    #[test]
+    fn test_regular_package_golden_no_upstream_leak() {
+        let fixture = load_fixture("package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let body = String::from_utf8(result).unwrap();
+        assert_no_upstream_urls(&body, "regular package rewrite");
+    }
+
+    #[test]
+    fn test_regular_package_golden_all_tarballs_rewritten() {
+        let fixture = load_fixture("package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        let versions = json["versions"].as_object().unwrap();
+        for (ver, data) in versions {
+            let tarball = data["dist"]["tarball"].as_str().unwrap();
+            assert!(
+                tarball.starts_with("http://nora:4000/npm/"),
+                "version {} tarball not rewritten: {}",
+                ver,
+                tarball
+            );
+        }
+    }
+
+    #[test]
+    fn test_regular_package_golden_preserves_integrity() {
+        let fixture = load_fixture("package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        // integrity and shasum must survive rewriting
+        let dist = &json["versions"]["4.17.21"]["dist"];
+        assert!(
+            dist["shasum"].as_str().is_some(),
+            "shasum must be preserved"
+        );
+        assert!(
+            dist["integrity"].as_str().is_some(),
+            "integrity must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_regular_package_golden_snapshot() {
+        let fixture = load_fixture("package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        // Snapshot only tarball URLs (stable against other metadata changes)
+        let tarball_urls: Vec<&str> = json["versions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v["dist"]["tarball"].as_str())
+            .collect();
+        insta::assert_json_snapshot!("npm_regular_tarball_urls", tarball_urls);
+    }
+
+    // ── Scoped package rewrite ──
+
+    #[test]
+    fn test_scoped_package_golden_no_upstream_leak() {
+        let fixture = load_fixture("scoped-package-metadata.json");
+        let result = rewrite_tarball_urls(
+            &fixture,
+            "https://registry.airgap.local",
+            "https://registry.npmjs.org",
+        )
+        .unwrap();
+        let body = String::from_utf8(result).unwrap();
+        assert_no_upstream_urls(&body, "scoped package rewrite");
+    }
+
+    #[test]
+    fn test_scoped_package_golden_all_tarballs_rewritten() {
+        let fixture = load_fixture("scoped-package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        let versions = json["versions"].as_object().unwrap();
+        for (ver, data) in versions {
+            let tarball = data["dist"]["tarball"].as_str().unwrap();
+            assert!(
+                tarball.starts_with("http://nora:4000/npm/"),
+                "scoped version {} tarball not rewritten: {}",
+                ver,
+                tarball
+            );
+            // Scoped packages must preserve the @scope prefix in the path
+            assert!(
+                tarball.contains("@babel/core"),
+                "scoped package path lost: {}",
+                tarball
+            );
+        }
+    }
+
+    #[test]
+    fn test_scoped_package_golden_snapshot() {
+        let fixture = load_fixture("scoped-package-metadata.json");
+        let result =
+            rewrite_tarball_urls(&fixture, "http://nora:4000", "https://registry.npmjs.org")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        let tarball_urls: Vec<&str> = json["versions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v["dist"]["tarball"].as_str())
+            .collect();
+        insta::assert_json_snapshot!("npm_scoped_tarball_urls", tarball_urls);
+    }
+
+    // ── Content-Type assertions ──
+
+    #[test]
+    fn test_with_content_type_metadata_is_json() {
+        let data = Bytes::from(b"{}".to_vec());
+        let (status, headers, _body) = with_content_type(false, data);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/json");
+    }
+
+    #[test]
+    fn test_with_content_type_tarball_is_octet() {
+        let data = Bytes::from(b"\x1f\x8b".to_vec());
+        let (status, headers, _body) = with_content_type(true, data);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "application/octet-stream");
+    }
+
+    // ── Edge cases for URL rewriting ──
+
+    #[test]
+    fn test_rewrite_custom_upstream_no_leak() {
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://private.npm.corp/pkg/-/pkg-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:4000", "https://private.npm.corp").unwrap();
+        let body = String::from_utf8(result).unwrap();
+        assert!(
+            !body.contains("private.npm.corp"),
+            "custom upstream domain leaked"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_preserves_non_dist_urls() {
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "repository": {"url": "https://github.com/test/pkg.git"},
+            "homepage": "https://pkg.example.com",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
+                    },
+                    "repository": {"url": "https://github.com/test/pkg.git"}
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:4000", "https://registry.npmjs.org").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+        // Non-dist URLs must be untouched
+        assert_eq!(
+            json["repository"]["url"].as_str().unwrap(),
+            "https://github.com/test/pkg.git"
+        );
+        assert_eq!(
+            json["homepage"].as_str().unwrap(),
+            "https://pkg.example.com"
+        );
+    }
+}

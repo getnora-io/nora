@@ -1,0 +1,27 @@
+{
+  "name": "@babel/core",
+  "description": "Babel compiler core.",
+  "dist-tags": {
+    "latest": "7.26.0"
+  },
+  "versions": {
+    "7.25.9": {
+      "name": "@babel/core",
+      "version": "7.25.9",
+      "dist": {
+        "tarball": "https://registry.npmjs.org/@babel/core/-/core-7.25.9.tgz",
+        "shasum": "test-shasum-1",
+        "integrity": "sha512-test1"
+      }
+    },
+    "7.26.0": {
+      "name": "@babel/core",
+      "version": "7.26.0",
+      "dist": {
+        "tarball": "https://registry.npmjs.org/@babel/core/-/core-7.26.0.tgz",
+        "shasum": "test-shasum-2",
+        "integrity": "sha512-test2"
+      }
+    }
+  }
+}
