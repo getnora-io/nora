@@ -3437,6 +3437,8 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_per_registry_quarantine() {
+        // Clear global quarantine env var to avoid race with test_curation_env_override_quarantine
+        std::env::remove_var("NORA_CURATION_QUARANTINE");
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
