@@ -641,12 +641,13 @@ async fn extract_terraform_publish_date(
     None
 }
 
-/// Resolve the real upstream download URL for a provider binary.
+/// Resolve the real upstream download URL for a provider file.
 ///
-/// Looks up the cached metadata JSON (`_nora_upstream_url` field saved by
-/// `rewrite_download_url`) to find the original URL (typically on
-/// releases.hashicorp.com). Falls back to constructing a
-/// releases.hashicorp.com URL from the path components.
+/// Looks up the cached metadata JSON to find the original URL (typically on
+/// releases.hashicorp.com). Checks `_nora_upstream_url` for binaries,
+/// `_nora_upstream_shasums_url` for SHA256SUMS, and
+/// `_nora_upstream_shasums_sig_url` for signature files.
+/// Falls back to constructing a releases.hashicorp.com URL from path components.
 async fn resolve_upstream_download_url(
     state: &AppState,
     ns: &str,
@@ -654,9 +655,16 @@ async fn resolve_upstream_download_url(
     ver: &str,
     filename: &str,
 ) -> String {
-    // Try every os/arch combo that might have cached metadata.
-    // The filename encodes os/arch: terraform-provider-{ptype}_{ver}_{os}_{arch}.zip
-    // Parse it to find the right metadata file directly.
+    // Determine which metadata field to look up based on filename
+    let meta_field = if filename.ends_with(".sig") {
+        "_nora_upstream_shasums_sig_url"
+    } else if filename.contains("SHA256SUMS") || filename.contains("SHA512SUMS") {
+        "_nora_upstream_shasums_url"
+    } else {
+        "_nora_upstream_url"
+    };
+
+    // For binary .zip files, parse os/arch from filename to find the right metadata
     if let Some((os, arch)) = parse_os_arch_from_filename(filename) {
         let meta_key = format!(
             "terraform/providers/{}/{}/{}/{}_{}.json",
@@ -664,8 +672,24 @@ async fn resolve_upstream_download_url(
         );
         if let Ok(data) = state.storage.get(&meta_key).await {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(url) = json.get("_nora_upstream_url").and_then(|v| v.as_str()) {
+                if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
                     return url.to_string();
+                }
+            }
+        }
+    } else {
+        // For shasums/sig files, scan any cached metadata for this provider version
+        // (shasums URLs are the same regardless of os/arch)
+        let prefix = format!("terraform/providers/{}/{}/{}/", ns, ptype, ver);
+        let keys = state.storage.list(&prefix).await;
+        for key in keys {
+            if key.ends_with(".json") {
+                if let Ok(data) = state.storage.get(&key).await {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
+                            return url.to_string();
+                        }
+                    }
                 }
             }
         }
@@ -735,9 +759,10 @@ fn with_binary(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// Rewrite download_url in provider metadata JSON to point through NORA.
+/// Rewrite download_url, shasums_url, and shasums_signature_url in provider
+/// metadata JSON to point through NORA.
 ///
-/// Also stores the original upstream URL in `_nora_upstream_url` so the
+/// Also stores the original upstream URLs in `_nora_upstream_*` fields so the
 /// binary download handler can fetch from the real host (e.g.
 /// releases.hashicorp.com) instead of the registry API endpoint.
 fn rewrite_download_url(
@@ -747,27 +772,62 @@ fn rewrite_download_url(
     ptype: &str,
     ver: &str,
 ) -> String {
-    // Parse JSON, find download_url, rewrite it
     if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(json_text) {
         if let Some(obj) = json.as_object_mut() {
-            if let Some(download_url) = obj.get("download_url").cloned() {
-                if let Some(url_str) = download_url.as_str() {
-                    // Preserve original upstream URL for the binary download handler
-                    obj.insert(
-                        "_nora_upstream_url".to_string(),
-                        serde_json::Value::String(url_str.to_string()),
-                    );
-                    // Extract filename from original URL
-                    let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
-                    let new_url = format!(
-                        "{}/terraform/v1/providers/download/{}/{}/{}/{}",
-                        base_url, ns, ptype, ver, filename
-                    );
-                    obj.insert(
-                        "download_url".to_string(),
-                        serde_json::Value::String(new_url),
-                    );
-                }
+            let download_base = format!(
+                "{}/terraform/v1/providers/download/{}/{}/{}",
+                base_url, ns, ptype, ver
+            );
+
+            // Rewrite download_url
+            if let Some(url_str) = obj
+                .get("download_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
+                obj.insert(
+                    "download_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
+            }
+
+            // Rewrite shasums_url
+            if let Some(url_str) = obj
+                .get("shasums_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_shasums_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS");
+                obj.insert(
+                    "shasums_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
+            }
+
+            // Rewrite shasums_signature_url
+            if let Some(url_str) = obj
+                .get("shasums_signature_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_shasums_sig_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS.sig");
+                obj.insert(
+                    "shasums_signature_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
             }
         }
         serde_json::to_string(&json).unwrap_or_else(|_| json_text.to_string())
