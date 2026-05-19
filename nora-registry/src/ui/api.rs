@@ -574,7 +574,14 @@ pub async fn get_npm_detail(
                     }
 
                     // Check if tarball is actually cached on disk
-                    let tarball_key = format!("npm/{}/tarballs/{}-{}.tgz", name, name, version);
+                    // For scoped packages (@scope/name), tarball uses just the "name" part
+                    let name_part = if name.contains('/') {
+                        name.rsplit('/').next().unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    let tarball_key =
+                        format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
                     let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
                         (meta.size, true)
                     } else {
