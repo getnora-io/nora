@@ -148,6 +148,8 @@ async fn search_query(
     .await
     {
         Ok(text) => {
+            let base_url = nora_base_url(&state);
+            let rewritten = rewrite_service_index(&text, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -156,7 +158,7 @@ async fn search_query(
                 "nuget",
                 "PROXY",
             ));
-            with_json(text.into_bytes())
+            with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
@@ -193,6 +195,8 @@ async fn autocomplete_query(
     .await
     {
         Ok(text) => {
+            let base_url = nora_base_url(&state);
+            let rewritten = rewrite_service_index(&text, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -201,7 +205,7 @@ async fn autocomplete_query(
                 "nuget",
                 "PROXY",
             ));
-            with_json(text.into_bytes())
+            with_json(rewritten.into_bytes())
         }
         Err(_) => {
             // Autocomplete is UX convenience, not correctness-critical
@@ -1542,6 +1546,24 @@ mod spec_conformance_tests {
             .map(|r| r["@id"].as_str().unwrap())
             .collect();
         insta::assert_json_snapshot!("nuget_service_index_ids", ids);
+    }
+
+    #[test]
+    fn test_search_response_urls_rewritten() {
+        let upstream_search = r#"{"totalHits":1,"data":[{"id":"Newtonsoft.Json","version":"13.0.3","registration":"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"}]}"#;
+        let rewritten = rewrite_service_index(upstream_search, "http://nora:4000");
+        assert_no_upstream_urls(&rewritten, "search response rewrite");
+        assert!(
+            rewritten.contains("http://nora:4000/nuget/v3/registration/newtonsoft.json/index.json")
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_response_no_leak() {
+        let upstream =
+            r#"{"totalHits":5,"data":["Newtonsoft.Json","NUnit","NLog","Nancy","Noda"]}"#;
+        let rewritten = rewrite_service_index(upstream, "http://nora:4000");
+        assert_no_upstream_urls(&rewritten, "autocomplete response");
     }
 
     // ── Registration index rewrite: paginated fixture ──
