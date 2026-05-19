@@ -712,14 +712,24 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
     let nora_autocomplete = format!("{}/v3/autocomplete", nora_nuget);
 
     // Rewrite major service URLs to route through NORA
+    let nora_registration = format!("{}/v3/registration/", nora_nuget);
     json_text
         .replace(
             "https://api.nuget.org/v3-flatcontainer/",
             &format!("{}/v3/flatcontainer/", nora_nuget),
         )
+        // Rewrite all registration base URL variants (nuget.org serves 5)
+        .replace(
+            "https://api.nuget.org/v3/registration5-semver1/",
+            &nora_registration,
+        )
+        .replace(
+            "https://api.nuget.org/v3/registration5-gz-semver1/",
+            &nora_registration,
+        )
         .replace(
             "https://api.nuget.org/v3/registration5-gz-semver2/",
-            &format!("{}/v3/registration/", nora_nuget),
+            &nora_registration,
         )
         // Rewrite search endpoints to proxy through NORA
         .replace("https://azuresearch-usnc.nuget.org/query", &nora_query)
@@ -810,6 +820,36 @@ mod tests {
         assert!(result.contains("https://artifact.company.local/nuget/v3/registration/"));
         assert!(!result.contains("http://artifact.company.local"));
         assert!(!result.contains("api.nuget.org"));
+    }
+
+    #[test]
+    fn test_rewrite_service_index_all_registration_variants() {
+        // nuget.org serves 5 registration base URL variants plus URL templates
+        let input = r#"{"resources":[
+            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl"},
+            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl/3.0.0-rc"},
+            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl/3.0.0-beta"},
+            {"@id":"https://api.nuget.org/v3/registration5-gz-semver1/","@type":"RegistrationsBaseUrl/3.4.0"},
+            {"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/3.6.0"},
+            {"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/Versioned"},
+            {"@id":"https://api.nuget.org/v3/registration5-semver1/{id-lower}/index.json","@type":"PackageDisplayMetadataUriTemplate/3.0.0-rc"},
+            {"@id":"https://api.nuget.org/v3/registration5-semver1/{id-lower}/{version-lower}.json","@type":"PackageVersionDisplayMetadataUriTemplate/3.0.0-rc"}
+        ]}"#;
+        let result = rewrite_service_index(input, "https://registry.company.local");
+        // All registration URLs should be rewritten
+        assert!(
+            !result.contains("api.nuget.org"),
+            "leaked upstream URL in: {result}"
+        );
+        // All should point to NORA registration endpoint
+        assert!(result.contains("https://registry.company.local/nuget/v3/registration/"));
+        // URL templates should also be rewritten (prefix match)
+        assert!(
+            result.contains("registry.company.local/nuget/v3/registration/{id-lower}/index.json")
+        );
+        assert!(result.contains(
+            "registry.company.local/nuget/v3/registration/{id-lower}/{version-lower}.json"
+        ));
     }
 
     #[test]
