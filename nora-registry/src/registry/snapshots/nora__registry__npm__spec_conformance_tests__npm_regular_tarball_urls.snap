@@ -1,0 +1,9 @@
+---
+source: nora-registry/src/registry/npm.rs
+assertion_line: 985
+expression: tarball_urls
+---
+[
+  "http://nora:4000/npm/lodash/-/lodash-4.17.20.tgz",
+  "http://nora:4000/npm/lodash/-/lodash-4.17.21.tgz"
+]

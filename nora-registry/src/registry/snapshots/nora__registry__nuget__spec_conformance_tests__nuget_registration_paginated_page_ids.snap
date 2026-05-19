@@ -1,0 +1,9 @@
+---
+source: nora-registry/src/registry/nuget.rs
+assertion_line: 1553
+expression: page_ids
+---
+[
+  "http://nora:4000/nuget/v3/registration/dotnet-ef/page/1.0.0/3.1.32.json",
+  "http://nora:4000/nuget/v3/registration/dotnet-ef/page/5.0.0/9.0.0.json"
+]
