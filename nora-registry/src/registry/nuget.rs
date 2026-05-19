@@ -847,7 +847,8 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses.
-/// Replaces all registration5-* variants with NORA registration path.
+/// Replaces all registration5-* variants with NORA registration path,
+/// and v3-flatcontainer packageContent URLs with NORA flatcontainer path.
 fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
     let upstream = upstream_url.trim_end_matches('/');
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
@@ -865,6 +866,10 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
         .replace(
             &format!("{}/v3/registration5-gz-semver2/", upstream),
             &nora_reg,
+        )
+        .replace(
+            &format!("{}/v3-flatcontainer/", upstream),
+            &format!("{}/v3/flatcontainer/", nora_nuget),
         )
 }
 
@@ -1009,11 +1014,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_registration_urls_preserves_non_upstream() {
+    fn test_rewrite_registration_urls_rewrites_flatcontainer() {
         let input = r#"{"packageContent":"https://api.nuget.org/v3-flatcontainer/foo/1.0.0/foo.1.0.0.nupkg"}"#;
         let result = rewrite_registration_urls(input, "https://api.nuget.org", "http://nora:4000");
-        // flatcontainer URLs are NOT rewritten by this function (handled by service_index rewrite)
-        assert!(result.contains("api.nuget.org/v3-flatcontainer"));
+        assert!(!result.contains("api.nuget.org/v3-flatcontainer"));
+        assert!(
+            result.contains("http://nora:4000/nuget/v3/flatcontainer/foo/1.0.0/foo.1.0.0.nupkg")
+        );
     }
 
     #[test]
@@ -1458,9 +1465,7 @@ mod spec_conformance_tests {
 
     /// Known URL patterns in NuGet responses that are NOT client-fetchable:
     /// - /v3/catalog0/ — server-side metadata, never requested by NuGet CLI
-    /// - /v3-flatcontainer/ in registration — informational packageContent;
-    ///   clients get flatcontainer base URL from service index (which IS rewritten)
-    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/", "/v3-flatcontainer/"];
+    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/"];
 
     /// Assert that no upstream URLs remain in a rewritten response body,
     /// excluding known non-client-fetchable URL patterns.
