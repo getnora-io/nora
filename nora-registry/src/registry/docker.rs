@@ -2826,6 +2826,206 @@ mod integration_tests {
         assert!(String::from_utf8_lossy(&body).contains("temporarily unavailable"));
     }
 
+    // ── OCI Distribution Spec conformance ──
+
+    /// OCI spec: GET /v2/ must return `Docker-Distribution-API-Version: registry/2.0`.
+    #[tokio::test]
+    async fn test_oci_v2_api_version_header() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::GET, "/v2/", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let api_ver = resp
+            .headers()
+            .get("docker-distribution-api-version")
+            .expect("OCI spec requires Docker-Distribution-API-Version header")
+            .to_str()
+            .unwrap();
+        assert_eq!(api_ver, "registry/2.0");
+    }
+
+    /// OCI spec: GET /v2/_catalog must return `{"repositories": [...]}`.
+    #[tokio::test]
+    async fn test_oci_catalog_json_structure() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::GET, "/v2/_catalog", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("repositories").is_some(),
+            "OCI spec requires 'repositories' key in catalog response"
+        );
+        assert!(json["repositories"].is_array());
+    }
+
+    /// OCI spec: GET /v2/{name}/tags/list must return `{"name": ..., "tags": [...]}`.
+    #[tokio::test]
+    async fn test_oci_tags_list_json_structure() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/myapp/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/v2/myapp/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json.get("name").is_some(),
+            "OCI spec requires 'name' in tags/list"
+        );
+        assert!(
+            json.get("tags").is_some(),
+            "OCI spec requires 'tags' in tags/list"
+        );
+        assert_eq!(json["name"], "myapp");
+        assert!(json["tags"].is_array());
+    }
+
+    /// OCI spec: manifest response MUST include Docker-Content-Digest = sha256 of body.
+    #[tokio::test]
+    async fn test_oci_manifest_digest_matches_body() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/verify/manifests/latest",
+            Body::from(manifest_bytes),
+        )
+        .await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/verify/manifests/latest",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let digest_header = resp
+            .headers()
+            .get("docker-content-digest")
+            .expect("OCI spec requires Docker-Content-Digest header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let body = body_bytes(resp).await;
+        let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
+        assert_eq!(
+            digest_header, computed,
+            "Docker-Content-Digest must equal sha256 of response body"
+        );
+    }
+
+    /// OCI spec: Content-Type of manifest response must match the manifest's mediaType.
+    #[tokio::test]
+    async fn test_oci_manifest_content_type_matches_media_type() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/ctcheck/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/ctcheck/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("OCI spec requires Content-Type header on manifest")
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/vnd.docker.distribution.manifest.v2+json");
+    }
+
+    /// OCI spec: Content-Length must match actual body length.
+    #[tokio::test]
+    async fn test_oci_manifest_content_length_matches() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/clcheck/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/clcheck/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cl: usize = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .expect("OCI spec requires Content-Length on manifest")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body = body_bytes(resp).await;
+        assert_eq!(cl, body.len(), "Content-Length must match body size");
+    }
+
     /// Per-upstream circuit breaker isolation: upstream A down, upstream B serves.
     #[tokio::test]
     async fn test_docker_circuit_breaker_per_upstream() {

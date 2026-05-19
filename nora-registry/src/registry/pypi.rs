@@ -488,7 +488,7 @@ async fn upload(State(state): State<Arc<AppState>>, mut multipart: Multipart) ->
 }
 
 // ============================================================================
-// PEP 691 JSON responses
+// PEP 691 JSON responses — typed structs per spec
 // ============================================================================
 
 struct FileEntry {
@@ -496,26 +496,52 @@ struct FileEntry {
     sha256: Option<String>,
 }
 
+/// PEP 691 top-level response — typed to prevent field-name drift.
+#[derive(serde::Serialize)]
+struct Pep691Response<'a> {
+    meta: Pep691Meta,
+    name: &'a str,
+    files: Vec<Pep691File>,
+}
+
+#[derive(serde::Serialize)]
+struct Pep691Meta {
+    #[serde(rename = "api-version")]
+    api_version: &'static str,
+}
+
+/// PEP 691 file entry — field `hashes` (NOT `digests`) per spec.
+#[derive(serde::Serialize)]
+struct Pep691File {
+    filename: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hashes: Option<Pep691Hashes>,
+}
+
+#[derive(serde::Serialize)]
+struct Pep691Hashes {
+    sha256: String,
+}
+
 fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
-    let file_entries: Vec<serde_json::Value> = files
+    let pep691_files: Vec<Pep691File> = files
         .iter()
-        .map(|f| {
-            let mut entry = serde_json::json!({
-                "filename": f.filename,
-                "url": format!("{}/simple/{}/{}", base_url, normalized, f.filename),
-            });
-            if let Some(hash) = &f.sha256 {
-                entry["hashes"] = serde_json::json!({"sha256": hash});
-            }
-            entry
+        .map(|f| Pep691File {
+            filename: f.filename.clone(),
+            url: format!("{}/simple/{}/{}", base_url, normalized, f.filename),
+            hashes: f
+                .sha256
+                .as_ref()
+                .map(|h| Pep691Hashes { sha256: h.clone() }),
         })
         .collect();
 
-    let body = serde_json::json!({
-        "meta": {"api-version": "1.0"},
-        "name": normalized,
-        "files": file_entries,
-    });
+    let body = Pep691Response {
+        meta: Pep691Meta { api_version: "1.0" },
+        name: normalized,
+        files: pep691_files,
+    };
 
     (
         StatusCode::OK,
@@ -1181,5 +1207,158 @@ mod integration_tests {
         let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+// ============================================================================
+// PEP 691 spec conformance tests
+// ============================================================================
+
+#[cfg(test)]
+mod spec_conformance_tests {
+    use super::*;
+
+    /// PEP 691 requires the field name `hashes`, NOT `digests`.
+    /// Regression test for bug where `digests` was used instead.
+    #[test]
+    fn test_pep691_uses_hashes_not_digests() {
+        let files = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".into(),
+            sha256: Some("abcdef1234567890".into()),
+        }];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let body = response.into_body();
+        let bytes = futures::executor::block_on(axum::body::to_bytes(body, 1024 * 1024)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(
+            json["files"][0].get("hashes").is_some(),
+            "PEP 691 requires 'hashes' field, not 'digests'"
+        );
+        assert!(
+            json["files"][0].get("digests").is_none(),
+            "PEP 691 forbids 'digests' — must be 'hashes'"
+        );
+        assert_eq!(json["files"][0]["hashes"]["sha256"], "abcdef1234567890");
+    }
+
+    /// PEP 691 requires `meta.api-version` field.
+    #[test]
+    fn test_pep691_meta_api_version() {
+        let files = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".into(),
+            sha256: None,
+        }];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            json["meta"]["api-version"], "1.0",
+            "PEP 691 requires meta.api-version = '1.0'"
+        );
+    }
+
+    /// PEP 691 JSON Content-Type must be `application/vnd.pypi.simple.v1+json`.
+    #[test]
+    fn test_pep691_content_type() {
+        let files = vec![];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, PEP691_JSON,
+            "PEP 691 requires Content-Type: {PEP691_JSON}"
+        );
+    }
+
+    /// PEP 691: `hashes` field must be omitted when no hash is available,
+    /// not set to null or empty object.
+    #[test]
+    fn test_pep691_hashes_omitted_when_none() {
+        let files = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".into(),
+            sha256: None,
+        }];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(
+            json["files"][0].get("hashes").is_none(),
+            "hashes must be omitted (not null) when no hash available"
+        );
+    }
+
+    /// PEP 691: `name` field must match the normalized package name.
+    #[test]
+    fn test_pep691_name_is_normalized() {
+        let files = vec![];
+        let normalized = normalize_name("Flask-RESTful");
+        let response = versions_json_response(&normalized, &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["name"], "flask-restful");
+    }
+
+    /// PEP 691: file URLs must point to NORA, not upstream.
+    #[test]
+    fn test_pep691_urls_point_to_nora() {
+        let files = vec![
+            FileEntry {
+                filename: "pkg-1.0.tar.gz".into(),
+                sha256: Some("aaa".into()),
+            },
+            FileEntry {
+                filename: "pkg-2.0.whl".into(),
+                sha256: Some("bbb".into()),
+            },
+        ];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        for file in json["files"].as_array().unwrap() {
+            let url = file["url"].as_str().unwrap();
+            assert!(
+                url.starts_with("http://nora:4000/simple/"),
+                "file URL must point to NORA base: {url}"
+            );
+        }
+    }
+
+    /// PEP 691 response must be valid JSON and deserializable back to typed struct.
+    #[test]
+    fn test_pep691_response_round_trip() {
+        let files = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".into(),
+            sha256: Some("abc123".into()),
+        }];
+        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+
+        // Must parse as valid JSON with expected top-level keys
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("meta").is_some(), "missing 'meta' key");
+        assert!(json.get("name").is_some(), "missing 'name' key");
+        assert!(json.get("files").is_some(), "missing 'files' key");
+
+        // Snapshot the structure
+        insta::assert_json_snapshot!("pypi_pep691_response_structure", json);
     }
 }

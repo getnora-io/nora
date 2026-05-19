@@ -1,0 +1,19 @@
+---
+source: nora-registry/src/registry/pypi.rs
+expression: json
+---
+{
+  "files": [
+    {
+      "filename": "pkg-1.0.tar.gz",
+      "hashes": {
+        "sha256": "abc123"
+      },
+      "url": "http://nora:4000/simple/pkg/pkg-1.0.tar.gz"
+    }
+  ],
+  "meta": {
+    "api-version": "1.0"
+  },
+  "name": "pkg"
+}
