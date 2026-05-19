@@ -60,6 +60,12 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/nuget/v3/registration/{id}/index.json",
             get(registration_index),
         )
+        // Registration page (proxied from rewritten registration index URLs)
+        // Pattern: /nuget/v3/registration/{id}/page/{lower}/{upper}.json
+        .route(
+            "/nuget/v3/registration/{id}/{*rest}",
+            get(registration_page),
+        )
         // Flat container: version list + package download (single wildcard)
         .route(
             "/nuget/v3/flatcontainer/{*path}",
@@ -230,9 +236,10 @@ async fn registration_index(
         return response;
     }
 
+    let base_url = nora_base_url(&state);
     let storage_key = format!("nuget/registration/{}/index.json", id_lower);
 
-    // TTL cache
+    // TTL cache — stored data is already rewritten
     if let Ok(data) = state.storage.get(&storage_key).await {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
@@ -262,6 +269,7 @@ async fn registration_index(
     .await
     {
         Ok(text) => {
+            let rewritten = rewrite_registration_response(&text, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -274,13 +282,61 @@ async fn registration_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
-            with_json(text.into_bytes())
+            state.spawn_cache("nuget", storage_key, Bytes::from(rewritten.clone()));
+            with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration error");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+// ── Registration page (proxied) ─────────────────────────────────────────
+
+async fn registration_page(
+    State(state): State<Arc<AppState>>,
+    Path((id, rest)): Path<(String, String)>,
+) -> Response {
+    let id_lower = id.to_lowercase();
+    if !is_valid_package_id(&id_lower) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Validate rest: must end in .json, no traversal
+    if !rest.ends_with(".json") || !is_safe_path(&rest) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let base_url = nora_base_url(&state);
+    let proxy_url = upstream_url(&state);
+    let url = format!(
+        "{}/v3/registration5-gz-semver2/{}/{}",
+        proxy_url.trim_end_matches('/'),
+        id_lower,
+        rest
+    );
+
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        state.config.nuget.proxy_timeout,
+        state.config.nuget.proxy_auth.as_deref(),
+        None,
+        &state.circuit_breaker,
+        "nuget",
+    )
+    .await
+    {
+        Ok(text) => {
+            let rewritten = rewrite_registration_response(&text, &base_url);
+            with_json(rewritten.into_bytes())
+        }
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        Err(e) => {
+            tracing::debug!(error = ?e, "NuGet registration page error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -745,6 +801,16 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
         )
 }
 
+/// Rewrite upstream registration page URLs in registration index responses.
+/// Prevents clients from bypassing NORA by following `api.nuget.org` page links.
+fn rewrite_registration_response(json_text: &str, base_url: &str) -> String {
+    let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
+    json_text.replace(
+        "https://api.nuget.org/v3/registration5-gz-semver2/",
+        &format!("{}/v3/registration/", nora_nuget),
+    )
+}
+
 fn is_valid_package_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
@@ -830,6 +896,32 @@ mod tests {
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
         assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
         assert!(result.contains("http://nora:4000/nuget/v3/"));
+    }
+
+    #[test]
+    fn test_rewrite_registration_response_page_urls() {
+        let input = r#"{"items":[{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/dotnet-ef/page/0.0.1-alpha/3.1.27.json","items":[]},{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/dotnet-ef/page/3.1.28/6.0.22.json","items":[]}]}"#;
+        let result = rewrite_registration_response(input, "https://artifact.company.local");
+        assert!(!result.contains("api.nuget.org"));
+        assert!(result.contains("https://artifact.company.local/nuget/v3/registration/dotnet-ef/page/0.0.1-alpha/3.1.27.json"));
+        assert!(result.contains("https://artifact.company.local/nuget/v3/registration/dotnet-ef/page/3.1.28/6.0.22.json"));
+    }
+
+    #[test]
+    fn test_rewrite_registration_response_http() {
+        let input = r#"{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"}"#;
+        let result = rewrite_registration_response(input, "http://nora:4000");
+        assert!(!result.contains("api.nuget.org"));
+        assert!(
+            result.contains("http://nora:4000/nuget/v3/registration/newtonsoft.json/index.json")
+        );
+    }
+
+    #[test]
+    fn test_rewrite_registration_response_no_upstream_urls_unchanged() {
+        let input = r#"{"count":1,"items":[{"items":[{"catalogEntry":{"version":"1.0.0"}}]}]}"#;
+        let result = rewrite_registration_response(input, "http://nora:4000");
+        assert_eq!(input, result);
     }
 }
 
