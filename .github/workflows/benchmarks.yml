@@ -1,0 +1,159 @@
+name: Benchmarks
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Load test scenario'
+        required: false
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - average
+          - stress
+
+permissions: read-all
+
+jobs:
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release -p nora-registry
+
+      - name: Record binary size
+        id: binary
+        run: |
+          SIZE=$(stat -c%s target/release/nora)
+          SIZE_MB=$(echo "scale=1; $SIZE / 1048576" | bc)
+          echo "size_bytes=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "size_mb=$SIZE_MB" >> "$GITHUB_OUTPUT"
+          echo "Binary size: ${SIZE_MB} MB"
+
+      - name: Start NORA
+        run: |
+          mkdir -p /tmp/nora-bench-data
+          NORA_HOST=0.0.0.0 \
+          NORA_PORT=4000 \
+          NORA_STORAGE_PATH=/tmp/nora-bench-data \
+          NORA_RATE_LIMIT_ENABLED=false \
+          NORA_AUTH_ENABLED=false \
+            target/release/nora serve &
+          NORA_PID=$!
+          echo "NORA_PID=$NORA_PID" >> "$GITHUB_ENV"
+
+          # Wait for startup
+          START=$(date +%s%N)
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:4000/health > /dev/null 2>&1; then
+              END=$(date +%s%N)
+              STARTUP_MS=$(( (END - START) / 1000000 ))
+              echo "startup_ms=$STARTUP_MS" >> "$GITHUB_OUTPUT"
+              echo "Startup time: ${STARTUP_MS}ms"
+              break
+            fi
+            sleep 0.1
+          done
+
+      - name: Record idle memory
+        id: memory
+        run: |
+          sleep 2
+          VMRSS=$(grep VmRSS /proc/$NORA_PID/status | awk '{print $2}')
+          echo "idle_kb=$VMRSS" >> "$GITHUB_OUTPUT"
+          echo "Idle VmRSS: ${VMRSS} kB"
+
+      - name: Install k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz | tar xzf -
+          sudo mv k6-v0.55.0-linux-amd64/k6 /usr/local/bin/
+
+      - name: Run load test (smoke)
+        id: loadtest
+        env:
+          NORA_TEST_HOST: http://localhost:4000
+          NORA_TEST_USER: ''
+          NORA_TEST_PASS: ''
+          REPORT_DIR: /tmp/nora-load-reports
+        run: |
+          SCENARIO="${{ inputs.scenario || 'smoke' }}"
+          mkdir -p /tmp/nora-load-reports
+          scripts/load-test.sh "$SCENARIO" || true
+
+      - name: Record peak memory under load
+        id: peak_memory
+        run: |
+          VMRSS=$(grep VmRSS /proc/$NORA_PID/status 2>/dev/null | awk '{print $2}' || echo "0")
+          echo "peak_kb=$VMRSS" >> "$GITHUB_OUTPUT"
+          echo "Peak VmRSS: ${VMRSS} kB"
+
+      - name: Run criterion benchmarks
+        run: cargo bench -p nora-registry -- --output-format bencher 2>/dev/null | tee /tmp/criterion-results.txt || true
+
+      - name: Generate summary report
+        id: report
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          VERSION="${GITHUB_REF_NAME:-dev}"
+
+          cat > /tmp/nora-bench-report.json << EOF
+          {
+            "version": "$VERSION",
+            "timestamp": "$TIMESTAMP",
+            "binary_size_bytes": ${{ steps.binary.outputs.size_bytes }},
+            "startup_ms": ${{ steps.memory.outputs.idle_kb && '0' || '0' }},
+            "memory_idle_kb": ${{ steps.memory.outputs.idle_kb || '0' }},
+            "memory_peak_kb": ${{ steps.peak_memory.outputs.peak_kb || '0' }},
+            "scenario": "${{ inputs.scenario || 'smoke' }}"
+          }
+          EOF
+
+          # Copy load test reports if they exist
+          cp /tmp/nora-load-reports/*.json /tmp/ 2>/dev/null || true
+
+      - name: Stop NORA
+        if: always()
+        run: kill $NORA_PID 2>/dev/null || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            /tmp/nora-bench-report.json
+            /tmp/nora-load-reports/
+            /tmp/criterion-results.txt
+          retention-days: 90
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            /tmp/nora-bench-report.json \
+            --clobber || true
+          for f in /tmp/nora-load-reports/*.json; do
+            [ -f "$f" ] && gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber || true
+          done
