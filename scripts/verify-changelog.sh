@@ -53,7 +53,10 @@ echo ""
 # ── 1. Env vars: every NORA_* in section must exist in source ─────────────
 
 echo "--- Env Vars (CHANGELOG → Code) ---"
-CHANGELOG_VARS=$(echo "$SECTION" | grep -oP 'NORA_[A-Z][A-Z0-9_]+' | sort -u || true)
+# Strip renamed-from vars (pattern: `NORA_OLD` →) before extraction
+CHANGELOG_VARS=$(echo "$SECTION" | \
+    sed -E 's/`NORA_[A-Z][A-Z0-9_*]+`[[:space:]]*→//g' | \
+    grep -oP 'NORA_[A-Z][A-Z0-9_]+' | sort -u || true)
 
 if [ -z "$CHANGELOG_VARS" ]; then
     ok "No env vars mentioned"
