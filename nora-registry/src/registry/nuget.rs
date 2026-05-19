@@ -796,7 +796,7 @@ async fn local_search_results(
 
 /// Rewrite known Microsoft NuGet service index URLs with NORA endpoints.
 /// `base_url` is the full NORA base URL including scheme (e.g. `https://artifact.company.local`).
-/// Targets api.nuget.org and azuresearch-{usnc,ussc}.nuget.org specifically.
+/// Targets api.nuget.org, www.nuget.org, and azuresearch-{usnc,ussc}.nuget.org.
 fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
     let nora_query = format!("{}/v3/query", nora_nuget);
@@ -844,6 +844,18 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
             "https://azuresearch-ussc.nuget.org/",
             &format!("{}/v3/", nora_nuget),
         )
+        // Rewrite repository signatures URLs (prevents outbound in air-gap)
+        .replace(
+            "https://api.nuget.org/v3-index/repository-signatures/",
+            &format!("{}/v3/repository-signatures/", nora_nuget),
+        )
+        // Rewrite vulnerability info URL
+        .replace(
+            "https://api.nuget.org/v3/vulnerabilities/",
+            &format!("{}/v3/vulnerabilities/", nora_nuget),
+        )
+        // Rewrite www.nuget.org URLs (v2 gallery, publish, templates)
+        .replace("https://www.nuget.org/", &format!("{}/v3/www/", nora_nuget))
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses.
