@@ -1,0 +1,50 @@
+{
+  "version": "3.0.0",
+  "resources": [
+    {
+      "@id": "https://api.nuget.org/v3-flatcontainer/",
+      "@type": "PackageBaseAddress/3.0.0",
+      "comment": "Base URL of where NuGet packages are stored, in the format https://api.nuget.org/v3-flatcontainer/{id-lower}/{version-lower}/{id-lower}.{version-lower}.nupkg"
+    },
+    {
+      "@id": "https://api.nuget.org/v3/registration5-gz-semver2/",
+      "@type": "RegistrationsBaseUrl/3.6.0",
+      "comment": "Base URL of storage where NuGet package registration info is stored compressed"
+    },
+    {
+      "@id": "https://azuresearch-usnc.nuget.org/query",
+      "@type": "SearchQueryService",
+      "comment": "Query endpoint of NuGet Search service (primary) used by RC clients"
+    },
+    {
+      "@id": "https://azuresearch-ussc.nuget.org/query",
+      "@type": "SearchQueryService",
+      "comment": "Query endpoint of NuGet Search service (secondary) used by RC clients"
+    },
+    {
+      "@id": "https://azuresearch-usnc.nuget.org/autocomplete",
+      "@type": "SearchAutocompleteService",
+      "comment": "Autocomplete endpoint of NuGet Search service (primary) used by RC clients"
+    },
+    {
+      "@id": "https://azuresearch-ussc.nuget.org/autocomplete",
+      "@type": "SearchAutocompleteService/3.5.0",
+      "comment": "Autocomplete endpoint of NuGet Search service (secondary) used by RC clients"
+    },
+    {
+      "@id": "https://azuresearch-usnc.nuget.org/",
+      "@type": "SearchGalleryQueryService/3.0.0-rc",
+      "comment": "Search endpoint of NuGet gallery"
+    },
+    {
+      "@id": "https://azuresearch-ussc.nuget.org/",
+      "@type": "SearchGalleryQueryService/3.0.0-rc",
+      "comment": "Search endpoint of NuGet gallery"
+    },
+    {
+      "@id": "https://api.nuget.org/v3/catalog0/index.json",
+      "@type": "Catalog/3.0.0",
+      "comment": "Index of the NuGet package catalog"
+    }
+  ]
+}

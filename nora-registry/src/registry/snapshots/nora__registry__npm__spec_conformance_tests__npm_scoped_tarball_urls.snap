@@ -1,0 +1,9 @@
+---
+source: nora-registry/src/registry/npm.rs
+assertion_line: 1049
+expression: tarball_urls
+---
+[
+  "http://nora:4000/npm/@babel/core/-/core-7.25.9.tgz",
+  "http://nora:4000/npm/@babel/core/-/core-7.26.0.tgz"
+]

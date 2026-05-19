@@ -15,7 +15,9 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -304,6 +306,10 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
     .await
     {
         Ok(text) => {
+            let base_url = nora_base_url(state);
+            let upstream = upstream_url(state);
+            let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
+
             state.metrics.record_download("ansible");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -317,7 +323,7 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
                 .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
 
             state.repo_index.invalidate("ansible");
-            with_json(text.into_bytes())
+            with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -326,6 +332,34 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+// ── URL rewriting ─────────────────────────────────────────────────────
+
+/// Rewrite upstream Galaxy URLs in JSON responses to point through NORA.
+///
+/// Replacements are applied most-specific-first to avoid double-rewriting:
+/// 1. `{upstream}/download/` → `{base}/ansible/download/`
+/// 2. `{upstream}{API_PREFIX}/` → `{base}/ansible/v3/collections/`
+/// 3. `{upstream}` (remaining) → `{base}/ansible`
+fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
+    let upstream = upstream_url.trim_end_matches('/');
+    let base = base_url.trim_end_matches('/');
+    let nora_ansible = format!("{}/ansible", base);
+
+    json_text
+        // Most specific first: download URLs
+        .replace(
+            &format!("{}/download/", upstream),
+            &format!("{}/download/", nora_ansible),
+        )
+        // Pulp-style API paths → short v3 paths
+        .replace(
+            &format!("{}{}/", upstream, API_PREFIX),
+            &format!("{}/v3/collections/", nora_ansible),
+        )
+        // Catch-all: any remaining upstream references
+        .replace(upstream, &nora_ansible)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -428,6 +462,53 @@ mod tests {
         assert!(is_safe_filename("community-general-7.0.0.tar.gz"));
         assert!(!is_safe_filename("../evil.tar.gz"));
         assert!(!is_safe_filename("evil/path.tar.gz"));
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_download() {
+        let input = r#"{"download_url":"https://galaxy.ansible.com/download/community-general-7.0.0.tar.gz"}"#;
+        let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
+        assert!(result.contains("http://nora:4000/ansible/download/community-general-7.0.0.tar.gz"));
+        assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_href_and_pagination() {
+        let input = r#"{"data":[{"href":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/community/general/"}],"links":{"next":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/?page=2"}}"#;
+        let result = rewrite_ansible_urls(
+            input,
+            "https://galaxy.ansible.com",
+            "https://registry.local",
+        );
+        assert!(result.contains("https://registry.local/ansible/v3/collections/community/general/"));
+        assert!(result.contains("https://registry.local/ansible/v3/collections/?page=2"));
+        assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_versions_url() {
+        let input = r#"{"versions_url":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/"}"#;
+        let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
+        assert!(
+            result.contains("http://nora:4000/ansible/v3/collections/community/general/versions/")
+        );
+        assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_no_upstream_unchanged() {
+        let input = r#"{"name":"community.general","version":"7.0.0"}"#;
+        let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
+        assert_eq!(input, result);
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_custom_upstream() {
+        let input =
+            r#"{"download_url":"https://hub.example.com/download/my-collection-1.0.0.tar.gz"}"#;
+        let result = rewrite_ansible_urls(input, "https://hub.example.com", "http://nora:4000");
+        assert!(result.contains("http://nora:4000/ansible/download/my-collection-1.0.0.tar.gz"));
+        assert!(!result.contains("hub.example.com"));
     }
 }
 

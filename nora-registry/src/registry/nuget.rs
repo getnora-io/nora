@@ -1437,3 +1437,296 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }
+
+// ── Spec conformance tests (#390) ─────────────────────────────────────
+//
+// Invariant: after URL rewriting, no upstream domains remain in the response.
+// Uses golden fixtures from testdata/nuget/ to validate against realistic
+// upstream payloads, not just synthetic test data.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spec_conformance_tests {
+    use super::*;
+
+    /// Known upstream domains that MUST NOT appear in rewritten responses.
+    const NUGET_UPSTREAM_DOMAINS: &[&str] = &[
+        "api.nuget.org",
+        "azuresearch-usnc.nuget.org",
+        "azuresearch-ussc.nuget.org",
+    ];
+
+    /// Known URL patterns in NuGet responses that are NOT client-fetchable:
+    /// - /v3/catalog0/ — server-side metadata, never requested by NuGet CLI
+    /// - /v3-flatcontainer/ in registration — informational packageContent;
+    ///   clients get flatcontainer base URL from service index (which IS rewritten)
+    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/", "/v3-flatcontainer/"];
+
+    /// Assert that no upstream URLs remain in a rewritten response body,
+    /// excluding known non-client-fetchable URL patterns.
+    /// This is the core air-gap invariant: any leaked URL means the client
+    /// tries to reach the internet and fails in air-gapped environments.
+    fn assert_no_upstream_urls(body: &str, context: &str) {
+        for line in body.lines() {
+            if NUGET_EXCLUDED_PATTERNS.iter().any(|p| line.contains(p)) {
+                continue;
+            }
+            for domain in NUGET_UPSTREAM_DOMAINS {
+                assert!(
+                    !line.contains(domain),
+                    "upstream domain '{}' leaked in {} (line: {})",
+                    domain,
+                    context,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// Load a golden fixture from testdata/nuget/.
+    fn load_fixture(name: &str) -> String {
+        let path = format!("{}/testdata/nuget/{}", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to load fixture {}: {}", path, e))
+    }
+
+    // ── Service index rewrite: golden fixture ──
+
+    #[test]
+    fn test_service_index_golden_no_upstream_leak() {
+        let fixture = load_fixture("service-index.json");
+        let rewritten = rewrite_service_index(&fixture, "https://registry.airgap.local");
+        assert_no_upstream_urls(&rewritten, "service-index rewrite");
+
+        // Verify the rewritten JSON is still valid
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert!(json["resources"].is_array());
+        assert!(!json["resources"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_service_index_golden_correct_replacements() {
+        let fixture = load_fixture("service-index.json");
+        let rewritten = rewrite_service_index(&fixture, "http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        let resources = json["resources"].as_array().unwrap();
+
+        // Every @id must start with nora base or be a non-rewritable URL
+        for res in resources {
+            let id = res["@id"].as_str().unwrap();
+            let res_type = res["@type"].as_str().unwrap_or("");
+            // Catalog URL is not rewritten (no client-facing use)
+            if res_type.starts_with("Catalog") {
+                continue;
+            }
+            assert!(
+                id.starts_with("http://nora:4000/nuget/"),
+                "resource @id not rewritten: {} (type: {})",
+                id,
+                res_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_service_index_golden_snapshot() {
+        let fixture = load_fixture("service-index.json");
+        let rewritten = rewrite_service_index(&fixture, "http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+
+        // Snapshot only the @id fields (stable against upstream comment changes)
+        let ids: Vec<&str> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["@id"].as_str().unwrap())
+            .collect();
+        insta::assert_json_snapshot!("nuget_service_index_ids", ids);
+    }
+
+    // ── Registration index rewrite: paginated fixture ──
+
+    #[test]
+    fn test_registration_paginated_golden_no_upstream_leak() {
+        let fixture = load_fixture("registration-index-paginated.json");
+        let rewritten = rewrite_registration_urls(
+            &fixture,
+            "https://api.nuget.org",
+            "https://registry.airgap.local",
+        );
+        assert_no_upstream_urls(&rewritten, "registration-index-paginated rewrite");
+
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(json["count"].as_u64().unwrap(), 2);
+
+        // All page @id must point to NORA
+        for item in json["items"].as_array().unwrap() {
+            let id = item["@id"].as_str().unwrap();
+            assert!(
+                id.starts_with("https://registry.airgap.local/nuget/v3/registration/"),
+                "page @id not rewritten: {}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn test_registration_paginated_golden_snapshot() {
+        let fixture = load_fixture("registration-index-paginated.json");
+        let rewritten =
+            rewrite_registration_urls(&fixture, "https://api.nuget.org", "http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+
+        let page_ids: Vec<&str> = json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["@id"].as_str().unwrap())
+            .collect();
+        insta::assert_json_snapshot!("nuget_registration_paginated_page_ids", page_ids);
+    }
+
+    // ── Registration index rewrite: inline fixture ──
+
+    #[test]
+    fn test_registration_inline_golden_no_upstream_leak() {
+        let fixture = load_fixture("registration-index-inline.json");
+        let rewritten =
+            rewrite_registration_urls(&fixture, "https://api.nuget.org", "http://nora:4000");
+
+        // registration5-gz-semver2 URLs must be rewritten
+        assert!(!rewritten.contains("registration5-gz-semver2"));
+        assert!(!rewritten.contains("registration5-semver1"));
+        assert!(!rewritten.contains("registration5-gz-semver1"));
+
+        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        let page = &json["items"][0];
+        let entry = &page["items"][0];
+
+        // catalogEntry @id points to catalog (not rewritten by registration_urls)
+        // but the entry @id itself must be rewritten
+        let entry_id = entry["@id"].as_str().unwrap();
+        assert!(
+            entry_id.starts_with("http://nora:4000/nuget/v3/registration/"),
+            "inline entry @id not rewritten: {}",
+            entry_id
+        );
+    }
+
+    // ── Content-Type assertions ──
+
+    #[tokio::test]
+    async fn test_service_index_content_type() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        // Pre-populate a cached service index
+        let fixture = load_fixture("service-index.json");
+        ctx.state
+            .storage
+            .put("nuget/service-index.json", fixture.as_bytes())
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/index.json", "").await;
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "NuGet service index must return application/json, got: {}",
+            content_type
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_registration_content_type() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        let fixture = load_fixture("registration-index-inline.json");
+        ctx.state
+            .storage
+            .put("nuget/registration/xunit/index.json", fixture.as_bytes())
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/xunit/index.json",
+            "",
+        )
+        .await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "NuGet registration index must return application/json, got: {}",
+            content_type
+        );
+
+        // Verify the rewritten body has no upstream URLs
+        let body = body_bytes(resp).await;
+        let body_str = String::from_utf8_lossy(&body);
+        assert_no_upstream_urls(&body_str, "cached registration index response");
+    }
+
+    // ── Cache-Control assertions ──
+
+    #[tokio::test]
+    async fn test_nupkg_cache_control_immutable() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+        });
+
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/testpkg/1.0.0/testpkg.1.0.0.nupkg",
+                b"fake-nupkg",
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/testpkg/1.0.0/testpkg.1.0.0.nupkg",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            cache_control.contains("immutable"),
+            "nupkg must have immutable cache-control, got: {}",
+            cache_control
+        );
+    }
+}
