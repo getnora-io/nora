@@ -20,7 +20,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, put},
     Router,
@@ -80,7 +80,11 @@ async fn index_config(State(state): State<Arc<AppState>>) -> Response {
 ///   4+ chars: /cargo/index/{first_two}/{next_two}/{name}
 ///
 /// Each entry is one JSON line per version (newline-delimited).
-async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn sparse_index(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
     // Extract crate name from the path (last segment), normalized to lowercase
     let crate_name = match path.rsplit('/').next() {
         Some(name) if !name.is_empty() => name.to_lowercase(),
@@ -109,7 +113,7 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
             "cargo",
             "CACHE",
         ));
-        return sparse_index_response(data.to_vec());
+        return sparse_index_conditional(data.to_vec(), &headers);
     }
 
     // Try upstream sparse index (sparse+https://index.crates.io/)
@@ -165,7 +169,7 @@ async fn sparse_index(State(state): State<Arc<AppState>>, Path(path): Path<Strin
                 }
             });
 
-            sparse_index_response(data)
+            sparse_index_conditional(data, &headers)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(crate::registry::ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -625,19 +629,36 @@ fn is_valid_crate_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Build response with sparse index content-type.
-fn sparse_index_response(data: Vec<u8>) -> Response {
+/// Build sparse index response with ETag and conditional 304 support.
+///
+/// Computes a SHA-256 ETag from the response body. If the client sends
+/// `If-None-Match` with a matching ETag, returns 304 Not Modified.
+fn sparse_index_conditional(data: Vec<u8>, req_headers: &HeaderMap) -> Response {
+    let etag_hash = hex::encode(sha2::Sha256::digest(&data));
+    let etag_val = format!("\"{}\"", etag_hash);
+
+    if let Some(inm) = req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if inm.trim() == etag_val || inm.trim() == "*" {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::ETAG, etag_val),
+                    (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+                ],
+            )
+                .into_response();
+        }
+    }
+
     (
         StatusCode::OK,
         [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            ),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=300"),
-            ),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+            (header::ETAG, etag_val),
         ],
         data,
     )
@@ -817,6 +838,111 @@ mod integration_tests {
 
         let resp = send(&ctx.app, Method::GET, "/cargo/index/3/f/foo", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_sparse_index_returns_etag() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context();
+        let index_data = br#"{"name":"serde","vers":"1.0.0","deps":[]}"#;
+        ctx.state
+            .storage
+            .put("cargo/index/se/rd/serde", index_data)
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/se/rd/serde", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let etag = resp
+            .headers()
+            .get("etag")
+            .expect("response must include ETag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"'),
+            "ETag must be quoted"
+        );
+        assert!(etag.len() > 2, "ETag must contain a hash");
+
+        // Second request with matching If-None-Match → 304
+        let resp2 = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/cargo/index/se/rd/serde",
+            vec![("if-none-match", &etag)],
+            "",
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::NOT_MODIFIED);
+        // 304 should also include ETag
+        let etag2 = resp2.headers().get("etag").expect("304 must include ETag");
+        assert_eq!(etag2.to_str().unwrap(), etag);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_sparse_index_etag_mismatch_returns_200() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context();
+        let index_data = br#"{"name":"serde","vers":"1.0.0","deps":[]}"#;
+        ctx.state
+            .storage
+            .put("cargo/index/se/rd/serde", index_data)
+            .await
+            .unwrap();
+
+        // Request with non-matching ETag → 200
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/cargo/index/se/rd/serde",
+            vec![("if-none-match", "\"stale-etag\"")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("etag").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cargo_sparse_index_etag_changes_with_data() {
+        let ctx = create_test_context();
+
+        // First version
+        ctx.state
+            .storage
+            .put("cargo/index/se/rd/serde", br#"{"vers":"1.0.0"}"#)
+            .await
+            .unwrap();
+        let resp1 = send(&ctx.app, Method::GET, "/cargo/index/se/rd/serde", "").await;
+        let etag1 = resp1
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Update data
+        ctx.state
+            .storage
+            .put("cargo/index/se/rd/serde", br#"{"vers":"2.0.0"}"#)
+            .await
+            .unwrap();
+        let resp2 = send(&ctx.app, Method::GET, "/cargo/index/se/rd/serde", "").await;
+        let etag2 = resp2
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(etag1, etag2, "ETag must change when data changes");
     }
 
     #[tokio::test]
