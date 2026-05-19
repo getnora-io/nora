@@ -947,6 +947,64 @@ fi
 rm -f "$PYPI_HEADERS"
 echo ""
 
+# 11. Terraform X-Terraform-Get URL Rewrite (#380)
+# Verifies that module download endpoint rewrites X-Terraform-Get
+# to point through NORA instead of leaking upstream URLs.
+echo "--- 11. Terraform X-Terraform-Get Rewrite (#380) ---"
+
+# Restart NORA with Terraform enabled
+start_nora env NORA_TF_ENABLED=true
+
+# Seed a module source URL metadata (simulates upstream module download response)
+TF_NS="hashicorp"
+TF_MOD="consul"
+TF_PROV="aws"
+TF_VER="0.1.0"
+TF_SOURCE_URL="https://codeload.github.com/hashicorp/terraform-aws-consul/tar.gz/v0.1.0"
+mkdir -p "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}"
+echo -n "$TF_SOURCE_URL" > "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/_source_url"
+
+# 11.1 Module download endpoint returns rewritten X-Terraform-Get header
+TF_RESP=$(curl -sf -D - \
+    "${BASE}/terraform/v1/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/download" \
+    2>/dev/null || echo "")
+TF_GET_HEADER=$(echo "$TF_RESP" | grep -i "^x-terraform-get:" | tr -d '\r' | head -1 || echo "")
+
+if [ -n "$TF_GET_HEADER" ]; then
+    pass "Terraform module download returns X-Terraform-Get header"
+else
+    fail "Terraform module download missing X-Terraform-Get header"
+fi
+
+# 11.2 X-Terraform-Get must NOT contain upstream URL (air-gap check)
+if echo "$TF_GET_HEADER" | grep -qi "github.com"; then
+    fail "Terraform X-Terraform-Get leaks upstream github.com URL"
+elif echo "$TF_GET_HEADER" | grep -qi "codeload"; then
+    fail "Terraform X-Terraform-Get leaks upstream codeload URL"
+else
+    pass "Terraform X-Terraform-Get does not leak upstream URLs"
+fi
+
+# 11.3 X-Terraform-Get must point through NORA
+if echo "$TF_GET_HEADER" | grep -q "/terraform/v1/modules/download/"; then
+    pass "Terraform X-Terraform-Get points through NORA proxy"
+else
+    fail "Terraform X-Terraform-Get does not point through NORA: $TF_GET_HEADER"
+fi
+
+# 11.4 Module source endpoint serves cached content
+echo -n "fake-module-tarball" > "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/source.tar.gz"
+TF_SOURCE_RESP=$(curl -sf \
+    "${BASE}/terraform/v1/modules/download/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/source" \
+    2>/dev/null || echo "")
+if [ "$TF_SOURCE_RESP" = "fake-module-tarball" ]; then
+    pass "Terraform module source served from NORA cache"
+else
+    fail "Terraform module source not served correctly: got '$TF_SOURCE_RESP'"
+fi
+
+echo ""
+
 # ===========================================================================
 # Summary
 # ===========================================================================
