@@ -834,6 +834,11 @@ fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
             "https://azuresearch-ussc.nuget.org/autocomplete",
             &nora_autocomplete,
         )
+        // Rewrite catalog endpoint (air-gap bypass if left as-is)
+        .replace(
+            "https://api.nuget.org/v3/catalog0/",
+            &format!("{}/v3/catalog0/", nora_nuget),
+        )
         // Rewrite remaining azuresearch root URLs (SearchGalleryQueryService)
         // Must come AFTER query/autocomplete replaces to avoid partial matches
         .replace(
@@ -865,6 +870,11 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
         .replace(
             &format!("{}/v3/registration5-gz-semver2/", upstream),
             &nora_reg,
+        )
+        // Rewrite catalog0 URLs in catalogEntry fields (air-gap bypass)
+        .replace(
+            &format!("{}/v3/catalog0/", upstream),
+            &format!("{}/v3/catalog0/", nora_nuget),
         )
 }
 
@@ -1457,10 +1467,9 @@ mod spec_conformance_tests {
     ];
 
     /// Known URL patterns in NuGet responses that are NOT client-fetchable:
-    /// - /v3/catalog0/ — server-side metadata, never requested by NuGet CLI
     /// - /v3-flatcontainer/ in registration — informational packageContent;
     ///   clients get flatcontainer base URL from service index (which IS rewritten)
-    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/", "/v3-flatcontainer/"];
+    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3-flatcontainer/"];
 
     /// Assert that no upstream URLs remain in a rewritten response body,
     /// excluding known non-client-fetchable URL patterns.
@@ -1511,14 +1520,10 @@ mod spec_conformance_tests {
         let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         let resources = json["resources"].as_array().unwrap();
 
-        // Every @id must start with nora base or be a non-rewritable URL
+        // Every @id must start with nora base — no exceptions (air-gap invariant)
         for res in resources {
             let id = res["@id"].as_str().unwrap();
             let res_type = res["@type"].as_str().unwrap_or("");
-            // Catalog URL is not rewritten (no client-facing use)
-            if res_type.starts_with("Catalog") {
-                continue;
-            }
             assert!(
                 id.starts_with("http://nora:4000/nuget/"),
                 "resource @id not rewritten: {} (type: {})",
@@ -1542,6 +1547,19 @@ mod spec_conformance_tests {
             .map(|r| r["@id"].as_str().unwrap())
             .collect();
         insta::assert_json_snapshot!("nuget_service_index_ids", ids);
+    }
+
+    #[test]
+    fn test_catalog0_url_rewritten() {
+        let input =
+            r#"{"@id":"https://api.nuget.org/v3/catalog0/index.json","@type":"Catalog/3.0.0"}"#;
+        let result = rewrite_service_index(input, "http://nora:4000");
+        assert!(
+            !result.contains("api.nuget.org"),
+            "catalog0 URL must be rewritten, got: {}",
+            result
+        );
+        assert!(result.contains("http://nora:4000/nuget/v3/catalog0/index.json"));
     }
 
     // ── Registration index rewrite: paginated fixture ──
@@ -1603,8 +1621,7 @@ mod spec_conformance_tests {
         let page = &json["items"][0];
         let entry = &page["items"][0];
 
-        // catalogEntry @id points to catalog (not rewritten by registration_urls)
-        // but the entry @id itself must be rewritten
+        // entry @id must be rewritten to NORA
         let entry_id = entry["@id"].as_str().unwrap();
         assert!(
             entry_id.starts_with("http://nora:4000/nuget/v3/registration/"),
