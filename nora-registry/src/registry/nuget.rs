@@ -70,48 +70,25 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/nuget/v3/flatcontainer/{*path}",
             get(flatcontainer_handler),
         )
+        // Catch-all: any unhandled /nuget/v3/ path → 404 + diagnostic log
+        .route("/nuget/v3/{*path}", get(nuget_catchall))
 }
 
 // ── Service index ──────────────────────────────────────────────────────
 
 async fn service_index(State(state): State<Arc<AppState>>) -> Response {
     let base_url = nora_base_url(&state);
-    let proxy_url = upstream_url(&state);
-    let url = format!("{}/v3/index.json", proxy_url.trim_end_matches('/'));
+    let index = generate_service_index(&base_url);
 
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        state.config.nuget.proxy_timeout,
-        state.config.nuget.proxy_auth.as_deref(),
-        None,
-        &state.circuit_breaker,
+    state.metrics.record_download("nuget");
+    state.activity.push(ActivityEntry::new(
+        ActionType::CacheHit,
+        "service-index".to_string(),
         "nuget",
-    )
-    .await
-    {
-        Ok(text) => {
-            // Rewrite @id URLs to point through NORA
-            let rewritten = rewrite_service_index(&text, &base_url);
+        "LOCAL",
+    ));
 
-            state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
-            state.activity.push(ActivityEntry::new(
-                ActionType::ProxyFetch,
-                "service-index".to_string(),
-                "nuget",
-                "PROXY",
-            ));
-
-            with_json(rewritten.into_bytes())
-        }
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(e) => {
-            tracing::debug!(error = ?e, "NuGet service index error");
-            StatusCode::BAD_GATEWAY.into_response()
-        }
-    }
+    with_json(index.into_bytes())
 }
 
 // ── Search query (proxy to upstream SearchQueryService, local fallback) ──
@@ -149,7 +126,8 @@ async fn search_query(
     {
         Ok(text) => {
             let base_url = nora_base_url(&state);
-            let rewritten = rewrite_service_index(&text, &base_url);
+            let upstream = upstream_url(&state);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -196,7 +174,8 @@ async fn autocomplete_query(
     {
         Ok(text) => {
             let base_url = nora_base_url(&state);
-            let rewritten = rewrite_service_index(&text, &base_url);
+            let upstream = upstream_url(&state);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss();
             state.activity.push(ActivityEntry::new(
@@ -798,73 +777,49 @@ async fn local_search_results(
     serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
 }
 
-/// Rewrite known Microsoft NuGet service index URLs with NORA endpoints.
+/// Generate NuGet v3 service index from scratch, advertising only resources
+/// that NORA actually implements. This is the fail-closed approach: clients
+/// only see resources with real handlers behind them. (#404)
+///
 /// `base_url` is the full NORA base URL including scheme (e.g. `https://artifact.company.local`).
-/// Targets api.nuget.org, www.nuget.org, and azuresearch-{usnc,ussc}.nuget.org.
-fn rewrite_service_index(json_text: &str, base_url: &str) -> String {
+fn generate_service_index(base_url: &str) -> String {
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
-    let nora_query = format!("{}/v3/query", nora_nuget);
-    let nora_autocomplete = format!("{}/v3/autocomplete", nora_nuget);
 
-    // Rewrite major service URLs to route through NORA
-    let nora_registration = format!("{}/v3/registration/", nora_nuget);
-    json_text
-        .replace(
-            "https://api.nuget.org/v3-flatcontainer/",
-            &format!("{}/v3/flatcontainer/", nora_nuget),
-        )
-        // Rewrite all registration base URL variants (nuget.org serves 5)
-        .replace(
-            "https://api.nuget.org/v3/registration5-semver1/",
-            &nora_registration,
-        )
-        .replace(
-            "https://api.nuget.org/v3/registration5-gz-semver1/",
-            &nora_registration,
-        )
-        .replace(
-            "https://api.nuget.org/v3/registration5-gz-semver2/",
-            &nora_registration,
-        )
-        // Rewrite search endpoints to proxy through NORA
-        .replace("https://azuresearch-usnc.nuget.org/query", &nora_query)
-        .replace("https://azuresearch-ussc.nuget.org/query", &nora_query)
-        // Rewrite autocomplete endpoints to proxy through NORA
-        .replace(
-            "https://azuresearch-usnc.nuget.org/autocomplete",
-            &nora_autocomplete,
-        )
-        .replace(
-            "https://azuresearch-ussc.nuget.org/autocomplete",
-            &nora_autocomplete,
-        )
-        // Rewrite catalog endpoint (air-gap bypass if left as-is)
-        .replace(
-            "https://api.nuget.org/v3/catalog0/",
-            &format!("{}/v3/catalog0/", nora_nuget),
-        )
-        // Rewrite remaining azuresearch root URLs (SearchGalleryQueryService)
-        // Must come AFTER query/autocomplete replaces to avoid partial matches
-        .replace(
-            "https://azuresearch-usnc.nuget.org/",
-            &format!("{}/v3/", nora_nuget),
-        )
-        .replace(
-            "https://azuresearch-ussc.nuget.org/",
-            &format!("{}/v3/", nora_nuget),
-        )
-        // Rewrite repository signatures URLs (prevents outbound in air-gap)
-        .replace(
-            "https://api.nuget.org/v3-index/repository-signatures/",
-            &format!("{}/v3/repository-signatures/", nora_nuget),
-        )
-        // Rewrite vulnerability info URL
-        .replace(
-            "https://api.nuget.org/v3/vulnerabilities/",
-            &format!("{}/v3/vulnerabilities/", nora_nuget),
-        )
-        // Rewrite www.nuget.org URLs (v2 gallery, publish, templates)
-        .replace("https://www.nuget.org/", &format!("{}/v3/www/", nora_nuget))
+    let index = serde_json::json!({
+        "version": "3.0.0",
+        "resources": [
+            {
+                "@id": format!("{}/v3/flatcontainer/", nora_nuget),
+                "@type": "PackageBaseAddress/3.0.0",
+                "comment": "Base URL of NuGet package storage"
+            },
+            {
+                "@id": format!("{}/v3/registration/", nora_nuget),
+                "@type": "RegistrationsBaseUrl/3.6.0",
+                "comment": "Base URL of NuGet package registration info"
+            },
+            {
+                "@id": format!("{}/v3/query", nora_nuget),
+                "@type": "SearchQueryService",
+                "comment": "NuGet search endpoint"
+            },
+            {
+                "@id": format!("{}/v3/autocomplete", nora_nuget),
+                "@type": "SearchAutocompleteService",
+                "comment": "NuGet autocomplete endpoint"
+            }
+        ]
+    });
+
+    serde_json::to_string_pretty(&index).expect("static JSON serialization cannot fail")
+}
+
+/// Catch-all handler for unhandled NuGet v3 resource paths.
+/// Returns 404 with diagnostic logging so operators can see which resources
+/// clients are requesting that NORA doesn't implement yet. (#404)
+async fn nuget_catchall(Path(path): Path<String>) -> Response {
+    tracing::debug!(path = %path, "NuGet: unhandled resource requested");
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses.
@@ -954,80 +909,62 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_service_index_http() {
-        let input = r#"{"resources":[{"@id":"https://api.nuget.org/v3-flatcontainer/","@type":"PackageBaseAddress/3.0.0"}]}"#;
-        let result = rewrite_service_index(input, "http://nora:4000");
+    fn test_generate_service_index_http() {
+        let result = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["version"], "3.0.0");
+        let resources = json["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 4);
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
-        assert!(!result.contains("api.nuget.org/v3-flatcontainer/"));
-    }
-
-    #[test]
-    fn test_rewrite_service_index_search_urls() {
-        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/query","@type":"SearchQueryService"},{"@id":"https://azuresearch-ussc.nuget.org/query","@type":"SearchQueryService"}]}"#;
-        let result = rewrite_service_index(input, "http://nora:4000");
+        assert!(result.contains("http://nora:4000/nuget/v3/registration/"));
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
-        assert!(!result.contains("azuresearch-usnc.nuget.org"));
-        assert!(!result.contains("azuresearch-ussc.nuget.org"));
+        assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
     }
 
     #[test]
-    fn test_rewrite_service_index_https() {
-        let input = r#"{"resources":[{"@id":"https://api.nuget.org/v3-flatcontainer/","@type":"PackageBaseAddress/3.0.0"},{"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/3.6.0"}]}"#;
-        let result = rewrite_service_index(input, "https://artifact.company.local");
+    fn test_generate_service_index_https() {
+        let result = generate_service_index("https://artifact.company.local");
         assert!(result.contains("https://artifact.company.local/nuget/v3/flatcontainer/"));
         assert!(result.contains("https://artifact.company.local/nuget/v3/registration/"));
         assert!(!result.contains("http://artifact.company.local"));
+    }
+
+    #[test]
+    fn test_generate_service_index_no_upstream_urls() {
+        let result = generate_service_index("http://nora:4000");
         assert!(!result.contains("api.nuget.org"));
-    }
-
-    #[test]
-    fn test_rewrite_service_index_all_registration_variants() {
-        // nuget.org serves 5 registration base URL variants plus URL templates
-        let input = r#"{"resources":[
-            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl"},
-            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl/3.0.0-rc"},
-            {"@id":"https://api.nuget.org/v3/registration5-semver1/","@type":"RegistrationsBaseUrl/3.0.0-beta"},
-            {"@id":"https://api.nuget.org/v3/registration5-gz-semver1/","@type":"RegistrationsBaseUrl/3.4.0"},
-            {"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/3.6.0"},
-            {"@id":"https://api.nuget.org/v3/registration5-gz-semver2/","@type":"RegistrationsBaseUrl/Versioned"},
-            {"@id":"https://api.nuget.org/v3/registration5-semver1/{id-lower}/index.json","@type":"PackageDisplayMetadataUriTemplate/3.0.0-rc"},
-            {"@id":"https://api.nuget.org/v3/registration5-semver1/{id-lower}/{version-lower}.json","@type":"PackageVersionDisplayMetadataUriTemplate/3.0.0-rc"}
-        ]}"#;
-        let result = rewrite_service_index(input, "https://registry.company.local");
-        // All registration URLs should be rewritten
-        assert!(
-            !result.contains("api.nuget.org"),
-            "leaked upstream URL in: {result}"
-        );
-        // All should point to NORA registration endpoint
-        assert!(result.contains("https://registry.company.local/nuget/v3/registration/"));
-        // URL templates should also be rewritten (prefix match)
-        assert!(
-            result.contains("registry.company.local/nuget/v3/registration/{id-lower}/index.json")
-        );
-        assert!(result.contains(
-            "registry.company.local/nuget/v3/registration/{id-lower}/{version-lower}.json"
-        ));
-    }
-
-    #[test]
-    fn test_rewrite_service_index_autocomplete_urls() {
-        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/autocomplete","@type":"SearchAutocompleteService"},{"@id":"https://azuresearch-ussc.nuget.org/autocomplete","@type":"SearchAutocompleteService/3.5.0"}]}"#;
-        let result = rewrite_service_index(input, "http://nora:4000");
-        assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
-        assert!(!result.contains("azuresearch-usnc.nuget.org/autocomplete"));
-        assert!(!result.contains("azuresearch-ussc.nuget.org/autocomplete"));
-    }
-
-    #[test]
-    fn test_rewrite_service_index_gallery_urls() {
-        let input = r#"{"resources":[{"@id":"https://azuresearch-usnc.nuget.org/query","@type":"SearchQueryService"},{"@id":"https://azuresearch-usnc.nuget.org/autocomplete","@type":"SearchAutocompleteService"},{"@id":"https://azuresearch-usnc.nuget.org/","@type":"SearchGalleryQueryService/3.0.0-rc"},{"@id":"https://azuresearch-ussc.nuget.org/","@type":"SearchGalleryQueryService/3.0.0-rc"}]}"#;
-        let result = rewrite_service_index(input, "http://nora:4000");
         assert!(!result.contains("azuresearch-usnc.nuget.org"));
         assert!(!result.contains("azuresearch-ussc.nuget.org"));
-        assert!(result.contains("http://nora:4000/nuget/v3/query"));
-        assert!(result.contains("http://nora:4000/nuget/v3/autocomplete"));
-        assert!(result.contains("http://nora:4000/nuget/v3/"));
+        assert!(!result.contains("www.nuget.org"));
+        assert!(!result.contains("nuget.org"));
+    }
+
+    #[test]
+    fn test_generate_service_index_only_implemented_resources() {
+        let result = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let types: Vec<&str> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["@type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"PackageBaseAddress/3.0.0"));
+        assert!(types.contains(&"RegistrationsBaseUrl/3.6.0"));
+        assert!(types.contains(&"SearchQueryService"));
+        assert!(types.contains(&"SearchAutocompleteService"));
+        // Must NOT include unimplemented resources
+        assert!(!types.iter().any(|t| t.contains("Catalog")));
+        assert!(!types.iter().any(|t| t.contains("RepositorySignatures")));
+        assert!(!types.iter().any(|t| t.contains("Vulnerability")));
+    }
+
+    #[test]
+    fn test_generate_service_index_trailing_slash() {
+        let result = generate_service_index("http://nora:4000/");
+        // Should not produce double slashes
+        assert!(!result.contains("http://nora:4000//"));
+        assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
     }
 
     #[test]
@@ -1521,25 +1458,22 @@ mod spec_conformance_tests {
             .unwrap_or_else(|e| panic!("failed to load fixture {}: {}", path, e))
     }
 
-    // ── Service index rewrite: golden fixture ──
+    // ── Generated service index: air-gap invariants ──
 
     #[test]
-    fn test_service_index_golden_no_upstream_leak() {
-        let fixture = load_fixture("service-index.json");
-        let rewritten = rewrite_service_index(&fixture, "https://registry.airgap.local");
-        assert_no_upstream_urls(&rewritten, "service-index rewrite");
+    fn test_generated_service_index_no_upstream_leak() {
+        let generated = generate_service_index("https://registry.airgap.local");
+        assert_no_upstream_urls(&generated, "generated service-index");
 
-        // Verify the rewritten JSON is still valid
-        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&generated).unwrap();
         assert!(json["resources"].is_array());
         assert!(!json["resources"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_service_index_golden_correct_replacements() {
-        let fixture = load_fixture("service-index.json");
-        let rewritten = rewrite_service_index(&fixture, "http://nora:4000");
-        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+    fn test_generated_service_index_all_ids_point_to_nora() {
+        let generated = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&generated).unwrap();
         let resources = json["resources"].as_array().unwrap();
 
         // Every @id must start with nora base — no exceptions (air-gap invariant)
@@ -1548,7 +1482,7 @@ mod spec_conformance_tests {
             let res_type = res["@type"].as_str().unwrap_or("");
             assert!(
                 id.starts_with("http://nora:4000/nuget/"),
-                "resource @id not rewritten: {} (type: {})",
+                "resource @id not pointing to NORA: {} (type: {})",
                 id,
                 res_type
             );
@@ -1556,12 +1490,10 @@ mod spec_conformance_tests {
     }
 
     #[test]
-    fn test_service_index_golden_snapshot() {
-        let fixture = load_fixture("service-index.json");
-        let rewritten = rewrite_service_index(&fixture, "http://nora:4000");
-        let json: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+    fn test_generated_service_index_snapshot() {
+        let generated = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&generated).unwrap();
 
-        // Snapshot only the @id fields (stable against upstream comment changes)
         let ids: Vec<&str> = json["resources"]
             .as_array()
             .unwrap()
@@ -1572,22 +1504,10 @@ mod spec_conformance_tests {
     }
 
     #[test]
-    fn test_catalog0_url_rewritten() {
-        let input =
-            r#"{"@id":"https://api.nuget.org/v3/catalog0/index.json","@type":"Catalog/3.0.0"}"#;
-        let result = rewrite_service_index(input, "http://nora:4000");
-        assert!(
-            !result.contains("api.nuget.org"),
-            "catalog0 URL must be rewritten, got: {}",
-            result
-        );
-        assert!(result.contains("http://nora:4000/nuget/v3/catalog0/index.json"));
-    }
-
-    #[test]
-    fn test_search_response_urls_rewritten() {
+    fn test_search_response_registration_urls_rewritten() {
         let upstream_search = r#"{"totalHits":1,"data":[{"id":"Newtonsoft.Json","version":"13.0.3","registration":"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"}]}"#;
-        let rewritten = rewrite_service_index(upstream_search, "http://nora:4000");
+        let rewritten =
+            rewrite_registration_urls(upstream_search, "https://api.nuget.org", "http://nora:4000");
         assert_no_upstream_urls(&rewritten, "search response rewrite");
         assert!(
             rewritten.contains("http://nora:4000/nuget/v3/registration/newtonsoft.json/index.json")
@@ -1596,9 +1516,11 @@ mod spec_conformance_tests {
 
     #[test]
     fn test_autocomplete_response_no_leak() {
+        // Autocomplete responses contain only package names, no URLs to rewrite
         let upstream =
             r#"{"totalHits":5,"data":["Newtonsoft.Json","NUnit","NLog","Nancy","Noda"]}"#;
-        let rewritten = rewrite_service_index(upstream, "http://nora:4000");
+        let rewritten =
+            rewrite_registration_urls(upstream, "https://api.nuget.org", "http://nora:4000");
         assert_no_upstream_urls(&rewritten, "autocomplete response");
     }
 
@@ -1682,15 +1604,9 @@ mod spec_conformance_tests {
             cfg.nuget.proxy = None;
         });
 
-        // Pre-populate a cached service index
-        let fixture = load_fixture("service-index.json");
-        ctx.state
-            .storage
-            .put("nuget/service-index.json", fixture.as_bytes())
-            .await
-            .unwrap();
-
+        // Generated service index — no upstream or fixture needed
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/index.json", "").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let content_type = resp
             .headers()
             .get("content-type")

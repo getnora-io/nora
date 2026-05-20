@@ -1,16 +1,10 @@
 ---
 source: nora-registry/src/registry/nuget.rs
-assertion_line: 1508
 expression: ids
 ---
 [
   "http://nora:4000/nuget/v3/flatcontainer/",
   "http://nora:4000/nuget/v3/registration/",
   "http://nora:4000/nuget/v3/query",
-  "http://nora:4000/nuget/v3/query",
-  "http://nora:4000/nuget/v3/autocomplete",
-  "http://nora:4000/nuget/v3/autocomplete",
-  "http://nora:4000/nuget/v3/",
-  "http://nora:4000/nuget/v3/",
-  "http://nora:4000/nuget/v3/catalog0/index.json"
+  "http://nora:4000/nuget/v3/autocomplete"
 ]
