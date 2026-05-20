@@ -895,7 +895,9 @@ async fn run_server(mut config: Config, storage: Storage) {
                 registry_routes = registry_routes.merge(registry::ansible_routes())
             }
             RegistryType::Nuget => {
-                registry_routes = registry_routes.merge(registry::nuget_routes())
+                registry_routes = registry_routes
+                    .merge(registry::nuget_routes())
+                    .merge(registry::nuget_alias_routes())
             }
             RegistryType::PubDart => {
                 registry_routes = registry_routes.merge(registry::pub_dart_routes())

@@ -161,30 +161,38 @@ pub async fn discover_search_endpoints(
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
+    routes_with_prefix("nuget")
+}
+
+/// Alias routes for Chocolatey and PowerShell Gallery clients.
+/// These serve the same NuGet V3 handlers under alternate path prefixes.
+/// The service index points back to /nuget/ paths, so clients follow those
+/// URLs after initial discovery — storage and caching stay unified.
+pub fn alias_routes() -> Router<Arc<AppState>> {
+    routes_with_prefix("chocolatey").merge(routes_with_prefix("pwsh"))
+}
+
+fn routes_with_prefix(prefix: &str) -> Router<Arc<AppState>> {
     Router::new()
-        // Service index
-        .route("/nuget/v3/index.json", get(service_index))
-        // Search (proxy to upstream SearchQueryService)
-        .route("/nuget/v3/query", get(search_query))
-        // Autocomplete (proxy to upstream SearchAutocompleteService)
-        .route("/nuget/v3/autocomplete", get(autocomplete_query))
-        // Registration index
+        .route(&format!("/{prefix}/v3/index.json"), get(service_index))
+        .route(&format!("/{prefix}/v3/query"), get(search_query))
         .route(
-            "/nuget/v3/registration/{id}/index.json",
+            &format!("/{prefix}/v3/autocomplete"),
+            get(autocomplete_query),
+        )
+        .route(
+            &format!("/{prefix}/v3/registration/{{id}}/index.json"),
             get(registration_index),
         )
-        // Registration page (paginated version ranges)
         .route(
-            "/nuget/v3/registration/{id}/page/{lower}/{*upper}",
+            &format!("/{prefix}/v3/registration/{{id}}/page/{{lower}}/{{*upper}}"),
             get(registration_page),
         )
-        // Flat container: version list + package download (single wildcard)
         .route(
-            "/nuget/v3/flatcontainer/{*path}",
+            &format!("/{prefix}/v3/flatcontainer/{{*path}}"),
             get(flatcontainer_handler),
         )
-        // Catch-all: any unhandled /nuget/v3/ path → 404 + diagnostic log
-        .route("/nuget/v3/{*path}", get(nuget_catchall))
+        .route(&format!("/{prefix}/v3/{{*path}}"), get(nuget_catchall))
 }
 
 // ── Service index ──────────────────────────────────────────────────────
