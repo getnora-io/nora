@@ -248,7 +248,7 @@ async fn registration_index(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.proxy_timeout,
+        state.config.nuget.metadata_proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
@@ -336,7 +336,7 @@ async fn registration_page(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.proxy_timeout,
+        state.config.nuget.metadata_proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
@@ -422,7 +422,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.proxy_timeout,
+        state.config.nuget.metadata_proxy_timeout,
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,

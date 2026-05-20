@@ -486,6 +486,11 @@ pub struct NugetConfig {
     pub proxy_auth: Option<String>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+    /// Timeout for metadata requests (registration, version list) in seconds.
+    /// Metadata responses are small JSON; lower timeout improves air-gap stale
+    /// restore by letting the circuit breaker open faster. Default: 2s.
+    #[serde(default = "default_nuget_metadata_timeout")]
+    pub metadata_proxy_timeout: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
     /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
@@ -513,6 +518,10 @@ fn default_nuget_autocomplete() -> String {
     "https://azuresearch-usnc.nuget.org/autocomplete".to_string()
 }
 
+fn default_nuget_metadata_timeout() -> u64 {
+    2
+}
+
 impl Default for NugetConfig {
     fn default() -> Self {
         Self {
@@ -520,6 +529,7 @@ impl Default for NugetConfig {
             proxy: default_nuget_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
+            metadata_proxy_timeout: 2,
             metadata_ttl: 300,
             serve_stale: true,
             search_service: default_nuget_search(),
@@ -2283,6 +2293,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_NUGET_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
                 self.nuget.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_NUGET_METADATA_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.nuget.metadata_proxy_timeout = timeout;
             }
         }
         if let Ok(val) = env::var("NORA_NUGET_METADATA_TTL") {
