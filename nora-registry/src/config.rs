@@ -490,6 +490,9 @@ pub struct NugetConfig {
     /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Serve stale cached metadata when upstream is unreachable (default: true).
+    #[serde(default = "default_true")]
+    pub serve_stale: bool,
     /// Upstream NuGet search service URL
     #[serde(default = "default_nuget_search")]
     pub search_service: String,
@@ -518,6 +521,7 @@ impl Default for NugetConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            serve_stale: true,
             search_service: default_nuget_search(),
             autocomplete: default_nuget_autocomplete(),
         }
@@ -2285,6 +2289,9 @@ impl Config {
             if let Ok(ttl) = val.parse() {
                 self.nuget.metadata_ttl = ttl;
             }
+        }
+        if let Ok(val) = env::var("NORA_NUGET_SERVE_STALE") {
+            self.nuget.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
         if let Ok(val) = env::var("NORA_NUGET_SEARCH_SERVICE") {
             if !val.is_empty() {

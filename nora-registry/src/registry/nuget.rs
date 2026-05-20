@@ -223,13 +223,16 @@ async fn registration_index(
     let base_url = nora_base_url(&state);
     let upstream = upstream_url(&state);
 
+    // Read cache eagerly so stale data is available on upstream failure.
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit();
-                let text = String::from_utf8_lossy(&data);
+                let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
                 return with_json(rewritten.into_bytes());
             }
@@ -275,7 +278,8 @@ async fn registration_index(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration error");
-            StatusCode::BAD_GATEWAY.into_response()
+            let rewrite = Some((upstream.as_str(), base_url.as_str()));
+            serve_stale_or_not_found(&state, cached_data, "registration_index", rewrite)
         }
     }
 }
@@ -305,13 +309,16 @@ async fn registration_page(
         id_lower, lower, upper
     );
 
+    // Read cache eagerly so stale data is available on upstream failure.
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
     // TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit();
-                let text = String::from_utf8_lossy(&data);
+                let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
                 return with_json(rewritten.into_bytes());
             }
@@ -355,7 +362,8 @@ async fn registration_page(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet registration page error");
-            StatusCode::BAD_GATEWAY.into_response()
+            let rewrite = Some((upstream.as_str(), base_url.as_str()));
+            serve_stale_or_not_found(&state, cached_data, "registration_page", rewrite)
         }
     }
 }
@@ -390,8 +398,11 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
 
     let storage_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
 
+    // Read cache eagerly so stale data is available on upstream failure.
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
     // TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
@@ -439,7 +450,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet version list error");
-            StatusCode::BAD_GATEWAY.into_response()
+            serve_stale_or_not_found(&state, cached_data, "version_list", None)
         }
     }
 }
@@ -622,9 +633,60 @@ async fn flatcontainer_download(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "NuGet download error");
-            StatusCode::BAD_GATEWAY.into_response()
+            // Binary was not cached and upstream is unreachable — package not available here.
+            StatusCode::NOT_FOUND.into_response()
         }
     }
+}
+
+// ── Stale-while-error helper ──────────────────────────────────────────
+
+/// Serve stale cached metadata when upstream is unreachable, or 404 if no cache.
+///
+/// If `rewrite_ctx` is `Some((upstream, base_url))`, registration URL rewriting
+/// is applied to the stale response (for registration endpoints).
+fn serve_stale_or_not_found(
+    state: &AppState,
+    cached: Option<Bytes>,
+    label: &str,
+    rewrite_ctx: Option<(&str, &str)>,
+) -> Response {
+    if let Some(data) = cached {
+        if state.config.nuget.serve_stale {
+            tracing::warn!(
+                registry = "nuget",
+                endpoint = label,
+                "Upstream unreachable, serving stale cached metadata"
+            );
+            let body = if let Some((upstream, base_url)) = rewrite_ctx {
+                let text = String::from_utf8_lossy(&data);
+                rewrite_registration_urls(&text, upstream, base_url).into_bytes()
+            } else {
+                data.to_vec()
+            };
+            return (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                    ),
+                    (
+                        axum::http::header::HeaderName::from_static("x-nora-stale"),
+                        axum::http::header::HeaderValue::from_static("true"),
+                    ),
+                ],
+                body,
+            )
+                .into_response();
+        }
+    }
+    // No cached data or serve_stale disabled — package not available here.
+    StatusCode::NOT_FOUND.into_response()
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1115,6 +1177,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[doc = "No cache + unreachable upstream → 404 (not 502) since #410"]
     async fn test_nuget_unreachable_proxy() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
@@ -1128,7 +1191,123 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=true → 200 with X-Nora-Stale header (#409)
+    #[tokio::test]
+    async fn test_serve_stale_version_list() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_ttl = 0; // force TTL expiry
+            cfg.nuget.serve_stale = true;
+        });
+        // Seed cache
+        let versions = br#"{"versions":["1.0.0","2.0.0"]}"#;
+        ctx.state
+            .storage
+            .put("nuget/flatcontainer/test-package/index.json", versions)
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/test-package/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
+        let body = body_bytes(resp).await;
+        assert!(body.starts_with(b"{\"versions\""));
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=false → 404 (#409)
+    #[tokio::test]
+    async fn test_serve_stale_disabled_returns_404() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_ttl = 0;
+            cfg.nuget.serve_stale = false;
+        });
+        // Seed cache
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/test-package/index.json",
+                br#"{"versions":["1.0.0"]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/test-package/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+    }
+
+    /// Uncached .nupkg + unreachable upstream → 404 (not 502) (#410)
+    #[tokio::test]
+    async fn test_uncached_nupkg_returns_404_not_502() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/nosuch-pkg/1.0.0/nosuch-pkg.1.0.0.nupkg",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Stale registration index is served with URL rewriting (#409)
+    #[tokio::test]
+    async fn test_serve_stale_registration_index() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.proxy_timeout = 1;
+            cfg.nuget.metadata_ttl = 0;
+            cfg.nuget.serve_stale = true;
+        });
+        // Seed registration cache
+        let reg_json =
+            br#"{"items":[{"@id":"http://127.0.0.1:1/v3/registration/test-pkg/index.json"}]}"#;
+        ctx.state
+            .storage
+            .put("nuget/registration/test-pkg/index.json", reg_json)
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/test-pkg/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
     }
 
     #[tokio::test]
@@ -1445,6 +1624,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[doc = "No cache + unreachable upstream → 404 (not 502) since #410"]
     async fn test_registration_page_unreachable_upstream() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
@@ -1459,7 +1639,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 
