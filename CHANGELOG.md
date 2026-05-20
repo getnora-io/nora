@@ -21,7 +21,7 @@
 
 ### Changed
 - **Manifest response builder** — extracted `manifest_response()` helper, removing 3 duplicate return paths in Docker registry (#338)
-- **Env var naming convention** — shortened variables to `NORA_{SECTION}_{FIELD}` under 30 chars: `NORA_TERRAFORM_*` → `NORA_TF_*`, `*_PROXY_TIMEOUT_DOWNLOAD` → `*_PROXY_TIMEOUT_DL`, `NORA_CURATION_INTERNAL_NAMESPACES` → `NORA_CURATION_INTERNAL_NS`
+- **Env var naming convention** — shortened variables to `NORA_{SECTION}_{FIELD}` pattern (under 30 chars), e.g. `NORA_TF_*`, `NORA_CURATION_INTERNAL_NS`
 
 ## [0.8.4] - 2026-05-15
 

@@ -2547,6 +2547,13 @@ impl Default for Config {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
+
+    lazy_static! {
+        /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
+        static ref ENV_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     #[test]
     fn test_rate_limit_default() {
@@ -3349,6 +3356,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_mode() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_MODE", "enforce");
         config.apply_env_overrides();
@@ -3358,6 +3366,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_on_failure() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ON_FAILURE", "open");
         config.apply_env_overrides();
@@ -3380,6 +3389,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_paths() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ALLOWLIST_PATH", "/etc/nora/allow.json");
         std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", "/etc/nora/block.json");
@@ -3398,6 +3408,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_bypass_token() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
         config.apply_env_overrides();
@@ -3410,6 +3421,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_require_integrity() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_REQUIRE_INTEGRITY", "true");
         config.apply_env_overrides();
@@ -3419,6 +3431,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_quarantine() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE", "observe");
         config.apply_env_overrides();
@@ -3428,6 +3441,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_quarantine_ttl() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE_TTL", "14d");
         config.apply_env_overrides();
@@ -3437,8 +3451,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_per_registry_quarantine() {
-        // Clear global quarantine env var to avoid race with test_curation_env_override_quarantine
-        std::env::remove_var("NORA_CURATION_QUARANTINE");
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
