@@ -151,11 +151,17 @@ async fn search_query(
 
 async fn autocomplete_query(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
-    // No upstream proxy configured → return empty results
+    let query = params.q.unwrap_or_default();
+    let skip = params.skip.unwrap_or(0);
+    let take = params.take.unwrap_or(20);
+
+    // No upstream proxy configured → local autocomplete from cache
     if state.config.nuget.proxy.is_none() {
-        return with_json(br#"{"totalHits":0,"data":[]}"#.to_vec());
+        let data = local_autocomplete_results(&state, &query, skip, take).await;
+        return with_json(data);
     }
 
     let qs = raw_query.0.unwrap_or_default();
@@ -186,9 +192,11 @@ async fn autocomplete_query(
             ));
             with_json(rewritten.into_bytes())
         }
-        Err(_) => {
-            // Autocomplete is UX convenience, not correctness-critical
-            with_json(br#"{"totalHits":0,"data":[]}"#.to_vec())
+        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+            tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
+            let data = local_autocomplete_results(&state, &query, skip, take).await;
+            with_json(data)
         }
     }
 }
@@ -857,6 +865,37 @@ async fn local_search_results(
     let result = serde_json::json!({
         "totalHits": total_hits,
         "data": data,
+    });
+    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+}
+
+/// Build local autocomplete results from the in-memory repo index.
+/// Returns package name strings (not full search objects) per NuGet autocomplete spec.
+async fn local_autocomplete_results(
+    state: &AppState,
+    query: &str,
+    skip: usize,
+    take: usize,
+) -> Vec<u8> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+
+    let query_lower = query.to_lowercase();
+    let filtered: Vec<&crate::repo_index::RepoInfo> = packages
+        .iter()
+        .filter(|pkg| query_lower.is_empty() || pkg.name.to_lowercase().contains(&query_lower))
+        .collect();
+
+    let total_hits = filtered.len();
+    let names: Vec<&str> = filtered
+        .into_iter()
+        .skip(skip)
+        .take(take)
+        .map(|pkg| pkg.name.as_str())
+        .collect();
+
+    let result = serde_json::json!({
+        "totalHits": total_hits,
+        "data": names,
     });
     serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
 }
