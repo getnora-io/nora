@@ -775,7 +775,7 @@ fn init_logging(json_format: bool) {
     }
 }
 
-async fn run_server(config: Config, storage: Storage) {
+async fn run_server(mut config: Config, storage: Storage) {
     let start_time = Instant::now();
 
     // Log rate limiting configuration
@@ -828,6 +828,11 @@ async fn run_server(config: Config, storage: Storage) {
 
     let http_client = build_http_client(&config.tls);
     log_outbound_proxy();
+
+    // Discover NuGet search endpoints from upstream service index
+    if config.nuget.enabled {
+        registry::nuget::discover_search_endpoints(&http_client, &mut config.nuget).await;
+    }
 
     // Validate curation config at startup — panic in enforce mode on errors
     if config.curation.mode == CurationMode::Enforce {

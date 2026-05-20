@@ -33,6 +33,8 @@ use std::sync::Arc;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_SEARCH: &str = "https://azuresearch-usnc.nuget.org/query";
+const DEFAULT_AUTOCOMPLETE: &str = "https://azuresearch-usnc.nuget.org/autocomplete";
 
 #[derive(Deserialize)]
 struct SearchParams {
@@ -46,6 +48,117 @@ struct SearchParams {
 /// Storage prefix and file suffix for repo index scanning.
 /// Count .nupkg files (not index.json) so size reflects actual packages.
 pub const INDEX_PATTERN: (&str, &str) = ("nuget/flatcontainer/", ".nupkg");
+
+/// Discover search and autocomplete endpoints from the upstream NuGet V3 service index.
+///
+/// When the proxy URL differs from the default (api.nuget.org), the hardcoded
+/// Azure Search URLs won't work for private feeds. This function fetches the
+/// feed's service index and extracts the correct SearchQueryService and
+/// SearchAutocompleteService URLs.
+///
+/// Only runs if search_service/autocomplete are still at their default values
+/// (user overrides via env vars take precedence). Falls back silently on error.
+pub async fn discover_search_endpoints(
+    client: &reqwest::Client,
+    config: &mut crate::config::NugetConfig,
+) {
+    let proxy_url = match &config.proxy {
+        Some(url) => url.clone(),
+        None => return, // no proxy configured
+    };
+
+    // Only discover if proxy is non-default AND search/autocomplete are at defaults
+    let proxy_base = strip_url_path(&proxy_url);
+    if proxy_base == UPSTREAM_DEFAULT {
+        return; // using default upstream, Azure Search URLs are correct
+    }
+    let search_is_default = config.search_service == DEFAULT_SEARCH;
+    let autocomplete_is_default = config.autocomplete == DEFAULT_AUTOCOMPLETE;
+    if !search_is_default && !autocomplete_is_default {
+        return; // user has overridden both, respect their config
+    }
+
+    // Fetch the upstream service index
+    let index_url = format!("{}/v3/index.json", proxy_base);
+    tracing::info!(
+        url = %index_url,
+        "NuGet: discovering search endpoints from upstream service index"
+    );
+
+    let resp = match client
+        .get(&index_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(
+                status = %r.status(),
+                url = %index_url,
+                "NuGet: service index discovery failed, keeping defaults"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                url = %index_url,
+                "NuGet: service index discovery failed, keeping defaults"
+            );
+            return;
+        }
+    };
+
+    let body = match resp.text().await {
+        Ok(t) if t.len() > 1_048_576 => {
+            tracing::warn!(
+                size = t.len(),
+                "NuGet: service index too large, skipping discovery"
+            );
+            return;
+        }
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "NuGet: failed to read service index body");
+            return;
+        }
+    };
+
+    let index: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "NuGet: failed to parse service index JSON");
+            return;
+        }
+    };
+
+    let resources = match index.get("resources").and_then(|r| r.as_array()) {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!("NuGet: service index has no 'resources' array");
+            return;
+        }
+    };
+
+    // Find SearchQueryService and SearchAutocompleteService
+    for resource in resources {
+        let rtype = resource.get("@type").and_then(|t| t.as_str()).unwrap_or("");
+        let rid = resource.get("@id").and_then(|id| id.as_str()).unwrap_or("");
+        if rid.is_empty() || !(rid.starts_with("https://") || rid.starts_with("http://")) {
+            continue;
+        }
+
+        if search_is_default && rtype.starts_with("SearchQueryService") {
+            tracing::info!(url = %rid, "NuGet: discovered search endpoint");
+            config.search_service = rid.to_string();
+        }
+        if autocomplete_is_default && rtype.starts_with("SearchAutocompleteService") {
+            tracing::info!(url = %rid, "NuGet: discovered autocomplete endpoint");
+            config.autocomplete = rid.to_string();
+        }
+    }
+}
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
