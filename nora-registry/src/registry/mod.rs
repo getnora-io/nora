@@ -25,6 +25,7 @@ pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
+pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;

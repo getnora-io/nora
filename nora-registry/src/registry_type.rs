@@ -138,7 +138,7 @@ impl RegistryType {
             "gems" | "rubygems" => Some(Self::Gems),
             "terraform" => Some(Self::Terraform),
             "ansible" => Some(Self::Ansible),
-            "nuget" => Some(Self::Nuget),
+            "nuget" | "chocolatey" | "choco" | "powershellgallery" | "pwsh" => Some(Self::Nuget),
             "pub" | "pub_dart" | "dart" => Some(Self::PubDart),
             "conan" => Some(Self::Conan),
             _ => None,
