@@ -660,12 +660,27 @@ async fn extract_nuget_publish_date(
 }
 
 fn upstream_url(state: &AppState) -> String {
-    state
+    let raw = state
         .config
         .nuget
         .proxy
         .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string());
+    strip_url_path(&raw)
+}
+
+/// Keep only `scheme://authority` from a URL, stripping path/query/fragment.
+///
+/// Callers append their own paths (e.g. `/v3-flatcontainer/`, `/v3/registration5-gz-semver2/`),
+/// so the path component (e.g. `/v3/index.json`) must be stripped.
+fn strip_url_path(url: &str) -> String {
+    if let Some(idx) = url.find("://") {
+        let after_scheme = &url[idx + 3..];
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        url[..idx + 3 + authority_end].to_string()
+    } else {
+        url.to_string()
+    }
 }
 
 use crate::cache_ttl::is_within_ttl;
@@ -906,6 +921,46 @@ mod tests {
         assert!(!is_valid_package_id(""));
         assert!(!is_valid_package_id("../evil"));
         assert!(!is_valid_package_id("foo/bar"));
+    }
+
+    #[test]
+    fn test_strip_url_path_with_index_json() {
+        assert_eq!(
+            strip_url_path("https://api.nuget.org/v3/index.json"),
+            "https://api.nuget.org"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_path_no_path() {
+        assert_eq!(
+            strip_url_path("https://api.nuget.org"),
+            "https://api.nuget.org"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_path_trailing_slash() {
+        assert_eq!(
+            strip_url_path("https://api.nuget.org/"),
+            "https://api.nuget.org"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_path_custom_port() {
+        assert_eq!(
+            strip_url_path("https://artifact.company.local:8443/nuget/v3/index.json"),
+            "https://artifact.company.local:8443"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_path_http() {
+        assert_eq!(
+            strip_url_path("http://localhost:4000/nuget/v3/index.json"),
+            "http://localhost:4000"
+        );
     }
 
     #[test]
