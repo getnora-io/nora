@@ -41,8 +41,9 @@ struct SearchParams {
     q: Option<String>,
     skip: Option<usize>,
     take: Option<usize>,
-    #[allow(dead_code)]
     prerelease: Option<bool>,
+    #[serde(rename = "semVerLevel")]
+    sem_ver_level: Option<String>,
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -216,17 +217,27 @@ async fn service_index(State(state): State<Arc<AppState>>) -> Response {
 
 async fn search_query(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
     let take = params.take.unwrap_or(20);
+    let prerelease = params.prerelease.unwrap_or(false);
+    let sem_ver_level = params.sem_ver_level;
 
     // No upstream proxy configured → local search directly
     if state.config.nuget.proxy.is_none() {
-        let data = local_search_results(&state, &headers, &query, skip, take).await;
+        let data = local_search_results(
+            &state,
+            &query,
+            skip,
+            take,
+            prerelease,
+            sem_ver_level.as_deref(),
+        )
+        .await;
         return with_json(data);
     }
 
@@ -262,7 +273,15 @@ async fn search_query(
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             tracing::info!("NuGet search: upstream unavailable, using local index");
-            let data = local_search_results(&state, &headers, &query, skip, take).await;
+            let data = local_search_results(
+                &state,
+                &query,
+                skip,
+                take,
+                prerelease,
+                sem_ver_level.as_deref(),
+            )
+            .await;
             with_json(data)
         }
     }
@@ -278,10 +297,20 @@ async fn autocomplete_query(
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
     let take = params.take.unwrap_or(20);
+    let prerelease = params.prerelease.unwrap_or(false);
+    let sem_ver_level = params.sem_ver_level;
 
     // No upstream proxy configured → local autocomplete from cache
     if state.config.nuget.proxy.is_none() {
-        let data = local_autocomplete_results(&state, &query, skip, take).await;
+        let data = local_autocomplete_results(
+            &state,
+            &query,
+            skip,
+            take,
+            prerelease,
+            sem_ver_level.as_deref(),
+        )
+        .await;
         return with_json(data);
     }
 
@@ -316,7 +345,15 @@ async fn autocomplete_query(
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
             tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
-            let data = local_autocomplete_results(&state, &query, skip, take).await;
+            let data = local_autocomplete_results(
+                &state,
+                &query,
+                skip,
+                take,
+                prerelease,
+                sem_ver_level.as_deref(),
+            )
+            .await;
             with_json(data)
         }
     }
@@ -363,7 +400,7 @@ async fn registration_index(
                 state.metrics.record_cache_hit();
                 let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-                return with_json(rewritten.into_bytes());
+                return with_json_gzip(rewritten.into_bytes());
             }
         }
     }
@@ -401,7 +438,7 @@ async fn registration_index(
             // Cache raw response, rewrite on serve
             state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            with_json(rewritten.into_bytes())
+            with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -449,7 +486,7 @@ async fn registration_page(
                 state.metrics.record_cache_hit();
                 let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-                return with_json(rewritten.into_bytes());
+                return with_json_gzip(rewritten.into_bytes());
             }
         }
     }
@@ -485,7 +522,7 @@ async fn registration_page(
 
             state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            with_json(rewritten.into_bytes())
+            with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -901,6 +938,33 @@ fn with_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// Build a gzip-compressed JSON response for registration endpoints.
+///
+/// The service index advertises `RegistrationsBaseUrl/3.6.0`, which per NuGet spec
+/// means responses are gzip-encoded.  Falls back to plain JSON if compression fails.
+fn with_json_gzip(data: Vec<u8>) -> Response {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    match std::io::Write::write_all(&mut encoder, &data).and_then(|_| encoder.finish()) {
+        Ok(compressed) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                ),
+                (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=60, must-revalidate"),
+                ),
+            ],
+            compressed,
+        )
+            .into_response(),
+        Err(_) => with_json(data), // fallback: plain JSON if gzip fails
+    }
+}
+
 // ── Local search helpers ───────────────────────────────────────────────
 
 /// Read cached version list from flatcontainer index.json.
@@ -957,12 +1021,18 @@ fn build_search_entry(
 }
 
 /// Build local search results from the in-memory repo index.
+///
+/// When `prerelease` is false, versions containing a hyphen (SemVer pre-release)
+/// are excluded. When `sem_ver_level` is not `"2.0.0"`, SemVer 2.0 versions
+/// (dot-separated pre-release or build metadata) are hidden.
+/// Packages with zero remaining versions are omitted entirely.
 async fn local_search_results(
     state: &AppState,
-    _headers: &HeaderMap,
     query: &str,
     skip: usize,
     take: usize,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
     let base_url = nora_base_url(state);
@@ -973,46 +1043,84 @@ async fn local_search_results(
         .filter(|pkg| query_lower.is_empty() || pkg.name.to_lowercase().contains(&query_lower))
         .collect();
 
-    let total_hits = filtered.len();
-    let page: Vec<&crate::repo_index::RepoInfo> =
-        filtered.into_iter().skip(skip).take(take).collect();
-
-    let mut data = Vec::with_capacity(page.len());
-    for pkg in &page {
-        let versions = get_cached_versions(&state.storage, &pkg.name).await;
+    let mut data = Vec::new();
+    for pkg in &filtered {
+        let all_versions = get_cached_versions(&state.storage, &pkg.name).await;
+        let versions: Vec<String> = if prerelease {
+            all_versions
+        } else {
+            all_versions
+                .into_iter()
+                .filter(|v| !v.contains('-'))
+                .collect()
+        };
+        // Hide SemVer 2.0 versions unless semVerLevel=2.0.0
+        let versions: Vec<String> = if sem_ver_level == Some("2.0.0") {
+            versions
+        } else {
+            versions
+                .into_iter()
+                .filter(|v| !is_semver2_version(v))
+                .collect()
+        };
+        if versions.is_empty() {
+            continue;
+        }
         data.push(build_search_entry(&base_url, pkg, &versions));
     }
 
+    let total_hits = data.len();
+    let page: Vec<serde_json::Value> = data.into_iter().skip(skip).take(take).collect();
+
     let result = serde_json::json!({
         "totalHits": total_hits,
-        "data": data,
+        "data": page,
     });
     serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
 }
 
 /// Build local autocomplete results from the in-memory repo index.
 /// Returns package name strings (not full search objects) per NuGet autocomplete spec.
+///
+/// When `prerelease` is false, packages that have only pre-release versions are omitted.
+/// When `sem_ver_level` is not `"2.0.0"`, packages with only SemVer 2.0 versions are hidden.
 async fn local_autocomplete_results(
     state: &AppState,
     query: &str,
     skip: usize,
     take: usize,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
 
     let query_lower = query.to_lowercase();
-    let filtered: Vec<&crate::repo_index::RepoInfo> = packages
-        .iter()
-        .filter(|pkg| query_lower.is_empty() || pkg.name.to_lowercase().contains(&query_lower))
-        .collect();
+    let mut matched: Vec<&str> = Vec::new();
+    for pkg in packages.iter() {
+        if !query_lower.is_empty() && !pkg.name.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+        let versions = get_cached_versions(&state.storage, &pkg.name).await;
+        // Apply prerelease filter
+        let versions: Vec<&String> = if prerelease {
+            versions.iter().collect()
+        } else {
+            versions.iter().filter(|v| !v.contains('-')).collect()
+        };
+        // Apply SemVer 2.0 filter
+        let versions: Vec<&&String> = if sem_ver_level == Some("2.0.0") {
+            versions.iter().collect()
+        } else {
+            versions.iter().filter(|v| !is_semver2_version(v)).collect()
+        };
+        if versions.is_empty() {
+            continue;
+        }
+        matched.push(pkg.name.as_str());
+    }
 
-    let total_hits = filtered.len();
-    let names: Vec<&str> = filtered
-        .into_iter()
-        .skip(skip)
-        .take(take)
-        .map(|pkg| pkg.name.as_str())
-        .collect();
+    let total_hits = matched.len();
+    let names: Vec<&str> = matched.into_iter().skip(skip).take(take).collect();
 
     let result = serde_json::json!({
         "totalHits": total_hits,
@@ -1074,6 +1182,10 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
     let nora_reg = format!("{}/v3/registration/", nora_nuget);
 
+    // Rewrite registration and flatcontainer URLs to point to Nora.
+    // catalog0 URLs (catalogEntry.@id) are intentionally left as-is: Nora has
+    // no catalog handler, and NuGet clients do not fetch these during restore.
+    // Rewriting them would produce Nora URLs that 404.
     json_text
         .replace(
             &format!("{}/v3/registration5-semver1/", upstream),
@@ -1086,11 +1198,6 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
         .replace(
             &format!("{}/v3/registration5-gz-semver2/", upstream),
             &nora_reg,
-        )
-        // Rewrite catalog0 URLs in catalogEntry fields (air-gap bypass)
-        .replace(
-            &format!("{}/v3/catalog0/", upstream),
-            &format!("{}/v3/catalog0/", nora_nuget),
         )
         .replace(
             &format!("{}/v3-flatcontainer/", upstream),
@@ -1121,6 +1228,21 @@ fn is_valid_package_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+/// Check if a version string uses SemVer 2.0.0 features.
+///
+/// SemVer 2.0 = dot-separated pre-release identifiers (`1.0.0-rc.1`)
+/// OR build metadata (`1.0.0+build`).  NuGet V3 search/autocomplete hides
+/// such versions unless `semVerLevel=2.0.0` is passed.
+fn is_semver2_version(version: &str) -> bool {
+    if version.contains('+') {
+        return true;
+    }
+    if let Some(idx) = version.find('-') {
+        return version[idx + 1..].contains('.');
+    }
+    false
 }
 
 fn is_safe_path(path: &str) -> bool {
@@ -1298,6 +1420,64 @@ mod tests {
         assert!(!is_valid_version("foo\0bar"));
         assert!(!is_valid_version("1..0"));
         assert!(!is_valid_version("1.0.0\\evil"));
+    }
+
+    #[test]
+    fn test_is_semver2_version() {
+        // SemVer 2.0: dot-separated pre-release identifiers
+        assert!(is_semver2_version("1.0.0-rc.1"));
+        assert!(is_semver2_version("9.0.0-rc.1.24431.7"));
+        assert!(is_semver2_version("1.0.0-beta.2.3"));
+
+        // SemVer 2.0: build metadata
+        assert!(is_semver2_version("1.0.0+build"));
+        assert!(is_semver2_version("1.0.0-alpha+001"));
+
+        // SemVer 1.0: simple pre-release (no dots after hyphen)
+        assert!(!is_semver2_version("1.0.0-alpha"));
+        assert!(!is_semver2_version("1.0.0-beta1"));
+        assert!(!is_semver2_version("2.0.0-preview"));
+
+        // Stable versions: not SemVer 2.0
+        assert!(!is_semver2_version("1.0.0"));
+        assert!(!is_semver2_version("13.0.3"));
+    }
+
+    #[test]
+    fn test_registration_returns_gzip_content_encoding() {
+        let resp = with_json_gzip(br#"{"count":1}"#.to_vec());
+        let (parts, body) = resp.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(
+            parts.headers.get("content-encoding").map(|v| v.as_bytes()),
+            Some(b"gzip".as_slice()),
+        );
+        assert_eq!(
+            parts.headers.get("content-type").map(|v| v.as_bytes()),
+            Some(b"application/json".as_slice()),
+        );
+
+        // Decompress body and verify round-trip
+        use axum::body::Body;
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let body_bytes =
+            futures::executor::block_on(axum::body::to_bytes(Body::new(body), 1 << 20)).unwrap();
+        let mut decoder = GzDecoder::new(&body_bytes[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert_eq!(decompressed, r#"{"count":1}"#);
+    }
+
+    #[test]
+    fn test_service_index_no_gzip() {
+        let resp = with_json(br#"{"version":"3.0.0"}"#.to_vec());
+        let (parts, _body) = resp.into_parts();
+        assert!(
+            parts.headers.get("content-encoding").is_none(),
+            "service index (with_json) must NOT have Content-Encoding header"
+        );
     }
 }
 
@@ -1720,6 +1900,73 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_local_search_sem_ver_level_filters_v2() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+
+        // Package with SemVer 2.0 version (dot-separated pre-release)
+        let index = serde_json::json!({"versions": ["1.0.0", "2.0.0-rc.1"]});
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/semver2pkg/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/semver2pkg/1.0.0/semver2pkg.1.0.0.nupkg",
+                b"fake-nupkg",
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        // Without semVerLevel → SemVer2 version hidden, only 1.0.0 visible
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=semver2pkg&prerelease=true",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = &json["data"][0];
+        let versions = entry["versions"].as_array().unwrap();
+        assert_eq!(
+            versions.len(),
+            1,
+            "without semVerLevel, SemVer2 must be hidden"
+        );
+        assert_eq!(versions[0]["version"].as_str().unwrap(), "1.0.0");
+
+        // With semVerLevel=2.0.0 → both versions visible
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=semver2pkg&prerelease=true&semVerLevel=2.0.0",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = &json["data"][0];
+        let versions = entry["versions"].as_array().unwrap();
+        assert_eq!(
+            versions.len(),
+            2,
+            "with semVerLevel=2.0.0, SemVer2 must be visible"
+        );
+    }
+
+    #[tokio::test]
     async fn test_autocomplete_no_upstream_returns_empty() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
@@ -1828,9 +2075,10 @@ mod spec_conformance_tests {
         "azuresearch-ussc.nuget.org",
     ];
 
-    /// Known URL patterns in NuGet responses that are NOT client-fetchable:
-    /// (all patterns now rewritten — kept for future use)
-    const NUGET_EXCLUDED_PATTERNS: &[&str] = &[];
+    /// Known URL patterns in NuGet responses that are NOT client-fetchable
+    /// and intentionally left unrewritten. catalog0 URLs appear in
+    /// catalogEntry.@id fields but NuGet clients never fetch them during restore.
+    const NUGET_EXCLUDED_PATTERNS: &[&str] = &["/v3/catalog0/"];
 
     /// Assert that no upstream URLs remain in a rewritten response body,
     /// excluding known non-client-fetchable URL patterns.
@@ -1997,7 +2245,7 @@ mod spec_conformance_tests {
     // ── Content-Type assertions ──
 
     #[tokio::test]
-    async fn test_service_index_content_type() {
+    async fn test_service_index_content_type_no_gzip() {
         use crate::test_helpers::{create_test_context_with_config, send};
         use axum::http::Method;
 
@@ -2019,10 +2267,16 @@ mod spec_conformance_tests {
             "NuGet service index must return application/json, got: {}",
             content_type
         );
+
+        // Service index must NOT be gzip-encoded (only registration endpoints are)
+        assert!(
+            resp.headers().get("content-encoding").is_none(),
+            "service index must not have Content-Encoding header"
+        );
     }
 
     #[tokio::test]
-    async fn test_cached_registration_content_type() {
+    async fn test_cached_registration_content_type_and_gzip() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::Method;
 
@@ -2058,10 +2312,23 @@ mod spec_conformance_tests {
             content_type
         );
 
-        // Verify the rewritten body has no upstream URLs
+        // Registration must be gzip-encoded (RegistrationsBaseUrl/3.6.0 spec)
+        let content_encoding = resp
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("");
+        assert_eq!(
+            content_encoding, "gzip",
+            "registration response must have Content-Encoding: gzip"
+        );
+
+        // Decompress and verify the rewritten body has no upstream URLs
         let body = body_bytes(resp).await;
-        let body_str = String::from_utf8_lossy(&body);
-        assert_no_upstream_urls(&body_str, "cached registration index response");
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut decompressed = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decompressed).unwrap();
+        assert_no_upstream_urls(&decompressed, "cached registration index response");
     }
 
     // ── Cache-Control assertions ──
