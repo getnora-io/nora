@@ -45,17 +45,6 @@ set -euo pipefail
 #  [ ] Package publish (Nora is read-only proxy)
 #  [ ] Vulnerability, Catalog, Repository Signatures APIs (not proxied)
 #
-# ── Industry comparison (May 2025 research) ──────────────────────────────
-#  BaGet:            JSON snapshot assertions, in-process server, no real CLI, no air-gap
-#  JFrog CLI:        real dotnet restore against Artifactory, no URL leak checks, no air-gap
-#  NuGet.Client:     mock StaticHttpHandler, no proxy testing at all
-#  Verdaccio:        closest to stale/offline (npm), ETag/304, but all via mocks
-#  Artifact-Keeper:  12 formats with native CLI e2e (pip/npm/cargo/helm/apt/dnf),
-#                    but NuGet = 1 basic API test, no dotnet restore, no service index check.
-#                    Good patterns: Docker Compose profiles, failure injection, cache timing.
-#  Nexus/ProGet/Cloudsmith: no public test code for NuGet proxy
-#  → No known project tests NuGet URL leak detection or air-gap with network isolation.
-#
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
