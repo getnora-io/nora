@@ -1869,6 +1869,7 @@ dependencies = [
  "jsonwebtoken",
  "lazy_static",
  "md-5 0.11.0",
+ "memchr",
  "object_store",
  "parking_lot",
  "percent-encoding",

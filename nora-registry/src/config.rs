@@ -1683,6 +1683,75 @@ impl Config {
         }
     }
 
+    /// Collect all configured upstream hostnames for leak detection (#386).
+    ///
+    /// Returns `(registry_name, hostname)` pairs extracted from proxy URLs.
+    /// Used once at startup to pre-compile substring searchers.
+    pub fn upstream_hostnames(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+
+        let extract_host = |url: &str| -> Option<String> {
+            let without_scheme = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url);
+            let host = without_scheme.split('/').next()?;
+            let host = host.split(':').next()?;
+            if host.is_empty() || host == "localhost" || host == "127.0.0.1" {
+                return None;
+            }
+            Some(host.to_lowercase())
+        };
+
+        // Simple proxy: Option<String>
+        let simple = [
+            ("npm", self.npm.proxy.as_deref()),
+            ("pypi", self.pypi.proxy.as_deref()),
+            ("cargo", self.cargo.proxy.as_deref()),
+            ("go", self.go.proxy.as_deref()),
+            ("gems", self.gems.proxy.as_deref()),
+            ("terraform", self.terraform.proxy.as_deref()),
+            ("ansible", self.ansible.proxy.as_deref()),
+            ("nuget", self.nuget.proxy.as_deref()),
+            ("pub", self.pub_dart.proxy.as_deref()),
+            ("conan", self.conan.proxy.as_deref()),
+        ];
+        for (name, url) in simple {
+            if let Some(url) = url {
+                if let Some(host) = extract_host(url) {
+                    result.push((name.to_string(), host));
+                }
+            }
+        }
+
+        // NuGet extra search/autocomplete URLs
+        if let Some(host) = extract_host(&self.nuget.search_service) {
+            result.push(("nuget".to_string(), host));
+        }
+        if let Some(host) = extract_host(&self.nuget.autocomplete) {
+            result.push(("nuget".to_string(), host));
+        }
+
+        // Docker upstreams: Vec<DockerUpstream>
+        for upstream in &self.docker.upstreams {
+            if let Some(host) = extract_host(&upstream.url) {
+                result.push(("docker".to_string(), host));
+            }
+        }
+
+        // Maven proxies: Vec<MavenProxyEntry>
+        for proxy in &self.maven.proxies {
+            if let Some(host) = extract_host(proxy.url()) {
+                result.push(("maven".to_string(), host));
+            }
+        }
+
+        // Deduplicate
+        result.sort();
+        result.dedup();
+        result
+    }
+
     /// Validate configuration and return (warnings, errors).
     ///
     /// Warnings are logged but do not prevent startup.
@@ -3835,5 +3904,69 @@ mod tests {
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
         assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_extracts_from_defaults() {
+        let config = Config::default();
+        let hosts = config.upstream_hostnames();
+        // Default config has proxy URLs for several registries
+        let hostnames: Vec<&str> = hosts.iter().map(|(_, h)| h.as_str()).collect();
+        assert!(hostnames.contains(&"crates.io"), "cargo default missing");
+        assert!(
+            hostnames.contains(&"api.nuget.org"),
+            "nuget default missing"
+        );
+        assert!(
+            hostnames.contains(&"azuresearch-usnc.nuget.org"),
+            "nuget search default missing"
+        );
+        assert!(
+            hostnames.contains(&"proxy.golang.org"),
+            "go default missing"
+        );
+        // localhost should be excluded
+        assert!(!hostnames.contains(&"localhost"));
+        assert!(!hostnames.contains(&"127.0.0.1"));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_deduplicates() {
+        let config = Config::default();
+        let hosts = config.upstream_hostnames();
+        let mut seen = std::collections::HashSet::new();
+        for pair in &hosts {
+            assert!(seen.insert(pair), "duplicate: {:?}", pair);
+        }
+    }
+
+    #[test]
+    fn test_upstream_hostnames_docker_upstreams() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            path = "/tmp/nora-test"
+
+            [docker]
+            enabled = true
+
+            [[docker.upstreams]]
+            url = "https://registry-1.docker.io"
+
+            [[docker.upstreams]]
+            url = "https://ghcr.io"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let hosts = config.upstream_hostnames();
+        let docker_hosts: Vec<&str> = hosts
+            .iter()
+            .filter(|(r, _)| r == "docker")
+            .map(|(_, h)| h.as_str())
+            .collect();
+        assert!(docker_hosts.contains(&"registry-1.docker.io"));
+        assert!(docker_hosts.contains(&"ghcr.io"));
     }
 }

@@ -1162,6 +1162,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 ctx.state.config.circuit_breaker.clone(),
             ),
             digest_store: ctx.state.digest_store.clone(),
+            leak_finders: ctx.state.leak_finders.clone(),
         });
 
         // Rebuild router with new state

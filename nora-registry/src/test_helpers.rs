@@ -223,6 +223,8 @@ fn build_context(
         bypass_token,
     }));
 
+    let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -246,6 +248,7 @@ fn build_context(
         digest_store: std::sync::Arc::new(crate::digest_quarantine::DigestStore::empty(
             &storage_path,
         )),
+        leak_finders,
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

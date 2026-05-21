@@ -174,6 +174,8 @@ pub struct AppState {
     pub oidc: Option<auth::OidcValidator>,
     pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
     pub digest_store: std::sync::Arc<digest_quarantine::DigestStore>,
+    /// Pre-compiled upstream hostname searchers for leak detection (#386)
+    pub leak_finders: metrics::LeakFinders,
 }
 
 impl AppState {
@@ -962,6 +964,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         bypass_token,
     }));
 
+    let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -983,6 +987,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         oidc: oidc_validator,
         circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
         digest_store,
+        leak_finders,
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
@@ -1053,6 +1058,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         ))
         .layer(middleware::from_fn(request_id::request_id_middleware))
         .layer(middleware::from_fn(metrics::metrics_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::leak_detection_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

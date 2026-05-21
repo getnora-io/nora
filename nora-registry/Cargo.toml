@@ -58,6 +58,7 @@ percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"
 arc-swap = "1"
+memchr = "2"
 
 [dev-dependencies]
 proptest = "1"

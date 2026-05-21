@@ -3,7 +3,7 @@
 
 use axum::{
     body::Body,
-    extract::MatchedPath,
+    extract::{MatchedPath, State},
     http::Request,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -11,6 +11,7 @@ use axum::{
     Router,
 };
 use lazy_static::lazy_static;
+use memchr::memmem;
 use prometheus::{
     register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
     TextEncoder,
@@ -70,6 +71,66 @@ lazy_static! {
         "Total requests rejected by circuit breaker",
         &["registry"]
     ).expect("failed to create CIRCUIT_BREAKER_REJECTIONS metric at startup");
+
+    /// Upstream URL leak detections in responses (#386)
+    pub static ref UPSTREAM_URL_LEAK_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "nora_response_upstream_url_leak_total",
+        "Upstream hostname detected in outgoing response body",
+        &["registry"]
+    ).expect("failed to create UPSTREAM_URL_LEAK_TOTAL metric at startup");
+}
+
+/// Maximum response body size to scan for upstream URL leaks (2 MB).
+const LEAK_SCAN_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Pre-compiled substring searchers for upstream hostname leak detection.
+///
+/// Built once at startup from `Config::upstream_hostnames()` and stored in `AppState`.
+#[derive(Clone)]
+pub struct LeakFinders {
+    entries: Arc<Vec<LeakFinderEntry>>,
+}
+
+#[derive(Clone)]
+struct LeakFinderEntry {
+    registry: String,
+    hostname: String,
+    finder: memmem::Finder<'static>,
+}
+
+impl LeakFinders {
+    /// Build leak finders from (registry, hostname) pairs.
+    pub fn new(hostnames: Vec<(String, String)>) -> Self {
+        let entries = hostnames
+            .into_iter()
+            .map(|(registry, hostname)| {
+                let finder = memmem::Finder::new(hostname.as_bytes()).into_owned();
+                LeakFinderEntry {
+                    registry,
+                    hostname,
+                    finder,
+                }
+            })
+            .collect();
+        Self {
+            entries: Arc::new(entries),
+        }
+    }
+
+    /// Scan bytes for any upstream hostname. Returns first match.
+    fn scan(&self, haystack: &[u8]) -> Option<(&str, &str)> {
+        for entry in self.entries.iter() {
+            if entry.finder.find(haystack).is_some() {
+                return Some((&entry.registry, &entry.hostname));
+            }
+        }
+        None
+    }
+
+    /// Returns true if no finders are configured.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Routes for metrics endpoint
@@ -121,6 +182,105 @@ pub async fn metrics_middleware(
         .observe(duration);
 
     response
+}
+
+/// Middleware to detect upstream URL leaks in JSON response bodies (#386).
+///
+/// Scans outgoing JSON responses for configured upstream hostnames.
+/// Detection only — never blocks responses. Increments counter and logs WARN.
+pub async fn leak_detection_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+
+    // Fast path: skip if no finders configured
+    if state.leak_finders.is_empty() {
+        return response;
+    }
+
+    // Only scan JSON responses
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("json"));
+    if !is_json {
+        return response;
+    }
+
+    // Skip if Content-Length exceeds scan limit (avoid consuming body we can't restore)
+    let content_length = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    if content_length.is_some_and(|len| len > LEAK_SCAN_MAX_BYTES) {
+        return response;
+    }
+
+    let is_gzip = response
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ce| ce.contains("gzip"));
+
+    // Collect response body
+    let (parts, body) = response.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, LEAK_SCAN_MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Body exceeded limit or read failed — can't restore original, return empty.
+            // In practice unreachable: Content-Length pre-check above catches oversized bodies.
+            tracing::debug!("leak_detection: body read exceeded limit, skipping scan");
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
+
+    // Skip tiny bodies
+    if body_bytes.len() < 20 {
+        return Response::from_parts(parts, Body::from(body_bytes));
+    }
+
+    // Decompress gzip if needed, scan decompressed bytes
+    let scan_bytes: Vec<u8>;
+    let haystack = if is_gzip {
+        match decompress_gzip(&body_bytes) {
+            Some(decompressed) => {
+                scan_bytes = decompressed;
+                &scan_bytes
+            }
+            None => &body_bytes[..],
+        }
+    } else {
+        &body_bytes[..]
+    };
+
+    if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
+        UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
+        tracing::warn!(
+            registry = registry,
+            upstream = hostname,
+            path = path.as_str(),
+            body_len = haystack.len(),
+            "upstream URL leak detected in response"
+        );
+    }
+
+    // Return original (possibly gzip-compressed) body unchanged
+    Response::from_parts(parts, Body::from(body_bytes))
+}
+
+/// Decompress gzip bytes; returns None on failure (non-fatal).
+fn decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(data);
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Detect registry type from path
@@ -227,5 +387,66 @@ mod tests {
         assert_eq!(detect_registry("/raw/data/file.bin"), "raw");
         // Bare prefix without trailing slash should not match
         assert_eq!(detect_registry("/rawdata/file"), "other");
+    }
+
+    #[test]
+    fn test_leak_finders_detects_upstream_hostname() {
+        let finders = LeakFinders::new(vec![
+            ("nuget".to_string(), "api.nuget.org".to_string()),
+            ("npm".to_string(), "registry.npmjs.org".to_string()),
+        ]);
+        let body = br#"{"@id":"https://api.nuget.org/v3/registration/newtonsoft.json"}"#;
+        let result = finders.scan(body);
+        assert!(result.is_some());
+        let (registry, hostname) = result.unwrap();
+        assert_eq!(registry, "nuget");
+        assert_eq!(hostname, "api.nuget.org");
+    }
+
+    #[test]
+    fn test_leak_finders_no_match_returns_none() {
+        let finders = LeakFinders::new(vec![("nuget".to_string(), "api.nuget.org".to_string())]);
+        let body = br#"{"@id":"http://localhost:4000/nuget/v3/registration/newtonsoft.json"}"#;
+        assert!(finders.scan(body).is_none());
+    }
+
+    #[test]
+    fn test_leak_finders_empty_has_no_match() {
+        let finders = LeakFinders::new(vec![]);
+        assert!(finders.is_empty());
+        assert!(finders.scan(b"anything").is_none());
+    }
+
+    #[test]
+    fn test_decompress_gzip_roundtrip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let original = b"hello upstream api.nuget.org world";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_gzip(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_leak_finders_detects_in_decompressed_gzip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let finders = LeakFinders::new(vec![("nuget".to_string(), "api.nuget.org".to_string())]);
+        let body = br#"{"packageContent":"https://api.nuget.org/v3-flatcontainer/pkg/1.0.0/pkg.1.0.0.nupkg"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(body).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Compressed bytes should NOT match (gzip obfuscates)
+        assert!(finders.scan(&compressed).is_none());
+
+        // Decompressed bytes should match
+        let decompressed = decompress_gzip(&compressed).unwrap();
+        let result = finders.scan(&decompressed);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "nuget");
     }
 }
