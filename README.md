@@ -16,14 +16,14 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
 - **13 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++).
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 990+ tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 1040+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 [![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
 
-**< 23 MB** binary | **< 100 MB** RAM | **3s** startup | **13** registries
+**< 25 MB** binary | **< 100 MB** RAM | **3s** startup | **13** registries
 
 ## Supported Registries
 
@@ -137,7 +137,7 @@ docker run -d -p 4000:4000 \
 |--------|------|-------|-------|
 | Startup | < 3s | 30-60s | 30-60s |
 | Memory | < 100 MB | 2-4 GB | 2-4 GB |
-| Binary | < 23 MB | 600+ MB | 1+ GB |
+| Binary | < 25 MB | 600+ MB | 1+ GB |
 
 ## Roadmap
 
@@ -148,8 +148,9 @@ docker run -d -p 4000:4000 \
 - ~~Curation layer & 13 registry formats~~ ✅ v0.7.0
 - ~~Min Release Age~~ ✅ v0.7.1
 - ~~Hash Pin Store, auth rate limiting, Cache-Control~~ ✅ v0.8.0
-- ~~Outbound proxy, structured audit log, 994 tests~~ ✅ v0.8.3
+- ~~Outbound proxy, structured audit log~~ ✅ v0.8.3
 - ~~Circuit breaker, OIDC, hot reload, arm64, streaming uploads~~ ✅ v0.9.0
+- ~~NuGet V3 stabilization, Cargo ETag, 1049 tests~~ ✅ v0.9.1
 - **Image Signing Policy** — cosign verification on upstream pulls
 - **Semver contract** — stable API, configuration format, and storage layout
 
