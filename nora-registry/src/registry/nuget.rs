@@ -1430,6 +1430,36 @@ mod tests {
         assert!(result.contains("http://nora:4000/nuget/v3/registration/bar/index.json"));
     }
 
+    /// Deprecation fields survive URL rewriting — catalog0 @ids left as-is (#424)
+    #[test]
+    fn test_rewrite_preserves_deprecation_field() {
+        let input = r#"{"items":[{"catalogEntry":{"@id":"https://api.nuget.org/v3/catalog0/data/2024.09.20/ef.4.1.json","version":"4.1.10311","deprecation":{"@id":"https://api.nuget.org/v3/catalog0/data/2024.09.20/ef.4.1.json#deprecation","@type":"deprecation","alternatePackage":{"@id":"https://api.nuget.org/v3/catalog0/data/2024.09.20/ef.4.1.json#deprecation/alternatePackage","@type":"alternatePackage","id":"EntityFramework","range":"[6.5.1, )"},"reasons":["Legacy"]},"packageContent":"https://api.nuget.org/v3-flatcontainer/entityframework/4.1.10311/entityframework.4.1.10311.nupkg"}}]}"#;
+        let result = rewrite_registration_urls(input, "https://api.nuget.org", "http://nora:4000");
+        // deprecation block preserved intact (catalog0 URLs stay as-is)
+        assert!(result.contains(r#""deprecation":{""#));
+        assert!(result.contains(r#""reasons":["Legacy"]"#));
+        assert!(result.contains(r#""id":"EntityFramework""#));
+        assert!(result.contains("https://api.nuget.org/v3/catalog0/data/2024.09.20"));
+        assert!(!result.contains("nora:4000/nuget/v3/catalog0"));
+        // packageContent rewritten to Nora
+        assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
+    }
+
+    /// Vulnerabilities array survives URL rewriting (#424)
+    #[test]
+    fn test_rewrite_preserves_vulnerabilities_field() {
+        let input = r#"{"items":[{"catalogEntry":{"@id":"https://api.nuget.org/v3/catalog0/data/2024.01.01/log4net.1.2.10.json","version":"1.2.10","vulnerabilities":[{"advisoryUrl":"https://github.com/advisories/GHSA-2cwj-8chv-9pp9","severity":"3"},{"advisoryUrl":"https://github.com/advisories/GHSA-4f7c-pmjv-c25w","severity":"1"}],"packageContent":"https://api.nuget.org/v3-flatcontainer/log4net/1.2.10/log4net.1.2.10.nupkg"}}]}"#;
+        let result = rewrite_registration_urls(input, "https://api.nuget.org", "http://nora:4000");
+        // vulnerabilities array preserved intact (external advisory URLs, not upstream registry)
+        assert!(result.contains(r#""vulnerabilities":[{"#));
+        assert!(result.contains("GHSA-2cwj-8chv-9pp9"));
+        assert!(result.contains("GHSA-4f7c-pmjv-c25w"));
+        assert!(result.contains(r#""severity":"3""#));
+        assert!(result.contains(r#""advisoryUrl":"https://github.com/advisories/"#));
+        // packageContent rewritten to Nora
+        assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
+    }
+
     #[test]
     fn test_valid_versions() {
         assert!(is_valid_version("1.0.0"));
