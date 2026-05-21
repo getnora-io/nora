@@ -70,6 +70,12 @@ export MSBUILDDISABLENODEREUSE=1
 cleanup() {
     [ -n "$NORA_PID" ] && kill "$NORA_PID" 2>/dev/null && wait "$NORA_PID" 2>/dev/null || true
     rm -rf "$STORAGE_DIR" "$NUGET_PACKAGES"
+    # Clean generated NuGet.Config and build artifacts
+    rm -f "$SCRIPT_DIR/NuGet.Config"
+    rm -f "$SCRIPT_DIR/11-ChocolateyAlias/NuGet.Config"
+    for d in "$SCRIPT_DIR"/[0-9]*; do
+        rm -rf "$d/obj" "$d/bin" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -174,6 +180,29 @@ start_nora env \
     NORA_NUGET_METADATA_TTL=300
 
 pass "Nora started on port $PORT"
+
+# Generate NuGet.Config pointing all projects to Nora
+cat > "$SCRIPT_DIR/NuGet.Config" <<NUGETCFG
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="nora" value="$BASE/nuget/v3/index.json" />
+  </packageSources>
+</configuration>
+NUGETCFG
+
+# 11-ChocolateyAlias uses the /chocolatey/ alias endpoint
+cat > "$SCRIPT_DIR/11-ChocolateyAlias/NuGet.Config" <<CHOCOCFG
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="nora-choco" value="$BASE/chocolatey/v3/index.json" />
+  </packageSources>
+</configuration>
+CHOCOCFG
+
 echo ""
 
 # =========================================================================
