@@ -272,6 +272,9 @@ async fn search_query(
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+            if !state.config.nuget.serve_stale {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             tracing::info!("NuGet search: upstream unavailable, using local index");
             let data = local_search_results(
                 &state,
@@ -282,7 +285,7 @@ async fn search_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json(data)
+            with_json_stale(data)
         }
     }
 }
@@ -344,6 +347,9 @@ async fn autocomplete_query(
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+            if !state.config.nuget.serve_stale {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
             let data = local_autocomplete_results(
                 &state,
@@ -354,7 +360,7 @@ async fn autocomplete_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json(data)
+            with_json_stale(data)
         }
     }
 }
@@ -965,6 +971,28 @@ fn with_json_gzip(data: Vec<u8>) -> Response {
     }
 }
 
+/// JSON response with `X-Nora-Stale: true` header indicating degraded/fallback data.
+fn with_json_stale(data: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                HeaderValue::from_static("true"),
+            ),
+        ],
+        data,
+    )
+        .into_response()
+}
 // ── Local search helpers ───────────────────────────────────────────────
 
 /// Read cached version list from flatcontainer index.json.
@@ -2054,6 +2082,68 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Search fallback adds X-Nora-Stale header when upstream is unreachable (#422)
+    #[tokio::test]
+    async fn test_search_fallback_has_stale_header() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.search_service = "http://127.0.0.1:1/query".to_string();
+            cfg.nuget.serve_stale = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=test", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
+    }
+
+    /// Search returns 503 when serve_stale=false and upstream is down (#422)
+    #[tokio::test]
+    async fn test_search_serve_stale_disabled_returns_503() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.search_service = "http://127.0.0.1:1/query".to_string();
+            cfg.nuget.serve_stale = false;
+        });
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=test", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+    }
+
+    /// Autocomplete fallback adds X-Nora-Stale header when upstream is unreachable (#422)
+    #[tokio::test]
+    async fn test_autocomplete_fallback_has_stale_header() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.autocomplete = "http://127.0.0.1:1/autocomplete".to_string();
+            cfg.nuget.serve_stale = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/autocomplete?q=test", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
+    }
+
+    /// Autocomplete returns 503 when serve_stale=false and upstream is down (#422)
+    #[tokio::test]
+    async fn test_autocomplete_serve_stale_disabled_returns_503() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.autocomplete = "http://127.0.0.1:1/autocomplete".to_string();
+            cfg.nuget.serve_stale = false;
+        });
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/autocomplete?q=test", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("x-nora-stale").is_none());
     }
 }
 
