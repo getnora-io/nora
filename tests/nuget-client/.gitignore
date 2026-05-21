@@ -1,0 +1,10 @@
+# Generated at test time by run-tests.sh
+NuGet.Config
+11-ChocolateyAlias/NuGet.Config
+
+# dotnet build artifacts
+*/obj/
+*/bin/
+
+# Lock file generated during test
+09-LockFile/packages.lock.json

@@ -1,8 +1,36 @@
 # Changelog
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-21
+
+### Added
+- **NuGet gzip registration** — `RegistrationsBaseUrl/3.6.0` responses compressed with gzip per NuGet V3 spec (#421)
+- **NuGet semVerLevel filtering** — search and autocomplete hide SemVer 2.0 packages when `semVerLevel` not specified (#421)
+- **NuGet service index generation** — generate service index from scratch instead of rewriting upstream, ensures all `@id` URLs point to Nora (#404, #405)
+- **NuGet Chocolatey/PowerShell aliases** — `/chocolatey/` and `/powershell/` path aliases for NuGet V3 endpoints (#412, #419)
+- **NuGet local autocomplete fallback** — autocomplete works in air-gap mode using cached package index (#414, #417)
+- **NuGet serve-stale** — serve cached metadata when upstream is unreachable, with `X-Nora-Stale` header (#409, #410, #411)
+- **NuGet deprecation/vulnerability pass-through** — registration responses preserve deprecation and vulnerability metadata from upstream (#425)
+- **Cargo ETag + HTTP 304** — sparse index responses include SHA-256 ETag; `If-None-Match` returns 304 Not Modified (#397)
+- **Upstream URL leak detection metric** — Prometheus counter `nora_upstream_url_leak_total{registry, leak_type}` fires when response bodies/headers contain upstream registry URLs (#386, #426)
+- **NuGet E2E test suite** — 11 dotnet client fixture projects covering restore, analyzers, source generators, native RID, SemVer2, version ranges, case insensitivity, lock files, deep transitive deps, and Chocolatey alias
+
 ### Fixed
-- **PyPI file hash key** — renamed `digests` to `hashes` to support `PEP 691` specification (#389)
+- **NuGet URL rewriting** — registration index/page `@id` and `packageContent` URLs no longer leak `api.nuget.org` (#388, #392, #393, #394, #400)
+- **NuGet background fetch** — index fetch routed through `proxy_fetch_text` to respect proxy and circuit breaker settings (#413, #416)
+- **NuGet upstream URL stripping** — strip path component from upstream proxy URL to prevent double-path (#407, #408)
+- **NuGet serve_stale config** — respect `serve_stale` config flag in search/autocomplete fallback (#423)
+- **PyPI PEP 691 typed structs** — replaced ad-hoc JSON manipulation with typed Serde structs for spec conformance (#390, #398)
+- **PyPI file hash key** — renamed `digests` to `hashes` to support PEP 691 specification (#389, #399)
+- **npm scoped package tarball key** — correct tarball storage key for `@scope/package` in UI detail view (#402, #403)
+- **Air-gap URL leaks** — fixed upstream URL leaks across NuGet, Terraform, and Ansible registries (#400)
+- **Curation test serialization** — serialize env-override tests with mutex to prevent flaky parallel failures (#406)
+
+### Changed
+- **NuGet search endpoint discovery** — dynamically discover search/autocomplete endpoints from upstream service index instead of hardcoding (#370, #418)
+- **NuGet metadata proxy timeout** — reduced from default to 2s for faster fallback to cache (#415, #420)
+- **URL-leak invariant tests** — added URL-leak detection tests for NuGet and npm registries (#390, #395)
+- 1049 total tests (up from 994)
 
 ## [0.9.0] - 2026-05-16
 
