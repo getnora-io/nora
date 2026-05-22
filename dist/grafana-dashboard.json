@@ -1,0 +1,269 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" },
+    { "type": "panel", "id": "table", "name": "Table", "version": "" },
+    { "type": "panel", "id": "gauge", "name": "Gauge", "version": "" }
+  ],
+  "id": null,
+  "uid": "nora-overview",
+  "title": "NORA — Artifact Registry",
+  "description": "Overview dashboard for NORA artifact registry — HTTP traffic, cache, upstream, storage, security",
+  "tags": ["nora", "registry", "prometheus"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(nora_http_requests_total, registry)",
+        "name": "registry",
+        "label": "Registry",
+        "type": "query",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 500 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "sum(rate(nora_http_requests_total{registry=~\"$registry\"}[5m]))", "legendFormat": "req/s" }],
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "Error Rate (5xx)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "sum(rate(nora_http_requests_total{registry=~\"$registry\",status=~\"5..\"}[5m])) / sum(rate(nora_http_requests_total{registry=~\"$registry\"}[5m]))", "legendFormat": "error %" }],
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "P50 Latency",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 2 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "histogram_quantile(0.5, sum(rate(nora_http_request_duration_seconds_bucket{registry=~\"$registry\"}[5m])) by (le))", "legendFormat": "p50" }],
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "P99 Latency",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "histogram_quantile(0.99, sum(rate(nora_http_request_duration_seconds_bucket{registry=~\"$registry\"}[5m])) by (le))", "legendFormat": "p99" }],
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "sum(rate(nora_cache_requests_total{registry=~\"$registry\",result=\"hit\"}[5m])) / sum(rate(nora_cache_requests_total{registry=~\"$registry\"}[5m]))", "legendFormat": "hit rate" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "Storage Used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10737418240 }, { "color": "red", "value": 107374182400 }] } },
+        "overrides": []
+      },
+      "targets": [{ "expr": "sum(nora_storage_bytes{registry=~\"$registry\"})", "legendFormat": "total" }],
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "HTTP Request Rate by Registry",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 15, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [{ "expr": "sum by (registry) (rate(nora_http_requests_total{registry=~\"$registry\"}[5m]))", "legendFormat": "{{ registry }}" }],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "title": "HTTP Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(nora_http_request_duration_seconds_bucket{registry=~\"$registry\"}[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(nora_http_request_duration_seconds_bucket{registry=~\"$registry\"}[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(nora_http_request_duration_seconds_bucket{registry=~\"$registry\"}[5m])) by (le))", "legendFormat": "p99" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "title": "Error Rate by Registry (5xx)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
+      "targets": [{ "expr": "sum by (registry) (rate(nora_http_requests_total{registry=~\"$registry\",status=~\"5..\"}[5m])) / sum by (registry) (rate(nora_http_requests_total{registry=~\"$registry\"}[5m]))", "legendFormat": "{{ registry }}" }],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "title": "Upstream Proxy Latency by Registry",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (registry, le) (rate(nora_upstream_request_duration_seconds_bucket{registry=~\"$registry\"}[5m]))","legendFormat": "{{ registry }} p50" },
+        { "expr": "histogram_quantile(0.99, sum by (registry, le) (rate(nora_upstream_request_duration_seconds_bucket{registry=~\"$registry\"}[5m]))","legendFormat": "{{ registry }} p99" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "title": "Cache Hit / Miss Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "miss" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+        { "matcher": { "id": "byName", "options": "hit" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
+      ] },
+      "targets": [
+        { "expr": "sum(rate(nora_cache_requests_total{registry=~\"$registry\",result=\"hit\"}[5m]))", "legendFormat": "hit" },
+        { "expr": "sum(rate(nora_cache_requests_total{registry=~\"$registry\",result=\"miss\"}[5m]))", "legendFormat": "miss" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "Downloads / Uploads by Registry",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 15, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [
+        { "expr": "sum by (registry) (rate(nora_downloads_total{registry=~\"$registry\"}[5m]))", "legendFormat": "{{ registry }} downloads" },
+        { "expr": "sum by (registry) (rate(nora_uploads_total{registry=~\"$registry\"}[5m]))", "legendFormat": "{{ registry }} uploads" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "title": "Storage by Registry",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 25, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [{ "expr": "nora_storage_bytes{registry=~\"$registry\"}", "legendFormat": "{{ registry }}" }],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "Circuit Breaker State",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": {}, "overrides": [
+        { "matcher": { "id": "byName", "options": "Value" }, "properties": [
+          { "id": "mappings", "value": [{ "type": "value", "options": { "0": { "text": "CLOSED", "color": "green" }, "1": { "text": "OPEN", "color": "red" }, "2": { "text": "HALF_OPEN", "color": "yellow" } } }] },
+          { "id": "custom.displayMode", "value": "color-background" }
+        ] }
+      ] },
+      "targets": [{ "expr": "nora_circuit_breaker_state", "legendFormat": "{{ registry }}", "format": "table", "instant": true }],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true }, "renameByName": { "registry": "Registry", "Value": "State" } } }
+      ]
+    },
+    {
+      "title": "Security Alerts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "URL leaks" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+        { "matcher": { "id": "byName", "options": "CB rejections" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+      ] },
+      "targets": [
+        { "expr": "sum(rate(nora_response_upstream_url_leak_total{registry=~\"$registry\"}[5m]))", "legendFormat": "URL leaks" },
+        { "expr": "sum(rate(nora_circuit_breaker_rejections_total{registry=~\"$registry\"}[5m]))", "legendFormat": "CB rejections" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "Retention & GC",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] },
+      "targets": [
+        { "expr": "increase(nora_retention_bytes_freed_total[1h])", "legendFormat": "retention freed" },
+        { "expr": "increase(nora_gc_bytes_freed_total[1h])", "legendFormat": "GC freed" }
+      ],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "GC & Retention Last Run",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "dateTimeFromNow", "thresholds": { "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
+      "targets": [
+        { "expr": "nora_retention_last_run_timestamp * 1000", "legendFormat": "Retention" },
+        { "expr": "nora_gc_last_run_timestamp * 1000", "legendFormat": "GC" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "title": "Storage Operations",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
+      "targets": [{ "expr": "sum by (operation) (rate(nora_storage_operations_total[5m]))", "legendFormat": "{{ operation }}" }],
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    }
+  ]
+}
