@@ -1,0 +1,51 @@
+name: nora
+arch: "${NFPM_ARCH}"
+platform: linux
+version: "${VERSION}"
+maintainer: "Pavel Volkov <devitway@gmail.com>"
+description: "NORA — universal artifact registry (Docker, npm, Maven, PyPI, Cargo, Go, NuGet, and 6 more)"
+homepage: "https://getnora.dev"
+license: "MIT"
+vendor: "getnora.io"
+section: "net"
+priority: "optional"
+
+contents:
+  - src: ./nora
+    dst: /usr/bin/nora
+    file_info:
+      mode: 0755
+
+  - src: dist/nora.service
+    dst: /lib/systemd/system/nora.service
+
+  - src: dist/nora.env.example
+    dst: /etc/nora/nora.env
+    type: config|noreplace
+
+  - dst: /var/lib/nora
+    type: dir
+    file_info:
+      owner: nora
+      group: nora
+      mode: 0750
+
+  - dst: /var/log/nora
+    type: dir
+    file_info:
+      owner: nora
+      group: nora
+      mode: 0750
+
+  - src: LICENSE
+    dst: /usr/share/doc/nora/copyright
+
+scripts:
+  postinstall: dist/postinst.sh
+  preremove: dist/prerm.sh
+
+depends:
+  - systemd
+
+rpm:
+  group: "Applications/Internet"

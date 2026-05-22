@@ -191,6 +191,69 @@ jobs:
           curl -sf http://localhost:5555/health
           docker stop nora-smoke
 
+  package:
+    name: Package (${{ matrix.format }}-${{ matrix.arch }})
+    runs-on: [self-hosted, nora]
+    needs: build
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            nfpm_arch: amd64
+            binary: nora
+            format: deb
+          - arch: amd64
+            nfpm_arch: amd64
+            binary: nora
+            format: rpm
+          - arch: arm64
+            nfpm_arch: arm64
+            binary: nora-linux-arm64
+            format: deb
+          - arch: arm64
+            nfpm_arch: arm64
+            binary: nora-linux-arm64
+            format: rpm
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: ./artifacts
+
+      - name: Prepare binary
+        run: |
+          cp ./artifacts/${{ matrix.binary }} ./nora
+          chmod +x ./nora
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION=2.41.1
+          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build ${{ matrix.format }} (${{ matrix.arch }})
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}" \
+          NFPM_ARCH="${{ matrix.nfpm_arch }}" \
+          nfpm package \
+            --config dist/nora.nfpm.yaml \
+            --packager ${{ matrix.format }} \
+            --target ./nora-${{ matrix.arch }}.${{ matrix.format }}
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nora-pkg-${{ matrix.format }}-${{ matrix.arch }}-${{ github.run_id }}
+          path: ./nora-${{ matrix.arch }}.${{ matrix.format }}
+          retention-days: 1
+
   scan:
     name: Scan (${{ matrix.name }})
     runs-on: [self-hosted, nora]
@@ -249,7 +312,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: [self-hosted, nora]
-    needs: [build, provenance]
+    needs: [build, package, provenance]
     permissions:
       contents: write
       id-token: write  # Sigstore cosign keyless signing
@@ -266,6 +329,13 @@ jobs:
         with:
           name: nora-binary-${{ github.run_id }}
           path: ./artifacts
+
+      - name: Download deb/rpm artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nora-pkg-*-${{ github.run_id }}
+          path: ./packages
+          merge-multiple: true
 
       - name: Prepare binaries
         run: |
@@ -336,6 +406,10 @@ jobs:
             nora-linux-arm64.bundle
             nora-${{ github.ref_name }}.sbom.spdx.json
             nora-${{ github.ref_name }}.sbom.cdx.json
+            packages/nora-amd64.deb
+            packages/nora-amd64.rpm
+            packages/nora-arm64.deb
+            packages/nora-arm64.rpm
           body: |
             ${{ steps.changelog.outputs.content }}
 
@@ -365,6 +439,18 @@ jobs:
             | RED OS | `getnora/nora:${{ steps.ver.outputs.tag }}-redos` | amd64 |
             | Astra Linux SE | `getnora/nora:${{ steps.ver.outputs.tag }}-astra` | amd64 |
             | GHCR | `ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}` | amd64, arm64 |
+
+            ## DEB / RPM
+
+            ```bash
+            # Debian / Ubuntu / Astra Linux (amd64)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-amd64.deb
+            sudo dpkg -i nora-amd64.deb
+
+            # RHEL / Fedora / RED OS (amd64)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-amd64.rpm
+            sudo rpm -i nora-amd64.rpm
+            ```
 
             ## Changelog
 
