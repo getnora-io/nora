@@ -236,7 +236,7 @@ async fn download_tarball(
         }
 
         state.metrics.record_download("ansible");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("ansible");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             filename,
@@ -268,7 +268,7 @@ async fn download_tarball(
     {
         Ok(bytes) => {
             state.metrics.record_download("ansible");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("ansible");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 filename,
@@ -311,7 +311,7 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
             let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
 
             state.metrics.record_download("ansible");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("ansible");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact_name.to_string(),

@@ -68,7 +68,7 @@ async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
                     ActionType::CacheHit,
                     filename.to_string(),
@@ -96,7 +96,7 @@ async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
     {
         Ok(bytes) => {
             state.metrics.record_download("gems");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 filename.to_string(),
@@ -151,7 +151,7 @@ async fn compact_index(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("gems");
                 state.activity.push(ActivityEntry::new(
                     ActionType::CacheHit,
                     name.clone(),
@@ -179,7 +179,7 @@ async fn compact_index(
     {
         Ok(text) => {
             state.metrics.record_download("gems");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 name,
@@ -259,7 +259,7 @@ async fn download_gem(
         }
 
         state.metrics.record_download("gems");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("gems");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
@@ -285,7 +285,7 @@ async fn download_gem(
     {
         Ok(bytes) => {
             state.metrics.record_download("gems");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
@@ -334,7 +334,7 @@ async fn download_gemspec(
     // Immutable cache
     if let Ok(data) = state.storage.get(&storage_key).await {
         state.metrics.record_download("gems");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("gems");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
@@ -363,7 +363,7 @@ async fn download_gemspec(
     {
         Ok(bytes) => {
             state.metrics.record_download("gems");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,

@@ -119,7 +119,7 @@ async fn handle(
         }
 
         state.metrics.record_download("go");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("go");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             format_artifact(&module_encoded, &file),
@@ -192,7 +192,7 @@ async fn handle(
             }
 
             state.metrics.record_download("go");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("go");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format_artifact(&module_encoded, &file),

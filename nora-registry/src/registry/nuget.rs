@@ -261,7 +261,7 @@ async fn search_query(
             let upstream = upstream_url(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("search?{}", qs.chars().take(50).collect::<String>()),
@@ -336,7 +336,7 @@ async fn autocomplete_query(
             let upstream = upstream_url(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("autocomplete?{}", qs.chars().take(50).collect::<String>()),
@@ -403,7 +403,7 @@ async fn registration_index(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("nuget");
                 let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
                 return with_json_gzip(rewritten.into_bytes());
@@ -430,7 +430,7 @@ async fn registration_index(
     {
         Ok(text) => {
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 id_lower.clone(),
@@ -489,7 +489,7 @@ async fn registration_page(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("nuget");
                 let text = String::from_utf8_lossy(data);
                 let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
                 return with_json_gzip(rewritten.into_bytes());
@@ -518,7 +518,7 @@ async fn registration_page(
     {
         Ok(text) => {
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/page/{}/{}", id_lower, lower, upper),
@@ -578,7 +578,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("nuget");
                 return with_json(data.to_vec());
             }
         }
@@ -604,7 +604,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
     {
         Ok(text) => {
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/versions", id_lower),
@@ -688,7 +688,7 @@ async fn flatcontainer_download(
         }
 
         state.metrics.record_download("nuget");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("nuget");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             format!("{}/{}", id_lower, filename),
@@ -743,7 +743,7 @@ async fn flatcontainer_download(
     {
         Ok(bytes) => {
             state.metrics.record_download("nuget");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}", id_lower, filename),

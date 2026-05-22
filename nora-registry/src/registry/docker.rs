@@ -559,7 +559,7 @@ async fn download_blob(
         }
 
         state.metrics.record_download("docker");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("docker");
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", name, &digest[..19.min(digest.len())]),
@@ -600,7 +600,7 @@ async fn download_blob(
         {
             Ok(data) => {
                 state.metrics.record_download("docker");
-                state.metrics.record_cache_miss();
+                state.metrics.record_cache_miss("docker");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     format!("{}@{}", name, &digest[..19.min(digest.len())]),
@@ -1113,7 +1113,7 @@ async fn get_manifest(
         {
             Ok((data, content_type)) => {
                 state.metrics.record_download("docker");
-                state.metrics.record_cache_miss();
+                state.metrics.record_cache_miss("docker");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     format!("{}:{}", name, reference),
@@ -1220,7 +1220,7 @@ async fn get_manifest(
             {
                 Ok((data, content_type)) => {
                     state.metrics.record_download("docker");
-                    state.metrics.record_cache_miss();
+                    state.metrics.record_cache_miss("docker");
                     state.activity.push(ActivityEntry::new(
                         ActionType::ProxyFetch,
                         format!("{}:{}", name, reference),
@@ -1326,7 +1326,7 @@ fn serve_cached_manifest(
     }
 
     state.metrics.record_download("docker");
-    state.metrics.record_cache_hit();
+    state.metrics.record_cache_hit("docker");
     state.activity.push(ActivityEntry::new(
         ActionType::Pull,
         format!("{}:{}", name, reference),

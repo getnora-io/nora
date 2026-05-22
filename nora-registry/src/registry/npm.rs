@@ -157,7 +157,7 @@ async fn handle_request(
         }
 
         state.metrics.record_download("npm");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("npm");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             package_name,
@@ -200,7 +200,7 @@ async fn handle_request(
                     });
 
                     state.metrics.record_download("npm");
-                    state.metrics.record_cache_miss();
+                    state.metrics.record_cache_miss("npm");
                     state.activity.push(ActivityEntry::new(
                         ActionType::ProxyFetch,
                         package_name,

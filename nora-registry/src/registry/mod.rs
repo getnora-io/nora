@@ -34,10 +34,11 @@ pub use terraform::routes as terraform_routes;
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
+use crate::metrics::UPSTREAM_REQUEST_DURATION;
 use crate::AppState;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
 pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
@@ -109,9 +110,14 @@ where
             request = request.header(key, val);
         }
 
+        let upstream_start = Instant::now();
         match request.send().await {
             Ok(response) => {
+                let elapsed = upstream_start.elapsed().as_secs_f64();
                 if response.status().is_success() {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry, "2xx"])
+                        .observe(elapsed);
                     let result = extract(response)
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
@@ -122,17 +128,31 @@ where
                 }
                 let status = response.status().as_u16();
                 if (400..500).contains(&status) {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry, "4xx"])
+                        .observe(elapsed);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry, "5xx"])
+                        .observe(elapsed);
                     tracing::debug!(url, status, "upstream 5xx, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
+                UPSTREAM_REQUEST_DURATION
+                    .with_label_values(&[registry, "5xx"])
+                    .observe(elapsed);
                 cb.record_failure(registry);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
+                let elapsed = upstream_start.elapsed().as_secs_f64();
+                let status_label = if e.is_timeout() { "timeout" } else { "error" };
+                UPSTREAM_REQUEST_DURATION
+                    .with_label_values(&[registry, status_label])
+                    .observe(elapsed);
                 if attempt == 0 {
                     tracing::debug!(url, error = %e, "upstream error, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;

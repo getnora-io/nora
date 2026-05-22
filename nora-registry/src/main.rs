@@ -1118,9 +1118,12 @@ async fn run_server(mut config: Config, storage: Storage) {
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
             metrics_state.auth_failures.cleanup();
 
-            // Every 60s (every other tick): refresh S3 total_size cache
+            // Every 60s (every other tick): refresh S3 total_size cache + storage gauge
             if tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_total_size_cache().await;
+                metrics::STORAGE_BYTES
+                    .with_label_values(&["total"])
+                    .set(metrics_state.storage.total_size().await as i64);
             }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks

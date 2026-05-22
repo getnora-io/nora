@@ -117,7 +117,7 @@ async fn provider_versions(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("terraform");
                 return with_json(data.to_vec());
             }
         }
@@ -144,7 +144,7 @@ async fn provider_versions(
     {
         Ok(text) => {
             state.metrics.record_download("terraform");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("terraform");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}", ns, ptype),
@@ -212,7 +212,7 @@ async fn provider_download_meta(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("terraform");
                 return with_json(data.to_vec());
             }
         }
@@ -245,7 +245,7 @@ async fn provider_download_meta(
             let rewritten = rewrite_download_url(&text, &base_url, &ns, &ptype, &ver);
 
             state.metrics.record_download("terraform");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("terraform");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
@@ -283,7 +283,7 @@ async fn provider_download_binary(
     // Immutable: if cached, serve directly
     if let Ok(data) = state.storage.get(&storage_key).await {
         state.metrics.record_download("terraform");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("terraform");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             path.clone(),
@@ -318,7 +318,7 @@ async fn provider_download_binary(
     {
         Ok(bytes) => {
             state.metrics.record_download("terraform");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("terraform");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 path,
@@ -362,7 +362,7 @@ async fn module_versions(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("terraform");
                 return with_json(data.to_vec());
             }
         }
@@ -390,7 +390,7 @@ async fn module_versions(
     {
         Ok(text) => {
             state.metrics.record_download("terraform");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("terraform");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}/{}", ns, name, provider),
@@ -440,7 +440,7 @@ async fn module_download(
         let rewritten =
             rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
         state.metrics.record_download("terraform");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("terraform");
         return (
             StatusCode::NO_CONTENT,
             [("x-terraform-get", rewritten.as_str())],
@@ -532,7 +532,7 @@ async fn module_source_download(
     // Immutable: if cached, serve directly
     if let Ok(data) = state.storage.get(&storage_key).await {
         state.metrics.record_download("terraform");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("terraform");
         return with_binary(data.to_vec());
     }
 
@@ -566,7 +566,7 @@ async fn module_source_download(
     {
         Ok(bytes) => {
             state.metrics.record_download("terraform");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("terraform");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}/{} v{}", ns, name, provider, ver),

@@ -106,7 +106,7 @@ async fn sparse_index(
     let index_key = format!("cargo/index/{}/{}", expected_prefix, crate_name);
     if let Ok(data) = state.storage.get(&index_key).await {
         state.metrics.record_download("cargo");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("cargo");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             crate_name.to_string(),
@@ -147,7 +147,7 @@ async fn sparse_index(
     {
         Ok(data) => {
             state.metrics.record_download("cargo");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("cargo");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 crate_name.to_string(),
@@ -294,7 +294,7 @@ async fn download(
         }
 
         state.metrics.record_download("cargo");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("cargo");
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", crate_name, version),
@@ -347,7 +347,7 @@ async fn download(
         Ok(data) => {
             state.spawn_cache("cargo", key.clone(), Bytes::from(data.clone()));
             state.metrics.record_download("cargo");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("cargo");
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("{}@{}", crate_name, version),

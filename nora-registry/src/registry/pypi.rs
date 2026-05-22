@@ -249,7 +249,7 @@ async fn download_file(
         }
 
         state.metrics.record_download("pypi");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("pypi");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             format!("{}/{}", name, filename),
@@ -301,7 +301,7 @@ async fn download_file(
                     {
                         Ok(data) => {
                             state.metrics.record_download("pypi");
-                            state.metrics.record_cache_miss();
+                            state.metrics.record_cache_miss("pypi");
                             state.activity.push(ActivityEntry::new(
                                 ActionType::ProxyFetch,
                                 format!("{}/{}", name, filename),

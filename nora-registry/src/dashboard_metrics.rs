@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+use crate::metrics::{CACHE_REQUESTS, DOWNLOADS_TOTAL, UPLOADS_TOTAL};
 use crate::registry_type::RegistryType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -159,19 +160,23 @@ impl DashboardMetrics {
     pub fn record_download(&self, registry: &str) {
         self.downloads.fetch_add(1, Ordering::Relaxed);
         self.registry_downloads.inc(registry);
+        DOWNLOADS_TOTAL.with_label_values(&[registry]).inc();
     }
 
     pub fn record_upload(&self, registry: &str) {
         self.uploads.fetch_add(1, Ordering::Relaxed);
         self.registry_uploads.inc(registry);
+        UPLOADS_TOTAL.with_label_values(&[registry]).inc();
     }
 
-    pub fn record_cache_hit(&self) {
+    pub fn record_cache_hit(&self, registry: &str) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        CACHE_REQUESTS.with_label_values(&[registry, "hit"]).inc();
     }
 
-    pub fn record_cache_miss(&self) {
+    pub fn record_cache_miss(&self, registry: &str) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        CACHE_REQUESTS.with_label_values(&[registry, "miss"]).inc();
     }
 
     pub fn cache_hit_rate(&self) -> f64 {
@@ -271,16 +276,16 @@ mod tests {
     #[test]
     fn test_cache_hit_rate_all_hits() {
         let m = DashboardMetrics::new();
-        m.record_cache_hit();
-        m.record_cache_hit();
+        m.record_cache_hit("docker");
+        m.record_cache_hit("docker");
         assert_eq!(m.cache_hit_rate(), 100.0);
     }
 
     #[test]
     fn test_cache_hit_rate_mixed() {
         let m = DashboardMetrics::new();
-        m.record_cache_hit();
-        m.record_cache_miss();
+        m.record_cache_hit("npm");
+        m.record_cache_miss("npm");
         assert_eq!(m.cache_hit_rate(), 50.0);
     }
 
@@ -315,7 +320,7 @@ mod tests {
             m.record_download("docker");
             m.record_download("docker");
             m.record_upload("maven");
-            m.record_cache_hit();
+            m.record_cache_hit("docker");
             m.save().await;
         }
 

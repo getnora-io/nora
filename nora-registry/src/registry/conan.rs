@@ -189,7 +189,7 @@ async fn recipe_latest(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
             }
         }
@@ -222,7 +222,7 @@ async fn recipe_revisions(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
             }
         }
@@ -259,7 +259,7 @@ async fn recipe_file_list(
     // Immutable: if cached, serve directly
     if let Ok(data) = state.storage.get(&storage_key).await {
         state.metrics.record_download("conan");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
@@ -333,7 +333,7 @@ async fn recipe_file_download(
         }
 
         state.metrics.record_download("conan");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("conan");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
@@ -364,7 +364,7 @@ async fn recipe_file_download(
     {
         Ok(bytes) => {
             state.metrics.record_download("conan");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
@@ -421,7 +421,7 @@ async fn package_latest(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
             }
         }
@@ -472,7 +472,7 @@ async fn package_revisions(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
-                state.metrics.record_cache_hit();
+                state.metrics.record_cache_hit("conan");
                 return with_json(data.to_vec());
             }
         }
@@ -524,7 +524,7 @@ async fn package_file_list(
     // Immutable
     if let Ok(data) = state.storage.get(&storage_key).await {
         state.metrics.record_download("conan");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
@@ -607,7 +607,7 @@ async fn package_file_download(
         }
 
         state.metrics.record_download("conan");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("conan");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
@@ -640,7 +640,7 @@ async fn package_file_download(
     {
         Ok(bytes) => {
             state.metrics.record_download("conan");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
@@ -686,7 +686,7 @@ async fn fetch_and_cache_json(
     {
         Ok(text) => {
             state.metrics.record_download("conan");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact.to_string(),
@@ -729,7 +729,7 @@ async fn fetch_and_cache_immutable_json(
     {
         Ok(text) => {
             state.metrics.record_download("conan");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact.to_string(),

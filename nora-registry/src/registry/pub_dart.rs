@@ -322,7 +322,7 @@ async fn download_archive(
         }
 
         state.metrics.record_download("pub");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("pub");
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", package, version),
@@ -374,7 +374,7 @@ async fn download_archive(
             state.repo_index.invalidate("pub");
 
             state.metrics.record_download("pub");
-            state.metrics.record_cache_miss();
+            state.metrics.record_cache_miss("pub");
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("{}@{}", package, version),

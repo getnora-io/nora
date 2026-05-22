@@ -168,7 +168,7 @@ async fn download(
         }
 
         state.metrics.record_download("maven");
-        state.metrics.record_cache_hit();
+        state.metrics.record_cache_hit("maven");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact_name,
@@ -196,7 +196,7 @@ async fn download(
         {
             Ok(data) => {
                 state.metrics.record_download("maven");
-                state.metrics.record_cache_miss();
+                state.metrics.record_cache_miss("maven");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     artifact_name,
