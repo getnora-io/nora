@@ -107,7 +107,9 @@ impl Storage {
                 Ok(())
             }
             Err(e) => {
-                STORAGE_OPERATIONS.with_label_values(&["put", "error"]).inc();
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put", "error"])
+                    .inc();
                 Err(e)
             }
         }
@@ -124,7 +126,9 @@ impl Storage {
                 Ok(data)
             }
             Err(e) => {
-                STORAGE_OPERATIONS.with_label_values(&["get", "error"]).inc();
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get", "error"])
+                    .inc();
                 Err(e)
             }
         }
@@ -134,7 +138,9 @@ impl Storage {
         validate_storage_key(key)?;
         match self.inner.delete(key).await {
             Ok(()) => {
-                STORAGE_OPERATIONS.with_label_values(&["delete", "ok"]).inc();
+                STORAGE_OPERATIONS
+                    .with_label_values(&["delete", "ok"])
+                    .inc();
                 if let Some(ref pins) = self.pin_store {
                     pins.remove(key);
                 }
@@ -208,7 +214,9 @@ impl Storage {
                 Ok(())
             }
             Err(e) => {
-                STORAGE_OPERATIONS.with_label_values(&["put", "error"]).inc();
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put", "error"])
+                    .inc();
                 Err(e)
             }
         }
