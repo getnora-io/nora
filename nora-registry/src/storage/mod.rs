@@ -8,6 +8,7 @@ pub use local::LocalStorage;
 pub use s3::S3Storage;
 
 use crate::hash_pin_store::HashPinStore;
+use crate::metrics::STORAGE_OPERATIONS;
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -97,29 +98,55 @@ impl Storage {
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         validate_storage_key(key)?;
-        self.inner.put(key, data).await?;
-        if let Some(ref pins) = self.pin_store {
-            pins.record(key, data);
+        match self.inner.put(key, data).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
+                if let Some(ref pins) = self.pin_store {
+                    pins.record(key, data);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS.with_label_values(&["put", "error"]).inc();
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         validate_storage_key(key)?;
-        let data = self.inner.get(key).await?;
-        if let Some(ref pins) = self.pin_store {
-            pins.verify(key, &data);
+        match self.inner.get(key).await {
+            Ok(data) => {
+                STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
+                if let Some(ref pins) = self.pin_store {
+                    pins.verify(key, &data);
+                }
+                Ok(data)
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS.with_label_values(&["get", "error"]).inc();
+                Err(e)
+            }
         }
-        Ok(data)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {
         validate_storage_key(key)?;
-        self.inner.delete(key).await?;
-        if let Some(ref pins) = self.pin_store {
-            pins.remove(key);
+        match self.inner.delete(key).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS.with_label_values(&["delete", "ok"]).inc();
+                if let Some(ref pins) = self.pin_store {
+                    pins.remove(key);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["delete", "error"])
+                    .inc();
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     pub async fn list(&self, prefix: &str) -> Vec<String> {
@@ -175,6 +202,15 @@ impl Storage {
     /// not updated (re-reading gigabytes just to hash is wasteful).
     pub async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
         validate_storage_key(key)?;
-        self.inner.put_from_path(key, src).await
+        match self.inner.put_from_path(key, src).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
+                Ok(())
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS.with_label_values(&["put", "error"]).inc();
+                Err(e)
+            }
+        }
     }
 }
