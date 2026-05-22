@@ -21,7 +21,7 @@ use crate::registry::{
 use crate::AppState;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -92,9 +92,13 @@ async fn api_discovery() -> Response {
 
 // ── Collection list ────────────────────────────────────────────────────
 
-async fn collection_list(State(state): State<Arc<AppState>>) -> Response {
+async fn collection_list(
+    State(state): State<Arc<AppState>>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     let proxy_url = upstream_url(&state);
-    let url = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
+    let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
+    let url = append_query(&base, raw_query.as_deref());
 
     proxy_json(&state, &url, "ansible-collections").await
 }
@@ -126,19 +130,21 @@ async fn collection_detail(
 async fn version_list(
     State(state): State<Arc<AppState>>,
     Path((ns, name)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
     if !is_valid_name(&ns) || !is_valid_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     let proxy_url = upstream_url(&state);
-    let url = format!(
+    let base = format!(
         "{}{}/{}/{}/versions/",
         proxy_url.trim_end_matches('/'),
         API_PREFIX,
         ns,
         name
     );
+    let url = append_query(&base, raw_query.as_deref());
 
     proxy_json(&state, &url, &format!("{}.{}/versions", ns, name)).await
 }
@@ -364,6 +370,16 @@ fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> 
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Append query string to a URL, rejecting oversized or malformed values.
+fn append_query(base_url: &str, raw_query: Option<&str>) -> String {
+    match raw_query {
+        Some(q) if !q.is_empty() && q.len() <= 256 && !q.contains('#') && !q.contains('\0') => {
+            format!("{}?{}", base_url, q)
+        }
+        _ => base_url.to_string(),
+    }
+}
+
 fn upstream_url(state: &AppState) -> String {
     state
         .config
@@ -492,6 +508,49 @@ mod tests {
         assert!(
             result.contains("http://nora:4000/ansible/v3/collections/community/general/versions/")
         );
+        assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_append_query_basic() {
+        let base = "https://galaxy.ansible.com/api/v3/versions/";
+        assert_eq!(
+            append_query(base, Some("limit=10&offset=20")),
+            "https://galaxy.ansible.com/api/v3/versions/?limit=10&offset=20"
+        );
+    }
+
+    #[test]
+    fn test_append_query_empty() {
+        let base = "https://galaxy.ansible.com/api/v3/versions/";
+        assert_eq!(append_query(base, None), base);
+        assert_eq!(append_query(base, Some("")), base);
+    }
+
+    #[test]
+    fn test_append_query_rejects_oversized() {
+        let base = "https://galaxy.ansible.com/api/v3/versions/";
+        let huge = "a".repeat(257);
+        assert_eq!(append_query(base, Some(&huge)), base);
+    }
+
+    #[test]
+    fn test_append_query_rejects_fragment() {
+        let base = "https://galaxy.ansible.com/api/v3/versions/";
+        assert_eq!(append_query(base, Some("page=1#evil")), base);
+    }
+
+    #[test]
+    fn test_append_query_rejects_null_byte() {
+        let base = "https://galaxy.ansible.com/api/v3/versions/";
+        assert_eq!(append_query(base, Some("page=1\0")), base);
+    }
+
+    #[test]
+    fn test_rewrite_preserves_pagination_query_params() {
+        let input = r#"{"links":{"next":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/?limit=10&offset=20"}}"#;
+        let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
+        assert!(result.contains("http://nora:4000/ansible/v3/collections/community/general/versions/?limit=10&offset=20"));
         assert!(!result.contains("galaxy.ansible.com"));
     }
 
