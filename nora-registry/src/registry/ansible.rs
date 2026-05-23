@@ -4,12 +4,17 @@
 //! Ansible Galaxy collection proxy (API v3).
 //!
 //! Implements a caching proxy for galaxy.ansible.com:
-//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/
-//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/
-//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/
-//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/{ver}/
-//!   GET /ansible/download/{ns}-{name}-{ver}.tar.gz — collection tarball (immutable)
-//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/artifacts/{file} — alias
+//!   GET /ansible/                                         — API discovery
+//!   GET /ansible/v3/collections/                          — collection list (short path)
+//!   GET /ansible/v3/collections/{ns}/{name}/              — collection detail
+//!   GET /ansible/v3/collections/{ns}/{name}/versions/     — version list
+//!   GET /ansible/v3/collections/{ns}/{name}/versions/{ver}/ — version detail
+//!   GET /ansible/download/{ns}-{name}-{ver}.tar.gz        — tarball (immutable)
+//!   GET /ansible/api/v3/.../artifacts/{file}              — tarball alias (Galaxy format)
+//!
+//! Also supports full Pulp-style paths under /ansible/api/v3/plugin/ansible/...
+//!
+//! Namespace and collection names follow Galaxy spec: [a-z0-9_]+ (no hyphens).
 //!
 //! Client config:
 //!   ansible-galaxy collection install community.general -s http://nora:4000/ansible/
