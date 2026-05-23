@@ -52,7 +52,7 @@ async fn index_config(State(state): State<Arc<AppState>>) -> Response {
     let base = nora_base_url(&state);
     let config = serde_json::json!({
         "dl": format!("{}/cargo/api/v1/crates", base.trim_end_matches('/')),
-        "api": format!("{}/cargo", base.trim_end_matches('/'))
+        "api": format!("{}/cargo/api", base.trim_end_matches('/'))
     });
     (
         StatusCode::OK,
@@ -773,8 +773,54 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("dl").is_some());
-        assert!(json.get("api").is_some());
+        let dl = json["dl"].as_str().unwrap();
+        let api = json["api"].as_str().unwrap();
+        assert!(
+            dl.ends_with("/cargo/api/v1/crates"),
+            "dl must end with /cargo/api/v1/crates, got: {}",
+            dl
+        );
+        assert!(
+            api.ends_with("/cargo/api"),
+            "api must end with /cargo/api so {{api}}/v1/crates/{{name}} matches routes, got: {}",
+            api
+        );
+    }
+
+    /// Verify that config.json `api` field produces correct metadata route (#442).
+    ///
+    /// Cargo constructs `{api}/v1/crates/{name}` for metadata requests.
+    /// The `api` field must match the route prefix so requests don't 404.
+    #[tokio::test]
+    async fn test_cargo_config_api_routes_to_metadata() {
+        let ctx = create_test_context();
+
+        // Put metadata in storage so the handler returns 200
+        let meta = r#"{"name":"serde","versions":[]}"#;
+        ctx.state
+            .storage
+            .put("cargo/serde/metadata.json", meta.as_bytes())
+            .await
+            .unwrap();
+
+        // Get config.json to extract the api field
+        let config_resp = send(&ctx.app, Method::GET, "/cargo/index/config.json", "").await;
+        let config_body = body_bytes(config_resp).await;
+        let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap();
+        let api_url = config["api"].as_str().unwrap();
+
+        // Construct the metadata URL the way Cargo does: {api}/v1/crates/{name}
+        let metadata_path = format!(
+            "{}/v1/crates/serde",
+            api_url.trim_start_matches("http://localhost")
+        );
+
+        let resp = send(&ctx.app, Method::GET, &metadata_path, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "metadata request via config.json api field must not 404 (#442)"
+        );
     }
 
     #[tokio::test]
