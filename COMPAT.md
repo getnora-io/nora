@@ -161,12 +161,16 @@ Caching proxy for galaxy.ansible.com. Collection tarballs are immutably cached.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Collection list | Full | TTL-cached |
-| Collection detail | Full | TTL-cached |
-| Collection versions | Full | TTL-cached |
-| Version detail | Full | TTL-cached |
-| Tarball download | Full | Immutable cache |
+| API discovery | Full | `/ansible/` and `/ansible/api/` |
+| Collection list | Full | Short v3 and Pulp-style paths |
+| Collection detail | Full | URL rewriting |
+| Collection versions | Full | Paginated |
+| Version detail | Full | Curation checks |
+| Tarball download | Full | Immutable cache, both `/download/` and `/artifacts/` paths |
+| Tarball curation | Full | Blocklist/allowlist, integrity verification |
 | Collection publish | — | Proxy-only (read) |
+
+Namespace and collection name validation follows Galaxy spec (`[a-z0-9_]+`).
 
 Client: `ansible-galaxy collection install ns.name -s http://nora:4000/ansible/`
 
