@@ -32,6 +32,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 ///
 /// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
 /// with NORA URLs (e.g. `http://nora:5000/npm/lodash/-/lodash-4.17.21.tgz`).
+///
+/// Two-layer approach (#439):
+/// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball`
+/// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
 fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|_| ())?;
 
@@ -54,7 +58,42 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
         }
     }
 
-    serde_json::to_vec(&json).map_err(|_| ())
+    let output = serde_json::to_vec(&json).map_err(|_| ())?;
+
+    // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
+    // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
+    Ok(replace_upstream_bytes(
+        &output,
+        upstream_trimmed,
+        &nora_npm_base,
+    ))
+}
+
+/// Byte-level replace of upstream URL prefix in response body (#439).
+///
+/// Used as safety net after targeted JSON rewrite, and as fallback when JSON
+/// parsing fails. Replaces full URL prefix (e.g. `https://registry.npmjs.org`)
+/// rather than bare hostname to avoid corrupting unrelated fields.
+fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
+    if upstream_url.is_empty() {
+        return data.to_vec();
+    }
+    let needle = upstream_url.as_bytes();
+    if memchr::memmem::find(data, needle).is_none() {
+        return data.to_vec();
+    }
+    // Replace all occurrences of the upstream URL prefix
+    let replacement = nora_npm_base.as_bytes();
+    let mut result = Vec::with_capacity(data.len());
+    let mut start = 0;
+    let finder = memchr::memmem::Finder::new(needle);
+    while let Some(pos) = finder.find(&data[start..]) {
+        result.extend_from_slice(&data[start..start + pos]);
+        result.extend_from_slice(replacement);
+        start += pos + needle.len();
+    }
+    result.extend_from_slice(&data[start..]);
+    result
 }
 
 async fn handle_request(
@@ -216,8 +255,16 @@ async fn handle_request(
                 } else {
                     // Metadata: rewrite tarball URLs to point to NORA
                     let nora_base = nora_base_url(&state);
-                    let rewritten =
-                        rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
+                    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url)
+                        .unwrap_or_else(|()| {
+                            tracing::warn!(
+                                path = %path,
+                                "npm metadata JSON parse failed, using byte-level URL rewrite"
+                            );
+                            let upstream_trimmed = proxy_url.trim_end_matches('/');
+                            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+                            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
+                        });
 
                     data_to_cache = rewritten.clone();
                     data_to_serve = rewritten;
@@ -267,7 +314,15 @@ async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Optio
     .ok()?;
 
     let nora_base = nora_base_url(state);
-    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or(data);
+    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
+        tracing::warn!(
+            path = %path,
+            "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
+        );
+        let upstream_trimmed = proxy_url.trim_end_matches('/');
+        let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+        replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
+    });
 
     let storage = state.storage.clone();
     let key_clone = key.to_string();
@@ -713,6 +768,96 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(json["description"], "A test package");
         assert_eq!(json["versions"]["1.0.0"]["dist"]["shasum"], "abc123");
+    }
+
+    // ── Safety net tests (#439) ──
+
+    #[test]
+    fn test_replace_upstream_bytes_basic() {
+        let data = b"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let result =
+            replace_upstream_bytes(data, "https://registry.npmjs.org", "http://nora:5000/npm");
+        assert_eq!(
+            String::from_utf8(result).unwrap(),
+            "http://nora:5000/npm/lodash/-/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_replace_upstream_bytes_no_match() {
+        let data = b"no upstream urls here";
+        let result = replace_upstream_bytes(data, "https://registry.npmjs.org", "http://nora/npm");
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_replace_upstream_bytes_empty_upstream() {
+        let data = b"https://registry.npmjs.org/test";
+        let result = replace_upstream_bytes(data, "", "http://nora/npm");
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_replace_upstream_bytes_multiple_occurrences() {
+        let data = b"url1: https://registry.npmjs.org/a url2: https://registry.npmjs.org/b";
+        let result =
+            replace_upstream_bytes(data, "https://registry.npmjs.org", "http://nora:5000/npm");
+        let s = String::from_utf8(result).unwrap();
+        assert!(!s.contains("registry.npmjs.org"));
+        assert!(s.contains("http://nora:5000/npm/a"));
+        assert!(s.contains("http://nora:5000/npm/b"));
+    }
+
+    #[test]
+    fn test_rewrite_tarball_urls_safety_net_catches_unknown_fields() {
+        // Simulate metadata with upstream URL in an unexpected field
+        let metadata = serde_json::json!({
+            "name": "test",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz"
+                    },
+                    "_resolved": "https://registry.npmjs.org/test/-/test-1.0.0.tgz"
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:5000", "https://registry.npmjs.org").unwrap();
+        let body = String::from_utf8(result).unwrap();
+        // Safety net should catch the _resolved field too
+        assert!(
+            !body.contains("registry.npmjs.org"),
+            "upstream URL leaked through _resolved field: {}",
+            &body[..body.len().min(500)]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_tarball_urls_preserves_non_upstream_urls() {
+        // homepage and repository.url should NOT be mangled
+        let metadata = serde_json::json!({
+            "name": "test",
+            "homepage": "https://github.com/test/test",
+            "repository": { "url": "git+https://github.com/test/test.git" },
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/test/-/test-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        let data = serde_json::to_vec(&metadata).unwrap();
+        let result =
+            rewrite_tarball_urls(&data, "http://nora:5000", "https://registry.npmjs.org").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(json["homepage"], "https://github.com/test/test");
+        assert_eq!(
+            json["repository"]["url"],
+            "git+https://github.com/test/test.git"
+        );
     }
 
     #[test]
