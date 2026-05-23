@@ -990,6 +990,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
     });
 
+    // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
+    let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
+    state.circuit_breaker.init_gauges(&registry_names);
+
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
