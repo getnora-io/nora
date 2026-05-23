@@ -60,9 +60,10 @@ jobs:
           echo "Binary size (amd64): $(du -sh nora-linux-amd64 | cut -f1)"
           file ./nora-linux-amd64
 
-      - name: Extract binary from multi-stage build (arm64)
+      - name: Cross-compile binary (arm64)
         run: |
-          docker buildx build --platform linux/arm64 --target binary --output type=local,dest=./dist-arm64 .
+          docker buildx build --platform linux/amd64 --target binary-arm64 \
+            --output type=local,dest=./dist-arm64 .
           cp ./dist-arm64/nora ./nora-linux-arm64
           chmod +x ./nora-linux-arm64
           echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
@@ -114,6 +115,7 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
+          file: deploy/Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-alpine.outputs.tags }}
