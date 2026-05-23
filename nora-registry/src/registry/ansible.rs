@@ -9,6 +9,7 @@
 //!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/
 //!   GET /ansible/api/v3/plugin/ansible/content/published/collections/index/{ns}/{name}/versions/{ver}/
 //!   GET /ansible/download/{ns}-{name}-{ver}.tar.gz — collection tarball (immutable)
+//!   GET /ansible/api/v3/plugin/ansible/content/published/collections/artifacts/{file} — alias
 //!
 //! Client config:
 //!   ansible-galaxy collection install community.general -s http://nora:4000/ansible/
@@ -73,6 +74,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         // Collection tarball download (immutable)
         .route("/ansible/download/{filename}", get(download_tarball))
+        // Artifact path alias — upstream Galaxy serves tarballs here too (#438)
+        .route(
+            "/ansible/api/v3/plugin/ansible/content/published/collections/artifacts/{filename}",
+            get(download_tarball),
+        )
 }
 
 // ── API discovery ─────────────────────────────────────────────────────
@@ -346,8 +352,9 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
 ///
 /// Replacements are applied most-specific-first to avoid double-rewriting:
 /// 1. `{upstream}/download/` → `{base}/ansible/download/`
-/// 2. `{upstream}{API_PREFIX}/` → `{base}/ansible/v3/collections/`
-/// 3. `{upstream}` (remaining) → `{base}/ansible`
+/// 2. `{upstream}/.../artifacts/` → `{base}/ansible/download/` (#438)
+/// 3. `{upstream}{API_PREFIX}/` → `{base}/ansible/v3/collections/`
+/// 4. `{upstream}` (remaining) → `{base}/ansible`
 fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
     let upstream = upstream_url.trim_end_matches('/');
     let base = base_url.trim_end_matches('/');
@@ -357,6 +364,14 @@ fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> 
         // Most specific first: download URLs
         .replace(
             &format!("{}/download/", upstream),
+            &format!("{}/download/", nora_ansible),
+        )
+        // Artifact URLs → download path (#438)
+        .replace(
+            &format!(
+                "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
+                upstream
+            ),
             &format!("{}/download/", nora_ansible),
         )
         // Pulp-style API paths → short v3 paths
@@ -551,6 +566,19 @@ mod tests {
         let input = r#"{"links":{"next":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/?limit=10&offset=20"}}"#;
         let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
         assert!(result.contains("http://nora:4000/ansible/v3/collections/community/general/versions/?limit=10&offset=20"));
+        assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_rewrite_ansible_urls_artifacts_path() {
+        // Upstream Galaxy returns download_url with artifacts path (#438)
+        let input = r#"{"download_url":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/artifacts/community-general-12.2.0.tar.gz"}"#;
+        let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
+        assert!(
+            result.contains("http://nora:4000/ansible/download/community-general-12.2.0.tar.gz"),
+            "artifacts path should rewrite to /ansible/download/: {}",
+            result
+        );
         assert!(!result.contains("galaxy.ansible.com"));
     }
 
