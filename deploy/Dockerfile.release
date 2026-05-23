@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.4
+#
+# Multi-platform packaging from pre-built binaries.
+# No compilation — just COPY the right binary for the target arch.
+#
+# Usage:
+#   docker buildx build -f deploy/Dockerfile.release \
+#     --platform linux/amd64,linux/arm64 --push .
+#
+# Expects nora-linux-amd64 and nora-linux-arm64 in the build context.
+
+FROM alpine:3.21
+ARG TARGETARCH
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
+    && addgroup -S nora && adduser -S -G nora nora \
+    && mkdir -p /data && chown nora:nora /data
+
+COPY --chown=nora:nora nora-linux-${TARGETARCH} /usr/local/bin/nora
+RUN chmod +x /usr/local/bin/nora
+
+ENV RUST_LOG=info \
+    NORA_HOST=0.0.0.0 \
+    NORA_PORT=4000 \
+    NORA_STORAGE_PATH=/data/storage \
+    NORA_AUTH_TOKEN_STORAGE=/data/tokens
+
+EXPOSE 4000
+VOLUME ["/data"]
+USER nora
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -q --spider http://localhost:4000/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/nora"]
+CMD ["serve"]

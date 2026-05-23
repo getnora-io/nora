@@ -7,7 +7,8 @@
 #   docker build .                                             # Alpine (default)
 #   docker build --target redos .                              # RED OS
 #   docker build --target astra .                              # Astra Linux SE
-#   docker buildx build --target binary --output type=local,dest=out .  # Binary only
+#   docker buildx build --target binary --output type=local,dest=out .      # amd64 binary
+#   docker buildx build --target binary-arm64 --output type=local,dest=out .  # arm64 binary (cross-compiled)
 #
 
 # ── Build ──────────────────────────────────────────────────────────────────
@@ -34,6 +35,33 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── Binary export (for CI release artifacts) ───────────────────────────────
 FROM scratch AS binary
 COPY --from=builder /nora /nora
+
+# ── Cross-compile arm64 (runs natively on x86, no QEMU) ──────────────────
+FROM rust:1-alpine3.21 AS cross-arm64
+
+RUN apk add --no-cache musl-dev \
+    && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+
+ENV PATH="/opt/aarch64-linux-musl-cross/bin:$PATH" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+
+RUN rustup target add aarch64-unknown-linux-musl
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY nora-registry/ nora-registry/
+RUN sed -i '/"fuzz"/d' Cargo.toml
+
+ARG CARGO_FEATURES=""
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
+    cp target/aarch64-unknown-linux-musl/release/nora /nora && \
+    aarch64-linux-musl-strip /nora
+
+FROM scratch AS binary-arm64
+COPY --from=cross-arm64 /nora /nora
 
 # ── RED OS (FSTEC-certified, RPM-based) ───────────────────────────────────
 FROM registry.red-soft.ru/ubi8/ubi-minimal AS redos
