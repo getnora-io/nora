@@ -58,7 +58,36 @@ pub mod npm_fuzz {
             }
         }
 
-        serde_json::to_vec(&json).map_err(|_| ())
+        let output = serde_json::to_vec(&json).map_err(|_| ())?;
+
+        // Safety net: byte-level replace of any remaining upstream URL prefix (#439)
+        Ok(replace_upstream_bytes(
+            &output,
+            upstream_trimmed,
+            &nora_npm_base,
+        ))
+    }
+
+    /// Byte-level replace of upstream URL prefix (safety net for fuzz targets).
+    fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
+        if upstream_url.is_empty() {
+            return data.to_vec();
+        }
+        let needle = upstream_url.as_bytes();
+        if memchr::memmem::find(data, needle).is_none() {
+            return data.to_vec();
+        }
+        let replacement = nora_npm_base.as_bytes();
+        let mut result = Vec::with_capacity(data.len());
+        let mut start = 0;
+        let finder = memchr::memmem::Finder::new(needle);
+        while let Some(pos) = finder.find(&data[start..]) {
+            result.extend_from_slice(&data[start..start + pos]);
+            result.extend_from_slice(replacement);
+            start += pos + needle.len();
+        }
+        result.extend_from_slice(&data[start..]);
+        result
     }
 }
 
