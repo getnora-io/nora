@@ -212,6 +212,10 @@ async fn download_tarball(
     }
     let (ns, name, ver) = (parts[0], parts[1], parts[2]);
 
+    if !is_valid_name(ns) || !is_valid_name(name) || !is_valid_version(ver) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     let storage_key = format!("ansible/download/{}", filename);
 
     // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
@@ -446,9 +450,7 @@ fn is_valid_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\0')
         && !name.contains("..")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn is_valid_version(version: &str) -> bool {
@@ -478,7 +480,7 @@ mod tests {
     fn test_valid_names() {
         assert!(is_valid_name("community"));
         assert!(is_valid_name("ansible"));
-        assert!(is_valid_name("cloud-common"));
+        assert!(is_valid_name("cloud_common"));
     }
 
     #[test]
@@ -486,6 +488,17 @@ mod tests {
         assert!(!is_valid_name(""));
         assert!(!is_valid_name("../evil"));
         assert!(!is_valid_name("foo/bar"));
+        // Galaxy spec: namespaces/names use underscores, not hyphens
+        assert!(!is_valid_name("cloud-common"));
+    }
+
+    #[test]
+    fn test_valid_version() {
+        assert!(is_valid_version("7.0.0"));
+        assert!(is_valid_version("1.2.3"));
+        assert!(!is_valid_version(""));
+        assert!(!is_valid_version("../evil"));
+        assert!(!is_valid_version("foo/bar"));
     }
 
     #[test]
@@ -709,5 +722,32 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"tarball-v3");
+    }
+
+    #[tokio::test]
+    async fn test_ansible_download_rejects_invalid_name_parts() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+
+        // Path traversal in namespace
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/download/..%2F-name-1.0.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Empty name part (double-hyphen)
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/download/community--1.0.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
