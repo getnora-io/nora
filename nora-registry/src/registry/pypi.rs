@@ -525,11 +525,12 @@ struct Pep691Hashes {
 }
 
 fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
+    let base = base_url.trim_end_matches('/');
     let pep691_files: Vec<Pep691File> = files
         .iter()
         .map(|f| Pep691File {
             filename: f.filename.clone(),
-            url: format!("{}/simple/{}/{}", base_url, normalized, f.filename),
+            url: format!("{}/simple/{}/{}", base, normalized, f.filename),
             hashes: f
                 .sha256
                 .as_ref()
@@ -552,6 +553,7 @@ fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str)
 }
 
 fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
+    let base = base_url.trim_end_matches('/');
     let escaped = html_escape(normalized);
     let mut html = format!(
         "<!DOCTYPE html>\n<html><head><title>Links for {}</title></head><body><h1>Links for {}</h1>\n",
@@ -567,7 +569,7 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
         let _ = writeln!(
             html,
             "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
-            base_url,
+            base,
             normalized,
             html_escape(&f.filename),
             hash_fragment,
@@ -1338,6 +1340,94 @@ mod spec_conformance_tests {
                 "file URL must point to NORA base: {url}"
             );
         }
+    }
+
+    // ========================================================================
+    // URL-rewrite systematic tests (#387)
+    // ========================================================================
+
+    /// URLs in HTML response must point to NORA, not upstream (#387).
+    #[test]
+    fn test_html_urls_point_to_nora_no_upstream_leak() {
+        let files = vec![
+            FileEntry {
+                filename: "requests-2.31.0.tar.gz".into(),
+                sha256: Some("aaa111".into()),
+            },
+            FileEntry {
+                filename: "requests-2.31.0-py3-none-any.whl".into(),
+                sha256: Some("bbb222".into()),
+            },
+        ];
+        let response = versions_html_response("requests", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            html.contains("http://nora:4000/simple/requests/requests-2.31.0.tar.gz"),
+            "HTML must contain NORA URL for tarball"
+        );
+        assert!(
+            html.contains("http://nora:4000/simple/requests/requests-2.31.0-py3-none-any.whl"),
+            "HTML must contain NORA URL for wheel"
+        );
+        // No upstream host leak
+        assert!(
+            !html.contains("pypi.org") && !html.contains("pythonhosted"),
+            "HTML must not contain upstream URLs"
+        );
+    }
+
+    /// Trailing slash on base_url must not produce double-slash in URLs (#387).
+    #[test]
+    fn test_pep691_trailing_slash_handling() {
+        let files = vec![FileEntry {
+            filename: "pkg-1.0.tar.gz".into(),
+            sha256: Some("abc".into()),
+        }];
+        let response = versions_json_response("pkg", &files, "http://nora:4000/");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let url = json["files"][0]["url"].as_str().unwrap();
+        assert!(
+            !url.contains("//simple"),
+            "trailing slash on base_url must not produce double-slash: {url}"
+        );
+        assert!(
+            url.starts_with("http://nora:4000/"),
+            "URL must start with base: {url}"
+        );
+    }
+
+    /// Empty file list produces valid response with no file URLs (#387).
+    #[test]
+    fn test_pep691_no_files_clean_response() {
+        let files: Vec<FileEntry> = vec![];
+        let response = versions_json_response("empty-pkg", &files, "http://nora:4000");
+        let bytes =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["files"].as_array().unwrap().len(), 0);
+        assert_eq!(json["name"], "empty-pkg");
+    }
+
+    /// Upstream HTML with no matching package links → empty file list (#387).
+    #[test]
+    fn test_parse_upstream_no_package_links_yields_empty() {
+        let html = r#"<html><body>
+            <a href="https://example.com/page">Not a package</a>
+            <a href="/about">About</a>
+        </body></html>"#;
+        let files = parse_upstream_files(html);
+        assert!(
+            files.is_empty(),
+            "HTML without package links should yield empty list"
+        );
     }
 
     /// PEP 691 response must be valid JSON and deserializable back to typed struct.

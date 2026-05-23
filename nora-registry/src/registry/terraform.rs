@@ -990,6 +990,101 @@ mod tests {
         assert_eq!(result, git_url, "git:: URLs should pass through unchanged");
     }
 
+    // ========================================================================
+    // URL-rewrite systematic tests (#387)
+    // ========================================================================
+
+    /// Rewrite all three URL fields: download_url, shasums_url, shasums_signature_url (#387).
+    #[test]
+    fn test_rewrite_download_url_all_fields() {
+        let input = serde_json::json!({
+            "os": "linux",
+            "arch": "amd64",
+            "download_url": "https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_linux_amd64.zip",
+            "shasums_url": "https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_SHA256SUMS",
+            "shasums_signature_url": "https://releases.hashicorp.com/terraform-provider-aws/5.0.0/terraform-provider-aws_5.0.0_SHA256SUMS.sig",
+            "shasum": "abc123"
+        });
+        let result = rewrite_download_url(
+            &input.to_string(),
+            "http://nora:4000",
+            "hashicorp",
+            "aws",
+            "5.0.0",
+        );
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // All three URLs must point to NORA
+        assert!(
+            json["download_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora:4000/terraform/"),
+            "download_url must point to NORA"
+        );
+        assert!(
+            json["shasums_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora:4000/terraform/"),
+            "shasums_url must point to NORA"
+        );
+        assert!(
+            json["shasums_signature_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora:4000/terraform/"),
+            "shasums_signature_url must point to NORA"
+        );
+        // No upstream leak
+        assert!(
+            !result.contains("releases.hashicorp.com") || result.contains("_nora_upstream"),
+            "upstream URL must only appear in _nora_upstream fields"
+        );
+        // Upstream URLs preserved in _nora_upstream_* fields
+        assert!(json.get("_nora_upstream_url").is_some());
+        assert!(json.get("_nora_upstream_shasums_url").is_some());
+        assert!(json.get("_nora_upstream_shasums_sig_url").is_some());
+    }
+
+    /// Custom upstream (not hashicorp) — URLs still rewritten to NORA (#387).
+    #[test]
+    fn test_rewrite_download_url_custom_upstream() {
+        let input = r#"{"download_url":"https://private.registry.corp/providers/myorg/myprovider/1.0.0/terraform-provider-myprovider_1.0.0_linux_amd64.zip"}"#;
+        let result =
+            rewrite_download_url(input, "http://nora:4000", "myorg", "myprovider", "1.0.0");
+        assert!(
+            result.contains(
+                "http://nora:4000/terraform/v1/providers/download/myorg/myprovider/1.0.0/"
+            ),
+            "custom upstream must be rewritten to NORA"
+        );
+        assert!(
+            !result.contains("private.registry.corp") || result.contains("_nora_upstream"),
+            "custom upstream must not leak outside _nora_upstream fields"
+        );
+    }
+
+    /// Base URL with trailing slash must not produce double-slash (#387).
+    #[test]
+    fn test_rewrite_module_source_url_trailing_slash() {
+        let result = rewrite_module_source_url(
+            "https://codeload.github.com/hashicorp/terraform-aws-consul/tar.gz/v0.1.0",
+            "http://nora:4000/",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert!(
+            !result.contains("4000//terraform"),
+            "trailing slash must not produce double-slash: {result}"
+        );
+        assert_eq!(
+            result,
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+        );
+    }
+
     #[test]
     fn test_rewrite_module_source_url_relative_passthrough() {
         let result = rewrite_module_source_url(

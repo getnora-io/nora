@@ -756,6 +756,132 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // URL-rewrite systematic tests (#387)
+    // ========================================================================
+
+    /// Response without upstream URLs passes through with only archive_url rewritten (#387).
+    #[test]
+    fn test_rewrite_package_response_no_upstream_urls_noop() {
+        let source = serde_json::json!({
+            "name": "http",
+            "latest": {
+                "version": "1.2.0",
+                "archive_url": "https://pub.dev/api/archives/http-1.2.0.tar.gz",
+                "pubspec": {"name": "http", "version": "1.2.0"}
+            },
+            "versions": [{
+                "version": "1.2.0",
+                "archive_url": "https://pub.dev/api/archives/http-1.2.0.tar.gz",
+                "pubspec": {"name": "http", "version": "1.2.0"}
+            }]
+        });
+        let rewritten = rewrite_package_response(
+            &serde_json::to_vec(&source).unwrap(),
+            "http://nora:4000/pub",
+            "http",
+        )
+        .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        // archive_url rewritten
+        assert!(
+            json["latest"]["archive_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora:4000/pub/"),
+            "archive_url must be rewritten"
+        );
+        // pubspec preserved unchanged
+        assert_eq!(json["latest"]["pubspec"]["name"], "http");
+    }
+
+    /// Custom upstream (not pub.dev) — archive_url still rewritten to NORA (#387).
+    #[test]
+    fn test_rewrite_package_response_custom_upstream() {
+        let source = serde_json::json!({
+            "name": "my_pkg",
+            "latest": {
+                "version": "3.0.0",
+                "archive_url": "https://private-dart.corp.com/api/archives/my_pkg-3.0.0.tar.gz"
+            },
+            "versions": [{
+                "version": "3.0.0",
+                "archive_url": "https://private-dart.corp.com/api/archives/my_pkg-3.0.0.tar.gz"
+            }]
+        });
+        let rewritten = rewrite_package_response(
+            &serde_json::to_vec(&source).unwrap(),
+            "http://nora:4000/pub",
+            "my_pkg",
+        )
+        .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            json["latest"]["archive_url"],
+            "http://nora:4000/pub/packages/my_pkg/versions/3.0.0.tar.gz",
+        );
+        let body = String::from_utf8(rewritten).unwrap();
+        assert!(
+            !body.contains("private-dart.corp.com"),
+            "upstream URL must not leak (#387)"
+        );
+    }
+
+    /// Trailing slash on nora_base must not produce double-slash (#387).
+    #[test]
+    fn test_rewrite_package_response_trailing_slash() {
+        let source = serde_json::json!({
+            "name": "http",
+            "latest": {
+                "version": "1.0.0",
+                "archive_url": "https://pub.dev/api/archives/http-1.0.0.tar.gz"
+            },
+            "versions": []
+        });
+        let rewritten = rewrite_package_response(
+            &serde_json::to_vec(&source).unwrap(),
+            "http://nora:4000/pub/",
+            "http",
+        )
+        .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let url = json["latest"]["archive_url"].as_str().unwrap();
+        assert!(
+            !url.contains("//packages"),
+            "trailing slash must not produce double-slash: {url}"
+        );
+    }
+
+    /// Search response without next_url — no pagination rewrite needed (#387).
+    #[test]
+    fn test_rewrite_search_response_no_next_url() {
+        let source = serde_json::json!({
+            "packages": [{
+                "name": "http",
+                "latest": {
+                    "version": "1.2.0",
+                    "archive_url": "https://pub.dev/api/archives/http-1.2.0.tar.gz"
+                }
+            }]
+        });
+        let rewritten = rewrite_search_response(
+            &serde_json::to_vec(&source).unwrap(),
+            "http://nora:4000/pub",
+            "https://pub.dev",
+        )
+        .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert!(
+            json.get("next_url").is_none(),
+            "missing next_url must not appear in rewritten response"
+        );
+        let body = String::from_utf8(rewritten).unwrap();
+        assert!(
+            !body.contains("pub.dev"),
+            "upstream URL must not leak in search response (#387)"
+        );
+    }
+
     #[tokio::test]
     async fn test_pub_disabled_returns_404() {
         let ctx = create_test_context_with_config(|cfg| {
