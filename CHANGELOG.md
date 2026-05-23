@@ -1,6 +1,26 @@
 # Changelog
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-23
+
+### Added
+- **Prometheus P0 metrics** — `nora_downloads_total`, `nora_uploads_total`, `nora_storage_bytes`, `nora_cache_requests_total`, `nora_upstream_request_duration_seconds` histogram with per-registry labels (#431, #432, #443)
+- **Grafana dashboard** — production-ready dashboard JSON in `dist/grafana-dashboard.json` with documentation (#436, #437)
+- **Ansible Galaxy v3 compliance** — pagination forwarding, artifact route alias, spec name validation (#433, #434, #438, #444, #445)
+- **.deb/.rpm packaging** — `nfpm` configuration for native Linux packages (#209, #435)
+- **Circuit breaker gauge initialization** — `nora_circuit_breaker_state` emits 0 (CLOSED) at startup for all enabled registries (#441)
+- **PyPI URL-rewrite tests** — 11 tests covering trailing-slash and double-slash regressions (#387)
+- 1086 total tests (up from 1049)
+
+### Fixed
+- **npm upstream URL leak (P0 security)** — metadata responses no longer expose `registry.npmjs.org` URLs (#439)
+- **Cargo sparse index `api` field** — `config.json` now returns correct `/cargo/api` path instead of `/cargo` (#442)
+- **PyPI trailing-slash URL rewrite** — response body URLs no longer contain double-slash `//simple` (#387)
+
+### Changed
+- Dashboard screenshot updated to v0.9.2 with populated metrics panels (#429, #430)
+- README and SECURITY.md synced with v0.9.2 (#428)
+
 ## [0.9.1] - 2026-05-21
 
 ### Added

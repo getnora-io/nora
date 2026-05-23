@@ -151,6 +151,7 @@ docker run -d -p 4000:4000 \
 - ~~Outbound proxy, structured audit log~~ ✅ v0.8.3
 - ~~Circuit breaker, OIDC, hot reload, arm64, streaming uploads~~ ✅ v0.9.0
 - ~~NuGet V3 stabilization, Cargo ETag, 1049 tests~~ ✅ v0.9.1
+- ~~Prometheus metrics, Ansible Galaxy v3, security fixes, 1086 tests~~ ✅ v0.9.2
 - **Image Signing Policy** — cosign verification on upstream pulls
 - **Semver contract** — stable API, configuration format, and storage layout
 
