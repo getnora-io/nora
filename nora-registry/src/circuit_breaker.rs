@@ -74,6 +74,19 @@ impl CircuitBreakerRegistry {
         Self::new(CircuitBreakerConfig::default())
     }
 
+    /// Initialize gauge to 0 (Closed) for all known registries so Prometheus
+    /// exports the metric immediately, even before any state transition (#441).
+    pub(crate) fn init_gauges(&self, registries: &[&str]) {
+        if !self.config.enabled {
+            return;
+        }
+        for name in registries {
+            CIRCUIT_BREAKER_STATE
+                .with_label_values(&[name])
+                .set(BreakerState::Closed.as_gauge());
+        }
+    }
+
     /// Resolve the failure threshold for a given registry key, checking overrides first.
     fn threshold_for(&self, registry: &str) -> u32 {
         self.config
@@ -243,6 +256,33 @@ mod tests {
             reset_timeout: 30,
             overrides: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_init_gauges_sets_closed() {
+        // Use unique names to avoid interference from other tests (global metrics)
+        let cb = CircuitBreakerRegistry::new(enabled_config(5, 30));
+        cb.init_gauges(&["init_test_a", "init_test_b"]);
+        assert_eq!(
+            CIRCUIT_BREAKER_STATE
+                .with_label_values(&["init_test_a"])
+                .get(),
+            0,
+            "gauge must be 0 (Closed) after init (#441)"
+        );
+        assert_eq!(
+            CIRCUIT_BREAKER_STATE
+                .with_label_values(&["init_test_b"])
+                .get(),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_init_gauges_noop_when_disabled() {
+        let cb = CircuitBreakerRegistry::new(disabled_config());
+        // Should not panic or set anything
+        cb.init_gauges(&["init_disabled_a"]);
     }
 
     #[test]
