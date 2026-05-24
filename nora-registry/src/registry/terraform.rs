@@ -213,7 +213,7 @@ async fn provider_download_meta(
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
-                return with_json(data.to_vec());
+                return with_json(strip_nora_internal_fields(&data));
             }
         }
     }
@@ -257,7 +257,7 @@ async fn provider_download_meta(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
 
             state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
-            with_json(rewritten.into_bytes())
+            with_json(strip_nora_internal_fields(rewritten.as_bytes()))
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -492,8 +492,13 @@ async fn module_download(
                     &ver,
                 );
 
-                // Cache the original upstream URL for module_source_download
-                state.spawn_cache("terraform", source_url_key, Bytes::from(original_url));
+                // Cache the inner URL (stripping VCS prefix like git::) for module_source_download
+                let (_, inner_url) = strip_vcs_prefix(&original_url);
+                state.spawn_cache(
+                    "terraform",
+                    source_url_key,
+                    Bytes::from(inner_url.to_string()),
+                );
 
                 return (
                     StatusCode::NO_CONTENT,
@@ -839,8 +844,9 @@ fn rewrite_download_url(
 /// Rewrite X-Terraform-Get URL to point through NORA.
 ///
 /// HTTP/HTTPS URLs are rewritten to NORA's module source proxy endpoint.
-/// Non-HTTP URLs (git::, hg::, relative paths) are returned as-is since
-/// they cannot be proxied through a simple HTTP cache.
+/// VCS-prefixed URLs like `git::https://...` have their inner URL extracted
+/// and rewritten (the VCS prefix is dropped since NORA proxies via HTTP).
+/// Non-HTTP URLs (s3::, ssh://, relative paths) are returned as-is.
 fn rewrite_module_source_url(
     original_url: &str,
     base_url: &str,
@@ -849,7 +855,17 @@ fn rewrite_module_source_url(
     provider: &str,
     ver: &str,
 ) -> String {
-    if original_url.starts_with("http://") || original_url.starts_with("https://") {
+    let (vcs_prefix, inner_url) = strip_vcs_prefix(original_url);
+
+    if inner_url.starts_with("http://") || inner_url.starts_with("https://") {
+        if !vcs_prefix.is_empty() {
+            tracing::warn!(
+                module = %format!("{}/{}/{}", ns, name, provider),
+                version = %ver,
+                vcs = vcs_prefix.trim_end_matches("::"),
+                "Module uses VCS prefix — source download via HTTP proxy may not work"
+            );
+        }
         format!(
             "{}/terraform/v1/modules/download/{}/{}/{}/{}/source",
             base_url.trim_end_matches('/'),
@@ -859,9 +875,40 @@ fn rewrite_module_source_url(
             ver
         )
     } else {
-        // git::, hg::, s3::, relative paths — pass through as-is
+        // s3::, ssh://, relative paths — pass through as-is
         original_url.to_string()
     }
+}
+
+/// Strip internal `_nora_*` fields from cached metadata before sending to clients.
+///
+/// The cached JSON contains `_nora_upstream_url`, `_nora_upstream_shasums_url`, and
+/// `_nora_upstream_shasums_sig_url` — needed internally by `resolve_upstream_download_url`
+/// but must NOT be exposed to clients (air-gap URL leak).
+fn strip_nora_internal_fields(data: &[u8]) -> Vec<u8> {
+    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(data) {
+        if let Some(obj) = json.as_object_mut() {
+            obj.retain(|k, _| !k.starts_with("_nora_"));
+        }
+        serde_json::to_vec(&json).unwrap_or_else(|_| data.to_vec())
+    } else {
+        tracing::warn!(
+            "strip_nora_internal_fields: failed to parse cached JSON, returning raw data"
+        );
+        data.to_vec()
+    }
+}
+
+/// Extract VCS prefix (`git::`, `hg::`) from a Terraform module source URL.
+///
+/// Returns `(prefix, inner_url)`. If no VCS prefix is present, prefix is empty.
+fn strip_vcs_prefix(url: &str) -> (&str, &str) {
+    for prefix in &["git::", "hg::"] {
+        if let Some(inner) = url.strip_prefix(prefix) {
+            return (prefix, inner);
+        }
+    }
+    ("", url)
 }
 
 /// Validate namespace/type/provider names
@@ -977,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_module_source_url_git_passthrough() {
+    fn test_rewrite_module_source_url_git_rewrite() {
         let git_url = "git::https://example.com/module.git";
         let result = rewrite_module_source_url(
             git_url,
@@ -987,7 +1034,106 @@ mod tests {
             "aws",
             "0.1.0",
         );
-        assert_eq!(result, git_url, "git:: URLs should pass through unchanged");
+        assert_eq!(
+            result,
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
+            "git::https:// URLs must be rewritten through NORA (air-gap)"
+        );
+        assert!(
+            !result.contains("example.com"),
+            "upstream URL must not leak"
+        );
+        assert!(!result.contains("git::"), "VCS prefix must be stripped");
+    }
+
+    #[test]
+    fn test_rewrite_module_source_url_hg_rewrite() {
+        let hg_url = "hg::https://example.com/module.hg";
+        let result = rewrite_module_source_url(
+            hg_url,
+            "http://nora:4000",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert_eq!(
+            result,
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
+            "hg::https:// URLs must be rewritten through NORA"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_module_source_url_s3_passthrough() {
+        let s3_url = "s3::https://bucket.s3.amazonaws.com/module.zip";
+        let result = rewrite_module_source_url(
+            s3_url,
+            "http://nora:4000",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert_eq!(result, s3_url, "s3:: URLs should pass through unchanged");
+    }
+
+    #[test]
+    fn test_strip_nora_internal_fields() {
+        let input = serde_json::json!({
+            "download_url": "http://nora:4000/terraform/providers/download/test.zip",
+            "_nora_upstream_url": "https://releases.hashicorp.com/test.zip",
+            "_nora_upstream_shasums_url": "https://releases.hashicorp.com/SHA256SUMS",
+            "_nora_upstream_shasums_sig_url": "https://releases.hashicorp.com/SHA256SUMS.sig",
+            "shasum": "abc123"
+        });
+        let stripped = strip_nora_internal_fields(input.to_string().as_bytes());
+        let json: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+        assert!(
+            json.get("download_url").is_some(),
+            "download_url must remain"
+        );
+        assert!(json.get("shasum").is_some(), "shasum must remain");
+        assert!(
+            json.get("_nora_upstream_url").is_none(),
+            "_nora_upstream_url must be stripped"
+        );
+        assert!(
+            json.get("_nora_upstream_shasums_url").is_none(),
+            "shasums must be stripped"
+        );
+        assert!(
+            json.get("_nora_upstream_shasums_sig_url").is_none(),
+            "sig must be stripped"
+        );
+    }
+
+    #[test]
+    fn test_strip_nora_internal_fields_invalid_json() {
+        let input = b"not json at all";
+        let result = strip_nora_internal_fields(input);
+        assert_eq!(result, input, "invalid JSON must pass through unchanged");
+    }
+
+    #[test]
+    fn test_strip_vcs_prefix() {
+        assert_eq!(
+            strip_vcs_prefix("git::https://example.com"),
+            ("git::", "https://example.com")
+        );
+        assert_eq!(
+            strip_vcs_prefix("hg::https://example.com"),
+            ("hg::", "https://example.com")
+        );
+        assert_eq!(
+            strip_vcs_prefix("https://example.com"),
+            ("", "https://example.com")
+        );
+        assert_eq!(strip_vcs_prefix("./local/path"), ("", "./local/path"));
+        assert_eq!(
+            strip_vcs_prefix("s3::https://bucket.s3.amazonaws.com/mod.zip"),
+            ("", "s3::https://bucket.s3.amazonaws.com/mod.zip")
+        );
     }
 
     // ========================================================================
