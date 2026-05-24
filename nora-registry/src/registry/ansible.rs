@@ -111,7 +111,12 @@ async fn collection_list(
     let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
     let url = append_query(&base, raw_query.as_deref());
 
-    proxy_json(&state, &url, "ansible-collections").await
+    let cache_key = match extract_page_param(raw_query.as_deref()) {
+        Some(page) => format!("ansible/metadata/collections-page-{}.json", page),
+        None => "ansible/metadata/collections.json".to_string(),
+    };
+
+    proxy_json(&state, &url, "ansible-collections", &cache_key).await
 }
 
 // ── Collection detail ──────────────────────────────────────────────────
@@ -133,7 +138,8 @@ async fn collection_detail(
         name
     );
 
-    proxy_json(&state, &url, &format!("{}.{}", ns, name)).await
+    let cache_key = format!("ansible/metadata/{}/{}.json", ns, name);
+    proxy_json(&state, &url, &format!("{}.{}", ns, name), &cache_key).await
 }
 
 // ── Version listing ────────────────────────────────────────────────────
@@ -157,7 +163,21 @@ async fn version_list(
     );
     let url = append_query(&base, raw_query.as_deref());
 
-    proxy_json(&state, &url, &format!("{}.{}/versions", ns, name)).await
+    let cache_key = match extract_page_param(raw_query.as_deref()) {
+        Some(page) => format!(
+            "ansible/metadata/{}/{}/versions-page-{}.json",
+            ns, name, page
+        ),
+        None => format!("ansible/metadata/{}/{}/versions.json", ns, name),
+    };
+
+    proxy_json(
+        &state,
+        &url,
+        &format!("{}.{}/versions", ns, name),
+        &cache_key,
+    )
+    .await
 }
 
 // ── Version detail ─────────────────────────────────────────────────────
@@ -194,7 +214,14 @@ async fn version_detail(
         ver
     );
 
-    proxy_json(&state, &url, &format!("{}.{} v{}", ns, name, ver)).await
+    let cache_key = format!("ansible/metadata/{}/{}/{}.json", ns, name, ver);
+    proxy_json(
+        &state,
+        &url,
+        &format!("{}.{} v{}", ns, name, ver),
+        &cache_key,
+    )
+    .await
 }
 
 // ── Tarball download (immutable) ───────────────────────────────────────
@@ -312,9 +339,38 @@ async fn download_tarball(
     }
 }
 
-// ── Generic JSON proxy ─────────────────────────────────────────────────
+// ── Generic JSON proxy with metadata caching ─────────────────────────
 
-async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Response {
+/// Proxy a Galaxy API JSON request with metadata caching and serve-stale.
+///
+/// `cache_key` is the storage path for the cached response (e.g.
+/// `ansible/metadata/community/general.json`).
+async fn proxy_json(
+    state: &Arc<AppState>,
+    url: &str,
+    artifact_name: &str,
+    cache_key: &str,
+) -> Response {
+    let base_url = nora_base_url(state);
+    let upstream = upstream_url(state);
+
+    // Read cache eagerly so stale data is available on upstream failure.
+    let cached_data = state.storage.get(cache_key).await.ok();
+
+    // TTL check — serve fresh cache without hitting upstream.
+    if let Some(ref data) = cached_data {
+        if let Some(meta) = state.storage.stat(cache_key).await {
+            if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
+                state.metrics.record_download("ansible");
+                state.metrics.record_cache_hit("ansible");
+                let text = String::from_utf8_lossy(data);
+                let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
+                return with_json(rewritten.into_bytes());
+            }
+        }
+    }
+
+    // Cache miss or stale — fetch from upstream.
     match proxy_fetch_text(
         &state.http_client,
         url,
@@ -327,10 +383,6 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
     .await
     {
         Ok(text) => {
-            let base_url = nora_base_url(state);
-            let upstream = upstream_url(state);
-            let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
-
             state.metrics.record_download("ansible");
             state.metrics.record_cache_miss("ansible");
             state.activity.push(ActivityEntry::new(
@@ -343,6 +395,10 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
 
+            // Cache raw response (before URL rewriting) for serve-stale.
+            state.spawn_cache("ansible", cache_key.to_string(), Bytes::from(text.clone()));
+
+            let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
             state.repo_index.invalidate("ansible");
             with_json(rewritten.into_bytes())
         }
@@ -350,9 +406,50 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str) -> Respons
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Ansible Galaxy upstream error");
-            StatusCode::BAD_GATEWAY.into_response()
+            serve_stale_or_bad_gateway(state, cached_data, cache_key, &upstream, &base_url)
         }
     }
+}
+
+/// Serve stale cached metadata when upstream is unreachable, or 502 if no cache.
+fn serve_stale_or_bad_gateway(
+    state: &AppState,
+    cached: Option<Bytes>,
+    label: &str,
+    upstream: &str,
+    base_url: &str,
+) -> Response {
+    if let Some(data) = cached {
+        if state.config.ansible.serve_stale {
+            tracing::warn!(
+                registry = "ansible",
+                endpoint = label,
+                "Upstream unreachable, serving stale cached metadata"
+            );
+            let text = String::from_utf8_lossy(&data);
+            let rewritten = rewrite_ansible_urls(&text, upstream, base_url);
+            return (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                    ),
+                    (
+                        axum::http::header::HeaderName::from_static("x-nora-stale"),
+                        axum::http::header::HeaderValue::from_static("true"),
+                    ),
+                ],
+                rewritten.into_bytes(),
+            )
+                .into_response();
+        }
+    }
+    StatusCode::BAD_GATEWAY.into_response()
 }
 
 // ── URL rewriting ─────────────────────────────────────────────────────
@@ -402,6 +499,22 @@ fn append_query(base_url: &str, raw_query: Option<&str>) -> String {
         }
         _ => base_url.to_string(),
     }
+}
+
+/// Extract `page` or `offset` parameter from a query string for cache key differentiation.
+fn extract_page_param(raw_query: Option<&str>) -> Option<String> {
+    let q = raw_query?;
+    for pair in q.split('&') {
+        if let Some(val) = pair
+            .strip_prefix("page=")
+            .or_else(|| pair.strip_prefix("offset="))
+        {
+            if !val.is_empty() && val.len() <= 10 && val.chars().all(|c| c.is_ascii_digit()) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn upstream_url(state: &AppState) -> String {
@@ -580,6 +693,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_page_param() {
+        assert_eq!(extract_page_param(Some("page=2")), Some("2".to_string()));
+        assert_eq!(
+            extract_page_param(Some("limit=10&offset=20")),
+            Some("20".to_string())
+        );
+        assert_eq!(extract_page_param(Some("limit=10")), None);
+        assert_eq!(extract_page_param(None), None);
+        assert_eq!(extract_page_param(Some("")), None);
+        // Reject non-numeric
+        assert_eq!(extract_page_param(Some("page=abc")), None);
+    }
+
+    #[test]
     fn test_rewrite_preserves_pagination_query_params() {
         let input = r#"{"links":{"next":"https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/community/general/versions/?limit=10&offset=20"}}"#;
         let result = rewrite_ansible_urls(input, "https://galaxy.ansible.com", "http://nora:4000");
@@ -754,5 +881,126 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=true → 200 with X-Nora-Stale header (#466)
+    #[tokio::test]
+    async fn test_serve_stale_collection_detail() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.ansible.proxy_timeout = 1;
+            cfg.ansible.metadata_ttl = 0; // force TTL expiry → always stale
+            cfg.ansible.serve_stale = true;
+        });
+
+        // Pre-populate cache
+        ctx.state
+            .storage
+            .put(
+                "ansible/metadata/community/general.json",
+                br#"{"name":"community.general","namespace":{"name":"community"}}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_ref()),
+        );
+        let body = body_bytes(resp).await;
+        assert!(String::from_utf8_lossy(&body).contains("community.general"));
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=false → 502 (#466)
+    #[tokio::test]
+    async fn test_serve_stale_disabled_returns_502() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.ansible.proxy_timeout = 1;
+            cfg.ansible.metadata_ttl = 0;
+            cfg.ansible.serve_stale = false;
+        });
+
+        ctx.state
+            .storage
+            .put(
+                "ansible/metadata/community/general.json",
+                br#"{"name":"community.general"}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+    }
+
+    /// Fresh cache (within TTL) → 200 without upstream request (#466)
+    #[tokio::test]
+    async fn test_fresh_cache_served_without_upstream() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.ansible.proxy_timeout = 1;
+            cfg.ansible.metadata_ttl = -1; // cache forever
+        });
+
+        ctx.state
+            .storage
+            .put(
+                "ansible/metadata/community/general.json",
+                br#"{"name":"community.general","cached":true}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // No stale header — cache is fresh
+        assert!(resp.headers().get("x-nora-stale").is_none());
+        let body = body_bytes(resp).await;
+        assert!(String::from_utf8_lossy(&body).contains("community.general"));
+    }
+
+    /// No cache + unreachable upstream → 502 (not stale, just unavailable)
+    #[tokio::test]
+    async fn test_no_cache_unreachable_returns_502() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.ansible.proxy_timeout = 1;
+            cfg.ansible.serve_stale = true;
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

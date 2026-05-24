@@ -457,10 +457,21 @@ pub struct AnsibleConfig {
     pub proxy_auth: Option<String>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+    /// Metadata cache TTL in seconds (default: 3600 = 1 hour).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
+    #[serde(default = "default_ansible_metadata_ttl")]
+    pub metadata_ttl: i64,
+    /// Serve stale cached metadata when upstream is unreachable (default: true).
+    #[serde(default = "default_true")]
+    pub serve_stale: bool,
 }
 
 fn default_ansible_proxy() -> Option<String> {
     Some("https://galaxy.ansible.com".to_string())
+}
+
+fn default_ansible_metadata_ttl() -> i64 {
+    3600
 }
 
 impl Default for AnsibleConfig {
@@ -470,6 +481,8 @@ impl Default for AnsibleConfig {
             proxy: default_ansible_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
+            metadata_ttl: 3600,
+            serve_stale: true,
         }
     }
 }
@@ -2350,6 +2363,14 @@ impl Config {
             if let Ok(timeout) = val.parse() {
                 self.ansible.proxy_timeout = timeout;
             }
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.ansible.metadata_ttl = ttl;
+            }
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_SERVE_STALE") {
+            self.ansible.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
 
         // NuGet config
