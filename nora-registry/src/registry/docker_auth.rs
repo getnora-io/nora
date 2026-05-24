@@ -17,19 +17,16 @@ struct CachedToken {
 pub struct DockerAuth {
     tokens: RwLock<HashMap<String, CachedToken>>,
     client: reqwest::Client,
-    timeout: Duration,
 }
 
 impl DockerAuth {
-    /// Create a new DockerAuth using the provided HTTP client.
-    ///
-    /// The client should be pre-configured with any required TLS settings
-    /// (e.g. custom CA certificates). The timeout is applied per-request.
-    pub fn new(client: reqwest::Client, timeout: u64) -> Self {
+    pub fn new(timeout: u64) -> Self {
         Self {
             tokens: RwLock::new(HashMap::new()),
-            client,
-            timeout: Duration::from_secs(timeout),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -99,7 +96,7 @@ impl DockerAuth {
 
         tracing::debug!(url = %url, "Fetching auth token");
 
-        let mut request = self.client.get(&url).timeout(self.timeout);
+        let mut request = self.client.get(&url);
         if let Some(credentials) = basic_auth {
             request = request.header("Authorization", basic_auth_header(credentials));
             tracing::debug!("Using basic auth for token request");
@@ -124,7 +121,7 @@ impl DockerAuth {
 
 impl Default for DockerAuth {
     fn default() -> Self {
-        Self::new(reqwest::Client::new(), 60)
+        Self::new(60)
     }
 }
 
@@ -208,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_docker_auth_new() {
-        let auth = DockerAuth::new(reqwest::Client::new(), 30);
+        let auth = DockerAuth::new(30);
         assert!(auth.tokens.read().is_empty());
     }
 
@@ -301,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_token_invalid_url() {
-        let auth = DockerAuth::new(reqwest::Client::new(), 1);
+        let auth = DockerAuth::new(1);
         let result = auth
             .get_token(
                 "https://registry.example.com",

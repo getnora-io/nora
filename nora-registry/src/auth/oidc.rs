@@ -89,15 +89,15 @@ pub struct OidcValidator {
     jwks_cache: RwLock<HashMap<String, CachedJwks>>,
 }
 
-/// Per-request timeout for OIDC HTTP calls (discovery + JWKS fetch).
-const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
 impl OidcValidator {
     /// Create a new validator from config.
-    ///
-    /// The client should be pre-configured with any required TLS settings
-    /// (e.g. custom CA certificates). Per-request timeouts are applied internally.
-    pub fn new(config: OidcConfig, http_client: Client) -> Self {
+    pub fn new(config: OidcConfig) -> Self {
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .user_agent("nora-registry/0.8")
+            .build()
+            .unwrap_or_default();
+
         Self {
             config,
             http_client,
@@ -280,13 +280,7 @@ impl OidcValidator {
             provider.issuer.trim_end_matches('/')
         );
 
-        if let Ok(resp) = self
-            .http_client
-            .get(&discovery_url)
-            .timeout(OIDC_REQUEST_TIMEOUT)
-            .send()
-            .await
-        {
+        if let Ok(resp) = self.http_client.get(&discovery_url).send().await {
             if resp.status().is_success() {
                 if let Ok(config) = resp.json::<OidcDiscoveryDoc>().await {
                     if !config.jwks_uri.is_empty() {
@@ -313,7 +307,6 @@ impl OidcValidator {
         let resp = self
             .http_client
             .get(url)
-            .timeout(OIDC_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| format!("HTTP error: {}", e))?;
@@ -431,7 +424,7 @@ mod tests {
     #[test]
     fn test_match_role_first_wins() {
         let config = OidcConfig::default();
-        let validator = OidcValidator::new(config, Client::new());
+        let validator = OidcValidator::new(config);
 
         let provider = OidcProvider {
             name: "test".to_string(),

@@ -93,7 +93,9 @@ pub async fn run_mirror(
     concurrency: usize,
     json_output: bool,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
+    // SAFETY: mirror CLI connects to local NORA instance, not upstream.
+    // TODO(#474): add NORA_TLS_CA_CERT support for mirror command
+    let client = reqwest::Client::builder() // nosemgrep: reqwest-client-bypass
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
