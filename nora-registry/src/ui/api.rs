@@ -873,6 +873,85 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
     (result, false)
 }
 
+/// List Ansible Galaxy namespaces or collections within a namespace.
+///
+/// - `path == ""` → group all `ansible/download/*.tar.gz` by namespace, return `Vec<RepoInfo>`
+///   where `name` = namespace, `versions` = collection count.
+/// - `path == "community"` → filter by namespace, group by collection name, return `Vec<RepoInfo>`
+///   where `name` = collection name, `versions` = version count.
+///
+/// Filenames follow the Galaxy convention: `{namespace}-{name}-{version}.tar.gz`.
+/// Namespace and name are `[a-z0-9_]+`, so the first `-` is an unambiguous separator.
+/// Does NOT call `storage.stat` — avoids latency on large collection counts.
+pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
+    let keys = storage.list("ansible/download/").await;
+
+    if keys.is_empty() {
+        return vec![];
+    }
+
+    // Parse filenames: {ns}-{name}-{version}.tar.gz
+    // splitn(3, '-') → [ns, name, version_with_ext]
+    struct Parsed {
+        namespace: String,
+        collection: String,
+    }
+    let mut parsed: Vec<Parsed> = Vec::new();
+    for key in &keys {
+        if let Some(filename) = key
+            .strip_prefix("ansible/download/")
+            .and_then(|f| f.strip_suffix(".tar.gz"))
+        {
+            let parts: Vec<&str> = filename.splitn(3, '-').collect();
+            if parts.len() == 3 && !parts[0].is_empty() && !parts[1].is_empty() {
+                parsed.push(Parsed {
+                    namespace: parts[0].to_string(),
+                    collection: parts[1].to_string(),
+                });
+            }
+        }
+    }
+
+    if path.is_empty() {
+        // Root: group by namespace, count distinct collections per namespace
+        let mut ns_collections: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for p in &parsed {
+            ns_collections
+                .entry(p.namespace.clone())
+                .or_default()
+                .insert(p.collection.clone());
+        }
+        let mut result: Vec<RepoInfo> = ns_collections
+            .into_iter()
+            .map(|(ns, cols)| RepoInfo {
+                name: ns,
+                versions: cols.len(),
+                ..Default::default()
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result
+    } else {
+        // Namespace level: filter by namespace, group by collection name, count versions
+        let mut col_counts: HashMap<String, usize> = HashMap::new();
+        for p in &parsed {
+            if p.namespace == path {
+                *col_counts.entry(p.collection.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut result: Vec<RepoInfo> = col_counts
+            .into_iter()
+            .map(|(col, count)| RepoInfo {
+                name: col,
+                versions: count,
+                ..Default::default()
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result
+    }
+}
+
 pub async fn get_go_detail(
     storage: &Storage,
     module: &str,
@@ -956,6 +1035,7 @@ pub async fn get_generic_detail(
         "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
         "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
         "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
+        "ansible" => get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await,
         _ => {
             get_storage_scan_detail(storage, registry, &name_lower, show_prerelease, show_all).await
         }
@@ -1297,6 +1377,65 @@ async fn get_pub_detail(
             }
         }
     }
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_prerelease_filter(versions, show_prerelease, show_all);
+    PackageDetail {
+        versions,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
+    }
+}
+
+/// Ansible Galaxy collection detail: list versions of `{ns}.{name}`.
+/// Files stored as `ansible/download/{ns}-{name}-{ver}.tar.gz`.
+async fn get_ansible_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
+    // name comes as "community.general" → split to (ns, collection)
+    let (ns, col) = match name.split_once('.') {
+        Some(pair) => pair,
+        None => {
+            return PackageDetail {
+                versions: vec![],
+                prerelease_count: 0,
+                total_stable: 0,
+                metadata: PackageMetadata::default(),
+            };
+        }
+    };
+
+    let keys = storage.list("ansible/download/").await;
+    let prefix = format!("{}-{}-", ns, col);
+    let mut versions = Vec::new();
+
+    for key in &keys {
+        if let Some(filename) = key
+            .strip_prefix("ansible/download/")
+            .and_then(|f| f.strip_suffix(".tar.gz"))
+        {
+            if let Some(version) = filename.strip_prefix(&prefix) {
+                if !version.is_empty() {
+                    let (size, published) = if let Some(meta) = storage.stat(key).await {
+                        (meta.size, format_timestamp(meta.modified))
+                    } else {
+                        (0, "N/A".to_string())
+                    };
+                    versions.push(VersionInfo {
+                        version: version.to_string(),
+                        size,
+                        published,
+                        cached: true,
+                    });
+                }
+            }
+        }
+    }
+
     versions.sort_by(|a, b| b.version.cmp(&a.version));
     let (versions, prerelease_count, total_stable) =
         apply_prerelease_filter(versions, show_prerelease, show_all);

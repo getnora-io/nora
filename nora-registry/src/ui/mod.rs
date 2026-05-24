@@ -144,7 +144,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         // New registries (v0.7 — generic list pages)
         .route("/ui/gems", get(generic_registry_list))
         .route("/ui/terraform", get(generic_registry_list))
-        .route("/ui/ansible", get(generic_registry_list))
+        .route("/ui/ansible", get(ansible_browse_root))
+        .route("/ui/ansible/{*path}", get(ansible_browse))
         .route("/ui/nuget", get(generic_registry_list))
         .route("/ui/nuget/{name}", get(generic_registry_detail))
         .route("/ui/pub", get(generic_registry_list))
@@ -153,7 +154,6 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/conan/{name}", get(generic_registry_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
-        .route("/ui/ansible/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
         // Token management API (HTMX endpoints)
@@ -677,6 +677,96 @@ async fn generic_registry_detail(
         &base_url,
         auth_enabled,
     ))
+}
+
+// Ansible Galaxy hierarchical browsing (namespace → collection → versions)
+async fn ansible_browse_root(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+
+    let entries = api::get_ansible_namespace_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_ansible_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn ansible_browse(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let auth_enabled = state.auth.is_some();
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match segments.len() {
+        // /ui/ansible/community → list collections in namespace
+        1 => {
+            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let total = entries.len();
+            Html(templates::render_ansible_dir(
+                &path,
+                &entries,
+                total,
+                lang,
+                auth_enabled,
+            ))
+        }
+        // /ui/ansible/community/general → version detail
+        2 => {
+            let base_url = resolve_base_url(&state);
+            let show_prerelease = query.prerelease.unwrap_or(false);
+            let show_all = query.all.unwrap_or(false);
+            let full_name = format!("{}.{}", segments[0], segments[1]);
+            let detail = get_generic_detail(
+                &state.storage,
+                "ansible",
+                &full_name,
+                show_prerelease,
+                show_all,
+            )
+            .await;
+            Html(render_package_detail(
+                "ansible",
+                &full_name,
+                &detail,
+                lang,
+                &base_url,
+                auth_enabled,
+            ))
+        }
+        // Deeper paths: 404
+        _ => Html(templates::render_ansible_dir(
+            &path,
+            &[],
+            0,
+            lang,
+            auth_enabled,
+        )),
+    }
 }
 
 // ==================== Token Management Handlers ====================

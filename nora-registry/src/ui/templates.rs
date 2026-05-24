@@ -920,6 +920,131 @@ pub fn render_go_dir(
     )
 }
 
+/// Renders Ansible Galaxy namespace browser with breadcrumbs
+pub fn render_ansible_dir(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+
+    // Build breadcrumbs: Ansible Galaxy / community / general
+    let mut breadcrumbs =
+        r#"<a href="/ui/ansible" class="text-blue-400 hover:text-blue-300">Ansible Galaxy</a>"#
+            .to_string();
+    if !path.is_empty() {
+        let segments: Vec<&str> = path.split('/').collect();
+        for (i, seg) in segments.iter().enumerate() {
+            let crumb_path = segments[..=i].join("/");
+            if i == segments.len() - 1 {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    html_escape(seg)
+                );
+            } else {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/ansible/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    crumb_path,
+                    html_escape(seg)
+                );
+            }
+        }
+    }
+
+    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
+
+    let rows: String = entries
+        .iter()
+        .map(|entry| {
+            let href = if path.is_empty() {
+                format!("/ui/ansible/{}", encode_uri_component(&entry.name))
+            } else {
+                format!(
+                    "/ui/ansible/{}/{}",
+                    path,
+                    encode_uri_component(&entry.name)
+                )
+            };
+            format!(
+                r##"
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                    </td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                </tr>
+            "##,
+                href,
+                folder_icon,
+                href,
+                html_escape(&entry.name),
+                entry.versions,
+            )
+        })
+        .collect();
+
+    let title_display = if path.is_empty() {
+        "Ansible Galaxy".to_string()
+    } else {
+        html_escape(path.rsplit('/').next().unwrap_or(path))
+    };
+
+    // Column header: "Items" at root (namespace count), "Versions" at namespace level
+    let col_count_label = if path.is_empty() { t.items } else { t.versions };
+
+    let showing = t.showing_all.replace("{count}", &total.to_string());
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_count}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        icon = icons::ANSIBLE,
+        title = title_display,
+        col_name = t.name,
+        col_count = col_count_label,
+        rows = rows,
+        showing = showing,
+    );
+
+    layout_dark(
+        &format!(
+            "Ansible Galaxy — {}",
+            if path.is_empty() { "Browse" } else { path }
+        ),
+        &content,
+        Some("ansible"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -1038,7 +1163,28 @@ pub fn render_package_detail(
     };
 
     // Build breadcrumbs — make each path segment clickable for hierarchical names
-    let breadcrumb_html = if name.contains('/') {
+    let breadcrumb_html = if registry_type == "ansible" && name.contains('.') {
+        // Ansible: community.general → Ansible Galaxy / community / general
+        let parts: Vec<&str> = name.splitn(2, '.').collect();
+        let mut crumbs = format!(
+            r#"<a href="/ui/ansible" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+            registry_title
+        );
+        let _ = write!(
+            crumbs,
+            r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/ansible/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+            encode_uri_component(parts[0]),
+            html_escape(parts[0])
+        );
+        if parts.len() > 1 {
+            let _ = write!(
+                crumbs,
+                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                html_escape(parts[1])
+            );
+        }
+        crumbs
+    } else if name.contains('/') {
         let segments: Vec<&str> = name.split('/').collect();
         let mut crumbs = format!(
             r#"<a href="/ui/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
