@@ -12,7 +12,7 @@
 #
 
 # ── Build ──────────────────────────────────────────────────────────────────
-FROM rust:1-alpine3.21 AS builder
+FROM rust:1-alpine3.21@sha256:77d036177a4caf204bf23c6c68e1aa013a0d919fd40058eb27943295080fe869 AS builder
 
 RUN apk add --no-cache musl-dev
 
@@ -37,7 +37,7 @@ FROM scratch AS binary
 COPY --from=builder /nora /nora
 
 # ── Cross-compile arm64 (runs natively on x86, no QEMU) ──────────────────
-FROM rust:1-alpine3.21 AS cross-arm64
+FROM rust:1-alpine3.21@sha256:77d036177a4caf204bf23c6c68e1aa013a0d919fd40058eb27943295080fe869 AS cross-arm64
 
 RUN apk add --no-cache musl-dev \
     && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
@@ -117,7 +117,7 @@ ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
 
 # ── Alpine (default — must be last) ───────────────────────────────────────
-FROM alpine:3.21
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
