@@ -105,7 +105,7 @@ pub async fn run_docker_mirror(
     images: &[ImageRef],
     concurrency: usize,
 ) -> Result<MirrorResult, String> {
-    let docker_auth = DockerAuth::new(DEFAULT_TIMEOUT);
+    let docker_auth = DockerAuth::new(client.clone(), DEFAULT_TIMEOUT);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
 
     let pb = create_progress_bar(images.len() as u64);

@@ -1132,7 +1132,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
         });
 
         // Wire up the OidcValidator on the existing state
-        let oidc_validator = OidcValidator::new(ctx.state.config.auth.oidc.clone());
+        let oidc_validator =
+            OidcValidator::new(ctx.state.config.auth.oidc.clone(), reqwest::Client::new());
         // We need to rebuild the state with oidc set — use Arc::get_mut or rebuild
         let state = Arc::new(crate::AppState {
             storage: ctx.state.storage.clone(),
@@ -1145,7 +1146,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             metrics: crate::dashboard_metrics::DashboardMetrics::new(),
             activity: crate::activity_log::ActivityLog::new(50),
             audit: ctx.state.audit.clone(),
-            docker_auth: crate::registry::DockerAuth::new(5),
+            docker_auth: crate::registry::DockerAuth::new(reqwest::Client::new(), 5),
             repo_index: crate::repo_index::RepoIndex::new(),
             http_client: reqwest::Client::new(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

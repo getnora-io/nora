@@ -192,7 +192,8 @@ fn build_context(
         None
     };
 
-    let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
+    let docker_auth =
+        registry::DockerAuth::new(reqwest::Client::new(), config.docker.proxy_timeout);
 
     // Build curation engine before consuming config (mirroring main.rs)
     let mut curation_engine = CurationEngine::new(config.curation.clone());

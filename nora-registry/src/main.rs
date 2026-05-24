@@ -825,11 +825,11 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    // Initialize Docker auth with proxy timeout
-    let docker_auth = registry::DockerAuth::new(config.docker.proxy_timeout);
-
     let http_client = build_http_client(&config.tls);
     log_outbound_proxy();
+
+    // Initialize Docker auth with shared HTTP client (includes custom CA certs)
+    let docker_auth = registry::DockerAuth::new(http_client.clone(), config.docker.proxy_timeout);
 
     // Discover NuGet search endpoints from upstream service index
     if config.nuget.enabled {
@@ -953,7 +953,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     };
 
     let oidc_validator = if config.auth.oidc.enabled {
-        Some(auth::OidcValidator::new(config.auth.oidc.clone()))
+        Some(auth::OidcValidator::new(
+            config.auth.oidc.clone(),
+            http_client.clone(),
+        ))
     } else {
         None
     };
