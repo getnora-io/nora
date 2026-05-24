@@ -42,6 +42,38 @@ Instead, please report them via:
 | Medium | Limited impact vulnerabilities | Fix in next release |
 | Low | Minor issues | Scheduled fix |
 
+## Known Advisory Exclusions
+
+The following RustSec advisories are excluded from `cargo audit` in CI
+with documented rationale:
+
+### RUSTSEC-2023-0071 — Marvin Attack (`rsa` crate)
+
+| Field | Value |
+|-------|-------|
+| Advisory | [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html) |
+| Crate | `rsa` 0.9.x (transitive via `jsonwebtoken`) |
+| Attack | Marvin Attack — timing side-channel on RSA PKCS#1 v1.5 **decryption** |
+| NORA usage | JWT signature **verification** only (OIDC workload identity) |
+| Applicable | **No** — NORA calls `rsa::verify`, never `rsa::decrypt` |
+| Upstream fix | None available; `rsa` crate maintainers have not patched |
+
+**Why RS256 is required:** GitHub Actions and GitLab CI OIDC providers sign
+their workload identity tokens with RS256. NORA must verify these signatures
+to support keyless CI/CD authentication. The `rsa` crate cannot be removed
+from the dependency tree without breaking OIDC integration.
+
+**Mitigations in place:**
+- Algorithm whitelist per OIDC provider (`algorithms` config field)
+- Default allowed algorithms: RS256, ES256 (EdDSA ready when providers adopt it)
+- Symmetric algorithms (HS256/384/512) rejected globally
+- `ed25519-dalek` already compiled in via `jsonwebtoken` `rust_crypto` feature
+
+### RUSTSEC-2025-0119 — Unmaintained crate
+
+Transitive dependency flagged as unmaintained. No fix available,
+no security impact — the crate is functioning correctly.
+
 ## Security Best Practices
 
 When deploying NORA:
