@@ -322,7 +322,7 @@ async fn main() {
 
     // Initialize logging (JSON for server, plain for CLI commands)
     let is_server = matches!(cli.command, None | Some(Commands::Serve));
-    init_logging(is_server);
+    let _log_guard = init_logging(is_server);
 
     let config = Config::load();
 
@@ -761,20 +761,107 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     }
 }
 
-fn init_logging(json_format: bool) {
+/// Initialize tracing subscriber with stdout + optional file output.
+///
+/// When `NORA_LOG_FILE` is set, logs are duplicated to the specified file path
+/// using a non-blocking writer. The file layer uses the same format and level
+/// filter as stdout. Returns a guard that must be held for the process lifetime
+/// to ensure the non-blocking writer flushes on shutdown.
+fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if json_format {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt::layer().json().with_target(true))
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt::layer().with_target(false))
-            .init();
+    // Optional file output via NORA_LOG_FILE
+    let file_writer = match std::env::var("NORA_LOG_FILE") {
+        Ok(path) if !path.is_empty() => open_log_file(&path),
+        _ => None,
+    };
+
+    match (json_format, file_writer) {
+        (true, Some((non_blocking, guard))) => {
+            let file_filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt::layer().json().with_target(true))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(non_blocking)
+                        .with_filter(file_filter),
+                )
+                .init();
+            Some(guard)
+        }
+        (true, None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt::layer().json().with_target(true))
+                .init();
+            None
+        }
+        (false, Some((non_blocking, guard))) => {
+            let file_filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt::layer().with_target(false))
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_writer(non_blocking)
+                        .with_filter(file_filter),
+                )
+                .init();
+            Some(guard)
+        }
+        (false, None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt::layer().with_target(false))
+                .init();
+            None
+        }
     }
+}
+
+/// Open a log file for non-blocking writes. Creates parent directories as needed.
+fn open_log_file(
+    path: &str,
+) -> Option<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    let file_path = std::path::Path::new(path);
+
+    // Create parent directories if needed
+    if let Some(parent) = file_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "WARNING: cannot create log directory {}: {e}",
+                    parent.display()
+                );
+                return None;
+            }
+        }
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("WARNING: cannot open log file {}: {e}", file_path.display());
+            return None;
+        }
+    };
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+    eprintln!("Log file: {path}");
+    Some((non_blocking, guard))
 }
 
 async fn run_server(mut config: Config, storage: Storage) {
@@ -1325,6 +1412,51 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     }
     if !uncovered.is_empty() {
         println!("\nNote: No retention rules for: {}", uncovered.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::open_log_file;
+
+    #[test]
+    fn open_log_file_creates_parent_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("dir").join("nora.log");
+        let result = open_log_file(path.to_str().unwrap());
+        assert!(result.is_some(), "should open file with nested dirs");
+        assert!(path.exists(), "log file should be created");
+    }
+
+    #[test]
+    fn open_log_file_invalid_path() {
+        let result = open_log_file("/nonexistent-root-82371/nora.log");
+        assert!(result.is_none(), "should return None for invalid path");
+    }
+
+    #[test]
+    fn open_log_file_appends() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nora.log");
+        std::fs::write(&path, "existing\n").unwrap();
+        let result = open_log_file(path.to_str().unwrap());
+        assert!(result.is_some());
+        // Drop the writer to flush
+        drop(result);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.starts_with("existing\n"),
+            "should preserve existing content"
+        );
+    }
+
+    #[test]
+    fn open_log_file_empty_path() {
+        // open_log_file is called only when path is non-empty,
+        // but test defensively
+        let result = open_log_file("");
+        // Empty path will fail to open
+        assert!(result.is_none());
     }
 }
 
