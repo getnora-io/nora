@@ -192,7 +192,9 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
             let manifest_pos = parts.iter().position(|&p| p == "manifests");
             if let Some(pos) = manifest_pos {
                 if pos >= 1 && ends_with_ci(key, ".json") {
-                    let name = parts[..pos].join("/");
+                    let raw_name = parts[..pos].join("/");
+                    let name =
+                        crate::registry::docker::strip_docker_namespace(&raw_name).to_string();
                     let entry = repos.entry(name).or_insert((0, 0, 0));
                     entry.0 += 1;
 

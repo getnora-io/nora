@@ -349,8 +349,28 @@ pub async fn api_search(
 }
 
 pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
+    // Search for manifests under both the bare name and all namespace-prefixed variants.
+    // E.g. for "library/nginx", find keys in docker/library/nginx/manifests/
+    // AND docker/docker.io/library/nginx/manifests/, docker/ghcr.io/library/nginx/manifests/, etc.
     let prefix = format!("docker/{}/manifests/", name);
-    let keys = state.storage.list(&prefix).await;
+    let mut keys = state.storage.list(&prefix).await;
+
+    // Also collect namespaced keys by scanning all docker/ keys for this image name
+    let all_docker_keys = state.storage.list("docker/").await;
+    for key in &all_docker_keys {
+        if let Some(rest) = key.strip_prefix("docker/") {
+            if let Some(idx) = rest.find("/manifests/") {
+                let raw_name = &rest[..idx];
+                if crate::registry::docker::strip_docker_namespace(raw_name) == name
+                    && raw_name != name
+                {
+                    keys.push(key.clone());
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
 
     // Build public URL for pull commands
     let registry_host =
@@ -365,10 +385,17 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
             continue;
         }
 
-        if let Some(tag_name) = key
+        // Extract tag name: find /manifests/{tag}.json regardless of namespace prefix
+        let tag_name = key
             .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(".json"))
-        {
+            .or_else(|| {
+                // For namespaced keys: docker/{ns}/{name}/manifests/{tag}.json
+                key.find("/manifests/")
+                    .map(|idx| &key[idx + "/manifests/".len()..])
+            })
+            .and_then(|s| s.strip_suffix(".json"));
+
+        if let Some(tag_name) = tag_name {
             // Load metadata from .meta.json file
             let meta_key = format!("{}.meta.json", key.trim_end_matches(".json"));
             let metadata = if let Ok(meta_data) = state.storage.get(&meta_key).await {

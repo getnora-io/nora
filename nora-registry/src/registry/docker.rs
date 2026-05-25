@@ -456,6 +456,21 @@ async fn check() -> impl IntoResponse {
     )
 }
 
+/// Strip upstream namespace prefix from a Docker repository name.
+///
+/// Storage keys include the upstream namespace (e.g. `docker.io/library/nginx`),
+/// but catalog and UI should show the clean image name (`library/nginx`).
+/// Namespace segments are detected by containing a dot (hostnames like `docker.io`,
+/// `ghcr.io`), which is not valid in Docker org/user names.
+pub(crate) fn strip_docker_namespace(name: &str) -> &str {
+    if let Some((first, rest)) = name.split_once('/') {
+        if first.contains('.') && !rest.is_empty() {
+            return rest;
+        }
+    }
+    name
+}
+
 /// List all repositories in the registry
 async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
     let keys = state.storage.list("docker/").await;
@@ -476,7 +491,9 @@ async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
             if name.is_empty() {
                 return None;
             }
-            Some(name.to_string())
+            // Strip upstream namespace prefix (e.g. "docker.io/" or "ghcr.io/")
+            // so that images proxied through different upstreams are deduplicated.
+            Some(strip_docker_namespace(name).to_string())
         })
         .collect();
 
@@ -3073,5 +3090,89 @@ mod integration_tests {
             .circuit_breaker
             .check("docker:http://127.0.0.1:2")
             .is_ok());
+    }
+
+    #[test]
+    fn test_strip_docker_namespace() {
+        // Namespace prefix (hostname with dot) should be stripped
+        assert_eq!(
+            super::strip_docker_namespace("docker.io/library/nginx"),
+            "library/nginx"
+        );
+        assert_eq!(
+            super::strip_docker_namespace("ghcr.io/requarks/wiki"),
+            "requarks/wiki"
+        );
+        assert_eq!(
+            super::strip_docker_namespace("registry.example.com/myapp"),
+            "myapp"
+        );
+
+        // No namespace prefix — returned as-is
+        assert_eq!(
+            super::strip_docker_namespace("library/nginx"),
+            "library/nginx"
+        );
+        assert_eq!(super::strip_docker_namespace("alpine"), "alpine");
+
+        // Edge: empty or slash-only
+        assert_eq!(super::strip_docker_namespace(""), "");
+        assert_eq!(super::strip_docker_namespace("docker.io/"), "docker.io/");
+
+        // Org name with no dots — not a namespace
+        assert_eq!(
+            super::strip_docker_namespace("myorg/myimage"),
+            "myorg/myimage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_dedup_across_namespaces() {
+        use crate::test_helpers::create_test_context;
+
+        let ctx = create_test_context();
+
+        // Simulate keys from two different upstream namespaces for the same image
+        ctx.state
+            .storage
+            .put(
+                "docker/docker.io/library/nginx/manifests/latest.json",
+                b"{}",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("docker/ghcr.io/library/nginx/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+        // And a non-namespaced (legacy) key for the same image
+        ctx.state
+            .storage
+            .put("docker/library/nginx/manifests/old.json", b"{}")
+            .await
+            .unwrap();
+
+        let keys = ctx.state.storage.list("docker/").await;
+        let mut repos: Vec<String> = keys
+            .iter()
+            .filter_map(|k| {
+                let rest = k.strip_prefix("docker/")?;
+                let name = if let Some(idx) = rest.find("/manifests/") {
+                    &rest[..idx]
+                } else {
+                    return None;
+                };
+                if name.is_empty() {
+                    return None;
+                }
+                Some(super::strip_docker_namespace(name).to_string())
+            })
+            .collect();
+        repos.sort();
+        repos.dedup();
+
+        // All three keys should resolve to a single repo: "library/nginx"
+        assert_eq!(repos, vec!["library/nginx"]);
     }
 }
