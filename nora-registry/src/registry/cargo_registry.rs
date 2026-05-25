@@ -159,15 +159,7 @@ async fn sparse_index(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
 
             // Cache in background
-            let storage = state.storage.clone();
-            let key = index_key;
-            let data_clone = data.clone();
-            let state_clone = Arc::clone(&state);
-            tokio::spawn(async move {
-                if storage.put(&key, &data_clone).await.is_ok() {
-                    state_clone.repo_index.invalidate("cargo");
-                }
-            });
+            state.spawn_cache("cargo", index_key, Bytes::from(data.clone()));
 
             sparse_index_conditional(data, &headers)
         }
@@ -226,14 +218,7 @@ async fn get_metadata(
     .await
     {
         Ok(data) => {
-            let storage = state.storage.clone();
-            let key_clone = key.clone();
-            let data_clone = data.clone();
-            tokio::spawn(async move {
-                if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                    tracing::warn!(key = %key_clone, error = %e, "cargo: failed to cache proxy metadata");
-                }
-            });
+            state.spawn_cache("cargo", key.clone(), Bytes::from(data.clone()));
             (StatusCode::OK, data).into_response()
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
