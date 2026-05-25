@@ -218,7 +218,9 @@ pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>
 /// Get the temp directory for Docker uploads, creating it if needed.
 fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(path = %dir.display(), error = %e, "failed to create upload temp directory");
+    }
     dir
 }
 
@@ -1114,7 +1116,12 @@ async fn try_fetch_and_cache(
                         let key_clone = cache_key.to_string();
                         let state_clone = Arc::clone(state);
                         tokio::spawn(async move {
-                            let _ = storage.put(&key_clone, &data).await;
+                            if let Err(e) = storage.put(&key_clone, &data).await {
+                                tracing::warn!(key = %key_clone, error = %e, "cache write failed (quarantine pre-cache)");
+                                crate::metrics::CACHE_WRITE_ERRORS
+                                    .with_label_values(&["docker", "manifest"])
+                                    .inc();
+                            }
                             state_clone.repo_index.invalidate("docker");
                         });
                         return Some(quarantine_forbidden(&digest, &q_status, q_secs));
@@ -1132,10 +1139,20 @@ async fn try_fetch_and_cache(
                 let state_clone = Arc::clone(state);
                 tokio::spawn(async move {
                     // Store manifest by tag and digest (namespaced)
-                    let _ = storage.put(&key_clone, &data_clone).await;
+                    if let Err(e) = storage.put(&key_clone, &data_clone).await {
+                        tracing::warn!(key = %key_clone, error = %e, "cache write failed (manifest by tag)");
+                        crate::metrics::CACHE_WRITE_ERRORS
+                            .with_label_values(&["docker", "manifest"])
+                            .inc();
+                    }
                     let digest_key =
                         manifest_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
-                    let _ = storage.put(&digest_key, &data_clone).await;
+                    if let Err(e) = storage.put(&digest_key, &data_clone).await {
+                        tracing::warn!(key = %digest_key, error = %e, "cache write failed (manifest by digest)");
+                        crate::metrics::CACHE_WRITE_ERRORS
+                            .with_label_values(&["docker", "manifest"])
+                            .inc();
+                    }
 
                     // Extract and save metadata
                     let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
@@ -1145,11 +1162,21 @@ async fn try_fetch_and_cache(
                             &name_clone,
                             &reference_clone,
                         );
-                        let _ = storage.put(&meta_key, &meta_json).await;
+                        if let Err(e) = storage.put(&meta_key, &meta_json).await {
+                            tracing::warn!(key = %meta_key, error = %e, "cache write failed (metadata by tag)");
+                            crate::metrics::CACHE_WRITE_ERRORS
+                                .with_label_values(&["docker", "metadata"])
+                                .inc();
+                        }
 
                         let digest_meta_key =
                             manifest_meta_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
-                        let _ = storage.put(&digest_meta_key, &meta_json).await;
+                        if let Err(e) = storage.put(&digest_meta_key, &meta_json).await {
+                            tracing::warn!(key = %digest_meta_key, error = %e, "cache write failed (metadata by digest)");
+                            crate::metrics::CACHE_WRITE_ERRORS
+                                .with_label_values(&["docker", "metadata"])
+                                .inc();
+                        }
                     }
                     state_clone.repo_index.invalidate("docker");
                 });
@@ -1387,11 +1414,21 @@ async fn put_manifest(
     let metadata = extract_metadata(&body, &state.storage, &name).await;
     let meta_key = format!("docker/{}/manifests/{}.meta.json", name, reference);
     if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-        let _ = state.storage.put(&meta_key, &meta_json).await;
+        if let Err(e) = state.storage.put(&meta_key, &meta_json).await {
+            tracing::warn!(key = %meta_key, error = %e, "cache write failed (push metadata by tag)");
+            crate::metrics::CACHE_WRITE_ERRORS
+                .with_label_values(&["docker", "metadata"])
+                .inc();
+        }
 
         // Also save metadata by digest
         let digest_meta_key = format!("docker/{}/manifests/{}.meta.json", name, digest);
-        let _ = state.storage.put(&digest_meta_key, &meta_json).await;
+        if let Err(e) = state.storage.put(&digest_meta_key, &meta_json).await {
+            tracing::warn!(key = %digest_meta_key, error = %e, "cache write failed (push metadata by digest)");
+            crate::metrics::CACHE_WRITE_ERRORS
+                .with_label_values(&["docker", "metadata"])
+                .inc();
+        }
     }
 
     state.metrics.record_upload("docker");
@@ -2076,7 +2113,12 @@ async fn update_metadata_on_pull(state: Arc<AppState>, storage: Storage, meta_ke
 
     // Save back
     if let Ok(json) = serde_json::to_vec(&metadata) {
-        let _ = storage.put(&meta_key, &json).await;
+        if let Err(e) = storage.put(&meta_key, &json).await {
+            tracing::warn!(key = %meta_key, error = %e, "cache write failed (pull stats update)");
+            crate::metrics::CACHE_WRITE_ERRORS
+                .with_label_values(&["docker", "metadata"])
+                .inc();
+        }
     }
 }
 
