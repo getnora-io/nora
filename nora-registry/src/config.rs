@@ -101,7 +101,7 @@ pub enum StorageMode {
     S3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default)]
     pub mode: StorageMode,
@@ -120,6 +120,26 @@ pub struct StorageConfig {
     /// S3 region (default: us-east-1)
     #[serde(default = "default_s3_region")]
     pub s3_region: String,
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("mode", &self.mode)
+            .field("path", &self.path)
+            .field("s3_url", &self.s3_url)
+            .field("bucket", &self.bucket)
+            .field(
+                "s3_access_key",
+                &self.s3_access_key.as_ref().map(|_| "***REDACTED***"),
+            )
+            .field(
+                "s3_secret_key",
+                &self.s3_secret_key.as_ref().map(|_| "***REDACTED***"),
+            )
+            .field("s3_region", &self.s3_region)
+            .finish()
+    }
 }
 
 fn default_s3_region() -> String {
@@ -3968,5 +3988,31 @@ mod tests {
             .collect();
         assert!(docker_hosts.contains(&"registry-1.docker.io"));
         assert!(docker_hosts.contains(&"ghcr.io"));
+    }
+
+    #[test]
+    fn test_storage_config_debug_redacts_credentials() {
+        let config = StorageConfig {
+            mode: StorageMode::Local,
+            path: String::new(),
+            s3_url: String::new(),
+            bucket: String::new(),
+            s3_access_key: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+            s3_secret_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            s3_region: String::new(),
+        };
+        let debug_output = format!("{:?}", config);
+        assert!(
+            !debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "Debug output must not contain access key"
+        );
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "Debug output must not contain secret key"
+        );
+        assert!(
+            debug_output.contains("REDACTED"),
+            "Debug output should show REDACTED for credential fields"
+        );
     }
 }
