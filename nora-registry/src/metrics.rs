@@ -107,6 +107,13 @@ lazy_static! {
         "Storage size in bytes by registry",
         &["registry"]
     ).expect("failed to create STORAGE_BYTES metric at startup");
+
+    /// Cache write errors by registry and operation (#500)
+    pub static ref CACHE_WRITE_ERRORS: IntCounterVec = register_int_counter_vec!(
+        "nora_cache_write_errors_total",
+        "Cache write failures in background cache tasks",
+        &["registry", "operation"]
+    ).expect("failed to create CACHE_WRITE_ERRORS metric at startup");
 }
 
 /// Maximum response body size to scan for upstream URL leaks (2 MB).
