@@ -94,6 +94,7 @@ impl HashPinStore {
     ///
     /// Returns `true` if the hash matches or no pin exists for this key.
     /// Returns `false` and logs a warning if tampering is detected.
+    #[must_use = "ignoring verification result may allow tampered data"]
     pub fn verify(&self, key: &str, data: &[u8]) -> bool {
         let pins = self.pins.read();
         if let Some(expected) = pins.get(key) {

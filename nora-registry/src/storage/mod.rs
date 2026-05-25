@@ -121,7 +121,11 @@ impl Storage {
             Ok(data) => {
                 STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
                 if let Some(ref pins) = self.pin_store {
-                    pins.verify(key, &data);
+                    if !pins.verify(key, &data) {
+                        STORAGE_OPERATIONS
+                            .with_label_values(&["get", "integrity_fail"])
+                            .inc();
+                    }
                 }
                 Ok(data)
             }

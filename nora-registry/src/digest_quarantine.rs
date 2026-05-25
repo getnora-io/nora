@@ -237,6 +237,7 @@ impl DigestStore {
     }
 
     /// Check quarantine status for a digest.
+    #[must_use = "ignoring quarantine status may serve blocked artifacts"]
     pub fn check(&self, registry: &str, digest: &str, quarantine_secs: i64) -> QuarantineStatus {
         let key = format!("{}:{}", registry, digest);
         let entries = self.entries.read();
