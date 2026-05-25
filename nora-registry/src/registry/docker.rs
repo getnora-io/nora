@@ -1044,6 +1044,128 @@ async fn upload_blob(
     }
 }
 
+/// Try to fetch a manifest from upstream(s) and cache it locally.
+///
+/// Iterates over `upstreams`, fetching `upstream_name` (which may differ from
+/// the user-facing `name` — e.g. `library/nginx` vs `nginx`). On success:
+/// records metrics/activity, runs quarantine, spawns a cache task that writes
+/// the manifest by tag, by digest, plus metadata sidecars.
+///
+/// Returns `Some(Response)` on first successful upstream (or quarantine block),
+/// `None` if all upstreams failed.
+async fn try_fetch_and_cache(
+    state: &Arc<AppState>,
+    upstreams: &[&crate::config::DockerUpstream],
+    upstream_name: &str,
+    name: &str,
+    reference: &str,
+    cache_key: &str,
+) -> Option<Response> {
+    for upstream in upstreams {
+        tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
+        match fetch_manifest_from_upstream(
+            &state.http_client,
+            &upstream.url,
+            upstream_name,
+            reference,
+            &state.docker_auth,
+            state.config.docker.proxy_timeout,
+            upstream.auth.as_deref(),
+            &state.circuit_breaker,
+        )
+        .await
+        {
+            Ok((data, content_type)) => {
+                state.metrics.record_download("docker");
+                state.metrics.record_cache_miss("docker");
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    format!("{}:{}", name, reference),
+                    "docker",
+                    "PROXY",
+                ));
+
+                // Calculate digest for Docker-Content-Digest header
+                use sha2::Digest;
+                let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+
+                // Quarantine: record digest, check status
+                let (q_mode, q_secs) = resolve_quarantine(state);
+                if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+                    state.digest_store.record("docker", &digest, &upstream.url);
+                    let q_status = state.digest_store.check("docker", &digest, q_secs);
+                    match &q_status {
+                        crate::digest_quarantine::QuarantineStatus::Mature => {}
+                        _ => {
+                            tracing::warn!(
+                                digest = %digest,
+                                upstream = %upstream.url,
+                                status = %q_status.header_value(),
+                                mode = ?q_mode,
+                                "Quarantine: proxy-fetched manifest"
+                            );
+                        }
+                    }
+                    // In enforce mode, still cache but block the client
+                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
+                        && !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
+                    {
+                        let storage = state.storage.clone();
+                        let key_clone = cache_key.to_string();
+                        let state_clone = Arc::clone(state);
+                        tokio::spawn(async move {
+                            let _ = storage.put(&key_clone, &data).await;
+                            state_clone.repo_index.invalidate("docker");
+                        });
+                        return Some(quarantine_forbidden(&digest, &q_status, q_secs));
+                    }
+                }
+
+                // Cache manifest and create metadata (fire and forget)
+                let upstream_ns = Some(upstream.resolved_namespace());
+                let storage = state.storage.clone();
+                let key_clone = cache_key.to_string();
+                let data_clone = data.clone();
+                let name_clone = name.to_string();
+                let reference_clone = reference.to_string();
+                let digest_clone = digest.clone();
+                let state_clone = Arc::clone(state);
+                tokio::spawn(async move {
+                    // Store manifest by tag and digest (namespaced)
+                    let _ = storage.put(&key_clone, &data_clone).await;
+                    let digest_key =
+                        manifest_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
+                    let _ = storage.put(&digest_key, &data_clone).await;
+
+                    // Extract and save metadata
+                    let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
+                    if let Ok(meta_json) = serde_json::to_vec(&metadata) {
+                        let meta_key = manifest_meta_key(
+                            upstream_ns.as_deref(),
+                            &name_clone,
+                            &reference_clone,
+                        );
+                        let _ = storage.put(&meta_key, &meta_json).await;
+
+                        let digest_meta_key =
+                            manifest_meta_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
+                        let _ = storage.put(&digest_meta_key, &meta_json).await;
+                    }
+                    state_clone.repo_index.invalidate("docker");
+                });
+
+                return Some(manifest_response(data, content_type, digest));
+            }
+            Err(ProxyError::CircuitOpen(reg)) => return Some(circuit_open_response(&reg)),
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
+                continue;
+            }
+        }
+    }
+    None
+}
+
 async fn get_manifest(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1114,193 +1236,27 @@ async fn get_manifest(
         upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    for upstream in &upstreams_to_try {
-        tracing::debug!(upstream_url = %upstream.url, "Trying upstream");
-        match fetch_manifest_from_upstream(
-            &state.http_client,
-            &upstream.url,
-            &name,
-            &reference,
-            &state.docker_auth,
-            state.config.docker.proxy_timeout,
-            upstream.auth.as_deref(),
-            &state.circuit_breaker,
-        )
-        .await
-        {
-            Ok((data, content_type)) => {
-                state.metrics.record_download("docker");
-                state.metrics.record_cache_miss("docker");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    format!("{}:{}", name, reference),
-                    "docker",
-                    "PROXY",
-                ));
-
-                // Calculate digest for Docker-Content-Digest header
-                use sha2::Digest;
-                let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-
-                // Quarantine: record digest, check status
-                let (q_mode, q_secs) = resolve_quarantine(&state);
-                if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                    state.digest_store.record("docker", &digest, &upstream.url);
-                    let q_status = state.digest_store.check("docker", &digest, q_secs);
-                    match &q_status {
-                        crate::digest_quarantine::QuarantineStatus::Mature => {}
-                        _ => {
-                            tracing::warn!(
-                                digest = %digest,
-                                upstream = %upstream.url,
-                                status = %q_status.header_value(),
-                                mode = ?q_mode,
-                                "Quarantine: proxy-fetched manifest"
-                            );
-                        }
-                    }
-                    // In enforce mode, still cache but block the client
-                    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
-                        && !matches!(q_status, crate::digest_quarantine::QuarantineStatus::Mature)
-                    {
-                        // Cache manifest so it's ready after quarantine expires
-                        let storage = state.storage.clone();
-                        let key_clone = key.clone();
-                        let state_clone = Arc::clone(&state);
-                        tokio::spawn(async move {
-                            let _ = storage.put(&key_clone, &data).await;
-                            state_clone.repo_index.invalidate("docker");
-                        });
-                        return quarantine_forbidden(&digest, &q_status, q_secs);
-                    }
-                }
-
-                // Cache manifest and create metadata (fire and forget)
-                let upstream_ns = Some(upstream.resolved_namespace());
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let data_clone = data.clone();
-                let name_clone = name.clone();
-                let reference_clone = reference.clone();
-                let digest_clone = digest.clone();
-                let state_clone = Arc::clone(&state);
-                tokio::spawn(async move {
-                    // Store manifest by tag and digest (namespaced)
-                    let _ = storage.put(&key_clone, &data_clone).await;
-                    let digest_key =
-                        manifest_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
-                    let _ = storage.put(&digest_key, &data_clone).await;
-
-                    // Extract and save metadata
-                    let metadata = extract_metadata(&data_clone, &storage, &name_clone).await;
-                    if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-                        let meta_key = manifest_meta_key(
-                            upstream_ns.as_deref(),
-                            &name_clone,
-                            &reference_clone,
-                        );
-                        let _ = storage.put(&meta_key, &meta_json).await;
-
-                        let digest_meta_key =
-                            manifest_meta_key(upstream_ns.as_deref(), &name_clone, &digest_clone);
-                        let _ = storage.put(&digest_meta_key, &meta_json).await;
-                    }
-                    state_clone.repo_index.invalidate("docker");
-                });
-
-                return manifest_response(data, content_type, digest);
-            }
-            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(e) => {
-                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
-                continue;
-            }
-        }
+    if let Some(response) =
+        try_fetch_and_cache(&state, &upstreams_to_try, &name, &name, &reference, &key).await
+    {
+        return response;
     }
 
     // Auto-prepend library/ for single-segment names (Docker Hub official images)
     // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
     if !name.contains('/') {
         let library_name = format!("library/{}", name);
-        for upstream in &upstreams_to_try {
-            match fetch_manifest_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                &library_name,
-                &reference,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                upstream.auth.as_deref(),
-                &state.circuit_breaker,
-            )
-            .await
-            {
-                Ok((data, content_type)) => {
-                    state.metrics.record_download("docker");
-                    state.metrics.record_cache_miss("docker");
-                    state.activity.push(ActivityEntry::new(
-                        ActionType::ProxyFetch,
-                        format!("{}:{}", name, reference),
-                        "docker",
-                        "PROXY",
-                    ));
-
-                    use sha2::Digest;
-                    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-
-                    // Quarantine: record digest, check status
-                    let (q_mode, q_secs) = resolve_quarantine(&state);
-                    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                        state.digest_store.record("docker", &digest, &upstream.url);
-                        let q_status = state.digest_store.check("docker", &digest, q_secs);
-                        match &q_status {
-                            crate::digest_quarantine::QuarantineStatus::Mature => {}
-                            _ => {
-                                tracing::warn!(
-                                    digest = %digest,
-                                    upstream = %upstream.url,
-                                    status = %q_status.header_value(),
-                                    mode = ?q_mode,
-                                    "Quarantine: proxy-fetched manifest (library/)"
-                                );
-                            }
-                        }
-                        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce)
-                            && !matches!(
-                                q_status,
-                                crate::digest_quarantine::QuarantineStatus::Mature
-                            )
-                        {
-                            // Cache even though quarantined
-                            let storage = state.storage.clone();
-                            let key_clone = key.clone();
-                            tokio::spawn(async move {
-                                let _ = storage.put(&key_clone, &data).await;
-                            });
-                            return quarantine_forbidden(&digest, &q_status, q_secs);
-                        }
-                    }
-
-                    // Cache under original name for future local hits
-                    let storage = state.storage.clone();
-                    let key_clone = key.clone();
-                    let data_clone = data.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = storage.put(&key_clone, &data_clone).await {
-                            tracing::warn!(key = %key_clone, error = %e, "Failed to cache blob in storage");
-                        }
-                    });
-
-                    state.repo_index.invalidate("docker");
-
-                    return manifest_response(data, content_type, digest);
-                }
-                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(e) => {
-                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
-                    continue;
-                }
-            }
+        if let Some(response) = try_fetch_and_cache(
+            &state,
+            &upstreams_to_try,
+            &library_name,
+            &name,
+            &reference,
+            &key,
+        )
+        .await
+        {
+            return response;
         }
     }
 
