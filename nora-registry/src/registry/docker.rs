@@ -67,24 +67,53 @@ fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
-/// Resolve upstream and namespace for a Docker image name.
+/// Result of Docker image name canonicalization.
 ///
-/// Returns `(matched_upstream, stripped_name, namespace)`:
-/// - If `raw_name` starts with a configured prefix (e.g. `docker-hub/library/nginx`),
-///   returns the matching upstream, the name with prefix stripped (`library/nginx`),
-///   and that upstream's namespace.
-/// - Otherwise falls back to the first upstream (existing behavior).
-fn resolve_upstream<'c, 'n>(
-    config: &'c crate::config::DockerConfig,
-    raw_name: &'n str,
-) -> (
-    Option<&'c crate::config::DockerUpstream>,
-    &'n str,
-    Option<String>,
-) {
-    // Check for prefix-based routing: first path segment matches an upstream prefix
+/// Unifies both config-aware prefix routing and hostname-based namespace
+/// detection into a single entry point, eliminating the asymmetry between
+/// write-path (former `resolve_upstream`) and read-path (`strip_docker_namespace`).
+pub(crate) struct Canonical {
+    /// Cleaned image name (prefix/hostname stripped).
+    pub name: String,
+    /// Namespace for storage key construction (e.g. `"docker.io"`).
+    pub namespace: Option<String>,
+    /// Index of the prefix-matched upstream in the config, if any.
+    matched_upstream_idx: Option<usize>,
+}
+
+impl Canonical {
+    /// Get the list of upstreams to try for fetching this image.
+    ///
+    /// If a specific upstream was matched by prefix, returns only that one.
+    /// Otherwise returns all configured upstreams (fallback chain).
+    pub fn upstreams_to_try<'a>(
+        &self,
+        upstreams: &'a [crate::config::DockerUpstream],
+    ) -> Vec<&'a crate::config::DockerUpstream> {
+        match self.matched_upstream_idx {
+            Some(idx) => vec![&upstreams[idx]],
+            None => upstreams.iter().collect(),
+        }
+    }
+}
+
+/// Canonicalize a Docker image name: resolve upstream, strip prefix/hostname,
+/// and determine the storage namespace.
+///
+/// This is the single entry point for Docker name resolution. Use instead of
+/// the heuristic `strip_docker_namespace()` whenever upstream config is available.
+///
+/// Resolution order (early-return):
+/// 1. Prefix match — first path segment matches a configured upstream prefix
+/// 2. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
+/// 3. Fallback — use the first configured upstream, keep name as-is
+pub(crate) fn canonicalize(
+    raw_name: &str,
+    upstreams: &[crate::config::DockerUpstream],
+) -> Canonical {
+    // Step 1: Check for prefix-based routing
     if let Some((first_segment, rest)) = raw_name.split_once('/') {
-        for upstream in &config.upstreams {
+        for (idx, upstream) in upstreams.iter().enumerate() {
             if let Some(ref prefix) = upstream.prefix {
                 if first_segment == prefix {
                     tracing::debug!(
@@ -94,15 +123,45 @@ fn resolve_upstream<'c, 'n>(
                         routing = "prefix",
                         "Docker path-based upstream routing"
                     );
-                    return (Some(upstream), rest, Some(upstream.resolved_namespace()));
+                    return Canonical {
+                        name: rest.to_string(),
+                        namespace: Some(upstream.resolved_namespace()),
+                        matched_upstream_idx: Some(idx),
+                    };
                 }
             }
         }
+
+        // Step 2: Hostname detection (dot in first segment = FQDN)
+        if first_segment.contains('.') && !rest.is_empty() {
+            // Check if it matches a known upstream's namespace
+            for (idx, upstream) in upstreams.iter().enumerate() {
+                let ns = upstream.resolved_namespace();
+                if first_segment == ns {
+                    return Canonical {
+                        name: rest.to_string(),
+                        namespace: Some(ns),
+                        matched_upstream_idx: Some(idx),
+                    };
+                }
+            }
+            // Unknown hostname — strip it but use default upstream
+            let ns = upstreams.first().map(|u| u.resolved_namespace());
+            return Canonical {
+                name: rest.to_string(),
+                namespace: ns,
+                matched_upstream_idx: None,
+            };
+        }
     }
 
-    // Fallback: first upstream (existing behavior for single-upstream setups)
-    let ns = config.upstreams.first().map(|u| u.resolved_namespace());
-    (None, raw_name, ns)
+    // Step 3: Fallback — first upstream, name unchanged
+    let ns = upstreams.first().map(|u| u.resolved_namespace());
+    Canonical {
+        name: raw_name.to_string(),
+        namespace: ns,
+        matched_upstream_idx: None,
+    }
 }
 
 /// Try to get content from namespaced key, falling back to legacy (non-namespaced) key.
@@ -458,12 +517,14 @@ async fn check() -> impl IntoResponse {
     )
 }
 
-/// Strip upstream namespace prefix from a Docker repository name.
+/// Strip hostname prefix from a Docker repository name (config-free heuristic).
 ///
-/// Storage keys include the upstream namespace (e.g. `docker.io/library/nginx`),
-/// but catalog and UI should show the clean image name (`library/nginx`).
-/// Namespace segments are detected by containing a dot (hostnames like `docker.io`,
-/// `ghcr.io`), which is not valid in Docker org/user names.
+/// Detects hostnames by checking for a dot in the first path segment
+/// (e.g. `docker.io/library/nginx` → `library/nginx`).
+///
+/// **When to use:** Only in config-free contexts like storage key classification
+/// (e.g., `docker_key_migration`). For request-time routing, use [`canonicalize()`]
+/// which is config-aware and handles prefix-based upstream matching.
 pub(crate) fn strip_docker_namespace(name: &str) -> &str {
     if let Some((first, rest)) = name.split_once('/') {
         if first.contains('.') && !rest.is_empty() {
@@ -493,9 +554,9 @@ async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
             if name.is_empty() {
                 return None;
             }
-            // Strip upstream namespace prefix (e.g. "docker.io/" or "ghcr.io/")
+            // Canonicalize to strip upstream namespace prefix (e.g. "docker.io/")
             // so that images proxied through different upstreams are deduplicated.
-            Some(strip_docker_namespace(name).to_string())
+            Some(canonicalize(name, &state.config.docker.upstreams).name)
         })
         .collect();
 
@@ -509,8 +570,8 @@ async fn check_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -518,7 +579,7 @@ async fn check_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = blob_key(ns.as_deref(), &name, &digest);
+    let key = blob_key(c.namespace.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
     match storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
         Ok(data) => (
@@ -539,8 +600,10 @@ async fn download_blob(
     headers: axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let (matched_upstream, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
+    let ns = c.namespace;
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -596,13 +659,7 @@ async fn download_blob(
             .into_response();
     }
 
-    // Select upstreams: prefix-matched → single upstream, otherwise → fallback chain
-    let upstreams_to_try: Vec<&crate::config::DockerUpstream> = match matched_upstream {
-        Some(u) => vec![u],
-        None => state.config.docker.upstreams.iter().collect(),
-    };
-
-    // Try upstream proxies
+    // Try upstream proxies (prefix-matched → single upstream, otherwise → fallback chain)
     for upstream in &upstreams_to_try {
         match fetch_blob_from_upstream(
             &state.http_client,
@@ -688,8 +745,7 @@ async fn download_blob(
 }
 
 async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -741,8 +797,7 @@ async fn patch_blob(
     Path((name, uuid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -869,8 +924,7 @@ async fn upload_blob(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1198,8 +1252,10 @@ async fn get_manifest(
     headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
-    let (matched_upstream, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
+    let ns = c.namespace;
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1251,12 +1307,6 @@ async fn get_manifest(
             return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
         }
     }
-
-    // Select upstreams: prefix-matched → single upstream, otherwise → fallback chain
-    let upstreams_to_try: Vec<&crate::config::DockerUpstream> = match matched_upstream {
-        Some(u) => vec![u],
-        None => state.config.docker.upstreams.iter().collect(),
-    };
 
     // Try upstream proxies (always if no cache, or if cache is stale)
     tracing::debug!(
@@ -1379,8 +1429,7 @@ async fn put_manifest(
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let (_matched, name, _ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1459,8 +1508,9 @@ async fn put_manifest(
 }
 
 async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let ns = c.namespace;
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1494,8 +1544,9 @@ async fn delete_manifest(
     State(state): State<Arc<AppState>>,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
-    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let ns = c.namespace;
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1613,8 +1664,9 @@ async fn delete_blob(
     State(state): State<Arc<AppState>>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let (_matched, name, ns) = resolve_upstream(&state.config.docker, &name);
-    let name = name.to_string();
+    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let ns = c.namespace;
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -3172,5 +3224,105 @@ mod integration_tests {
 
         // All three keys should resolve to a single repo: "library/nginx"
         assert_eq!(repos, vec!["library/nginx"]);
+    }
+
+    #[test]
+    fn test_canonicalize_prefix_routing() {
+        let upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".to_string(),
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: Some("docker-hub".to_string()),
+        }];
+
+        let c = super::canonicalize("docker-hub/library/nginx", &upstreams);
+        assert_eq!(c.name, "library/nginx");
+        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
+        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+    }
+
+    #[test]
+    fn test_canonicalize_hostname_detection() {
+        let upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".to_string(),
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: None,
+        }];
+
+        let c = super::canonicalize("docker.io/library/nginx", &upstreams);
+        assert_eq!(c.name, "library/nginx");
+        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
+        // Known namespace matches specific upstream
+        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+
+        // Unknown hostname → strip but use default upstream
+        let c2 = super::canonicalize("ghcr.io/requarks/wiki", &upstreams);
+        assert_eq!(c2.name, "requarks/wiki");
+        assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
+        // No specific match → all upstreams
+        assert_eq!(c2.upstreams_to_try(&upstreams).len(), 1); // only 1 configured
+    }
+
+    #[test]
+    fn test_canonicalize_fallback() {
+        let upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".to_string(),
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: None,
+        }];
+
+        // No prefix, no dot in first segment → fallback
+        let c = super::canonicalize("library/nginx", &upstreams);
+        assert_eq!(c.name, "library/nginx");
+        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
+        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+
+        // Single segment
+        let c2 = super::canonicalize("alpine", &upstreams);
+        assert_eq!(c2.name, "alpine");
+        assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
+    }
+
+    #[test]
+    fn test_canonicalize_empty_upstreams() {
+        let upstreams: Vec<crate::config::DockerUpstream> = vec![];
+
+        let c = super::canonicalize("library/nginx", &upstreams);
+        assert_eq!(c.name, "library/nginx");
+        assert!(c.namespace.is_none());
+        assert!(c.upstreams_to_try(&upstreams).is_empty());
+    }
+
+    #[test]
+    fn test_canonicalize_multi_upstream() {
+        let upstreams = vec![
+            crate::config::DockerUpstream {
+                url: "https://registry-1.docker.io".to_string(),
+                auth: None,
+                namespace: Some("docker.io".to_string()),
+                prefix: Some("docker-hub".to_string()),
+            },
+            crate::config::DockerUpstream {
+                url: "https://ghcr.io".to_string(),
+                auth: None,
+                namespace: Some("ghcr.io".to_string()),
+                prefix: Some("ghcr".to_string()),
+            },
+        ];
+
+        // Prefix routes to specific upstream
+        let c1 = super::canonicalize("ghcr/requarks/wiki", &upstreams);
+        assert_eq!(c1.name, "requarks/wiki");
+        assert_eq!(c1.namespace.as_deref(), Some("ghcr.io"));
+        let targets = c1.upstreams_to_try(&upstreams);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url, "https://ghcr.io");
+
+        // No prefix match → all upstreams
+        let c2 = super::canonicalize("library/nginx", &upstreams);
+        assert_eq!(c2.name, "library/nginx");
+        assert_eq!(c2.upstreams_to_try(&upstreams).len(), 2);
     }
 }
