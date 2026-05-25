@@ -109,7 +109,7 @@ async fn sparse_index(
         state.metrics.record_cache_hit("cargo");
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
-            crate_name.to_string(),
+            crate_name.clone(),
             "cargo",
             "CACHE",
         ));
@@ -150,7 +150,7 @@ async fn sparse_index(
             state.metrics.record_cache_miss("cargo");
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
-                crate_name.to_string(),
+                crate_name.clone(),
                 "cargo",
                 "PROXY",
             ));

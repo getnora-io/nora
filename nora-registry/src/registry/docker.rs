@@ -1014,7 +1014,7 @@ async fn upload_blob(
                     (header::LOCATION, location),
                     (
                         HeaderName::from_static("docker-content-digest"),
-                        digest.to_string(),
+                        digest.clone(),
                     ),
                 ],
             )

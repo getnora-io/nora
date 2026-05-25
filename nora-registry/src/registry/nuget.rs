@@ -804,7 +804,7 @@ async fn flatcontainer_download(
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
                 ],
-                bytes.to_vec(),
+                bytes,
             )
                 .into_response()
         }

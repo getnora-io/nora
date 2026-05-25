@@ -1757,14 +1757,14 @@ impl Config {
     /// Warnings are logged but do not prevent startup.
     /// Errors indicate a fatal misconfiguration and should cause a panic.
     pub fn validate(&self) -> (Vec<String>, Vec<String>) {
-        self.validate_with_config_path(env::var("NORA_CONFIG_PATH").ok())
+        self.validate_with_config_path(env::var("NORA_CONFIG_PATH").ok().as_deref())
     }
 
     /// Validate configuration with explicit config_path to avoid env var
     /// dependency in tests (env vars are process-global, tests run in parallel).
     pub fn validate_with_config_path(
         &self,
-        config_path: Option<String>,
+        config_path: Option<&str>,
     ) -> (Vec<String>, Vec<String>) {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
@@ -3242,8 +3242,7 @@ mod tests {
         let mut config = Config::default();
         config.auth.enabled = true;
         // default paths are relative: "data/storage", "data/tokens"
-        let (warnings, _) =
-            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
+        let (warnings, _) = config.validate_with_config_path(Some("/tmp/test-config.toml"));
         assert!(
             warnings.iter().any(|w| w.contains("storage.path")),
             "should warn about relative storage.path"
@@ -3260,8 +3259,7 @@ mod tests {
         config.storage.path = "/data/storage".to_string();
         config.auth.enabled = true;
         config.auth.token_storage = "/data/tokens".to_string();
-        let (warnings, _) =
-            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
+        let (warnings, _) = config.validate_with_config_path(Some("/tmp/test-config.toml"));
         assert!(
             !warnings.iter().any(|w| w.contains("storage.path")),
             "should not warn about absolute storage.path"

@@ -34,6 +34,15 @@ naive_bytecount = "deny"
 stable_sort_primitive = "deny"
 large_types_passed_by_value = "deny"
 assigning_clones = "deny"
+# Concurrency safety — blocking locks held across .await cause deadlocks
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+# Allocation hygiene — reduce unnecessary heap allocations
+implicit_clone = "warn"
+needless_pass_by_value = "warn"
+unnecessary_to_owned = "warn"
+# Correctness — callers must check return values
+large_enum_variant = "warn"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [] }
