@@ -13,6 +13,7 @@ mod config;
 mod curation;
 mod dashboard_metrics;
 mod digest_quarantine;
+mod docker_key_migration;
 mod gc;
 mod hash_pin_store;
 mod health;
@@ -126,6 +127,12 @@ enum Commands {
     Curation {
         #[command(subcommand)]
         action: CurationCommand,
+    },
+    /// Migrate legacy Docker storage keys to namespaced format
+    MigrateDockerKeys {
+        /// Dry run — show what would be migrated without modifying storage
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
     },
 }
 
@@ -526,6 +533,41 @@ async fn main() {
                 run_curation_explain(&config, &package);
             }
         },
+        Some(Commands::MigrateDockerKeys { dry_run }) => {
+            let namespace = config
+                .docker
+                .upstreams
+                .first()
+                .map(|u| u.resolved_namespace())
+                .unwrap_or_else(|| "docker.io".to_string());
+
+            if config.docker.upstreams.len() > 1 {
+                warn!(
+                    namespace = %namespace,
+                    upstream_count = config.docker.upstreams.len(),
+                    "Multiple Docker upstreams configured; using first upstream namespace for migration"
+                );
+            }
+
+            match docker_key_migration::migrate_docker_keys(
+                &storage,
+                &namespace,
+                docker_key_migration::MigrateDockerKeysOptions { dry_run },
+            )
+            .await
+            {
+                Ok(stats) => {
+                    if stats.failed > 0 {
+                        error!("{} keys failed to migrate", stats.failed);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    error!("Docker key migration failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
