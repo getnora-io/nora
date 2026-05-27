@@ -583,6 +583,10 @@ pub struct PubDartConfig {
     pub proxy_auth: Option<String>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
+    /// Metadata cache TTL in seconds (default: 300 = 5 min).
+    /// -1 = cache forever, 0 = always refetch, >0 = seconds.
+    #[serde(default = "default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 fn default_pub_proxy() -> Option<String> {
@@ -596,6 +600,7 @@ impl Default for PubDartConfig {
             proxy: default_pub_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
+            metadata_ttl: 300,
         }
     }
 }
@@ -2474,6 +2479,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_PUB_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
                 self.pub_dart.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_PUB_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.pub_dart.metadata_ttl = ttl;
             }
         }
 

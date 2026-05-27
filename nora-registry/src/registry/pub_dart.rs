@@ -16,6 +16,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::cache_ttl::is_within_ttl;
 use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
 };
@@ -85,7 +86,11 @@ async fn search_packages(
     );
 
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -146,7 +151,11 @@ async fn package_listing(
 
     let key = format!("pub/api/packages/{}.json", package);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -190,7 +199,11 @@ async fn version_metadata(
 
     let key = format!("pub/api/packages/{}/versions/{}.json", package, version);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
