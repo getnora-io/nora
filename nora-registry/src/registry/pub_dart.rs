@@ -16,6 +16,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::cache_ttl::is_within_ttl;
 use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
 };
@@ -85,7 +86,11 @@ async fn search_packages(
     );
 
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -146,7 +151,11 @@ async fn package_listing(
 
     let key = format!("pub/api/packages/{}.json", package);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -190,7 +199,11 @@ async fn version_metadata(
 
     let key = format!("pub/api/packages/{}/versions/{}.json", package, version);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -234,7 +247,11 @@ async fn package_advisories(
 
     let key = format!("pub/api/packages/{}/advisories.json", package);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -567,7 +584,14 @@ fn rewrite_next_url(next_url: &str, nora_base: &str, proxy_url: &str) -> String 
     next_url
         .strip_prefix(&upstream_prefix)
         .map(|suffix| format!("{}{}", nora_prefix, suffix))
-        .unwrap_or_else(|| next_url.to_string())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                next_url,
+                expected_prefix = %upstream_prefix,
+                "pub: next_url does not match expected upstream prefix, returning as-is"
+            );
+            next_url.to_string()
+        })
 }
 
 fn nora_archive_url(nora_base: &str, package: &str, version: &str) -> String {
