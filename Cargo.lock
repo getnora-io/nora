@@ -1876,7 +1876,6 @@ dependencies = [
  "indicatif",
  "insta",
  "jsonwebtoken",
- "lazy_static",
  "md-5 0.11.0",
  "memchr",
  "object_store",

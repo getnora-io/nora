@@ -14,10 +14,9 @@
 //! - **Raw**: no orphan detection (no version/reference model)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use lazy_static::lazy_static;
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
@@ -30,32 +29,43 @@ use crate::validation::ends_with_ci;
 // Prometheus metrics
 // ============================================================================
 
-lazy_static! {
-    pub static ref GC_BLOBS_REMOVED: IntCounter = register_int_counter!(
+pub static GC_BLOBS_REMOVED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "nora_gc_blobs_removed_total",
         "Total orphaned blobs/files removed by GC"
     )
-    .expect("gc_blobs_removed metric");
-    pub static ref GC_BYTES_FREED: IntCounter =
-        register_int_counter!("nora_gc_bytes_freed_total", "Total bytes freed by GC")
-            .expect("gc_bytes_freed metric");
-    pub static ref GC_DURATION: Histogram = register_histogram!(
+    .expect("gc_blobs_removed metric")
+});
+
+pub static GC_BYTES_FREED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("nora_gc_bytes_freed_total", "Total bytes freed by GC")
+        .expect("gc_bytes_freed metric")
+});
+
+pub static GC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
         "nora_gc_duration_seconds",
         "Duration of GC runs in seconds",
         vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
     )
-    .expect("gc_duration metric");
-    pub static ref GC_LAST_RUN: IntGauge = register_int_gauge!(
+    .expect("gc_duration metric")
+});
+
+pub static GC_LAST_RUN: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "nora_gc_last_run_timestamp",
         "Unix timestamp of last GC run"
     )
-    .expect("gc_last_run metric");
-    pub static ref GC_METADATA_PHANTOMS: IntCounter = register_int_counter!(
+    .expect("gc_last_run metric")
+});
+
+pub static GC_METADATA_PHANTOMS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "nora_gc_metadata_phantoms_total",
         "Total phantom version entries cleaned from metadata"
     )
-    .expect("gc_metadata_phantoms metric");
-}
+    .expect("gc_metadata_phantoms metric")
+});
 
 // ============================================================================
 // GC Result

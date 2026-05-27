@@ -6,10 +6,9 @@
 //! Retention is per-registry and operates on "versions" (Maven versions,
 //! Docker tags, npm tarballs, PyPI files, Cargo versions, Go modules).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use lazy_static::lazy_static;
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
@@ -23,29 +22,38 @@ use crate::validation::ends_with_ci;
 // Prometheus metrics
 // ============================================================================
 
-lazy_static! {
-    pub static ref RETENTION_VERSIONS_DELETED: IntCounter = register_int_counter!(
+pub static RETENTION_VERSIONS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "nora_retention_versions_deleted_total",
         "Total versions removed by retention policies"
     )
-    .expect("retention_versions_deleted metric");
-    pub static ref RETENTION_BYTES_FREED: IntCounter = register_int_counter!(
+    .expect("retention_versions_deleted metric")
+});
+
+pub static RETENTION_BYTES_FREED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "nora_retention_bytes_freed_total",
         "Total bytes freed by retention policies"
     )
-    .expect("retention_bytes_freed metric");
-    pub static ref RETENTION_DURATION: Histogram = register_histogram!(
+    .expect("retention_bytes_freed metric")
+});
+
+pub static RETENTION_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
         "nora_retention_duration_seconds",
         "Duration of retention runs in seconds",
         vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
     )
-    .expect("retention_duration metric");
-    pub static ref RETENTION_LAST_RUN: IntGauge = register_int_gauge!(
+    .expect("retention_duration metric")
+});
+
+pub static RETENTION_LAST_RUN: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "nora_retention_last_run_timestamp",
         "Unix timestamp of last retention run"
     )
-    .expect("retention_last_run metric");
-}
+    .expect("retention_last_run metric")
+});
 
 // ============================================================================
 // Retention planner (pure function)

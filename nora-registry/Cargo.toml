@@ -40,7 +40,6 @@ uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.19"
 base64 = "0.22"
 prometheus = "0.14"
-lazy_static = "1.5"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 clap = { version = "4", features = ["derive"] }

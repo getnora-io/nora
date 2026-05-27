@@ -2679,13 +2679,10 @@ impl Default for Config {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use lazy_static::lazy_static;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
-    lazy_static! {
-        /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
-        static ref ENV_MUTEX: Mutex<()> = Mutex::new(());
-    }
+    /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_rate_limit_default() {

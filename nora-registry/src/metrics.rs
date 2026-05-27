@@ -10,111 +10,148 @@ use axum::{
     routing::get,
     Router,
 };
-use lazy_static::lazy_static;
 use memchr::memmem;
 use prometheus::{
     register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, Encoder,
     HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder,
 };
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crate::AppState;
 
-lazy_static! {
-    /// Total HTTP requests counter
-    pub static ref HTTP_REQUESTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+/// Total HTTP requests counter
+pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_http_requests_total",
         "Total number of HTTP requests",
         &["registry", "method", "status"]
-    ).expect("failed to create HTTP_REQUESTS_TOTAL metric at startup");
+    )
+    .expect("failed to create HTTP_REQUESTS_TOTAL metric at startup")
+});
 
-    /// HTTP request duration histogram
-    pub static ref HTTP_REQUEST_DURATION: HistogramVec = register_histogram_vec!(
+/// HTTP request duration histogram
+pub static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "nora_http_request_duration_seconds",
         "HTTP request latency in seconds",
         &["registry", "method"],
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-    ).expect("failed to create HTTP_REQUEST_DURATION metric at startup");
+    )
+    .expect("failed to create HTTP_REQUEST_DURATION metric at startup")
+});
 
-    /// Cache requests counter (hit/miss)
-    pub static ref CACHE_REQUESTS: IntCounterVec = register_int_counter_vec!(
+/// Cache requests counter (hit/miss)
+pub static CACHE_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_cache_requests_total",
         "Total cache requests",
         &["registry", "result"]
-    ).expect("failed to create CACHE_REQUESTS metric at startup");
+    )
+    .expect("failed to create CACHE_REQUESTS metric at startup")
+});
 
-    /// Storage operations counter
-    pub static ref STORAGE_OPERATIONS: IntCounterVec = register_int_counter_vec!(
+/// Storage operations counter
+pub static STORAGE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_storage_operations_total",
         "Total storage operations",
         &["operation", "status"]
-    ).expect("failed to create STORAGE_OPERATIONS metric at startup");
+    )
+    .expect("failed to create STORAGE_OPERATIONS metric at startup")
+});
 
-    /// Artifacts count by registry
-    pub static ref ARTIFACTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+/// Artifacts count by registry
+#[allow(dead_code)]
+pub static ARTIFACTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_artifacts_total",
         "Total artifacts stored",
         &["registry"]
-    ).expect("failed to create ARTIFACTS_TOTAL metric at startup");
+    )
+    .expect("failed to create ARTIFACTS_TOTAL metric at startup")
+});
 
-    /// Circuit breaker state per registry (0=closed, 1=open, 2=half_open)
-    pub static ref CIRCUIT_BREAKER_STATE: prometheus::IntGaugeVec = prometheus::register_int_gauge_vec!(
+/// Circuit breaker state per registry (0=closed, 1=open, 2=half_open)
+pub static CIRCUIT_BREAKER_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "nora_circuit_breaker_state",
         "Circuit breaker state (0=closed, 1=open, 2=half_open)",
         &["registry"]
-    ).expect("failed to create CIRCUIT_BREAKER_STATE metric at startup");
+    )
+    .expect("failed to create CIRCUIT_BREAKER_STATE metric at startup")
+});
 
-    /// Total requests rejected by circuit breaker
-    pub static ref CIRCUIT_BREAKER_REJECTIONS: IntCounterVec = register_int_counter_vec!(
+/// Total requests rejected by circuit breaker
+pub static CIRCUIT_BREAKER_REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_circuit_breaker_rejections_total",
         "Total requests rejected by circuit breaker",
         &["registry"]
-    ).expect("failed to create CIRCUIT_BREAKER_REJECTIONS metric at startup");
+    )
+    .expect("failed to create CIRCUIT_BREAKER_REJECTIONS metric at startup")
+});
 
-    /// Upstream URL leak detections in responses (#386)
-    pub static ref UPSTREAM_URL_LEAK_TOTAL: IntCounterVec = register_int_counter_vec!(
+/// Upstream URL leak detections in responses (#386)
+pub static UPSTREAM_URL_LEAK_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_response_upstream_url_leak_total",
         "Upstream hostname detected in outgoing response body",
         &["registry"]
-    ).expect("failed to create UPSTREAM_URL_LEAK_TOTAL metric at startup");
+    )
+    .expect("failed to create UPSTREAM_URL_LEAK_TOTAL metric at startup")
+});
 
-    /// Upstream proxy request latency (#431)
-    pub static ref UPSTREAM_REQUEST_DURATION: HistogramVec = register_histogram_vec!(
+/// Upstream proxy request latency (#431)
+pub static UPSTREAM_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "nora_upstream_request_duration_seconds",
         "Upstream proxy request latency in seconds",
         &["registry", "status"],
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
-    ).expect("failed to create UPSTREAM_REQUEST_DURATION metric at startup");
+    )
+    .expect("failed to create UPSTREAM_REQUEST_DURATION metric at startup")
+});
 
-    /// Total artifact downloads by registry (#431)
-    pub static ref DOWNLOADS_TOTAL: IntCounterVec = register_int_counter_vec!(
+/// Total artifact downloads by registry (#431)
+pub static DOWNLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_downloads_total",
         "Total artifact downloads",
         &["registry"]
-    ).expect("failed to create DOWNLOADS_TOTAL metric at startup");
+    )
+    .expect("failed to create DOWNLOADS_TOTAL metric at startup")
+});
 
-    /// Total artifact uploads by registry (#431)
-    pub static ref UPLOADS_TOTAL: IntCounterVec = register_int_counter_vec!(
+/// Total artifact uploads by registry (#431)
+pub static UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_uploads_total",
         "Total artifact uploads",
         &["registry"]
-    ).expect("failed to create UPLOADS_TOTAL metric at startup");
+    )
+    .expect("failed to create UPLOADS_TOTAL metric at startup")
+});
 
-    /// Storage size in bytes by registry (#431)
-    pub static ref STORAGE_BYTES: IntGaugeVec = register_int_gauge_vec!(
+/// Storage size in bytes by registry (#431)
+pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "nora_storage_bytes",
         "Storage size in bytes by registry",
         &["registry"]
-    ).expect("failed to create STORAGE_BYTES metric at startup");
+    )
+    .expect("failed to create STORAGE_BYTES metric at startup")
+});
 
-    /// Cache write errors by registry and operation (#500)
-    pub static ref CACHE_WRITE_ERRORS: IntCounterVec = register_int_counter_vec!(
+/// Cache write errors by registry and operation (#500)
+pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "nora_cache_write_errors_total",
         "Cache write failures in background cache tasks",
         &["registry", "operation"]
-    ).expect("failed to create CACHE_WRITE_ERRORS metric at startup");
-}
+    )
+    .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
+});
 
 /// Maximum response body size to scan for upstream URL leaks (2 MB).
 const LEAK_SCAN_MAX_BYTES: usize = 2 * 1024 * 1024;
