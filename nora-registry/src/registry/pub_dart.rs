@@ -567,7 +567,14 @@ fn rewrite_next_url(next_url: &str, nora_base: &str, proxy_url: &str) -> String 
     next_url
         .strip_prefix(&upstream_prefix)
         .map(|suffix| format!("{}{}", nora_prefix, suffix))
-        .unwrap_or_else(|| next_url.to_string())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                next_url,
+                expected_prefix = %upstream_prefix,
+                "pub: next_url does not match expected upstream prefix, returning as-is"
+            );
+            next_url.to_string()
+        })
 }
 
 fn nora_archive_url(nora_base: &str, package: &str, version: &str) -> String {
