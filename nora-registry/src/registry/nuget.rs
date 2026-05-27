@@ -876,7 +876,7 @@ fn serve_stale_or_not_found(
 /// ```json
 /// { "items": [{ "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
 /// ```
-// TODO(v1.0): trust_upstream_dates config for high-security installs
+// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_nuget_publish_date(
     storage: &crate::storage::Storage,
     id: &str,

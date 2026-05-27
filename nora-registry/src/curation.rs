@@ -315,7 +315,7 @@ pub fn check_download(
 
 /// Extract publish date from file mtime. ONLY for hosted registries —
 /// proxy mtime reflects cache time, not actual publish date.
-// TODO(v1.0): trust_upstream_dates config for high-security installs
+// TODO(#513): trust_upstream_dates config for high-security installs
 pub async fn extract_mtime_as_publish_date(
     storage: &crate::storage::Storage,
     key: &str,

@@ -1979,7 +1979,7 @@ fn detect_manifest_media_type(data: &[u8]) -> String {
 ///
 /// Docker metadata sidecar stores `push_timestamp` (Unix seconds) when the
 /// manifest was first pushed or cached.
-// TODO(v1.0): trust_upstream_dates config for high-security installs
+// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_docker_publish_date(
     storage: &Storage,
     name: &str,

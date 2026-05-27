@@ -614,7 +614,7 @@ fn extract_base_url(state: &AppState, headers: &HeaderMap) -> String {
 ///
 /// Terraform registry API does not reliably include `published_at` in the
 /// versions listing. Falls back to mtime for hosted-only mode.
-// TODO(v1.0): trust_upstream_dates config for high-security installs
+// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_terraform_publish_date(
     state: &AppState,
     ns: &str,
