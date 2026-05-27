@@ -14,6 +14,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
+use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
 use crate::validation::ends_with_ci;
 use crate::AppState;
@@ -27,6 +28,7 @@ use axum::{
 use sha2::Digest;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// PEP 691 JSON content type
 const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
@@ -156,11 +158,11 @@ async fn package_versions(
         match proxy_fetch_text(
             &state.http_client,
             &url,
-            state.config.pypi.proxy_timeout,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
             state.config.pypi.proxy_auth.as_deref(),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
-            "pypi",
+            RegistryType::PyPI,
         )
         .await
         {
@@ -279,11 +281,11 @@ async fn download_file(
         match proxy_fetch_text(
             &state.http_client,
             &page_url,
-            state.config.pypi.proxy_timeout,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
             state.config.pypi.proxy_auth.as_deref(),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
-            "pypi",
+            RegistryType::PyPI,
         )
         .await
         {
@@ -292,10 +294,10 @@ async fn download_file(
                     match proxy_fetch(
                         &state.http_client,
                         &file_url,
-                        state.config.pypi.proxy_timeout,
+                        Duration::from_secs(state.config.pypi.proxy_timeout),
                         state.config.pypi.proxy_auth.as_deref(),
                         &state.circuit_breaker,
-                        "pypi",
+                        RegistryType::PyPI,
                     )
                     .await
                     {

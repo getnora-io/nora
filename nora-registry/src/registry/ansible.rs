@@ -24,6 +24,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -34,6 +35,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
 
@@ -307,10 +309,10 @@ async fn download_tarball(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.ansible.proxy_timeout,
+        Duration::from_secs(state.config.ansible.proxy_timeout),
         state.config.ansible.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "ansible",
+        RegistryType::Ansible,
     )
     .await
     {
@@ -374,11 +376,11 @@ async fn proxy_json(
     match proxy_fetch_text(
         &state.http_client,
         url,
-        state.config.ansible.proxy_timeout,
+        Duration::from_secs(state.config.ansible.proxy_timeout),
         state.config.ansible.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "ansible",
+        RegistryType::Ansible,
     )
     .await
     {

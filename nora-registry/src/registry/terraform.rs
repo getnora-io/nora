@@ -22,6 +22,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -32,6 +33,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://registry.terraform.io";
 
@@ -136,11 +138,11 @@ async fn provider_versions(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.terraform.proxy_timeout,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
         state.config.terraform.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "terraform",
+        RegistryType::Terraform,
     )
     .await
     {
@@ -234,11 +236,11 @@ async fn provider_download_meta(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.terraform.proxy_timeout,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
         state.config.terraform.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "terraform",
+        RegistryType::Terraform,
     )
     .await
     {
@@ -311,10 +313,10 @@ async fn provider_download_binary(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.terraform.proxy_timeout_dl,
+        Duration::from_secs(state.config.terraform.proxy_timeout_dl),
         state.config.terraform.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "terraform",
+        RegistryType::Terraform,
     )
     .await
     {
@@ -382,11 +384,11 @@ async fn module_versions(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.terraform.proxy_timeout,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
         state.config.terraform.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "terraform",
+        RegistryType::Terraform,
     )
     .await
     {
@@ -563,10 +565,10 @@ async fn module_source_download(
     match proxy_fetch(
         &state.http_client,
         &upstream_url,
-        state.config.terraform.proxy_timeout_dl,
+        Duration::from_secs(state.config.terraform.proxy_timeout_dl),
         state.config.terraform.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "terraform",
+        RegistryType::Terraform,
     )
     .await
     {

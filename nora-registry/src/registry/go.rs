@@ -13,6 +13,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry_type::RegistryType;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::body::Bytes;
@@ -25,6 +26,7 @@ use axum::{
 };
 use percent_encoding::percent_decode;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/go/{*path}", get(handle))
@@ -147,11 +149,11 @@ async fn handle(
     );
 
     // Use longer timeout for .zip files
-    let timeout = if ends_with_ci(&file, ".zip") {
+    let timeout = Duration::from_secs(if ends_with_ci(&file, ".zip") {
         state.config.go.proxy_timeout_zip
     } else {
         state.config.go.proxy_timeout
-    };
+    });
 
     // Fetch: binary for .zip, text for everything else
     let data = if ends_with_ci(&file, ".zip") {
@@ -161,7 +163,7 @@ async fn handle(
             timeout,
             state.config.go.proxy_auth.as_deref(),
             &state.circuit_breaker,
-            "go",
+            RegistryType::Go,
         )
         .await
     } else {
@@ -172,7 +174,7 @@ async fn handle(
             state.config.go.proxy_auth.as_deref(),
             None,
             &state.circuit_breaker,
-            "go",
+            RegistryType::Go,
         )
         .await
         .map(|s| s.into_bytes())

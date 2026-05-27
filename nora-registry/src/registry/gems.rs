@@ -17,6 +17,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -27,6 +28,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
 
@@ -87,10 +89,10 @@ async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.gems.proxy_timeout,
+        Duration::from_secs(state.config.gems.proxy_timeout),
         state.config.gems.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "gems",
+        RegistryType::Gems,
     )
     .await
     {
@@ -169,11 +171,11 @@ async fn compact_index(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.gems.proxy_timeout,
+        Duration::from_secs(state.config.gems.proxy_timeout),
         state.config.gems.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "gems",
+        RegistryType::Gems,
     )
     .await
     {
@@ -276,10 +278,10 @@ async fn download_gem(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.gems.proxy_timeout,
+        Duration::from_secs(state.config.gems.proxy_timeout),
         state.config.gems.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "gems",
+        RegistryType::Gems,
     )
     .await
     {
@@ -354,10 +356,10 @@ async fn download_gemspec(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.gems.proxy_timeout,
+        Duration::from_secs(state.config.gems.proxy_timeout),
         state.config.gems.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "gems",
+        RegistryType::Gems,
     )
     .await
     {

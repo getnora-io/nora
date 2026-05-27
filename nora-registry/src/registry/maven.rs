@@ -11,6 +11,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
+use crate::registry_type::RegistryType;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -24,6 +25,7 @@ use axum::{
 use sha2::Digest;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route(
@@ -187,10 +189,10 @@ async fn download(
         match proxy_fetch(
             &state.http_client,
             &url,
-            state.config.maven.proxy_timeout,
+            Duration::from_secs(state.config.maven.proxy_timeout),
             proxy.auth(),
             &state.circuit_breaker,
-            "maven",
+            RegistryType::Maven,
         )
         .await
         {

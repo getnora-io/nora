@@ -28,6 +28,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -39,6 +40,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
 
@@ -144,11 +146,11 @@ async fn search(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.conan.proxy_timeout,
+        Duration::from_secs(state.config.conan.proxy_timeout),
         state.config.conan.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "conan",
+        RegistryType::Conan,
     )
     .await
     {
@@ -355,10 +357,10 @@ async fn recipe_file_download(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.conan.proxy_timeout,
+        Duration::from_secs(state.config.conan.proxy_timeout),
         state.config.conan.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "conan",
+        RegistryType::Conan,
     )
     .await
     {
@@ -631,10 +633,10 @@ async fn package_file_download(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.conan.proxy_timeout_dl,
+        Duration::from_secs(state.config.conan.proxy_timeout_dl),
         state.config.conan.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "conan",
+        RegistryType::Conan,
     )
     .await
     {
@@ -676,11 +678,11 @@ async fn fetch_and_cache_json(
     match proxy_fetch_text(
         &state.http_client,
         url,
-        state.config.conan.proxy_timeout,
+        Duration::from_secs(state.config.conan.proxy_timeout),
         state.config.conan.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "conan",
+        RegistryType::Conan,
     )
     .await
     {
@@ -719,11 +721,11 @@ async fn fetch_and_cache_immutable_json(
     match proxy_fetch_text(
         &state.http_client,
         url,
-        state.config.conan.proxy_timeout,
+        Duration::from_secs(state.config.conan.proxy_timeout),
         state.config.conan.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "conan",
+        RegistryType::Conan,
     )
     .await
     {

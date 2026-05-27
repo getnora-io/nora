@@ -6,6 +6,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -18,6 +19,7 @@ use axum::{
 use base64::Engine;
 use sha2::Digest;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route(
@@ -220,10 +222,10 @@ async fn handle_request(
         match proxy_fetch(
             &state.http_client,
             &url,
-            state.config.npm.proxy_timeout,
+            Duration::from_secs(state.config.npm.proxy_timeout),
             state.config.npm.proxy_auth.as_deref(),
             &state.circuit_breaker,
-            "npm",
+            RegistryType::Npm,
         )
         .await
         {
@@ -309,10 +311,10 @@ async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Optio
     let data = proxy_fetch(
         &state.http_client,
         &url,
-        state.config.npm.proxy_timeout,
+        Duration::from_secs(state.config.npm.proxy_timeout),
         state.config.npm.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "npm",
+        RegistryType::Npm,
     )
     .await
     .ok()?;

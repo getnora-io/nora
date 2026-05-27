@@ -20,6 +20,7 @@ use crate::cache_ttl::is_within_ttl;
 use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
 };
+use crate::registry_type::RegistryType;
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -33,6 +34,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{Map, Value};
 use sha2::Digest;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("pub/", ".tar.gz");
@@ -377,10 +379,10 @@ async fn download_archive(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.pub_dart.proxy_timeout,
+        Duration::from_secs(state.config.pub_dart.proxy_timeout),
         state.config.pub_dart.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "pub",
+        RegistryType::PubDart,
     )
     .await
     {
@@ -421,12 +423,12 @@ async fn fetch_pub_api(
     super::proxy_fetch_core(
         &state.http_client,
         url,
-        state.config.pub_dart.proxy_timeout,
+        Duration::from_secs(state.config.pub_dart.proxy_timeout),
         state.config.pub_dart.proxy_auth.as_deref(),
         Some(("Accept", PUB_CONTENT_TYPE)),
         |response| async { response.bytes().await.map(|b| b.to_vec()) },
         cb,
-        "pub",
+        RegistryType::PubDart,
     )
     .await
 }

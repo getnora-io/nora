@@ -18,6 +18,7 @@ use crate::audit::AuditEntry;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
+use crate::registry_type::RegistryType;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -30,6 +31,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
@@ -248,11 +250,11 @@ async fn search_query(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        SEARCH_TIMEOUT_SECS,
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
         None, // search endpoint is public
         None,
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -323,11 +325,11 @@ async fn autocomplete_query(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        SEARCH_TIMEOUT_SECS,
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
         None, // autocomplete endpoint is public
         None,
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -420,11 +422,11 @@ async fn registration_index(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.metadata_proxy_timeout,
+        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -508,11 +510,11 @@ async fn registration_page(
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.metadata_proxy_timeout,
+        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -594,11 +596,11 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
     match proxy_fetch_text(
         &state.http_client,
         &url,
-        state.config.nuget.metadata_proxy_timeout,
+        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         state.config.nuget.proxy_auth.as_deref(),
         None,
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -734,10 +736,10 @@ async fn flatcontainer_download(
     match proxy_fetch(
         &state.http_client,
         &url,
-        state.config.nuget.proxy_timeout,
+        Duration::from_secs(state.config.nuget.proxy_timeout),
         state.config.nuget.proxy_auth.as_deref(),
         &state.circuit_breaker,
-        "nuget",
+        RegistryType::Nuget,
     )
     .await
     {
@@ -772,11 +774,11 @@ async fn flatcontainer_download(
                         if let Ok(text) = proxy_fetch_text(
                             &state2.http_client,
                             &url,
-                            state2.config.nuget.proxy_timeout,
+                            Duration::from_secs(state2.config.nuget.proxy_timeout),
                             state2.config.nuget.proxy_auth.as_deref(),
                             None,
                             &state2.circuit_breaker,
-                            "nuget",
+                            RegistryType::Nuget,
                         )
                         .await
                         {

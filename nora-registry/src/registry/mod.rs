@@ -35,6 +35,7 @@ pub use terraform::routes as terraform_routes;
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::metrics::UPSTREAM_REQUEST_DURATION;
+use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -88,21 +89,22 @@ pub(crate) fn circuit_open_response(registry: &str) -> Response {
 async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
     url: &str,
-    timeout_secs: u64,
+    timeout: Duration,
     auth: Option<&str>,
     extra_headers: Option<(&str, &str)>,
     extract: F,
     cb: &CircuitBreakerRegistry,
-    registry: &str,
+    registry: RegistryType,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
-    cb.check(registry)?;
+    let registry_str = registry.as_str();
+    cb.check(registry_str)?;
 
     for attempt in 0..2 {
-        let mut request = client.get(url).timeout(Duration::from_secs(timeout_secs));
+        let mut request = client.get(url).timeout(timeout);
         if let Some(credentials) = auth {
             request = request.header("Authorization", basic_auth_header(credentials));
         }
@@ -116,54 +118,54 @@ where
                 let elapsed = upstream_start.elapsed().as_secs_f64();
                 if response.status().is_success() {
                     UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry, "2xx"])
+                        .with_label_values(&[registry_str, "2xx"])
                         .observe(elapsed);
                     let result = extract(response)
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
-                        cb.record_success(registry);
+                        cb.record_success(registry_str);
                     }
                     return result;
                 }
                 let status = response.status().as_u16();
                 if (400..500).contains(&status) {
                     UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry, "4xx"])
+                        .with_label_values(&[registry_str, "4xx"])
                         .observe(elapsed);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
                     UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry, "5xx"])
+                        .with_label_values(&[registry_str, "5xx"])
                         .observe(elapsed);
                     tracing::debug!(url, status, "upstream 5xx, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 UPSTREAM_REQUEST_DURATION
-                    .with_label_values(&[registry, "5xx"])
+                    .with_label_values(&[registry_str, "5xx"])
                     .observe(elapsed);
-                cb.record_failure(registry);
+                cb.record_failure(registry_str);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
                 let status_label = if e.is_timeout() { "timeout" } else { "error" };
                 UPSTREAM_REQUEST_DURATION
-                    .with_label_values(&[registry, status_label])
+                    .with_label_values(&[registry_str, status_label])
                     .observe(elapsed);
                 if attempt == 0 {
                     tracing::debug!(url, error = %e, "upstream error, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry);
+                cb.record_failure(registry_str);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry);
+    cb.record_failure(registry_str);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -171,15 +173,15 @@ where
 pub(crate) async fn proxy_fetch(
     client: &reqwest::Client,
     url: &str,
-    timeout_secs: u64,
+    timeout: Duration,
     auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
-    registry: &str,
+    registry: RegistryType,
 ) -> Result<Vec<u8>, ProxyError> {
     proxy_fetch_core(
         client,
         url,
-        timeout_secs,
+        timeout,
         auth,
         None,
         |r| async { r.bytes().await.map(|b| b.to_vec()) },
@@ -193,16 +195,16 @@ pub(crate) async fn proxy_fetch(
 pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
     url: &str,
-    timeout_secs: u64,
+    timeout: Duration,
     auth: Option<&str>,
     extra_headers: Option<(&str, &str)>,
     cb: &CircuitBreakerRegistry,
-    registry: &str,
+    registry: RegistryType,
 ) -> Result<String, ProxyError> {
     proxy_fetch_core(
         client,
         url,
-        timeout_secs,
+        timeout,
         auth,
         extra_headers,
         |r| r.text(),
@@ -225,10 +227,10 @@ mod tests {
         let result = proxy_fetch(
             &client,
             "http://127.0.0.1:1/nonexistent",
-            2,
+            Duration::from_secs(2),
             None,
             &cb,
-            "test",
+            RegistryType::Docker, // arbitrary variant, testing proxy logic not registry type
         )
         .await;
         assert!(matches!(result, Err(ProxyError::Network(_))));
