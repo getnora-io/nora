@@ -1807,6 +1807,41 @@ impl Config {
             errors.push("server.port must not be 0".to_string());
         }
 
+        // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
+        {
+            let host = &self.server.host;
+            let is_wildcard = host == "0.0.0.0" || host == "::" || host == "0:0:0:0:0:0:0:0";
+
+            if is_wildcard && self.server.public_url.is_none() {
+                errors.push(format!(
+                    "NORA_PUBLIC_URL is required when host is '{}' (not routable). \
+                     Set: NORA_PUBLIC_URL=http://your-registry:{}",
+                    host, self.server.port
+                ));
+            }
+        }
+
+        // 1c. Validate public_url format if set
+        if let Some(ref url_str) = self.server.public_url {
+            match reqwest::Url::parse(url_str) {
+                Ok(parsed) => {
+                    let scheme = parsed.scheme();
+                    if scheme != "http" && scheme != "https" {
+                        errors.push(format!(
+                            "NORA_PUBLIC_URL must use http:// or https:// scheme, got: '{}'",
+                            scheme
+                        ));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "NORA_PUBLIC_URL is not a valid URL: '{}' — {}",
+                        url_str, e
+                    ));
+                }
+            }
+        }
+
         // 2. Storage path must not be empty when mode = Local
         if self.storage.mode == StorageMode::Local && self.storage.path.trim().is_empty() {
             errors.push("storage.path must not be empty when storage mode is local".to_string());
@@ -4035,5 +4070,100 @@ mod tests {
             debug_output.contains("REDACTED"),
             "Debug output should show REDACTED for credential fields"
         );
+    }
+
+    // ========================================================================
+    // Wildcard host + public_url validation (#510)
+    // ========================================================================
+
+    #[test]
+    fn test_validate_wildcard_host_requires_public_url() {
+        for host in &["0.0.0.0", "::", "0:0:0:0:0:0:0:0"] {
+            let mut config = Config::default();
+            config.server.host = host.to_string();
+            config.server.public_url = None;
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+                "host='{}' without public_url should produce NORA_PUBLIC_URL error, got: {:?}",
+                host,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_wildcard_host_with_public_url_ok() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.public_url = Some("http://registry.example.com:4000".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+            "0.0.0.0 with valid public_url should not error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_non_wildcard_host_no_public_url_ok() {
+        let mut config = Config::default();
+        config.server.host = "192.168.1.10".to_string();
+        config.server.public_url = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.is_empty(),
+            "non-wildcard host without public_url should have no errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_public_url_rejects_bad_scheme() {
+        for scheme_url in &["ftp://registry.example.com", "javascript://alert(1)"] {
+            let mut config = Config::default();
+            config.server.public_url = Some(scheme_url.to_string());
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("http://") || e.contains("https://")),
+                "public_url='{}' should be rejected for bad scheme: {:?}",
+                scheme_url,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_public_url_rejects_garbage() {
+        let mut config = Config::default();
+        config.server.public_url = Some("not-a-url".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("not a valid URL")),
+            "garbage public_url should produce validation error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_public_url_accepts_valid() {
+        for url in &[
+            "http://registry:4000",
+            "https://nora.example.com",
+            "http://10.0.0.1:4000",
+            "https://nora.example.com:8443/",
+        ] {
+            let mut config = Config::default();
+            config.server.public_url = Some(url.to_string());
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                !errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+                "valid public_url='{}' should not produce errors: {:?}",
+                url,
+                errors
+            );
+        }
     }
 }
