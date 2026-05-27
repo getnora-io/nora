@@ -21,7 +21,7 @@ use sha2::Digest;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/npm/{*path}",
         get(handle_request)
@@ -103,7 +103,7 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
 }
 
 async fn handle_request(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
@@ -280,12 +280,12 @@ async fn handle_request(
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let invalidate_npm = is_tarball;
-                let state_clone = Arc::clone(&state);
+                let repo_index = Arc::clone(&state.repo_index);
                 tokio::spawn(async move {
                     if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
                         tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
                     } else if invalidate_npm {
-                        state_clone.repo_index.invalidate("npm");
+                        repo_index.invalidate("npm");
                     }
                 });
 
@@ -304,7 +304,7 @@ async fn handle_request(
 
 /// Refetch metadata from upstream, rewrite URLs, update cache.
 /// Returns None if upstream is unavailable (caller serves stale cache).
-async fn refetch_metadata(state: &Arc<AppState>, path: &str, key: &str) -> Option<Vec<u8>> {
+async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec<u8>> {
     let proxy_url = state.config.npm.proxy.as_ref()?;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
@@ -359,7 +359,7 @@ fn is_valid_attachment_name(name: &str) -> bool {
 }
 
 async fn handle_publish(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     body: Bytes,
 ) -> Response {

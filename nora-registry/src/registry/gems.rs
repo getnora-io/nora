@@ -27,12 +27,11 @@ use axum::{
     routing::get,
     Router,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         // Index files (mutable)
         .route("/gems/specs.4.8.gz", get(specs_index))
@@ -50,19 +49,19 @@ use crate::cache_ttl::is_within_ttl;
 
 // ── Index endpoints (mutable, TTL cached) ─────────────────────────────
 
-async fn specs_index(State(state): State<Arc<AppState>>) -> Response {
+async fn specs_index(State(state): State<AppState>) -> Response {
     fetch_index(&state, "specs.4.8.gz").await
 }
 
-async fn latest_specs_index(State(state): State<Arc<AppState>>) -> Response {
+async fn latest_specs_index(State(state): State<AppState>) -> Response {
     fetch_index(&state, "latest_specs.4.8.gz").await
 }
 
-async fn prerelease_specs_index(State(state): State<Arc<AppState>>) -> Response {
+async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
     fetch_index(&state, "prerelease_specs.4.8.gz").await
 }
 
-async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
+async fn fetch_index(state: &AppState, filename: &str) -> Response {
     let storage_key = format!("gems/{}", filename);
 
     // Check TTL: if cached and fresh, serve from cache
@@ -125,7 +124,7 @@ async fn fetch_index(state: &Arc<AppState>, filename: &str) -> Response {
 // ── Compact index ──────────────────────────────────────────────────────
 
 async fn compact_index(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
@@ -207,7 +206,7 @@ async fn compact_index(
 // ── Gem download (immutable) ───────────────────────────────────────────
 
 async fn download_gem(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(filename): Path<String>,
 ) -> Response {
@@ -313,10 +312,7 @@ async fn download_gem(
 
 // ── Gemspec download (immutable) ───────────────────────────────────────
 
-async fn download_gemspec(
-    State(state): State<Arc<AppState>>,
-    Path(filename): Path<String>,
-) -> Response {
+async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<String>) -> Response {
     // filename = "name-version.gemspec.rz" — strip suffix and split
     let stem = match filename.strip_suffix(".gemspec.rz") {
         Some(s) => s,

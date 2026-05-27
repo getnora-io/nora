@@ -8,7 +8,6 @@
 #![allow(dead_code)] // utoipa doc stubs — not called at runtime, used by derive macros
 
 use axum::Router;
-use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -1046,7 +1045,7 @@ pub async fn revoke_token() {}
 
 // ============ Routes ============
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }

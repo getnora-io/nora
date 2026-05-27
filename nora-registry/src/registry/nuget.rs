@@ -30,7 +30,6 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use std::sync::Arc;
 use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
@@ -163,7 +162,7 @@ pub async fn discover_search_endpoints(
     }
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     routes_with_prefix("nuget")
 }
 
@@ -171,11 +170,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// These serve the same NuGet V3 handlers under alternate path prefixes.
 /// The service index points back to /nuget/ paths, so clients follow those
 /// URLs after initial discovery — storage and caching stay unified.
-pub fn alias_routes() -> Router<Arc<AppState>> {
+pub fn alias_routes() -> Router<AppState> {
     routes_with_prefix("chocolatey").merge(routes_with_prefix("pwsh"))
 }
 
-fn routes_with_prefix(prefix: &str) -> Router<Arc<AppState>> {
+fn routes_with_prefix(prefix: &str) -> Router<AppState> {
     Router::new()
         .route(&format!("/{prefix}/v3/index.json"), get(service_index))
         .route(&format!("/{prefix}/v3/query"), get(search_query))
@@ -200,7 +199,7 @@ fn routes_with_prefix(prefix: &str) -> Router<Arc<AppState>> {
 
 // ── Service index ──────────────────────────────────────────────────────
 
-async fn service_index(State(state): State<Arc<AppState>>) -> Response {
+async fn service_index(State(state): State<AppState>) -> Response {
     let base_url = nora_base_url(&state);
     let index = generate_service_index(&base_url);
 
@@ -218,7 +217,7 @@ async fn service_index(State(state): State<Arc<AppState>>) -> Response {
 // ── Search query (proxy to upstream SearchQueryService, local fallback) ──
 
 async fn search_query(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     _headers: HeaderMap,
     Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
@@ -295,7 +294,7 @@ async fn search_query(
 // ── Autocomplete (proxy to upstream SearchAutocompleteService) ─────────
 
 async fn autocomplete_query(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(params): Query<SearchParams>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
@@ -370,7 +369,7 @@ async fn autocomplete_query(
 // ── Registration index ─────────────────────────────────────────────────
 
 async fn registration_index(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -461,7 +460,7 @@ async fn registration_index(
 // ── Registration page (paginated version ranges) ────────────────────────
 
 async fn registration_page(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((id, lower, upper_raw)): Path<(String, String, String)>,
 ) -> Response {
     let id_lower = id.to_lowercase();
@@ -545,7 +544,7 @@ async fn registration_page(
 // ── Flat container dispatcher ───────────────────────────────────────────
 
 async fn flatcontainer_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
@@ -563,7 +562,7 @@ async fn flatcontainer_handler(
 
 // ── Version list ───────────────────────────────────────────────────────
 
-async fn version_list(state: Arc<AppState>, id: &str) -> Response {
+async fn version_list(state: AppState, id: &str) -> Response {
     let id = id.to_string();
     let id_lower = id.to_lowercase();
     if !is_valid_package_id(&id_lower) {
@@ -632,7 +631,7 @@ async fn version_list(state: Arc<AppState>, id: &str) -> Response {
 // ── Flatcontainer download (nupkg/nuspec, immutable) ───────────────────
 
 async fn flatcontainer_download(
-    state: Arc<AppState>,
+    state: AppState,
     headers: axum::http::HeaderMap,
     path: &str,
     id: &str,
@@ -761,7 +760,7 @@ async fn flatcontainer_download(
             // Best-effort: fetch flatcontainer index.json if missing (for local search)
             if ends_with_ci(filename, ".nupkg") {
                 let index_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
-                let state2 = Arc::clone(&state);
+                let state2 = state.clone();
                 let proxy_url2 = proxy_url.clone();
                 let id2 = id_lower.clone();
                 tokio::spawn(async move {

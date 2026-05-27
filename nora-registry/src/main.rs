@@ -156,31 +156,32 @@ pub struct ReloadableConfig {
     pub bypass_token: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
-    pub config: Config,
-    pub enabled_registries: HashSet<RegistryType>,
+    pub config: Arc<Config>,
+    pub enabled_registries: Arc<HashSet<RegistryType>>,
     pub start_time: Instant,
     pub startup_duration_ms: u64,
-    pub auth: Option<HtpasswdAuth>,
+    pub auth: Option<Arc<HtpasswdAuth>>,
     pub tokens: Option<TokenStore>,
-    pub metrics: DashboardMetrics,
-    pub activity: ActivityLog,
+    pub metrics: Arc<DashboardMetrics>,
+    pub activity: Arc<ActivityLog>,
     pub audit: Arc<AuditLog>,
-    pub docker_auth: registry::DockerAuth,
-    pub repo_index: RepoIndex,
+    pub docker_auth: Arc<registry::DockerAuth>,
+    pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
-    publish_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    publish_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Hot-reloadable curation config (swapped atomically on SIGHUP).
     pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
-    pub auth_failures: auth::AuthFailureTracker,
+    pub auth_failures: Arc<auth::AuthFailureTracker>,
     /// OIDC validator for workload identity (CI/CD)
-    pub oidc: Option<auth::OidcValidator>,
-    pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
-    pub digest_store: std::sync::Arc<digest_quarantine::DigestStore>,
+    pub oidc: Option<Arc<auth::OidcValidator>>,
+    pub(crate) circuit_breaker: Arc<circuit_breaker::CircuitBreakerRegistry>,
+    pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Pre-compiled upstream hostname searchers for leak detection (#386)
     pub leak_finders: metrics::LeakFinders,
 }
@@ -210,12 +211,13 @@ impl AppState {
     /// Use for ALL proxy caching instead of manual `tokio::spawn` + `storage.put`.
     /// Guarantees that `repo_index.invalidate()` is called AFTER the write completes,
     /// avoiding the race condition where invalidation fires before the file lands on S3.
-    pub fn spawn_cache(self: &Arc<Self>, registry: &'static str, key: String, data: Bytes) {
-        let state = Arc::clone(self);
+    pub fn spawn_cache(&self, registry: &'static str, key: String, data: Bytes) {
+        let storage = self.storage.clone();
+        let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                if state.storage.put(&key, &data).await.is_ok() {
-                    state.repo_index.invalidate(registry);
+                if storage.put(&key, &data).await.is_ok() {
+                    repo_index.invalidate(registry);
                 }
             })
             .catch_unwind()
@@ -228,19 +230,13 @@ impl AppState {
     }
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
-    pub fn spawn_cache_immutable(
-        self: &Arc<Self>,
-        registry: &'static str,
-        key: String,
-        data: Bytes,
-    ) {
-        let state = Arc::clone(self);
+    pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
+        let storage = self.storage.clone();
+        let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
-                if state.storage.stat(&key).await.is_none()
-                    && state.storage.put(&key, &data).await.is_ok()
-                {
-                    state.repo_index.invalidate(registry);
+                if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
+                    repo_index.invalidate(registry);
                 }
             })
             .catch_unwind()
@@ -1098,29 +1094,30 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
 
-    let state = Arc::new(AppState {
+    let enabled_registries = Arc::new(enabled_registries);
+    let state = AppState {
         storage,
-        config,
+        config: Arc::new(config),
         enabled_registries,
         start_time,
         startup_duration_ms,
-        auth,
+        auth: auth.map(Arc::new),
         tokens,
-        metrics: DashboardMetrics::with_persistence(&storage_path),
-        activity: ActivityLog::new(50),
+        metrics: Arc::new(DashboardMetrics::with_persistence(&storage_path)),
+        activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
-        docker_auth,
-        repo_index: RepoIndex::new(),
+        docker_auth: Arc::new(docker_auth),
+        repo_index: Arc::new(RepoIndex::new()),
         http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
-        publish_locks: parking_lot::Mutex::new(HashMap::new()),
+        publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
-        auth_failures: auth::AuthFailureTracker::new(5, 900),
-        oidc: oidc_validator,
-        circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
+        oidc: oidc_validator.map(Arc::new),
+        circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         digest_store,
         leak_finders,
-    });
+    };
 
     // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
     let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
@@ -1366,7 +1363,7 @@ async fn shutdown_signal() {
 /// Re-reads config.toml, rebuilds the CurationEngine with new filters,
 /// and atomically swaps the old config via ArcSwap.
 /// Storage, auth, port, and other settings are NOT reloaded — only curation.
-fn reload_curation(state: &Arc<AppState>) -> Result<(), String> {
+fn reload_curation(state: &AppState) -> Result<(), String> {
     let config = Config::try_load()?;
     let engine = build_curation_engine(&config);
 

@@ -207,7 +207,7 @@ impl LeakFinders {
 }
 
 /// Routes for metrics endpoint
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new().route("/metrics", get(metrics_handler))
 }
 
@@ -262,7 +262,7 @@ pub async fn metrics_middleware(
 /// Scans outgoing JSON responses for configured upstream hostnames.
 /// Detection only — never blocks responses. Increments counter and logs WARN.
 pub async fn leak_detection_middleware(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {

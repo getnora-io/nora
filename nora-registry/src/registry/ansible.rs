@@ -34,7 +34,6 @@ use axum::{
     routing::get,
     Router,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
@@ -43,7 +42,7 @@ const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
 pub const INDEX_PATTERN: (&str, &str) = ("ansible/", ".tar.gz");
 const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         // Galaxy API discovery (ansible-galaxy CLI hits this first)
         .route("/ansible/", get(api_discovery))
@@ -105,10 +104,7 @@ async fn api_discovery() -> Response {
 
 // ── Collection list ────────────────────────────────────────────────────
 
-async fn collection_list(
-    State(state): State<Arc<AppState>>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
+async fn collection_list(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let proxy_url = upstream_url(&state);
     let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
     let url = append_query(&base, raw_query.as_deref());
@@ -124,7 +120,7 @@ async fn collection_list(
 // ── Collection detail ──────────────────────────────────────────────────
 
 async fn collection_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Response {
     if !is_valid_name(&ns) || !is_valid_name(&name) {
@@ -147,7 +143,7 @@ async fn collection_detail(
 // ── Version listing ────────────────────────────────────────────────────
 
 async fn version_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, name)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
@@ -185,7 +181,7 @@ async fn version_list(
 // ── Version detail ─────────────────────────────────────────────────────
 
 async fn version_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((ns, name, ver)): Path<(String, String, String)>,
 ) -> Response {
@@ -229,7 +225,7 @@ async fn version_detail(
 // ── Tarball download (immutable) ───────────────────────────────────────
 
 async fn download_tarball(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(filename): Path<String>,
 ) -> Response {
@@ -347,12 +343,7 @@ async fn download_tarball(
 ///
 /// `cache_key` is the storage path for the cached response (e.g.
 /// `ansible/metadata/community/general.json`).
-async fn proxy_json(
-    state: &Arc<AppState>,
-    url: &str,
-    artifact_name: &str,
-    cache_key: &str,
-) -> Response {
+async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key: &str) -> Response {
     let base_url = nora_base_url(state);
     let upstream = upstream_url(state);
 

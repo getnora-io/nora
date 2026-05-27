@@ -27,10 +27,9 @@ use axum::{
     Router,
 };
 use sha2::Digest;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/cargo/index/config.json", get(index_config))
         .route("/cargo/index/{*path}", get(sparse_index))
@@ -50,7 +49,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 // ============================================================================
 
 /// GET /cargo/index/config.json — tells cargo where to download crates.
-async fn index_config(State(state): State<Arc<AppState>>) -> Response {
+async fn index_config(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
     let config = serde_json::json!({
         "dl": format!("{}/cargo/api/v1/crates", base),
@@ -83,7 +82,7 @@ async fn index_config(State(state): State<Arc<AppState>>) -> Response {
 ///
 /// Each entry is one JSON line per version (newline-delimited).
 async fn sparse_index(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
@@ -183,10 +182,7 @@ async fn sparse_index(
 // ============================================================================
 
 /// GET /cargo/api/v1/crates/{crate_name} — JSON metadata.
-async fn get_metadata(
-    State(state): State<Arc<AppState>>,
-    Path(crate_name): Path<String>,
-) -> Response {
+async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<String>) -> Response {
     if validate_storage_key(&crate_name).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -234,7 +230,7 @@ async fn get_metadata(
 
 /// GET /cargo/api/v1/crates/{name}/{version}/download — download .crate file.
 async fn download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
@@ -380,7 +376,7 @@ async fn download(
 ///   N bytes:    metadata JSON
 ///   4 bytes LE: .crate tarball length
 ///   M bytes:    .crate tarball
-async fn publish(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
     if body.len() < 8 {
         return (StatusCode::BAD_REQUEST, "Payload too small").into_response();
     }

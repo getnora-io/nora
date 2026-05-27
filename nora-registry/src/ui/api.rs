@@ -16,7 +16,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use utoipa::ToSchema;
 
 #[derive(Serialize)]
@@ -152,9 +151,9 @@ pub struct MountPoint {
 
 // ============ API Handlers ============
 
-pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats> {
+pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
     // Trigger index rebuild if needed, then get counts
-    for reg in &state.enabled_registries {
+    for reg in state.enabled_registries.iter() {
         let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
     }
 
@@ -177,7 +176,7 @@ pub async fn api_stats(State(state): State<Arc<AppState>>) -> Json<RegistryStats
     })
 }
 
-pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<DashboardResponse> {
+pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
     let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
     let mut registry_card_stats = Vec::new();
@@ -261,7 +260,7 @@ pub async fn api_dashboard(State(state): State<Arc<AppState>>) -> Json<Dashboard
 }
 
 pub async fn api_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(registry_type): Path<String>,
 ) -> Json<Vec<RepoInfo>> {
     let repos = state.repo_index.get(&registry_type, &state.storage).await;
@@ -269,7 +268,7 @@ pub async fn api_list(
 }
 
 pub async fn api_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((registry_type, name)): Path<(String, String)>,
 ) -> Json<serde_json::Value> {
     match registry_type.as_str() {
@@ -290,7 +289,7 @@ pub async fn api_detail(
 }
 
 pub async fn api_search(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(registry_type): Path<String>,
     Query(params): Query<SearchQuery>,
 ) -> axum::response::Html<String> {

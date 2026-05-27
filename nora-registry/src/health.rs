@@ -4,7 +4,6 @@
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::AppState;
@@ -25,13 +24,13 @@ pub struct StorageHealth {
     pub total_size_bytes: u64,
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
 }
 
-async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthStatus>) {
+async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
 
@@ -45,7 +44,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
 
     // Build registries map from enabled registries
     let mut registries = HashMap::new();
-    for reg in &state.enabled_registries {
+    for reg in state.enabled_registries.iter() {
         registries.insert(reg.as_str().to_string(), "ok".to_string());
     }
 
@@ -70,7 +69,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<H
     (status_code, Json(health))
 }
 
-async fn readiness_check(State(state): State<Arc<AppState>>) -> StatusCode {
+async fn readiness_check(State(state): State<AppState>) -> StatusCode {
     if check_storage_reachable(&state).await {
         StatusCode::OK
     } else {

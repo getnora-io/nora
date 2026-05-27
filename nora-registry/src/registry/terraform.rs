@@ -32,7 +32,6 @@ use axum::{
     routing::get,
     Router,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://registry.terraform.io";
@@ -40,7 +39,7 @@ const UPSTREAM_DEFAULT: &str = "https://registry.terraform.io";
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("terraform/", ".zip");
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         // Service discovery
         .route(
@@ -81,7 +80,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 // ── Service discovery ──────────────────────────────────────────────────
 
-async fn service_discovery(State(state): State<Arc<AppState>>) -> Response {
+async fn service_discovery(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
     let json = serde_json::json!({
         "providers.v1": format!("{}/terraform/v1/providers/", base),
@@ -107,7 +106,7 @@ async fn service_discovery(State(state): State<Arc<AppState>>) -> Response {
 // ── Provider versions (mutable, TTL cached) ────────────────────────────
 
 async fn provider_versions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, ptype)): Path<(String, String)>,
 ) -> Response {
     if !is_valid_name(&ns) || !is_valid_name(&ptype) {
@@ -174,7 +173,7 @@ async fn provider_versions(
 // ── Provider download metadata ─────────────────────────────────────────
 
 async fn provider_download_meta(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path((ns, ptype, ver, os, arch)): Path<(String, String, String, String, String)>,
 ) -> Response {
@@ -275,7 +274,7 @@ async fn provider_download_meta(
 // ── Provider binary download (immutable) ───────────────────────────────
 
 async fn provider_download_binary(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Response {
     if !is_safe_path(&path) {
@@ -349,7 +348,7 @@ async fn provider_download_binary(
 // ── Module versions ────────────────────────────────────────────────────
 
 async fn module_versions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, name, provider)): Path<(String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns) || !is_valid_name(&name) || !is_valid_name(&provider) {
@@ -420,7 +419,7 @@ async fn module_versions(
 // ── Module download ────────────────────────────────────────────────────
 
 async fn module_download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -521,7 +520,7 @@ async fn module_download(
 // ── Module source download (cached, proxied) ─────────────────────────
 
 async fn module_source_download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)

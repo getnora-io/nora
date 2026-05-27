@@ -33,7 +33,7 @@ use std::time::Duration;
 /// PEP 691 JSON content type
 const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/simple/",
@@ -50,10 +50,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 // ============================================================================
 
 /// GET /simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
-async fn list_packages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let keys = state.storage.list("pypi/").await;
     let mut packages = std::collections::HashSet::new();
 
@@ -121,7 +118,7 @@ async fn list_packages(
 /// (e.g. both cp310 and cp314) regardless of which were cached first.
 /// Falls back to local-only when upstream is unavailable.
 async fn package_versions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -206,7 +203,7 @@ async fn package_versions(
 
 /// GET /simple/{name}/{filename} — download a specific file.
 async fn download_file(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
@@ -318,14 +315,14 @@ async fn download_file(
                             let storage = state.storage.clone();
                             let key_clone = key.clone();
                             let data_clone = data.clone();
-                            let state_clone = Arc::clone(&state);
+                            let repo_index = Arc::clone(&state.repo_index);
                             tokio::spawn(async move {
                                 if storage.put(&key_clone, &data_clone).await.is_ok() {
                                     let hash = hex::encode(sha2::Sha256::digest(&data_clone));
                                     let _ = storage
                                         .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                                         .await;
-                                    state_clone.repo_index.invalidate("pypi");
+                                    repo_index.invalidate("pypi");
                                 }
                             });
 
@@ -369,7 +366,7 @@ async fn download_file(
 ///   content = the file bytes
 ///   sha256_digest = hex SHA-256 of file (optional)
 ///   metadata_version, summary, etc. (optional metadata)
-async fn upload(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
+async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Response {
     let mut action = String::new();
     let mut name = String::new();
     let mut version = String::new();

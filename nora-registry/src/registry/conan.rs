@@ -39,12 +39,11 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         // Ping — must come before the wildcard
         .route("/conan/v2/ping", get(ping))
@@ -109,7 +108,7 @@ async fn ping() -> Response {
 // ── Search ────────────────────────────────────────────────────────────
 
 async fn search(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let query = params.get("q").cloned().unwrap_or_default();
@@ -176,7 +175,7 @@ async fn search(
 // ── Recipe latest revision (TTL cached) ───────────────────────────────
 
 async fn recipe_latest(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_ref(&name) || !is_valid_ref(&ver) || !is_valid_ref(&user) || !is_valid_ref(&chan) {
@@ -210,7 +209,7 @@ async fn recipe_latest(
 // ── Recipe revisions (TTL cached) ─────────────────────────────────────
 
 async fn recipe_revisions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_ref(&name) || !is_valid_ref(&ver) || !is_valid_ref(&user) || !is_valid_ref(&chan) {
@@ -243,7 +242,7 @@ async fn recipe_revisions(
 // ── Recipe file listing (immutable — scoped to revision) ──────────────
 
 async fn recipe_file_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan, rrev)): Path<(String, String, String, String, String)>,
 ) -> Response {
     if !is_valid_ref(&name)
@@ -279,7 +278,7 @@ async fn recipe_file_list(
 // ── Recipe file download (immutable) ──────────────────────────────────
 
 async fn recipe_file_download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path((name, ver, user, chan, rrev, filename)): Path<(
         String,
@@ -393,7 +392,7 @@ async fn recipe_file_download(
 // ── Package latest revision (TTL cached) ──────────────────────────────
 
 async fn package_latest(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan, rrev, pkg_id)): Path<(
         String,
         String,
@@ -444,7 +443,7 @@ async fn package_latest(
 // ── Package revisions (TTL cached) ────────────────────────────────────
 
 async fn package_revisions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan, rrev, pkg_id)): Path<(
         String,
         String,
@@ -495,7 +494,7 @@ async fn package_revisions(
 // ── Package file listing (immutable — scoped to PREV) ─────────────────
 
 async fn package_file_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, ver, user, chan, rrev, pkg_id, prev)): Path<(
         String,
         String,
@@ -546,7 +545,7 @@ async fn package_file_list(
 // ── Package file download (immutable) ─────────────────────────────────
 
 async fn package_file_download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path((name, ver, user, chan, rrev, pkg_id, prev, filename)): Path<(
         String,
@@ -670,7 +669,7 @@ async fn package_file_download(
 
 /// Fetch JSON from upstream, cache with TTL (mutable content).
 async fn fetch_and_cache_json(
-    state: &Arc<AppState>,
+    state: &AppState,
     url: &str,
     storage_key: &str,
     artifact: &str,
@@ -713,7 +712,7 @@ async fn fetch_and_cache_json(
 
 /// Fetch JSON from upstream, cache immutably (content scoped to revision, never changes).
 async fn fetch_and_cache_immutable_json(
-    state: &Arc<AppState>,
+    state: &AppState,
     url: &str,
     storage_key: &str,
     artifact: &str,

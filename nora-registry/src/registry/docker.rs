@@ -358,7 +358,7 @@ fn quarantine_forbidden(
 /// Docker v2 routes.
 /// Uses a `{*rest}` wildcard to support image names with arbitrary path depth
 /// (e.g., `library/astra/ubi18-cpp122`), per OCI Distribution spec.
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/v2/",
@@ -372,7 +372,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// Parses the image name (arbitrary depth) and operation from the wildcard path,
 /// then delegates to the appropriate handler with correct method routing.
 async fn docker_v2_dispatch(
-    state: State<Arc<AppState>>,
+    state: State<AppState>,
     method: Method,
     Path(wildcard): Path<String>,
     uri: Uri,
@@ -535,7 +535,7 @@ pub(crate) fn strip_docker_namespace(name: &str) -> &str {
 }
 
 /// List all repositories in the registry
-async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
+async fn catalog(State(state): State<AppState>) -> Json<Value> {
     let keys = state.storage.list("docker/").await;
 
     // Extract unique repository names from paths like "docker/{name}/manifests/..."
@@ -567,7 +567,7 @@ async fn catalog(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn check_blob(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker.upstreams);
@@ -596,7 +596,7 @@ async fn check_blob(
 }
 
 async fn download_blob(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
@@ -744,7 +744,7 @@ async fn download_blob(
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -793,7 +793,7 @@ async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 /// PATCH handler for chunked blob uploads
 /// Docker client sends data chunks via PATCH, then finalizes with PUT
 async fn patch_blob(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
@@ -919,7 +919,7 @@ async fn patch_blob(
 /// Handles both monolithic uploads (body contains all data) and
 /// chunked upload finalization (body may be empty, data in session)
 async fn upload_blob(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
@@ -1110,7 +1110,7 @@ async fn upload_blob(
 /// Returns `Some(Response)` on first successful upstream (or quarantine block),
 /// `None` if all upstreams failed.
 async fn try_fetch_and_cache(
-    state: &Arc<AppState>,
+    state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
     upstream_name: &str,
     name: &str,
@@ -1168,7 +1168,7 @@ async fn try_fetch_and_cache(
                     {
                         let storage = state.storage.clone();
                         let key_clone = cache_key.to_string();
-                        let state_clone = Arc::clone(state);
+                        let repo_index = Arc::clone(&state.repo_index);
                         tokio::spawn(async move {
                             if let Err(e) = storage.put(&key_clone, &data).await {
                                 tracing::warn!(key = %key_clone, error = %e, "cache write failed (quarantine pre-cache)");
@@ -1176,7 +1176,7 @@ async fn try_fetch_and_cache(
                                     .with_label_values(&["docker", "manifest"])
                                     .inc();
                             }
-                            state_clone.repo_index.invalidate("docker");
+                            repo_index.invalidate("docker");
                         });
                         return Some(quarantine_forbidden(&digest, &q_status, q_secs));
                     }
@@ -1190,7 +1190,7 @@ async fn try_fetch_and_cache(
                 let name_clone = name.to_string();
                 let reference_clone = reference.to_string();
                 let digest_clone = digest.clone();
-                let state_clone = Arc::clone(state);
+                let repo_index = Arc::clone(&state.repo_index);
                 tokio::spawn(async move {
                     // Store manifest by tag and digest (namespaced)
                     if let Err(e) = storage.put(&key_clone, &data_clone).await {
@@ -1232,7 +1232,7 @@ async fn try_fetch_and_cache(
                                 .inc();
                         }
                     }
-                    state_clone.repo_index.invalidate("docker");
+                    repo_index.invalidate("docker");
                 });
 
                 return Some(manifest_response(data, content_type, digest));
@@ -1248,7 +1248,7 @@ async fn try_fetch_and_cache(
 }
 
 async fn get_manifest(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
@@ -1358,7 +1358,7 @@ async fn get_manifest(
 
 /// Serve a manifest from local cache with all required headers and side-effects.
 fn serve_cached_manifest(
-    state: &Arc<AppState>,
+    state: &AppState,
     data: &[u8],
     name: &str,
     reference: &str,
@@ -1425,7 +1425,7 @@ fn serve_cached_manifest(
 }
 
 async fn put_manifest(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
@@ -1507,7 +1507,7 @@ async fn put_manifest(
         .into_response()
 }
 
-async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let c = canonicalize(&name, &state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
@@ -1541,7 +1541,7 @@ async fn list_tags(State(state): State<Arc<AppState>>, Path(name): Path<String>)
 // ============================================================================
 
 async fn delete_manifest(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker.upstreams);
@@ -1661,7 +1661,7 @@ async fn delete_manifest(
 }
 
 async fn delete_blob(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker.upstreams);
@@ -2142,7 +2142,7 @@ async fn get_config_info(
 
 /// Update metadata when a manifest is pulled
 /// Increments download counter and updates last_pulled timestamp
-async fn update_metadata_on_pull(state: Arc<AppState>, storage: Storage, meta_key: String) {
+async fn update_metadata_on_pull(state: AppState, storage: Storage, meta_key: String) {
     // Lock to prevent lost counter increments from concurrent pulls
     let lock = state.publish_lock(&meta_key);
     let _guard = lock.lock().await;

@@ -18,7 +18,6 @@ use axum::{
     routing::{get, post},
     Form, Router,
 };
-use std::sync::Arc;
 
 use api::*;
 use i18n::Lang;
@@ -121,7 +120,7 @@ fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
     Some(user.to_string())
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         // UI Pages
         .route("/", get(|| async { Redirect::to("/ui/") }))
@@ -176,7 +175,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 // Dashboard page
 async fn dashboard(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -191,7 +190,7 @@ async fn dashboard(
 
 // Docker pages
 async fn docker_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -216,7 +215,7 @@ async fn docker_list(
 }
 
 async fn docker_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
@@ -239,7 +238,7 @@ async fn docker_detail(
 
 // Maven pages
 async fn maven_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -260,7 +259,7 @@ async fn maven_list(
 }
 
 async fn maven_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
@@ -293,7 +292,7 @@ async fn maven_detail(
 
 // npm pages
 async fn npm_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -318,7 +317,7 @@ async fn npm_list(
 }
 
 async fn npm_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -349,7 +348,7 @@ async fn npm_detail(
 
 // Cargo pages
 async fn cargo_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -374,7 +373,7 @@ async fn cargo_list(
 }
 
 async fn cargo_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -405,7 +404,7 @@ async fn cargo_detail(
 
 // PyPI pages
 async fn pypi_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -430,7 +429,7 @@ async fn pypi_list(
 }
 
 async fn pypi_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -461,7 +460,7 @@ async fn pypi_detail(
 
 // Go pages
 async fn go_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -482,7 +481,7 @@ async fn go_list(
 }
 
 async fn go_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -530,7 +529,7 @@ async fn go_detail(
 
 // Raw pages
 async fn raw_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -555,7 +554,7 @@ async fn raw_list(
 }
 
 async fn raw_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
@@ -596,7 +595,7 @@ async fn raw_detail(
 
 // Generic registry list handler for new formats (v0.7)
 async fn generic_registry_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
@@ -634,7 +633,7 @@ async fn generic_registry_list(
 }
 
 async fn generic_registry_detail(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -681,7 +680,7 @@ async fn generic_registry_detail(
 
 // Ansible Galaxy hierarchical browsing (namespace → collection → versions)
 async fn ansible_browse_root(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
@@ -704,7 +703,7 @@ async fn ansible_browse_root(
 }
 
 async fn ansible_browse(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
@@ -773,7 +772,7 @@ async fn ansible_browse(
 
 /// Token management page (GET /ui/tokens)
 async fn tokens_page(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_headers(&headers);
@@ -795,7 +794,7 @@ struct CreateTokenForm {
 }
 
 async fn tokens_create(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -862,7 +861,7 @@ async fn tokens_create(
 
 /// List tokens HTMX fragment (GET /api/ui/tokens/list)
 async fn tokens_list(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_headers(&headers);
@@ -877,7 +876,7 @@ async fn tokens_list(
 
 /// Revoke token (POST /api/ui/tokens/{file_id}/revoke)
 async fn tokens_revoke(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(file_id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {

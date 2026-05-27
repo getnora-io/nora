@@ -33,7 +33,6 @@ use axum::{
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{Map, Value};
 use sha2::Digest;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -59,7 +58,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/pub/api/packages", get(search_packages))
         .route(
@@ -77,10 +76,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
 }
 
-async fn search_packages(
-    State(state): State<Arc<AppState>>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
+async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let raw_query = raw_query.unwrap_or_default();
     let key = format!(
         "pub/search/{}.json",
@@ -126,7 +122,7 @@ async fn search_packages(
 }
 
 async fn package_listing(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(package): Path<String>,
 ) -> Response {
@@ -188,7 +184,7 @@ async fn package_listing(
 }
 
 async fn version_metadata(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path((package, version)): Path<(String, String)>,
 ) -> Response {
     if !is_valid_pub_package_name(&package) || !is_valid_pub_version(&version) {
@@ -236,7 +232,7 @@ async fn version_metadata(
 }
 
 async fn package_advisories(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(package): Path<String>,
 ) -> Response {
     if !is_valid_pub_package_name(&package) {
@@ -281,7 +277,7 @@ async fn package_advisories(
 }
 
 async fn download_archive(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((package, archive)): Path<(String, String)>,
 ) -> Response {
@@ -433,7 +429,7 @@ async fn fetch_pub_api(
     .await
 }
 
-async fn cache_bytes(state: &Arc<AppState>, key: String, data: Vec<u8>) {
+async fn cache_bytes(state: &AppState, key: String, data: Vec<u8>) {
     if let Err(e) = state.storage.put(&key, &data).await {
         tracing::warn!(key = %key, error = %e, "pub: failed to cache proxy data");
     }

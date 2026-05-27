@@ -37,7 +37,7 @@ use parking_lot::RwLock;
 
 /// Everything a test needs: tempdir (must stay alive), shared state, and the router.
 pub struct TestContext {
-    pub state: Arc<AppState>,
+    pub state: AppState,
     pub app: Router,
     pub _tempdir: TempDir,
 }
@@ -226,36 +226,37 @@ fn build_context(
 
     let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
 
-    let state = Arc::new(AppState {
+    let enabled_registries = Arc::new(enabled_registries);
+    let state = AppState {
         storage,
-        config,
+        config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),
         startup_duration_ms: 0,
-        auth,
+        auth: auth.map(Arc::new),
         tokens,
-        metrics: DashboardMetrics::new(),
-        activity: ActivityLog::new(50),
+        metrics: Arc::new(DashboardMetrics::new()),
+        activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, crate::audit::AuditMode::Off)),
-        docker_auth,
-        repo_index: RepoIndex::new(),
+        docker_auth: Arc::new(docker_auth),
+        repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
-        publish_locks: parking_lot::Mutex::new(HashMap::new()),
+        publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
-        auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
+        auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
         oidc: None,
-        circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
-        digest_store: std::sync::Arc::new(crate::digest_quarantine::DigestStore::empty(
-            &storage_path,
+        circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
+            cb_config,
         )),
+        digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         leak_finders,
-    });
+    };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
     // Dynamic route merging based on enabled registries
     let mut registry_routes = Router::new();
-    for reg in &enabled_registries {
+    for reg in enabled_registries.iter() {
         match reg {
             crate::registry_type::RegistryType::Docker => {
                 registry_routes = registry_routes.merge(registry::docker_routes());

@@ -26,7 +26,6 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::AppState;
@@ -167,7 +166,7 @@ fn extract_client_ip(
 
 /// Auth middleware - supports Basic auth, Bearer tokens, and OIDC JWT
 pub async fn auth_middleware(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -1135,7 +1134,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let oidc_validator =
             OidcValidator::new(ctx.state.config.auth.oidc.clone(), reqwest::Client::new());
         // We need to rebuild the state with oidc set — use Arc::get_mut or rebuild
-        let state = Arc::new(crate::AppState {
+        let state = crate::AppState {
             storage: ctx.state.storage.clone(),
             config: ctx.state.config.clone(),
             enabled_registries: ctx.state.enabled_registries.clone(),
@@ -1143,33 +1142,33 @@ Jd74nq6dNCjpWG4drIsyhqX+
             startup_duration_ms: ctx.state.startup_duration_ms,
             auth: ctx.state.auth.clone(),
             tokens: ctx.state.tokens.clone(),
-            metrics: crate::dashboard_metrics::DashboardMetrics::new(),
-            activity: crate::activity_log::ActivityLog::new(50),
+            metrics: Arc::new(crate::dashboard_metrics::DashboardMetrics::new()),
+            activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
-            docker_auth: crate::registry::DockerAuth::new(reqwest::Client::new(), 5),
-            repo_index: crate::repo_index::RepoIndex::new(),
+            docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
+            repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            publish_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             reloadable: Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
                 curation_engine: crate::curation::CurationEngine::new(
                     crate::config::CurationConfig::default(),
                 ),
                 bypass_token: None,
             })),
-            auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
-            oidc: Some(oidc_validator),
-            circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(
+            auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
+            oidc: Some(Arc::new(oidc_validator)),
+            circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 ctx.state.config.circuit_breaker.clone(),
-            ),
+            )),
             digest_store: ctx.state.digest_store.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
-        });
+        };
 
         // Rebuild router with new state
         use axum::{extract::DefaultBodyLimit, middleware, Router};
         let mut registry_routes = Router::new();
-        for reg in &state.enabled_registries {
+        for reg in state.enabled_registries.iter() {
             match reg {
                 crate::registry_type::RegistryType::Raw => {
                     registry_routes = registry_routes.merge(crate::registry::raw_routes());

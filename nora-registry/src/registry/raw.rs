@@ -13,9 +13,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::sync::Arc;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new().route("/raw/-/reindex", post(reindex)).route(
         "/raw/{*path}",
         get(download)
@@ -28,7 +27,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// Invalidate the raw index so it rebuilds on next read.
 /// Useful after uploading files directly to S3/storage bypassing the API.
-async fn reindex(State(state): State<Arc<AppState>>) -> Response {
+async fn reindex(State(state): State<AppState>) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -38,7 +37,7 @@ async fn reindex(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
@@ -110,7 +109,7 @@ async fn download(
 }
 
 async fn upload(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -243,7 +242,7 @@ async fn upload(
 }
 
 /// Overwrite an existing file (conditional PUT with `If-Match`).
-async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8]) -> Response {
+async fn do_overwrite(state: &AppState, key: &str, path: &str, body: &[u8]) -> Response {
     // Direct put() — both filesystem and S3 backends overwrite in-place,
     // avoiding the 404 window that delete-then-put created for concurrent readers.
     match state.storage.put(key, body).await {
@@ -268,7 +267,7 @@ async fn do_overwrite(state: &Arc<AppState>, key: &str, path: &str, body: &[u8])
     }
 }
 
-async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -290,7 +289,7 @@ async fn delete_file(State(state): State<Arc<AppState>>, Path(path): Path<String
     }
 }
 
-async fn check_exists(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }

@@ -12,7 +12,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::tokens::Role;
@@ -63,7 +62,7 @@ pub struct TokenListResponse {
 
 /// Create a new API token (requires Basic auth)
 async fn create_token(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
@@ -129,7 +128,7 @@ async fn create_token(
 
 /// List tokens for authenticated user
 async fn list_tokens(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
@@ -195,7 +194,7 @@ pub struct RevokeRequest {
 
 /// Revoke a token
 async fn revoke_token(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
@@ -243,7 +242,7 @@ async fn revoke_token(
 }
 
 /// Token management routes
-pub fn token_routes() -> Router<Arc<AppState>> {
+pub fn token_routes() -> Router<AppState> {
     Router::new()
         .route("/api/tokens", post(create_token))
         .route("/api/tokens/list", post(list_tokens))

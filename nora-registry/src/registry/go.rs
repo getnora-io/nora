@@ -25,16 +25,15 @@ use axum::{
     Router,
 };
 use percent_encoding::percent_decode;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new().route("/go/{*path}", get(handle))
 }
 
 /// Main handler — parses the wildcard path and dispatches to the right logic.
 async fn handle(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {

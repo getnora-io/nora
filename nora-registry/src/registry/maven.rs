@@ -24,10 +24,9 @@ use axum::{
 };
 use sha2::Digest;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/maven2/{*path}",
         get(download)
@@ -105,7 +104,7 @@ fn is_snapshot(version: &str) -> bool {
 // ============================================================================
 
 async fn download(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
@@ -231,11 +230,7 @@ async fn download(
 // Upload
 // ============================================================================
 
-async fn upload(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-    body: Bytes,
-) -> Response {
+async fn upload(State(state): State<AppState>, Path(path): Path<String>, body: Bytes) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
