@@ -629,7 +629,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
 }
 
 // ── Flatcontainer download (nupkg/nuspec, immutable) ───────────────────
-
+// LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn flatcontainer_download(
     state: AppState,
     headers: axum::http::HeaderMap,

@@ -102,6 +102,7 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
     result
 }
 
+// LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn handle_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

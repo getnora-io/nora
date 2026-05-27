@@ -202,6 +202,7 @@ async fn package_versions(
 // ============================================================================
 
 /// GET /simple/{name}/{filename} — download a specific file.
+// LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn download_file(
     State(state): State<AppState>,
     headers: HeaderMap,
