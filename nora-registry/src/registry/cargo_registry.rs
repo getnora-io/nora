@@ -51,8 +51,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 async fn index_config(State(state): State<Arc<AppState>>) -> Response {
     let base = nora_base_url(&state);
     let config = serde_json::json!({
-        "dl": format!("{}/cargo/api/v1/crates", base.trim_end_matches('/')),
-        "api": format!("{}/cargo/api", base.trim_end_matches('/'))
+        "dl": format!("{}/cargo/api/v1/crates", base),
+        "api": format!("{}/cargo/api", base)
     });
     (
         StatusCode::OK,

@@ -19,7 +19,9 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -77,8 +79,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 // ── Service discovery ──────────────────────────────────────────────────
 
-async fn service_discovery(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let base = extract_base_url(&state, &headers);
+async fn service_discovery(State(state): State<Arc<AppState>>) -> Response {
+    let base = nora_base_url(&state);
     let json = serde_json::json!({
         "providers.v1": format!("{}/terraform/v1/providers/", base),
         "modules.v1": format!("{}/terraform/v1/modules/", base)
@@ -171,7 +173,7 @@ async fn provider_versions(
 
 async fn provider_download_meta(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Path((ns, ptype, ver, os, arch)): Path<(String, String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -183,7 +185,7 @@ async fn provider_download_meta(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let base_url = extract_base_url(&state, &headers);
+    let base_url = nora_base_url(&state);
     let artifact = format!("{}/{} v{} {}/{}", ns, ptype, ver, os, arch);
 
     // Extract publish date from cached metadata
@@ -417,7 +419,6 @@ async fn module_versions(
 
 async fn module_download(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -428,7 +429,7 @@ async fn module_download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let base_url = extract_base_url(&state, &headers);
+    let base_url = nora_base_url(&state);
 
     // If we have a cached source URL, return the rewritten header immediately
     let source_url_key = format!(
@@ -593,22 +594,6 @@ async fn module_source_download(
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
-
-/// Extract base URL (scheme + host) from config or request headers.
-fn extract_base_url(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(public_url) = &state.config.server.public_url {
-        return public_url.trim_end_matches('/').to_string();
-    }
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:4000");
-    format!("{}://{}", scheme, host)
-}
 
 /// Extract publish date from cached Terraform provider versions metadata.
 ///

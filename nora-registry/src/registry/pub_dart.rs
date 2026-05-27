@@ -104,7 +104,7 @@ async fn search_packages(
 
     match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
-            let nora_base = nora_base_url(&state);
+            let nora_base = pub_base_url(&state);
             let rewritten = rewrite_search_response(&data, &nora_base, proxy_url).unwrap_or(data);
             cache_bytes(&state, key, rewritten.clone()).await;
             pub_json_response(rewritten)
@@ -161,7 +161,7 @@ async fn package_listing(
 
     match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
-            let nora_base = nora_base_url(&state);
+            let nora_base = pub_base_url(&state);
             let rewritten = rewrite_package_response(&data, &nora_base, &package).unwrap_or(data);
             cache_bytes(&state, key, rewritten.clone()).await;
             state.repo_index.invalidate("pub");
@@ -206,7 +206,7 @@ async fn version_metadata(
 
     match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
         Ok(data) => {
-            let nora_base = nora_base_url(&state);
+            let nora_base = pub_base_url(&state);
             let rewritten = rewrite_version_response(&data, &nora_base, &package).unwrap_or(data);
             cache_bytes(&state, key, rewritten.clone()).await;
             pub_json_response(rewritten)
@@ -597,7 +597,7 @@ fn nora_version_url(nora_base: &str, package: &str, version: &str) -> String {
 }
 
 /// Build NORA base URL with /pub prefix for URL rewriting.
-fn nora_base_url(state: &AppState) -> String {
+fn pub_base_url(state: &AppState) -> String {
     format!("{}/pub", nora_base_url_shared(state))
 }
 
