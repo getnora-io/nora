@@ -92,15 +92,8 @@ pub async fn run_mirror(
     registry: &str,
     concurrency: usize,
     json_output: bool,
+    client: &reqwest::Client,
 ) -> Result<(), String> {
-    // SAFETY: mirror CLI connects to a local NORA server (not upstream registries),
-    // so custom CA certs from build_http_client() are not needed here.
-    // nosemgrep: reqwest-client-bypass
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
     // Health check
     let health_url = format!("{}/health", registry.trim_end_matches('/'));
     match client.get(&health_url).send().await {
@@ -131,7 +124,7 @@ pub async fn run_mirror(
                 }
             }
             npm::run_npm_mirror(
-                &client,
+                client,
                 registry,
                 lockfile,
                 packages,
@@ -158,17 +151,17 @@ pub async fn run_mirror(
                     targets.len(),
                     registry
                 );
-                npm::mirror_npm_packages(&client, registry, &targets, concurrency).await?
+                npm::mirror_npm_packages(client, registry, &targets, concurrency).await?
             }
         }
         MirrorFormat::Pip { lockfile } => {
-            mirror_lockfile(&client, registry, "pip", &lockfile).await?
+            mirror_lockfile(client, registry, "pip", &lockfile).await?
         }
         MirrorFormat::Cargo { lockfile } => {
-            mirror_lockfile(&client, registry, "cargo", &lockfile).await?
+            mirror_lockfile(client, registry, "cargo", &lockfile).await?
         }
         MirrorFormat::Maven { lockfile } => {
-            mirror_lockfile(&client, registry, "maven", &lockfile).await?
+            mirror_lockfile(client, registry, "maven", &lockfile).await?
         }
         MirrorFormat::Docker {
             images,
@@ -191,7 +184,7 @@ pub async fn run_mirror(
                 image_refs.len(),
                 registry
             );
-            docker::run_docker_mirror(&client, registry, &image_refs, concurrency).await?
+            docker::run_docker_mirror(client, registry, &image_refs, concurrency).await?
         }
     };
 

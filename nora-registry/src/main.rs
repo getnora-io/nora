@@ -291,8 +291,15 @@ fn log_outbound_proxy() {
 }
 
 /// Build HTTP client with optional custom CA certificate support.
-fn build_http_client(tls: &TlsConfig) -> reqwest::Client {
+///
+/// When `timeout` is `Some`, a default request timeout is set on the client
+/// (used by `nora mirror` for long-running downloads).
+fn build_http_client(tls: &TlsConfig, timeout: Option<std::time::Duration>) -> reqwest::Client {
     let mut builder = reqwest::ClientBuilder::new();
+
+    if let Some(t) = timeout {
+        builder = builder.timeout(t);
+    }
 
     if let Some(ref ca_path) = tls.ca_cert {
         match std::fs::read(ca_path) {
@@ -473,7 +480,9 @@ async fn main() {
             concurrency,
             json,
         }) => {
-            if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json).await {
+            let client = build_http_client(&config.tls, Some(std::time::Duration::from_secs(300)));
+            if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
+            {
                 error!("Mirror failed: {}", e);
                 std::process::exit(1);
             }
@@ -950,7 +959,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls);
+    let http_client = build_http_client(&config.tls, None);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)

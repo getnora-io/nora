@@ -153,6 +153,16 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
 });
 
+/// Leak detection scans skipped (#517)
+static LEAK_DETECTION_SKIPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_leak_detection_skipped_total",
+        "Leak detection scans skipped (body too large or unknown size)",
+        &["reason"]
+    )
+    .expect("failed to create LEAK_DETECTION_SKIPPED metric at startup")
+});
+
 /// Maximum response body size to scan for upstream URL leaks (2 MB).
 const LEAK_SCAN_MAX_BYTES: usize = 2 * 1024 * 1024;
 
@@ -284,14 +294,34 @@ pub async fn leak_detection_middleware(
         return response;
     }
 
-    // Skip if Content-Length exceeds scan limit (avoid consuming body we can't restore)
+    // Determine body size BEFORE consuming it (#517).
+    // Primary: body.size_hint().exact() — works for handler-built responses (Full<Bytes>).
+    // Fallback: Content-Length header — works for proxy responses where upstream set it.
+    // If both are None (streaming/chunked without CL), skip scan to avoid body loss.
+    use axum::body::HttpBody as _;
+    let size_hint_exact = response.body().size_hint().exact().map(|s| s as usize);
     let content_length = response
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
-    if content_length.is_some_and(|len| len > LEAK_SCAN_MAX_BYTES) {
-        return response;
+    let known_size = size_hint_exact.or(content_length);
+
+    match known_size {
+        Some(size) if size > LEAK_SCAN_MAX_BYTES => {
+            LEAK_DETECTION_SKIPPED
+                .with_label_values(&["too_large"])
+                .inc();
+            return response;
+        }
+        None => {
+            // Unknown body size — cannot safely consume (body is one-shot stream).
+            LEAK_DETECTION_SKIPPED
+                .with_label_values(&["unknown_size"])
+                .inc();
+            return response;
+        }
+        Some(_) => {} // Size known and within limit — proceed to scan
     }
 
     let is_gzip = response
@@ -300,15 +330,30 @@ pub async fn leak_detection_middleware(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ce| ce.contains("gzip"));
 
-    // Collect response body
+    // CANCEL-SAFETY: to_bytes consumes the body stream (one-shot). If this future is
+    // dropped, the body is partially consumed and cannot be restored. The size pre-check
+    // above ensures we only reach here for known-size bodies within the limit, so
+    // cancellation would only occur from external timeout, not from exceeding the limit.
     let (parts, body) = response.into_parts();
     let body_bytes = match axum::body::to_bytes(body, LEAK_SCAN_MAX_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            // Body exceeded limit or read failed — can't restore original, return empty.
-            // In practice unreachable: Content-Length pre-check above catches oversized bodies.
-            tracing::debug!("leak_detection: body read exceeded limit, skipping scan");
-            return Response::from_parts(parts, Body::empty());
+            // Defense-in-depth: should be unreachable with correct size pre-check.
+            // Body is already consumed — cannot restore. Log and return empty.
+            LEAK_DETECTION_SKIPPED
+                .with_label_values(&["body_read_error"])
+                .inc();
+            tracing::warn!(
+                path = path.as_str(),
+                size_hint = ?size_hint_exact,
+                content_length = ?content_length,
+                "leak_detection: body read failed after size pre-check passed — returning empty body"
+            );
+            let mut error_parts = parts;
+            error_parts
+                .headers
+                .remove(axum::http::header::CONTENT_LENGTH);
+            return Response::from_parts(error_parts, Body::empty());
         }
     };
 
@@ -346,13 +391,30 @@ pub async fn leak_detection_middleware(
     Response::from_parts(parts, Body::from(body_bytes))
 }
 
-/// Decompress gzip bytes; returns None on failure (non-fatal).
+/// Decompress gzip bytes; returns None on failure or if decompressed size exceeds limit.
+///
+/// Capped at `LEAK_SCAN_MAX_BYTES` to prevent gzip bomb attacks (#517).
 fn decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut decoder = GzDecoder::new(data);
+    let decoder = GzDecoder::new(data);
+    // Cap decompression to prevent gzip bombs (e.g. 42KB compressed → 4.5GB decompressed).
+    let mut limited = decoder.take(LEAK_SCAN_MAX_BYTES as u64);
     let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf).ok()?;
+    limited.read_to_end(&mut buf).ok()?;
+    // Check if data was truncated (more bytes available beyond cap)
+    let mut probe = [0u8; 1];
+    if limited.into_inner().read(&mut probe).unwrap_or(0) > 0 {
+        LEAK_DETECTION_SKIPPED
+            .with_label_values(&["gzip_truncated"])
+            .inc();
+        tracing::debug!(
+            compressed_len = data.len(),
+            decompressed_cap = LEAK_SCAN_MAX_BYTES,
+            "leak_detection: gzip decompression truncated at scan limit"
+        );
+    }
+    debug_assert!(buf.len() <= LEAK_SCAN_MAX_BYTES);
     Some(buf)
 }
 
@@ -521,5 +583,41 @@ mod tests {
         let result = finders.scan(&decompressed);
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, "nuget");
+    }
+
+    #[test]
+    fn test_decompress_gzip_capped_at_limit() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        // Create data larger than LEAK_SCAN_MAX_BYTES
+        let large_data = vec![b'A'; LEAK_SCAN_MAX_BYTES + 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&large_data).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        // decompress_gzip must cap output at LEAK_SCAN_MAX_BYTES
+        let result = decompress_gzip(&compressed).expect("decompress");
+        assert!(result.len() <= LEAK_SCAN_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_decompress_gzip_invalid_data_returns_none() {
+        // Random bytes are not valid gzip
+        assert!(decompress_gzip(b"not gzip data at all").is_none());
+        assert!(decompress_gzip(b"").is_none());
+    }
+
+    #[test]
+    fn test_decompress_gzip_normal_data_unchanged() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        // Data well under the limit should decompress fully
+        let original = b"small payload for leak scanning test";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        let result = decompress_gzip(&compressed).expect("decompress");
+        assert_eq!(result, original);
     }
 }
