@@ -247,7 +247,11 @@ async fn package_advisories(
 
     let key = format!("pub/api/packages/{}/advisories.json", package);
     if let Ok(data) = state.storage.get(&key).await {
-        return pub_json_response(data.to_vec());
+        if let Some(meta) = state.storage.stat(&key).await {
+            if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
+                return pub_json_response(data.to_vec());
+            }
+        }
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {

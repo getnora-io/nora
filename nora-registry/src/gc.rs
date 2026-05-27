@@ -162,10 +162,23 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
 
     // Detect registries with data but no GC coverage
     // Raw has no version model and no reference graph — nothing to GC by design
+    // Terraform/Pub/Ansible/NuGet store only cached metadata — no orphan graph,
+    // but we track them so the GC report shows data exists outside coverage
     let mut uncovered = Vec::new();
-    let count = storage.list("raw/").await.len();
-    if count > 0 {
-        uncovered.push(("raw".to_string(), count));
+    for prefix in [
+        "raw/",
+        "terraform/",
+        "pub/",
+        "ansible/",
+        "nuget/",
+        "gems/",
+        "conan/",
+    ] {
+        let count = storage.list(prefix).await.len();
+        if count > 0 {
+            let name = prefix.trim_end_matches('/').to_string();
+            uncovered.push((name, count));
+        }
     }
 
     let duration = start.elapsed().as_secs_f64();
