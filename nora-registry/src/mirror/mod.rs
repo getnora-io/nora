@@ -93,6 +93,9 @@ pub async fn run_mirror(
     concurrency: usize,
     json_output: bool,
 ) -> Result<(), String> {
+    // SAFETY: mirror CLI connects to a local NORA server (not upstream registries),
+    // so custom CA certs from build_http_client() are not needed here.
+    // nosemgrep: reqwest-client-bypass
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
