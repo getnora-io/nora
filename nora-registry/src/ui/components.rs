@@ -730,6 +730,40 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Validate that a URL is safe to use in an `href` attribute.
+///
+/// Returns the trimmed URL if the scheme is `http` or `https` (case-insensitive),
+/// `None` otherwise. Strips leading ASCII control characters and whitespace
+/// to prevent bypass via `\x00javascript:` or `\tjavascript:` patterns.
+///
+/// # Security
+/// This prevents `javascript:`, `data:`, `vbscript:`, `blob:`, `file:` and
+/// other dangerous URI schemes from being rendered as clickable links.
+/// See: <https://github.com/nicholasgasior/nora/issues/522>
+pub fn sanitize_href(url: &str) -> Option<&str> {
+    // Strip leading ASCII control chars (0x00-0x1F, 0x7F) and whitespace
+    let trimmed = url.trim_start_matches(|c: char| c.is_ascii_control() || c.is_ascii_whitespace());
+
+    let bytes = trimmed.as_bytes();
+
+    // Check for https:// (8 bytes) or http:// (7 bytes) prefix, case-insensitive.
+    // All prefix chars are ASCII so byte comparison is safe and avoids char boundary issues.
+    let is_safe = (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"))
+        || (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"));
+    let result = if is_safe { Some(trimmed) } else { None };
+
+    // --- POSTCONDITION ---
+    debug_assert!(
+        result.is_none_or(|u| {
+            let lower = u.to_ascii_lowercase();
+            lower.starts_with("http://") || lower.starts_with("https://")
+        }),
+        "sanitize_href postcondition violated: result must start with http:// or https://"
+    );
+
+    result
+}
+
 /// Dynamic stats for the bragging footer (demo builds only).
 #[cfg(feature = "demo")]
 pub struct BraggingStats {
@@ -943,5 +977,155 @@ pub fn format_expiry(ts: u64) -> (String, bool) {
     } else {
         let days = diff / 86400;
         (format!("in {}d", days), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn sanitize_href_allows_https() {
+        assert_eq!(
+            sanitize_href("https://example.com"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_http() {
+        assert_eq!(
+            sanitize_href("http://example.com"),
+            Some("http://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_mixed_case_https() {
+        assert_eq!(
+            sanitize_href("HTTPS://example.com"),
+            Some("HTTPS://example.com")
+        );
+        assert_eq!(
+            sanitize_href("Https://example.com"),
+            Some("Https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_mixed_case_http() {
+        assert_eq!(
+            sanitize_href("HTTP://example.com"),
+            Some("HTTP://example.com")
+        );
+        assert_eq!(
+            sanitize_href("Http://example.com"),
+            Some("Http://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_javascript() {
+        assert_eq!(sanitize_href("javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("JAVASCRIPT:alert(1)"), None);
+        assert_eq!(sanitize_href("JavaScript:alert(document.cookie)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_data() {
+        assert_eq!(
+            sanitize_href("data:text/html,<script>alert(1)</script>"),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_vbscript() {
+        assert_eq!(sanitize_href("vbscript:MsgBox(1)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_blob() {
+        assert_eq!(sanitize_href("blob:http://evil.com/uuid"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_file() {
+        assert_eq!(sanitize_href("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn sanitize_href_strips_leading_control_chars() {
+        assert_eq!(sanitize_href("\x00javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\tjavascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\njavascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\x01javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\x7Fjavascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_strips_leading_whitespace_for_valid() {
+        assert_eq!(
+            sanitize_href("  https://example.com"),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            sanitize_href("\thttps://example.com"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_empty_and_short() {
+        assert_eq!(sanitize_href(""), None);
+        assert_eq!(sanitize_href("http"), None);
+        assert_eq!(sanitize_href("http:/"), None);
+        // "http://" (7 bytes) passes — it's a valid http scheme prefix, not dangerous
+        assert_eq!(sanitize_href("http://"), Some("http://"));
+    }
+
+    #[test]
+    fn sanitize_href_blocks_relative_paths() {
+        assert_eq!(sanitize_href("/path/to/page"), None);
+        assert_eq!(sanitize_href("../other"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_ftp_ssh() {
+        assert_eq!(sanitize_href("ftp://example.com"), None);
+        assert_eq!(sanitize_href("ssh://git@github.com"), None);
+        assert_eq!(sanitize_href("git://github.com/repo"), None);
+    }
+
+    proptest! {
+        #[test]
+        fn sanitize_href_never_returns_non_http(input in "\\PC{0,200}") {
+            if let Some(result) = sanitize_href(&input) {
+                let lower = result.to_ascii_lowercase();
+                prop_assert!(
+                    lower.starts_with("http://") || lower.starts_with("https://"),
+                    "sanitize_href returned non-http URL: {}", result
+                );
+            }
+        }
+
+        #[test]
+        fn sanitize_href_preserves_valid_http(suffix in "[a-zA-Z0-9./-]{1,100}") {
+            let url = format!("https://{}", suffix);
+            prop_assert_eq!(sanitize_href(&url), Some(url.as_str()));
+        }
+
+        #[test]
+        fn sanitize_href_rejects_arbitrary_scheme(
+            scheme in "[a-zA-Z]{1,20}",
+            body in "\\PC{0,100}"
+        ) {
+            let lower = scheme.to_ascii_lowercase();
+            if lower != "http" && lower != "https" {
+                let url = format!("{}://{}", scheme, body);
+                prop_assert_eq!(sanitize_href(&url), None, "should reject scheme: {}", scheme);
+            }
+        }
     }
 }

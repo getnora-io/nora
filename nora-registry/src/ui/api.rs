@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use super::components::{format_size, format_timestamp, html_escape};
+use super::components::{format_size, format_timestamp, html_escape, sanitize_href};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
 use crate::registry_type::RegistryType;
@@ -674,6 +674,7 @@ pub async fn get_npm_detail(
                 .get("homepage")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .filter(|s| sanitize_href(s).is_some())
                 .map(|s| s.to_string());
             metadata.repository = meta_json
                 .get("repository")
@@ -687,7 +688,8 @@ pub async fn get_npm_detail(
                     s.trim_start_matches("git+")
                         .trim_end_matches(".git")
                         .to_string()
-                });
+                })
+                .filter(|s| sanitize_href(s).is_some());
             metadata.keywords = meta_json
                 .get("keywords")
                 .and_then(|v| v.as_array())
@@ -755,11 +757,13 @@ pub async fn get_cargo_detail(
                 .get("homepage")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .filter(|s| sanitize_href(s).is_some())
                 .map(|s| s.to_string());
             metadata.repository = crate_obj
                 .get("repository")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .filter(|s| sanitize_href(s).is_some())
                 .map(|s| s.to_string());
             // Cargo uses documentation field as well; use homepage fallback
             if metadata.homepage.is_none() {
@@ -767,6 +771,7 @@ pub async fn get_cargo_detail(
                     .get("documentation")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
+                    .filter(|s| sanitize_href(s).is_some())
                     .map(|s| s.to_string());
             }
             metadata.keywords = crate_obj

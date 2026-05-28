@@ -1771,19 +1771,33 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
     }
 
     if let Some(ref homepage) = meta.homepage {
-        info_items.push(format!(
-            r#"<span class="text-slate-500">Homepage:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
-            html_escape(homepage),
-            html_escape(homepage)
-        ));
+        if let Some(safe_url) = sanitize_href(homepage) {
+            info_items.push(format!(
+                r#"<span class="text-slate-500">Homepage:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+                html_escape(safe_url),
+                html_escape(safe_url)
+            ));
+        } else {
+            info_items.push(format!(
+                r#"<span class="text-slate-500">Homepage:</span> <span class="text-slate-300">{}</span>"#,
+                html_escape(homepage)
+            ));
+        }
     }
 
     if let Some(ref repo) = meta.repository {
-        info_items.push(format!(
-            r#"<span class="text-slate-500">Repository:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
-            html_escape(repo),
-            html_escape(repo)
-        ));
+        if let Some(safe_url) = sanitize_href(repo) {
+            info_items.push(format!(
+                r#"<span class="text-slate-500">Repository:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+                html_escape(safe_url),
+                html_escape(safe_url)
+            ));
+        } else {
+            info_items.push(format!(
+                r#"<span class="text-slate-500">Repository:</span> <span class="text-slate-300">{}</span>"#,
+                html_escape(repo)
+            ));
+        }
     }
 
     if !info_items.is_empty() {
