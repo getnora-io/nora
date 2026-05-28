@@ -674,6 +674,13 @@ impl TrustedProxies {
                 ) {
                     let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
                     if prefix <= max_prefix {
+                        if prefix == 0 {
+                            tracing::warn!(
+                                value = %item,
+                                "CIDR /0 matches ALL addresses in this family — all peers will be \
+                                 trusted proxies (X-Forwarded-For honored, IP-based rate limiting disabled)"
+                            );
+                        }
                         entries.push((addr, prefix));
                     } else {
                         tracing::warn!(value = %item, "Invalid CIDR prefix length, skipping");
@@ -706,6 +713,11 @@ impl TrustedProxies {
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
+                    // /0 matches all addresses in this family (RFC 4632).
+                    // Must check before shift: u32::MAX << 32 overflows.
+                    if *prefix == 0 {
+                        return true;
+                    }
                     if *prefix >= 32 {
                         return *net == addr;
                     }
@@ -715,6 +727,11 @@ impl TrustedProxies {
                     (net_bits & mask) == (addr_bits & mask)
                 }
                 (std::net::IpAddr::V6(net), std::net::IpAddr::V6(addr)) => {
+                    // /0 matches all addresses in this family (RFC 4632).
+                    // Must check before shift: u128::MAX << 128 overflows.
+                    if *prefix == 0 {
+                        return true;
+                    }
                     if *prefix >= 128 {
                         return *net == addr;
                     }
@@ -726,6 +743,11 @@ impl TrustedProxies {
                 _ => false, // v4 vs v6 mismatch
             }
         })
+    }
+
+    /// Returns true if any entry uses prefix /0 (matches all addresses in its family).
+    pub fn has_prefix_zero(&self) -> bool {
+        self.entries.iter().any(|(_, prefix)| *prefix == 0)
     }
 }
 
@@ -1891,7 +1913,16 @@ impl Config {
             }
         }
 
-        // 7. "Enabled but empty" — subsystems that silently do nothing
+        // 7. Trusted proxies /0 — security footgun
+        if self.auth.trusted_proxies.has_prefix_zero() {
+            warnings.push(
+                "auth.trusted_proxies contains a /0 CIDR — all peers are trusted proxies. \
+                 X-Forwarded-For will be honored from any source, disabling IP-based brute-force protection"
+                    .to_string(),
+            );
+        }
+
+        // 8. "Enabled but empty" — subsystems that silently do nothing
         if self.gc.enabled && self.gc.dry_run {
             warnings.push(
                 "gc.enabled=true with gc.dry_run=true — GC will run but never delete anything. Set gc.dry_run=false to actually free space".to_string(),
@@ -4216,6 +4247,164 @@ mod tests {
                 url,
                 errors
             );
+        }
+    }
+
+    // --- TrustedProxies: prefix=0 overflow fix (#525) ---
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_v4() {
+        let proxies = TrustedProxies::parse("0.0.0.0/0");
+        assert!(proxies.contains("192.168.1.1".parse().unwrap()));
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(proxies.contains("255.255.255.255".parse().unwrap()));
+        assert!(proxies.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_v6() {
+        let proxies = TrustedProxies::parse("::/0");
+        assert!(proxies.contains("::1".parse().unwrap()));
+        assert!(proxies.contains("fe80::1".parse().unwrap()));
+        assert!(proxies.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_no_cross_family() {
+        // 0.0.0.0/0 must NOT match IPv6 addresses
+        let v4_all = TrustedProxies::parse("0.0.0.0/0");
+        assert!(!v4_all.contains("::1".parse().unwrap()));
+        assert!(!v4_all.contains("2001:db8::1".parse().unwrap()));
+
+        // ::/0 must NOT match IPv4 addresses
+        let v6_all = TrustedProxies::parse("::/0");
+        assert!(!v6_all.contains("127.0.0.1".parse().unwrap()));
+        assert!(!v6_all.contains("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_non_canonical_network() {
+        // Non-zero network address with /0 still matches everything in that family
+        let proxies = TrustedProxies::parse("192.168.1.1/0");
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(proxies.contains("172.16.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_parse_accepted() {
+        // /0 must not be dropped by parse()
+        let proxies = TrustedProxies::parse("0.0.0.0/0");
+        assert!(proxies.has_prefix_zero());
+
+        let proxies = TrustedProxies::parse("::/0");
+        assert!(proxies.has_prefix_zero());
+
+        // Normal CIDR must not trigger has_prefix_zero
+        let proxies = TrustedProxies::parse("10.0.0.0/8");
+        assert!(!proxies.has_prefix_zero());
+    }
+
+    #[test]
+    fn test_trusted_proxies_existing_behavior_unchanged() {
+        // Verify existing prefix values still work correctly
+        let proxies = TrustedProxies::parse("10.0.0.0/8");
+        assert!(proxies.contains("10.255.255.255".parse().unwrap()));
+        assert!(!proxies.contains("11.0.0.1".parse().unwrap()));
+
+        let proxies = TrustedProxies::parse("192.168.1.0/24");
+        assert!(proxies.contains("192.168.1.100".parse().unwrap()));
+        assert!(!proxies.contains("192.168.2.1".parse().unwrap()));
+
+        // Exact match (no CIDR)
+        let proxies = TrustedProxies::parse("10.0.0.1");
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(!proxies.contains("10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_validate_warns_on_prefix_zero() {
+        let mut config = Config::default();
+        config.auth.trusted_proxies = TrustedProxies::parse("0.0.0.0/0");
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("/0 CIDR")),
+            "validate() should warn about /0 in trusted_proxies: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_no_warn_on_normal_proxies() {
+        let mut config = Config::default();
+        config.auth.trusted_proxies = TrustedProxies::parse("10.0.0.0/8,192.168.1.0/24");
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("/0 CIDR")),
+            "validate() should not warn about normal CIDRs: {:?}",
+            warnings
+        );
+    }
+
+    mod proptest_trusted_proxies {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Reference implementation for CIDR matching (avoids the shift overflow).
+        fn cidr_matches_reference(net: u32, addr: u32, prefix: u8) -> bool {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix >= 32 {
+                return net == addr;
+            }
+            // Right-shift is safe for prefix 1..=31
+            (net >> (32 - prefix)) == (addr >> (32 - prefix))
+        }
+
+        fn cidr_matches_reference_v6(net: u128, addr: u128, prefix: u8) -> bool {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix >= 128 {
+                return net == addr;
+            }
+            (net >> (128 - prefix)) == (addr >> (128 - prefix))
+        }
+
+        proptest! {
+            #[test]
+            fn cidr_v4_matches_oracle(
+                net_raw in any::<u32>(),
+                addr_raw in any::<u32>(),
+                prefix in 0u8..=32,
+            ) {
+                let net = std::net::Ipv4Addr::from(net_raw);
+                let addr = std::net::Ipv4Addr::from(addr_raw);
+                let cidr = format!("{}/{}", net, prefix);
+                let proxies = TrustedProxies::parse(&cidr);
+                let actual = proxies.contains(std::net::IpAddr::V4(addr));
+                let expected = cidr_matches_reference(net_raw, addr_raw, prefix);
+                prop_assert_eq!(actual, expected,
+                    "CIDR {} vs addr {}: expected={}, actual={}",
+                    cidr, addr, expected, actual);
+            }
+
+            #[test]
+            fn cidr_v6_matches_oracle(
+                net_raw in any::<u128>(),
+                addr_raw in any::<u128>(),
+                prefix in 0u8..=128,
+            ) {
+                let net = std::net::Ipv6Addr::from(net_raw);
+                let addr = std::net::Ipv6Addr::from(addr_raw);
+                let cidr = format!("{}/{}", net, prefix);
+                let proxies = TrustedProxies::parse(&cidr);
+                let actual = proxies.contains(std::net::IpAddr::V6(addr));
+                let expected = cidr_matches_reference_v6(net_raw, addr_raw, prefix);
+                prop_assert_eq!(actual, expected,
+                    "CIDR {} vs addr {}: expected={}, actual={}",
+                    cidr, addr, expected, actual);
+            }
         }
     }
 }
