@@ -30,13 +30,30 @@ pub enum AuditMode {
     Off,
 }
 
-impl AuditMode {
-    pub fn from_str_lossy(s: &str) -> Self {
+impl std::fmt::Display for AuditMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File => write!(f, "file"),
+            Self::Stdout => write!(f, "stdout"),
+            Self::Both => write!(f, "both"),
+            Self::Off => write!(f, "off"),
+        }
+    }
+}
+
+impl std::str::FromStr for AuditMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "stdout" | "stderr" => Self::Stdout,
-            "both" => Self::Both,
-            "off" | "none" | "false" | "0" => Self::Off,
-            _ => Self::File,
+            "file" => Ok(Self::File),
+            "stdout" | "stderr" => Ok(Self::Stdout),
+            "both" => Ok(Self::Both),
+            "off" | "none" | "false" | "0" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown audit mode {:?} — valid values: file, stdout, both, off",
+                other
+            )),
         }
     }
 }
@@ -235,15 +252,41 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_mode_from_str_lossy() {
-        assert_eq!(AuditMode::from_str_lossy("stdout"), AuditMode::Stdout);
-        assert_eq!(AuditMode::from_str_lossy("stderr"), AuditMode::Stdout);
-        assert_eq!(AuditMode::from_str_lossy("both"), AuditMode::Both);
-        assert_eq!(AuditMode::from_str_lossy("off"), AuditMode::Off);
-        assert_eq!(AuditMode::from_str_lossy("none"), AuditMode::Off);
-        assert_eq!(AuditMode::from_str_lossy("false"), AuditMode::Off);
-        assert_eq!(AuditMode::from_str_lossy("file"), AuditMode::File);
-        assert_eq!(AuditMode::from_str_lossy("anything"), AuditMode::File);
+    fn test_audit_mode_from_str() {
+        assert_eq!("stdout".parse::<AuditMode>().unwrap(), AuditMode::Stdout);
+        assert_eq!("stderr".parse::<AuditMode>().unwrap(), AuditMode::Stdout);
+        assert_eq!("both".parse::<AuditMode>().unwrap(), AuditMode::Both);
+        assert_eq!("off".parse::<AuditMode>().unwrap(), AuditMode::Off);
+        assert_eq!("none".parse::<AuditMode>().unwrap(), AuditMode::Off);
+        assert_eq!("false".parse::<AuditMode>().unwrap(), AuditMode::Off);
+        assert_eq!("0".parse::<AuditMode>().unwrap(), AuditMode::Off);
+        assert_eq!("file".parse::<AuditMode>().unwrap(), AuditMode::File);
+    }
+
+    #[test]
+    fn test_audit_mode_rejects_invalid() {
+        assert!("anything".parse::<AuditMode>().is_err());
+        assert!("flie".parse::<AuditMode>().is_err());
+        assert!("".parse::<AuditMode>().is_err());
+        let err = "typo".parse::<AuditMode>().unwrap_err();
+        assert!(
+            err.contains("file"),
+            "error should list valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn test_audit_mode_display_roundtrip() {
+        for mode in [
+            AuditMode::File,
+            AuditMode::Stdout,
+            AuditMode::Both,
+            AuditMode::Off,
+        ] {
+            let s = mode.to_string();
+            let parsed: AuditMode = s.parse().unwrap();
+            assert_eq!(mode, parsed);
+        }
     }
 
     #[test]

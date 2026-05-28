@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 
+use crate::digest_quarantine::QuarantineMode;
 use crate::registry_type::RegistryType;
 
 use crate::secrets::ProtectedString;
@@ -1184,6 +1185,22 @@ impl std::fmt::Display for CurationMode {
     }
 }
 
+impl std::str::FromStr for CurationMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "audit" => Ok(Self::Audit),
+            "enforce" => Ok(Self::Enforce),
+            other => Err(format!(
+                "unknown curation mode {:?} — valid values: off, audit, enforce",
+                other
+            )),
+        }
+    }
+}
+
 /// Behavior when a curation filter returns an error or panics.
 ///
 /// - `closed` — treat as blocked (fail-safe, default)
@@ -1234,8 +1251,9 @@ pub struct CurationConfig {
     pub min_release_age: Option<String>,
     /// Digest quarantine mode: "off" (default), "observe", or "enforce".
     /// Tracks first-seen timestamps for proxy-fetched content digests.
+    /// Invalid values are rejected at config parse time (ADR-8: security never silently disabled).
     #[serde(default)]
-    pub quarantine: Option<String>,
+    pub quarantine: Option<QuarantineMode>,
     /// How long new digests are held in quarantine (e.g., "14d", "24h", "1w").
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
@@ -1274,7 +1292,7 @@ pub struct RegistryCurationOverride {
     pub min_release_age: Option<String>,
     /// Override quarantine mode for this specific registry.
     #[serde(default)]
-    pub quarantine: Option<String>,
+    pub quarantine: Option<QuarantineMode>,
     /// Override quarantine TTL for this specific registry.
     #[serde(default)]
     pub quarantine_ttl: Option<String>,
@@ -2030,7 +2048,9 @@ impl Config {
         };
 
         // 3. Override with ENV vars (highest priority)
-        config.apply_env_overrides();
+        if let Err(e) = config.apply_env_overrides() {
+            panic!("Fatal env override error: {}", e);
+        }
 
         // 4. Validate configuration
         let (warnings, errors) = config.validate();
@@ -2062,7 +2082,7 @@ impl Config {
                 Err(_) => Config::default(),
             }
         };
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         let (_, errors) = config.validate();
         if !errors.is_empty() {
             return Err(format!("Validation errors: {}", errors.join("; ")));
@@ -2070,8 +2090,11 @@ impl Config {
         Ok(config)
     }
 
-    /// Apply environment variable overrides
-    fn apply_env_overrides(&mut self) {
+    /// Apply environment variable overrides.
+    ///
+    /// Returns `Err` if a security-critical enum (curation mode, quarantine mode,
+    /// audit mode) has an unrecognized value — typos must not silently disable security.
+    fn apply_env_overrides(&mut self) -> Result<(), String> {
         // Server config
         if let Ok(val) = env::var("NORA_HOST") {
             self.server.host = val;
@@ -2616,11 +2639,9 @@ impl Config {
 
         // Curation config
         if let Ok(val) = env::var("NORA_CURATION_MODE") {
-            self.curation.mode = match val.to_lowercase().as_str() {
-                "audit" => CurationMode::Audit,
-                "enforce" => CurationMode::Enforce,
-                _ => CurationMode::Off,
-            };
+            self.curation.mode = val
+                .parse::<CurationMode>()
+                .map_err(|e| format!("NORA_CURATION_MODE={:?}: {}", val, e))?;
         }
         if let Ok(val) = env::var("NORA_CURATION_ON_FAILURE") {
             self.curation.on_failure = match val.to_lowercase().as_str() {
@@ -2655,7 +2676,14 @@ impl Config {
             self.curation.min_release_age = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_CURATION_QUARANTINE") {
-            self.curation.quarantine = if val.is_empty() { None } else { Some(val) };
+            self.curation.quarantine = if val.is_empty() {
+                None
+            } else {
+                Some(
+                    val.parse::<QuarantineMode>()
+                        .map_err(|e| format!("NORA_CURATION_QUARANTINE={:?}: {}", val, e))?,
+                )
+            };
         }
         if let Ok(val) = env::var("NORA_CURATION_QUARANTINE_TTL") {
             self.curation.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
@@ -2695,7 +2723,13 @@ impl Config {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };
             }
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE", env_suffix)) {
-                field.quarantine = if val.is_empty() { None } else { Some(val) };
+                field.quarantine = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.parse::<QuarantineMode>().map_err(|e| {
+                        format!("NORA_CURATION_{}_QUARANTINE={:?}: {}", env_suffix, val, e)
+                    })?)
+                };
             }
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_QUARANTINE_TTL", env_suffix)) {
                 field.quarantine_ttl = if val.is_empty() { None } else { Some(val) };
@@ -2704,8 +2738,12 @@ impl Config {
 
         // Audit config
         if let Ok(val) = env::var("NORA_AUDIT_LOG") {
-            self.audit.mode = crate::audit::AuditMode::from_str_lossy(&val);
+            self.audit.mode = val
+                .parse::<crate::audit::AuditMode>()
+                .map_err(|e| format!("NORA_AUDIT_LOG={:?}: {}", val, e))?;
         }
+
+        Ok(())
     }
 }
 
@@ -2898,7 +2936,7 @@ mod tests {
     fn test_env_override_anonymous_read() {
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(config.auth.anonymous_read);
         std::env::remove_var("NORA_AUTH_ANONYMOUS_READ");
     }
@@ -2943,7 +2981,7 @@ mod tests {
         std::env::set_var("NORA_PORT", "8080");
         std::env::set_var("NORA_PUBLIC_URL", "registry.example.com");
         std::env::set_var("NORA_BODY_LIMIT_MB", "4096");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
         assert_eq!(
@@ -2964,7 +3002,7 @@ mod tests {
         std::env::set_var("NORA_STORAGE_PATH", "/data/nora");
         std::env::set_var("NORA_STORAGE_BUCKET", "my-bucket");
         std::env::set_var("NORA_STORAGE_S3_REGION", "eu-west-1");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.storage.mode, StorageMode::S3);
         assert_eq!(config.storage.path, "/data/nora");
         assert_eq!(config.storage.bucket, "my-bucket");
@@ -2981,7 +3019,7 @@ mod tests {
         std::env::set_var("NORA_AUTH_ENABLED", "true");
         std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
         std::env::set_var("NORA_AUTH_TOKEN_STORAGE", "/data/tokens");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(config.auth.enabled);
         assert_eq!(config.auth.htpasswd_file, "/etc/nora/users");
         assert_eq!(config.auth.token_storage, "/data/tokens");
@@ -2997,7 +3035,7 @@ mod tests {
             "NORA_MAVEN_PROXIES",
             "https://repo1.com,https://repo2.com|user:pass",
         );
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.maven.proxies.len(), 2);
         assert_eq!(config.maven.proxies[0].url(), "https://repo1.com");
         assert!(config.maven.proxies[0].auth().is_none());
@@ -3013,7 +3051,7 @@ mod tests {
         assert!(config.maven.immutable_releases); // default true
         std::env::set_var("NORA_MAVEN_CHECKSUM_VERIFY", "false");
         std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(!config.maven.checksum_verify);
         assert!(!config.maven.immutable_releases);
         std::env::remove_var("NORA_MAVEN_CHECKSUM_VERIFY");
@@ -3033,7 +3071,7 @@ mod tests {
         std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
         std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
         std::env::set_var("NORA_NPM_METADATA_TTL", "600");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             config.npm.proxy,
             Some("https://npm.company.com".to_string())
@@ -3056,7 +3094,7 @@ mod tests {
         std::env::set_var("NORA_RAW_ENABLED", "false");
         std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
         std::env::set_var("NORA_RAW_CACHE_CONTROL", "no-cache");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(!config.raw.enabled);
         assert_eq!(config.raw.max_file_size, 524288000);
         assert_eq!(config.raw.cache_control, "no-cache");
@@ -3071,7 +3109,7 @@ mod tests {
         std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
         std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
         std::env::set_var("NORA_RATE_LIMIT_GENERAL_BURST", "500");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(!config.rate_limit.enabled);
         assert_eq!(config.rate_limit.auth_rps, 10);
         assert_eq!(config.rate_limit.general_burst, 500);
@@ -3401,7 +3439,7 @@ mod tests {
             "https://mirror.gcr.io,https://private.io|token123",
         );
         let mut config = Config::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.docker.upstreams.len(), 2);
         assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
         assert!(config.docker.upstreams[0].auth.is_none());
@@ -3416,7 +3454,7 @@ mod tests {
         std::env::remove_var("NORA_DOCKER_PROXIES");
         std::env::set_var("NORA_DOCKER_UPSTREAMS", "https://legacy.io|secret");
         let mut config2 = Config::default();
-        config2.apply_env_overrides();
+        config2.apply_env_overrides().unwrap();
         assert_eq!(config2.docker.upstreams.len(), 1);
         assert_eq!(config2.docker.upstreams[0].url, "https://legacy.io");
         assert_eq!(
@@ -3430,7 +3468,7 @@ mod tests {
     fn test_env_override_go_proxy() {
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             config.go.proxy,
             Some("https://goproxy.company.com".to_string()),
@@ -3442,7 +3480,7 @@ mod tests {
     fn test_env_override_go_proxy_auth() {
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             crate::secrets::expose_opt(&config.go.proxy_auth),
             Some("user:pass")
@@ -3476,7 +3514,7 @@ mod tests {
         "#;
 
         let mut config: Config = toml::from_str(toml).unwrap();
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             config.storage.mode,
             StorageMode::S3,
@@ -3542,11 +3580,11 @@ mod tests {
         "#;
 
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.curation.quarantine, Some("enforce".to_string()));
+        assert_eq!(config.curation.quarantine, Some(QuarantineMode::Enforce));
         assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
         assert_eq!(
             config.curation.docker.quarantine,
-            Some("observe".to_string())
+            Some(QuarantineMode::Observe)
         );
         assert_eq!(
             config.curation.docker.quarantine_ttl,
@@ -3576,7 +3614,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_MODE", "enforce");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.curation.mode, CurationMode::Enforce);
         std::env::remove_var("NORA_CURATION_MODE");
     }
@@ -3586,7 +3624,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ON_FAILURE", "open");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
         std::env::remove_var("NORA_CURATION_ON_FAILURE");
     }
@@ -3610,7 +3648,7 @@ mod tests {
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ALLOWLIST_PATH", "/etc/nora/allow.json");
         std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", "/etc/nora/block.json");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             config.curation.allowlist_path,
             Some("/etc/nora/allow.json".to_string())
@@ -3628,7 +3666,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             crate::secrets::expose_opt(&config.curation.bypass_token),
             Some("secret-bypass")
@@ -3641,7 +3679,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_REQUIRE_INTEGRITY", "true");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert!(config.curation.require_integrity);
         std::env::remove_var("NORA_CURATION_REQUIRE_INTEGRITY");
     }
@@ -3651,8 +3689,8 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE", "observe");
-        config.apply_env_overrides();
-        assert_eq!(config.curation.quarantine, Some("observe".to_string()));
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.curation.quarantine, Some(QuarantineMode::Observe));
         std::env::remove_var("NORA_CURATION_QUARANTINE");
     }
 
@@ -3661,7 +3699,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE_TTL", "14d");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
         std::env::remove_var("NORA_CURATION_QUARANTINE_TTL");
     }
@@ -3672,10 +3710,10 @@ mod tests {
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
-        config.apply_env_overrides();
+        config.apply_env_overrides().unwrap();
         assert_eq!(
             config.curation.docker.quarantine,
-            Some("enforce".to_string())
+            Some(QuarantineMode::Enforce)
         );
         assert_eq!(
             config.curation.docker.quarantine_ttl,
@@ -3685,6 +3723,72 @@ mod tests {
         assert_eq!(config.curation.quarantine, None);
         std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE");
         std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_TTL");
+    }
+
+    #[test]
+    fn test_quarantine_toml_rejects_typo() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            quarantine = "eforce"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err(), "typo 'eforce' should be rejected by serde");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown variant"),
+            "error should mention unknown variant: {err}"
+        );
+    }
+
+    #[test]
+    fn test_curation_mode_env_rejects_typo() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "enforec");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "typo 'enforec' should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("NORA_CURATION_MODE"),
+            "error should name the env var: {err}"
+        );
+        std::env::remove_var("NORA_CURATION_MODE");
+    }
+
+    #[test]
+    fn test_quarantine_env_rejects_typo() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE", "enfocre");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "typo 'enfocre' should be rejected");
+        std::env::remove_var("NORA_CURATION_QUARANTINE");
+    }
+
+    #[test]
+    fn test_curation_mode_fromstr() {
+        assert_eq!("off".parse::<CurationMode>().unwrap(), CurationMode::Off);
+        assert_eq!(
+            "audit".parse::<CurationMode>().unwrap(),
+            CurationMode::Audit
+        );
+        assert_eq!(
+            "enforce".parse::<CurationMode>().unwrap(),
+            CurationMode::Enforce
+        );
+        assert_eq!(
+            "ENFORCE".parse::<CurationMode>().unwrap(),
+            CurationMode::Enforce
+        );
+        assert!("typo".parse::<CurationMode>().is_err());
+        assert!("".parse::<CurationMode>().is_err());
     }
 
     #[test]

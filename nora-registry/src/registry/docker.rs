@@ -291,16 +291,15 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
 fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::QuarantineMode, i64) {
     use crate::digest_quarantine::QuarantineMode;
 
-    let mode_str = state
+    let mode = state
         .config
         .curation
         .docker
         .quarantine
-        .as_deref()
-        .or(state.config.curation.quarantine.as_deref())
-        .unwrap_or("off");
-
-    let mode = QuarantineMode::from_str_lossy(mode_str);
+        .as_ref()
+        .or(state.config.curation.quarantine.as_ref())
+        .cloned()
+        .unwrap_or(QuarantineMode::Off);
     if matches!(mode, QuarantineMode::Off) {
         return (QuarantineMode::Off, 0);
     }

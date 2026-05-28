@@ -40,12 +40,28 @@ pub enum QuarantineMode {
     Enforce,
 }
 
-impl QuarantineMode {
-    pub fn from_str_lossy(s: &str) -> Self {
+impl std::fmt::Display for QuarantineMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Observe => write!(f, "observe"),
+            Self::Enforce => write!(f, "enforce"),
+        }
+    }
+}
+
+impl std::str::FromStr for QuarantineMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "observe" => Self::Observe,
-            "enforce" => Self::Enforce,
-            _ => Self::Off,
+            "off" => Ok(Self::Off),
+            "observe" => Ok(Self::Observe),
+            "enforce" => Ok(Self::Enforce),
+            other => Err(format!(
+                "unknown quarantine mode {:?} — valid values: off, observe, enforce",
+                other
+            )),
         }
     }
 }
@@ -346,27 +362,64 @@ mod tests {
 
     #[test]
     fn test_quarantine_mode_from_str() {
-        assert_eq!(QuarantineMode::from_str_lossy("off"), QuarantineMode::Off);
         assert_eq!(
-            QuarantineMode::from_str_lossy("observe"),
-            QuarantineMode::Observe
-        );
-        assert_eq!(
-            QuarantineMode::from_str_lossy("enforce"),
-            QuarantineMode::Enforce
-        );
-        assert_eq!(
-            QuarantineMode::from_str_lossy("anything"),
+            "off".parse::<QuarantineMode>().unwrap(),
             QuarantineMode::Off
         );
         assert_eq!(
-            QuarantineMode::from_str_lossy("OBSERVE"),
+            "observe".parse::<QuarantineMode>().unwrap(),
             QuarantineMode::Observe
         );
         assert_eq!(
-            QuarantineMode::from_str_lossy("ENFORCE"),
+            "enforce".parse::<QuarantineMode>().unwrap(),
             QuarantineMode::Enforce
         );
+        // Case insensitive
+        assert_eq!(
+            "OBSERVE".parse::<QuarantineMode>().unwrap(),
+            QuarantineMode::Observe
+        );
+        assert_eq!(
+            "ENFORCE".parse::<QuarantineMode>().unwrap(),
+            QuarantineMode::Enforce
+        );
+        assert_eq!(
+            "Off".parse::<QuarantineMode>().unwrap(),
+            QuarantineMode::Off
+        );
+    }
+
+    #[test]
+    fn test_quarantine_mode_rejects_invalid() {
+        assert!("anything".parse::<QuarantineMode>().is_err());
+        assert!("eforce".parse::<QuarantineMode>().is_err());
+        assert!("enabled".parse::<QuarantineMode>().is_err());
+        assert!("on".parse::<QuarantineMode>().is_err());
+        assert!("".parse::<QuarantineMode>().is_err());
+        // Error message includes valid values
+        let err = "typo".parse::<QuarantineMode>().unwrap_err();
+        assert!(err.contains("off"), "error should list valid values: {err}");
+        assert!(
+            err.contains("observe"),
+            "error should list valid values: {err}"
+        );
+        assert!(
+            err.contains("enforce"),
+            "error should list valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_mode_display_roundtrip() {
+        for mode in [
+            QuarantineMode::Off,
+            QuarantineMode::Observe,
+            QuarantineMode::Enforce,
+        ] {
+            let s = mode.to_string();
+            let parsed: QuarantineMode = s.parse().unwrap();
+            assert_eq!(mode, parsed);
+        }
     }
 
     #[test]
