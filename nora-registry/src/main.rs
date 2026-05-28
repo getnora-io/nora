@@ -1233,6 +1233,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         ))
         .with_state(state.clone());
 
+    // Clean up stale Docker upload temp files from previous runs (#530).
+    if state.config.docker.enabled {
+        registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
+    }
+
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

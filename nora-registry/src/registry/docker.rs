@@ -284,6 +284,54 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Validate that an upload UUID from URL path is safe (no path traversal).
+///
+/// Accepts only lowercase hex + hyphens (UUID-4 format) up to 36 chars.
+/// Rejects `/`, `..`, null bytes, and anything that could escape the temp directory.
+fn validate_upload_uuid(uuid: &str) -> Result<(), &'static str> {
+    if uuid.is_empty() || uuid.len() > 36 {
+        return Err("invalid upload UUID length");
+    }
+    if uuid
+        .bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+    {
+        return Err("invalid upload UUID characters");
+    }
+    Ok(())
+}
+
+/// Remove stale temp files from the Docker upload directory on startup.
+///
+/// Files older than `SESSION_TTL` are removed regardless of name format.
+/// This catches orphans from previous crashes, TOCTOU races, and legacy naming.
+pub fn cleanup_upload_temp_dir(data_dir: &str) {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to read upload temp directory for cleanup");
+            return;
+        }
+    };
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= SESSION_TTL);
+        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files on startup");
+    }
+}
+
 /// Resolve effective quarantine mode and TTL (seconds) for Docker.
 ///
 /// Returns `(QuarantineMode, quarantine_secs)`. Per-registry override takes
@@ -760,9 +808,15 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
 
     let uuid = uuid::Uuid::new_v4().to_string();
 
-    // Create temp file for blob data
+    // Create temp file for blob data on disk BEFORE inserting into session map.
+    // This ensures patch_blob can use .append(true) without .create(true),
+    // preventing orphan re-creation if cleanup_expired_sessions deletes the file (#530).
     let temp_dir = upload_temp_dir(&state.config.storage.path);
     let temp_path = temp_dir.join(&uuid);
+    if let Err(e) = tokio::fs::File::create(&temp_path).await {
+        tracing::error!(path = %temp_path.display(), error = %e, "Failed to create upload temp file");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     // Single write lock: check limit + insert atomically (no TOCTOU)
     {
@@ -808,6 +862,9 @@ async fn patch_blob(
     let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_upload_uuid(&uuid) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
     }
 
     // Phase 1: Validate session under lock, extract temp_path (no file I/O)
@@ -857,11 +914,13 @@ async fn patch_blob(
         (session.temp_path.clone(), new_size)
     }; // lock released before file I/O
 
-    // Phase 2: Append to temp file outside lock (non-blocking)
+    // Phase 2: Append to temp file outside lock (non-blocking).
+    // No .create(true) — temp file was created by start_upload.
+    // If cleanup_expired_sessions deleted the file while we were unlocked,
+    // open() returns NotFound and we return 404 instead of re-creating an orphan (#530).
     {
         use tokio::io::AsyncWriteExt;
         let file = tokio::fs::OpenOptions::new()
-            .create(true)
             .append(true)
             .open(&temp_path)
             .await;
@@ -885,6 +944,13 @@ async fn patch_blob(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Temp file was deleted by cleanup_expired_sessions between
+                // Phase 1 and Phase 2 — session is gone, return 404.
+                tracing::warn!(uuid = %uuid, "Upload temp file deleted by cleanup during PATCH — session race");
+                state.upload_sessions.write().remove(&uuid);
+                return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
+            }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to open upload temp file");
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -894,11 +960,18 @@ async fn patch_blob(
         }
     }
 
-    // Phase 3: Update session size (brief lock, no I/O)
+    // Phase 3: Update session size (brief lock, no I/O).
+    // If session is gone (cleanup raced, or upload_blob consumed it), log and return 404.
+    // Do NOT delete the temp file here — upload_blob may be using it (#530).
     {
         let mut sessions = state.upload_sessions.write();
-        if let Some(session) = sessions.get_mut(&uuid) {
-            session.size = new_size as u64;
+        match sessions.get_mut(&uuid) {
+            Some(session) => session.size = new_size as u64,
+            None => {
+                tracing::warn!(uuid = %uuid, "Upload session disappeared between Phase 1 and Phase 3");
+                return (StatusCode::NOT_FOUND, "Upload session not found or expired")
+                    .into_response();
+            }
         }
     }
 
@@ -935,6 +1008,9 @@ async fn upload_blob(
     let name = canonicalize(&name, &state.config.docker.upstreams).name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_upload_uuid(&uuid) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
     }
 
     let digest = match params.get("digest") {
@@ -2318,6 +2394,68 @@ mod tests {
     fn test_max_session_size_default() {
         let max = max_session_size();
         assert_eq!(max, DEFAULT_MAX_SESSION_SIZE_MB * 1024 * 1024);
+    }
+
+    // --- validate_upload_uuid tests ---
+
+    #[test]
+    fn test_validate_upload_uuid_valid() {
+        assert!(validate_upload_uuid("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_upload_uuid("abcdef01-2345-4678-9abc-def012345678").is_ok());
+    }
+
+    #[test]
+    fn test_validate_upload_uuid_rejects_path_traversal() {
+        assert!(validate_upload_uuid("../../../etc/passwd").is_err());
+        assert!(validate_upload_uuid("x/../../etc/cron.d/backdoor").is_err());
+        assert!(validate_upload_uuid("..").is_err());
+    }
+
+    #[test]
+    fn test_validate_upload_uuid_rejects_invalid() {
+        assert!(validate_upload_uuid("").is_err()); // empty
+        assert!(validate_upload_uuid("ABCDEF01-2345-4678-9ABC-DEF012345678").is_err()); // uppercase
+        assert!(validate_upload_uuid("hello world").is_err()); // spaces
+        assert!(validate_upload_uuid("a".repeat(37).as_str()).is_err()); // too long
+    }
+
+    // --- cleanup_upload_temp_dir tests ---
+
+    #[test]
+    fn test_cleanup_upload_temp_dir_removes_old_files() {
+        use std::fs::FileTimes;
+        use std::time::SystemTime;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let upload_dir = temp_dir.path().join("tmp/docker-uploads");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+
+        // Create an old file (set mtime to 2 hours ago)
+        let old_file = upload_dir.join("old-uuid");
+        std::fs::write(&old_file, b"stale data").unwrap();
+        let old_time = SystemTime::now() - std::time::Duration::from_secs(7200);
+        let times = FileTimes::new().set_modified(old_time);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_file)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        // Create a recent file
+        let new_file = upload_dir.join("new-uuid");
+        std::fs::write(&new_file, b"fresh data").unwrap();
+
+        cleanup_upload_temp_dir(temp_dir.path().to_str().unwrap());
+
+        assert!(!old_file.exists(), "old file should be removed");
+        assert!(new_file.exists(), "recent file should be preserved");
+    }
+
+    #[test]
+    fn test_cleanup_upload_temp_dir_nonexistent_dir() {
+        // Should not panic when directory doesn't exist
+        cleanup_upload_temp_dir("/nonexistent/path/that/does/not/exist");
     }
 
     // --- detect_manifest_media_type tests ---
