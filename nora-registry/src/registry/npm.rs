@@ -7,6 +7,7 @@ use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -224,7 +225,7 @@ async fn handle_request(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
-            state.config.npm.proxy_auth.as_deref(),
+            expose_opt(&state.config.npm.proxy_auth),
             &state.circuit_breaker,
             RegistryType::Npm,
         )
@@ -313,7 +314,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        state.config.npm.proxy_auth.as_deref(),
+        expose_opt(&state.config.npm.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Npm,
     )

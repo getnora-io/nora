@@ -4,43 +4,62 @@
 //! Protected secret types with memory safety
 //!
 //! Secrets are automatically zeroed on drop and redacted in Debug output.
+//! Used for all credential fields in [`Config`](crate::config::Config) to
+//! prevent accidental plaintext logging and ensure memory cleanup.
 
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-/// A protected secret string that is zeroed on drop
+/// A protected secret string that is zeroed on drop.
 ///
 /// - Implements Zeroize: memory is overwritten with zeros when dropped
 /// - Debug shows `***REDACTED***` instead of actual value
-/// - Clone creates a new protected copy
-#[allow(dead_code)] // Used internally by SecretsProvider impls
+/// - Clone creates a new protected copy (also zeroed on drop)
+/// - Deserialize accepts a plain string from config (TOML/JSON/YAML)
+/// - Does **not** implement Serialize — credential fields must use
+///   `#[serde(skip_serializing)]` to prevent accidental re-serialization
+/// - Does **not** implement `Deref<Target=str>` — callers must use
+///   [`expose()`](ProtectedString::expose) explicitly
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct ProtectedString {
     inner: String,
 }
 
-#[allow(dead_code)]
 impl ProtectedString {
-    /// Create a new protected string
+    /// Create a new protected string.
     pub fn new(value: String) -> Self {
         Self { inner: value }
     }
 
-    /// Get the secret value (use sparingly!)
+    /// Get the secret value.
+    ///
+    /// **Use sparingly!** The returned `&str` is not protected against
+    /// accidental logging. Never pass the result to `debug!`/`info!`/etc.
     pub fn expose(&self) -> &str {
         &self.inner
     }
 
-    /// Consume and return the inner value
+    /// Consume and return the inner value wrapped in [`Zeroizing`].
     pub fn into_inner(mut self) -> Zeroizing<String> {
         Zeroizing::new(std::mem::take(&mut self.inner))
     }
 
-    /// Check if the secret is empty
+    /// Check if the secret is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+}
+
+/// Expose the inner `&str` from an `Option<ProtectedString>`.
+///
+/// Convenience helper for the common pattern in registry handlers:
+/// ```rust,ignore
+/// // Before: config.npm.proxy_auth.as_deref()
+/// // After:  expose_opt(&config.npm.proxy_auth)
+/// ```
+pub fn expose_opt(opt: &Option<ProtectedString>) -> Option<&str> {
+    opt.as_ref().map(|s| s.expose())
 }
 
 impl fmt::Debug for ProtectedString {
@@ -69,8 +88,22 @@ impl From<&str> for ProtectedString {
     }
 }
 
+/// Custom Deserialize: accepts a plain string and wraps it in ProtectedString.
+///
+/// This preserves backwards compatibility with existing TOML config files
+/// where credentials are written as `proxy_auth = "user:pass"`.
+impl<'de> serde::Deserialize<'de> for ProtectedString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(ProtectedString::new(s))
+    }
+}
+
 /// S3 credentials with protected secrets
-#[allow(dead_code)]
+#[allow(dead_code)] // Scaffolding for future secrets integration (Vault, AWS SM, K8s)
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct S3Credentials {
@@ -155,5 +188,24 @@ mod tests {
         let non_empty = ProtectedString::new("secret".to_string());
         assert!(empty.is_empty());
         assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn test_protected_string_deserialize() {
+        let json = "\"my-secret-value\"";
+        let secret: ProtectedString = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(secret.expose(), "my-secret-value");
+        // Debug must not leak
+        let debug_output = format!("{:?}", secret);
+        assert!(!debug_output.contains("my-secret-value"));
+        assert!(debug_output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn test_expose_opt() {
+        let some = Some(ProtectedString::from("secret"));
+        let none: Option<ProtectedString> = None;
+        assert_eq!(expose_opt(&some), Some("secret"));
+        assert_eq!(expose_opt(&none), None);
     }
 }

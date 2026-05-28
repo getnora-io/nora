@@ -23,6 +23,7 @@ use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -138,7 +139,7 @@ async fn provider_versions(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        state.config.terraform.proxy_auth.as_deref(),
+        expose_opt(&state.config.terraform.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -236,7 +237,7 @@ async fn provider_download_meta(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        state.config.terraform.proxy_auth.as_deref(),
+        expose_opt(&state.config.terraform.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -313,7 +314,7 @@ async fn provider_download_binary(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        state.config.terraform.proxy_auth.as_deref(),
+        expose_opt(&state.config.terraform.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )
@@ -384,7 +385,7 @@ async fn module_versions(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        state.config.terraform.proxy_auth.as_deref(),
+        expose_opt(&state.config.terraform.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -467,7 +468,7 @@ async fn module_download(
     let mut request = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(timeout));
-    if let Some(auth) = state.config.terraform.proxy_auth.as_deref() {
+    if let Some(auth) = expose_opt(&state.config.terraform.proxy_auth) {
         request = request.header("Authorization", crate::config::basic_auth_header(auth));
     }
 
@@ -565,7 +566,7 @@ async fn module_source_download(
         &state.http_client,
         &upstream_url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        state.config.terraform.proxy_auth.as_deref(),
+        expose_opt(&state.config.terraform.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )

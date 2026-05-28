@@ -29,6 +29,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -146,7 +147,7 @@ async fn search(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        state.config.conan.proxy_auth.as_deref(),
+        expose_opt(&state.config.conan.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Conan,
@@ -357,7 +358,7 @@ async fn recipe_file_download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        state.config.conan.proxy_auth.as_deref(),
+        expose_opt(&state.config.conan.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Conan,
     )
@@ -633,7 +634,7 @@ async fn package_file_download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout_dl),
-        state.config.conan.proxy_auth.as_deref(),
+        expose_opt(&state.config.conan.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Conan,
     )
@@ -678,7 +679,7 @@ async fn fetch_and_cache_json(
         &state.http_client,
         url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        state.config.conan.proxy_auth.as_deref(),
+        expose_opt(&state.config.conan.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Conan,
@@ -721,7 +722,7 @@ async fn fetch_and_cache_immutable_json(
         &state.http_client,
         url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        state.config.conan.proxy_auth.as_deref(),
+        expose_opt(&state.config.conan.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Conan,

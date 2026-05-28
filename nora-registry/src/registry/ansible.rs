@@ -25,6 +25,7 @@ use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -306,7 +307,7 @@ async fn download_tarball(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.ansible.proxy_timeout),
-        state.config.ansible.proxy_auth.as_deref(),
+        expose_opt(&state.config.ansible.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Ansible,
     )
@@ -368,7 +369,7 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key:
         &state.http_client,
         url,
         Duration::from_secs(state.config.ansible.proxy_timeout),
-        state.config.ansible.proxy_auth.as_deref(),
+        expose_opt(&state.config.ansible.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Ansible,

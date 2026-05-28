@@ -16,6 +16,7 @@ use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -140,7 +141,7 @@ async fn sparse_index(
         &state.http_client,
         &upstream_index_url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        state.config.cargo.proxy_auth.as_deref(),
+        expose_opt(&state.config.cargo.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
@@ -209,7 +210,7 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        state.config.cargo.proxy_auth.as_deref(),
+        expose_opt(&state.config.cargo.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
@@ -321,7 +322,7 @@ async fn download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        state.config.cargo.proxy_auth.as_deref(),
+        expose_opt(&state.config.cargo.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
