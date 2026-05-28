@@ -503,8 +503,8 @@ pub fn render_docker_detail(
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">Pull Command</h2>
             <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
-                <code class="flex-1 whitespace-nowrap">{}</code>
-                <button onclick="navigator.clipboard.writeText('{}')" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
+                <code id="pull-cmd" class="flex-1 whitespace-nowrap">{}</code>
+                <button data-cmd="{}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
@@ -533,8 +533,8 @@ pub fn render_docker_detail(
         html_escape(name),
         icons::DOCKER,
         html_escape(name),
-        pull_cmd,
-        pull_cmd,
+        html_escape(&pull_cmd),
+        html_escape(&pull_cmd),
         detail.tags.len(),
         tags_rows
     );
@@ -1317,7 +1317,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         icon = icon,
         title = detail_title,
         install_label = _t.install_command,
-        cmd = install_cmd,
+        cmd = html_escape(&install_cmd),
         metadata_panel = metadata_panel,
         versions_label = if registry_type == "raw" {
             _t.files
@@ -1998,8 +1998,76 @@ mod tests {
         let html =
             render_package_detail("raw", "subdir", &subdir_detail, Lang::En, base_url, false);
         assert!(
-            html.contains("curl -O https://registry.example.com/raw/subdir/<file>"),
-            "Subdirectory raw group must show <file> placeholder"
+            html.contains("curl -O https://registry.example.com/raw/subdir/&lt;file&gt;"),
+            "Subdirectory raw group must show <file> placeholder (HTML-escaped)"
+        );
+    }
+
+    #[test]
+    fn test_xss_escape_in_install_cmd() {
+        let base_url = "https://registry.example.com";
+        let xss_payload = r#""><script>alert(1)</script>"#;
+
+        // Generic detail — npm
+        let html = render_package_detail(
+            "npm",
+            xss_payload,
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "XSS payload must be escaped in npm install command"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "XSS payload must appear as escaped HTML entities"
+        );
+
+        // Generic detail — pypi
+        let html = render_package_detail(
+            "pypi",
+            xss_payload,
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "XSS payload must be escaped in pypi install command"
+        );
+
+        // Docker detail
+        let docker_detail = super::super::api::DockerDetail { tags: vec![] };
+        let html = render_docker_detail(xss_payload, &docker_detail, Lang::En, base_url, false);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "XSS payload must be escaped in docker pull command"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "Docker pull command must contain escaped entities"
+        );
+
+        // Docker: quote-based injection via data-cmd (defence-in-depth)
+        let quote_payload = "img');alert(document.cookie);//";
+        let html = render_docker_detail(quote_payload, &docker_detail, Lang::En, base_url, false);
+        // Single quotes must be escaped as &#39; in data-cmd attribute
+        assert!(
+            html.contains("&#39;"),
+            "Single quotes must be HTML-escaped in data-cmd attribute"
+        );
+        assert!(
+            html.contains("data-cmd="),
+            "Docker template must use data-cmd attribute pattern"
+        );
+        // Must not have inline writeText('...') with direct interpolation
+        assert!(
+            !html.contains("writeText('docker pull"),
+            "Docker template must not use inline JS string interpolation"
         );
     }
 }
