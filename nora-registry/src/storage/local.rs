@@ -9,6 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
+/// Monotonic counter for unique temp file names (atomic — no collisions).
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Local filesystem storage backend (zero-config default)
 pub struct LocalStorage {
     base_path: PathBuf,
@@ -57,12 +60,36 @@ impl StorageBackend for LocalStorage {
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
 
-        // Write file
-        fs::write(&path, data)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-
-        Ok(())
+        // Atomic write: create temp file in same directory, write, rename.
+        // This prevents readers from seeing partial/truncated data during write.
+        // Temp file uses PID + monotonic counter to guarantee uniqueness.
+        // Relaxed ordering: counter is only used for name uniqueness, not
+        // for happens-before relationships between threads.
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+        let write_result: Result<()> = async {
+            let mut file = fs::File::create(&tmp)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            file.write_all(data)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            file.flush()
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            file.sync_all()
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            fs::rename(&tmp, &path)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            Ok(())
+        }
+        .await;
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        write_result
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {

@@ -151,6 +151,26 @@ enum CurationCommand {
     },
 }
 
+/// Per-key publish locks — shared between AppState and GC to serialize
+/// metadata read-modify-write operations on the same artifact.
+///
+/// # Lock ordering
+///
+/// `cleanup_lock` → `publish_lock`. Never acquire `cleanup_lock` while
+/// holding a `publish_lock` (handlers never touch `cleanup_lock`).
+pub type PublishLocks = Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Get or create a per-key publish lock for TOCTOU protection.
+///
+/// Used by both `AppState::publish_lock()` and GC metadata cleanup to ensure
+/// all metadata writes to the same key are serialized.
+pub fn acquire_publish_lock(locks: &PublishLocks, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock();
+    map.entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Curation-related config that can be hot-reloaded via SIGHUP.
 pub struct ReloadableConfig {
     pub curation_engine: curation::CurationEngine,
@@ -174,7 +194,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
-    publish_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    publish_locks: PublishLocks,
     /// Hot-reloadable curation config (swapped atomically on SIGHUP).
     pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
@@ -204,11 +224,7 @@ impl AppState {
 
     /// Get or create a per-key publish lock for TOCTOU protection.
     pub fn publish_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.publish_locks.lock();
-        locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        acquire_publish_lock(&self.publish_locks, key)
     }
 
     /// Background-cache proxy data and invalidate the registry index.
@@ -388,7 +404,8 @@ async fn main() {
         }
         Some(Commands::Gc { apply }) => {
             let dry_run = !apply;
-            let result = gc::run_gc(&storage, dry_run).await;
+            let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let result = gc::run_gc(&storage, &cli_publish_locks, dry_run).await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
@@ -1148,6 +1165,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     if state.config.gc.enabled {
         let handle = gc::spawn_gc_scheduler(
             state.storage.clone(),
+            state.publish_locks.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
             cleanup_lock.clone(),
