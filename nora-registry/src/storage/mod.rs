@@ -46,7 +46,7 @@ pub trait StorageBackend: Send + Sync {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Bytes>;
     async fn delete(&self, key: &str) -> Result<()>;
-    async fn list(&self, prefix: &str) -> Vec<String>;
+    async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
     async fn health_check(&self) -> bool;
     /// Total size of all stored artifacts in bytes
@@ -159,17 +159,16 @@ impl Storage {
         }
     }
 
-    pub async fn list(&self, prefix: &str) -> Vec<String> {
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         // Empty prefix is valid for listing all
-        if !prefix.is_empty() && validate_storage_key(prefix).is_err() {
-            return Vec::new();
+        if !prefix.is_empty() {
+            validate_storage_key(prefix)?;
         }
-        self.inner
-            .list(prefix)
-            .await
+        let keys = self.inner.list(prefix).await?;
+        Ok(keys
             .into_iter()
             .filter(|k| !k.starts_with(".nora-"))
-            .collect()
+            .collect())
     }
 
     pub async fn stat(&self, key: &str) -> Option<FileMeta> {

@@ -184,7 +184,11 @@ pub async fn run_gc(storage: &Storage, dry_run: bool) -> GcResult {
         "gems/",
         "conan/",
     ] {
-        let count = storage.list(prefix).await.len();
+        let keys = storage.list(prefix).await.unwrap_or_else(|e| {
+            tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
+            Vec::new()
+        });
+        let count = keys.len();
         if count > 0 {
             let name = prefix.trim_end_matches('/').to_string();
             uncovered.push((name, count));
@@ -222,7 +226,10 @@ struct DetectionResult {
 }
 
 async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("docker/").await;
+    let keys = storage.list("docker/").await.unwrap_or_else(|e| {
+        tracing::error!("GC: storage.list(docker/) failed: {}", e);
+        Vec::new()
+    });
 
     let mut blobs: Vec<String> = Vec::new();
     let mut referenced = HashSet::new();
@@ -310,7 +317,10 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
 
     // Scan Maven, npm, PyPI prefixes for checksum sidecar files
     for prefix in &["maven/", "npm/", "pypi/"] {
-        let keys = storage.list(prefix).await;
+        let keys = storage.list(prefix).await.unwrap_or_else(|e| {
+            tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
+            Vec::new()
+        });
         for key in keys {
             if is_checksum_sidecar(&key) {
                 checksums.push(key);
@@ -340,7 +350,10 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
 /// Go modules store 3 files per version: .info, .mod, .zip
 /// If any file is missing, the remaining files are orphaned (partial upload or failed delete).
 async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("go/").await;
+    let keys = storage.list("go/").await.unwrap_or_else(|e| {
+        tracing::error!("GC: storage.list(go/) failed: {}", e);
+        Vec::new()
+    });
     let mut versions: HashMap<String, Vec<String>> = HashMap::new();
 
     for key in &keys {
@@ -384,7 +397,10 @@ async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
 /// Cargo stores .crate files and index entries separately.
 /// Orphan = index entry without .crate file, or .crate without index entry.
 async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("cargo/").await;
+    let keys = storage.list("cargo/").await.unwrap_or_else(|e| {
+        tracing::error!("GC: storage.list(cargo/) failed: {}", e);
+        Vec::new()
+    });
     let mut crate_files: HashSet<String> = HashSet::new(); // "name/version"
     let mut index_entries: HashSet<String> = HashSet::new(); // "name"
     let mut crate_keys: Vec<String> = Vec::new();
@@ -461,7 +477,10 @@ async fn detect_and_clean_metadata_phantoms(storage: &Storage, dry_run: bool) ->
     let mut total_removed = 0usize;
 
     // npm metadata cleanup
-    let npm_keys = storage.list("npm/").await;
+    let npm_keys = storage.list("npm/").await.unwrap_or_else(|e| {
+        tracing::error!("GC: storage.list(npm/) failed: {}", e);
+        Vec::new()
+    });
     let mut npm_meta_keys: Vec<String> = Vec::new();
     let mut npm_tarball_keys: HashSet<String> = HashSet::new();
 
@@ -482,7 +501,10 @@ async fn detect_and_clean_metadata_phantoms(storage: &Storage, dry_run: bool) ->
     }
 
     // PyPI metadata cleanup
-    let pypi_keys = storage.list("pypi/").await;
+    let pypi_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
+        tracing::error!("GC: storage.list(pypi/) failed: {}", e);
+        Vec::new()
+    });
     let mut pypi_meta_keys: Vec<String> = Vec::new();
     let mut pypi_file_keys: HashSet<String> = HashSet::new();
 

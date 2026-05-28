@@ -49,7 +49,10 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
 
     // List all keys
     println!("Scanning storage...");
-    let keys = storage.list("").await;
+    let keys = storage
+        .list("")
+        .await
+        .map_err(|e| format!("storage list failed: {}", e))?;
 
     if keys.is_empty() {
         println!("No artifacts found in storage. Creating empty backup.");

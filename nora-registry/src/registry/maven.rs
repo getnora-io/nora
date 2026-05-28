@@ -393,7 +393,13 @@ async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &st
 
 async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_id: &str) {
     let prefix = format!("maven/{}/{}/", group_path, artifact_id);
-    let keys = state.storage.list(&prefix).await;
+    let keys = match state.storage.list(&prefix).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = ?e, prefix, "maven: failed to list storage for metadata generation");
+            return;
+        }
+    };
 
     let mut versions = BTreeSet::new();
     for key in &keys {

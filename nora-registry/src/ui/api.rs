@@ -352,10 +352,10 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     // E.g. for "library/nginx", find keys in docker/library/nginx/manifests/
     // AND docker/docker.io/library/nginx/manifests/, docker/ghcr.io/library/nginx/manifests/, etc.
     let prefix = format!("docker/{}/manifests/", name);
-    let mut keys = state.storage.list(&prefix).await;
+    let mut keys = state.storage.list(&prefix).await.unwrap_or_default();
 
     // Also collect namespaced keys by scanning all docker/ keys for this image name
-    let all_docker_keys = state.storage.list("docker/").await;
+    let all_docker_keys = state.storage.list("docker/").await.unwrap_or_default();
     for key in &all_docker_keys {
         if let Some(rest) = key.strip_prefix("docker/") {
             if let Some(idx) = rest.find("/manifests/") {
@@ -489,7 +489,7 @@ pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoIn
     } else {
         format!("maven/{}/", path)
     };
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     if keys.is_empty() {
         return (vec![], false);
@@ -540,7 +540,7 @@ pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoIn
 
 pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     let prefix = format!("maven/{}/", path);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     let mut artifacts = Vec::new();
     for key in &keys {
@@ -717,7 +717,7 @@ pub async fn get_cargo_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("cargo/{}/", name);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
     for key in keys.iter().filter(|k| ends_with_ci(k, ".crate")) {
@@ -811,7 +811,7 @@ pub async fn get_pypi_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("pypi/{}/", name);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
     for key in &keys {
@@ -851,7 +851,7 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
     } else {
         format!("go/{}/", path)
     };
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     if keys.is_empty() {
         return (vec![], false);
@@ -915,7 +915,7 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
 /// Namespace and name are `[a-z0-9_]+`, so the first `-` is an unambiguous separator.
 /// Does NOT call `storage.stat` — avoids latency on large collection counts.
 pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
-    let keys = storage.list("ansible/download/").await;
+    let keys = storage.list("ansible/download/").await.unwrap_or_default();
 
     if keys.is_empty() {
         return vec![];
@@ -1006,7 +1006,7 @@ pub async fn get_go_detail(
     }
 
     // Also scan for .zip files that might exist without being in the list
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
     for key in keys.iter().filter(|k| ends_with_ci(k, ".zip")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.strip_suffix(".zip") {
@@ -1274,7 +1274,7 @@ async fn get_conan_detail(
     // Conan: conan/{name}/{version}/_/_/revisions.json (metadata)
     // Actual files: conan/{name}/{version}/_/_/{rrev}/export/* or /packages/*/
     let prefix = format!("conan/{}/", name);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
     let mut version_data: HashMap<String, (u64, u64, bool)> = HashMap::new(); // (size, mtime, has_content)
 
     for key in &keys {
@@ -1384,7 +1384,7 @@ async fn get_pub_detail(
 ) -> PackageDetail {
     // Pub: pub/packages/{name}/versions/{version}.tar.gz
     let prefix = format!("pub/packages/{}/versions/", name);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
     let mut versions = Vec::new();
 
     for key in &keys {
@@ -1440,7 +1440,7 @@ async fn get_ansible_detail(
         }
     };
 
-    let keys = storage.list("ansible/download/").await;
+    let keys = storage.list("ansible/download/").await.unwrap_or_default();
     let prefix = format!("{}-{}-", ns, col);
     let mut versions = Vec::new();
 
@@ -1487,7 +1487,7 @@ async fn get_storage_scan_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("{}/{}/", registry, name);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
     let mut versions = Vec::new();
     for key in &keys {
         if let Some(rest) = key.strip_prefix(&prefix) {
@@ -1624,7 +1624,7 @@ fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
 
 pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
     let prefix = format!("raw/{}/", group);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
 
@@ -1675,7 +1675,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
 /// Returns (entries, is_directory). If the path is a single file, returns empty vec + false.
 pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
     let prefix = format!("raw/{}/", path);
-    let keys = storage.list(&prefix).await;
+    let keys = storage.list(&prefix).await.unwrap_or_default();
 
     if keys.is_empty() {
         // Check if it's a direct file

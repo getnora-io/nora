@@ -193,7 +193,10 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
 
 /// Collect Maven versions for a given group/artifact.
 async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("maven/").await;
+    let all_keys = storage.list("maven/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list maven/ keys: {}", e);
+        Vec::new()
+    });
     let mut artifacts: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
@@ -243,7 +246,10 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 
 /// Collect Docker tags for each repository.
 async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("docker/").await;
+    let all_keys = storage.list("docker/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list docker/ keys: {}", e);
+        Vec::new()
+    });
     let mut repos: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
 
@@ -287,7 +293,10 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
 
 /// Collect npm package versions.
 async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("npm/").await;
+    let all_keys = storage.list("npm/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list npm/ keys: {}", e);
+        Vec::new()
+    });
     let mut packages: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
@@ -332,7 +341,10 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 
 /// Collect PyPI package files.
 async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("pypi/").await;
+    let all_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list pypi/ keys: {}", e);
+        Vec::new()
+    });
     let mut packages: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
@@ -375,7 +387,10 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
 
 /// Collect Cargo crate versions.
 async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("cargo/").await;
+    let all_keys = storage.list("cargo/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list cargo/ keys: {}", e);
+        Vec::new()
+    });
     let mut crates: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
@@ -422,7 +437,10 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 }
 
 async fn collect_go_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("go/").await;
+    let all_keys = storage.list("go/").await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list go/ keys: {}", e);
+        Vec::new()
+    });
     let mut modules: std::collections::HashMap<
         String,
         std::collections::HashMap<String, Vec<String>>,
