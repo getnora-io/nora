@@ -128,7 +128,7 @@ async fn handle(
             "go",
             "CACHE",
         ));
-        return with_content_type(data.to_vec(), content_type);
+        return with_content_type(data.to_vec(), content_type, is_mutable);
     }
 
     // 2. Try upstream proxy
@@ -212,7 +212,7 @@ async fn handle(
                 state.spawn_cache("go", storage_key, Bytes::from(bytes.clone()));
             }
 
-            with_content_type(bytes, content_type)
+            with_content_type(bytes, content_type, is_mutable)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -358,14 +358,14 @@ fn format_artifact(module: &str, file: &str) -> String {
     }
 }
 
-/// Build response with Content-Type header
-fn with_content_type(data: Vec<u8>, content_type: &'static str) -> Response {
-    // .zip and .mod are content-addressed/versioned (immutable)
-    // .info, list, @latest are metadata (mutable)
-    let cache_control = if content_type == "application/zip" || content_type == "text/plain" {
-        "public, max-age=31536000, immutable"
-    } else {
+/// Build response with Content-Type and Cache-Control headers.
+/// `is_mutable` controls caching: mutable endpoints (@v/list, @latest) get short TTL,
+/// immutable content (.zip, .mod, .info) gets long TTL.
+fn with_content_type(data: Vec<u8>, content_type: &'static str, is_mutable: bool) -> Response {
+    let cache_control = if is_mutable {
         "public, max-age=60, must-revalidate"
+    } else {
+        "public, max-age=31536000, immutable"
     };
 
     (
@@ -565,6 +565,41 @@ mod tests {
     #[test]
     fn test_content_type_list() {
         assert_eq!(content_type_for("@v/list"), "text/plain; charset=utf-8");
+    }
+
+    // ── Cache-Control headers ─────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_control_immutable() {
+        let resp = with_content_type(b"data".to_vec(), "application/zip", false);
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc, "public, max-age=31536000, immutable");
+    }
+
+    #[test]
+    fn test_cache_control_mutable_list() {
+        let resp = with_content_type(b"v1.0.0\n".to_vec(), "text/plain; charset=utf-8", true);
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc, "public, max-age=60, must-revalidate");
+    }
+
+    #[test]
+    fn test_cache_control_mutable_latest() {
+        let resp = with_content_type(b"{}".to_vec(), "application/json", true);
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc, "public, max-age=60, must-revalidate");
+    }
+
+    #[test]
+    fn test_cache_control_immutable_mod() {
+        // .mod is text/plain but immutable — must get long TTL
+        let resp = with_content_type(
+            b"module example".to_vec(),
+            "text/plain; charset=utf-8",
+            false,
+        );
+        let cc = resp.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cc, "public, max-age=31536000, immutable");
     }
 
     // ── Artifact formatting ─────────────────────────────────────────────
