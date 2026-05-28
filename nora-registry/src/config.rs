@@ -9,6 +9,7 @@ use std::fs;
 
 use crate::registry_type::RegistryType;
 
+use crate::secrets::ProtectedString;
 pub use crate::secrets::SecretsConfig;
 
 /// Encode "user:pass" into a Basic Auth header value, e.g. "Basic dXNlcjpwYXNz".
@@ -101,7 +102,7 @@ pub enum StorageMode {
     S3,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default)]
     pub mode: StorageMode,
@@ -113,33 +114,13 @@ pub struct StorageConfig {
     pub bucket: String,
     /// S3 access key (optional, uses anonymous access if not set)
     #[serde(default, skip_serializing)]
-    pub s3_access_key: Option<String>,
+    pub s3_access_key: Option<ProtectedString>,
     /// S3 secret key (optional, uses anonymous access if not set)
     #[serde(default, skip_serializing)]
-    pub s3_secret_key: Option<String>,
+    pub s3_secret_key: Option<ProtectedString>,
     /// S3 region (default: us-east-1)
     #[serde(default = "default_s3_region")]
     pub s3_region: String,
-}
-
-impl std::fmt::Debug for StorageConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageConfig")
-            .field("mode", &self.mode)
-            .field("path", &self.path)
-            .field("s3_url", &self.s3_url)
-            .field("bucket", &self.bucket)
-            .field(
-                "s3_access_key",
-                &self.s3_access_key.as_ref().map(|_| "***REDACTED***"),
-            )
-            .field(
-                "s3_secret_key",
-                &self.s3_secret_key.as_ref().map(|_| "***REDACTED***"),
-            )
-            .field("s3_region", &self.s3_region)
-            .finish()
-    }
 }
 
 fn default_s3_region() -> String {
@@ -184,8 +165,8 @@ pub struct NpmConfig {
     pub enabled: bool,
     #[serde(default)]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
@@ -200,8 +181,8 @@ pub struct PypiConfig {
     pub enabled: bool,
     #[serde(default)]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
 }
@@ -214,8 +195,8 @@ pub struct CargoConfig {
     /// Upstream Cargo registry (crates.io API)
     #[serde(default = "default_cargo_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
 }
@@ -243,8 +224,8 @@ pub struct GoConfig {
     /// Upstream Go module proxy URL (default: https://proxy.golang.org)
     #[serde(default = "default_go_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Separate timeout for .zip downloads (default: 120s, zips can be large)
@@ -306,8 +287,8 @@ pub struct DockerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerUpstream {
     pub url: String,
-    #[serde(default)]
-    pub auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default, skip_serializing)]
+    pub auth: Option<ProtectedString>,
     /// Storage namespace prefix (e.g. "docker.io"). Derived from URL host if omitted.
     #[serde(default)]
     pub namespace: Option<String>,
@@ -363,8 +344,8 @@ pub enum MavenProxyEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MavenProxy {
     pub url: String,
-    #[serde(default)]
-    pub auth: Option<String>, // "user:pass" for basic auth
+    #[serde(default, skip_serializing)]
+    pub auth: Option<ProtectedString>,
 }
 
 impl MavenProxyEntry {
@@ -375,9 +356,10 @@ impl MavenProxyEntry {
         }
     }
     pub fn auth(&self) -> Option<&str> {
+        use crate::secrets::expose_opt;
         match self {
             MavenProxyEntry::Simple(_) => None,
-            MavenProxyEntry::Full(p) => p.auth.as_deref(),
+            MavenProxyEntry::Full(p) => expose_opt(&p.auth),
         }
     }
 }
@@ -401,8 +383,8 @@ pub struct GemsConfig {
     /// Upstream RubyGems registry (default: https://rubygems.org)
     #[serde(default = "default_gems_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
@@ -435,8 +417,8 @@ pub struct TerraformConfig {
     /// Upstream Terraform registry (default: https://registry.terraform.io)
     #[serde(default = "default_terraform_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Separate timeout for binary downloads (default: 120s)
@@ -473,8 +455,8 @@ pub struct AnsibleConfig {
     /// Upstream Galaxy server (default: https://galaxy.ansible.com)
     #[serde(default = "default_ansible_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Metadata cache TTL in seconds (default: 3600 = 1 hour).
@@ -515,8 +497,8 @@ pub struct NugetConfig {
     /// Upstream NuGet API (default: https://api.nuget.org)
     #[serde(default = "default_nuget_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Timeout for metadata requests (registration, version list) in seconds.
@@ -579,8 +561,8 @@ pub struct PubDartConfig {
     /// Upstream pub registry (default: https://pub.dev)
     #[serde(default = "default_pub_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Metadata cache TTL in seconds (default: 300 = 5 min).
@@ -613,8 +595,8 @@ pub struct ConanConfig {
     /// Upstream Conan registry (default: https://center2.conan.io)
     #[serde(default = "default_conan_proxy")]
     pub proxy: Option<String>,
-    #[serde(default)]
-    pub proxy_auth: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "default_timeout")]
     pub proxy_timeout: u64,
     /// Separate timeout for binary downloads (default: 120s)
@@ -1239,7 +1221,7 @@ pub struct CurationConfig {
     pub blocklist_path: Option<String>,
     /// Token to bypass curation. Should only be set via env var, not config file.
     #[serde(default, skip_serializing)]
-    pub bypass_token: Option<String>,
+    pub bypass_token: Option<ProtectedString>,
     #[serde(default)]
     pub require_integrity: bool,
     /// Glob patterns for internal namespaces that must never be proxied upstream.
@@ -2130,10 +2112,18 @@ impl Config {
             self.storage.bucket = val;
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_ACCESS_KEY") {
-            self.storage.s3_access_key = if val.is_empty() { None } else { Some(val) };
+            self.storage.s3_access_key = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_SECRET_KEY") {
-            self.storage.s3_secret_key = if val.is_empty() { None } else { Some(val) };
+            self.storage.s3_secret_key = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_REGION") {
             self.storage.s3_region = val;
@@ -2204,7 +2194,7 @@ impl Config {
                     if parts.len() > 1 {
                         MavenProxyEntry::Full(MavenProxy {
                             url: parts[0].to_string(),
-                            auth: Some(parts[1].to_string()),
+                            auth: Some(ProtectedString::from(parts[1])),
                         })
                     } else {
                         MavenProxyEntry::Simple(parts[0].to_string())
@@ -2241,7 +2231,11 @@ impl Config {
 
         // npm proxy auth
         if let Ok(val) = env::var("NORA_NPM_PROXY_AUTH") {
-            self.npm.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.npm.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
 
         // PyPI config
@@ -2256,7 +2250,11 @@ impl Config {
 
         // PyPI proxy auth
         if let Ok(val) = env::var("NORA_PYPI_PROXY_AUTH") {
-            self.pypi.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.pypi.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
 
         // Docker config
@@ -2296,7 +2294,7 @@ impl Config {
                         if a.is_empty() {
                             None
                         } else {
-                            Some(a.to_string())
+                            Some(ProtectedString::from(*a))
                         }
                     });
                     let prefix = parts.get(2).and_then(|p| {
@@ -2327,7 +2325,11 @@ impl Config {
             self.go.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_GO_PROXY_AUTH") {
-            self.go.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.go.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_GO_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2355,7 +2357,11 @@ impl Config {
             }
         }
         if let Ok(val) = env::var("NORA_CARGO_PROXY_AUTH") {
-            self.cargo.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.cargo.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
 
         // Raw config
@@ -2376,7 +2382,11 @@ impl Config {
             self.gems.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_GEMS_PROXY_AUTH") {
-            self.gems.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.gems.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_GEMS_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2394,7 +2404,11 @@ impl Config {
             self.terraform.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_TF_PROXY_AUTH") {
-            self.terraform.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.terraform.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_TF_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2417,7 +2431,11 @@ impl Config {
             self.ansible.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_PROXY_AUTH") {
-            self.ansible.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.ansible.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2438,7 +2456,11 @@ impl Config {
             self.nuget.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_NUGET_PROXY_AUTH") {
-            self.nuget.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.nuget.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_NUGET_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2474,7 +2496,11 @@ impl Config {
             self.pub_dart.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_PUB_PROXY_AUTH") {
-            self.pub_dart.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.pub_dart.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_PUB_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2492,7 +2518,11 @@ impl Config {
             self.conan.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY_AUTH") {
-            self.conan.proxy_auth = if val.is_empty() { None } else { Some(val) };
+            self.conan.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT") {
             if let Ok(timeout) = val.parse() {
@@ -2605,7 +2635,11 @@ impl Config {
             self.curation.blocklist_path = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_CURATION_BYPASS_TOKEN") {
-            self.curation.bypass_token = if val.is_empty() { None } else { Some(val) };
+            self.curation.bypass_token = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
         }
         if let Ok(val) = env::var("NORA_CURATION_REQUIRE_INTEGRITY") {
             self.curation.require_integrity = val.to_lowercase() == "true" || val == "1";
@@ -2880,7 +2914,7 @@ mod tests {
     fn test_maven_proxy_entry_full() {
         let entry = MavenProxyEntry::Full(MavenProxy {
             url: "https://private.repo.com".to_string(),
-            auth: Some("user:secret".to_string()),
+            auth: Some(ProtectedString::from("user:secret")),
         });
         assert_eq!(entry.url(), "https://private.repo.com");
         assert_eq!(entry.auth(), Some("user:secret"));
@@ -3004,7 +3038,10 @@ mod tests {
             config.npm.proxy,
             Some("https://npm.company.com".to_string())
         );
-        assert_eq!(config.npm.proxy_auth, Some("user:token".to_string()));
+        assert_eq!(
+            crate::secrets::expose_opt(&config.npm.proxy_auth),
+            Some("user:token")
+        );
         assert_eq!(config.npm.proxy_timeout, 60);
         assert_eq!(config.npm.metadata_ttl, 600);
         std::env::remove_var("NORA_NPM_PROXY");
@@ -3134,8 +3171,8 @@ mod tests {
         assert_eq!(config.docker.upstreams.len(), 2);
         assert!(config.docker.upstreams[0].auth.is_none());
         assert_eq!(
-            config.docker.upstreams[1].auth,
-            Some("user:pass".to_string())
+            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
+            Some("user:pass")
         );
     }
 
@@ -3370,8 +3407,8 @@ mod tests {
         assert!(config.docker.upstreams[0].auth.is_none());
         assert_eq!(config.docker.upstreams[1].url, "https://private.io");
         assert_eq!(
-            config.docker.upstreams[1].auth,
-            Some("token123".to_string())
+            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
+            Some("token123")
         );
         std::env::remove_var("NORA_DOCKER_PROXIES");
 
@@ -3382,7 +3419,10 @@ mod tests {
         config2.apply_env_overrides();
         assert_eq!(config2.docker.upstreams.len(), 1);
         assert_eq!(config2.docker.upstreams[0].url, "https://legacy.io");
-        assert_eq!(config2.docker.upstreams[0].auth, Some("secret".to_string()));
+        assert_eq!(
+            crate::secrets::expose_opt(&config2.docker.upstreams[0].auth),
+            Some("secret")
+        );
         std::env::remove_var("NORA_DOCKER_UPSTREAMS");
     }
 
@@ -3403,7 +3443,10 @@ mod tests {
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
         config.apply_env_overrides();
-        assert_eq!(config.go.proxy_auth, Some("user:pass".to_string()));
+        assert_eq!(
+            crate::secrets::expose_opt(&config.go.proxy_auth),
+            Some("user:pass")
+        );
         std::env::remove_var("NORA_GO_PROXY_AUTH");
     }
 
@@ -3587,8 +3630,8 @@ mod tests {
         std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
         config.apply_env_overrides();
         assert_eq!(
-            config.curation.bypass_token,
-            Some("secret-bypass".to_string())
+            crate::secrets::expose_opt(&config.curation.bypass_token),
+            Some("secret-bypass")
         );
         std::env::remove_var("NORA_CURATION_BYPASS_TOKEN");
     }
@@ -4060,8 +4103,10 @@ mod tests {
             path: String::new(),
             s3_url: String::new(),
             bucket: String::new(),
-            s3_access_key: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            s3_secret_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            s3_access_key: Some(ProtectedString::from("AKIAIOSFODNN7EXAMPLE")),
+            s3_secret_key: Some(ProtectedString::from(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            )),
             s3_region: String::new(),
         };
         let debug_output = format!("{:?}", config);

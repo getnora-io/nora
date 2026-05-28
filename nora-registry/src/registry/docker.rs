@@ -7,6 +7,7 @@ use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
+use crate::secrets::expose_opt;
 use crate::storage::Storage;
 use crate::validation::{
     ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
@@ -669,7 +670,7 @@ async fn download_blob(
             &state.docker_auth,
             state.config.docker.proxy_timeout,
             state.config.docker.read_timeout,
-            upstream.auth.as_deref(),
+            expose_opt(&upstream.auth),
             &state.circuit_breaker,
         )
         .await
@@ -714,7 +715,7 @@ async fn download_blob(
                 &state.docker_auth,
                 state.config.docker.proxy_timeout,
                 state.config.docker.read_timeout,
-                upstream.auth.as_deref(),
+                expose_opt(&upstream.auth),
                 &state.circuit_breaker,
             )
             .await
@@ -1126,7 +1127,7 @@ async fn try_fetch_and_cache(
             reference,
             &state.docker_auth,
             state.config.docker.proxy_timeout,
-            upstream.auth.as_deref(),
+            expose_opt(&upstream.auth),
             &state.circuit_breaker,
         )
         .await

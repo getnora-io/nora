@@ -21,6 +21,7 @@ use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -376,7 +377,7 @@ async fn download_archive(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        state.config.pub_dart.proxy_auth.as_deref(),
+        expose_opt(&state.config.pub_dart.proxy_auth),
         &state.circuit_breaker,
         RegistryType::PubDart,
     )
@@ -420,7 +421,7 @@ async fn fetch_pub_api(
         &state.http_client,
         url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        state.config.pub_dart.proxy_auth.as_deref(),
+        expose_opt(&state.config.pub_dart.proxy_auth),
         Some(("Accept", PUB_CONTENT_TYPE)),
         |response| async { response.bytes().await.map(|b| b.to_vec()) },
         cb,

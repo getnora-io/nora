@@ -25,8 +25,8 @@ mod env;
 pub mod protected;
 
 pub use env::EnvProvider;
-#[allow(unused_imports)]
-pub use protected::{ProtectedString, S3Credentials};
+#[allow(unused_imports)] // S3Credentials: scaffolding for future secrets integration
+pub use protected::{expose_opt, ProtectedString, S3Credentials};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

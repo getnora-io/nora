@@ -53,6 +53,7 @@ use config::{Config, CurationMode, StorageMode, TlsConfig};
 use dashboard_metrics::DashboardMetrics;
 use registry_type::RegistryType;
 use repo_index::RepoIndex;
+use secrets::{expose_opt, ProtectedString};
 pub use storage::Storage;
 use tokens::TokenStore;
 
@@ -153,7 +154,7 @@ enum CurationCommand {
 /// Curation-related config that can be hot-reloaded via SIGHUP.
 pub struct ReloadableConfig {
     pub curation_engine: curation::CurationEngine,
-    pub bypass_token: Option<String>,
+    pub bypass_token: Option<ProtectedString>,
 }
 
 #[derive(Clone)]
@@ -194,7 +195,11 @@ impl AppState {
 
     /// Shorthand for the curation bypass token from the reloadable config.
     pub fn bypass_token(&self) -> Option<String> {
-        self.reloadable.load().bypass_token.clone()
+        self.reloadable
+            .load()
+            .bypass_token
+            .as_ref()
+            .map(|s| s.expose().to_string())
     }
 
     /// Get or create a per-key publish lock for TOCTOU protection.
@@ -358,8 +363,8 @@ async fn main() {
                 &config.storage.s3_url,
                 &config.storage.bucket,
                 &config.storage.s3_region,
-                config.storage.s3_access_key.as_deref(),
-                config.storage.s3_secret_key.as_deref(),
+                expose_opt(&config.storage.s3_access_key),
+                expose_opt(&config.storage.s3_secret_key),
             )
         }
     };
@@ -494,8 +499,8 @@ async fn main() {
                     &config.storage.s3_url,
                     &config.storage.bucket,
                     &config.storage.s3_region,
-                    config.storage.s3_access_key.as_deref(),
-                    config.storage.s3_secret_key.as_deref(),
+                    expose_opt(&config.storage.s3_access_key),
+                    expose_opt(&config.storage.s3_secret_key),
                 ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local' or 's3'", from);
@@ -509,8 +514,8 @@ async fn main() {
                     &config.storage.s3_url,
                     &config.storage.bucket,
                     &config.storage.s3_region,
-                    config.storage.s3_access_key.as_deref(),
-                    config.storage.s3_secret_key.as_deref(),
+                    expose_opt(&config.storage.s3_access_key),
+                    expose_opt(&config.storage.s3_secret_key),
                 ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local' or 's3'", to);

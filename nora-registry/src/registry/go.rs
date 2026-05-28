@@ -14,6 +14,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::body::Bytes;
@@ -160,7 +161,7 @@ async fn handle(
             &state.http_client,
             &upstream_url,
             timeout,
-            state.config.go.proxy_auth.as_deref(),
+            expose_opt(&state.config.go.proxy_auth),
             &state.circuit_breaker,
             RegistryType::Go,
         )
@@ -170,7 +171,7 @@ async fn handle(
             &state.http_client,
             &upstream_url,
             timeout,
-            state.config.go.proxy_auth.as_deref(),
+            expose_opt(&state.config.go.proxy_auth),
             None,
             &state.circuit_breaker,
             RegistryType::Go,

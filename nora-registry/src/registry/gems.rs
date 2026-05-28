@@ -18,6 +18,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -89,7 +90,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
-        state.config.gems.proxy_auth.as_deref(),
+        expose_opt(&state.config.gems.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Gems,
     )
@@ -171,7 +172,7 @@ async fn compact_index(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
-        state.config.gems.proxy_auth.as_deref(),
+        expose_opt(&state.config.gems.proxy_auth),
         None,
         &state.circuit_breaker,
         RegistryType::Gems,
@@ -278,7 +279,7 @@ async fn download_gem(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
-        state.config.gems.proxy_auth.as_deref(),
+        expose_opt(&state.config.gems.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Gems,
     )
@@ -353,7 +354,7 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
-        state.config.gems.proxy_auth.as_deref(),
+        expose_opt(&state.config.gems.proxy_auth),
         &state.circuit_breaker,
         RegistryType::Gems,
     )

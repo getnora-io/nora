@@ -15,6 +15,7 @@ use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
 use crate::registry_type::RegistryType;
+use crate::secrets::expose_opt;
 use crate::ui::components::html_escape;
 use crate::validation::ends_with_ci;
 use crate::AppState;
@@ -156,7 +157,7 @@ async fn package_versions(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            state.config.pypi.proxy_auth.as_deref(),
+            expose_opt(&state.config.pypi.proxy_auth),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
             RegistryType::PyPI,
@@ -280,7 +281,7 @@ async fn download_file(
             &state.http_client,
             &page_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            state.config.pypi.proxy_auth.as_deref(),
+            expose_opt(&state.config.pypi.proxy_auth),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
             RegistryType::PyPI,
@@ -293,7 +294,7 @@ async fn download_file(
                         &state.http_client,
                         &file_url,
                         Duration::from_secs(state.config.pypi.proxy_timeout),
-                        state.config.pypi.proxy_auth.as_deref(),
+                        expose_opt(&state.config.pypi.proxy_auth),
                         &state.circuit_breaker,
                         RegistryType::PyPI,
                     )
