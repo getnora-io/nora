@@ -429,6 +429,9 @@ pub struct TerraformConfig {
     /// -1 = cache forever, 0 = always refetch, >0 = seconds.
     #[serde(default = "default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Serve stale cached metadata when upstream is unreachable (default: true).
+    #[serde(default = "default_true")]
+    pub serve_stale: bool,
 }
 
 fn default_terraform_proxy() -> Option<String> {
@@ -444,6 +447,7 @@ impl Default for TerraformConfig {
             proxy_timeout: 30,
             proxy_timeout_dl: 120,
             metadata_ttl: 300,
+            serve_stale: true,
         }
     }
 }
@@ -2478,6 +2482,9 @@ impl Config {
             if let Ok(ttl) = val.parse() {
                 self.terraform.metadata_ttl = ttl;
             }
+        }
+        if let Ok(val) = env::var("NORA_TF_SERVE_STALE") {
+            self.terraform.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
 
         // Ansible Galaxy config

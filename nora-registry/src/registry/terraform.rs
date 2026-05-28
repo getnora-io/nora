@@ -116,8 +116,11 @@ async fn provider_versions(
 
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
 
-    // TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Read cache eagerly — preserve for serve-stale fallback (#532)
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
+    // TTL cache — serve fresh if within TTL
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
@@ -166,7 +169,7 @@ async fn provider_versions(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform upstream error");
-            StatusCode::BAD_GATEWAY.into_response()
+            serve_stale_or_bad_gateway(&state, cached_data, "provider_versions")
         }
     }
 }
@@ -211,13 +214,22 @@ async fn provider_download_meta(
         ns, ptype, ver, os, arch
     );
 
-    // TTL cache for metadata
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Read cache eagerly — preserve for serve-stale fallback (#532).
+    // Strip internal fields now so stale response is client-safe.
+    let cached_data = state
+        .storage
+        .get(&storage_key)
+        .await
+        .ok()
+        .map(|d| Bytes::from(strip_nora_internal_fields(&d)));
+
+    // TTL cache — serve fresh if within TTL
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
-                return with_json(strip_nora_internal_fields(&data));
+                return with_json(data.to_vec());
             }
         }
     }
@@ -267,7 +279,7 @@ async fn provider_download_meta(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform download metadata error");
-            StatusCode::BAD_GATEWAY.into_response()
+            serve_stale_or_bad_gateway(&state, cached_data, "provider_download_meta")
         }
     }
 }
@@ -361,8 +373,11 @@ async fn module_versions(
         ns, name, provider
     );
 
-    // TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Read cache eagerly — preserve for serve-stale fallback (#532)
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
+    // TTL cache — serve fresh if within TTL
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
@@ -412,7 +427,7 @@ async fn module_versions(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module versions error");
-            StatusCode::BAD_GATEWAY.into_response()
+            serve_stale_or_bad_gateway(&state, cached_data, "module_versions")
         }
     }
 }
@@ -731,6 +746,39 @@ fn with_json(data: Vec<u8>) -> Response {
         data,
     )
         .into_response()
+}
+
+/// Serve stale cached metadata when upstream is unreachable, or 502 if no cache.
+fn serve_stale_or_bad_gateway(state: &AppState, cached: Option<Bytes>, endpoint: &str) -> Response {
+    if let Some(data) = cached {
+        if state.config.terraform.serve_stale {
+            tracing::warn!(
+                registry = "terraform",
+                endpoint,
+                "Upstream unreachable, serving stale cached metadata"
+            );
+            return (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                    ),
+                    (
+                        axum::http::header::HeaderName::from_static("x-nora-stale"),
+                        axum::http::header::HeaderValue::from_static("true"),
+                    ),
+                ],
+                data.to_vec(),
+            )
+                .into_response();
+        }
+    }
+    StatusCode::BAD_GATEWAY.into_response()
 }
 
 fn with_binary(data: Vec<u8>) -> Response {
@@ -1438,5 +1486,93 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=true → 200 with X-Nora-Stale header (#532)
+    #[tokio::test]
+    async fn test_serve_stale_provider_versions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.metadata_ttl = 0; // force TTL expiry
+            cfg.terraform.serve_stale = true;
+        });
+
+        // Pre-populate cache
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/aws/versions.json",
+                br#"{"versions":[{"version":"5.0.0"}]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/aws/versions",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_ref()),
+        );
+        let body = body_bytes(resp).await;
+        assert!(String::from_utf8_lossy(&body).contains("5.0.0"));
+    }
+
+    /// Stale cache + unreachable upstream + serve_stale=false → 502 (#532)
+    #[tokio::test]
+    async fn test_serve_stale_disabled_returns_502() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.metadata_ttl = 0;
+            cfg.terraform.serve_stale = false;
+        });
+
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/aws/versions.json",
+                br#"{"versions":[{"version":"5.0.0"}]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/aws/versions",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+    }
+
+    /// No cache + unreachable upstream → 502 regardless of serve_stale (#532)
+    #[tokio::test]
+    async fn test_no_cache_upstream_down_returns_502() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.serve_stale = true;
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/aws/versions",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }
