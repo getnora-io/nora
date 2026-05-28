@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
@@ -412,11 +413,28 @@ async fn handle_publish(
     let _guard = lock.lock().await;
 
     // Load or create metadata
-    let mut metadata = if let Ok(existing) = state.storage.get(&metadata_key).await {
-        serde_json::from_slice::<serde_json::Value>(&existing)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
+    let mut metadata = match state.storage.get(&metadata_key).await {
+        Ok(existing) => match serde_json::from_slice::<serde_json::Value>(&existing) {
+            Ok(val) => val,
+            Err(e) => {
+                // Corrupt metadata — refuse publish to protect existing versions (#533).
+                // The corrupt file is preserved on disk for forensic recovery.
+                tracing::error!(
+                    registry = "npm",
+                    key = %metadata_key,
+                    error = %e,
+                    bytes = existing.len(),
+                    "Corrupt metadata detected during publish — refusing to overwrite"
+                );
+                METADATA_CORRUPT_TOTAL.with_label_values(&["npm"]).inc();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Existing package metadata is corrupt; publish blocked to prevent data loss",
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => serde_json::json!({}), // No existing metadata — first publish
     };
 
     // Version immutability
@@ -1027,6 +1045,72 @@ mod integration_tests {
         let response = send(&ctx.app, Method::PUT, "/npm/mypkg", Body::from(body_bytes)).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Corrupt metadata in storage → publish returns 500 (#533).
+    #[tokio::test]
+    async fn test_publish_corrupt_metadata_returns_500() {
+        let ctx = create_test_context();
+
+        // Plant corrupt (non-JSON) data in metadata key
+        ctx.state
+            .storage
+            .put("npm/mypkg/metadata.json", b"NOT VALID JSON{{{")
+            .await
+            .unwrap();
+
+        let tarball_data = b"fake-tarball";
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+
+        let payload = serde_json::json!({
+            "name": "mypkg",
+            "versions": {
+                "2.0.0": { "dist": {} }
+            },
+            "_attachments": {
+                "mypkg-2.0.0.tgz": { "data": base64_data }
+            },
+            "dist-tags": { "latest": "2.0.0" }
+        });
+
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let response = send(&ctx.app, Method::PUT, "/npm/mypkg", Body::from(body_bytes)).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Corrupt data must NOT be overwritten — preserved for forensics
+        let stored = ctx
+            .state
+            .storage
+            .get("npm/mypkg/metadata.json")
+            .await
+            .unwrap();
+        assert_eq!(&stored[..], b"NOT VALID JSON{{{");
+    }
+
+    /// First publish (no existing metadata) still works (#533 regression guard).
+    #[tokio::test]
+    async fn test_first_publish_no_existing_metadata() {
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball";
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+
+        let payload = serde_json::json!({
+            "name": "newpkg",
+            "versions": {
+                "1.0.0": { "dist": {} }
+            },
+            "_attachments": {
+                "newpkg-1.0.0.tgz": { "data": base64_data }
+            },
+            "dist-tags": { "latest": "1.0.0" }
+        });
+
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let response = send(&ctx.app, Method::PUT, "/npm/newpkg", Body::from(body_bytes)).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 }
 

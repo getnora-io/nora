@@ -153,6 +153,16 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
 });
 
+/// Corrupt metadata detected during publish (#533)
+pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_metadata_corrupt_total",
+        "Corrupt metadata detected during publish (parse failure on existing data)",
+        &["registry"]
+    )
+    .expect("failed to create METADATA_CORRUPT_TOTAL metric at startup")
+});
+
 /// Leak detection scans skipped (#517)
 static LEAK_DETECTION_SKIPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
