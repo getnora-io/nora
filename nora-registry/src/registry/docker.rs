@@ -581,17 +581,15 @@ async fn check_blob(
 
     let key = blob_key(c.namespace.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
-    match storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
-        Ok(data) => (
+    // Use stat() instead of get() to avoid loading multi-GB blobs into memory
+    // just to return Content-Length on a HEAD request (#526).
+    match storage_stat_with_fallback(&state.storage, &key, &legacy_key).await {
+        Some(meta) => (
             StatusCode::OK,
-            [(header::CONTENT_LENGTH, data.len().to_string())],
+            [(header::CONTENT_LENGTH, meta.size.to_string())],
         )
             .into_response(),
-        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, key = %key, "Failed to check blob existence");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -684,13 +682,15 @@ async fn download_blob(
                     "PROXY",
                 ));
 
-                // Cache in storage (fire and forget, panic-safe)
-                state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
+                // Convert Vec<u8> to Bytes first — Bytes::clone() is O(1) refcount
+                // instead of Vec::clone() which copies the entire buffer (#526).
+                let data = Bytes::from(data);
+                state.spawn_cache("docker", key.clone(), data.clone());
 
                 return (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/octet-stream")],
-                    Bytes::from(data),
+                    data,
                 )
                     .into_response();
             }
@@ -720,12 +720,14 @@ async fn download_blob(
             .await
             {
                 Ok(data) => {
-                    state.spawn_cache("docker", key.clone(), Bytes::from(data.clone()));
+                    // Convert Vec<u8> to Bytes first — O(1) clone (#526)
+                    let data = Bytes::from(data);
+                    state.spawn_cache("docker", key.clone(), data.clone());
 
                     return (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, "application/octet-stream")],
-                        Bytes::from(data),
+                        data,
                     )
                         .into_response();
                 }
