@@ -244,9 +244,9 @@ impl TokenStore {
             return Err(TokenError::Expired);
         }
 
-        // Populate cache
+        // Populate cache (key must match lookup at line 180: full 64-char SHA-256 hex)
         self.cache.write().insert(
-            cache_key[..16].to_string(),
+            cache_key.clone(),
             CachedToken {
                 user: info.user.clone(),
                 role: info.role.clone(),
@@ -341,9 +341,13 @@ impl TokenStore {
         tracing::debug!(count = pending.len(), "Flushed pending last_used updates");
     }
 
-    /// Remove a token from the in-memory cache (called on revoke)
+    /// Remove a token from the in-memory cache (called on revoke).
+    /// Cache keys are full 64-char SHA-256 hex; revoke only knows the 16-char prefix,
+    /// so we must scan for matching entries.
     fn invalidate_cache(&self, hash_prefix: &str) {
-        self.cache.write().remove(hash_prefix);
+        self.cache
+            .write()
+            .retain(|k, _| !k.starts_with(hash_prefix));
     }
 
     /// Revoke a token by its hash prefix
@@ -375,6 +379,11 @@ impl TokenStore {
                     }
                 }
             }
+        }
+
+        // Evict cached entries for this user so revoked tokens fail immediately
+        if count > 0 {
+            self.cache.write().retain(|_, v| v.user != user);
         }
 
         count
@@ -715,15 +724,35 @@ mod tests {
             .create_token("testuser", 30, None, Role::Write)
             .unwrap();
 
+        assert_eq!(
+            store.cache.read().len(),
+            0,
+            "cache should be empty before first verify"
+        );
+
         // First call: cold (disk + Argon2)
         let (user1, role1) = store.verify_token(&token).unwrap();
+        assert_eq!(
+            store.cache.read().len(),
+            1,
+            "cache should have 1 entry after first verify"
+        );
+
         // Second call: should hit cache (no Argon2)
         let (user2, role2) = store.verify_token(&token).unwrap();
+        assert_eq!(store.cache.read().len(), 1, "cache size unchanged on hit");
 
         assert_eq!(user1, user2);
         assert_eq!(role1, role2);
         assert_eq!(user1, "testuser");
         assert_eq!(role1, Role::Write);
+
+        // Verify cache key is the full SHA-256 hex (64 chars), not a 16-char prefix
+        let expected_key = sha256_hex(&token);
+        assert!(
+            store.cache.read().contains_key(&expected_key),
+            "cache key must be full 64-char SHA-256"
+        );
     }
 
     #[test]
@@ -746,6 +775,37 @@ mod tests {
         // Cache should be invalidated
         let result = store.verify_token(&token);
         assert!(matches!(result, Err(TokenError::NotFound)));
+    }
+
+    #[test]
+    fn test_revoke_all_clears_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        let token1 = store.create_token("alice", 30, None, Role::Write).unwrap();
+        let token2 = store.create_token("alice", 30, None, Role::Read).unwrap();
+        let token3 = store.create_token("bob", 30, None, Role::Write).unwrap();
+
+        // Populate cache for all tokens
+        store.verify_token(&token1).unwrap();
+        store.verify_token(&token2).unwrap();
+        store.verify_token(&token3).unwrap();
+        assert_eq!(store.cache.read().len(), 3);
+
+        // Revoke all tokens for alice
+        let revoked = store.revoke_all_for_user("alice");
+        assert_eq!(revoked, 2);
+
+        // Alice's cache entries should be gone, bob's should remain
+        assert_eq!(store.cache.read().len(), 1);
+        assert!(
+            store.verify_token(&token3).is_ok(),
+            "bob's token should still work"
+        );
+        assert!(
+            store.verify_token(&token1).is_err(),
+            "alice's token should be revoked"
+        );
     }
 
     #[test]
