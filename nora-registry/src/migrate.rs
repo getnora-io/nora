@@ -50,7 +50,10 @@ pub async fn migrate(
 
     // List all keys from source
     println!("Scanning source storage...");
-    let keys = from.list("").await;
+    let keys = from
+        .list("")
+        .await
+        .map_err(|e| format!("failed to list source: {e}"))?;
 
     if keys.is_empty() {
         println!("No artifacts found in source storage.");

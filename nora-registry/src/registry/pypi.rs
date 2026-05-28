@@ -52,7 +52,13 @@ pub fn routes() -> Router<AppState> {
 
 /// GET /simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
 async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let keys = state.storage.list("pypi/").await;
+    let keys = match state.storage.list("pypi/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = ?e, "pypi: failed to list storage for packages");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let mut packages = std::collections::HashSet::new();
 
     for key in keys {
@@ -128,7 +134,13 @@ async fn package_versions(
     let base_url = nora_base_url(&state);
 
     // Collect local files with their hashes
-    let keys = state.storage.list(&prefix).await;
+    let keys = match state.storage.list(&prefix).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = ?e, "pypi: failed to list storage for package versions");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let mut local_files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {

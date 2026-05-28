@@ -64,7 +64,10 @@ pub async fn migrate_docker_keys(
     }
 
     println!("Scanning docker storage keys...");
-    let all_keys = storage.list("docker/").await;
+    let all_keys = storage
+        .list("docker/")
+        .await
+        .map_err(|e| format!("Failed to list docker keys: {}", e))?;
 
     if all_keys.is_empty() {
         println!("No docker keys found in storage.");

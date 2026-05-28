@@ -1460,7 +1460,11 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     let mut uncovered = Vec::new();
     for name in &all_registries {
         if !covered.contains(name) {
-            let count = storage.list(&format!("{}/", name)).await.len();
+            let count = storage
+                .list(&format!("{}/", name))
+                .await
+                .unwrap_or_default()
+                .len();
             if count > 0 {
                 uncovered.push(format!("{} ({} files)", name, count));
             }

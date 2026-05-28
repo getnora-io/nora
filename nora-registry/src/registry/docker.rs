@@ -535,8 +535,14 @@ pub(crate) fn strip_docker_namespace(name: &str) -> &str {
 }
 
 /// List all repositories in the registry
-async fn catalog(State(state): State<AppState>) -> Json<Value> {
-    let keys = state.storage.list("docker/").await;
+async fn catalog(State(state): State<AppState>) -> Response {
+    let keys = match state.storage.list("docker/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = ?e, "docker: failed to list storage for catalog");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
 
     // Extract unique repository names from paths like "docker/{name}/manifests/..."
     let mut repos: Vec<String> = keys
@@ -563,7 +569,7 @@ async fn catalog(State(state): State<AppState>) -> Json<Value> {
     repos.sort();
     repos.dedup();
 
-    Json(json!({ "repositories": repos }))
+    Json(json!({ "repositories": repos })).into_response()
 }
 
 async fn check_blob(
@@ -1518,12 +1524,25 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
     }
     let prefix = manifest_prefix(ns.as_deref(), &name);
     let legacy_prefix = manifest_prefix(None, &name);
-    let mut keys = state.storage.list(&prefix).await;
+    let mut keys = match state.storage.list(&prefix).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = ?e, "docker: failed to list manifests for tags");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     // Also include legacy non-namespaced keys during migration
     if prefix != legacy_prefix {
-        keys.extend(state.storage.list(&legacy_prefix).await);
-        keys.sort();
-        keys.dedup();
+        match state.storage.list(&legacy_prefix).await {
+            Ok(legacy_keys) => {
+                keys.extend(legacy_keys);
+                keys.sort();
+                keys.dedup();
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "docker: failed to list legacy manifests, continuing with namespaced only");
+            }
+        }
     }
     let tags: Vec<String> = keys
         .iter()
@@ -3205,7 +3224,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let keys = ctx.state.storage.list("docker/").await;
+        let keys = ctx.state.storage.list("docker/").await.unwrap();
         let mut repos: Vec<String> = keys
             .iter()
             .filter_map(|k| {

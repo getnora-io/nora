@@ -98,7 +98,7 @@ impl StorageBackend for LocalStorage {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> Vec<String> {
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let base = self.base_path.clone();
         let prefix = prefix.to_string();
 
@@ -112,7 +112,7 @@ impl StorageBackend for LocalStorage {
             results
         })
         .await
-        .unwrap_or_default()
+        .map_err(|e| StorageError::Io(format!("list task panicked: {e}")))
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -255,11 +255,11 @@ mod tests {
         storage.put("docker/image/blob2", b"data2").await.unwrap();
         storage.put("maven/artifact", b"data3").await.unwrap();
 
-        let docker_keys = storage.list("docker/").await;
+        let docker_keys = storage.list("docker/").await.unwrap();
         assert_eq!(docker_keys.len(), 2);
         assert!(docker_keys.iter().all(|k| k.starts_with("docker/")));
 
-        let all_keys = storage.list("").await;
+        let all_keys = storage.list("").await.unwrap();
         assert_eq!(all_keys.len(), 3);
     }
 

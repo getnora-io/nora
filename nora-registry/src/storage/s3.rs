@@ -104,7 +104,7 @@ impl StorageBackend for S3Storage {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> Vec<String> {
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let encoded = encode_s3_key(prefix);
         let prefix_path = Path::from(encoded);
         let list_prefix = if prefix.is_empty() {
@@ -114,16 +114,17 @@ impl StorageBackend for S3Storage {
         };
 
         // Collect all objects from the listing stream.
-        let result: std::result::Result<Vec<_>, _> =
-            self.store.list(list_prefix).try_collect().await;
+        let objects: Vec<_> = self
+            .store
+            .list(list_prefix)
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::Network(e.to_string()))?;
 
-        match result {
-            Ok(objects) => objects
-                .into_iter()
-                .map(|meta| decode_s3_key(meta.location.as_ref()))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        Ok(objects
+            .into_iter()
+            .map(|meta| decode_s3_key(meta.location.as_ref()))
+            .collect())
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {

@@ -176,7 +176,7 @@ impl Default for RepoIndex {
 // ============================================================================
 
 async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("docker/").await;
+    let keys = storage.list("docker/").await.unwrap_or_default();
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -232,7 +232,7 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_maven_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("maven/").await;
+    let keys = storage.list("maven/").await.unwrap_or_default();
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -257,7 +257,7 @@ async fn build_maven_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("npm/").await;
+    let keys = storage.list("npm/").await.unwrap_or_default();
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     // Count tarballs instead of parsing metadata.json (faster than parsing JSON)
@@ -292,7 +292,7 @@ async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_cargo_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("cargo/").await;
+    let keys = storage.list("cargo/").await.unwrap_or_default();
     let mut crates: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -319,7 +319,7 @@ async fn build_cargo_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("pypi/").await;
+    let keys = storage.list("pypi/").await.unwrap_or_default();
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -344,7 +344,7 @@ async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("go/").await;
+    let keys = storage.list("go/").await.unwrap_or_default();
     let mut modules: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -373,7 +373,7 @@ async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
 }
 
 async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("raw/").await;
+    let keys = storage.list("raw/").await.unwrap_or_default();
     // (count, size, modified, is_file)
     let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
 
@@ -415,7 +415,7 @@ async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
 /// Generic index builder: groups files under `prefix` by first path segment.
 /// Only counts files matching `suffix` (e.g. ".gem", ".nupkg", ".tar.gz").
 async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> Vec<RepoInfo> {
-    let keys = storage.list(prefix).await;
+    let keys = storage.list(prefix).await.unwrap_or_default();
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -444,7 +444,7 @@ async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> V
 /// Gems index: keys like gems/gems/{name}-{version}.gem
 /// Uses split_gem_filename to extract package name from flat file layout.
 async fn build_gems_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("gems/gems/").await;
+    let keys = storage.list("gems/gems/").await.unwrap_or_default();
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -476,7 +476,7 @@ async fn build_gems_index(storage: &Storage) -> Vec<RepoInfo> {
 
 /// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
 async fn build_conan_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("conan/").await;
+    let keys = storage.list("conan/").await.unwrap_or_default();
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {

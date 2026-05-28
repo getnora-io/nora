@@ -673,7 +673,7 @@ async fn resolve_upstream_download_url(
         // For shasums/sig files, scan any cached metadata for this provider version
         // (shasums URLs are the same regardless of os/arch)
         let prefix = format!("terraform/providers/{}/{}/{}/", ns, ptype, ver);
-        let keys = state.storage.list(&prefix).await;
+        let keys = state.storage.list(&prefix).await.unwrap_or_default();
         for key in keys {
             if key.ends_with(".json") {
                 if let Ok(data) = state.storage.get(&key).await {
