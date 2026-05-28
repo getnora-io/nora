@@ -8,6 +8,8 @@ validat = "validat"
 registr = "registr"
 # base64-encoded RSA key data in OIDC test constants
 NLY = "NLY"
+# intentional typo in test_audit_mode_rejects_invalid (audit.rs)
+flie = "flie"
 
 [files]
 extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]
