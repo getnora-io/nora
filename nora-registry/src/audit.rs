@@ -9,6 +9,9 @@
 //!   - `stdout`  — write JSONL to stderr (12-factor compatible)
 //!   - `both`   — write to file AND stderr
 //!   - `off`    — disable audit logging
+//!
+//! Uses a bounded mpsc channel with a single writer task (#543) to avoid
+//! per-entry `spawn_blocking` + Mutex contention under load.
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -16,8 +19,13 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Channel bound for audit entries. Under normal load, entries are drained
+/// faster than they arrive. The bound provides backpressure under extreme
+/// load — entries exceeding this are dropped with a warning (#543).
+const AUDIT_CHANNEL_BOUND: usize = 10_000;
 
 /// Audit output mode.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -83,77 +91,157 @@ impl AuditEntry {
 
 pub struct AuditLog {
     path: PathBuf,
-    writer: Arc<Mutex<Option<fs::File>>>,
     mode: AuditMode,
+    /// Channel sender, wrapped in Mutex<Option<>> so `shutdown()` can take it
+    /// through `&self` (needed because AuditLog is behind Arc in AppState).
+    sender: Mutex<Option<mpsc::Sender<AuditEntry>>>,
+    /// Handle to the background writer task, used for graceful shutdown.
+    writer_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AuditLog {
     pub fn new(storage_path: &str, mode: AuditMode) -> Self {
+        let path = PathBuf::from(storage_path).join("audit.jsonl");
+
         if mode == AuditMode::Off {
             info!("Audit log disabled (mode=off)");
             return Self {
-                path: PathBuf::from(storage_path).join("audit.jsonl"),
-                writer: Arc::new(Mutex::new(None)),
+                path,
                 mode,
+                sender: Mutex::new(None),
+                writer_handle: Mutex::new(None),
             };
         }
 
-        let path = PathBuf::from(storage_path).join("audit.jsonl");
-        let writer = if mode == AuditMode::File || mode == AuditMode::Both {
+        // Open file handle if needed
+        let file = if mode == AuditMode::File || mode == AuditMode::Both {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(f) => {
                     info!(path = %path.display(), mode = ?mode, "Audit log initialized");
-                    Arc::new(Mutex::new(Some(f)))
+                    Some(f)
                 }
                 Err(e) => {
                     warn!(path = %path.display(), error = %e, "Failed to open audit log file");
-                    Arc::new(Mutex::new(None))
+                    None
                 }
             }
         } else {
             info!(mode = ?mode, "Audit log initialized (stderr only)");
-            Arc::new(Mutex::new(None))
+            None
         };
 
-        Self { path, writer, mode }
+        let (tx, rx) = mpsc::channel(AUDIT_CHANNEL_BOUND);
+
+        debug_assert!(
+            mode != AuditMode::Off,
+            "channel should not be created when mode is Off"
+        );
+
+        let writer_mode = mode.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            Self::writer_loop(rx, file, writer_mode);
+        });
+
+        Self {
+            path,
+            mode,
+            sender: Mutex::new(Some(tx)),
+            writer_handle: Mutex::new(Some(handle)),
+        }
     }
 
+    /// Background writer loop — receives entries from the channel and writes
+    /// them to file/stderr. Runs until the channel is closed (all senders dropped).
+    fn writer_loop(
+        mut rx: mpsc::Receiver<AuditEntry>,
+        mut file: Option<fs::File>,
+        mode: AuditMode,
+    ) {
+        // blocking_recv() blocks the current thread until an entry arrives
+        // or the channel is closed. This is correct because we're inside
+        // spawn_blocking.
+        while let Some(entry) = rx.blocking_recv() {
+            Self::write_entry(&entry, &mut file, &mode);
+        }
+
+        // Channel closed — drain any remaining buffered entries
+        while let Ok(entry) = rx.try_recv() {
+            Self::write_entry(&entry, &mut file, &mode);
+        }
+
+        // Final flush on shutdown
+        if let Some(ref mut f) = file {
+            if let Err(e) = f.flush() {
+                tracing::error!(error = %e, "Audit log final flush failed");
+            }
+        }
+    }
+
+    /// Write a single audit entry to file and/or stderr.
+    fn write_entry(entry: &AuditEntry, file: &mut Option<fs::File>, mode: &AuditMode) {
+        let json = match serde_json::to_string(entry) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "Audit log serialization failed");
+                return;
+            }
+        };
+
+        if *mode == AuditMode::File || *mode == AuditMode::Both {
+            if let Some(ref mut f) = file {
+                if let Err(e) = writeln!(f, "{}", json) {
+                    tracing::error!(error = %e, "Audit log write failed");
+                }
+                if let Err(e) = f.flush() {
+                    tracing::error!(error = %e, "Audit log flush failed");
+                }
+            }
+        }
+
+        if *mode == AuditMode::Stdout || *mode == AuditMode::Both {
+            eprintln!("{}", json);
+        }
+    }
+
+    /// Send an audit entry to the background writer (#543).
+    ///
+    /// Infallible: if the channel is full (extreme backpressure), the entry
+    /// is dropped with a warning. If the channel is closed (shutdown), the
+    /// entry is silently discarded.
     pub fn log(&self, entry: AuditEntry) {
         if self.mode == AuditMode::Off {
             return;
         }
 
-        let writer = Arc::clone(&self.writer);
-        let mode = self.mode.clone();
-        tokio::task::spawn_blocking(move || {
-            let json = match serde_json::to_string(&entry) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::error!(error = %e, "Audit log serialization failed");
-                    return;
-                }
-            };
-
-            // Write to file if mode is file or both
-            if mode == AuditMode::File || mode == AuditMode::Both {
-                if let Some(ref mut file) = *writer.lock() {
-                    if let Err(e) = writeln!(file, "{}", json) {
-                        tracing::error!(error = %e, "Audit log write failed");
-                    }
-                    if let Err(e) = file.flush() {
-                        tracing::error!(error = %e, "Audit log flush failed");
-                    }
-                }
+        if let Some(ref sender) = *self.sender.lock() {
+            if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(entry) {
+                warn!("Audit log channel full — entry dropped (backpressure)");
             }
+            // TrySendError::Closed is silently ignored — happens during shutdown
+        }
+    }
 
-            // Write to stderr if mode is stdout or both
-            if mode == AuditMode::Stdout || mode == AuditMode::Both {
-                eprintln!("{}", json);
+    /// Graceful shutdown: close the channel and wait for the writer to drain.
+    ///
+    /// Must be called AFTER all background schedulers have finished (#543),
+    /// so their final audit entries are captured.
+    pub async fn shutdown(&self) {
+        // Drop the sender to close the channel
+        self.sender.lock().take();
+
+        // Take the handle out of the mutex BEFORE awaiting (avoid holding
+        // MutexGuard across .await)
+        let handle = self.writer_handle.lock().take();
+
+        // Wait for the writer task to finish draining
+        if let Some(handle) = handle {
+            if let Err(e) = handle.await {
+                tracing::error!(error = %e, "Audit log writer task panicked");
             }
-        });
+        }
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -189,8 +277,11 @@ mod tests {
 
     #[test]
     fn test_audit_log_new_and_path() {
+        // AuditLog::new() spawns a tokio task, so we need a runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
+        let log =
+            rt.block_on(async { AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File) });
         assert!(log.path().ends_with("audit.jsonl"));
     }
 
@@ -202,17 +293,11 @@ mod tests {
         let entry = AuditEntry::new("pull", "user1", "lodash", "npm", "downloaded");
         log.log(entry);
 
-        // spawn_blocking is fire-and-forget; retry until flushed (max 1s)
+        // Wait for writer to process by shutting down (drains channel)
         let path = log.path().clone();
-        let mut content = String::new();
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            content = std::fs::read_to_string(&path).unwrap_or_default();
-            if content.contains(r#""action":"pull""#) {
-                break;
-            }
-        }
+        log.shutdown().await;
 
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains(r#""action":"pull""#));
         assert!(content.contains(r#""actor":"user1""#));
         assert!(content.contains(r#""artifact":"lodash""#));
@@ -227,20 +312,11 @@ mod tests {
         log.log(AuditEntry::new("pull", "user", "b", "npm", ""));
         log.log(AuditEntry::new("delete", "admin", "c", "maven", ""));
 
-        // Retry until all 3 entries flushed (max 1s)
         let path = log.path().clone();
-        let mut line_count = 0;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                line_count = content.lines().count();
-                if line_count >= 3 {
-                    break;
-                }
-            }
-        }
+        log.shutdown().await;
 
-        assert_eq!(line_count, 3);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(content.lines().count(), 3);
     }
 
     #[test]
@@ -289,10 +365,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_audit_log_off_mode() {
+    #[tokio::test]
+    async fn test_audit_log_off_mode() {
         let tmp = TempDir::new().unwrap();
         let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::Off);
         assert_eq!(log.mode(), &AuditMode::Off);
+        // Should not panic even when logging to Off mode
+        log.log(AuditEntry::new("test", "test", "test", "test", "test"));
     }
 }

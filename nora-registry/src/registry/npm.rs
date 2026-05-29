@@ -42,7 +42,7 @@ pub fn routes() -> Router<AppState> {
 /// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
 fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
-        tracing::debug!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
+        tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
     })?;
 
     let upstream_trimmed = upstream_url.trim_end_matches('/');
@@ -65,7 +65,7 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
     }
 
     let output = serde_json::to_vec(&json).map_err(|e| {
-        tracing::debug!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
+        tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
     })?;
 
     // Safety net: byte-level replace of any remaining upstream URL prefix (#439).

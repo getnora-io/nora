@@ -1571,6 +1571,26 @@ impl Default for AuditConfig {
     }
 }
 
+/// Parse an env var value into `target`, warning on failure (#537).
+///
+/// If `val` parses successfully, `*target` is updated. If parsing fails,
+/// a `warn!` is emitted with the variable name and invalid value, and
+/// `*target` is left unchanged (keeps the TOML/default value).
+fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(name: &str, val: &str, target: &mut T) {
+    match val.parse::<T>() {
+        Ok(parsed) => {
+            *target = parsed;
+        }
+        Err(_) => {
+            tracing::warn!(
+                var = name,
+                value = val,
+                "env override ignored: failed to parse value"
+            );
+        }
+    }
+}
+
 impl Config {
     /// Returns the set of enabled registry types.
     ///
@@ -2128,24 +2148,21 @@ impl Config {
     /// Apply environment variable overrides.
     ///
     /// Returns `Err` if a security-critical enum (curation mode, quarantine mode,
-    /// audit mode) has an unrecognized value — typos must not silently disable security.
+    /// audit mode, storage mode) has an unrecognized value — typos must not silently
+    /// disable security or misconfigure storage.
     fn apply_env_overrides(&mut self) -> Result<(), String> {
         // Server config
         if let Ok(val) = env::var("NORA_HOST") {
             self.server.host = val;
         }
         if let Ok(val) = env::var("NORA_PORT") {
-            if let Ok(port) = val.parse() {
-                self.server.port = port;
-            }
+            parse_env_warn("NORA_PORT", &val, &mut self.server.port);
         }
         if let Ok(val) = env::var("NORA_PUBLIC_URL") {
             self.server.public_url = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
-            if let Ok(mb) = val.parse() {
-                self.server.body_limit_mb = mb;
-            }
+            parse_env_warn("NORA_BODY_LIMIT_MB", &val, &mut self.server.body_limit_mb);
         }
 
         // TLS config
@@ -2156,8 +2173,14 @@ impl Config {
         // Storage config
         if let Ok(val) = env::var("NORA_STORAGE_MODE") {
             self.storage.mode = match val.to_lowercase().as_str() {
+                "local" | "filesystem" => StorageMode::Local,
                 "s3" => StorageMode::S3,
-                _ => StorageMode::Local,
+                other => {
+                    return Err(format!(
+                        "NORA_STORAGE_MODE={:?} is invalid — valid values: local, s3",
+                        other
+                    ))
+                }
             };
         }
         if let Ok(val) = env::var("NORA_STORAGE_PATH") {
@@ -2261,9 +2284,11 @@ impl Config {
                 .collect();
         }
         if let Ok(val) = env::var("NORA_MAVEN_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.maven.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_MAVEN_PROXY_TIMEOUT",
+                &val,
+                &mut self.maven.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_MAVEN_CHECKSUM_VERIFY") {
             self.maven.checksum_verify = val.to_lowercase() == "true" || val == "1";
@@ -2277,14 +2302,10 @@ impl Config {
             self.npm.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_NPM_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.npm.proxy_timeout = timeout;
-            }
+            parse_env_warn("NORA_NPM_PROXY_TIMEOUT", &val, &mut self.npm.proxy_timeout);
         }
         if let Ok(val) = env::var("NORA_NPM_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.npm.metadata_ttl = ttl;
-            }
+            parse_env_warn("NORA_NPM_METADATA_TTL", &val, &mut self.npm.metadata_ttl);
         }
 
         // npm proxy auth
@@ -2301,9 +2322,11 @@ impl Config {
             self.pypi.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_PYPI_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.pypi.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_PYPI_PROXY_TIMEOUT",
+                &val,
+                &mut self.pypi.proxy_timeout,
+            );
         }
 
         // PyPI proxy auth
@@ -2317,19 +2340,25 @@ impl Config {
 
         // Docker config
         if let Ok(val) = env::var("NORA_DOCKER_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.docker.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_DOCKER_PROXY_TIMEOUT",
+                &val,
+                &mut self.docker.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_DOCKER_READ_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.docker.read_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_DOCKER_READ_TIMEOUT",
+                &val,
+                &mut self.docker.read_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_DOCKER_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.docker.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_DOCKER_METADATA_TTL",
+                &val,
+                &mut self.docker.metadata_ttl,
+            );
         }
         if let Ok(val) = env::var("NORA_DOCKER_SERVE_STALE") {
             self.docker.serve_stale = !matches!(val.as_str(), "false" | "0");
@@ -2390,19 +2419,17 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_GO_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.go.proxy_timeout = timeout;
-            }
+            parse_env_warn("NORA_GO_PROXY_TIMEOUT", &val, &mut self.go.proxy_timeout);
         }
         if let Ok(val) = env::var("NORA_GO_PROXY_TIMEOUT_ZIP") {
-            if let Ok(timeout) = val.parse() {
-                self.go.proxy_timeout_zip = timeout;
-            }
+            parse_env_warn(
+                "NORA_GO_PROXY_TIMEOUT_ZIP",
+                &val,
+                &mut self.go.proxy_timeout_zip,
+            );
         }
         if let Ok(val) = env::var("NORA_GO_MAX_ZIP_SIZE") {
-            if let Ok(size) = val.parse() {
-                self.go.max_zip_size = size;
-            }
+            parse_env_warn("NORA_GO_MAX_ZIP_SIZE", &val, &mut self.go.max_zip_size);
         }
 
         // Cargo config
@@ -2410,9 +2437,11 @@ impl Config {
             self.cargo.proxy = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_CARGO_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.cargo.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_CARGO_PROXY_TIMEOUT",
+                &val,
+                &mut self.cargo.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_CARGO_PROXY_AUTH") {
             self.cargo.proxy_auth = if val.is_empty() {
@@ -2427,9 +2456,7 @@ impl Config {
             self.raw.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_RAW_MAX_FILE_SIZE") {
-            if let Ok(size) = val.parse() {
-                self.raw.max_file_size = size;
-            }
+            parse_env_warn("NORA_RAW_MAX_FILE_SIZE", &val, &mut self.raw.max_file_size);
         }
         if let Ok(val) = env::var("NORA_RAW_CACHE_CONTROL") {
             self.raw.cache_control = val;
@@ -2447,14 +2474,14 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_GEMS_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.gems.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_GEMS_PROXY_TIMEOUT",
+                &val,
+                &mut self.gems.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_GEMS_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.gems.metadata_ttl = ttl;
-            }
+            parse_env_warn("NORA_GEMS_METADATA_TTL", &val, &mut self.gems.metadata_ttl);
         }
 
         // Terraform config
@@ -2469,19 +2496,25 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_TF_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.terraform.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_TF_PROXY_TIMEOUT",
+                &val,
+                &mut self.terraform.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_TF_PROXY_TIMEOUT_DL") {
-            if let Ok(timeout) = val.parse() {
-                self.terraform.proxy_timeout_dl = timeout;
-            }
+            parse_env_warn(
+                "NORA_TF_PROXY_TIMEOUT_DL",
+                &val,
+                &mut self.terraform.proxy_timeout_dl,
+            );
         }
         if let Ok(val) = env::var("NORA_TF_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.terraform.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_TF_METADATA_TTL",
+                &val,
+                &mut self.terraform.metadata_ttl,
+            );
         }
         if let Ok(val) = env::var("NORA_TF_SERVE_STALE") {
             self.terraform.serve_stale = !matches!(val.as_str(), "false" | "0");
@@ -2499,14 +2532,18 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.ansible.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_ANSIBLE_PROXY_TIMEOUT",
+                &val,
+                &mut self.ansible.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.ansible.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_ANSIBLE_METADATA_TTL",
+                &val,
+                &mut self.ansible.metadata_ttl,
+            );
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_SERVE_STALE") {
             self.ansible.serve_stale = !matches!(val.as_str(), "false" | "0");
@@ -2524,19 +2561,25 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_NUGET_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.nuget.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_NUGET_PROXY_TIMEOUT",
+                &val,
+                &mut self.nuget.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_NUGET_METADATA_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.nuget.metadata_proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_NUGET_METADATA_TIMEOUT",
+                &val,
+                &mut self.nuget.metadata_proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_NUGET_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.nuget.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_NUGET_METADATA_TTL",
+                &val,
+                &mut self.nuget.metadata_ttl,
+            );
         }
         if let Ok(val) = env::var("NORA_NUGET_SERVE_STALE") {
             self.nuget.serve_stale = !matches!(val.as_str(), "false" | "0");
@@ -2564,14 +2607,18 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_PUB_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.pub_dart.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_PUB_PROXY_TIMEOUT",
+                &val,
+                &mut self.pub_dart.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_PUB_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.pub_dart.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_PUB_METADATA_TTL",
+                &val,
+                &mut self.pub_dart.metadata_ttl,
+            );
         }
 
         // Conan proxy config
@@ -2586,19 +2633,25 @@ impl Config {
             };
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT") {
-            if let Ok(timeout) = val.parse() {
-                self.conan.proxy_timeout = timeout;
-            }
+            parse_env_warn(
+                "NORA_CONAN_PROXY_TIMEOUT",
+                &val,
+                &mut self.conan.proxy_timeout,
+            );
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY_TIMEOUT_DL") {
-            if let Ok(timeout) = val.parse() {
-                self.conan.proxy_timeout_dl = timeout;
-            }
+            parse_env_warn(
+                "NORA_CONAN_PROXY_TIMEOUT_DL",
+                &val,
+                &mut self.conan.proxy_timeout_dl,
+            );
         }
         if let Ok(val) = env::var("NORA_CONAN_METADATA_TTL") {
-            if let Ok(ttl) = val.parse() {
-                self.conan.metadata_ttl = ttl;
-            }
+            parse_env_warn(
+                "NORA_CONAN_METADATA_TTL",
+                &val,
+                &mut self.conan.metadata_ttl,
+            );
         }
 
         // Token storage
@@ -2611,34 +2664,46 @@ impl Config {
             self.rate_limit.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_AUTH_RPS") {
-            if let Ok(v) = val.parse::<u64>() {
-                self.rate_limit.auth_rps = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_AUTH_RPS",
+                &val,
+                &mut self.rate_limit.auth_rps,
+            );
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_AUTH_BURST") {
-            if let Ok(v) = val.parse::<u32>() {
-                self.rate_limit.auth_burst = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_AUTH_BURST",
+                &val,
+                &mut self.rate_limit.auth_burst,
+            );
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_UPLOAD_RPS") {
-            if let Ok(v) = val.parse::<u64>() {
-                self.rate_limit.upload_rps = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_UPLOAD_RPS",
+                &val,
+                &mut self.rate_limit.upload_rps,
+            );
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_UPLOAD_BURST") {
-            if let Ok(v) = val.parse::<u32>() {
-                self.rate_limit.upload_burst = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_UPLOAD_BURST",
+                &val,
+                &mut self.rate_limit.upload_burst,
+            );
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_GENERAL_RPS") {
-            if let Ok(v) = val.parse::<u64>() {
-                self.rate_limit.general_rps = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_GENERAL_RPS",
+                &val,
+                &mut self.rate_limit.general_rps,
+            );
         }
         if let Ok(val) = env::var("NORA_RATE_LIMIT_GENERAL_BURST") {
-            if let Ok(v) = val.parse::<u32>() {
-                self.rate_limit.general_burst = v;
-            }
+            parse_env_warn(
+                "NORA_RATE_LIMIT_GENERAL_BURST",
+                &val,
+                &mut self.rate_limit.general_burst,
+            );
         }
 
         // GC config
@@ -2646,9 +2711,7 @@ impl Config {
             self.gc.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_GC_INTERVAL") {
-            if let Ok(v) = val.parse() {
-                self.gc.interval = v;
-            }
+            parse_env_warn("NORA_GC_INTERVAL", &val, &mut self.gc.interval);
         }
         if let Ok(val) = env::var("NORA_GC_DRY_RUN") {
             self.gc.dry_run = val.to_lowercase() == "true" || val == "1";
@@ -2659,9 +2722,11 @@ impl Config {
             self.retention.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_RETENTION_INTERVAL") {
-            if let Ok(v) = val.parse() {
-                self.retention.interval = v;
-            }
+            parse_env_warn(
+                "NORA_RETENTION_INTERVAL",
+                &val,
+                &mut self.retention.interval,
+            );
         }
         if let Ok(val) = env::var("NORA_RETENTION_DRY_RUN") {
             self.retention.dry_run = val.to_lowercase() == "true" || val == "1";
@@ -2732,14 +2797,18 @@ impl Config {
             self.circuit_breaker.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_CB_THRESHOLD") {
-            if let Ok(v) = val.parse() {
-                self.circuit_breaker.failure_threshold = v;
-            }
+            parse_env_warn(
+                "NORA_CB_THRESHOLD",
+                &val,
+                &mut self.circuit_breaker.failure_threshold,
+            );
         }
         if let Ok(val) = env::var("NORA_CB_RESET_TIMEOUT") {
-            if let Ok(v) = val.parse() {
-                self.circuit_breaker.reset_timeout = v;
-            }
+            parse_env_warn(
+                "NORA_CB_RESET_TIMEOUT",
+                &val,
+                &mut self.circuit_breaker.reset_timeout,
+            );
         }
 
         // Per-registry curation overrides
@@ -3049,6 +3118,55 @@ mod tests {
         std::env::remove_var("NORA_STORAGE_PATH");
         std::env::remove_var("NORA_STORAGE_BUCKET");
         std::env::remove_var("NORA_STORAGE_S3_REGION");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_local() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "local");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_case_insensitive() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "S3");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_rejects_unknown() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "redis");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "unknown storage mode must be rejected");
+        assert!(result.unwrap_err().contains("NORA_STORAGE_MODE"));
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_parse_env_warn_valid_u16() {
+        let mut port: u16 = 5000;
+        parse_env_warn("NORA_PORT", "8080", &mut port);
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_env_warn_invalid_keeps_original() {
+        let mut port: u16 = 5000;
+        parse_env_warn("NORA_PORT", "not-a-number", &mut port);
+        assert_eq!(port, 5000, "invalid parse must keep original value");
+    }
+
+    #[test]
+    fn test_parse_env_warn_empty_keeps_original() {
+        let mut timeout: u64 = 30;
+        parse_env_warn("NORA_TIMEOUT", "", &mut timeout);
+        assert_eq!(timeout, 30, "empty string must keep original value");
     }
 
     #[test]

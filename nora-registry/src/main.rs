@@ -510,6 +510,7 @@ async fn main() {
                             result.deleted_keys, result.bytes_freed, result.duration_secs
                         ),
                     ));
+                    audit.shutdown().await;
                 }
                 print_retention_coverage(&storage, &config.retention.rules).await;
             }
@@ -1241,8 +1242,15 @@ async fn run_server(mut config: Config, storage: Storage) {
             axum::http::header::HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
         ))
+        // Middleware layer order — LOAD-BEARING, do not reorder (#542).
+        //
+        // In axum, last .layer() = outermost (runs first). Execution order:
+        //   metrics → auth → leak_detection → request_id → handler
+        //
+        // metrics MUST be outermost so it counts ALL responses including
+        // auth rejections (401/403/429) in nora_http_requests_total.
+        // request_id is innermost so the ID is available to handlers.
         .layer(middleware::from_fn(request_id::request_id_middleware))
-        .layer(middleware::from_fn(metrics::metrics_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics::leak_detection_middleware,
@@ -1251,6 +1259,7 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.clone(),
             auth::auth_middleware,
         ))
+        .layer(middleware::from_fn(metrics::metrics_middleware))
         .with_state(state.clone());
 
     // Clean up stale Docker upload temp files from previous runs (#530).
@@ -1368,6 +1377,9 @@ async fn run_server(mut config: Config, storage: Storage) {
             warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
         }
     }
+
+    // Drain audit log — AFTER schedulers finish so their final entries are captured (#543)
+    state.audit.shutdown().await;
 
     // Save metrics on shutdown
     state.metrics.save().await;
