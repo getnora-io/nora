@@ -31,6 +31,26 @@ impl std::ops::Deref for RequestId {
     }
 }
 
+/// Maximum length for an externally-provided request ID.
+/// UUID is 36 chars; 128 is generous for any legitimate correlation ID.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Validate an external request ID: printable ASCII only, bounded length.
+/// Returns `None` if the value is unsafe for log inclusion (#539).
+fn sanitize_request_id(raw: &str) -> Option<&str> {
+    if raw.is_empty() || raw.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    // Only allow printable ASCII (0x21..=0x7E). Reject space (0x20) to prevent
+    // log field splitting, and control chars (0x00..=0x1F, 0x7F) to prevent
+    // log injection.
+    if raw.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
 /// Middleware that adds a unique request ID to each request.
 ///
 /// The request ID is:
@@ -42,13 +62,20 @@ impl std::ops::Deref for RequestId {
 /// - Added to the response `X-Request-ID` header
 /// - Included in the tracing span for log correlation
 pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
-    // Check if request already has an ID (from upstream proxy/gateway)
+    // Check if request already has an ID (from upstream proxy/gateway).
+    // Sanitize to prevent log injection via control chars or oversized values (#539).
     let request_id = request
         .headers()
         .get(&REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
+        .and_then(sanitize_request_id)
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    debug_assert!(
+        request_id.len() <= MAX_REQUEST_ID_LEN && request_id.is_ascii(),
+        "request_id postcondition violated"
+    );
 
     // Store in request extensions for handlers to access
     request
@@ -110,6 +137,59 @@ mod tests {
         let id = RequestId("req-12345".to_string());
         assert!(id.starts_with("req-"));
         assert_eq!(id.len(), 9);
+    }
+
+    // --- sanitize_request_id tests (#539) ---
+
+    #[test]
+    fn test_sanitize_valid_uuid() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(sanitize_request_id(uuid), Some(uuid));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_empty() {
+        assert_eq!(sanitize_request_id(""), None);
+    }
+
+    #[test]
+    fn test_sanitize_rejects_too_long() {
+        let long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        assert_eq!(sanitize_request_id(&long), None);
+    }
+
+    #[test]
+    fn test_sanitize_max_length_accepted() {
+        let exact = "a".repeat(MAX_REQUEST_ID_LEN);
+        assert_eq!(sanitize_request_id(&exact), Some(exact.as_str()));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_newline() {
+        assert_eq!(sanitize_request_id("real-id\nfake-log-line"), None);
+    }
+
+    #[test]
+    fn test_sanitize_rejects_tab() {
+        assert_eq!(sanitize_request_id("id\twith-tab"), None);
+    }
+
+    #[test]
+    fn test_sanitize_rejects_null_byte() {
+        assert_eq!(sanitize_request_id("id\0null"), None);
+    }
+
+    #[test]
+    fn test_sanitize_rejects_space() {
+        assert_eq!(sanitize_request_id("id with space"), None);
+    }
+
+    #[test]
+    fn test_sanitize_allows_printable_ascii() {
+        assert_eq!(
+            sanitize_request_id("req-123_abc.XYZ~!@#"),
+            Some("req-123_abc.XYZ~!@#")
+        );
     }
 }
 

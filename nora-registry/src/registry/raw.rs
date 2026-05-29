@@ -4,6 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::method_not_allowed;
+use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -46,6 +47,9 @@ async fn download(
     }
 
     let key = format!("raw/{}", path);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     // mtime fallback — Raw is always hosted (no proxy)
     let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await;
@@ -118,6 +122,11 @@ async fn upload(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let key = format!("raw/{}", path);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     if !path.is_ascii() {
         return (
             StatusCode::BAD_REQUEST,
@@ -146,8 +155,6 @@ async fn upload(
         .get(header::IF_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string());
-
-    let key = format!("raw/{}", path);
 
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
@@ -273,6 +280,9 @@ async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) ->
     }
 
     let key = format!("raw/{}", path);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match state.storage.delete(&key).await {
         Ok(()) => {
             state
@@ -295,6 +305,9 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
     }
 
     let key = format!("raw/{}", path);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match state.storage.stat(&key).await {
         Some(meta) => {
             let mut builder = axum::http::Response::builder()

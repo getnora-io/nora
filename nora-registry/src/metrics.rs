@@ -349,21 +349,22 @@ pub async fn leak_detection_middleware(
         Ok(bytes) => bytes,
         Err(_) => {
             // Defense-in-depth: should be unreachable with correct size pre-check.
-            // Body is already consumed — cannot restore. Log and return empty.
+            // Body is already consumed — cannot restore. Return 502 so clients
+            // know the response is broken, not 200-with-empty-body (#540).
             LEAK_DETECTION_SKIPPED
                 .with_label_values(&["body_read_error"])
                 .inc();
-            tracing::warn!(
+            tracing::error!(
                 path = path.as_str(),
                 size_hint = ?size_hint_exact,
                 content_length = ?content_length,
-                "leak_detection: body read failed after size pre-check passed — returning empty body"
+                "leak_detection: body read failed after size pre-check passed — response body lost"
             );
-            let mut error_parts = parts;
-            error_parts
-                .headers
-                .remove(axum::http::header::CONTENT_LENGTH);
-            return Response::from_parts(error_parts, Body::empty());
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "upstream response error",
+            )
+                .into_response();
         }
     };
 

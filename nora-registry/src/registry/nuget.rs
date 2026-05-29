@@ -889,12 +889,20 @@ async fn extract_nuget_publish_date(
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let pages = json.get("items")?.as_array()?;
     for page in pages {
-        let items = page.get("items")?.as_array()?;
+        // Pages may be non-inline (only @id pointer, no items array) per NuGet V3 spec.
+        // Skip instead of aborting the entire function (#535).
+        let Some(items) = page.get("items").and_then(|i| i.as_array()) else {
+            continue;
+        };
         for item in items {
-            let entry = item.get("catalogEntry")?;
-            let ver = entry.get("version")?.as_str()?;
+            let Some(entry) = item.get("catalogEntry") else {
+                continue;
+            };
+            let Some(ver) = entry.get("version").and_then(|v| v.as_str()) else {
+                continue;
+            };
             if ver.eq_ignore_ascii_case(version) {
-                let date_str = entry.get("published")?.as_str()?;
+                let date_str = entry.get("published").and_then(|d| d.as_str())?;
                 return crate::curation::parse_iso8601_to_unix(date_str);
             }
         }
@@ -1769,6 +1777,40 @@ mod integration_tests {
 
         let result = super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0").await;
         assert!(result.is_none());
+    }
+
+    /// Regression test for #535: pages without inline items must not abort
+    /// date extraction for subsequent pages.
+    #[tokio::test]
+    async fn test_extract_nuget_publish_date_sparse_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        // Page 0: non-inline (only @id, no items array).
+        // Page 1: inline with the target version.
+        let meta = serde_json::json!({
+            "items": [
+                { "@id": "https://upstream/page/0" },
+                {
+                    "items": [{
+                        "catalogEntry": {
+                            "version": "2.0.0",
+                            "published": "2024-06-15T12:00:00Z"
+                        }
+                    }]
+                }
+            ]
+        });
+        storage
+            .put(
+                "nuget/registration/sparse-pkg/index.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        // Before #535 fix: this returned None because page 0 had no "items".
+        let result = super::extract_nuget_publish_date(&storage, "sparse-pkg", "2.0.0").await;
+        assert!(result.is_some(), "date must be found despite sparse page 0");
     }
 
     #[tokio::test]

@@ -1093,7 +1093,8 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let app_routes = if rate_limit_enabled {
         // Create rate limiters before moving config to state
-        let auth_limiter = rate_limit::auth_rate_limiter(&config.rate_limit);
+        let auth_limiter =
+            rate_limit::auth_rate_limiter(&config.rate_limit, config.auth.trusted_proxies.clone());
         let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
         let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
 

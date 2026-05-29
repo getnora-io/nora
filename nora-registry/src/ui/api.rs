@@ -588,7 +588,7 @@ pub async fn get_npm_detail(
                     let published = time_obj
                         .and_then(|t| t.get(version))
                         .and_then(|p| p.as_str())
-                        .map(|s| s[..10].to_string())
+                        .map(|s| s.get(..10).unwrap_or(s).to_string())
                         .unwrap_or_else(|| "N/A".to_string());
 
                     // Count pre-release, skip unless toggled
