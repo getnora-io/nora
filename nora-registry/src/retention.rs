@@ -17,6 +17,7 @@ use tracing::info;
 use crate::config::RetentionRule;
 use crate::storage::Storage;
 use crate::validation::ends_with_ci;
+use crate::PublishLocks;
 
 // ============================================================================
 // Prometheus metrics
@@ -302,8 +303,12 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 
     for key in &all_keys {
         // npm/{package}/tarballs/{file} — each tarball is a "version"
+        // Skip metadata.json and checksum files — they are indexes, not versions.
         if let Some(rest) = key.strip_prefix("npm/") {
-            if rest.contains("/tarballs/") && !ends_with_ci(key, ".sha256") {
+            if rest.contains("/tarballs/")
+                && !ends_with_ci(key, ".sha256")
+                && !ends_with_ci(key, "/metadata.json")
+            {
                 let pkg = rest.split("/tarballs/").next().unwrap_or("");
                 if !pkg.is_empty() {
                     packages
@@ -350,7 +355,14 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
 
     for key in &all_keys {
         if let Some(rest) = key.strip_prefix("pypi/") {
-            if !ends_with_ci(key, ".sha256") {
+            // Skip checksums and metadata.json — metadata is the package index,
+            // not a version artifact. Deleting it makes the package undiscoverable.
+            if !ends_with_ci(key, ".sha256")
+                && !ends_with_ci(key, ".sha1")
+                && !ends_with_ci(key, ".md5")
+                && !ends_with_ci(key, ".sha512")
+                && !ends_with_ci(key, "/metadata.json")
+            {
                 let pkg = rest.split('/').next().unwrap_or("");
                 if !pkg.is_empty() {
                     packages
@@ -511,8 +523,13 @@ pub struct RetentionResult {
 }
 
 /// Run retention across all registries.
+///
+/// `publish_locks` serializes deletions with concurrent publish operations
+/// to prevent race conditions (e.g., deleting a blob while a manifest
+/// referencing it is being written).
 pub async fn run_retention(
     storage: &Storage,
+    publish_locks: &PublishLocks,
     rules: &[RetentionRule],
     dry_run: bool,
 ) -> RetentionResult {
@@ -554,6 +571,10 @@ pub async fn run_retention(
         if !dry_run {
             for plan in &plans {
                 for key in &plan.keys {
+                    // Serialize with concurrent publish to prevent deleting
+                    // an artifact that is being referenced by a new publish.
+                    let lock = crate::acquire_publish_lock(publish_locks, key);
+                    let _guard = lock.lock().await;
                     if storage.delete(key).await.is_ok() {
                         total_deleted_keys += 1;
                     }
@@ -632,8 +653,10 @@ fn find_matching_rule<'a>(
 /// Spawn a background retention task that runs periodically.
 /// Accepts a shared cleanup lock to prevent concurrent runs with GC scheduler.
 /// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_retention_scheduler(
     storage: Storage,
+    publish_locks: PublishLocks,
     rules: Vec<RetentionRule>,
     interval_secs: u64,
     dry_run: bool,
@@ -673,7 +696,7 @@ pub fn spawn_retention_scheduler(
                 dry_run = dry_run,
                 "Retention scheduler: starting periodic run"
             );
-            let result = run_retention(&storage, &rules, dry_run).await;
+            let result = run_retention(&storage, &publish_locks, &rules, dry_run).await;
             info!(
                 "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                 result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
@@ -707,6 +730,10 @@ pub fn spawn_retention_scheduler(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn test_publish_locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
 
     fn make_rule(
         keep_last: Option<u32>,
@@ -893,7 +920,7 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
         assert_eq!(result.planned, 2); // 1.0 and 2.0 deleted, 3.0 kept
         assert!(storage
             .get("maven/com/example/lib/3.0/lib-3.0.jar")
@@ -922,7 +949,7 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &rules, true).await;
+        let result = run_retention(&storage, &test_publish_locks(), &rules, true).await;
         assert_eq!(result.planned, 1);
         assert_eq!(result.deleted_keys, 0); // dry run
                                             // Both still exist
@@ -948,7 +975,7 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
         assert_eq!(result.planned, 0);
     }
 
@@ -973,7 +1000,7 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
         assert!(result.planned >= 1); // at least 1.0 deleted
     }
 
@@ -1011,7 +1038,7 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
         assert_eq!(result.planned, 2); // v1.0.0 and v2.0.0 deleted
         assert_eq!(result.deleted_keys, 6); // 3 files per version * 2
                                             // v3.0.0 kept (newest by name tiebreaker)

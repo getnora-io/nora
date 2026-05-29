@@ -12,6 +12,19 @@ use crate::config::RateLimitConfig;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
 
+/// Convert a "requests per second" value to a replenishment period.
+///
+/// `GovernorConfigBuilder::per_second(N)` sets the replenishment interval to
+/// N *seconds*, not N requests/second. So `per_second(200)` means 1 token
+/// every 200 seconds = 0.005 rps — the opposite of what we want.
+///
+/// For N rps we need: interval = 1000/N milliseconds per token.
+/// For rps > 1000 the result is clamped to 1ms (= 1000 rps effective max).
+fn rps_to_period(rps: u64) -> u64 {
+    debug_assert!(rps > 0, "rate limit rps must be > 0");
+    (1000 / rps.max(1)).max(1)
+}
+
 /// Create rate limiter layer for auth endpoints (strict protection against brute-force)
 pub fn auth_rate_limiter(
     config: &RateLimitConfig,
@@ -21,7 +34,7 @@ pub fn auth_rate_limiter(
     axum::body::Body,
 > {
     let gov_config = GovernorConfigBuilder::default()
-        .per_second(config.auth_rps)
+        .per_millisecond(rps_to_period(config.auth_rps))
         .burst_size(config.auth_burst)
         .use_headers()
         .finish()
@@ -42,7 +55,7 @@ pub fn upload_rate_limiter(
 > {
     let gov_config = GovernorConfigBuilder::default()
         .key_extractor(SmartIpKeyExtractor)
-        .per_second(config.upload_rps)
+        .per_millisecond(rps_to_period(config.upload_rps))
         .burst_size(config.upload_burst)
         .use_headers()
         .finish()
@@ -61,7 +74,7 @@ pub fn general_rate_limiter(
 > {
     let gov_config = GovernorConfigBuilder::default()
         .key_extractor(SmartIpKeyExtractor)
-        .per_second(config.general_rps)
+        .per_millisecond(rps_to_period(config.general_rps))
         .burst_size(config.general_burst)
         .use_headers()
         .finish()
@@ -116,5 +129,22 @@ mod tests {
         let _auth = auth_rate_limiter(&config);
         let _upload = upload_rate_limiter(&config);
         let _general = general_rate_limiter(&config);
+    }
+
+    #[test]
+    fn test_rps_to_period() {
+        // 1 rps → 1000ms per token
+        assert_eq!(rps_to_period(1), 1000);
+        // 200 rps → 5ms per token
+        assert_eq!(rps_to_period(200), 5);
+        // 100 rps → 10ms per token
+        assert_eq!(rps_to_period(100), 10);
+        // 10 rps → 100ms per token
+        assert_eq!(rps_to_period(10), 100);
+        // 1000 rps → 1ms per token
+        assert_eq!(rps_to_period(1000), 1);
+        // >1000 rps → clamped to 1ms (prevents zero period)
+        assert_eq!(rps_to_period(2000), 1);
+        assert_eq!(rps_to_period(10000), 1);
     }
 }
