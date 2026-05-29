@@ -1988,8 +1988,8 @@ impl Config {
             );
         }
         if self.curation.on_failure != CurationOnFailure::Closed {
-            warnings.push(
-                "curation.on_failure is not yet implemented — the setting is parsed but has no effect. All filter errors are treated as closed (blocked). This field will be removed in v0.9".to_string(),
+            errors.push(
+                "curation.on_failure=\"open\" is not implemented and would silently degrade to fail-closed. Remove the setting or set on_failure=\"closed\" explicitly. This field will be removed in v0.9".to_string(),
             );
         }
 
@@ -3668,15 +3668,15 @@ mod tests {
     }
 
     #[test]
-    fn test_curation_on_failure_open_emits_warning() {
+    fn test_curation_on_failure_open_emits_error() {
         let mut config = Config::default();
         config.curation.on_failure = CurationOnFailure::Open;
-        let (warnings, _errors) = config.validate_with_config_path(None);
+        let (_warnings, errors) = config.validate_with_config_path(None);
         assert!(
-            warnings
+            errors
                 .iter()
-                .any(|w| w.contains("on_failure is not yet implemented")),
-            "expected deprecation warning for on_failure=open"
+                .any(|e| e.contains("on_failure=\"open\" is not implemented")),
+            "expected hard error for on_failure=open"
         );
     }
 

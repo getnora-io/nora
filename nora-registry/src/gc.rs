@@ -140,6 +140,10 @@ pub async fn run_gc(storage: &Storage, publish_locks: &PublishLocks, dry_run: bo
             if let Some(meta) = storage.stat(key).await {
                 bytes_freed += meta.size;
             }
+            // Serialize with concurrent publish to prevent deleting an artifact
+            // that is being referenced by a manifest currently being written.
+            let lock = crate::acquire_publish_lock(publish_locks, key);
+            let _guard = lock.lock().await;
             if storage.delete(key).await.is_ok() {
                 deleted += 1;
                 info!("Deleted: {}", key);

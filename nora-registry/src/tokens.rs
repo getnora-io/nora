@@ -350,8 +350,16 @@ impl TokenStore {
             .retain(|k, _| !k.starts_with(hash_prefix));
     }
 
-    /// Revoke a token by its hash prefix
+    /// Revoke a token by its hash prefix.
+    ///
+    /// `hash_prefix` must be exactly 16 lowercase hexadecimal characters (the
+    /// first 16 chars of SHA-256(token)). Anything else is rejected to prevent
+    /// path-traversal attacks via crafted prefixes like `../../etc/passwd`.
     pub fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
+        // SECURITY: validate format before building filesystem path
+        if !is_valid_hash_prefix(hash_prefix) {
+            return Err(TokenError::NotFound);
+        }
         let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
 
         // TOCTOU fix: try remove directly
@@ -388,6 +396,15 @@ impl TokenStore {
 
         count
     }
+}
+
+/// Validate a hash prefix: must be exactly 16 lowercase hex characters (`[0-9a-f]`).
+///
+/// Token files are named `{sha256(token)[..16]}.json` (always lowercase via
+/// `hex::encode`). We restrict to lowercase only to prevent case-mismatch
+/// issues on case-sensitive filesystems.
+fn is_valid_hash_prefix(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Hash a token using Argon2id with random salt
@@ -824,5 +841,44 @@ mod tests {
 
         let tokens = store.list_tokens("testuser");
         assert_eq!(tokens[0].description, Some("CI/CD Pipeline".to_string()));
+    }
+
+    // -- hash_prefix validation (path traversal prevention) --
+
+    #[test]
+    fn test_is_valid_hash_prefix() {
+        assert!(is_valid_hash_prefix("0123456789abcdef"));
+        assert!(is_valid_hash_prefix("deadbeefcafe1234"));
+        // uppercase hex is rejected (token hashes are always lowercase)
+        assert!(!is_valid_hash_prefix("0123456789ABCDEF"));
+    }
+
+    #[test]
+    fn test_is_valid_hash_prefix_rejects_bad() {
+        assert!(!is_valid_hash_prefix(""));
+        assert!(!is_valid_hash_prefix("short"));
+        assert!(!is_valid_hash_prefix("0123456789abcde")); // 15 chars
+        assert!(!is_valid_hash_prefix("0123456789abcdef0")); // 17 chars
+        assert!(!is_valid_hash_prefix("../../etc/passwd")); // path traversal
+        assert!(!is_valid_hash_prefix("..%2f..%2fetcpwd")); // encoded traversal
+        assert!(!is_valid_hash_prefix("zzzzzzzzzzzzzzzz")); // non-hex
+    }
+
+    #[test]
+    fn test_revoke_rejects_path_traversal() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+
+        // Create a decoy file that path traversal would target
+        let decoy = temp_dir.path().join("../decoy.json");
+        let _ = std::fs::write(&decoy, "should not be deleted");
+
+        // Attempt path traversal
+        let result = store.revoke_token("../decoy");
+        assert!(matches!(result, Err(TokenError::NotFound)));
+        let result = store.revoke_token("../../etc/passwd");
+        assert!(matches!(result, Err(TokenError::NotFound)));
+        let result = store.revoke_token("");
+        assert!(matches!(result, Err(TokenError::NotFound)));
     }
 }

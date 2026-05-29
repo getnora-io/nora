@@ -429,7 +429,14 @@ async fn main() {
             }
         }
         Some(Commands::RetentionPlan) => {
-            let result = retention::run_retention(&storage, &config.retention.rules, true).await;
+            let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let result = retention::run_retention(
+                &storage,
+                &cli_publish_locks,
+                &config.retention.rules,
+                true,
+            )
+            .await;
             println!("Retention Plan (dry-run):");
             println!("  Versions to delete: {}", result.planned);
             println!("  Bytes to free:      {}", result.bytes_freed);
@@ -449,10 +456,16 @@ async fn main() {
             print_retention_coverage(&storage, &config.retention.rules).await;
         }
         Some(Commands::RetentionApply { yes }) => {
+            let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             if !yes {
                 // Show plan first, require --yes to execute
-                let result =
-                    retention::run_retention(&storage, &config.retention.rules, true).await;
+                let result = retention::run_retention(
+                    &storage,
+                    &cli_publish_locks,
+                    &config.retention.rules,
+                    true,
+                )
+                .await;
                 println!("Retention Plan:");
                 println!("  Versions to delete: {}", result.planned);
                 println!("  Bytes to free:      {}", result.bytes_freed);
@@ -474,8 +487,13 @@ async fn main() {
                 }
                 print_retention_coverage(&storage, &config.retention.rules).await;
             } else {
-                let result =
-                    retention::run_retention(&storage, &config.retention.rules, false).await;
+                let result = retention::run_retention(
+                    &storage,
+                    &cli_publish_locks,
+                    &config.retention.rules,
+                    false,
+                )
+                .await;
                 println!("Retention Applied:");
                 println!("  Versions deleted:   {}", result.planned);
                 println!("  Keys deleted:       {}", result.deleted_keys);
@@ -1183,6 +1201,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
         let handle = retention::spawn_retention_scheduler(
             state.storage.clone(),
+            state.publish_locks.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,

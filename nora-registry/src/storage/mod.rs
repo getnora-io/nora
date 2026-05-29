@@ -102,7 +102,11 @@ impl Storage {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 if let Some(ref pins) = self.pin_store {
-                    pins.record(key, data);
+                    let pins = Arc::clone(pins);
+                    let key = key.to_string();
+                    let data = data.to_vec();
+                    // SHA-256 + sync file append — offload from tokio worker
+                    tokio::task::spawn_blocking(move || pins.record(&key, &data));
                 }
                 Ok(())
             }
@@ -121,7 +125,20 @@ impl Storage {
             Ok(data) => {
                 STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
                 if let Some(ref pins) = self.pin_store {
-                    if !pins.verify(key, &data) {
+                    let pins = Arc::clone(pins);
+                    let key = key.to_string();
+                    let data_ref = data.clone();
+                    // SHA-256 verification — offload from tokio worker
+                    let ok = match tokio::task::spawn_blocking(move || pins.verify(&key, &data_ref))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "hash verification task failed");
+                            true // fail-open on infra error, not on data
+                        }
+                    };
+                    if !ok {
                         STORAGE_OPERATIONS
                             .with_label_values(&["get", "integrity_fail"])
                             .inc();
@@ -146,7 +163,10 @@ impl Storage {
                     .with_label_values(&["delete", "ok"])
                     .inc();
                 if let Some(ref pins) = self.pin_store {
-                    pins.remove(key);
+                    let pins = Arc::clone(pins);
+                    let key = key.to_string();
+                    // Sync file append — offload from tokio worker
+                    tokio::task::spawn_blocking(move || pins.remove(&key));
                 }
                 Ok(())
             }
