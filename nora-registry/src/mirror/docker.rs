@@ -9,6 +9,17 @@ use crate::registry::docker_auth::DockerAuth;
 use reqwest::Client;
 use std::time::Duration;
 
+/// Typed error for Docker mirror push operations.
+#[derive(Debug, thiserror::Error)]
+enum PushError {
+    #[error("HTTP request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("{context}: status {status}")]
+    Status { context: &'static str, status: u16 },
+    #[error("Missing Location header from upload start")]
+    MissingLocation,
+}
+
 const DEFAULT_REGISTRY: &str = "https://registry-1.docker.io";
 const DEFAULT_TIMEOUT: u64 = 300;
 
@@ -223,7 +234,9 @@ async fn mirror_single_image(
             .map_err(|e| format!("Failed to fetch blob {}: {:?}", digest, e))?;
 
             bytes += blob_data.len() as u64;
-            push_blob(client, nora_base, &image.name, digest, &blob_data).await?;
+            push_blob(client, nora_base, &image.name, digest, &blob_data)
+                .await
+                .map_err(|e| format!("Failed to push blob {}: {}", digest, e))?;
         }
 
         // 5. Push manifest to NORA
@@ -235,7 +248,8 @@ async fn mirror_single_image(
             mf_bytes,
             mf_ct,
         )
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     // If this was a manifest list, also push the list itself
@@ -248,7 +262,8 @@ async fn mirror_single_image(
             &manifest_bytes,
             &content_type,
         )
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     Ok(bytes)
@@ -362,21 +377,20 @@ async fn push_blob(
     name: &str,
     digest: &str,
     data: &[u8],
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     // Start upload session
     let start_url = format!("{}/v2/{}/blobs/uploads/", nora_base, name);
     let response = client
         .post(&start_url)
         .timeout(Duration::from_secs(30))
         .send()
-        .await
-        .map_err(|e| format!("Failed to start blob upload: {}", e))?;
+        .await?;
 
     let location = response
         .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
-        .ok_or("Missing Location header from upload start")?
+        .ok_or(PushError::MissingLocation)?
         .to_string();
 
     // Complete upload with digest
@@ -399,11 +413,14 @@ async fn push_blob(
         .body(data.to_vec())
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT))
         .send()
-        .await
-        .map_err(|e| format!("Failed to upload blob: {}", e))?;
+        .await?;
 
-    if !resp.status().is_success() && resp.status().as_u16() != 201 {
-        return Err(format!("Blob upload failed with status {}", resp.status()));
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() && status != 201 {
+        return Err(PushError::Status {
+            context: "blob upload",
+            status,
+        });
     }
 
     Ok(())
@@ -417,7 +434,7 @@ async fn push_manifest(
     reference: &str,
     data: &[u8],
     content_type: &str,
-) -> Result<(), String> {
+) -> Result<(), PushError> {
     let url = format!("{}/v2/{}/manifests/{}", nora_base, name, reference);
     let resp = client
         .put(&url)
@@ -425,14 +442,14 @@ async fn push_manifest(
         .body(data.to_vec())
         .timeout(Duration::from_secs(30))
         .send()
-        .await
-        .map_err(|e| format!("Failed to push manifest: {}", e))?;
+        .await?;
 
-    if !resp.status().is_success() && resp.status().as_u16() != 201 {
-        return Err(format!(
-            "Manifest push failed with status {}",
-            resp.status()
-        ));
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() && status != 201 {
+        return Err(PushError::Status {
+            context: "manifest push",
+            status,
+        });
     }
 
     Ok(())

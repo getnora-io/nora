@@ -1,0 +1,60 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+use crate::secrets::ProtectedString;
+use serde::{Deserialize, Serialize};
+use std::env;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NpmConfig {
+    #[serde(default = "super::super::default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub proxy_auth: Option<ProtectedString>,
+    #[serde(default = "super::super::default_timeout")]
+    pub proxy_timeout: u64,
+    #[serde(default = "super::super::default_metadata_ttl")]
+    pub metadata_ttl: i64,
+}
+
+impl Default for NpmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proxy: Some("https://registry.npmjs.org".to_string()),
+            proxy_auth: None,
+            proxy_timeout: 30,
+            metadata_ttl: 300,
+        }
+    }
+}
+
+impl NpmConfig {
+    pub(in crate::config) fn apply_env_overrides(&mut self) {
+        if let Ok(val) = env::var("NORA_NPM_ENABLED") {
+            self.enabled = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_NPM_PROXY") {
+            self.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_NPM_PROXY_AUTH") {
+            self.proxy_auth = if val.is_empty() {
+                None
+            } else {
+                Some(ProtectedString::new(val))
+            };
+        }
+        if let Ok(val) = env::var("NORA_NPM_PROXY_TIMEOUT") {
+            if let Ok(timeout) = val.parse() {
+                self.proxy_timeout = timeout;
+            }
+        }
+        if let Ok(val) = env::var("NORA_NPM_METADATA_TTL") {
+            if let Ok(ttl) = val.parse() {
+                self.metadata_ttl = ttl;
+            }
+        }
+    }
+}

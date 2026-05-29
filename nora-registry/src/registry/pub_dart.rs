@@ -491,7 +491,9 @@ fn pub_error_response(status: StatusCode, code: &str, message: &str) -> Response
 }
 
 fn rewrite_package_response(data: &[u8], nora_base: &str, package: &str) -> Result<Vec<u8>, ()> {
-    let mut json: Value = serde_json::from_slice(data).map_err(|_| ())?;
+    let mut json: Value = serde_json::from_slice(data).map_err(|e| {
+        tracing::debug!(error = %e, package, "pub: failed to parse package response");
+    })?;
 
     if let Some(latest) = json.get_mut("latest").and_then(|v| v.as_object_mut()) {
         rewrite_version_object(latest, nora_base, package, false);
@@ -504,20 +506,28 @@ fn rewrite_package_response(data: &[u8], nora_base: &str, package: &str) -> Resu
         }
     }
 
-    serde_json::to_vec(&json).map_err(|_| ())
+    serde_json::to_vec(&json).map_err(|e| {
+        tracing::debug!(error = %e, package, "pub: failed to serialize package response");
+    })
 }
 
 fn rewrite_version_response(data: &[u8], nora_base: &str, package: &str) -> Result<Vec<u8>, ()> {
-    let mut json: Value = serde_json::from_slice(data).map_err(|_| ())?;
+    let mut json: Value = serde_json::from_slice(data).map_err(|e| {
+        tracing::debug!(error = %e, package, "pub: failed to parse version response");
+    })?;
     let Some(obj) = json.as_object_mut() else {
         return Err(());
     };
     rewrite_version_object(obj, nora_base, package, false);
-    serde_json::to_vec(&json).map_err(|_| ())
+    serde_json::to_vec(&json).map_err(|e| {
+        tracing::debug!(error = %e, package, "pub: failed to serialize version response");
+    })
 }
 
 fn rewrite_search_response(data: &[u8], nora_base: &str, proxy_url: &str) -> Result<Vec<u8>, ()> {
-    let mut json: Value = serde_json::from_slice(data).map_err(|_| ())?;
+    let mut json: Value = serde_json::from_slice(data).map_err(|e| {
+        tracing::debug!(error = %e, "pub: failed to parse search response");
+    })?;
 
     if let Some(packages) = json.get_mut("packages").and_then(|v| v.as_array_mut()) {
         for package in packages {
