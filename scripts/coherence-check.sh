@@ -36,17 +36,17 @@ else
 fi
 echo ""
 
-# ── 2. Env vars: README table ⊆ config.rs apply_env_overrides() ──────────
+# ── 2. Env vars: README table ⊆ config/ apply_env_overrides() ──────────
 
 echo "--- Env Vars (README → Code) ---"
 README_VARS=$(grep -oP 'NORA_[A-Z_]+' "$REPO_ROOT/README.md" | sort -u)
-CODE_VARS=$(grep -oP 'NORA_[A-Z_]+' "$REPO_ROOT/nora-registry/src/config.rs" | sort -u)
+CODE_VARS=$(grep -roP 'NORA_[A-Z_]+' "$REPO_ROOT/nora-registry/src/config/" | grep -oP 'NORA_[A-Z_]+' | sort -u)
 
 for var in $README_VARS; do
     if echo "$CODE_VARS" | grep -qx "$var"; then
         ok "$var exists in code"
     else
-        fail "$var in README but NOT in config.rs"
+        fail "$var in README but NOT in config/"
     fi
 done
 echo ""
