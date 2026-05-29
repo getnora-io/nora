@@ -58,17 +58,31 @@ impl S3Storage {
     }
 }
 
-/// Encode `@` in S3 keys to `_at_` for SeaweedFS compatibility.
+/// Encode `@` in S3 keys to `%40` for SeaweedFS compatibility.
 ///
 /// SeaweedFS returns 500 on GET/PUT for keys containing `@`
 /// (e.g. npm scoped packages like `npm/@babel/core/...`).
+///
+/// Uses `%40` (URL-encoding style) instead of `_at_` to avoid roundtrip
+/// collisions with keys containing literal `_at_` (e.g. `look_at_this`) (#534).
 fn encode_s3_key(key: &str) -> String {
+    key.replace('@', "%40")
+}
+
+/// Legacy encoding: `@` → `_at_` (used before #534).
+/// Only needed for fallback reads of pre-migration data.
+fn encode_s3_key_legacy(key: &str) -> String {
     key.replace('@', "_at_")
 }
 
-/// Decode `_at_` back to `@` in S3 keys.
+/// Decode S3 keys back to original form.
+///
+/// Only decodes the current `%40` encoding. Legacy `_at_` keys from pre-#534
+/// data are NOT decoded here — they are handled by fallback reads in `get()`
+/// and `stat()`. This avoids the roundtrip collision where literal `_at_` in
+/// keys (e.g. `cargo/look_at_this/`) would be wrongly decoded as `@`.
 fn decode_s3_key(key: &str) -> String {
-    key.replace("_at_", "@")
+    key.replace("%40", "@")
 }
 
 /// Map object_store errors to StorageError.
@@ -92,9 +106,21 @@ impl StorageBackend for S3Storage {
     async fn get(&self, key: &str) -> Result<Bytes> {
         let encoded = encode_s3_key(key);
         let path = Path::from(encoded);
-        let result = self.store.get(&path).await.map_err(map_err)?;
-        let bytes = result.bytes().await.map_err(map_err)?;
-        Ok(bytes)
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(map_err)?;
+                Ok(bytes)
+            }
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                // Fallback: try legacy _at_ encoding for pre-#534 data.
+                // Only needed when key contains @, since otherwise both schemes produce the same output.
+                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                let result = self.store.get(&legacy_path).await.map_err(map_err)?;
+                let bytes = result.bytes().await.map_err(map_err)?;
+                Ok(bytes)
+            }
+            Err(e) => Err(map_err(e)),
+        }
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -130,7 +156,15 @@ impl StorageBackend for S3Storage {
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_s3_key(key);
         let path = Path::from(encoded);
-        let meta = self.store.head(&path).await.ok()?;
+        let meta = match self.store.head(&path).await {
+            Ok(m) => m,
+            Err(_) if key.contains('@') => {
+                // Fallback: try legacy _at_ encoding for pre-#534 data
+                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                self.store.head(&legacy_path).await.ok()?
+            }
+            Err(_) => return None,
+        };
 
         let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
 
@@ -260,19 +294,30 @@ mod tests {
 
     #[test]
     fn test_encode_s3_key() {
-        assert_eq!(encode_s3_key("npm/@scope/pkg"), "npm/_at_scope/pkg");
+        assert_eq!(encode_s3_key("npm/@scope/pkg"), "npm/%40scope/pkg");
         assert_eq!(
             encode_s3_key("npm/@babel/core/metadata.json"),
-            "npm/_at_babel/core/metadata.json"
+            "npm/%40babel/core/metadata.json"
         );
     }
 
     #[test]
-    fn test_decode_s3_key() {
-        assert_eq!(decode_s3_key("npm/_at_scope/pkg"), "npm/@scope/pkg");
+    fn test_decode_s3_key_new_encoding() {
+        assert_eq!(decode_s3_key("npm/%40scope/pkg"), "npm/@scope/pkg");
+        assert_eq!(
+            decode_s3_key("npm/%40babel/core/metadata.json"),
+            "npm/@babel/core/metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_decode_s3_key_legacy_not_decoded() {
+        // Legacy _at_ keys are NOT decoded by decode_s3_key (avoids #534 collision).
+        // They are handled by fallback reads in get()/stat() instead.
+        assert_eq!(decode_s3_key("npm/_at_scope/pkg"), "npm/_at_scope/pkg");
         assert_eq!(
             decode_s3_key("npm/_at_babel/core/metadata.json"),
-            "npm/@babel/core/metadata.json"
+            "npm/_at_babel/core/metadata.json"
         );
     }
 
@@ -283,15 +328,55 @@ mod tests {
             "npm/@babel/core/metadata.json",
             "simple/key/no-at",
             "raw/@org/file.txt",
+            "cargo/look_at_this/1.0.crate", // #534: was broken with _at_ encoding
+            "npm/some_at_pkg/metadata.json", // literal _at_ in name
         ];
         for key in keys {
-            assert_eq!(decode_s3_key(&encode_s3_key(key)), key);
+            assert_eq!(
+                decode_s3_key(&encode_s3_key(key)),
+                key,
+                "roundtrip failed for: {key}"
+            );
         }
+    }
+
+    /// Regression test for #534: keys with literal `_at_` must not collide.
+    #[test]
+    fn test_no_roundtrip_collision_with_literal_at() {
+        let key = "cargo/look_at_this/1.0.crate";
+        let encoded = encode_s3_key(key);
+        // Must NOT contain _at_ substitution — key has no @
+        assert_eq!(encoded, key);
+        assert_eq!(decode_s3_key(&encoded), key);
     }
 
     #[test]
     fn test_encode_no_at() {
         let key = "npm/chalk/metadata.json";
         assert_eq!(encode_s3_key(key), key);
+    }
+
+    #[test]
+    fn test_legacy_encode_for_fallback() {
+        assert_eq!(encode_s3_key_legacy("npm/@scope/pkg"), "npm/_at_scope/pkg");
+        // Key without @ is unchanged in both schemes
+        assert_eq!(
+            encode_s3_key_legacy("npm/chalk/metadata.json"),
+            "npm/chalk/metadata.json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// For any key containing @, _, or other ASCII chars, roundtrip must hold (#534).
+        #[test]
+        fn s3_key_roundtrip(key in "[a-z0-9@_./-]{1,100}") {
+            prop_assert_eq!(decode_s3_key(&encode_s3_key(&key)), key);
+        }
     }
 }
