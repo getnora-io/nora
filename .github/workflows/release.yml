@@ -321,6 +321,7 @@ jobs:
     with:
       base64-subjects: "${{ needs.build.outputs.hash }}"
       upload-assets: true
+      compile-generator: true
 
   release:
     name: GitHub Release
