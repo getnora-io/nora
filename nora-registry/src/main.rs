@@ -316,7 +316,8 @@ fn log_outbound_proxy() {
 /// When `timeout` is `Some`, a default request timeout is set on the client
 /// (used by `nora mirror` for long-running downloads).
 fn build_http_client(tls: &TlsConfig, timeout: Option<std::time::Duration>) -> reqwest::Client {
-    let mut builder = reqwest::ClientBuilder::new();
+    let mut builder =
+        reqwest::ClientBuilder::new().user_agent(format!("nora/{}", env!("CARGO_PKG_VERSION")));
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -1245,9 +1246,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         // Middleware layer order — LOAD-BEARING, do not reorder (#542).
         //
         // In axum, last .layer() = outermost (runs first). Execution order:
-        //   metrics → auth → leak_detection → request_id → handler
+        //   reject_null_bytes → metrics → auth → leak_detection → request_id → handler
         //
-        // metrics MUST be outermost so it counts ALL responses including
+        // reject_null_bytes MUST be outermost to block null-byte path attacks
+        // before any processing occurs.
+        // metrics MUST be next-outermost so it counts ALL responses including
         // auth rejections (401/403/429) in nora_http_requests_total.
         // request_id is innermost so the ID is available to handlers.
         .layer(middleware::from_fn(request_id::request_id_middleware))
@@ -1260,6 +1263,7 @@ async fn run_server(mut config: Config, storage: Storage) {
             auth::auth_middleware,
         ))
         .layer(middleware::from_fn(metrics::metrics_middleware))
+        .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 
     // Clean up stale Docker upload temp files from previous runs (#530).

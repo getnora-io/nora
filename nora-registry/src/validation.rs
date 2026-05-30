@@ -6,6 +6,12 @@
 //! Provides security validation to prevent path traversal attacks and
 //! ensure inputs conform to protocol specifications.
 
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use std::fmt;
 
 /// Validation errors
@@ -327,6 +333,28 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
     }
 
     Ok(())
+}
+
+/// Middleware that rejects requests with null bytes in the URI path.
+///
+/// Null bytes in URLs are used in path-traversal attacks. Axum URL-decodes
+/// `%00` before passing the path to handlers, which can cause panics or
+/// unexpected 500 errors. This middleware intercepts null bytes early and
+/// returns a clean 400 Bad Request.
+pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+
+    // Check for literal null byte (already URL-decoded by hyper) or
+    // percent-encoded null byte in the raw URI.
+    if path.contains('\0') || path.contains("%00") || path.contains("%2500") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Bad Request: null byte in URL path",
+        )
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 #[cfg(test)]
