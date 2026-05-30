@@ -76,6 +76,7 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 ENV RUST_LOG=info \
     NORA_HOST=0.0.0.0 \
     NORA_PORT=4000 \
+    NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \
     NORA_AUTH_TOKEN_STORAGE=/data/tokens
 
@@ -103,6 +104,7 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 ENV RUST_LOG=info \
     NORA_HOST=0.0.0.0 \
     NORA_PORT=4000 \
+    NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \
     NORA_AUTH_TOKEN_STORAGE=/data/tokens
 
@@ -129,6 +131,7 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 ENV RUST_LOG=info \
     NORA_HOST=0.0.0.0 \
     NORA_PORT=4000 \
+    NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \
     NORA_AUTH_TOKEN_STORAGE=/data/tokens
 
