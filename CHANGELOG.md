@@ -1,6 +1,48 @@
 # Changelog
 ## [Unreleased]
 
+## [0.9.3] - 2026-05-30
+
+### Security
+- **Null byte rejection middleware** — new outermost layer returns 400 Bad Request for URL paths containing `\0`, `%00`, or `%2500`; previously caused 500/panic in handlers (#565)
+- **Path traversal hardening** — additional guards against `../` and symlink-based traversal (#560)
+- **Rate limit inversion fix** — rate limiter no longer inverts allow/deny logic in certain edge cases (#560)
+- **javascript: URI injection** — metadata links with `javascript:` scheme are now stripped (#522, #546)
+- **Reflected XSS in install commands** — UI install commands are now HTML-escaped (#521, #545)
+- **Invalid quarantine/curation/audit mode values rejected** — fail-closed on unknown values (#524, #548)
+- **Credential fields migrated to ProtectedString** — secrets zeroed on drop, excluded from Debug (#523, #547)
+- **Dependency update: tar 0.4.45 → 0.4.46** — fixes PAX header desynchronization (GHSA-3pv8-6f4r-ffg2)
+
+### Fixed
+- **Cargo proxy User-Agent** — set `nora/<version>` User-Agent on the shared HTTP client; crates.io returns 403 without it (#565)
+- **Docker TOCTOU race** — upload session creation now uses atomic file operations; orphaned temp files cleaned on startup (#530, #554)
+- **Docker blob HEAD check** — use `stat()` instead of full `get()` for HEAD requests; fix `Bytes` refcount on proxy clone (#526, #550)
+- **npm publish with corrupt metadata** — reject publish when existing metadata JSON is malformed (#533, #558)
+- **Terraform serve-stale** — serve cached metadata when upstream is unreachable (#532, #557)
+- **Go Cache-Control** — use `is_mutable` flag instead of `content_type` for header selection (#531, #556)
+- **S3 key roundtrip collision** — use `%40` encoding for `@` in S3 storage keys (#534, #559)
+- **GC metadata serialization** — serialize metadata cleanup with `publish_lock`, make `put()` atomic (#529, #553)
+- **StorageBackend::list()** — now returns `Result` instead of panicking on I/O error (#528, #552)
+- **Auth token cache key alignment** — insert and lookup use the same key format (#527, #551)
+- **Auth CIDR prefix=0 overflow** — handle arithmetic overflow in TrustedProxies parsing (#525, #549)
+- **Base URL wildcard host** — fail-fast on startup if host is `0.0.0.0` without `NORA_PUBLIC_URL` (#510, #511, #512)
+- **Metrics body size_hint** — leak detection guard uses `size_hint` instead of `content_length` (#517, #519)
+
+### Changed
+- **Config refactor** — `config.rs` split into per-registry config modules for maintainability (#484, #564)
+- **AppState Clone** — `AppState` now implements `Clone` for Axum `FromRef` decomposition (#483, #516)
+- **Proxy fetch newtypes** — replaced stringly-typed proxy parameters with newtypes (#482, #515)
+- **LazyLock migration** — replaced `lazy_static!` with `std::sync::LazyLock` (#373, #480, #514)
+- **LOCK-SAFE annotations** — all cache-through proxy functions annotated with lock safety guarantees (#518, #520)
+- **Rust toolchain pinned to 1.96.0** (#555)
+
+### Added
+- **Playwright E2E contract tests** — typed contracts for all 13 registry UI pages, visual regression screenshots (#565)
+- **1204 tests** (up from 1086 in v0.9.2)
+
+### Breaking
+- **`NORA_PUBLIC_URL` required** when `host=0.0.0.0` — prevents misconfigured URL rewriting. Set `NORA_PUBLIC_URL=https://your-domain.com` in your environment. (#510, #512)
+
 ## [0.9.2] - 2026-05-23
 
 ### Added

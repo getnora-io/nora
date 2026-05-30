@@ -16,7 +16,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
 - **13 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++).
-- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 1040+ tests.
+- **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 1200+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -152,6 +152,7 @@ docker run -d -p 4000:4000 \
 - ~~Circuit breaker, OIDC, hot reload, arm64, streaming uploads~~ ✅ v0.9.0
 - ~~NuGet V3 stabilization, Cargo ETag, 1049 tests~~ ✅ v0.9.1
 - ~~Prometheus metrics, Ansible Galaxy v3, security fixes, 1086 tests~~ ✅ v0.9.2
+- ~~Security hardening, null byte protection, config refactor, 1204 tests~~ ✅ v0.9.3
 - **Image Signing Policy** — cosign verification on upstream pulls
 - **Semver contract** — stable API, configuration format, and storage layout
 
