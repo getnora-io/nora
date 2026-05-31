@@ -65,8 +65,9 @@ async fn prerelease_specs_index(State(state): State<AppState>) -> Response {
 async fn fetch_index(state: &AppState, filename: &str) -> Response {
     let storage_key = format!("gems/{}", filename);
 
-    // Check TTL: if cached and fresh, serve from cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Eager cache read — preserve data for serve-stale fallback
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
@@ -116,6 +117,35 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.gems.serve_stale {
+                    tracing::warn!(
+                        registry = "gems",
+                        filename,
+                        error = ?e,
+                        "RubyGems upstream error, serving stale index"
+                    );
+                    return (
+                        StatusCode::OK,
+                        [
+                            (
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/gzip"),
+                            ),
+                            (
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                            ),
+                            (
+                                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                                HeaderValue::from_static("true"),
+                            ),
+                        ],
+                        data.to_vec(),
+                    )
+                        .into_response();
+                }
+            }
             tracing::debug!(filename, error = ?e, "RubyGems upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -148,8 +178,9 @@ async fn compact_index(
 
     let storage_key = format!("gems/info/{}", name);
 
-    // Check TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Eager cache read — preserve data for serve-stale fallback
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
@@ -198,6 +229,35 @@ async fn compact_index(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.gems.serve_stale {
+                    tracing::warn!(
+                        registry = "gems",
+                        name = %name,
+                        error = ?e,
+                        "RubyGems upstream error, serving stale compact index"
+                    );
+                    return (
+                        StatusCode::OK,
+                        [
+                            (
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/plain; charset=utf-8"),
+                            ),
+                            (
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                            ),
+                            (
+                                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                                HeaderValue::from_static("true"),
+                            ),
+                        ],
+                        data.to_vec(),
+                    )
+                        .into_response();
+                }
+            }
             tracing::debug!(error = ?e, "RubyGems compact index error");
             StatusCode::BAD_GATEWAY.into_response()
         }

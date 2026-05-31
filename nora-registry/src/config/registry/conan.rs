@@ -19,6 +19,8 @@ pub struct ConanConfig {
     pub proxy_timeout_dl: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    #[serde(default = "super::super::default_true")]
+    pub serve_stale: bool,
 }
 
 fn default_conan_proxy() -> Option<String> {
@@ -34,6 +36,7 @@ impl Default for ConanConfig {
             proxy_timeout: 30,
             proxy_timeout_dl: 120,
             metadata_ttl: 300,
+            serve_stale: true,
         }
     }
 }
@@ -65,6 +68,9 @@ impl ConanConfig {
         }
         if let Ok(val) = env::var("NORA_CONAN_METADATA_TTL") {
             super::super::parse_env_warn("NORA_CONAN_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_CONAN_SERVE_STALE") {
+            self.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
     }
 }

@@ -170,7 +170,36 @@ async fn handle_request(
                     if let Some(fresh) = refetch_metadata(&state, &path, &key).await {
                         return with_content_type(false, fresh.into()).into_response();
                     }
-                    // Upstream failed — serve stale cache
+                    // Upstream failed — serve stale if configured, otherwise 502
+                    if state.config.npm.serve_stale {
+                        tracing::warn!(
+                            registry = "npm",
+                            path = %path,
+                            "npm upstream unavailable, serving stale metadata"
+                        );
+                        return (
+                            StatusCode::OK,
+                            [
+                                (
+                                    header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static("application/json"),
+                                ),
+                                (
+                                    header::CACHE_CONTROL,
+                                    axum::http::HeaderValue::from_static(
+                                        "public, max-age=0, must-revalidate",
+                                    ),
+                                ),
+                                (
+                                    axum::http::header::HeaderName::from_static("x-nora-stale"),
+                                    axum::http::HeaderValue::from_static("true"),
+                                ),
+                            ],
+                            data.to_vec(),
+                        )
+                            .into_response();
+                    }
+                    return StatusCode::BAD_GATEWAY.into_response();
                 }
             }
             return with_content_type(false, data).into_response();

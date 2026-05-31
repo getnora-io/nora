@@ -186,8 +186,9 @@ async fn recipe_latest(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let storage_key = format!("conan/{}/latest.json", ref_str);
 
-    // TTL cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Eager cache read — preserve data for serve-stale fallback
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
@@ -204,7 +205,7 @@ async fn recipe_latest(
         ref_str
     );
 
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str).await
+    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
 }
 
 // ── Recipe revisions (TTL cached) ─────────────────────────────────────
@@ -220,7 +221,8 @@ async fn recipe_revisions(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let storage_key = format!("conan/{}/revisions.json", ref_str);
 
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
@@ -237,7 +239,7 @@ async fn recipe_revisions(
         ref_str
     );
 
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str).await
+    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
 }
 
 // ── Recipe file listing (immutable — scoped to revision) ──────────────
@@ -419,7 +421,8 @@ async fn package_latest(
         ref_str, rrev, pkg_id
     );
 
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
@@ -438,7 +441,7 @@ async fn package_latest(
         pkg_id
     );
 
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str).await
+    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
 }
 
 // ── Package revisions (TTL cached) ────────────────────────────────────
@@ -470,7 +473,8 @@ async fn package_revisions(
         ref_str, rrev, pkg_id
     );
 
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let cached_data = state.storage.get(&storage_key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
@@ -489,7 +493,7 @@ async fn package_revisions(
         pkg_id
     );
 
-    fetch_and_cache_json(&state, &url, &storage_key, &ref_str).await
+    fetch_and_cache_json(&state, &url, &storage_key, &ref_str, cached_data).await
 }
 
 // ── Package file listing (immutable — scoped to PREV) ─────────────────
@@ -674,6 +678,7 @@ async fn fetch_and_cache_json(
     url: &str,
     storage_key: &str,
     artifact: &str,
+    cached: Option<Bytes>,
 ) -> Response {
     match proxy_fetch_text(
         &state.http_client,
@@ -705,6 +710,35 @@ async fn fetch_and_cache_json(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
+            if let Some(ref data) = cached {
+                if state.config.conan.serve_stale {
+                    tracing::warn!(
+                        registry = "conan",
+                        artifact,
+                        error = ?e,
+                        "Conan upstream error, serving stale metadata"
+                    );
+                    return (
+                        StatusCode::OK,
+                        [
+                            (
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            ),
+                            (
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+                            ),
+                            (
+                                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                                HeaderValue::from_static("true"),
+                            ),
+                        ],
+                        data.to_vec(),
+                    )
+                        .into_response();
+                }
+            }
             tracing::debug!(url, error = ?e, "Conan upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }

@@ -1486,7 +1486,17 @@ async fn get_manifest(
                 reference = %reference,
                 "Upstream failed, serving stale cached manifest"
             );
-            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+            let mut response =
+                serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+            response.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                axum::http::header::HeaderValue::from_static("true"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::header::HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            );
+            return response;
         }
     }
 

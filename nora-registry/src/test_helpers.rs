@@ -105,6 +105,7 @@ fn build_context(
             proxy_auth: None,
             proxy_timeout: 5,
             metadata_ttl: -1,
+            serve_stale: true,
         },
         pypi: PypiConfig {
             enabled: true,
