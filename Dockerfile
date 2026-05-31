@@ -85,7 +85,7 @@ VOLUME ["/data"]
 USER nora
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -sf http://localhost:4000/health || exit 1
+  CMD curl -sf http://127.0.0.1:4000/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
@@ -113,7 +113,7 @@ VOLUME ["/data"]
 USER nora
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -sf http://localhost:4000/health || exit 1
+  CMD curl -sf http://127.0.0.1:4000/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]
@@ -140,7 +140,7 @@ VOLUME ["/data"]
 USER nora
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -q --spider http://localhost:4000/health || exit 1
+  CMD wget -q --spider http://127.0.0.1:4000/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/nora"]
 CMD ["serve"]

@@ -1271,7 +1271,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
     }
 
-    let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
+    let addr = state.config.server.bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind");
