@@ -10,7 +10,8 @@ REPO="getnora-io/nora"
 GHCR_REGISTRY="ghcr.io/getnora-io/nora"
 DOCKERHUB_REGISTRY="docker.io/getnora/nora"
 VARIANTS=("" "-redos" "-astra")
-PORT="${GATE_PORT:-14100}"
+BINARY_PORT="${GATE_PORT:-14100}"
+DOCKER_PORT="$((BINARY_PORT + 100))"
 PASSED=0
 FAILED=0
 VERSIONS_COLLECTED=()
@@ -129,7 +130,7 @@ if [ -f "$WORK_DIR/nora-linux-amd64" ] && [ -f "$WORK_DIR/nora-linux-amd64.sha25
 
     # Health check via serve
     NORA_HOST=127.0.0.1 \
-    NORA_PORT=$PORT \
+    NORA_PORT=$BINARY_PORT \
     NORA_STORAGE_PATH="$WORK_DIR/data" \
     NORA_RATE_LIMIT_ENABLED=false \
     "$WORK_DIR/nora-linux-amd64" serve &
@@ -137,7 +138,7 @@ if [ -f "$WORK_DIR/nora-linux-amd64" ] && [ -f "$WORK_DIR/nora-linux-amd64.sha25
 
     HEALTHY=false
     for _ in $(seq 1 20); do
-        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        if curl -sf "http://127.0.0.1:${BINARY_PORT}/health" >/dev/null 2>&1; then
             HEALTHY=true
             break
         fi
@@ -145,7 +146,7 @@ if [ -f "$WORK_DIR/nora-linux-amd64" ] && [ -f "$WORK_DIR/nora-linux-amd64.sha25
     done
 
     if [ "$HEALTHY" = true ]; then
-        HEALTH_JSON=$(curl -sf "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "{}")
+        HEALTH_JSON=$(curl -sf "http://127.0.0.1:${BINARY_PORT}/health" 2>/dev/null || echo "{}")
         HEALTH_VERSION=$(echo "$HEALTH_JSON" | jq -r '.version // empty' 2>/dev/null || echo "")
         if [ "$HEALTH_VERSION" = "$VERSION" ]; then
             pass "Binary /health version = $VERSION"
@@ -185,15 +186,15 @@ for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
 
         # Run container, health check, verify version
         docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-        docker run --rm -d \
+        docker run -d \
             --name "$CONTAINER_NAME" \
-            -p "${PORT}:4000" \
+            -p "${DOCKER_PORT}:4000" \
             -e NORA_HOST=0.0.0.0 \
             "$IMAGE" >/dev/null 2>&1
 
         HEALTHY=false
         for _ in $(seq 1 15); do
-            if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${DOCKER_PORT}/health" >/dev/null 2>&1; then
                 HEALTHY=true
                 break
             fi
@@ -201,7 +202,7 @@ for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
         done
 
         if [ "$HEALTHY" = true ]; then
-            DOCKER_HEALTH=$(curl -sf "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "{}")
+            DOCKER_HEALTH=$(curl -sf "http://127.0.0.1:${DOCKER_PORT}/health" 2>/dev/null || echo "{}")
             DOCKER_VERSION=$(echo "$DOCKER_HEALTH" | jq -r '.version // empty' 2>/dev/null || echo "")
             if [ "$DOCKER_VERSION" = "$VERSION" ]; then
                 pass "Docker $LABEL /health version = $VERSION"
@@ -211,6 +212,9 @@ for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
                 [ -n "$DOCKER_VERSION" ] && VERSIONS_COLLECTED+=("docker-${LABEL}=$DOCKER_VERSION")
             fi
         else
+            echo "  --- docker logs $LABEL ---"
+            docker logs "$CONTAINER_NAME" 2>&1 | tail -20 || true
+            echo "  --- end logs ---"
             fail "Docker $LABEL did not become healthy"
         fi
 
