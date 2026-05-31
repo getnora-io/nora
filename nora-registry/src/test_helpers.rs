@@ -132,6 +132,7 @@ fn build_context(
             read_timeout: 60,
             metadata_ttl: -1,
             serve_stale: true,
+            default_action: crate::config::DefaultAction::Allow,
             upstreams: vec![],
         },
         raw: RawConfig {

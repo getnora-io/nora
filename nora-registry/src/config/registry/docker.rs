@@ -4,6 +4,29 @@
 use crate::secrets::ProtectedString;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fmt;
+
+/// Controls behavior when a Docker image name doesn't match any configured
+/// upstream prefix or known hostname.
+///
+/// - `Allow` (default): fall through to the first upstream (current behavior).
+/// - `Deny`: reject the request with 403, preventing unintended upstream queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultAction {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl fmt::Display for DefaultAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => f.write_str("allow"),
+            Self::Deny => f.write_str("deny"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerConfig {
@@ -17,6 +40,10 @@ pub struct DockerConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// What to do when an image name doesn't match any upstream prefix.
+    /// `allow` (default) = fall through to first upstream; `deny` = reject with 403.
+    #[serde(default)]
+    pub default_action: DefaultAction,
     #[serde(default)]
     pub upstreams: Vec<DockerUpstream>,
 }
@@ -78,6 +105,7 @@ impl Default for DockerConfig {
             read_timeout: 60,
             metadata_ttl: -1,
             serve_stale: true,
+            default_action: DefaultAction::default(),
             upstreams: vec![DockerUpstream {
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
@@ -108,6 +136,16 @@ impl DockerConfig {
         }
         if let Ok(val) = env::var("NORA_DOCKER_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_DEFAULT_ACTION") {
+            match val.to_lowercase().as_str() {
+                "deny" => self.default_action = DefaultAction::Deny,
+                "allow" => self.default_action = DefaultAction::Allow,
+                _ => tracing::warn!(
+                    value = %val,
+                    "Invalid NORA_DOCKER_DEFAULT_ACTION (expected 'allow' or 'deny'), ignoring"
+                ),
+            }
         }
         if let Ok(val) =
             env::var("NORA_DOCKER_PROXIES").or_else(|_| env::var("NORA_DOCKER_UPSTREAMS"))

@@ -608,6 +608,18 @@ impl Config {
             }
         }
 
+        // 9b. Docker default_action=deny without any prefixed upstream is a no-op trap
+        if self.docker.default_action == DefaultAction::Deny
+            && self.docker.enabled
+            && !self.docker.upstreams.iter().any(|u| u.prefix.is_some())
+        {
+            warnings.push(
+                "docker.default_action=\"deny\" but no upstream has a prefix configured — \
+                 all requests will be denied. Add prefix= to at least one [[docker.upstreams]]"
+                    .to_string(),
+            );
+        }
+
         // 10. [registries].enable validation
         if let Some(ref section) = self.registries {
             if let Some(ref spec) = section.enable {

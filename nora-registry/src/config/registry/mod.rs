@@ -22,7 +22,7 @@ pub use self::cargo::CargoConfig;
 pub use self::conan::ConanConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
 #[allow(unused_imports)]
-pub use self::docker::{extract_docker_namespace, DockerConfig, DockerUpstream};
+pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, DockerUpstream};
 pub use self::gems::GemsConfig;
 pub use self::go::GoConfig;
 #[allow(unused_imports)]

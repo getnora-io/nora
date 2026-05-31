@@ -80,6 +80,8 @@ pub(crate) struct Canonical {
     pub namespace: Option<String>,
     /// Index of the prefix-matched upstream in the config, if any.
     matched_upstream_idx: Option<usize>,
+    /// When true, the request should be rejected (no prefix match in deny mode).
+    pub denied: bool,
 }
 
 impl Canonical {
@@ -96,6 +98,31 @@ impl Canonical {
             None => upstreams.iter().collect(),
         }
     }
+
+    /// Return a 403 response if this request was denied by `default_action = "deny"`.
+    pub fn denied_response(&self) -> Option<axum::response::Response> {
+        if self.denied {
+            tracing::warn!(
+                name = %self.name,
+                "Docker request denied: image name did not match any configured upstream prefix"
+            );
+            Some(
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "errors": [{
+                            "code": "DENIED",
+                            "message": "image name does not match any configured upstream prefix",
+                            "detail": "default_action is set to deny"
+                        }]
+                    })),
+                )
+                    .into_response(),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 /// Canonicalize a Docker image name: resolve upstream, strip prefix/hostname,
@@ -107,11 +134,15 @@ impl Canonical {
 /// Resolution order (early-return):
 /// 1. Prefix match — first path segment matches a configured upstream prefix
 /// 2. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
-/// 3. Fallback — use the first configured upstream, keep name as-is
+/// 3. Fallback — if `default_action = deny`, mark as denied; otherwise use
+///    the first configured upstream
 pub(crate) fn canonicalize(
     raw_name: &str,
-    upstreams: &[crate::config::DockerUpstream],
+    docker_config: &crate::config::DockerConfig,
 ) -> Canonical {
+    let upstreams = &docker_config.upstreams;
+    let deny_mode = docker_config.default_action == crate::config::DefaultAction::Deny;
+
     // Step 1: Check for prefix-based routing
     if let Some((first_segment, rest)) = raw_name.split_once('/') {
         for (idx, upstream) in upstreams.iter().enumerate() {
@@ -128,6 +159,7 @@ pub(crate) fn canonicalize(
                         name: rest.to_string(),
                         namespace: Some(upstream.resolved_namespace()),
                         matched_upstream_idx: Some(idx),
+                        denied: false,
                     };
                 }
             }
@@ -143,6 +175,7 @@ pub(crate) fn canonicalize(
                         name: rest.to_string(),
                         namespace: Some(ns),
                         matched_upstream_idx: Some(idx),
+                        denied: false,
                     };
                 }
             }
@@ -152,6 +185,7 @@ pub(crate) fn canonicalize(
                 name: rest.to_string(),
                 namespace: ns,
                 matched_upstream_idx: None,
+                denied: deny_mode,
             };
         }
     }
@@ -162,6 +196,7 @@ pub(crate) fn canonicalize(
         name: raw_name.to_string(),
         namespace: ns,
         matched_upstream_idx: None,
+        denied: deny_mode,
     }
 }
 
@@ -610,7 +645,7 @@ async fn catalog(State(state): State<AppState>) -> Response {
             }
             // Canonicalize to strip upstream namespace prefix (e.g. "docker.io/")
             // so that images proxied through different upstreams are deduplicated.
-            Some(canonicalize(name, &state.config.docker.upstreams).name)
+            Some(canonicalize(name, &state.config.docker).name)
         })
         .collect();
 
@@ -624,7 +659,10 @@ async fn check_blob(
     State(state): State<AppState>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -652,7 +690,10 @@ async fn download_blob(
     headers: axum::http::HeaderMap,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
@@ -801,7 +842,11 @@ async fn download_blob(
 }
 
 async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let name = canonicalize(&name, &state.config.docker.upstreams).name;
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -859,7 +904,11 @@ async fn patch_blob(
     Path((name, uuid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let name = canonicalize(&name, &state.config.docker.upstreams).name;
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1005,7 +1054,11 @@ async fn upload_blob(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    let name = canonicalize(&name, &state.config.docker.upstreams).name;
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1336,7 +1389,10 @@ async fn get_manifest(
     headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
@@ -1513,7 +1569,11 @@ async fn put_manifest(
     Path((name, reference)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let name = canonicalize(&name, &state.config.docker.upstreams).name;
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1592,7 +1652,10 @@ async fn put_manifest(
 }
 
 async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let ns = c.namespace;
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
@@ -1641,7 +1704,10 @@ async fn delete_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
 ) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let ns = c.namespace;
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
@@ -1761,7 +1827,10 @@ async fn delete_blob(
     State(state): State<AppState>,
     Path((name, digest)): Path<(String, String)>,
 ) -> Response {
-    let c = canonicalize(&name, &state.config.docker.upstreams);
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
     let ns = c.namespace;
     let name = c.name;
     if let Err(e) = validate_docker_name(&name) {
@@ -3385,6 +3454,28 @@ mod integration_tests {
         assert_eq!(repos, vec!["library/nginx"]);
     }
 
+    /// Build a DockerConfig with the given upstreams and default_action = Allow.
+    fn docker_config_allow(
+        upstreams: Vec<crate::config::DockerUpstream>,
+    ) -> crate::config::DockerConfig {
+        crate::config::DockerConfig {
+            upstreams,
+            default_action: crate::config::DefaultAction::Allow,
+            ..Default::default()
+        }
+    }
+
+    /// Build a DockerConfig with the given upstreams and default_action = Deny.
+    fn docker_config_deny(
+        upstreams: Vec<crate::config::DockerUpstream>,
+    ) -> crate::config::DockerConfig {
+        crate::config::DockerConfig {
+            upstreams,
+            default_action: crate::config::DefaultAction::Deny,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_canonicalize_prefix_routing() {
         let upstreams = vec![crate::config::DockerUpstream {
@@ -3393,11 +3484,13 @@ mod integration_tests {
             namespace: Some("docker.io".to_string()),
             prefix: Some("docker-hub".to_string()),
         }];
+        let cfg = docker_config_allow(upstreams.clone());
 
-        let c = super::canonicalize("docker-hub/library/nginx", &upstreams);
+        let c = super::canonicalize("docker-hub/library/nginx", &cfg);
         assert_eq!(c.name, "library/nginx");
         assert_eq!(c.namespace.as_deref(), Some("docker.io"));
         assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+        assert!(!c.denied);
     }
 
     #[test]
@@ -3408,19 +3501,22 @@ mod integration_tests {
             namespace: Some("docker.io".to_string()),
             prefix: None,
         }];
+        let cfg = docker_config_allow(upstreams.clone());
 
-        let c = super::canonicalize("docker.io/library/nginx", &upstreams);
+        let c = super::canonicalize("docker.io/library/nginx", &cfg);
         assert_eq!(c.name, "library/nginx");
         assert_eq!(c.namespace.as_deref(), Some("docker.io"));
         // Known namespace matches specific upstream
         assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+        assert!(!c.denied);
 
         // Unknown hostname → strip but use default upstream
-        let c2 = super::canonicalize("ghcr.io/requarks/wiki", &upstreams);
+        let c2 = super::canonicalize("ghcr.io/requarks/wiki", &cfg);
         assert_eq!(c2.name, "requarks/wiki");
         assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
         // No specific match → all upstreams
         assert_eq!(c2.upstreams_to_try(&upstreams).len(), 1); // only 1 configured
+        assert!(!c2.denied); // Allow mode → not denied
     }
 
     #[test]
@@ -3431,27 +3527,32 @@ mod integration_tests {
             namespace: Some("docker.io".to_string()),
             prefix: None,
         }];
+        let cfg = docker_config_allow(upstreams.clone());
 
         // No prefix, no dot in first segment → fallback
-        let c = super::canonicalize("library/nginx", &upstreams);
+        let c = super::canonicalize("library/nginx", &cfg);
         assert_eq!(c.name, "library/nginx");
         assert_eq!(c.namespace.as_deref(), Some("docker.io"));
         assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
+        assert!(!c.denied);
 
         // Single segment
-        let c2 = super::canonicalize("alpine", &upstreams);
+        let c2 = super::canonicalize("alpine", &cfg);
         assert_eq!(c2.name, "alpine");
         assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
+        assert!(!c2.denied);
     }
 
     #[test]
     fn test_canonicalize_empty_upstreams() {
         let upstreams: Vec<crate::config::DockerUpstream> = vec![];
+        let cfg = docker_config_allow(upstreams.clone());
 
-        let c = super::canonicalize("library/nginx", &upstreams);
+        let c = super::canonicalize("library/nginx", &cfg);
         assert_eq!(c.name, "library/nginx");
         assert!(c.namespace.is_none());
         assert!(c.upstreams_to_try(&upstreams).is_empty());
+        assert!(!c.denied);
     }
 
     #[test]
@@ -3470,18 +3571,98 @@ mod integration_tests {
                 prefix: Some("ghcr".to_string()),
             },
         ];
+        let cfg = docker_config_allow(upstreams.clone());
 
         // Prefix routes to specific upstream
-        let c1 = super::canonicalize("ghcr/requarks/wiki", &upstreams);
+        let c1 = super::canonicalize("ghcr/requarks/wiki", &cfg);
         assert_eq!(c1.name, "requarks/wiki");
         assert_eq!(c1.namespace.as_deref(), Some("ghcr.io"));
         let targets = c1.upstreams_to_try(&upstreams);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].url, "https://ghcr.io");
+        assert!(!c1.denied);
 
-        // No prefix match → all upstreams
-        let c2 = super::canonicalize("library/nginx", &upstreams);
+        // No prefix match → all upstreams (allow mode)
+        let c2 = super::canonicalize("library/nginx", &cfg);
         assert_eq!(c2.name, "library/nginx");
         assert_eq!(c2.upstreams_to_try(&upstreams).len(), 2);
+        assert!(!c2.denied);
+    }
+
+    #[test]
+    fn test_canonicalize_deny_mode_blocks_unmatched() {
+        let upstreams = vec![
+            crate::config::DockerUpstream {
+                url: "https://registry-1.docker.io".to_string(),
+                auth: None,
+                namespace: Some("docker.io".to_string()),
+                prefix: Some("docker-hub".to_string()),
+            },
+            crate::config::DockerUpstream {
+                url: "https://ghcr.io".to_string(),
+                auth: None,
+                namespace: Some("ghcr.io".to_string()),
+                prefix: Some("ghcr".to_string()),
+            },
+        ];
+        let cfg = docker_config_deny(upstreams.clone());
+
+        // Prefix match → allowed even in deny mode
+        let c1 = super::canonicalize("ghcr/requarks/wiki", &cfg);
+        assert!(!c1.denied);
+        assert_eq!(c1.name, "requarks/wiki");
+
+        // No prefix match → denied
+        let c2 = super::canonicalize("library/nginx", &cfg);
+        assert!(c2.denied);
+        assert!(c2.denied_response().is_some());
+
+        // Single segment (no slash) → denied
+        let c3 = super::canonicalize("alpine", &cfg);
+        assert!(c3.denied);
+
+        // Unknown hostname → denied
+        let c4 = super::canonicalize("quay.io/prometheus/node-exporter", &cfg);
+        assert!(c4.denied);
+    }
+
+    #[test]
+    fn test_canonicalize_deny_mode_allows_known_hostname() {
+        let upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".to_string(),
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: None,
+        }];
+        let cfg = docker_config_deny(upstreams.clone());
+
+        // Known namespace hostname → matched upstream → allowed
+        let c = super::canonicalize("docker.io/library/nginx", &cfg);
+        assert!(!c.denied);
+        assert_eq!(c.name, "library/nginx");
+        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
+    }
+
+    #[test]
+    fn test_denied_response_format() {
+        let upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".to_string(),
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: Some("hub".to_string()),
+        }];
+        let cfg = docker_config_deny(upstreams);
+
+        let c = super::canonicalize("library/nginx", &cfg);
+        assert!(c.denied);
+
+        // denied_response returns Some for denied requests
+        let resp = c.denied_response();
+        assert!(resp.is_some());
+
+        // Non-denied request returns None
+        let c2 = super::canonicalize("hub/library/nginx", &cfg);
+        assert!(!c2.denied);
+        assert!(c2.denied_response().is_none());
     }
 }
