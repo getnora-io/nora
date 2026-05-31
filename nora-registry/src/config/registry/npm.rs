@@ -17,6 +17,8 @@ pub struct NpmConfig {
     pub proxy_timeout: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    #[serde(default = "super::super::default_true")]
+    pub serve_stale: bool,
 }
 
 impl Default for NpmConfig {
@@ -27,6 +29,7 @@ impl Default for NpmConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            serve_stale: true,
         }
     }
 }
@@ -51,6 +54,9 @@ impl NpmConfig {
         }
         if let Ok(val) = env::var("NORA_NPM_METADATA_TTL") {
             super::super::parse_env_warn("NORA_NPM_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_NPM_SERVE_STALE") {
+            self.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
     }
 }

@@ -17,6 +17,8 @@ pub struct PubDartConfig {
     pub proxy_timeout: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    #[serde(default = "super::super::default_true")]
+    pub serve_stale: bool,
 }
 
 fn default_pub_proxy() -> Option<String> {
@@ -31,6 +33,7 @@ impl Default for PubDartConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            serve_stale: true,
         }
     }
 }
@@ -55,6 +58,9 @@ impl PubDartConfig {
         }
         if let Ok(val) = env::var("NORA_PUB_METADATA_TTL") {
             super::super::parse_env_warn("NORA_PUB_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_PUB_SERVE_STALE") {
+            self.serve_stale = !matches!(val.as_str(), "false" | "0");
         }
     }
 }

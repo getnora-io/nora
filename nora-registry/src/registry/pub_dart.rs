@@ -84,7 +84,8 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
         hex::encode(sha2::Sha256::digest(raw_query.as_bytes()))
     );
 
-    if let Ok(data) = state.storage.get(&key).await {
+    let cached_data = state.storage.get(&key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
@@ -116,6 +117,17 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.pub_dart.serve_stale {
+                    tracing::warn!(
+                        registry = "pub",
+                        query = raw_query,
+                        error = ?e,
+                        "Pub upstream error, serving stale search results"
+                    );
+                    return pub_stale_json_response(data.to_vec());
+                }
+            }
             tracing::debug!(error = ?e, query = raw_query, "pub search upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -149,7 +161,8 @@ async fn package_listing(
     }
 
     let key = format!("pub/api/packages/{}.json", package);
-    if let Ok(data) = state.storage.get(&key).await {
+    let cached_data = state.storage.get(&key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
@@ -178,6 +191,17 @@ async fn package_listing(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.pub_dart.serve_stale {
+                    tracing::warn!(
+                        registry = "pub",
+                        package = %package,
+                        error = ?e,
+                        "Pub upstream error, serving stale package listing"
+                    );
+                    return pub_stale_json_response(data.to_vec());
+                }
+            }
             tracing::debug!(error = ?e, package, "pub package upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -197,7 +221,8 @@ async fn version_metadata(
     }
 
     let key = format!("pub/api/packages/{}/versions/{}.json", package, version);
-    if let Ok(data) = state.storage.get(&key).await {
+    let cached_data = state.storage.get(&key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
@@ -226,6 +251,18 @@ async fn version_metadata(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.pub_dart.serve_stale {
+                    tracing::warn!(
+                        registry = "pub",
+                        package = %package,
+                        version = %version,
+                        error = ?e,
+                        "Pub upstream error, serving stale version metadata"
+                    );
+                    return pub_stale_json_response(data.to_vec());
+                }
+            }
             tracing::debug!(error = ?e, package, version, "pub version upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -245,7 +282,8 @@ async fn package_advisories(
     }
 
     let key = format!("pub/api/packages/{}/advisories.json", package);
-    if let Ok(data) = state.storage.get(&key).await {
+    let cached_data = state.storage.get(&key).await.ok();
+    if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
@@ -271,6 +309,17 @@ async fn package_advisories(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if let Some(ref data) = cached_data {
+                if state.config.pub_dart.serve_stale {
+                    tracing::warn!(
+                        registry = "pub",
+                        package = %package,
+                        error = ?e,
+                        "Pub upstream error, serving stale advisories"
+                    );
+                    return pub_stale_json_response(data.to_vec());
+                }
+            }
             tracing::debug!(error = ?e, package, "pub advisories upstream error");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -447,6 +496,28 @@ fn pub_json_response(data: Vec<u8>) -> Response {
             (
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=300"),
+            ),
+        ],
+        data,
+    )
+        .into_response()
+}
+
+fn pub_stale_json_response(data: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(PUB_CONTENT_TYPE),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                HeaderValue::from_static("true"),
             ),
         ],
         data,
