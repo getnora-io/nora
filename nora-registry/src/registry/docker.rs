@@ -3921,4 +3921,126 @@ mod integration_tests {
         assert!(!c2.denied);
         assert!(c2.denied_response().is_none());
     }
+
+    // ── #580/#581: streaming proxy blob integrity (content-addressable) ──
+
+    /// Security-critical (#581): an upstream that returns bytes whose SHA-256 does
+    /// not match the requested content-addressable digest must be rejected with
+    /// 502, and the poisoned bytes must never enter the cache, the pin store, or
+    /// be served — and the streaming temp file must be cleaned up.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_sha256_mismatch_rejected() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+
+        // The requested digest is the SHA-256 of the *real* content...
+        let requested_digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"the real layer"))
+        );
+        // ...but the upstream serves unrelated (poisoned) bytes for that digest.
+        let poisoned = b"poisoned bytes that do not hash to the requested digest".to_vec();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/library/test/blobs/{requested_digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(poisoned))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream.uri(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{requested_digest}"),
+            Body::empty(),
+        )
+        .await;
+
+        // Mismatch → 502 Bad Gateway (verify-before-serve, no tee to client).
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // Poisoned blob must NOT have been cached under the docker blob key
+        // (computed via the same canonicalize/blob_key path the handler uses).
+        let c = super::canonicalize("library/test", &ctx.state.config.docker);
+        let key = super::blob_key(c.namespace.as_deref(), &c.name, &requested_digest);
+        assert!(
+            ctx.state.storage.get(&key).await.is_err(),
+            "poisoned blob must not be cached"
+        );
+
+        // TempFileGuard must have cleaned up — no leftover proxy temp files.
+        let proxy_tmp =
+            std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
+        let leftover = std::fs::read_dir(&proxy_tmp)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "temp files must be cleaned up after rejection");
+    }
+
+    /// Positive control for the integrity check: when the upstream bytes hash to
+    /// the requested digest, the blob is verified, cached, and streamed back to
+    /// the client via the get_reader path (#580) with a 200.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_sha256_match_served_and_cached() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let content = b"a genuine docker layer payload".to_vec();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&content)));
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/library/ok/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream.uri(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/ok/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        assert_eq!(
+            body.as_ref(),
+            content.as_slice(),
+            "served body must match upstream"
+        );
+
+        // Verified blob is cached synchronously under the docker blob key
+        // (computed via the same canonicalize/blob_key path the handler uses).
+        let c = super::canonicalize("library/ok", &ctx.state.config.docker);
+        let key = super::blob_key(c.namespace.as_deref(), &c.name, &digest);
+        assert!(
+            ctx.state.storage.get(&key).await.is_ok(),
+            "verified blob must be cached"
+        );
+    }
 }
