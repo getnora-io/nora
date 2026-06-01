@@ -14,7 +14,7 @@ use crate::validation::{
 };
 use crate::AppState;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{header, HeaderName, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_util::io::ReaderStream;
 
 // ============================================================================
 // Namespaced key builders (issue #323)
@@ -211,6 +212,25 @@ async fn storage_get_with_fallback(
     match storage.get(ns_key).await {
         Ok(data) => Ok(data),
         Err(_) if ns_key != legacy_key => storage.get(legacy_key).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Open a streaming reader for a blob, trying namespaced then legacy key (#580).
+async fn storage_get_reader_with_fallback(
+    storage: &Storage,
+    ns_key: &str,
+    legacy_key: &str,
+) -> Result<
+    (
+        u64,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    ),
+    crate::storage::StorageError,
+> {
+    match storage.get_reader(ns_key).await {
+        Ok(reader) => Ok(reader),
+        Err(_) if ns_key != legacy_key => storage.get_reader(legacy_key).await,
         Err(e) => Err(e),
     }
 }
@@ -806,15 +826,18 @@ async fn download_blob(
     let key = blob_key(ns.as_deref(), &name, &digest);
     let legacy_key = blob_key(None, &name, &digest);
 
-    // Try local storage first (namespaced key, then legacy fallback)
-    if let Ok(data) = storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
-        // Curation integrity verification (issue #189)
-        if let Some(response) = crate::curation::verify_integrity(
+    // Try local storage first — streaming read, never loads full blob into RAM (#580)
+    if let Ok((size, reader)) =
+        storage_get_reader_with_fallback(&state.storage, &key, &legacy_key).await
+    {
+        // Curation integrity check using digest from URL (no full-data rehash).
+        // Docker blobs are content-addressed: the URL digest IS the integrity.
+        if let Some(response) = crate::curation::verify_integrity_by_hash(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Docker,
             &name,
             Some(&digest),
-            &data,
+            &digest,
         ) {
             return response;
         }
@@ -827,15 +850,15 @@ async fn download_blob(
             "docker",
             "LOCAL",
         ));
-        return (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "application/octet-stream"),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-            ],
-            data,
-        )
-            .into_response();
+        let stream = ReaderStream::new(reader);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, size)
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header("docker-content-digest", &digest)
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
     let temp_dir = proxy_temp_dir(&state.config.storage.path);
@@ -928,35 +951,26 @@ async fn download_blob(
                         }
                     }
 
-                    // Serve response: read from storage (cache hit) since the blob
-                    // is now persisted. This avoids holding the temp file open and
-                    // uses the standard cache-hit path.
-                    // For the rare case where put_from_path failed, re-read from
-                    // the temp file (guard hasn't been disarmed).
+                    // Serve response via streaming — never load full blob into RAM (#580).
+                    // Two paths: storage (put succeeded) or temp file (put failed).
                     if fetched._guard.path.is_none() {
-                        // Successfully stored — serve from storage (standard path)
-                        match state.storage.get(&key).await {
-                            Ok(data) => {
-                                return (
-                                    StatusCode::OK,
-                                    [
-                                        (
-                                            header::CONTENT_TYPE,
-                                            "application/octet-stream".to_string(),
-                                        ),
-                                        (header::CONTENT_LENGTH, file_size.to_string()),
-                                        (
-                                            HeaderName::from_static("docker-content-digest"),
-                                            digest.clone(),
-                                        ),
-                                        (
-                                            header::CACHE_CONTROL,
-                                            "public, max-age=31536000, immutable".to_string(),
-                                        ),
-                                    ],
-                                    data,
-                                )
-                                    .into_response();
+                        // Successfully stored — stream from storage
+                        match state.storage.get_reader(&key).await {
+                            Ok((size, reader)) => {
+                                let stream = ReaderStream::new(reader);
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                                    .header(header::CONTENT_LENGTH, size)
+                                    .header(
+                                        header::CACHE_CONTROL,
+                                        "public, max-age=31536000, immutable",
+                                    )
+                                    .header("docker-content-digest", &digest)
+                                    .body(Body::from_stream(stream))
+                                    .unwrap_or_else(|_| {
+                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                    });
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, key = %key, "Failed to read just-stored blob");
@@ -964,28 +978,22 @@ async fn download_blob(
                             }
                         }
                     } else {
-                        // put_from_path failed — serve from temp file directly
-                        match tokio::fs::read(&fetched.path).await {
-                            Ok(data) => {
-                                return (
-                                    StatusCode::OK,
-                                    [
-                                        (
-                                            header::CONTENT_TYPE,
-                                            "application/octet-stream".to_string(),
-                                        ),
-                                        (header::CONTENT_LENGTH, data.len().to_string()),
-                                        (
-                                            HeaderName::from_static("docker-content-digest"),
-                                            digest.clone(),
-                                        ),
-                                    ],
-                                    Bytes::from(data),
-                                )
-                                    .into_response();
+                        // put_from_path failed — stream from temp file directly
+                        match tokio::fs::File::open(&fetched.path).await {
+                            Ok(file) => {
+                                let stream = ReaderStream::new(file);
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                                    .header(header::CONTENT_LENGTH, file_size)
+                                    .header("docker-content-digest", &digest)
+                                    .body(Body::from_stream(stream))
+                                    .unwrap_or_else(|_| {
+                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                    });
                             }
                             Err(e) => {
-                                tracing::error!(error = %e, "Failed to read temp blob file");
+                                tracing::error!(error = %e, "Failed to open temp blob file for streaming");
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
                         }

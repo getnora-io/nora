@@ -4,8 +4,9 @@
 use async_trait::async_trait;
 use axum::body::Bytes;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
@@ -245,6 +246,22 @@ impl StorageBackend for LocalStorage {
             }
             Err(e) => Err(StorageError::Io(e.to_string())),
         }
+    }
+
+    async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        let path = self.key_to_path(key);
+        let file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e.to_string())
+            }
+        })?;
+        let meta = file
+            .metadata()
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        Ok((meta.len(), Box::pin(file)))
     }
 }
 

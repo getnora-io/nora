@@ -7,7 +7,8 @@ use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
-use tokio::io::AsyncReadExt;
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
@@ -237,6 +238,23 @@ impl StorageBackend for S3Storage {
 
         let _ = tokio::fs::remove_file(src).await;
         Ok(())
+    }
+
+    async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        let encoded = encode_s3_key(key);
+        let path = Path::from(encoded);
+        let result = match self.store.get(&path).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                self.store.get(&legacy_path).await.map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
+        let size = result.meta.size;
+        let stream = result.into_stream().map_err(std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(stream);
+        Ok((size as u64, Box::pin(reader)))
     }
 }
 
