@@ -319,6 +319,42 @@ fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
     dir
 }
 
+fn proxy_temp_dir(data_dir: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(path = %dir.display(), error = %e, "failed to create proxy temp directory");
+    }
+    dir
+}
+
+/// RAII guard that deletes a temp file on drop unless disarmed.
+///
+/// Ensures temp files are cleaned up on ALL error paths (network errors,
+/// hash mismatch, panics, early returns via `?` operator) — #580.
+pub(crate) struct TempFileGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Disarm the guard — caller takes ownership of cleanup.
+    /// Call this after successful `put_from_path` (which moves/deletes the file).
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Validate that an upload UUID from URL path is safe (no path traversal).
 ///
 /// Accepts only lowercase hex + hyphens (UUID-4 format) up to 36 chars.
@@ -752,83 +788,162 @@ async fn download_blob(
             .into_response();
     }
 
+    let temp_dir = proxy_temp_dir(&state.config.storage.path);
+
     // Try upstream proxies (prefix-matched → single upstream, otherwise → fallback chain)
-    for upstream in &upstreams_to_try {
-        match fetch_blob_from_upstream(
-            &state.http_client,
-            &upstream.url,
-            &name,
-            &digest,
-            &state.docker_auth,
-            state.config.docker.proxy_timeout,
-            state.config.docker.read_timeout,
-            expose_opt(&upstream.auth),
-            &state.circuit_breaker,
-        )
-        .await
-        {
-            Ok(data) => {
-                state.metrics.record_download("docker");
-                state.metrics.record_cache_miss("docker");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    format!("{}@{}", name, &digest[..19.min(digest.len())]),
-                    "docker",
-                    "PROXY",
-                ));
+    // Includes library/ fallback for single-segment names (Docker Hub official images).
+    let names_to_try: Vec<String> = if name.contains('/') {
+        vec![name.clone()]
+    } else {
+        vec![name.clone(), format!("library/{}", name)]
+    };
 
-                // Convert Vec<u8> to Bytes first — Bytes::clone() is O(1) refcount
-                // instead of Vec::clone() which copies the entire buffer (#526).
-                let data = Bytes::from(data);
-                state.spawn_cache("docker", key.clone(), data.clone());
-
-                return (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    data,
-                )
-                    .into_response();
-            }
-            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(e) => {
-                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, "Docker blob proxy fetch failed, trying next");
-                continue;
-            }
-        }
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
+    for try_name in &names_to_try {
         for upstream in &upstreams_to_try {
             match fetch_blob_from_upstream(
                 &state.http_client,
                 &upstream.url,
-                &library_name,
+                try_name,
                 &digest,
                 &state.docker_auth,
                 state.config.docker.proxy_timeout,
                 state.config.docker.read_timeout,
                 expose_opt(&upstream.auth),
                 &state.circuit_breaker,
+                &temp_dir,
             )
             .await
             {
-                Ok(data) => {
-                    // Convert Vec<u8> to Bytes first — O(1) clone (#526)
-                    let data = Bytes::from(data);
-                    state.spawn_cache("docker", key.clone(), data.clone());
+                Ok(mut fetched) => {
+                    // Verify SHA-256 against digest from URL (curation fail-closed)
+                    let expected_hash = digest.strip_prefix("sha256:").unwrap_or(&digest);
+                    if fetched.sha256 != expected_hash {
+                        tracing::warn!(
+                            name = %try_name,
+                            digest = %digest,
+                            expected = %expected_hash,
+                            actual = %fetched.sha256,
+                            "Docker blob SHA-256 mismatch from upstream — rejecting"
+                        );
+                        // TempFileGuard drops and cleans up
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
 
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        data,
-                    )
-                        .into_response();
+                    // Curation integrity check with pre-computed hash (#580)
+                    let hash_with_prefix = format!("sha256:{}", fetched.sha256);
+                    if let Some(response) = crate::curation::verify_integrity_by_hash(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Docker,
+                        try_name,
+                        Some(&digest),
+                        &hash_with_prefix,
+                    ) {
+                        return response;
+                    }
+
+                    state.metrics.record_download("docker");
+                    state.metrics.record_cache_miss("docker");
+                    state.activity.push(ActivityEntry::new(
+                        ActionType::ProxyFetch,
+                        format!("{}@{}", try_name, &digest[..19.min(digest.len())]),
+                        "docker",
+                        "PROXY",
+                    ));
+
+                    // Read temp file size for Content-Length (always known — file is complete)
+                    let file_size = tokio::fs::metadata(&fetched.path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    // Store blob: atomic move temp → storage with SHA-256 pin (#580)
+                    let sha_for_pin = fetched.sha256.clone();
+                    match state
+                        .storage
+                        .put_from_path(&key, &fetched.path, Some(&sha_for_pin))
+                        .await
+                    {
+                        Ok(()) => {
+                            // put_from_path moved/deleted the file — disarm guard
+                            fetched._guard.disarm();
+                            state.repo_index.invalidate("docker");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                key = %key,
+                                "Failed to store proxied blob — serving from upstream anyway"
+                            );
+                            // Guard will clean up temp file on drop
+                        }
+                    }
+
+                    // Serve response: read from storage (cache hit) since the blob
+                    // is now persisted. This avoids holding the temp file open and
+                    // uses the standard cache-hit path.
+                    // For the rare case where put_from_path failed, re-read from
+                    // the temp file (guard hasn't been disarmed).
+                    if fetched._guard.path.is_none() {
+                        // Successfully stored — serve from storage (standard path)
+                        match state.storage.get(&key).await {
+                            Ok(data) => {
+                                return (
+                                    StatusCode::OK,
+                                    [
+                                        (
+                                            header::CONTENT_TYPE,
+                                            "application/octet-stream".to_string(),
+                                        ),
+                                        (header::CONTENT_LENGTH, file_size.to_string()),
+                                        (
+                                            HeaderName::from_static("docker-content-digest"),
+                                            digest.clone(),
+                                        ),
+                                        (
+                                            header::CACHE_CONTROL,
+                                            "public, max-age=31536000, immutable".to_string(),
+                                        ),
+                                    ],
+                                    data,
+                                )
+                                    .into_response();
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, key = %key, "Failed to read just-stored blob");
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                    } else {
+                        // put_from_path failed — serve from temp file directly
+                        match tokio::fs::read(&fetched.path).await {
+                            Ok(data) => {
+                                return (
+                                    StatusCode::OK,
+                                    [
+                                        (
+                                            header::CONTENT_TYPE,
+                                            "application/octet-stream".to_string(),
+                                        ),
+                                        (header::CONTENT_LENGTH, data.len().to_string()),
+                                        (
+                                            HeaderName::from_static("docker-content-digest"),
+                                            digest.clone(),
+                                        ),
+                                    ],
+                                    Bytes::from(data),
+                                )
+                                    .into_response();
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to read temp blob file");
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                    }
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
                 Err(e) => {
-                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %library_name, "Docker blob proxy fetch failed, trying next");
+                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
                     continue;
                 }
             }
@@ -1889,7 +2004,24 @@ async fn delete_blob(
 
 // ============================================================================
 
-/// Fetch a blob from an upstream Docker registry.
+/// Result of a successful streaming blob fetch from upstream (#580).
+pub struct FetchedBlob {
+    /// Path to temp file containing the complete blob data.
+    pub path: std::path::PathBuf,
+    /// SHA-256 hex digest computed incrementally during download (64 chars, lowercase).
+    pub sha256: String,
+    /// Content-Length from upstream response, if provided (None for chunked responses).
+    /// Used by mirror and future streaming response paths.
+    #[allow(dead_code)]
+    pub content_length: Option<u64>,
+    /// RAII guard — deletes temp file on drop unless disarmed.
+    pub _guard: TempFileGuard,
+}
+
+/// Fetch a blob from an upstream Docker registry, streaming to a temp file (#580).
+///
+/// Streams the upstream response to a temp file in `temp_dir` with incremental
+/// SHA-256 hashing. Never accumulates the full blob in RAM.
 ///
 /// Uses per-chunk `read_timeout` instead of a total request timeout so that
 /// large blob downloads (multi-GB images) don't time out on slow connections.
@@ -1905,7 +2037,8 @@ pub async fn fetch_blob_from_upstream(
     read_timeout: u64,
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
-) -> Result<Vec<u8>, ProxyError> {
+    temp_dir: &std::path::Path,
+) -> Result<FetchedBlob, ProxyError> {
     let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
     cb.check(&cb_key)?;
 
@@ -1961,18 +2094,33 @@ pub async fn fetch_blob_from_upstream(
         return Err(ProxyError::Upstream(status));
     }
 
-    // Stream body with per-chunk read timeout
-    let content_length = response.content_length().unwrap_or(0) as usize;
+    // Upstream Content-Length (None if chunked transfer-encoding)
+    let upstream_content_length = response.content_length();
+
+    // Create temp file in storage directory (same filesystem for atomic rename)
+    let temp_path = temp_dir.join(format!("proxy-{}", uuid::Uuid::new_v4()));
+    let guard = TempFileGuard::new(temp_path.clone());
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|e| ProxyError::Network(format!("temp file create: {}", e)))?;
+
+    // Stream body with per-chunk read timeout + incremental SHA-256
+    use sha2::Digest;
     let mut stream = response.bytes_stream();
-    let mut data = Vec::with_capacity(content_length);
+    let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
 
     loop {
         // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout,
-        // the partial chunk is discarded and we return a ProxyError — no
-        // accumulated state is lost since `data` is local and the error aborts.
+        // TempFileGuard drops and deletes the partial file — no leaked state.
         match tokio::time::timeout(chunk_timeout, stream.next()).await {
-            Ok(Some(Ok(chunk))) => data.extend_from_slice(&chunk),
+            Ok(Some(Ok(chunk))) => {
+                hasher.update(&chunk);
+                use tokio::io::AsyncWriteExt;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
+            }
             Ok(Some(Err(e))) => {
                 cb.record_failure(&cb_key);
                 return Err(ProxyError::Network(format!("chunk read error: {}", e)));
@@ -1988,8 +2136,25 @@ pub async fn fetch_blob_from_upstream(
         }
     }
 
+    // Flush to disk before returning
+    use tokio::io::AsyncWriteExt;
+    file.flush()
+        .await
+        .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
+    drop(file);
+
+    let sha256 = hex::encode(sha2::Digest::finalize(hasher));
     cb.record_success(&cb_key);
-    Ok(data)
+
+    // Transfer guard ownership to FetchedBlob — caller is responsible for
+    // disarming after successful put_from_path (which moves the temp file).
+    // If caller drops FetchedBlob without disarming, temp file is cleaned up.
+    Ok(FetchedBlob {
+        path: temp_path,
+        sha256,
+        content_length: upstream_content_length,
+        _guard: guard,
+    })
 }
 
 /// Fetch a manifest from an upstream Docker registry

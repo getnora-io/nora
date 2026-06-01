@@ -219,7 +219,9 @@ async fn mirror_single_image(
                 continue;
             }
 
-            let blob_data = crate::registry::docker::fetch_blob_from_upstream(
+            let mirror_temp = std::env::temp_dir().join("nora-mirror");
+            let _ = std::fs::create_dir_all(&mirror_temp);
+            let fetched = crate::registry::docker::fetch_blob_from_upstream(
                 client,
                 &image.registry,
                 &image.name,
@@ -229,10 +231,14 @@ async fn mirror_single_image(
                 60, // per-chunk read timeout
                 None,
                 &noop_cb,
+                &mirror_temp,
             )
             .await
             .map_err(|e| format!("Failed to fetch blob {}: {:?}", digest, e))?;
 
+            let blob_data = tokio::fs::read(&fetched.path)
+                .await
+                .map_err(|e| format!("Failed to read fetched blob: {}", e))?;
             bytes += blob_data.len() as u64;
             push_blob(client, nora_base, &image.name, digest, &blob_data)
                 .await
