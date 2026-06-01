@@ -986,6 +986,21 @@ async fn run_server(mut config: Config, storage: Storage) {
         None
     };
 
+    // #590: a loopback bind without NORA_PUBLIC_URL makes the registry service index
+    // advertise unreachable URLs to clients behind a reverse proxy. Warn (not fatal —
+    // local-only use is the default and valid). A public_url that itself points at
+    // loopback is caught separately by config validation.
+    if config.server.public_url.is_none() && Config::is_loopback_host(&config.server.host) {
+        warn!(
+            "server.host is loopback ('{}') and NORA_PUBLIC_URL is not set — behind a reverse \
+             proxy the service index (/nuget/v3/index.json and others) will advertise \
+             unreachable http://{}:{} URLs to remote clients. Set \
+             NORA_PUBLIC_URL=https://registry.example.com if proxied; ignore this if NORA is \
+             only used locally.",
+            config.server.host, config.server.host, config.server.port
+        );
+    }
+
     // Initialize token store if auth is enabled
     let tokens = if config.auth.enabled {
         let token_path = Path::new(&config.auth.token_storage);

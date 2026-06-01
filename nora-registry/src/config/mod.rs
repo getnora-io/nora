@@ -402,6 +402,19 @@ impl Config {
         self.validate_with_config_path(env::var("NORA_CONFIG_PATH").ok())
     }
 
+    /// True if `host` is a loopback address (the 127.0.0.0/8 block or ::1) or
+    /// the `localhost` hostname (case-insensitive). Used to warn when a service
+    /// index would be built from a loopback bind address, unreachable by remote
+    /// clients (#590). Callers passing a URL host must strip IPv6 brackets first
+    /// (`url::host_str()` returns "[::1]", which does not parse as an `IpAddr`).
+    pub(crate) fn is_loopback_host(host: &str) -> bool {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+    }
+
     /// Validate configuration with explicit config_path to avoid env var
     /// dependency in tests (env vars are process-global, tests run in parallel).
     pub fn validate_with_config_path(
@@ -440,6 +453,21 @@ impl Config {
                             "NORA_PUBLIC_URL must use http:// or https:// scheme, got: '{}'",
                             scheme
                         ));
+                    }
+                    // public_url explicitly set to a loopback host is also broken for
+                    // remote clients — the operator configured the footgun directly (#590).
+                    // host_str() returns IPv6 literals with brackets ("[::1]"), which do
+                    // not parse as an IpAddr — strip them before the loopback check.
+                    if let Some(h) = parsed.host_str() {
+                        let h = h.trim_start_matches('[').trim_end_matches(']');
+                        if Self::is_loopback_host(h) {
+                            warnings.push(format!(
+                                "NORA_PUBLIC_URL points at loopback ('{}') — clients behind a \
+                                 reverse proxy cannot reach it. Use the externally-reachable \
+                                 hostname, e.g. https://registry.example.com",
+                                h
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1304,6 +1332,48 @@ mod tests {
             "default config should have no warnings: {:?}",
             warnings
         );
+    }
+
+    #[test]
+    fn test_is_loopback_host() {
+        // loopback forms (caller strips IPv6 brackets before calling)
+        assert!(Config::is_loopback_host("127.0.0.1"));
+        assert!(Config::is_loopback_host("127.1.2.3")); // whole 127.0.0.0/8
+        assert!(Config::is_loopback_host("::1"));
+        assert!(Config::is_loopback_host("localhost"));
+        assert!(Config::is_loopback_host("LocalHost")); // case-insensitive (#590 review)
+                                                        // not loopback
+        assert!(!Config::is_loopback_host("0.0.0.0")); // wildcard → handled as error elsewhere
+        assert!(!Config::is_loopback_host("192.168.1.10"));
+        assert!(!Config::is_loopback_host("8.8.8.8"));
+        assert!(!Config::is_loopback_host("registry.example.com"));
+    }
+
+    #[test]
+    fn test_validate_public_url_loopback_warns() {
+        // public_url explicitly pointing at loopback is broken for remote clients (#590):
+        // a warning, not an error, since local-only use is valid. Tested through
+        // validate() (not is_loopback_host directly) to cover the real host_str() path,
+        // including IPv6 literals whose brackets must be stripped (#590 review).
+        for url in [
+            "http://localhost:4000",
+            "http://127.0.0.1:4000",
+            "http://[::1]:4000",
+        ] {
+            let mut config = Config::default();
+            config.server.public_url = Some(url.to_string());
+            let (warnings, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.is_empty(),
+                "loopback public_url '{url}' is a warning, not an error: {:?}",
+                errors
+            );
+            assert!(
+                warnings.iter().any(|w| w.contains("loopback")),
+                "expected loopback warning for public_url '{url}': {:?}",
+                warnings
+            );
+        }
     }
 
     #[test]
