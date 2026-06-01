@@ -90,6 +90,31 @@ impl HashPinStore {
         }
     }
 
+    /// Record a pre-computed SHA-256 hash for a storage key.
+    ///
+    /// Used by streaming paths where the hash was already computed
+    /// incrementally during download — avoids re-reading the file (#580).
+    ///
+    /// `hash` must be a lowercase hex-encoded SHA-256 (64 chars).
+    pub fn record_hash(&self, key: &str, hash: &str) {
+        debug_assert!(
+            hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "record_hash: expected 64-char hex SHA-256, got: {hash}"
+        );
+
+        let should_write = {
+            let mut pins = self.pins.write();
+            let changed = pins.get(key).is_none_or(|existing| *existing != hash);
+            if changed {
+                pins.insert(key.to_string(), hash.to_string());
+            }
+            changed
+        };
+        if should_write {
+            Self::append_to_file(&self.path, key, hash);
+        }
+    }
+
     /// Verify data integrity against pinned hash. Called on every `get()`.
     ///
     /// Returns `true` if the hash matches or no pin exists for this key.
@@ -302,6 +327,52 @@ mod tests {
 
         assert_eq!(store.len(), 0);
         assert!(!path.exists(), "empty store should not create file");
+    }
+
+    #[test]
+    fn test_record_hash_and_verify() {
+        let dir = TempDir::new().unwrap();
+        let store = HashPinStore::new(pin_path(&dir));
+
+        // Pre-computed SHA-256 of b"streaming-data"
+        let hash = HashPinStore::sha256_hex(b"streaming-data");
+        store.record_hash("docker/blob/sha256:abc", &hash);
+
+        assert_eq!(store.len(), 1);
+        assert!(store.verify("docker/blob/sha256:abc", b"streaming-data"));
+        assert!(!store.verify("docker/blob/sha256:abc", b"tampered"));
+    }
+
+    #[test]
+    fn test_record_hash_persists_on_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+
+        let hash = HashPinStore::sha256_hex(b"persistent");
+        {
+            let store = HashPinStore::new(&path);
+            store.record_hash("key/hash", &hash);
+        }
+
+        // Reload
+        let store = HashPinStore::new(&path);
+        assert_eq!(store.len(), 1);
+        assert!(store.verify("key/hash", b"persistent"));
+    }
+
+    #[test]
+    fn test_record_hash_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let store = HashPinStore::new(&path);
+
+        let hash = HashPinStore::sha256_hex(b"data");
+        store.record_hash("key", &hash);
+        store.record_hash("key", &hash);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "duplicate record_hash should be idempotent");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use axum::body::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use tokio::io::AsyncReadExt;
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
@@ -206,19 +206,35 @@ impl StorageBackend for S3Storage {
         let encoded = encode_s3_key(key);
         let s3_path = Path::from(encoded);
 
-        // Read file and upload via object_store PutPayload.
-        // For very large files a multipart upload would be better, but
-        // object_store handles chunking internally when payload exceeds
-        // the part-size threshold.
+        // Streaming multipart upload: read file in 8 MiB chunks, feed to
+        // WriteMultipart which buffers into 5 MiB parts and uploads in
+        // parallel. Never loads the entire file into RAM (#580).
         let mut file = tokio::fs::File::open(src)
             .await
             .map_err(|e| StorageError::Io(e.to_string()))?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let payload = PutPayload::from(buf);
-        self.store.put(&s3_path, payload).await.map_err(map_err)?;
+
+        // CANCEL-SAFETY: if dropped between put_multipart and finish,
+        // S3 does NOT automatically abort orphaned parts. Cleanup depends
+        // on S3 lifecycle policy (AbortIncompleteMultipartUpload rule).
+        // No partial objects are visible to readers (upload never completed).
+        // finish() calls abort() on its own errors; cancellation (future
+        // dropped) relies on lifecycle policy only.
+        let upload = self.store.put_multipart(&s3_path).await.map_err(map_err)?;
+        let mut writer = WriteMultipart::new(upload);
+
+        let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB read buffer
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            writer.write(&buf[..n]);
+        }
+        writer.finish().await.map_err(map_err)?;
+
         let _ = tokio::fs::remove_file(src).await;
         Ok(())
     }

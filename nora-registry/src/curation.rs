@@ -428,6 +428,77 @@ pub fn verify_integrity(
     }
 }
 
+/// Verify artifact integrity using a pre-computed hash string (#580).
+///
+/// Not yet called — API preparation for streaming download path (Commit 1).
+#[allow(dead_code)] // TODO(#580): remove when streaming handler calls this
+///
+/// Same logic as [`verify_integrity`] but accepts the hash directly instead
+/// of computing it from raw data. Used by streaming download paths where
+/// SHA-256 was computed incrementally during the download.
+///
+/// `hash` must be in `sha256:<64hex>` format (e.g., from Docker content-
+/// addressable digest).
+pub fn verify_integrity_by_hash(
+    engine: &CurationEngine,
+    registry: RegistryType,
+    name: &str,
+    version: Option<&str>,
+    hash: &str,
+) -> Option<Response> {
+    debug_assert!(
+        hash.starts_with("sha256:") && hash.len() == 71,
+        "verify_integrity_by_hash: expected sha256:<64hex>, got: {hash}"
+    );
+
+    if !engine.is_active() {
+        return None;
+    }
+
+    let request = FilterRequest {
+        registry,
+        upstream: None,
+        name: name.to_string(),
+        version: version.map(|v| v.to_string()),
+        integrity: Some(hash.to_string()),
+        bypass: false,
+        publish_date: None,
+    };
+
+    let result = engine.evaluate(&request);
+
+    match &result.decision {
+        Decision::Block { rule, reason } => {
+            if !rule.contains("integrity") {
+                return None;
+            }
+            if result.audited {
+                tracing::info!(
+                    registry = %registry,
+                    package = %name,
+                    version = version.unwrap_or("*"),
+                    rule = %rule,
+                    reason = %reason,
+                    "[AUDIT] Integrity check would block download (hash-based)"
+                );
+                None
+            } else {
+                Some(
+                    BlockedResponse {
+                        rule: rule.clone(),
+                        reason: reason.clone(),
+                        registry: registry.to_string(),
+                        package: name.to_string(),
+                        version: version.map(|v| v.to_string()),
+                    }
+                    .into_response(),
+                )
+            }
+        }
+        Decision::Allow | Decision::Skip => None,
+    }
+}
+
 // ============================================================================
 // Version parsers for filename-based registries (issue #187)
 // ============================================================================
@@ -2792,6 +2863,75 @@ mod tests {
             "pre-download with integrity=None must not block: got {:?}",
             decision
         );
+    }
+
+    // ── verify_integrity_by_hash tests (#580) ──────────────────────────
+
+    #[test]
+    fn test_verify_integrity_by_hash_mode_off_returns_none() {
+        let engine = super::CurationEngine::new(CurationConfig::default());
+        let hash = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"data")));
+        let result = super::verify_integrity_by_hash(
+            &engine,
+            super::RegistryType::Docker,
+            "library/nginx",
+            Some("latest"),
+            &hash,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_verify_integrity_by_hash_matching() {
+        let hash = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"blob-data")));
+        let allowlist_json = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "registry": "docker",
+                "name": "library/nginx",
+                "version": "latest",
+                "integrity": hash,
+                "integrity_source": "manual"
+            }]
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, serde_json::to_string(&allowlist_json).unwrap()).unwrap();
+
+        let mut config = CurationConfig::default();
+        config.mode = super::super::config::CurationMode::Enforce;
+        let mut engine = super::CurationEngine::new(config);
+        let filter = super::AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        engine.add_filter(Box::new(filter));
+
+        let result = super::verify_integrity_by_hash(
+            &engine,
+            super::RegistryType::Docker,
+            "library/nginx",
+            Some("latest"),
+            &hash,
+        );
+        assert!(result.is_none(), "matching hash should pass");
+    }
+
+    #[test]
+    fn test_verify_integrity_by_hash_consistent_with_verify_integrity() {
+        // verify_integrity_by_hash with the same hash that verify_integrity
+        // would compute must produce the same result.
+        let data = b"consistency-check";
+        let hash = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+        let engine = super::CurationEngine::new(CurationConfig::default());
+
+        let result_data =
+            super::verify_integrity(&engine, super::RegistryType::Docker, "test", None, data);
+        let result_hash = super::verify_integrity_by_hash(
+            &engine,
+            super::RegistryType::Docker,
+            "test",
+            None,
+            &hash,
+        );
+        assert_eq!(result_data.is_none(), result_hash.is_none());
     }
 
     #[test]

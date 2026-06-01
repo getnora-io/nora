@@ -1200,7 +1200,7 @@ async fn upload_blob(
 
     // Move temp file into storage — no RAM copy of the blob
     let key = format!("docker/{}/blobs/{}", name, digest);
-    match state.storage.put_from_path(&key, &temp_path).await {
+    match state.storage.put_from_path(&key, &temp_path, None).await {
         Ok(()) => {
             state.metrics.record_upload("docker");
             state.audit.log(AuditEntry::new(
