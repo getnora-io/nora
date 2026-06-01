@@ -12,8 +12,9 @@ use axum::{
 };
 use memchr::memmem;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, Encoder,
-    HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, TextEncoder,
 };
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -171,6 +172,30 @@ static LEAK_DETECTION_SKIPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["reason"]
     )
     .expect("failed to create LEAK_DETECTION_SKIPPED metric at startup")
+});
+
+/// Active streaming proxy downloads in progress (#580).
+///
+/// Incremented when `fetch_blob_from_upstream` starts streaming, decremented
+/// on completion or error. Used to detect concurrent download pressure.
+pub static PROXY_ACTIVE_DOWNLOADS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_proxy_active_downloads",
+        "Number of Docker blob proxy downloads currently in progress"
+    )
+    .expect("failed to create PROXY_ACTIVE_DOWNLOADS metric at startup")
+});
+
+/// Total bytes successfully downloaded from upstream via proxy (#580).
+///
+/// Only incremented after a complete, verified download (not on failures).
+/// Use with `rate()` in Prometheus to track upstream bandwidth consumption.
+pub static PROXY_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_proxy_download_bytes_total",
+        "Total bytes successfully downloaded from upstream Docker registries"
+    )
+    .expect("failed to create PROXY_DOWNLOAD_BYTES metric at startup")
 });
 
 /// Maximum response body size to scan for upstream URL leaks (2 MB).

@@ -1266,9 +1266,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 
-    // Clean up stale Docker upload temp files from previous runs (#530).
+    // Clean up stale Docker temp files from previous runs (#530, #580).
     if state.config.docker.enabled {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
+        registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
 
     let addr = state.config.server.bind_addr();
@@ -1330,9 +1331,14 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
+            // + clean up stale proxy temp files (#580)
             if tick_count.is_multiple_of(10) {
                 let mut locks = metrics_state.publish_locks.lock();
                 locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+                let storage_path = metrics_state.config.storage.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    registry::docker::cleanup_proxy_temp_dir(&storage_path);
+                });
             }
         }
     });

@@ -355,6 +355,18 @@ impl Drop for TempFileGuard {
     }
 }
 
+/// RAII guard for `PROXY_ACTIVE_DOWNLOADS` gauge — decrements on drop (#580).
+///
+/// Guarantees the gauge stays accurate on all exit paths including panics,
+/// early `?` returns, and tokio task cancellation.
+struct ProxyDownloadGuard;
+
+impl Drop for ProxyDownloadGuard {
+    fn drop(&mut self) {
+        crate::metrics::PROXY_ACTIVE_DOWNLOADS.dec();
+    }
+}
+
 /// Validate that an upload UUID from URL path is safe (no path traversal).
 ///
 /// Accepts only lowercase hex + hyphens (UUID-4 format) up to 36 chars.
@@ -400,6 +412,44 @@ pub fn cleanup_upload_temp_dir(data_dir: &str) {
     }
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files on startup");
+    }
+}
+
+/// Max age for proxy temp files before cleanup removes them (#580).
+///
+/// 4 hours — long enough for slow multi-GB downloads over constrained links,
+/// short enough to reclaim disk from orphaned files (crash, cancel, OOM).
+const PROXY_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+
+/// Remove stale temp files from the Docker proxy download directory (#580).
+///
+/// Files older than `PROXY_TEMP_MAX_AGE` are removed. Called at startup
+/// (catches orphans from crashes) and periodically from the background task.
+/// Logs warnings on errors but never panics — cleanup is best-effort.
+pub fn cleanup_proxy_temp_dir(data_dir: &str) {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to read proxy temp directory for cleanup");
+            return;
+        }
+    };
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= PROXY_TEMP_MAX_AGE);
+        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale proxy temp files");
     }
 }
 
@@ -2039,6 +2089,20 @@ pub async fn fetch_blob_from_upstream(
     cb: &CircuitBreakerRegistry,
     temp_dir: &std::path::Path,
 ) -> Result<FetchedBlob, ProxyError> {
+    use crate::metrics::{PROXY_ACTIVE_DOWNLOADS, PROXY_DOWNLOAD_BYTES};
+
+    // Track active concurrent proxy downloads. ProxyDownloadGuard decrements
+    // on drop (success, error, or cancellation — all paths).
+    PROXY_ACTIVE_DOWNLOADS.inc();
+    let _download_gauge_guard = ProxyDownloadGuard;
+
+    tracing::info!(
+        blob.name = %name,
+        blob.digest = %digest,
+        upstream = %upstream_url,
+        "Proxy blob download started"
+    );
+
     let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
     cb.check(&cb_key)?;
 
@@ -2109,6 +2173,7 @@ pub async fn fetch_blob_from_upstream(
     let mut stream = response.bytes_stream();
     let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
+    let mut bytes_written: u64 = 0;
 
     loop {
         // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout,
@@ -2120,6 +2185,7 @@ pub async fn fetch_blob_from_upstream(
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
+                bytes_written += chunk.len() as u64;
             }
             Ok(Some(Err(e))) => {
                 cb.record_failure(&cb_key);
@@ -2145,6 +2211,13 @@ pub async fn fetch_blob_from_upstream(
 
     let sha256 = hex::encode(sha2::Digest::finalize(hasher));
     cb.record_success(&cb_key);
+    PROXY_DOWNLOAD_BYTES.inc_by(bytes_written);
+
+    tracing::info!(
+        bytes = bytes_written,
+        content_length = ?upstream_content_length,
+        "Proxy blob download complete"
+    );
 
     // Transfer guard ownership to FetchedBlob — caller is responsible for
     // disarming after successful put_from_path (which moves the temp file).
