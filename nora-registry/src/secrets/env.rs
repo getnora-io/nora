@@ -49,7 +49,12 @@ impl Default for EnvProvider {
 #[async_trait]
 impl SecretsProvider for EnvProvider {
     async fn get_secret(&self, key: &str) -> Result<ProtectedString, SecretsError> {
-        let value = env::var(key).map_err(|_| SecretsError::NotFound(key.to_string()))?;
+        let value = env::var(key).map_err(|e| match e {
+            env::VarError::NotPresent => SecretsError::NotFound(key.to_string()),
+            env::VarError::NotUnicode(_) => {
+                SecretsError::Provider(format!("environment variable '{key}' is not valid UTF-8"))
+            }
+        })?;
 
         if self.clear_after_read {
             env::remove_var(key);
