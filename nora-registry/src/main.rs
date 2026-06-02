@@ -406,12 +406,27 @@ async fn main() {
         Some(Commands::Gc { apply }) => {
             let dry_run = !apply;
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-            let result = gc::run_gc(&storage, &cli_publish_locks, dry_run).await;
+            // Grace applies to manual GC too: `nora gc --apply` is often run while
+            // traffic is live, when in-flight pushes are most likely (#584).
+            let result =
+                gc::run_gc(&storage, &cli_publish_locks, dry_run, config.gc.grace_secs).await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
             println!("  Bytes freed:       {}", result.bytes_freed);
+            if result.skipped_recent > 0 {
+                println!(
+                    "  Skipped (grace):   {} (younger than {}s — likely in-flight uploads)",
+                    result.skipped_recent, config.gc.grace_secs
+                );
+            }
+            if result.stat_failures > 0 {
+                println!(
+                    "  Stat failures:     {} (kept, age unknown — GC may be unable to reclaim space)",
+                    result.stat_failures
+                );
+            }
             println!("  Duration:          {:.1}s", result.duration_secs);
             if dry_run && !result.orphan_keys.is_empty() {
                 println!("\nOrphan keys:");
@@ -1204,6 +1219,7 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.publish_locks.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
+            state.config.gc.grace_secs,
             cleanup_lock.clone(),
             cancel_token.clone(),
         );

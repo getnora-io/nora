@@ -20,7 +20,7 @@ use std::time::Instant;
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::storage::Storage;
 use crate::validation::ends_with_ci;
@@ -68,6 +68,14 @@ pub static GC_METADATA_PHANTOMS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_metadata_phantoms metric")
 });
 
+pub static GC_STAT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_stat_failures_total",
+        "Orphans GC could not stat (kept, age unknown) — nonzero means GC may be unable to reclaim space; alert on it"
+    )
+    .expect("gc_stat_failures metric")
+});
+
 // ============================================================================
 // GC Result
 // ============================================================================
@@ -83,15 +91,41 @@ pub struct GcResult {
     pub uncovered: Vec<(String, usize)>,
     /// Phantom version entries cleaned from metadata files (npm/PyPI)
     pub metadata_phantoms_removed: usize,
+    /// Orphans skipped because they were younger than the grace period —
+    /// protected from the write-vs-GC race (#584). Benign: collected next pass.
+    pub skipped_recent: usize,
+    /// Orphans kept because their age could not be determined (stat failed).
+    /// Nonzero is a warning sign: GC may be unable to make progress (disk grows
+    /// silently). Tracked separately from `skipped_recent` and metered via
+    /// `nora_gc_stat_failures_total` so it can be alerted on.
+    pub stat_failures: usize,
 }
 
 // ============================================================================
 // Main GC entry point
 // ============================================================================
 
-pub async fn run_gc(storage: &Storage, publish_locks: &PublishLocks, dry_run: bool) -> GcResult {
+/// Current wall-clock time as a Unix timestamp (seconds). Returns 0 if the
+/// clock is before the epoch, which makes every file look "in the future" and
+/// thus protected by the grace check — a safe (fail-closed) degradation.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub async fn run_gc(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    dry_run: bool,
+    grace_secs: u64,
+) -> GcResult {
     let start = Instant::now();
-    info!("Starting garbage collection (dry_run={})", dry_run);
+    info!(
+        "Starting garbage collection (dry_run={}, grace_secs={})",
+        dry_run, grace_secs
+    );
 
     let mut all_orphans: Vec<String> = Vec::new();
     let mut total_candidates = 0usize;
@@ -133,33 +167,69 @@ pub async fn run_gc(storage: &Storage, publish_locks: &PublishLocks, dry_run: bo
 
     let mut deleted = 0usize;
     let mut bytes_freed = 0u64;
+    let mut skipped_recent = 0usize;
+    let mut stat_failures = 0usize;
+    let now = now_unix_secs();
+
+    for key in &all_orphans {
+        // Grace period (#584): never reap an orphan whose backing file is
+        // younger than `grace_secs`. A blob written by an in-flight push whose
+        // referencing manifest PUT has not landed yet looks orphaned but is
+        // live — reaping it would strand the about-to-be-written manifest on a
+        // missing layer. This is the canonical defence for the write-vs-GC race
+        // (the manifest's key does not exist yet, so no lock can serialise
+        // against it — only wall-clock age can). Applied to dry-run too, so the
+        // preview matches what `--apply` would actually remove.
+        //
+        // Fail-closed: if the age cannot be determined (stat returned None),
+        // keep the artifact rather than risk reaping a live one, and count it
+        // separately (`stat_failures`) — a nonzero count means GC may be unable
+        // to make progress, which is alertable.
+        let Some(meta) = storage.stat(key).await else {
+            warn!("GC: cannot stat {}, keeping it (age unknown)", key);
+            stat_failures += 1;
+            continue;
+        };
+        if grace_secs > 0 && now.saturating_sub(meta.modified) < grace_secs {
+            skipped_recent += 1;
+            continue;
+        }
+
+        if dry_run {
+            bytes_freed += meta.size;
+            info!("[dry-run] Would delete: {} ({} bytes)", key, meta.size);
+            continue;
+        }
+
+        // Serialize with concurrent publish to prevent deleting an artifact
+        // under a same-key write.
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
+        if storage.delete(key).await.is_ok() {
+            deleted += 1;
+            bytes_freed += meta.size;
+            info!("Deleted: {}", key);
+        }
+    }
+
+    if skipped_recent > 0 {
+        info!(
+            "Skipped {} orphan(s) younger than grace ({}s) — likely in-flight uploads",
+            skipped_recent, grace_secs
+        );
+    }
+    if stat_failures > 0 {
+        warn!(
+            "GC could not stat {} orphan(s); kept them (age unknown). GC may be unable to reclaim space",
+            stat_failures
+        );
+        GC_STAT_FAILURES.inc_by(stat_failures as u64);
+    }
 
     if !dry_run {
-        for key in &all_orphans {
-            // Get size before deleting
-            if let Some(meta) = storage.stat(key).await {
-                bytes_freed += meta.size;
-            }
-            // Serialize with concurrent publish to prevent deleting an artifact
-            // that is being referenced by a manifest currently being written.
-            let lock = crate::acquire_publish_lock(publish_locks, key);
-            let _guard = lock.lock().await;
-            if storage.delete(key).await.is_ok() {
-                deleted += 1;
-                info!("Deleted: {}", key);
-            }
-        }
         info!("Deleted {} orphans, freed {} bytes", deleted, bytes_freed);
-
-        // Update Prometheus metrics
         GC_BLOBS_REMOVED.inc_by(deleted as u64);
         GC_BYTES_FREED.inc_by(bytes_freed);
-    } else {
-        for key in &all_orphans {
-            let size = storage.stat(key).await.map(|m| m.size).unwrap_or(0);
-            bytes_freed += size;
-            info!("[dry-run] Would delete: {} ({} bytes)", key, size);
-        }
     }
 
     // Metadata phantom cleanup (npm/PyPI) — acquires per-key publish_lock
@@ -220,6 +290,8 @@ pub async fn run_gc(storage: &Storage, publish_locks: &PublishLocks, dry_run: bo
         duration_secs: duration,
         uncovered,
         metadata_phantoms_removed,
+        skipped_recent,
+        stat_failures,
     }
 }
 
@@ -713,6 +785,7 @@ pub fn spawn_gc_scheduler(
     publish_locks: PublishLocks,
     interval_secs: u64,
     dry_run: bool,
+    grace_secs: u64,
     cleanup_lock: Arc<tokio::sync::Mutex<()>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -745,11 +818,11 @@ pub fn spawn_gc_scheduler(
             }
 
             info!("GC scheduler: starting periodic run");
-            let result = run_gc(&storage, &publish_locks, dry_run).await;
+            let result = run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
             info!(
-                "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms",
+                "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                 result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
-                result.metadata_phantoms_removed
+                result.metadata_phantoms_removed, result.skipped_recent
             );
 
             drop(guard);
@@ -781,6 +854,8 @@ mod tests {
             duration_secs: 0.0,
             uncovered: vec![],
             metadata_phantoms_removed: 0,
+            skipped_recent: 0,
+            stat_failures: 0,
         };
         assert_eq!(result.total_candidates, 0);
         assert!(result.orphan_keys.is_empty());
@@ -812,7 +887,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.total_candidates, 0);
         assert_eq!(result.orphaned, 0);
         assert_eq!(result.deleted, 0);
@@ -843,7 +918,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -876,7 +951,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 0);
         assert!(result.orphan_keys[0].contains("orphan999"));
@@ -885,6 +960,57 @@ mod tests {
             .get("docker/test/blobs/sha256:orphan999")
             .await
             .is_ok());
+    }
+
+    /// Regression for #584: a freshly-written orphan blob must NOT be deleted —
+    /// it may be a layer from an in-flight push whose manifest PUT has not
+    /// landed yet, and deleting it would strand that manifest on a missing
+    /// layer. With a non-zero grace the orphan is detected but protected; with
+    /// grace=0 (read-only maintenance window) it is collected. Drives the real
+    /// `run_gc` delete path.
+    #[tokio::test]
+    async fn test_gc_grace_protects_recent_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // An unreferenced (orphan) blob, just written → mtime ≈ now.
+        storage
+            .put("docker/test/blobs/sha256:fresh000", b"in-flight-layer")
+            .await
+            .unwrap();
+
+        // Generous grace: the orphan is detected but must NOT be deleted.
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600).await;
+        assert_eq!(result.orphaned, 1, "orphan should be detected");
+        assert_eq!(
+            result.deleted, 0,
+            "recent orphan must be protected by grace"
+        );
+        assert_eq!(result.skipped_recent, 1);
+        assert!(
+            storage
+                .get("docker/test/blobs/sha256:fresh000")
+                .await
+                .is_ok(),
+            "blob from a possible in-flight push must survive (#584)"
+        );
+
+        // Dry-run honors grace too, so the preview matches `--apply`: a
+        // protected orphan is reported as skipped, not as "would delete".
+        let preview = run_gc(&storage, &test_publish_locks(), true, 3600).await;
+        assert_eq!(preview.skipped_recent, 1);
+        assert_eq!(
+            preview.bytes_freed, 0,
+            "dry-run must not count a grace-protected orphan"
+        );
+
+        // grace=0 (no concurrent writes): the same orphan is now collected.
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        assert_eq!(result.deleted, 1, "grace=0 deletes the orphan");
+        assert!(storage
+            .get("docker/test/blobs/sha256:fresh000")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -912,7 +1038,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -953,7 +1079,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -975,7 +1101,7 @@ mod tests {
         // Raw: no GC coverage
         storage.put("raw/some-file.txt", b"raw-data").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         // Cargo crate without index entry = 1 orphan
         // Go .zip without .info = 1 orphan (incomplete version)
         assert_eq!(result.orphaned, 2);
@@ -1004,7 +1130,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "complete Go version should have no orphans"
@@ -1022,7 +1148,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
@@ -1041,7 +1167,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "cargo with matching index should have no orphans"
@@ -1059,7 +1185,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].contains("index"));
     }
@@ -1090,7 +1216,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 2);
         assert_eq!(result.deleted, 2);
         // Non-orphan checksum still exists
@@ -1121,7 +1247,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(storage
@@ -1149,7 +1275,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
     }
@@ -1186,7 +1312,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 2); // 1 docker blob + 1 maven checksum
         assert_eq!(result.deleted, 2);
     }
@@ -1217,7 +1343,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         // 4 checksums scanned, 0 orphans
         assert_eq!(result.total_candidates, 4);
         assert_eq!(result.orphaned, 0);
@@ -1245,7 +1371,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
     }
@@ -1274,7 +1400,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1306,7 +1432,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Dry run: metadata should be unchanged
@@ -1342,7 +1468,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1376,7 +1502,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1404,7 +1530,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1457,7 +1583,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
