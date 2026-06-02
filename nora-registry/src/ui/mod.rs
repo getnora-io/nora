@@ -24,20 +24,11 @@ use i18n::Lang;
 use templates::*;
 
 /// Returns base URL for UI install commands.
-/// Uses public_url if set (trimming trailing slash), otherwise http://host:port.
+///
+/// Thin wrapper over [`ServerConfig::public_base_url`] — the single source of
+/// truth for client-facing URLs.
 fn resolve_base_url(state: &AppState) -> String {
-    state
-        .config
-        .server
-        .public_url
-        .as_deref()
-        .map(|u| u.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "http://{}:{}",
-                state.config.server.host, state.config.server.port
-            )
-        })
+    state.config.server.public_base_url()
 }
 
 #[derive(Debug, serde::Deserialize)]

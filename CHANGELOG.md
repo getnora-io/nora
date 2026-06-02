@@ -1,6 +1,13 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **Docker pull command in the UI** — the package detail view built `docker pull` from `public_url` verbatim, so a configured `public_url` with a scheme produced an invalid `docker pull https://host/image`. The pull command now uses the bare host authority.
+- **IPv6 fallback base URL** — when `public_url` is unset and the bind host is an IPv6 literal, the advertised base URL now brackets the address (`http://[::1]:4000`), matching the listen address format.
+
+### Internal
+- Client-facing URL construction (service index rewriting, UI install commands, docker pull) is now centralized in `ServerConfig::public_base_url()` / `public_host()`, replacing three divergent inline copies.
+
 ### Security
 - **OIDC `namespace_scope` is now enforced on writes** — it was previously parsed and documented as a per-provider access control but never applied at runtime (fail-open, #583). A provider's `namespace_scope` now restricts which artifact namespaces its tokens may publish to, across docker, raw, npm, maven, pypi and cargo. Matching is segment-aware (`myorg/*` matches `myorg/repo` but never `myorg-evil/...`; use `myorg/**` for everything under `myorg/`).
   - **BREAKING (behavioral):** if a provider's `namespace_scope` is set to anything other than `["*"]`, out-of-scope writes from that issuer now return `403`. The default `["*"]` is unchanged and remains a no-op, so deployments that never set the field are unaffected. **Check your OIDC config before upgrading.**
