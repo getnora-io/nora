@@ -17,7 +17,7 @@ use crate::registry::{
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
-use crate::validation::validate_storage_key;
+use crate::validation::{enforce_namespace_scope, validate_storage_key, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -25,7 +25,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, put},
-    Router,
+    Extension, Router,
 };
 use sha2::Digest;
 use std::time::Duration;
@@ -377,7 +377,11 @@ async fn download(
 ///   N bytes:    metadata JSON
 ///   4 bytes LE: .crate tarball length
 ///   M bytes:    .crate tarball
-async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
+async fn publish(
+    State(state): State<AppState>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    body: Bytes,
+) -> Response {
     if body.len() < 8 {
         return (StatusCode::BAD_REQUEST, "Payload too small").into_response();
     }
@@ -437,6 +441,11 @@ async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
     // Normalize to lowercase for consistent storage keys
     let name = name.to_lowercase();
     let vers = vers.to_string();
+
+    // Enforce OIDC namespace_scope on the crate coordinate (#583).
+    if enforce_namespace_scope(&authority, &name).is_err() {
+        return (StatusCode::FORBIDDEN, "Outside namespace scope").into_response();
+    }
 
     // TOCTOU protection: lock per crate (not per version!) to serialize
     // index read-modify-write. The index file is shared across all versions

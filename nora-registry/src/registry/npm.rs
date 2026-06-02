@@ -9,6 +9,7 @@ use crate::registry::{
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
+use crate::validation::{enforce_namespace_scope, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -16,7 +17,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Extension, Router,
 };
 use base64::Engine;
 use sha2::Digest;
@@ -393,9 +394,15 @@ fn is_valid_attachment_name(name: &str) -> bool {
 async fn handle_publish(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
 ) -> Response {
     let package_name = path;
+
+    // Enforce OIDC namespace_scope on the package coordinate (#583).
+    if enforce_namespace_scope(&authority, &package_name).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,

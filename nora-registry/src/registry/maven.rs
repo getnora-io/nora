@@ -12,7 +12,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
-use crate::validation::ends_with_ci;
+use crate::validation::{ends_with_ci, enforce_namespace_scope, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -20,7 +20,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Extension, Router,
 };
 use sha2::Digest;
 use std::collections::BTreeSet;
@@ -230,9 +230,29 @@ async fn download(
 // Upload
 // ============================================================================
 
-async fn upload(State(state): State<AppState>, Path(path): Path<String>, body: Bytes) -> Response {
+async fn upload(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    body: Bytes,
+) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (group/artifactId).
+    // An unrecognized (Opaque) path yields an empty coordinate → fail-closed (#583).
+    let maven_namespace = match classify_path(&path) {
+        MavenPathKind::VersionFile(c) => format!("{}/{}", c.group_path, c.artifact_id),
+        MavenPathKind::ArtifactMeta {
+            group_path,
+            artifact_id,
+            ..
+        } => format!("{}/{}", group_path, artifact_id),
+        MavenPathKind::Opaque => String::new(),
+    };
+    if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let key = format!("maven/{}", path);
