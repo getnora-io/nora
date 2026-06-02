@@ -38,6 +38,12 @@ pub enum StorageError {
 
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
+
+    /// Stored artifact failed hash-pin verification — tampering or on-disk
+    /// corruption detected. Fail-closed: the tampered bytes are never served
+    /// (handlers map this to 5xx). See #582.
+    #[error("Integrity violation: artifact failed hash-pin verification")]
+    IntegrityViolation,
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -137,22 +143,44 @@ impl Storage {
                 STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
                 if let Some(ref pins) = self.pin_store {
                     let pins = Arc::clone(pins);
-                    let key = key.to_string();
+                    let key_owned = key.to_string();
                     let data_ref = data.clone();
-                    // SHA-256 verification — offload from tokio worker
-                    let ok = match tokio::task::spawn_blocking(move || pins.verify(&key, &data_ref))
+                    // SHA-256 verification — offloaded from the tokio worker.
+                    // A buffered `get()` may hold a large artifact in memory;
+                    // hashing it inline would stall the async worker for the
+                    // hash duration, so we keep the blocking pool. The panic
+                    // path is handled fail-closed below — see #582.
+                    match tokio::task::spawn_blocking(move || pins.verify(&key_owned, &data_ref))
                         .await
                     {
-                        Ok(result) => result,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "hash verification task failed");
-                            true // fail-open on infra error, not on data
+                        // Genuine hash mismatch — tampering or on-disk corruption.
+                        // Fail-closed: never serve the tampered bytes (#582).
+                        Ok(false) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["get", "integrity_fail"])
+                                .inc();
+                            tracing::error!(
+                                key = %key,
+                                "integrity violation: refusing to serve tampered artifact"
+                            );
+                            return Err(StorageError::IntegrityViolation);
                         }
-                    };
-                    if !ok {
-                        STORAGE_OPERATIONS
-                            .with_label_values(&["get", "integrity_fail"])
-                            .inc();
+                        // Verification task itself panicked. We cannot prove the
+                        // bytes are intact, so fail-closed too — a crashed
+                        // verifier must not become an integrity bypass (#582).
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["get", "verify_error"])
+                                .inc();
+                            tracing::error!(
+                                error = %e,
+                                key = %key,
+                                "hash verification task failed: refusing to serve unverified artifact"
+                            );
+                            return Err(StorageError::IntegrityViolation);
+                        }
+                        // Hash matched, or no pin exists for this key (open-world).
+                        Ok(true) => {}
                     }
                 }
                 Ok(data)
@@ -291,5 +319,80 @@ impl Storage {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Wait until the fire-and-forget pin record from `put()` has landed.
+    async fn await_pin(storage: &Storage, key: &str) {
+        for _ in 0..200 {
+            if storage.get_pin_hash(key).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pin for {key} was never recorded");
+    }
+
+    /// Regression for #582: a pinned artifact corrupted on disk must NOT be
+    /// served. Exercises the real call path `Storage::get()` — not `verify()`
+    /// in isolation (PM-4). The bug was that `get()` computed the verification
+    /// result and then returned `Ok(data)` regardless.
+    #[tokio::test]
+    async fn get_fails_closed_on_integrity_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+
+        let key = "raw/example/app.bin";
+        storage.put(key, b"genuine-bytes").await.unwrap();
+        await_pin(&storage, key).await;
+
+        // Sanity: an untampered read returns the bytes.
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"genuine-bytes");
+
+        // Tamper with the artifact directly on disk, bypassing NORA — exactly
+        // the threat the pin store exists to catch.
+        let before = STORAGE_OPERATIONS
+            .with_label_values(&["get", "integrity_fail"])
+            .get();
+        std::fs::write(dir.path().join(key), b"TAMPERED").unwrap();
+
+        // get() must refuse to serve the tampered bytes.
+        let result = storage.get(key).await;
+        assert!(
+            matches!(result, Err(StorageError::IntegrityViolation)),
+            "expected IntegrityViolation, got {result:?}"
+        );
+
+        // ...and the failure must be recorded (acceptance criterion).
+        let after = STORAGE_OPERATIONS
+            .with_label_values(&["get", "integrity_fail"])
+            .get();
+        assert!(after > before, "integrity_fail metric must increment");
+    }
+
+    /// The fix must not break legitimate reads: a matching hash still returns
+    /// the bytes, and an unpinned key (open-world) passes through.
+    #[tokio::test]
+    async fn get_succeeds_for_matching_and_unpinned() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+
+        // Pinned + matching → served.
+        let key = "raw/ok/file.bin";
+        storage.put(key, b"hello").await.unwrap();
+        await_pin(&storage, key).await;
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"hello");
+
+        // Unpinned key (written straight to disk, no pin) → open-world pass.
+        let unpinned = "raw/ok/unpinned.bin";
+        std::fs::write(dir.path().join(unpinned), b"no-pin").unwrap();
+        assert_eq!(&storage.get(unpinned).await.unwrap()[..], b"no-pin");
     }
 }
