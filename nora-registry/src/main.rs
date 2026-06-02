@@ -1027,32 +1027,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::nuget::discover_search_endpoints(&http_client, &mut config.nuget).await;
     }
 
-    // Validate curation config at startup — panic in enforce mode on errors
-    if config.curation.mode == CurationMode::Enforce {
-        if let Some(ref path) = config.curation.blocklist_path {
-            if curation::BlocklistFilter::from_file(path).is_err() {
-                panic!("Cannot start in enforce mode with invalid blocklist");
-            }
-        }
-        if let Some(ref path) = config.curation.allowlist_path {
-            if curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
-                .is_err()
-            {
-                panic!("Cannot start in enforce mode with invalid allowlist");
-            }
-        }
-        if let Some(ref age_str) = config.curation.min_release_age {
-            if curation::parse_duration(age_str).is_err() {
-                panic!(
-                    "Cannot start in enforce mode with invalid min_release_age: {}",
-                    age_str
-                );
-            }
-        }
-    }
-
-    // Build curation engine (shared helper, also used by SIGHUP reload)
-    let curation_engine = build_curation_engine(&config);
+    // Build curation engine (shared helper, also used by SIGHUP reload).
+    // Fail-closed: in enforce mode an unparsable filter aborts boot rather
+    // than starting in a silent allow-all state (#586).
+    let curation_engine = build_curation_engine(&config)
+        .unwrap_or_else(|e| panic!("Cannot start in enforce mode: {e}"));
     if curation_engine.is_active() {
         info!(
             mode = %config.curation.mode,
@@ -1459,7 +1438,12 @@ async fn shutdown_signal() {
 /// Storage, auth, port, and other settings are NOT reloaded — only curation.
 fn reload_curation(state: &AppState) -> Result<(), String> {
     let config = Config::try_load()?;
-    let engine = build_curation_engine(&config);
+
+    // Fail-closed: `build_curation_engine` returns Err in enforce mode if any
+    // filter no longer parses, so a broken allowlist surfaces here and the
+    // `?` short-circuits BEFORE the `store` below — the previous (working)
+    // engine is kept and never swapped for an allow-all one (#586).
+    let engine = build_curation_engine(&config)?;
 
     state.reloadable.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
@@ -1470,7 +1454,18 @@ fn reload_curation(state: &AppState) -> Result<(), String> {
 }
 
 /// Build a CurationEngine from the given config (used at startup and reload).
-fn build_curation_engine(config: &Config) -> curation::CurationEngine {
+///
+/// Fail-closed in enforce mode: if a configured filter fails to parse, this
+/// returns `Err` instead of silently dropping it. Dropping a deny-by-default
+/// allowlist would turn the engine into allow-all, so callers must refuse to
+/// boot (startup) or refuse to swap (SIGHUP reload) — see #586. The file is
+/// parsed exactly once here, so there is no validate-then-rebuild TOCTOU
+/// window: the same parse that is checked is the one that is installed.
+///
+/// In audit/off mode a parse error is logged and the filter dropped (the
+/// engine is advisory there), so this never returns `Err`.
+fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, String> {
+    let enforce = config.curation.mode == CurationMode::Enforce;
     let mut engine = curation::CurationEngine::new(config.curation.clone());
 
     // Load blocklist filter if configured
@@ -1481,9 +1476,8 @@ fn build_curation_engine(config: &Config) -> curation::CurationEngine {
                 engine.add_filter(Box::new(filter));
                 info!(path = %path, rules = count, "Blocklist filter loaded");
             }
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to load blocklist");
-            }
+            Err(e) if enforce => return Err(format!("invalid blocklist {path}: {e}")),
+            Err(e) => error!(path = %path, error = %e, "Failed to load blocklist"),
         }
     }
 
@@ -1495,9 +1489,8 @@ fn build_curation_engine(config: &Config) -> curation::CurationEngine {
                 engine.add_filter(Box::new(filter));
                 info!(path = %path, entries = count, "Allowlist filter loaded");
             }
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to load allowlist");
-            }
+            Err(e) if enforce => return Err(format!("invalid allowlist {path}: {e}")),
+            Err(e) => error!(path = %path, error = %e, "Failed to load allowlist"),
         }
     }
 
@@ -1518,13 +1511,12 @@ fn build_curation_engine(config: &Config) -> curation::CurationEngine {
                 engine.add_filter(Box::new(filter));
                 info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
             }
-            Err(e) => {
-                error!(value = %age_str, error = %e, "Invalid min_release_age");
-            }
+            Err(e) if enforce => return Err(format!("invalid min_release_age {age_str}: {e}")),
+            Err(e) => error!(value = %age_str, error = %e, "Invalid min_release_age"),
         }
     }
 
-    engine
+    Ok(engine)
 }
 
 /// Print note about registries that have data but no retention rules configured.
@@ -1636,5 +1628,70 @@ mod proxy_tests {
     #[test]
     fn sanitize_empty() {
         assert_eq!(sanitize_proxy_url(""), "");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod curation_reload_tests {
+    use super::build_curation_engine;
+    use crate::config::{Config, CurationConfig, CurationMode};
+
+    fn config_with_allowlist(mode: CurationMode, allowlist_path: String) -> Config {
+        Config {
+            curation: CurationConfig {
+                mode,
+                allowlist_path: Some(allowlist_path),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Regression for #586: a SIGHUP reload must NOT swap to an allow-all engine
+    /// when the allowlist no longer parses. `reload_curation()` gates its
+    /// `ArcSwap::store` on `build_curation_engine(&config)?`, so this is the
+    /// exact function the production reload path runs: in enforce mode a
+    /// malformed allowlist must return `Err` (so `?` short-circuits before the
+    /// swap and the previous engine survives), not a silently-dropped,
+    /// deny-by-default-defeating filter.
+    #[test]
+    fn enforce_rejects_malformed_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, b"{ not valid json").unwrap();
+
+        let config = config_with_allowlist(CurationMode::Enforce, path.to_str().unwrap().into());
+        let result = build_curation_engine(&config);
+        assert!(
+            result.is_err(),
+            "enforce mode must reject a malformed allowlist, got an engine"
+        );
+    }
+
+    /// A well-formed allowlist still builds, and the filter is actually
+    /// installed (engine active) — the fix must not reject valid reloads.
+    #[test]
+    fn enforce_accepts_valid_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, br#"{"version": 1, "entries": []}"#).unwrap();
+
+        let config = config_with_allowlist(CurationMode::Enforce, path.to_str().unwrap().into());
+        let engine = build_curation_engine(&config).expect("valid allowlist must build");
+        assert!(engine.is_active(), "allowlist filter must be installed");
+    }
+
+    /// Audit/off mode stays lenient (matches boot behavior): a broken file
+    /// there is logged and dropped, never blocking the build, since the engine
+    /// is advisory.
+    #[test]
+    fn non_enforce_is_lenient_on_malformed_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, b"garbage").unwrap();
+
+        let config = config_with_allowlist(CurationMode::Off, path.to_str().unwrap().into());
+        assert!(build_curation_engine(&config).is_ok());
     }
 }
