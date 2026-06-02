@@ -11,6 +11,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
@@ -24,7 +25,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
+    Extension, Router,
 };
 use sha2::Digest;
 use std::fmt::Write;
@@ -380,7 +381,11 @@ async fn download_file(
 ///   content = the file bytes
 ///   sha256_digest = hex SHA-256 of file (optional)
 ///   metadata_version, summary, etc. (optional metadata)
-async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Response {
+async fn upload(
+    State(state): State<AppState>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    mut multipart: Multipart,
+) -> Response {
     let mut action = String::new();
     let mut name = String::new();
     let mut version = String::new();
@@ -458,6 +463,11 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
 
     // Normalize name and store
     let normalized = normalize_name(&name);
+
+    // Enforce OIDC namespace_scope on the project coordinate (#583).
+    if enforce_namespace_scope(&authority, &normalized).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     // TOCTOU protection: lock per file to prevent concurrent uploads
     let file_key = format!("pypi/{}/{}", normalized, filename);

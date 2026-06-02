@@ -23,7 +23,9 @@ mod storage;
 pub use self::audit_cfg::AuditConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
 #[allow(unused_imports)]
-pub use self::auth::{AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, TrustedProxies};
+pub use self::auth::{
+    AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement, TrustedProxies,
+};
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
 pub use self::curation::{

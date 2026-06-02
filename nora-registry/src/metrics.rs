@@ -62,6 +62,18 @@ pub static STORAGE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_OPERATIONS metric at startup")
 });
 
+/// OIDC namespace_scope enforcement decisions, by provider and decision.
+/// `decision` is one of: allow | deny | would_deny (audit mode). Lets operators
+/// watch a staged rollout before switching a provider from audit to enforce (#583).
+pub static NAMESPACE_SCOPE_DECISIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_auth_namespace_scope_total",
+        "OIDC namespace_scope enforcement decisions",
+        &["provider", "decision"]
+    )
+    .expect("failed to create NAMESPACE_SCOPE_DECISIONS metric at startup")
+});
+
 /// Artifacts count by registry
 #[allow(dead_code)]
 pub static ARTIFACTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

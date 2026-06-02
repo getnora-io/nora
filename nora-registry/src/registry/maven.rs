@@ -10,6 +10,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::validation::ends_with_ci;
@@ -20,7 +21,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Extension, Router,
 };
 use sha2::Digest;
 use std::collections::BTreeSet;
@@ -230,9 +231,29 @@ async fn download(
 // Upload
 // ============================================================================
 
-async fn upload(State(state): State<AppState>, Path(path): Path<String>, body: Bytes) -> Response {
+async fn upload(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    body: Bytes,
+) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (group/artifactId).
+    // An unrecognized (Opaque) path yields an empty coordinate → fail-closed (#583).
+    let maven_namespace = match classify_path(&path) {
+        MavenPathKind::VersionFile(c) => format!("{}/{}", c.group_path, c.artifact_id),
+        MavenPathKind::ArtifactMeta {
+            group_path,
+            artifact_id,
+            ..
+        } => format!("{}/{}", group_path, artifact_id),
+        MavenPathKind::Opaque => String::new(),
+    };
+    if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let key = format!("maven/{}", path);
@@ -781,6 +802,53 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    #[tokio::test]
+    async fn test_maven_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["com/myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Out of scope (different group) -> 403.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("com/other/lib/1.0/lib-1.0.jar".to_string()),
+            Extension(scoped.clone()),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Opaque (unrecognized) path under a real scope -> fail-closed 403.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("foo".to_string()),
+            Extension(scoped.clone()),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // In scope -> enforcement passes (not 403).
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("com/myorg/lib/1.0/lib-1.0.jar".to_string()),
+            Extension(scoped),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
     use sha2::Digest;

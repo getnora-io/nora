@@ -357,6 +357,71 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
     next.run(request).await
 }
 
+/// Match an artifact namespace `value` (a slash-separated coordinate such as
+/// `myorg/repo`) against a scope `pattern` using segment-aware glob semantics.
+///
+/// This is used to enforce OIDC `namespace_scope` and is intentionally **not**
+/// the same matcher as the `sub`-claim glob in the OIDC provider: that one is
+/// substring/contains-based and is unsafe for `/`-separated paths (e.g. `org*`
+/// would match `org-evil`). This matcher is anchored at both ends and treats
+/// `/` as a hard segment boundary.
+///
+/// Semantics (wildcards are whole-segment only — they never match across `/`
+/// implicitly):
+/// - the whole pattern `"*"` matches anything — the universal, backward-compatible
+///   no-op used by the default `namespace_scope = ["*"]`.
+/// - a `*` segment matches exactly one segment (`github/*` matches `github/repo`
+///   but not `github/a/b`).
+/// - a `**` segment matches zero or more segments (`github/**` matches `github`,
+///   `github/a`, and `github/a/b`).
+/// - any other segment must match an identical literal segment.
+///
+/// A segment that merely *contains* `*` (e.g. `my*org`) is treated literally and
+/// therefore will not match a real namespace — fail-closed by construction. Only
+/// a segment that is exactly `*` or `**` is a wildcard. Operators should always
+/// include the `/` boundary in scopes (`myorg/**`, not `myorg*`).
+///
+/// # Examples
+/// ```ignore
+/// assert!(namespace_match("*", "anything/at/all"));
+/// assert!(namespace_match("github/*", "github/repo"));
+/// assert!(!namespace_match("github/*", "github-evil/x"));
+/// assert!(!namespace_match("github/*", "github/a/b"));
+/// assert!(namespace_match("github/**", "github/a/b"));
+/// ```
+pub fn namespace_match(pattern: &str, value: &str) -> bool {
+    // Universal no-op: the default scope, and any explicit `*`, matches everything.
+    if pattern == "*" {
+        return true;
+    }
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let val: Vec<&str> = value.split('/').collect();
+    segments_match(&pat, &val)
+}
+
+/// Recursive segment matcher backing [`namespace_match`]. Patterns are operator
+/// config of a handful of segments, so the worst-case branching on `**` is not a
+/// practical concern.
+fn segments_match(pat: &[&str], val: &[&str]) -> bool {
+    match pat.split_first() {
+        // Pattern exhausted: match iff the value is also exhausted (anchored end).
+        None => val.is_empty(),
+        // `**` consumes zero or more value segments.
+        Some((&"**", rest)) => {
+            // Zero consumed:
+            if segments_match(rest, val) {
+                return true;
+            }
+            // One or more consumed (suffixes val[1..], val[2..], …, []):
+            (0..val.len()).any(|i| segments_match(rest, &val[i + 1..]))
+        }
+        // `*` consumes exactly one value segment.
+        Some((&"*", rest)) => !val.is_empty() && segments_match(rest, &val[1..]),
+        // Literal segment must match exactly (anchored start).
+        Some((&lit, rest)) => !val.is_empty() && val[0] == lit && segments_match(rest, &val[1..]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +769,114 @@ mod proptests {
         ) {
             let reference = format!("{}../{}", prefix, suffix);
             prop_assert!(validate_docker_reference(&reference).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod namespace_match_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn star_pattern_is_universal_noop() {
+        // The default `namespace_scope = ["*"]` must match everything.
+        assert!(namespace_match("*", "myorg/repo"));
+        assert!(namespace_match("*", "a/b/c/d"));
+        assert!(namespace_match("*", "single"));
+        assert!(namespace_match("*", ""));
+    }
+
+    #[test]
+    fn single_star_matches_exactly_one_segment() {
+        assert!(namespace_match("github/*", "github/repo"));
+        // …but not zero and not more than one.
+        assert!(!namespace_match("github/*", "github"));
+        assert!(!namespace_match("github/*", "github/a/b"));
+    }
+
+    #[test]
+    fn double_star_matches_zero_or_more_segments() {
+        assert!(namespace_match("github/**", "github")); // zero
+        assert!(namespace_match("github/**", "github/a")); // one
+        assert!(namespace_match("github/**", "github/a/b")); // many
+        assert!(!namespace_match("github/**", "other/a")); // wrong prefix
+    }
+
+    #[test]
+    fn prefix_lookalikes_do_not_match() {
+        // The headline requirement of #583: `github/*` must NOT match `github-evil`.
+        assert!(!namespace_match("github/*", "github-evil/x"));
+        assert!(!namespace_match("github/**", "github-evil/x"));
+        assert!(!namespace_match("github/**", "github_evil/x"));
+        assert!(!namespace_match("github", "github-evil"));
+    }
+
+    #[test]
+    fn matching_is_anchored_not_substring() {
+        // Unlike the sub-claim glob, this matcher does not do `contains`.
+        assert!(!namespace_match("foo", "xfooy"));
+        assert!(!namespace_match("org", "org/sub")); // literal != prefix
+        assert!(!namespace_match("sub", "org/sub")); // literal != suffix
+        assert!(namespace_match("org", "org"));
+    }
+
+    #[test]
+    fn exact_literal_paths() {
+        assert!(namespace_match("myorg/team/repo", "myorg/team/repo"));
+        assert!(!namespace_match("myorg/team/repo", "myorg/team/other"));
+        assert!(!namespace_match("myorg/team", "myorg/team/repo"));
+    }
+
+    #[test]
+    fn intra_segment_star_is_literal_not_wildcard() {
+        // Only a whole-segment `*`/`**` is a wildcard; `my*org` is fail-closed.
+        assert!(!namespace_match("my*org/*", "myXXXorg/repo"));
+        assert!(namespace_match("my*org", "my*org")); // matches only itself, literally
+    }
+
+    proptest! {
+        // The universal no-op holds for any value.
+        #[test]
+        fn prop_star_matches_anything(s in "[a-zA-Z0-9/@._-]{0,60}") {
+            prop_assert!(namespace_match("*", &s));
+        }
+
+        // Anti prefix-confusion: `org/*` never matches `org<sep>rest/...`.
+        #[test]
+        fn prop_prefix_star_rejects_lookalike(
+            org in "[a-z][a-z0-9]{0,9}",
+            sep in "[-_.]",
+            rest in "[a-z][a-z0-9]{0,7}",
+            tail in "[a-z][a-z0-9]{0,7}",
+        ) {
+            let pattern = format!("{}/*", org);
+            let value = format!("{}{}{}/{}", org, sep, rest, tail);
+            prop_assert!(!namespace_match(&pattern, &value));
+        }
+
+        // Anchoring: a single literal segment never matches a strictly longer
+        // segment that merely contains it.
+        #[test]
+        fn prop_literal_segment_is_anchored(
+            pre in "[a-z]{1,4}",
+            seg in "[a-z]{2,8}",
+            post in "[a-z]{1,4}",
+        ) {
+            let value = format!("{}{}{}", pre, seg, post);
+            prop_assert!(!namespace_match(&seg, &value));
+        }
+
+        // `prefix/**` matches every value under `prefix/`.
+        #[test]
+        fn prop_double_star_matches_all_descendants(
+            prefix in "[a-z][a-z0-9]{0,9}",
+            descendant in "[a-z][a-z0-9/]{0,30}",
+        ) {
+            let pattern = format!("{}/**", prefix);
+            let value = format!("{}/{}", prefix, descendant);
+            prop_assert!(namespace_match(&pattern, &value));
         }
     }
 }

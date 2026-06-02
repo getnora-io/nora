@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
@@ -19,7 +20,7 @@ use axum::{
     http::{header, HeaderName, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -564,6 +565,7 @@ async fn docker_v2_dispatch(
     state: State<AppState>,
     method: Method,
     Path(wildcard): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -572,6 +574,13 @@ async fn docker_v2_dispatch(
     if rest.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Writes (push/delete) are gated by OIDC namespace_scope on the image name,
+    // which is the docker namespace coordinate (#583). Reads are never gated here.
+    let is_write = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
 
     // Parse endpoint pattern from right — handles names containing "blobs", "manifests", etc.
     // Order matters: check blob uploads before blobs (substring overlap).
@@ -583,6 +592,9 @@ async fn docker_v2_dispatch(
         }
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
         }
         return if after.is_empty() {
             match method {
@@ -617,6 +629,9 @@ async fn docker_v2_dispatch(
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
         }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         return match method {
             Method::HEAD => check_blob(state, Path((name.to_string(), digest.to_string()))).await,
             Method::GET => {
@@ -636,6 +651,9 @@ async fn docker_v2_dispatch(
         }
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
         }
         return match method {
             Method::GET | Method::HEAD => {
@@ -2916,6 +2934,62 @@ mod integration_tests {
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
     use sha2::Digest;
+
+    #[tokio::test]
+    async fn test_docker_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::Uri;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Out-of-scope blob upload (POST) -> 403.
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::POST,
+            Path("other/app/blobs/uploads/".to_string()),
+            Extension(scoped.clone()),
+            "/v2/other/app/blobs/uploads/".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // In-scope blob upload start -> not denied (enforcement passes).
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::POST,
+            Path("myorg/app/blobs/uploads/".to_string()),
+            Extension(scoped.clone()),
+            "/v2/myorg/app/blobs/uploads/".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Reads are never gated, even out of scope (404, not 403).
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::GET,
+            Path("other/app/manifests/latest".to_string()),
+            Extension(scoped.clone()),
+            "/v2/other/app/manifests/latest".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     async fn test_docker_v2_check() {

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::{OidcConfig, OidcProvider};
+use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
 use crate::tokens::Role;
 
 /// Result of a successful OIDC authentication.
@@ -37,6 +37,12 @@ pub struct OidcIdentity {
     pub issuer: String,
     /// Assigned role based on role_rules
     pub role: Role,
+    /// Provider's `namespace_scope` patterns (segment-aware globs). `["*"]` = all
+    /// namespaces. Enforced on writes via `auth::enforce_namespace_scope`.
+    pub namespace_scope: Vec<String>,
+    /// Whether `namespace_scope` is enforced (403 on mismatch) or only audited
+    /// for this provider.
+    pub namespace_scope_enforcement: ScopeEnforcement,
 }
 
 /// Standard JWT claims we extract.
@@ -215,6 +221,8 @@ impl OidcValidator {
             subject,
             issuer: provider.issuer.clone(),
             role,
+            namespace_scope: provider.namespace_scope.clone(),
+            namespace_scope_enforcement: provider.namespace_scope_enforcement,
         })
     }
 
@@ -441,6 +449,7 @@ mod tests {
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 900,
             namespace_scope: vec!["*".to_string()],
+            namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
             enabled: true,
             role_rules: vec![
                 OidcRoleRule {

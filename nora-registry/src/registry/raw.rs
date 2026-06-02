@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::method_not_allowed;
 use crate::validation::validate_storage_key;
 use crate::AppState;
@@ -12,7 +13,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 
 pub fn routes() -> Router<AppState> {
@@ -115,6 +116,7 @@ async fn download(
 async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -125,6 +127,11 @@ async fn upload(
     let key = format!("raw/{}", path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (#583).
+    if enforce_namespace_scope(&authority, &path).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     if !path.is_ascii() {
@@ -274,7 +281,11 @@ async fn do_overwrite(state: &AppState, key: &str, path: &str, body: &[u8]) -> R
     }
 }
 
-async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn delete_file(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -282,6 +293,11 @@ async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) ->
     let key = format!("raw/{}", path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (#583).
+    if enforce_namespace_scope(&authority, &path).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
     match state.storage.delete(&key).await {
         Ok(()) => {
@@ -461,6 +477,63 @@ mod integration_tests {
         send_with_headers,
     };
     use axum::http::{Method, StatusCode};
+
+    fn scoped(mode: crate::config::ScopeEnforcement) -> crate::auth::NamespaceAuthority {
+        crate::auth::NamespaceAuthority::from_oidc_scope("ci", &["myorg/**".to_string()], mode)
+    }
+
+    #[tokio::test]
+    async fn test_raw_namespace_scope_enforced() {
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let ctx = create_test_context();
+
+        // Out of scope -> 403, and nothing is written.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("other/secret.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(ctx.state.storage.get("raw/other/secret.txt").await.is_err());
+
+        // In scope -> created.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("myorg/app/file.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // DELETE out of scope -> 403.
+        let resp = super::delete_file(
+            State(ctx.state.clone()),
+            Path("other/secret.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Audit mode allows an out-of-scope write (only logs/counts).
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("elsewhere/a.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Audit)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
     #[tokio::test]
     async fn test_raw_put_get_roundtrip() {

@@ -1,6 +1,12 @@
 # Changelog
 ## [Unreleased]
 
+### Security
+- **OIDC `namespace_scope` is now enforced on writes** — it was previously parsed and documented as a per-provider access control but never applied at runtime (fail-open, #583). A provider's `namespace_scope` now restricts which artifact namespaces its tokens may publish to, across docker, raw, npm, maven, pypi and cargo. Matching is segment-aware (`myorg/*` matches `myorg/repo` but never `myorg-evil/...`; use `myorg/**` for everything under `myorg/`).
+  - **BREAKING (behavioral):** if a provider's `namespace_scope` is set to anything other than `["*"]`, out-of-scope writes from that issuer now return `403`. The default `["*"]` is unchanged and remains a no-op, so deployments that never set the field are unaffected. **Check your OIDC config before upgrading.**
+  - To stage the rollout, set `namespace_scope_enforcement = "audit"` on the provider: out-of-scope writes are allowed but logged and counted as `would_deny` via the new `nora_auth_namespace_scope_total{provider,decision}` metric. Switch to `"enforce"` (the default) once the metric is clean.
+  - Scope applies to OIDC identities only; opaque (`nra_`) tokens and Basic auth are unaffected. Reads are never gated.
+
 ## [0.9.3] - 2026-05-30
 
 ### Security

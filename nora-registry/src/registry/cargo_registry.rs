@@ -12,6 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
@@ -25,7 +26,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, put},
-    Router,
+    Extension, Router,
 };
 use sha2::Digest;
 use std::time::Duration;
@@ -377,7 +378,11 @@ async fn download(
 ///   N bytes:    metadata JSON
 ///   4 bytes LE: .crate tarball length
 ///   M bytes:    .crate tarball
-async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
+async fn publish(
+    State(state): State<AppState>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    body: Bytes,
+) -> Response {
     if body.len() < 8 {
         return (StatusCode::BAD_REQUEST, "Payload too small").into_response();
     }
@@ -437,6 +442,11 @@ async fn publish(State(state): State<AppState>, body: Bytes) -> Response {
     // Normalize to lowercase for consistent storage keys
     let name = name.to_lowercase();
     let vers = vers.to_string();
+
+    // Enforce OIDC namespace_scope on the crate coordinate (#583).
+    if enforce_namespace_scope(&authority, &name).is_err() {
+        return (StatusCode::FORBIDDEN, "Outside namespace scope").into_response();
+    }
 
     // TOCTOU protection: lock per crate (not per version!) to serialize
     // index read-modify-write. The index file is shared across all versions
@@ -747,6 +757,45 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    #[tokio::test]
+    async fn test_cargo_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["acme/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Crate name outside scope -> 403.
+        let metadata =
+            serde_json::json!({"name":"other-crate","vers":"0.1.0","deps":[],"features":{}});
+        let payload = build_publish_payload(&metadata, b"data");
+        let resp = super::publish(
+            State(ctx.state.clone()),
+            Extension(scoped.clone()),
+            Bytes::from(payload),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Crate name covered by the scope -> enforcement passes (not 403).
+        let metadata = serde_json::json!({"name":"acme","vers":"0.1.0","deps":[],"features":{}});
+        let payload = build_publish_payload(&metadata, b"data");
+        let resp = super::publish(
+            State(ctx.state.clone()),
+            Extension(scoped),
+            Bytes::from(payload),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
 

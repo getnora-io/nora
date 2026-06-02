@@ -159,6 +159,12 @@ algorithms = ["RS256", "ES256"]
 max_token_lifetime_secs = 900
 enabled = true
 
+# Ограничить издателя префиксом namespace (по умолчанию ["*"] = без ограничений).
+# Посегментные glob: myorg/* = прямые потомки, myorg/** = любая глубина.
+namespace_scope = ["myorg/**"]
+# "enforce" (по умолчанию, 403 при выходе за scope) или "audit" (только лог + счётчик).
+namespace_scope_enforcement = "enforce"
+
 # Правила ролей: первое совпадение побеждает. Glob-паттерны по `sub` claim.
 [[auth.oidc.providers.role_rules]]
 pattern = "repo:myorg/*:ref:refs/heads/main"
@@ -174,6 +180,27 @@ role = "read"
 ```bash
 export NORA_AUTH_OIDC_ENABLED=true
 ```
+
+### Ограничение по namespace
+
+`namespace_scope` ограничивает, в какие namespace токены издателя могут **писать**. Применяется к публикации и удалению (PUT/POST/DELETE) для реестров docker, raw, npm, maven, pypi и cargo. Чтение никогда не ограничивается; scope действует только для OIDC-идентичностей (не для API-токенов и не для Basic auth).
+
+Scope сверяется с **координатой** артефакта (а не с URL-путём), посегментно:
+
+| Реестр | Сверяемая координата | Пример scope |
+|--------|----------------------|--------------|
+| docker | имя образа (`myorg/app`)            | `myorg/**` |
+| raw    | путь объекта (`myorg/sub/file`)     | `myorg/**` |
+| npm    | пакет со scope (`@myorg/pkg`)       | `@myorg/**` |
+| maven  | groupId/artifactId (`com/myorg/lib`)| `com/myorg/**` |
+| pypi   | нормализованное имя проекта (`myproj`) | `myproj` |
+| cargo  | имя крейта (`mycrate`)              | `mycrate` |
+
+Сопоставление привязано к границам `/`: `*` соответствует ровно одному сегменту, `**` — нулю или более. Поэтому `myorg/*` совпадает с `myorg/app`, но **не** с `myorg-evil/app` и **не** с `myorg/team/app` — для вложенных путей используйте `myorg/**`. Значение по умолчанию `["*"]` отключает ограничение; пустой список `[]` запрещает любую запись (намеренная блокировка). У pypi и cargo плоское пространство имён (без `/`) — ограничивайте по точному имени или используйте `**`.
+
+Запись вне scope возвращает `403 Forbidden`.
+
+> **Замечание об обновлении:** до этого релиза `namespace_scope` принимался, но не применялся. Если вы уже задали значение, отличное от `["*"]`, эта версия начнёт возвращать 403 для записи вне scope — проверьте конфигурацию перед обновлением. Для поэтапного внедрения задайте `namespace_scope_enforcement = "audit"`: запись вне scope разрешается, но логируется и считается метрикой `nora_auth_namespace_scope_total{provider,decision="would_deny"}`. Верните `"enforce"`, когда метрика будет чистой.
 
 ### Настройка GitHub Actions
 
