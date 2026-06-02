@@ -40,6 +40,11 @@ struct BreakerInner {
     failures: u32,
     last_failure: Option<Instant>,
     half_open_in_flight: bool,
+    /// When the current half-open probe started. Used to release a probe slot
+    /// that was never reported back (a `check()` that returned Ok but whose
+    /// caller exited without `record_success`/`record_failure`, e.g. a 4xx or
+    /// body-extract path), so the breaker cannot wedge at 503 forever (#585).
+    half_open_started: Option<Instant>,
 }
 
 impl BreakerInner {
@@ -49,6 +54,7 @@ impl BreakerInner {
             failures: 0,
             last_failure: None,
             half_open_in_flight: false,
+            half_open_started: None,
         }
     }
 }
@@ -128,6 +134,7 @@ impl CircuitBreakerRegistry {
                     // Transition to HalfOpen — allow one probe
                     breaker.state = BreakerState::HalfOpen;
                     breaker.half_open_in_flight = true;
+                    breaker.half_open_started = Some(Instant::now());
                     CIRCUIT_BREAKER_STATE
                         .with_label_values(&[registry])
                         .set(BreakerState::HalfOpen.as_gauge());
@@ -144,15 +151,40 @@ impl CircuitBreakerRegistry {
                 }
             }
             BreakerState::HalfOpen => {
-                if breaker.half_open_in_flight {
-                    // Already probing — reject additional requests
+                // A probe slot is held until the caller reports back via
+                // `record_success`/`record_failure`. Some upstream outcomes
+                // exit without reporting (4xx, body-extract error), which would
+                // otherwise pin the slot and 503 every request forever. Treat a
+                // probe outstanding longer than the reset timeout as lost and
+                // start a fresh one (#585). `reset_timeout == 0` is the
+                // degenerate "retry immediately" mode and keeps the strict
+                // single-probe behavior.
+                //
+                // NOTE: this is a reliability floor, not the full fix. A 4xx
+                // upstream probe means the upstream is alive and should
+                // `record_success` at the call-site (else the breaker keeps
+                // slow-probing and never closes). Tracked in #606.
+                let reset = self.reset_timeout_for(registry);
+                let probe_stalled = reset > 0
+                    && breaker
+                        .half_open_started
+                        .is_none_or(|t| t.elapsed().as_secs() >= reset);
+                if breaker.half_open_in_flight && !probe_stalled {
+                    // Probe genuinely in flight — reject additional requests.
                     CIRCUIT_BREAKER_REJECTIONS
                         .with_label_values(&[registry])
                         .inc();
                     Err(ProxyError::CircuitOpen(registry.to_string()))
                 } else {
-                    // Probe slot free — allow
+                    if probe_stalled {
+                        tracing::warn!(
+                            registry = registry,
+                            "Circuit breaker probe stalled (no result within reset timeout) — starting fresh probe"
+                        );
+                    }
+                    // Slot free, or previous probe was lost — start a fresh probe.
                     breaker.half_open_in_flight = true;
+                    breaker.half_open_started = Some(Instant::now());
                     Ok(())
                 }
             }
@@ -180,6 +212,7 @@ impl CircuitBreakerRegistry {
         breaker.state = BreakerState::Closed;
         breaker.failures = 0;
         breaker.half_open_in_flight = false;
+        breaker.half_open_started = None;
         CIRCUIT_BREAKER_STATE
             .with_label_values(&[registry])
             .set(BreakerState::Closed.as_gauge());
@@ -219,6 +252,7 @@ impl CircuitBreakerRegistry {
                 breaker.state = BreakerState::Open;
                 breaker.last_failure = Some(now);
                 breaker.half_open_in_flight = false;
+                breaker.half_open_started = None;
                 CIRCUIT_BREAKER_STATE
                     .with_label_values(&[registry])
                     .set(BreakerState::Open.as_gauge());
@@ -376,6 +410,44 @@ mod tests {
         assert!(cb.check("npm").is_ok());
         // Second check — probe in flight, reject
         assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
+    }
+
+    /// Regression for #585: a half-open probe that never reports back (a 4xx or
+    /// body-extract path that skipped `record_*`) must NOT wedge the breaker at
+    /// 503 forever. After the reset timeout the stalled slot is released and a
+    /// fresh probe is allowed. Drives the real `check()` path; probe age is
+    /// controlled by backdating the stored `Instant`s (deterministic, no sleep).
+    #[test]
+    fn test_halfopen_stalled_probe_recovers() {
+        let cb = CircuitBreakerRegistry::new(enabled_config(2, 1));
+        cb.record_failure("npm");
+        cb.record_failure("npm");
+
+        // Backdate last_failure so the Open→HalfOpen transition fires now.
+        {
+            let mut b = cb.breakers.write();
+            let br = b.get_mut("npm").unwrap();
+            br.last_failure = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        }
+        // First check → HalfOpen, probe in flight.
+        assert!(cb.check("npm").is_ok());
+        // Concurrency still holds within the window: a fresh probe is rejected.
+        assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
+
+        // Simulate the probe being lost: backdate its start past the reset
+        // timeout (this is the 4xx/extract-error exit that never recorded).
+        {
+            let mut b = cb.breakers.write();
+            let br = b.get_mut("npm").unwrap();
+            br.half_open_started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        }
+        // Next check must release the stalled slot and allow a fresh probe —
+        // not 503 forever.
+        assert!(
+            cb.check("npm").is_ok(),
+            "stalled half-open probe must be released, not wedge at 503 (#585)"
+        );
     }
 
     #[test]
