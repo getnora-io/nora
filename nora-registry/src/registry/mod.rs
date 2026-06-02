@@ -48,21 +48,10 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
 
 /// Build NORA base URL from config (for URL rewriting).
 ///
-/// Returns `public_url` (trimmed trailing slash) if set,
-/// otherwise constructs `http://host:port`.
+/// Thin wrapper over [`ServerConfig::public_base_url`] — the single source of
+/// truth for client-facing URLs.
 pub(crate) fn nora_base_url(state: &AppState) -> String {
-    state
-        .config
-        .server
-        .public_url
-        .as_deref()
-        .map(|u| u.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "http://{}:{}",
-                state.config.server.host, state.config.server.port
-            )
-        })
+    state.config.server.public_base_url()
 }
 
 #[derive(Debug)]

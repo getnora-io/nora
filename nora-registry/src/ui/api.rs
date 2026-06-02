@@ -371,11 +371,8 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     keys.sort();
     keys.dedup();
 
-    // Build public URL for pull commands
-    let registry_host =
-        state.config.server.public_url.clone().unwrap_or_else(|| {
-            format!("{}:{}", state.config.server.host, state.config.server.port)
-        });
+    // Scheme-less host authority for `docker pull` commands.
+    let registry_host = state.config.server.public_host();
 
     let mut tags = Vec::new();
     for key in &keys {

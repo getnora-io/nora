@@ -43,6 +43,45 @@ impl ServerConfig {
         }
     }
 
+    /// Build the base URL advertised to clients (npm/docker/nuget service
+    /// index, UI install commands). Single source of truth for client-facing
+    /// URLs — handlers and UI must not reconstruct it inline.
+    ///
+    /// Returns `public_url` (trailing slash trimmed) if set, otherwise falls
+    /// back to `http://{host}:{port}`. The fallback only makes sense for a
+    /// routable bind address; `validate()` rejects a wildcard bind without a
+    /// public_url and warns on a loopback public_url (#510, #590), so a broken
+    /// URL never silently ships.
+    pub fn public_base_url(&self) -> String {
+        let base = self
+            .public_url
+            .as_deref()
+            .map(|u| u.trim_end_matches('/').to_string())
+            // Reuse bind_addr() so IPv6 literals get bracket notation
+            // (`http://[::1]:4000`) — keeping the authority format consistent
+            // with the listen address and avoiding drift.
+            .unwrap_or_else(|| format!("http://{}", self.bind_addr()));
+        debug_assert!(
+            base.starts_with("http://") || base.starts_with("https://"),
+            "public_base_url must carry an http(s) scheme: {base}"
+        );
+        base
+    }
+
+    /// Host authority (`host[:port]`) advertised to clients, without scheme.
+    ///
+    /// For registry references that take no URL scheme — e.g.
+    /// `docker pull {host}/repo:tag`. Derived from [`Self::public_base_url`]
+    /// so it shares the single source of truth.
+    pub fn public_host(&self) -> String {
+        let base = self.public_base_url();
+        base.strip_prefix("https://")
+            .or_else(|| base.strip_prefix("http://"))
+            .unwrap_or(&base)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
     /// Apply environment variable overrides for server config.
     pub(super) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_HOST") {
@@ -96,6 +135,52 @@ mod tests {
             server("registry.example.com", 443).bind_addr(),
             "registry.example.com:443"
         );
+    }
+
+    #[test]
+    fn public_base_url_falls_back_to_host_port() {
+        // No public_url → http://{host}:{port}.
+        assert_eq!(
+            server("127.0.0.1", 4000).public_base_url(),
+            "http://127.0.0.1:4000"
+        );
+    }
+
+    #[test]
+    fn public_base_url_brackets_ipv6_fallback() {
+        // IPv6 literal host without public_url must be bracketed, matching
+        // bind_addr() — otherwise the authority is ambiguous/malformed.
+        assert_eq!(
+            server("2001:db8::1", 4000).public_base_url(),
+            "http://[2001:db8::1]:4000"
+        );
+        assert_eq!(server("::1", 4000).public_host(), "[::1]:4000");
+    }
+
+    #[test]
+    fn public_base_url_uses_public_url_and_trims_slash() {
+        let mut cfg = server("0.0.0.0", 4000);
+        cfg.public_url = Some("https://registry.example.com/".to_string());
+        // public_url wins over the bind address; trailing slash trimmed.
+        assert_eq!(cfg.public_base_url(), "https://registry.example.com");
+    }
+
+    #[test]
+    fn public_host_strips_scheme_for_docker_pull() {
+        // Fallback case: scheme stripped, host:port kept.
+        assert_eq!(
+            server("registry.example.com", 4000).public_host(),
+            "registry.example.com:4000"
+        );
+
+        // public_url case: scheme and trailing slash stripped — `docker pull`
+        // takes a bare host, not a URL.
+        let mut cfg = server("0.0.0.0", 4000);
+        cfg.public_url = Some("https://nora.example.com/".to_string());
+        assert_eq!(cfg.public_host(), "nora.example.com");
+
+        cfg.public_url = Some("http://nora.example.com:8080".to_string());
+        assert_eq!(cfg.public_host(), "nora.example.com:8080");
     }
 }
 
