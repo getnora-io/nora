@@ -159,6 +159,12 @@ algorithms = ["RS256", "ES256"]
 max_token_lifetime_secs = 900
 enabled = true
 
+# Restrict this issuer to a namespace prefix (default ["*"] = unrestricted).
+# Segment-aware globs: myorg/* = direct children, myorg/** = any depth.
+namespace_scope = ["myorg/**"]
+# "enforce" (default, 403 on out-of-scope writes) or "audit" (log + count only).
+namespace_scope_enforcement = "enforce"
+
 # Role rules: first match wins. Glob patterns on the `sub` claim.
 [[auth.oidc.providers.role_rules]]
 pattern = "repo:myorg/*:ref:refs/heads/main"
@@ -174,6 +180,27 @@ Environment variable override:
 ```bash
 export NORA_AUTH_OIDC_ENABLED=true
 ```
+
+### Namespace Scoping
+
+`namespace_scope` restricts which artifact namespaces an issuer's tokens may **write** to. It applies to publish and delete (PUT/POST/DELETE) on the docker, raw, npm, maven, pypi, and cargo registries. Reads are never gated, and scoping applies to OIDC identities only — not API tokens or Basic auth.
+
+The scope is matched against the artifact's **coordinate** (not the URL path), segment by segment:
+
+| Registry | Coordinate matched | Example scope |
+|----------|--------------------|---------------|
+| docker   | image name (`myorg/app`)          | `myorg/**` |
+| raw      | object path (`myorg/sub/file`)    | `myorg/**` |
+| npm      | package incl. scope (`@myorg/pkg`) | `@myorg/**` |
+| maven    | groupId/artifactId (`com/myorg/lib`) | `com/myorg/**` |
+| pypi     | normalized project name (`myproj`) | `myproj` |
+| cargo    | crate name (`mycrate`)            | `mycrate` |
+
+Matching is anchored on `/` boundaries: `*` matches exactly one segment and `**` matches zero or more. So `myorg/*` matches `myorg/app` but **not** `myorg-evil/app` and **not** `myorg/team/app` — use `myorg/**` for nested paths. The default `["*"]` disables scoping; an empty list `[]` denies all writes (a deliberate lockout). pypi and cargo have flat namespaces (no `/`), so scope them by exact name or use `**`.
+
+A write outside the scope returns `403 Forbidden`.
+
+> **Upgrade note:** until this release, `namespace_scope` was accepted but never enforced. If you already set it to something other than `["*"]`, this version will start returning 403 for out-of-scope writes — review your config before upgrading. To stage the change, set `namespace_scope_enforcement = "audit"`: out-of-scope writes are allowed but logged and counted via the `nora_auth_namespace_scope_total{provider,decision="would_deny"}` metric. Switch back to `"enforce"` once the metric is clean.
 
 ### GitHub Actions Setup
 

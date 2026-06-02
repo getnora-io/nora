@@ -179,7 +179,16 @@ pub struct AuthConfig {
 /// audience = "nora"
 /// algorithms = ["RS256", "ES256"]
 /// max_token_lifetime_secs = 900
-/// namespace_scope = ["*"]
+/// # Restrict this issuer to artifacts whose coordinate is under `myorg/`.
+/// # Segment-aware: `myorg/*` = direct children only, `myorg/**` = any depth.
+/// # Per format the coordinate is: docker image (`myorg/<img>`), raw path
+/// # (`myorg/<path>`), npm package (`@myorg/*`), maven group/artifact
+/// # (`com/myorg/**`), pypi/cargo the normalized project/crate name.
+/// # `["*"]` (the default) disables scoping for this issuer.
+/// namespace_scope = ["myorg/**"]
+/// # "enforce" (default) denies out-of-scope writes with 403; "audit" allows
+/// # but logs+counts them (nora_auth_namespace_scope_total) for staged rollout.
+/// namespace_scope_enforcement = "enforce"
 ///
 /// [auth.oidc.providers.role_rules]
 /// "repo:myorg/*:ref:refs/heads/main" = "write"
