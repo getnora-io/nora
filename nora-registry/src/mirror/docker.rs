@@ -236,6 +236,14 @@ async fn mirror_single_image(
             .await
             .map_err(|e| format!("Failed to fetch blob {}: {:?}", digest, e))?;
 
+            // Verify the blob's content hash matches the requested digest
+            // BEFORE propagating it. A compromised / MITM'd / misconfigured
+            // upstream can return arbitrary bytes for sha256:<X>; without this
+            // check `nora mirror` would accept and push them as that digest.
+            // Fail-closed, mirroring the proxy-path check in registry/docker.rs
+            // (#587, the mirror counterpart of #581).
+            verify_blob_digest(digest, &fetched.sha256)?;
+
             let blob_data = tokio::fs::read(&fetched.path)
                 .await
                 .map_err(|e| format!("Failed to read fetched blob: {}", e))?;
@@ -363,6 +371,23 @@ fn extract_blob_digests(manifest: &serde_json::Value) -> Vec<String> {
     digests
 }
 
+/// Verify a downloaded blob's content hash matches the requested digest.
+///
+/// `digest` is the `sha256:<hex>` reference from the manifest; `actual_sha256`
+/// is the lowercase hex hash computed over the bytes actually received. Returns
+/// `Err` on mismatch so the caller aborts fail-closed and never propagates
+/// tampered content (#587). A non-`sha256:` digest is compared verbatim.
+fn verify_blob_digest(digest: &str, actual_sha256: &str) -> Result<(), String> {
+    let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if actual_sha256 != expected {
+        return Err(format!(
+            "blob {digest} SHA-256 mismatch: upstream returned sha256:{actual_sha256} \
+             (refusing to mirror tampered content)"
+        ));
+    }
+    Ok(())
+}
+
 /// Check if NORA already has a blob via HEAD request.
 async fn blob_exists(client: &Client, nora_base: &str, name: &str, digest: &str) -> bool {
     let url = format!("{}/v2/{}/blobs/{}", nora_base, name, digest);
@@ -465,6 +490,42 @@ async fn push_manifest(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // --- verify_blob_digest tests (#587) ---
+
+    /// Regression for #587: the mirror path must abort when an upstream blob's
+    /// content hash does not match the requested digest, instead of pushing
+    /// tampered bytes onward. `mirror_single_image` gates its `push_blob` on
+    /// this exact function, so it is the real call-path check, not a vacuum
+    /// reimplementation.
+    #[test]
+    fn verify_blob_digest_rejects_mismatch() {
+        let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let actual = "2222222222222222222222222222222222222222222222222222222222222222";
+        let result = verify_blob_digest(digest, actual);
+        assert!(result.is_err(), "mismatched hash must be rejected");
+        // Error must not leak as a silent success — it carries the digest.
+        assert!(result.unwrap_err().contains("mismatch"));
+    }
+
+    #[test]
+    fn verify_blob_digest_accepts_match() {
+        let hex = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcab";
+        let digest = format!("sha256:{hex}");
+        assert!(verify_blob_digest(&digest, hex).is_ok());
+    }
+
+    #[test]
+    fn verify_blob_digest_handles_unprefixed_digest() {
+        // A bare (non-"sha256:") digest is compared verbatim.
+        let hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0";
+        assert!(verify_blob_digest(hex, hex).is_ok());
+        assert!(verify_blob_digest(
+            hex,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err());
+    }
 
     // --- parse_image_ref tests ---
 
