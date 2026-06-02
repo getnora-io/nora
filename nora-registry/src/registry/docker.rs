@@ -2936,6 +2936,62 @@ mod integration_tests {
     use sha2::Digest;
 
     #[tokio::test]
+    async fn test_docker_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::Uri;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Out-of-scope blob upload (POST) -> 403.
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::POST,
+            Path("other/app/blobs/uploads/".to_string()),
+            Extension(scoped.clone()),
+            "/v2/other/app/blobs/uploads/".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // In-scope blob upload start -> not denied (enforcement passes).
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::POST,
+            Path("myorg/app/blobs/uploads/".to_string()),
+            Extension(scoped.clone()),
+            "/v2/myorg/app/blobs/uploads/".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Reads are never gated, even out of scope (404, not 403).
+        let resp = super::docker_v2_dispatch(
+            State(ctx.state.clone()),
+            Method::GET,
+            Path("other/app/manifests/latest".to_string()),
+            Extension(scoped.clone()),
+            "/v2/other/app/manifests/latest".parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn test_docker_v2_check() {
         let ctx = create_test_context();
         let resp = send(&ctx.app, Method::GET, "/v2/", Body::empty()).await;

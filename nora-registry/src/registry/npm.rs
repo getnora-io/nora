@@ -962,6 +962,43 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    #[tokio::test]
+    async fn test_npm_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["@myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Out of scope -> 403, decided before any payload parsing.
+        let resp = super::handle_publish(
+            State(ctx.state.clone()),
+            Path("@other/pkg".to_string()),
+            Extension(scoped.clone()),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // In scope -> enforcement passes (then fails payload validation, not 403).
+        let resp = super::handle_publish(
+            State(ctx.state.clone()),
+            Path("@myorg/pkg".to_string()),
+            Extension(scoped),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
     use base64::Engine;

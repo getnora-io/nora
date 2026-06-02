@@ -478,6 +478,63 @@ mod integration_tests {
     };
     use axum::http::{Method, StatusCode};
 
+    fn scoped(mode: crate::config::ScopeEnforcement) -> crate::auth::NamespaceAuthority {
+        crate::auth::NamespaceAuthority::from_oidc_scope("ci", &["myorg/**".to_string()], mode)
+    }
+
+    #[tokio::test]
+    async fn test_raw_namespace_scope_enforced() {
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let ctx = create_test_context();
+
+        // Out of scope -> 403, and nothing is written.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("other/secret.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(ctx.state.storage.get("raw/other/secret.txt").await.is_err());
+
+        // In scope -> created.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("myorg/app/file.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // DELETE out of scope -> 403.
+        let resp = super::delete_file(
+            State(ctx.state.clone()),
+            Path("other/secret.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Enforce)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Audit mode allows an out-of-scope write (only logs/counts).
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("elsewhere/a.txt".to_string()),
+            Extension(scoped(ScopeEnforcement::Audit)),
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
     #[tokio::test]
     async fn test_raw_put_get_roundtrip() {
         let ctx = create_test_context();

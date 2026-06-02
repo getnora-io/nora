@@ -802,6 +802,53 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    #[tokio::test]
+    async fn test_maven_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["com/myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Out of scope (different group) -> 403.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("com/other/lib/1.0/lib-1.0.jar".to_string()),
+            Extension(scoped.clone()),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Opaque (unrecognized) path under a real scope -> fail-closed 403.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("foo".to_string()),
+            Extension(scoped.clone()),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // In scope -> enforcement passes (not 403).
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("com/myorg/lib/1.0/lib-1.0.jar".to_string()),
+            Extension(scoped),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
     use sha2::Digest;

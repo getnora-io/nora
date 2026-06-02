@@ -757,6 +757,45 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    #[tokio::test]
+    async fn test_cargo_namespace_scope_enforced() {
+        use crate::auth::NamespaceAuthority;
+        use crate::config::ScopeEnforcement;
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scoped = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["acme/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+
+        // Crate name outside scope -> 403.
+        let metadata =
+            serde_json::json!({"name":"other-crate","vers":"0.1.0","deps":[],"features":{}});
+        let payload = build_publish_payload(&metadata, b"data");
+        let resp = super::publish(
+            State(ctx.state.clone()),
+            Extension(scoped.clone()),
+            Bytes::from(payload),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Crate name covered by the scope -> enforcement passes (not 403).
+        let metadata = serde_json::json!({"name":"acme","vers":"0.1.0","deps":[],"features":{}});
+        let payload = build_publish_payload(&metadata, b"data");
+        let resp = super::publish(
+            State(ctx.state.clone()),
+            Extension(scoped),
+            Bytes::from(payload),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
 
