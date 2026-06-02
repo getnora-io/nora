@@ -9,10 +9,12 @@
 //! - Brute-force protection with exponential backoff
 
 mod htpasswd;
+mod namespace;
 pub mod oidc;
 mod token_routes;
 
 pub use htpasswd::HtpasswdAuth;
+pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
 pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 
@@ -28,7 +30,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-use crate::validation::NamespaceAuthority;
 use crate::AppState;
 
 /// Tracks failed authentication attempts per IP for brute-force protection.
@@ -307,6 +308,7 @@ pub async fn auth_middleware(
                         let authority = NamespaceAuthority::from_oidc_scope(
                             &identity.provider,
                             &identity.namespace_scope,
+                            identity.namespace_scope_enforcement,
                         );
                         request.extensions_mut().insert(authority);
                         return next.run(request).await;
@@ -1140,6 +1142,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,
                     namespace_scope: vec!["*".to_string()],
+                    namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                     enabled: true,
                     role_rules: vec![
                         OidcRoleRule {

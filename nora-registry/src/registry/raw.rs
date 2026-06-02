@@ -3,8 +3,9 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::method_not_allowed;
-use crate::validation::{enforce_namespace_scope, validate_storage_key, NamespaceAuthority};
+use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
     body::Bytes,

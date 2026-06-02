@@ -3,13 +3,13 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
-use crate::validation::{enforce_namespace_scope, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::Bytes,

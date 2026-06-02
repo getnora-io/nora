@@ -13,7 +13,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::fmt;
-use std::sync::Arc;
 
 /// Validation errors
 #[derive(Debug, Clone, PartialEq)]
@@ -420,85 +419,6 @@ fn segments_match(pat: &[&str], val: &[&str]) -> bool {
         Some((&"*", rest)) => !val.is_empty() && segments_match(rest, &val[1..]),
         // Literal segment must match exactly (anchored start).
         Some((&lit, rest)) => !val.is_empty() && val[0] == lit && segments_match(rest, &val[1..]),
-    }
-}
-
-/// Per-request namespace authorization, derived from the authenticated identity.
-///
-/// The auth middleware stamps this into the request extensions on **every** path,
-/// so write handlers can extract it without a fallback. It is the vehicle for
-/// enforcing OIDC `namespace_scope` (#583): handlers call
-/// [`enforce_namespace_scope`] with the artifact coordinate they are about to
-/// write, and a `Scoped` authority that does not cover that coordinate yields 403.
-#[derive(Clone, Debug)]
-pub enum NamespaceAuthority {
-    /// No namespace restriction: Basic auth, opaque (`nra_`) tokens, anonymous
-    /// reads, auth disabled, or an OIDC provider scoped to `["*"]`.
-    Unrestricted,
-    /// An OIDC identity restricted to the given scope patterns.
-    Scoped {
-        /// Glob patterns from the provider's `namespace_scope` (segment-aware,
-        /// see [`namespace_match`]).
-        patterns: Arc<[String]>,
-        /// Provider name, included in deny logs (never the token or `sub`).
-        provider: Arc<str>,
-    },
-}
-
-impl NamespaceAuthority {
-    /// Build an authority from an OIDC provider's `namespace_scope`.
-    ///
-    /// A scope containing a bare `*` collapses to [`NamespaceAuthority::Unrestricted`]
-    /// so the default `namespace_scope = ["*"]` is a true no-op. An empty scope
-    /// (`[]`) stays `Scoped` with no patterns and therefore denies every write
-    /// (fail-closed) — a deliberate operator lockout.
-    pub fn from_oidc_scope(provider: &str, scope: &[String]) -> Self {
-        if scope.iter().any(|p| p == "*") {
-            return NamespaceAuthority::Unrestricted;
-        }
-        NamespaceAuthority::Scoped {
-            patterns: Arc::from(scope.to_vec()),
-            provider: Arc::from(provider),
-        }
-    }
-}
-
-/// A write was denied because its artifact coordinate fell outside the
-/// authenticated OIDC identity's `namespace_scope`. Callers must map this to
-/// HTTP 403 and must not touch storage (fail-closed).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamespaceDenied;
-
-/// Enforce an OIDC `namespace_scope` against the artifact `namespace` coordinate
-/// a write handler is about to act on.
-///
-/// `namespace` MUST be the canonical artifact coordinate the handler derived
-/// (e.g. the docker image name `myorg/img`, the npm package `@myorg/pkg`, the raw
-/// path) — never the raw URL path and never the storage key (which carries
-/// transport prefixes/suffixes that would make scoping format-dependent and
-/// bypassable). Returns `Ok(())` for an [`NamespaceAuthority::Unrestricted`]
-/// authority or when `namespace` matches at least one scope pattern; otherwise
-/// returns `Err(NamespaceDenied)` and logs the denial (provider + namespace +
-/// patterns; never the token).
-pub fn enforce_namespace_scope(
-    authority: &NamespaceAuthority,
-    namespace: &str,
-) -> Result<(), NamespaceDenied> {
-    let (patterns, provider) = match authority {
-        NamespaceAuthority::Unrestricted => return Ok(()),
-        NamespaceAuthority::Scoped { patterns, provider } => (patterns, provider),
-    };
-
-    if patterns.iter().any(|p| namespace_match(p, namespace)) {
-        Ok(())
-    } else {
-        tracing::warn!(
-            provider = %provider,
-            namespace = %namespace,
-            patterns = ?patterns,
-            "OIDC namespace_scope denied write outside provider scope"
-        );
-        Err(NamespaceDenied)
     }
 }
 
@@ -914,60 +834,6 @@ mod namespace_match_tests {
         // Only a whole-segment `*`/`**` is a wildcard; `my*org` is fail-closed.
         assert!(!namespace_match("my*org/*", "myXXXorg/repo"));
         assert!(namespace_match("my*org", "my*org")); // matches only itself, literally
-    }
-
-    fn scope(patterns: &[&str]) -> Vec<String> {
-        patterns.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn default_star_scope_is_unrestricted() {
-        // The default `namespace_scope = ["*"]` collapses to Unrestricted (no-op).
-        let auth = NamespaceAuthority::from_oidc_scope("ci", &scope(&["*"]));
-        assert!(matches!(auth, NamespaceAuthority::Unrestricted));
-        assert!(enforce_namespace_scope(&auth, "anyorg/whatever").is_ok());
-        // A `*` anywhere in the list is enough to be unrestricted.
-        let auth = NamespaceAuthority::from_oidc_scope("ci", &scope(&["myorg/**", "*"]));
-        assert!(matches!(auth, NamespaceAuthority::Unrestricted));
-    }
-
-    #[test]
-    fn unrestricted_authority_always_allows() {
-        assert!(enforce_namespace_scope(&NamespaceAuthority::Unrestricted, "").is_ok());
-        assert!(enforce_namespace_scope(&NamespaceAuthority::Unrestricted, "a/b/c").is_ok());
-    }
-
-    #[test]
-    fn scoped_authority_allows_inside_denies_outside() {
-        let auth = NamespaceAuthority::from_oidc_scope("github", &scope(&["myorg/**"]));
-        assert!(enforce_namespace_scope(&auth, "myorg/repo").is_ok());
-        assert!(enforce_namespace_scope(&auth, "myorg/team/repo").is_ok());
-        assert_eq!(
-            enforce_namespace_scope(&auth, "other/repo"),
-            Err(NamespaceDenied)
-        );
-        // The #583 lookalike must be denied, not allowed.
-        assert_eq!(
-            enforce_namespace_scope(&auth, "myorg-evil/repo"),
-            Err(NamespaceDenied)
-        );
-    }
-
-    #[test]
-    fn empty_scope_is_fail_closed() {
-        // `namespace_scope = []` is a deliberate lockout: deny everything.
-        let auth = NamespaceAuthority::from_oidc_scope("ci", &scope(&[]));
-        assert_eq!(
-            enforce_namespace_scope(&auth, "anything"),
-            Err(NamespaceDenied)
-        );
-    }
-
-    #[test]
-    fn empty_namespace_under_scope_is_denied() {
-        // A handler that fails to derive a coordinate must not fall open.
-        let auth = NamespaceAuthority::from_oidc_scope("ci", &scope(&["myorg/**"]));
-        assert_eq!(enforce_namespace_scope(&auth, ""), Err(NamespaceDenied));
     }
 
     proptest! {

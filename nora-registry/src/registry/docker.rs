@@ -3,6 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
@@ -10,8 +11,7 @@ use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
 use crate::secrets::expose_opt;
 use crate::storage::Storage;
 use crate::validation::{
-    ends_with_ci, enforce_namespace_scope, validate_digest, validate_docker_name,
-    validate_docker_reference, NamespaceAuthority,
+    ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
 };
 use crate::AppState;
 use axum::{

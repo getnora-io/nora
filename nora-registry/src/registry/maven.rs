@@ -10,9 +10,10 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
-use crate::validation::{ends_with_ci, enforce_namespace_scope, NamespaceAuthority};
+use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     body::Bytes,

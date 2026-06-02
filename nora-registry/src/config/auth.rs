@@ -236,6 +236,12 @@ pub struct OidcProvider {
     /// ["*"] = all, ["github/*"] = only repos under github/ prefix.
     #[serde(default = "default_namespace_scope")]
     pub namespace_scope: Vec<String>,
+    /// How `namespace_scope` is applied on writes: `enforce` (deny with 403,
+    /// the default) or `audit` (allow the write but log and count what would
+    /// have been denied). Audit mode lets operators stage a rollout — deploy in
+    /// audit, watch the metric, then switch to enforce (#583).
+    #[serde(default)]
+    pub namespace_scope_enforcement: ScopeEnforcement,
     /// Kill switch — disable this provider without removing config
     #[serde(default = "super::default_true")]
     pub enabled: bool,
@@ -252,6 +258,18 @@ pub struct OidcRoleRule {
     pub pattern: String,
     /// Role to assign: "read", "write", or "admin"
     pub role: String,
+}
+
+/// How an OIDC provider's `namespace_scope` is applied on writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeEnforcement {
+    /// Deny out-of-scope writes with HTTP 403 (default, fail-closed).
+    #[default]
+    Enforce,
+    /// Allow out-of-scope writes but log and count them as `would_deny`. Used to
+    /// stage a rollout before turning on hard denial.
+    Audit,
 }
 
 pub(super) fn default_oidc_leeway() -> u64 {
