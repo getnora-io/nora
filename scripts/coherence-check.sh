@@ -189,6 +189,32 @@ if [ "$SELECT_MISSING" -eq 0 ]; then
 fi
 echo ""
 
+# ── Namespace scope enforcement coverage (#583) ───────────────────────────
+# Every registry whose routes() mounts a write/any route must call
+# enforce_namespace_scope, so a new write-capable format cannot silently
+# reintroduce the OIDC namespace_scope fail-open.
+
+echo "--- Namespace Scope Enforcement Coverage ---"
+NS_COVERED=0
+NS_MISSING=0
+for ns_file in "$REPO_ROOT"/nora-registry/src/registry/*.rs; do
+    ns_base=$(basename "$ns_file")
+    [ "$ns_base" = "mod.rs" ] && continue
+    ns_routes=$(awk '/pub fn routes\(\)/{flag=1} flag{print} flag&&/^}/{exit}' "$ns_file")
+    if echo "$ns_routes" | grep -qE '\b(put|post|delete|any)\('; then
+        if grep -q 'enforce_namespace_scope' "$ns_file"; then
+            NS_COVERED=$((NS_COVERED + 1))
+        else
+            fail "registry/$ns_base mounts a write/any route but never calls enforce_namespace_scope (#583)"
+            NS_MISSING=$((NS_MISSING + 1))
+        fi
+    fi
+done
+if [ "$NS_MISSING" -eq 0 ]; then
+    ok "All write-capable registries enforce namespace_scope ($NS_COVERED modules)"
+fi
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────
 
 echo "=== Summary ==="
