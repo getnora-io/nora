@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::validation::NamespaceAuthority;
 use crate::AppState;
 
 /// Tracks failed authentication attempts per IP for brute-force protection.
@@ -167,16 +168,22 @@ fn extract_client_ip(
 /// Auth middleware - supports Basic auth, Bearer tokens, and OIDC JWT
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     // Skip auth if disabled (neither htpasswd nor OIDC configured)
     if !state.config.auth.enabled {
+        request
+            .extensions_mut()
+            .insert(NamespaceAuthority::Unrestricted);
         return next.run(request).await;
     }
 
     // Skip auth for public endpoints
     if is_public_path(request.uri().path()) {
+        request
+            .extensions_mut()
+            .insert(NamespaceAuthority::Unrestricted);
         return next.run(request).await;
     }
 
@@ -202,6 +209,9 @@ pub async fn auth_middleware(
         && !is_token_management
     {
         // Read requests allowed without auth
+        request
+            .extensions_mut()
+            .insert(NamespaceAuthority::Unrestricted);
         return next.run(request).await;
     }
 
@@ -256,6 +266,10 @@ pub async fn auth_middleware(
                     {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
+                    // Opaque (nra_) tokens are not namespace-scoped (#583 is OIDC-only).
+                    request
+                        .extensions_mut()
+                        .insert(NamespaceAuthority::Unrestricted);
                     return next.run(request).await;
                 }
                 Err(_) => {
@@ -288,6 +302,13 @@ pub async fn auth_middleware(
                             return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
                                 .into_response();
                         }
+                        // Carry the provider's namespace_scope into the request so
+                        // write handlers can enforce it on the artifact coordinate (#583).
+                        let authority = NamespaceAuthority::from_oidc_scope(
+                            &identity.provider,
+                            &identity.namespace_scope,
+                        );
+                        request.extensions_mut().insert(authority);
                         return next.run(request).await;
                     }
                     Err(_) => {
@@ -343,6 +364,10 @@ pub async fn auth_middleware(
     if let Some(ip) = client_ip {
         state.auth_failures.record_success(&ip);
     }
+    // Basic-auth identities are not namespace-scoped (#583 is OIDC-only).
+    request
+        .extensions_mut()
+        .insert(NamespaceAuthority::Unrestricted);
     next.run(request).await
 }
 

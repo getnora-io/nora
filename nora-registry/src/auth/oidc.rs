@@ -37,6 +37,9 @@ pub struct OidcIdentity {
     pub issuer: String,
     /// Assigned role based on role_rules
     pub role: Role,
+    /// Provider's `namespace_scope` patterns (segment-aware globs). `["*"]` = all
+    /// namespaces. Enforced on writes via `validation::enforce_namespace_scope`.
+    pub namespace_scope: Vec<String>,
 }
 
 /// Standard JWT claims we extract.
@@ -215,6 +218,7 @@ impl OidcValidator {
             subject,
             issuer: provider.issuer.clone(),
             role,
+            namespace_scope: provider.namespace_scope.clone(),
         })
     }
 

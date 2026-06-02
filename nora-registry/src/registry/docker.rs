@@ -10,7 +10,8 @@ use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
 use crate::secrets::expose_opt;
 use crate::storage::Storage;
 use crate::validation::{
-    ends_with_ci, validate_digest, validate_docker_name, validate_docker_reference,
+    ends_with_ci, enforce_namespace_scope, validate_digest, validate_docker_name,
+    validate_docker_reference, NamespaceAuthority,
 };
 use crate::AppState;
 use axum::{
@@ -19,7 +20,7 @@ use axum::{
     http::{header, HeaderName, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -564,6 +565,7 @@ async fn docker_v2_dispatch(
     state: State<AppState>,
     method: Method,
     Path(wildcard): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -572,6 +574,13 @@ async fn docker_v2_dispatch(
     if rest.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Writes (push/delete) are gated by OIDC namespace_scope on the image name,
+    // which is the docker namespace coordinate (#583). Reads are never gated here.
+    let is_write = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
 
     // Parse endpoint pattern from right — handles names containing "blobs", "manifests", etc.
     // Order matters: check blob uploads before blobs (substring overlap).
@@ -583,6 +592,9 @@ async fn docker_v2_dispatch(
         }
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
         }
         return if after.is_empty() {
             match method {
@@ -617,6 +629,9 @@ async fn docker_v2_dispatch(
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
         }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         return match method {
             Method::HEAD => check_blob(state, Path((name.to_string(), digest.to_string()))).await,
             Method::GET => {
@@ -636,6 +651,9 @@ async fn docker_v2_dispatch(
         }
         if validate_docker_name(name).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
+        }
+        if is_write && enforce_namespace_scope(&authority, name).is_err() {
+            return StatusCode::FORBIDDEN.into_response();
         }
         return match method {
             Method::GET | Method::HEAD => {

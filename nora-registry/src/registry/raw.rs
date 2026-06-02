@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::method_not_allowed;
-use crate::validation::validate_storage_key;
+use crate::validation::{enforce_namespace_scope, validate_storage_key, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -12,7 +12,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 
 pub fn routes() -> Router<AppState> {
@@ -115,6 +115,7 @@ async fn download(
 async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -125,6 +126,11 @@ async fn upload(
     let key = format!("raw/{}", path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (#583).
+    if enforce_namespace_scope(&authority, &path).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     if !path.is_ascii() {
@@ -274,7 +280,11 @@ async fn do_overwrite(state: &AppState, key: &str, path: &str, body: &[u8]) -> R
     }
 }
 
-async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn delete_file(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -282,6 +292,11 @@ async fn delete_file(State(state): State<AppState>, Path(path): Path<String>) ->
     let key = format!("raw/{}", path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Enforce OIDC namespace_scope on the artifact coordinate (#583).
+    if enforce_namespace_scope(&authority, &path).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
     }
     match state.storage.delete(&key).await {
         Ok(()) => {
