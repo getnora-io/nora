@@ -4,6 +4,7 @@
 ### Fixed
 - **Docker pull command in the UI** — the package detail view built `docker pull` from `public_url` verbatim, so a configured `public_url` with a scheme produced an invalid `docker pull https://host/image`. The pull command now uses the bare host authority.
 - **IPv6 fallback base URL** — when `public_url` is unset and the bind host is an IPv6 literal, the advertised base URL now brackets the address (`http://[::1]:4000`), matching the listen address format.
+- **False-positive upstream-URL leak warnings on the admin/UI surface** — the leak detector scanned every JSON response, so endpoints that legitimately present configured upstream URLs (the dashboard, stats, OpenAPI spec) logged a spurious `WARN` and incremented `nora_response_upstream_url_leak_total` on every request, drowning the signal for real proxy-response leaks (#624). NORA's own admin/UI/observability paths (`/api/`, `/api-docs`, `/ui`, `/health`, `/ready`, `/metrics`) are now excluded from the scan, and each skip is counted as `nora_leak_detection_skipped_total{reason="own_surface"}`. Registry proxy paths stay fully scanned, so `nora_response_upstream_url_leak_total` now reflects only genuine leaks and a non-zero rate is alertable.
 
 ### Internal
 - Client-facing URL construction (service index rewriting, UI install commands, docker pull) is now centralized in `ServerConfig::public_base_url()` / `public_host()`, replacing three divergent inline copies.

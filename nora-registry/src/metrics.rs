@@ -450,6 +450,26 @@ pub async fn leak_detection_middleware(
         return response;
     }
 
+    // Skip NORA's own admin/UI/observability surface (#624). These endpoints
+    // (the dashboard, stats, OpenAPI spec, health) legitimately echo the
+    // configured upstream URLs in their JSON — that is expected output, not a
+    // failed rewrite. Proxying only ever happens inside registry handlers on
+    // registry-protocol paths (ADR-4), so a configured upstream hostname here is
+    // never a leak. Scanning them poisons UPSTREAM_URL_LEAK_TOTAL with false
+    // positives and drowns the signal for genuine proxy-response leaks.
+    //
+    // Denylist (skip own-surface), not allowlist (scan only known registry
+    // paths): a security detector must fail toward over-scanning. An allowlist
+    // would silently blind the detector on any newly added registry path whose
+    // prefix nobody remembered to register — a missed leak is far worse than a
+    // stray scan. The skip is counted so it never goes silent.
+    if is_own_surface(&path) {
+        LEAK_DETECTION_SKIPPED
+            .with_label_values(&["own_surface"])
+            .inc();
+        return response;
+    }
+
     // Determine body size BEFORE consuming it (#517).
     // Primary: body.size_hint().exact() — works for handler-built responses (Full<Bytes>).
     // Fallback: Content-Length header — works for proxy responses where upstream set it.
@@ -573,6 +593,34 @@ fn decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
     }
     debug_assert!(buf.len() <= LEAK_SCAN_MAX_BYTES);
     Some(buf)
+}
+
+/// Returns true for NORA's own admin / UI / observability endpoints.
+///
+/// These surfaces may legitimately include configured upstream URLs in their
+/// responses (e.g. the dashboard listing which upstreams a registry proxies),
+/// so an upstream hostname appearing here is expected output, not a rewrite
+/// leak. Proxying happens exclusively inside registry handlers on
+/// registry-protocol paths (ADR-4); none of those paths share these prefixes,
+/// so excluding the own surface cannot blind leak detection on a proxy path —
+/// the `every_registry_prefix_stays_scannable` test guards that invariant.
+///
+/// Prefixes are matched with a boundary (`/api/`, not bare `/api`) so a
+/// hypothetical registry path like `/apiv2foo` is not skipped by accident.
+///
+/// INVARIANT (deliberate fail-open by prefix): the `/api/` prefix excludes every
+/// current and future endpoint under it. Any future `/api/*` route that serves
+/// *proxied upstream* content (not NORA's own config/data) MUST therefore be
+/// kept off the own surface — either route it under a registry prefix or exclude
+/// it from this function explicitly — or its upstream-URL leaks will go unscanned.
+fn is_own_surface(path: &str) -> bool {
+    path.starts_with("/api/")          // HTMX JSON backend: dashboard, stats, list, detail, search, tokens
+        || path.starts_with("/api-docs") // Swagger UI + /api-docs/openapi.json spec
+        || path == "/ui"
+        || path.starts_with("/ui/")    // UI pages (HTML, scanned defensively)
+        || path == "/health"
+        || path == "/ready"
+        || path == "/metrics"
 }
 
 /// Detect registry type from path
@@ -776,5 +824,172 @@ mod tests {
 
         let result = decompress_gzip(&compressed).expect("decompress");
         assert_eq!(result, original);
+    }
+
+    // --- #624: own-surface exclusion from upstream-URL leak detection ---
+
+    #[test]
+    fn is_own_surface_covers_admin_ui_and_observability() {
+        // Exact strings as produced by axum `Uri::path()` (query stripped).
+        assert!(is_own_surface("/api/ui/dashboard"));
+        assert!(is_own_surface("/api/ui/stats"));
+        assert!(is_own_surface("/api/ui/cargo/list"));
+        assert!(is_own_surface("/api-docs/openapi.json"));
+        assert!(is_own_surface("/ui"));
+        assert!(is_own_surface("/ui/"));
+        assert!(is_own_surface("/ui/cargo"));
+        assert!(is_own_surface("/health"));
+        assert!(is_own_surface("/ready"));
+        assert!(is_own_surface("/metrics"));
+    }
+
+    #[test]
+    fn is_own_surface_does_not_over_match_at_prefix_boundary() {
+        // Boundary-aware: must not skip paths that merely start with the letters.
+        assert!(!is_own_surface("/apiv2foo")); // not "/api/"
+        assert!(!is_own_surface("/uikit/widget")); // not "/ui" or "/ui/"
+        assert!(!is_own_surface("/metrics-export"));
+        assert!(!is_own_surface("/healthcheck-proxy"));
+    }
+
+    #[test]
+    fn every_registry_prefix_stays_scannable() {
+        // Guard: the own-surface denylist must never swallow a registry-protocol
+        // path, or the leak detector would go silently blind on that format.
+        // These are the prefixes registry handlers actually route on.
+        for p in [
+            "/v2/library/alpine/manifests/latest",
+            "/maven2/com/example/artifact/1.0/artifact-1.0.jar",
+            "/npm/lodash",
+            "/cargo/api/v1/crates/serde",
+            "/simple/requests/",
+            "/packages/requests/1.0/requests-1.0.tar.gz",
+            "/go/github.com/user/repo/@v/v1.0.0.info",
+            "/raw/my-project/artifact.tar.gz",
+            "/gems/rails-7.0.0.gem",
+            "/terraform/example/aws/1.0.0",
+            "/ansible/community/general/1.0.0",
+            "/nuget/v3/index.json",
+            "/pub/api/packages/http",
+            "/conan/v2/conans/zlib",
+        ] {
+            assert!(
+                !is_own_surface(p),
+                "registry path must remain scannable: {p}"
+            );
+        }
+    }
+
+    /// Build a minimal router that drives the REAL `leak_detection_middleware`
+    /// over a single handler-built JSON response (PM-4: test the call-path, not
+    /// the helper in isolation). A unique canary hostname per test keeps the
+    /// global counter assertions free of cross-test races.
+    fn leak_test_app(
+        route: &'static str,
+        registry_label: &'static str,
+        canary_host: &'static str,
+        body: &'static str,
+    ) -> (axum::Router, AppState) {
+        use axum::routing::get;
+        let mut ctx = crate::test_helpers::create_test_context();
+        ctx.state.leak_finders =
+            LeakFinders::new(vec![(registry_label.to_string(), canary_host.to_string())]);
+        let state = ctx.state.clone();
+        // The leak middleware only inspects the response body — it never touches
+        // storage — so the context's tempdir may drop at the end of this helper
+        // without affecting the test.
+        let app = axum::Router::new()
+            .route(
+                route,
+                get(move || async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                leak_detection_middleware,
+            ))
+            .with_state(state.clone());
+        (app, state)
+    }
+
+    #[tokio::test]
+    async fn own_surface_dashboard_json_is_not_flagged_as_leak() {
+        use tower::ServiceExt;
+        let (app, _state) = leak_test_app(
+            "/api/ui/dashboard",
+            "canary624a",
+            "leak-canary-624a.invalid",
+            r#"{"registries":[{"name":"cargo","upstream":"leak-canary-624a.invalid"}]}"#,
+        );
+        let leak_before = UPSTREAM_URL_LEAK_TOTAL
+            .with_label_values(&["canary624a"])
+            .get();
+        let skip_before = LEAK_DETECTION_SKIPPED
+            .with_label_values(&["own_surface"])
+            .get();
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/ui/dashboard?lang=en")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let leak_after = UPSTREAM_URL_LEAK_TOTAL
+            .with_label_values(&["canary624a"])
+            .get();
+        let skip_after = LEAK_DETECTION_SKIPPED
+            .with_label_values(&["own_surface"])
+            .get();
+        assert_eq!(
+            leak_before, leak_after,
+            "dashboard echoing an upstream URL must NOT be counted as a leak"
+        );
+        assert!(
+            skip_after > skip_before,
+            "own-surface skip must be observable via LEAK_DETECTION_SKIPPED"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_proxy_json_with_upstream_url_is_still_flagged() {
+        use tower::ServiceExt;
+        let (app, _state) = leak_test_app(
+            "/npm/leftpad",
+            "canary624b",
+            "leak-canary-624b.invalid",
+            r#"{"dist":{"tarball":"https://leak-canary-624b.invalid/leftpad-1.0.0.tgz"}}"#,
+        );
+        let leak_before = UPSTREAM_URL_LEAK_TOTAL
+            .with_label_values(&["canary624b"])
+            .get();
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/npm/leftpad")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let leak_after = UPSTREAM_URL_LEAK_TOTAL
+            .with_label_values(&["canary624b"])
+            .get();
+        assert_eq!(
+            leak_after,
+            leak_before + 1,
+            "a registry proxy response leaking an upstream URL must be flagged"
+        );
     }
 }
