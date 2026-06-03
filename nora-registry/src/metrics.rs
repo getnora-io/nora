@@ -65,6 +65,44 @@ pub static PROXY_REVALIDATION_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::
     .expect("failed to create PROXY_REVALIDATION_ERRORS_TOTAL metric at startup")
 });
 
+/// Concurrent upstream fetches collapsed into one by the single-flight
+/// coalescer: a follower served the leader's in-memory result without making
+/// its own upstream round-trip (#595).
+pub static PROXY_COALESCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_coalesced_total",
+        "Follower requests served from the single-flight leader without an upstream fetch",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_COALESCED_TOTAL metric at startup")
+});
+
+/// Current number of in-flight single-flight leaders (distinct keys being
+/// fetched right now). A flat zero under load means coalescing is not engaging;
+/// a monotonic climb signals a guard leak (#595).
+pub static PROXY_INFLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "nora_proxy_inflight",
+        "Distinct keys currently being fetched under single-flight coalescing",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_INFLIGHT metric at startup")
+});
+
+/// Followers that did NOT get the leader's result and fell through to their own
+/// upstream fetch — because the leader failed/cancelled (`leader`) or the wait
+/// budget elapsed while the leader was still fetching (`budget`). A `budget`
+/// rate rivalling `PROXY_COALESCED_TOTAL` means a slow upstream is re-stampeding
+/// past the coalescer; without this it degrades silently (#595).
+pub static PROXY_COALESCE_FALLTHROUGH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_coalesce_fallthrough_total",
+        "Followers that fell through to their own fetch instead of coalescing",
+        &["registry", "reason"]
+    )
+    .expect("failed to create PROXY_COALESCE_FALLTHROUGH_TOTAL metric at startup")
+});
+
 /// HTTP request duration histogram
 pub static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(

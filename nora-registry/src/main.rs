@@ -21,6 +21,7 @@ mod metrics;
 mod migrate;
 mod mirror;
 mod openapi;
+mod proxy_coalesce;
 mod rate_limit;
 mod registry;
 mod registry_type;
@@ -202,6 +203,10 @@ pub struct AppState {
     /// OIDC validator for workload identity (CI/CD)
     pub oidc: Option<Arc<auth::OidcValidator>>,
     pub(crate) circuit_breaker: Arc<circuit_breaker::CircuitBreakerRegistry>,
+    /// Single-flight coalescer for the proxy cache-miss path: collapses a
+    /// thundering herd of concurrent requests for the same key into one
+    /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
+    pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Pre-compiled upstream hostname searchers for leak detection (#386)
     pub leak_finders: metrics::LeakFinders,
@@ -1176,6 +1181,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
         oidc: oidc_validator.map(Arc::new),
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
+        proxy_coalesce: proxy_coalesce::InflightMap::new(),
         digest_store,
         leak_finders,
     };

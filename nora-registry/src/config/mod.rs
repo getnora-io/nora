@@ -806,6 +806,7 @@ impl Default for Config {
                 port: 4000,
                 public_url: None,
                 body_limit_mb: 2048,
+                proxy_coalesce: true,
             },
             storage: StorageConfig {
                 mode: StorageMode::Local,

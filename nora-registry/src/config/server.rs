@@ -16,10 +16,19 @@ pub struct ServerConfig {
     /// Maximum request body size in MB (default: 2048 = 2GB)
     #[serde(default = "default_body_limit_mb")]
     pub body_limit_mb: usize,
+    /// Coalesce concurrent upstream fetches for the same key on a cache miss
+    /// (single-flight, #595). Default `true`; set `false` to disable and let
+    /// every concurrent request fetch independently (kill-switch).
+    #[serde(default = "default_proxy_coalesce")]
+    pub proxy_coalesce: bool,
 }
 
 pub(super) fn default_body_limit_mb() -> usize {
     2048 // 2GB - enough for any Docker image
+}
+
+pub(super) fn default_proxy_coalesce() -> bool {
+    true
 }
 
 /// TLS configuration for outbound connections to upstream registries.
@@ -109,6 +118,7 @@ mod tests {
             port,
             public_url: None,
             body_limit_mb: 2048,
+            proxy_coalesce: true,
         }
     }
 

@@ -82,6 +82,7 @@ fn build_context(
             port: 0,
             public_url: None,
             body_limit_mb: 2048,
+            proxy_coalesce: true,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,
@@ -252,6 +253,7 @@ fn build_context(
         circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
             cb_config,
         )),
+        proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         leak_finders,
     };

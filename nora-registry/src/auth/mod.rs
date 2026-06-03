@@ -1189,6 +1189,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             circuit_breaker: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 ctx.state.config.circuit_breaker.clone(),
             )),
+            proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
             digest_store: ctx.state.digest_store.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
         };
