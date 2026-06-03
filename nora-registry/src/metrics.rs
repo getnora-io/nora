@@ -198,6 +198,43 @@ pub static UPSTREAM_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| 
     .expect("failed to create UPSTREAM_REQUEST_DURATION metric at startup")
 });
 
+/// Wall-clock time of the integrity-verify step on a buffered `Storage::get()`
+/// — the `spawn_blocking(pins.verify(..))` call. Includes blocking-pool queue
+/// time, so a rising p99 under read load signals pool saturation, not just hash
+/// cost. Recorded whenever a pin store is configured (Local backend); a key
+/// with no pin returns early inside `verify()` and contributes a near-zero
+/// sample. Quantifies the #602 perf question before any change is made (#602).
+pub static STORAGE_VERIFY_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_storage_verify_duration_seconds",
+        "Integrity-verify (SHA-256) wall-clock per buffered get, including blocking-pool queue",
+        &["registry"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+    )
+    .expect("failed to create STORAGE_VERIFY_DURATION_SECONDS metric at startup")
+});
+
+/// Size in bytes of bodies served through the buffered `Storage::get()` path.
+/// Shows how much read traffic is large enough for inline hashing to matter —
+/// the data needed to decide whether a size threshold is worthwhile (#602).
+pub static STORAGE_GET_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_storage_get_bytes",
+        "Body size of buffered Storage::get() reads",
+        &["registry"],
+        vec![
+            1024.0,
+            16_384.0,
+            262_144.0,
+            1_048_576.0,
+            8_388_608.0,
+            67_108_864.0,
+            536_870_912.0
+        ]
+    )
+    .expect("failed to create STORAGE_GET_BYTES metric at startup")
+});
+
 /// Total artifact downloads by registry (#431)
 pub static DOWNLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(

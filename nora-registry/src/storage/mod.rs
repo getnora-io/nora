@@ -8,7 +8,7 @@ pub use local::LocalStorage;
 pub use s3::S3Storage;
 
 use crate::hash_pin_store::HashPinStore;
-use crate::metrics::STORAGE_OPERATIONS;
+use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -47,6 +47,22 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// Registry prefix of a storage key, for metric labelling only
+/// (`npm/lodash/metadata.json` → `npm`). Storage stays format-agnostic: this
+/// reads the first path segment as an opaque label, with no registry-protocol
+/// knowledge. Cardinality is bounded — an empty, oversized, or non-lowercase
+/// first segment collapses to `other`, so a pathological key cannot explode the
+/// label set.
+fn registry_label(key: &str) -> &str {
+    let segment = key.split('/').next().unwrap_or("");
+    if !segment.is_empty() && segment.len() <= 16 && segment.bytes().all(|b| b.is_ascii_lowercase())
+    {
+        segment
+    } else {
+        "other"
+    }
+}
 
 /// Storage backend trait
 #[async_trait]
@@ -166,6 +182,10 @@ impl Storage {
         match self.inner.get(key).await {
             Ok(data) => {
                 STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
+                let label = registry_label(key);
+                STORAGE_GET_BYTES
+                    .with_label_values(&[label])
+                    .observe(data.len() as f64);
                 if let Some(ref pins) = self.pin_store {
                     let pins = Arc::clone(pins);
                     let key_owned = key.to_string();
@@ -175,9 +195,23 @@ impl Storage {
                     // hashing it inline would stall the async worker for the
                     // hash duration, so we keep the blocking pool. The panic
                     // path is handled fail-closed below — see #582.
-                    match tokio::task::spawn_blocking(move || pins.verify(&key_owned, &data_ref))
-                        .await
-                    {
+                    //
+                    // INVARIANT (#582): a *positive* verify result is NEVER
+                    // cached — the hash is recomputed on every read. Caching
+                    // "verified" by mtime/size would re-open the bypass #582
+                    // closed (bit-rot does not bump mtime; an on-disk tamperer
+                    // can forge it via `utimes`). The recompute is the
+                    // deliberate cost of fail-closed delivery; #602 instruments
+                    // that cost via STORAGE_VERIFY_DURATION_SECONDS rather than
+                    // weakening the guarantee.
+                    let verify_start = std::time::Instant::now();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || pins.verify(&key_owned, &data_ref))
+                            .await;
+                    STORAGE_VERIFY_DURATION_SECONDS
+                        .with_label_values(&[label])
+                        .observe(verify_start.elapsed().as_secs_f64());
+                    match outcome {
                         // Genuine hash mismatch — tampering or on-disk corruption.
                         // Fail-closed: never serve the tampered bytes (#582).
                         Ok(false) => {
@@ -399,6 +433,65 @@ mod tests {
         );
         // And the recorded pin must match the bytes (a subsequent get verifies).
         assert_eq!(&storage.get("raw/x/app.bin").await.unwrap()[..], b"payload");
+    }
+
+    #[test]
+    fn registry_label_extracts_prefix_and_bounds_cardinality() {
+        assert_eq!(registry_label("npm/lodash/metadata.json"), "npm");
+        assert_eq!(
+            registry_label("docker/library/nginx/blobs/sha256:ab"),
+            "docker"
+        );
+        assert_eq!(registry_label("raw/x/app.bin"), "raw");
+        // Defensive collapses to "other" — never an unbounded label.
+        assert_eq!(registry_label(""), "other");
+        assert_eq!(registry_label("/leading-slash"), "other");
+        assert_eq!(registry_label("UPPER/x"), "other");
+        assert_eq!(registry_label("averylongsegmentname/x"), "other"); // >16 chars
+                                                                       // Filter is strictly [a-z] — digits/hyphens collapse to "other" so a
+                                                                       // future "allow [a-z0-9]" change can't silently explode cardinality.
+        assert_eq!(registry_label("v2/x"), "other");
+        assert_eq!(registry_label("a-b/x"), "other");
+        assert_eq!(registry_label("npm"), "npm"); // no slash, whole key is prefix
+    }
+
+    /// #602: a buffered `get()` of a pinned artifact records both the body-size
+    /// and the verify-duration histograms (the data that decides whether the
+    /// hash-on-read cost warrants a fix). Exercises the real `Storage::get()`.
+    #[tokio::test]
+    async fn get_observes_size_and_verify_duration_metrics() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/metrics/app.bin";
+        storage.put(key, b"observe-me").await.unwrap();
+
+        let bytes_before = STORAGE_GET_BYTES
+            .with_label_values(&["raw"])
+            .get_sample_count();
+        let verify_before = STORAGE_VERIFY_DURATION_SECONDS
+            .with_label_values(&["raw"])
+            .get_sample_count();
+
+        let data = storage.get(key).await.unwrap();
+        assert_eq!(&data[..], b"observe-me");
+
+        // `>=` not `==`: these are global metrics and other tests share the
+        // `raw` label under parallel execution; our get() contributes at least
+        // one observation to each.
+        assert!(
+            STORAGE_GET_BYTES
+                .with_label_values(&["raw"])
+                .get_sample_count()
+                >= bytes_before + 1,
+            "get() must observe the body size"
+        );
+        assert!(
+            STORAGE_VERIFY_DURATION_SECONDS
+                .with_label_values(&["raw"])
+                .get_sample_count()
+                >= verify_before + 1,
+            "get() of a pinned key must observe the verify duration"
+        );
     }
 
     /// Regression for #604: the streaming write path `put_from_path()` must also
