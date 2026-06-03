@@ -708,6 +708,17 @@ mod integration_tests {
         let ctx = create_test_context();
         send(&ctx.app, Method::PUT, "/raw/etag.txt", b"hello".to_vec()).await;
 
+        // The ETag is the hash-pin, recorded fire-and-forget after PUT. Wait for
+        // it to land so HEAD deterministically sees the ETag — otherwise the
+        // pin task can be starved under a full parallel suite and the header is
+        // absent (#603). Polls (fast path = immediate), no fixed sleep.
+        for _ in 0..200 {
+            if ctx.state.storage.get_pin_hash("raw/etag.txt").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         let head = send(&ctx.app, Method::HEAD, "/raw/etag.txt", "").await;
         assert_eq!(head.status(), StatusCode::OK);
         let etag = head.headers().get("etag").expect("HEAD must return ETag");
