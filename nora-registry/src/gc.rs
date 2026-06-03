@@ -378,7 +378,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
 
 const CHECKSUM_EXTENSIONS: &[&str] = &[".md5", ".sha1", ".sha256", ".sha512"];
 
-fn is_checksum_sidecar(key: &str) -> bool {
+pub(crate) fn is_checksum_sidecar(key: &str) -> bool {
     CHECKSUM_EXTENSIONS.iter().any(|ext| ends_with_ci(key, ext))
 }
 

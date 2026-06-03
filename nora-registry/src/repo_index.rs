@@ -187,41 +187,41 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
         if let Some(rest) = key.strip_prefix("docker/") {
             // Support both single-segment and namespaced images:
             // docker/alpine/manifests/latest.json → name="alpine"
-            // docker/library/alpine/manifests/latest.json → name="library/alpine"
+            // docker/library/alpine/blobs/sha256:... → name="library/alpine"
             let parts: Vec<_> = rest.split('/').collect();
-            let manifest_pos = parts.iter().position(|&p| p == "manifests");
-            if let Some(pos) = manifest_pos {
-                if pos >= 1 && ends_with_ci(key, ".json") {
-                    let raw_name = parts[..pos].join("/");
-                    let name =
-                        crate::registry::docker::strip_docker_namespace(&raw_name).to_string();
-                    let entry = repos.entry(name).or_insert((0, 0, 0));
-                    entry.0 += 1;
+            // Repo name = everything before the "manifests"/"blobs" segment.
+            let Some(boundary) = parts.iter().position(|&p| p == "manifests" || p == "blobs")
+            else {
+                continue;
+            };
+            if boundary < 1 {
+                continue;
+            }
+            let raw_name = parts[..boundary].join("/");
+            let name = crate::registry::docker::strip_docker_namespace(&raw_name).to_string();
+            let entry = repos.entry(name).or_insert((0, 0, 0));
 
-                    if let Ok(data) = storage.get(key).await {
-                        if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            let cfg = m
-                                .get("config")
-                                .and_then(|c| c.get("size"))
-                                .and_then(|s| s.as_u64())
-                                .unwrap_or(0);
-                            let layers: u64 = m
-                                .get("layers")
-                                .and_then(|l| l.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
-                                        .sum()
-                                })
-                                .unwrap_or(0);
-                            entry.1 += cfg + layers;
-                        }
-                    }
+            // Size = ACTUAL on-disk bytes of every file in the repo (blobs +
+            // manifests), each counted once. The old code summed the manifest's
+            // declared config+layer sizes — a "virtual" size that multi-counts
+            // layers shared across tags and ignores real storage, so a 7.2G
+            // image tree could be reported as something else entirely (#588).
+            if let Some(meta) = storage.stat(key).await {
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
+                }
+            }
 
-                    if let Some(meta) = storage.stat(key).await {
-                        if meta.modified > entry.2 {
-                            entry.2 = meta.modified;
-                        }
+            // Count = number of distinct tags. Each push writes BOTH a
+            // tag manifest (`manifests/<tag>.json`) and a content-addressed
+            // `manifests/sha256:<digest>.json`; counting both double-counted
+            // every image (#588). Count only the tag form.
+            if parts[boundary] == "manifests" && ends_with_ci(key, ".json") {
+                if let Some(reference) = parts.get(boundary + 1) {
+                    let reference = reference.trim_end_matches(".json");
+                    if !reference.starts_with("sha256:") {
+                        entry.0 += 1;
                     }
                 }
             }
@@ -241,7 +241,15 @@ async fn build_maven_index(storage: &Storage) -> Vec<RepoInfo> {
             if parts.len() >= 2 {
                 let path = parts[..parts.len() - 1].join("/");
                 let entry = repos.entry(path).or_insert((0, 0, 0));
-                entry.0 += 1;
+                // A Maven artifact ships with a swarm of sidecars — `.sha1`,
+                // `.md5`, `.sha256`, `.sha512` and `maven-metadata.xml` — none
+                // of which are separate artifacts. Count only primary files so
+                // the dashboard doesn't report 5× the real artifact count
+                // (#588). Sidecar bytes still count toward size (= on-disk du).
+                let is_metadata = key.ends_with("maven-metadata.xml");
+                if !crate::gc::is_checksum_sidecar(key) && !is_metadata {
+                    entry.0 += 1;
+                }
 
                 if let Some(meta) = storage.stat(key).await {
                     entry.1 += meta.size;
@@ -328,7 +336,12 @@ async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
             if parts.len() >= 2 {
                 let name = parts[0].to_string();
                 let entry = packages.entry(name).or_insert((0, 0, 0));
-                entry.0 += 1;
+                // Count only real distribution files — a checksum sidecar
+                // (`<file>.sha256`) is not a separate artifact (#588). Its bytes
+                // still count toward size so the total matches on-disk du.
+                if !crate::gc::is_checksum_sidecar(key) {
+                    entry.0 += 1;
+                }
 
                 if let Some(meta) = storage.stat(key).await {
                     entry.1 += meta.size;
@@ -707,5 +720,107 @@ mod tests {
         assert_eq!(result[1].name, "zebra");
         assert_eq!(result[1].versions, 3);
         assert_eq!(result[1].updated, "N/A"); // modified = 0
+    }
+
+    // ── #588: dashboard stats must reflect real on-disk data ──────────────
+    // count = primary artifacts only (no checksum sidecars / metadata / digest
+    // manifests); size = actual on-disk bytes (du), never a manifest "virtual"
+    // size. Seed a Storage and exercise the real build_*_index path (PM-4).
+
+    fn temp_storage() -> (tempfile::TempDir, crate::Storage) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::Storage::new_local(dir.path().to_str().unwrap());
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn pypi_index_excludes_checksum_sidecars_from_count() {
+        let (_d, s) = temp_storage();
+        s.put("pypi/six/six-1.16.0-py3-none-any.whl", &[0u8; 100])
+            .await
+            .unwrap();
+        s.put("pypi/six/six-1.16.0-py3-none-any.whl.sha256", b"deadbeef")
+            .await
+            .unwrap();
+
+        let repos = build_pypi_index(&s).await;
+        assert_eq!(repos.len(), 1);
+        // ONE artifact, not two — the .sha256 sidecar is not an artifact (#588).
+        assert_eq!(repos[0].versions, 1, "checksum sidecar must not be counted");
+        // ...but its bytes still count toward size, so size == on-disk du.
+        assert_eq!(repos[0].size, 100 + 8);
+    }
+
+    #[tokio::test]
+    async fn maven_index_counts_only_primary_artifacts() {
+        let (_d, s) = temp_storage();
+        let base = "maven/com/example/app/1.0";
+        s.put(&format!("{base}/app-1.0.jar"), &[0u8; 200])
+            .await
+            .unwrap();
+        s.put(&format!("{base}/app-1.0.pom"), &[0u8; 50])
+            .await
+            .unwrap();
+        for ext in ["jar.sha1", "jar.md5", "jar.sha256", "jar.sha512"] {
+            s.put(&format!("{base}/app-1.0.{ext}"), b"x").await.unwrap();
+        }
+        s.put(&format!("{base}/maven-metadata.xml"), &[0u8; 30])
+            .await
+            .unwrap();
+
+        let repos = build_maven_index(&s).await;
+        let total: usize = repos.iter().map(|r| r.versions).sum();
+        // jar + pom = 2 primary; the 4 checksums + metadata.xml are NOT counted
+        // (old code reported 7) (#588).
+        assert_eq!(total, 2, "only primary artifacts counted, got {total}");
+        // size still sums every file on disk (du).
+        let size: u64 = repos.iter().map(|r| r.size).sum();
+        assert_eq!(size, 200 + 50 + 4 + 30);
+    }
+
+    #[tokio::test]
+    async fn docker_index_real_size_not_virtual_and_single_count() {
+        let (_d, s) = temp_storage();
+        // Manifest DECLARES huge layer sizes (virtual) but the actual blob
+        // files on disk are tiny — the index must report the on-disk size.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "size": 1_000_000, "digest": "sha256:cfg" },
+            "layers": [ { "size": 9_000_000, "digest": "sha256:lyr" } ]
+        })
+        .to_string();
+        // Same image pushed by tag AND its content-addressed digest manifest.
+        s.put(
+            "docker/library/app/manifests/latest.json",
+            manifest.as_bytes(),
+        )
+        .await
+        .unwrap();
+        s.put(
+            "docker/library/app/manifests/sha256:abc123.json",
+            manifest.as_bytes(),
+        )
+        .await
+        .unwrap();
+        // Real blobs on disk (tiny).
+        s.put("docker/library/app/blobs/sha256:cfg", &[0u8; 120])
+            .await
+            .unwrap();
+        s.put("docker/library/app/blobs/sha256:lyr", &[0u8; 340])
+            .await
+            .unwrap();
+
+        let repos = build_docker_index(&s).await;
+        assert_eq!(repos.len(), 1);
+        // Count = 1 tag, NOT 2 (the digest manifest is not a separate image).
+        assert_eq!(repos[0].versions, 1, "tag + digest manifest double-counted");
+        // Size = actual on-disk bytes (2 manifests + 2 blobs), NOT the
+        // declared 10_000_000 virtual size.
+        let on_disk = (manifest.len() as u64) * 2 + 120 + 340;
+        assert_eq!(
+            repos[0].size, on_disk,
+            "size must be on-disk du, not virtual"
+        );
+        assert!(repos[0].size < 10_000_000, "must not report virtual size");
     }
 }
