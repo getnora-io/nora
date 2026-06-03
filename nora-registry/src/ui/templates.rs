@@ -671,6 +671,24 @@ pub fn render_raw_dir(
     )
 }
 
+/// HTMX search bar that filters a registry's repo list into `#repo-table-body`.
+/// The hierarchical browsers (Maven/Go) embed this so they honour the same
+/// search contract as the flat-list pages — `/api/ui/<registry>/search` is a
+/// generic handler that works for every registry type.
+fn registry_search_bar(registry: &str, placeholder: &str) -> String {
+    format!(
+        r##"<div class="flex items-center justify-end mb-4">
+            <div class="relative w-full md:w-auto">
+                <input type="text" placeholder="{placeholder}"
+                    class="w-full md:w-auto pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-500"
+                    hx-get="/api/ui/{registry}/search" hx-trigger="keyup changed delay:300ms"
+                    hx-target="#repo-table-body" name="q">
+                <svg class="absolute left-3 top-2.5 h-5 w-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+            </div>
+        </div>"##
+    )
+}
+
 /// Renders a Maven namespace directory browser with breadcrumbs
 pub fn render_maven_dir(
     path: &str,
@@ -754,6 +772,8 @@ pub fn render_maven_dir(
             </div>
         </div>
 
+        {search_bar}
+
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
@@ -764,7 +784,7 @@ pub fn render_maven_dir(
                         <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-700">
+                <tbody id="repo-table-body" class="divide-y divide-slate-700">
                     {rows}
                 </tbody>
             </table>
@@ -772,6 +792,7 @@ pub fn render_maven_dir(
         </div>
     "##,
         breadcrumbs = breadcrumbs,
+        search_bar = registry_search_bar("maven", "Search Maven artifacts…"),
         icon = icons::MAVEN,
         title = title_display,
         col_name = t.name,
@@ -879,6 +900,8 @@ pub fn render_go_dir(
             </div>
         </div>
 
+        {search_bar}
+
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
@@ -889,7 +912,7 @@ pub fn render_go_dir(
                         <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-700">
+                <tbody id="repo-table-body" class="divide-y divide-slate-700">
                     {rows}
                 </tbody>
             </table>
@@ -897,6 +920,7 @@ pub fn render_go_dir(
         </div>
     "##,
         breadcrumbs = breadcrumbs,
+        search_bar = registry_search_bar("go", "Search Go modules…"),
         icon = icons::GO,
         title = title_display,
         col_name = t.name,
@@ -1842,6 +1866,41 @@ mod tests {
             total_stable: 0,
             metadata: PackageMetadata::default(),
         }
+    }
+
+    // The hierarchical browsers (Maven/Go) must carry the same search contract
+    // as the flat-list pages: a `name="q"` input wired to the registry's search
+    // endpoint and a `#repo-table-body` target. They previously lacked both,
+    // so HTMX search did not work and the UI contract failed.
+    #[test]
+    fn maven_dir_has_search_form_and_table_body() {
+        let html = render_maven_dir("", &[], 0, Lang::En, false);
+        assert!(
+            html.contains("name=\"q\""),
+            "maven page missing search input"
+        );
+        assert!(
+            html.contains("id=\"repo-table-body\""),
+            "maven page missing #repo-table-body"
+        );
+        assert!(
+            html.contains("/api/ui/maven/search"),
+            "maven search not wired to its endpoint"
+        );
+    }
+
+    #[test]
+    fn go_dir_has_search_form_and_table_body() {
+        let html = render_go_dir("", &[], 0, Lang::En, false);
+        assert!(html.contains("name=\"q\""), "go page missing search input");
+        assert!(
+            html.contains("id=\"repo-table-body\""),
+            "go page missing #repo-table-body"
+        );
+        assert!(
+            html.contains("/api/ui/go/search"),
+            "go search not wired to its endpoint"
+        );
     }
 
     #[test]
