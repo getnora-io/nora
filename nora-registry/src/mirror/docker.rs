@@ -183,6 +183,10 @@ async fn mirror_single_image(
     .await
     .map_err(|e| format!("Failed to fetch manifest for {}: {:?}", image.name, e))?;
 
+    // If pinned by digest, the manifest's content hash must match the requested
+    // digest before we propagate it (#608). No-op for tag references.
+    verify_manifest_digest(&image.reference, &manifest_bytes)?;
+
     bytes += manifest_bytes.len() as u64;
 
     // 2. Parse manifest to find layer digests
@@ -340,6 +344,11 @@ async fn resolve_platform_manifest(
     .await
     .map_err(|e| format!("Failed to fetch platform manifest {}: {:?}", digest, e))?;
 
+    // The platform sub-manifest is content-addressed by `digest` from the (already
+    // digest-verified) list — its bytes must hash to that digest, or a tampered
+    // upstream could swap the layers of a multi-arch image (#608).
+    verify_manifest_digest(digest, &mf_bytes)?;
+
     let mf_json: serde_json::Value = serde_json::from_slice(&mf_bytes)
         .map_err(|e| format!("Invalid platform manifest: {}", e))?;
 
@@ -371,20 +380,48 @@ fn extract_blob_digests(manifest: &serde_json::Value) -> Vec<String> {
     digests
 }
 
-/// Verify a downloaded blob's content hash matches the requested digest.
+/// Verify a downloaded artifact's content hash matches the requested digest.
 ///
-/// `digest` is the `sha256:<hex>` reference from the manifest; `actual_sha256`
-/// is the lowercase hex hash computed over the bytes actually received. Returns
-/// `Err` on mismatch so the caller aborts fail-closed and never propagates
-/// tampered content (#587). A non-`sha256:` digest is compared verbatim.
-fn verify_blob_digest(digest: &str, actual_sha256: &str) -> Result<(), String> {
+/// `what` labels the artifact ("blob"/"manifest") for error messages. `digest`
+/// is the `sha256:<hex>` reference; `actual_sha256` is the lowercase hex hash
+/// computed over the bytes actually received. Returns `Err` on mismatch so the
+/// caller aborts fail-closed and never propagates tampered content (#587/#608).
+/// A non-`sha256:` digest is compared verbatim.
+fn verify_digest(what: &str, digest: &str, actual_sha256: &str) -> Result<(), String> {
     let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
     if actual_sha256 != expected {
         return Err(format!(
-            "blob {digest} SHA-256 mismatch: upstream returned sha256:{actual_sha256} \
+            "{what} {digest} SHA-256 mismatch: upstream returned sha256:{actual_sha256} \
              (refusing to mirror tampered content)"
         ));
     }
+    Ok(())
+}
+
+/// Verify a downloaded blob's content hash matches the requested digest (#587).
+fn verify_blob_digest(digest: &str, actual_sha256: &str) -> Result<(), String> {
+    verify_digest("blob", digest, actual_sha256)
+}
+
+/// Verify a manifest fetched by digest matches that digest. A no-op when the
+/// image reference is a tag (not content-addressed). Closes the manifest-level
+/// integrity gap left by #587 — a tampered upstream could otherwise return a
+/// different manifest for a requested `sha256:<X>` (#608).
+fn verify_manifest_digest(reference: &str, manifest_bytes: &[u8]) -> Result<(), String> {
+    if reference.starts_with("sha256:") {
+        use sha2::Digest;
+        let actual = hex::encode(sha2::Sha256::digest(manifest_bytes));
+        return verify_digest("manifest", reference, &actual);
+    }
+    // A digest-pinned reference with an algorithm we cannot compute must fail
+    // closed — silently treating `sha512:…` as unverifiable would be a bypass.
+    // A Docker tag never contains ':', so this reliably distinguishes the two.
+    if reference.contains(':') {
+        return Err(format!(
+            "manifest {reference}: unsupported digest algorithm (only sha256 is verifiable)"
+        ));
+    }
+    // Tag reference — not content-addressed, nothing to verify.
     Ok(())
 }
 
@@ -525,6 +562,236 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000"
         )
         .is_err());
+    }
+
+    // --- verify_manifest_digest tests (#608) ---
+
+    /// Regression for #608: a manifest pulled by digest must match that digest
+    /// before being mirrored. `mirror_single_image` gates `push_manifest` on
+    /// this function via `?`, so it is the real call-path check.
+    #[test]
+    fn verify_manifest_digest_rejects_tampered() {
+        use sha2::Digest;
+        let bytes = br#"{"schemaVersion":2,"layers":[]}"#;
+        let real = hex::encode(sha2::Sha256::digest(bytes));
+        // Reference a DIFFERENT digest than the bytes actually hash to.
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        assert_ne!(format!("sha256:{real}"), wrong);
+        assert!(verify_manifest_digest(&wrong, bytes).is_err());
+    }
+
+    #[test]
+    fn verify_manifest_digest_accepts_matching() {
+        use sha2::Digest;
+        let bytes = br#"{"schemaVersion":2,"layers":[]}"#;
+        let reference = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+        assert!(verify_manifest_digest(&reference, bytes).is_ok());
+    }
+
+    /// A tag reference is not content-addressed, so verification is a no-op
+    /// (any bytes pass).
+    #[test]
+    fn verify_manifest_digest_tag_is_noop() {
+        assert!(verify_manifest_digest("latest", b"anything at all").is_ok());
+        assert!(verify_manifest_digest("3.20", b"whatever").is_ok());
+    }
+
+    /// A digest-pinned reference with a non-sha256 algorithm must fail closed,
+    /// not silently pass as unverifiable.
+    #[test]
+    fn verify_manifest_digest_rejects_unsupported_algorithm() {
+        let sha512 = format!("sha512:{}", "a".repeat(128));
+        assert!(verify_manifest_digest(&sha512, b"anything").is_err());
+    }
+
+    /// Integration regression for #587/#608: when an upstream returns a blob
+    /// whose content does not match the digest the manifest references, the
+    /// mirror must abort the image and must NOT push anything to NORA. Drives
+    /// the real `run_docker_mirror` → `mirror_single_image` path against a mock
+    /// upstream; a mock NORA target records requests to prove no push happened.
+    #[tokio::test]
+    async fn mirror_aborts_on_tampered_blob_and_does_not_push() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A layer digest the manifest claims, and tampered bytes that DON'T hash
+        // to it.
+        let layer_digest =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{{"digest":"{layer_digest}","size":3}},"layers":[]}}"#
+        );
+
+        // Upstream: serves the manifest and the (tampered) blob.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v2/.+/manifests/.+$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                    .set_body_string(manifest),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v2/.+/blobs/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("XXX")) // != layer_digest
+            .mount(&upstream)
+            .await;
+
+        // NORA target: HEAD says "blob absent" (so mirror tries to fetch it);
+        // every other request is recorded so we can assert no push occurred.
+        let nora = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&nora)
+            .await;
+
+        let image = ImageRef {
+            registry: upstream.uri(),
+            name: "library/tampered".to_string(),
+            reference: "latest".to_string(),
+        };
+        let client = Client::new();
+        let result = run_docker_mirror(&client, &nora.uri(), std::slice::from_ref(&image), 1)
+            .await
+            .expect("mirror run should complete");
+
+        assert_eq!(result.failed, 1, "tampered image must be reported failed");
+        assert_eq!(result.fetched, 0, "nothing should be successfully mirrored");
+
+        // No PUT/POST (push) ever reached NORA — only the HEAD existence probe.
+        let pushes = nora
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.method,
+                    wiremock::http::Method::PUT | wiremock::http::Method::POST
+                )
+            })
+            .count();
+        assert_eq!(pushes, 0, "tampered blob must never be pushed to NORA");
+    }
+
+    /// Integration regression for #608: when an image is pinned by digest but the
+    /// upstream returns a manifest whose content does not hash to that digest,
+    /// the mirror must abort BEFORE fetching blobs or pushing — driving the real
+    /// `verify_manifest_digest` gate in `mirror_single_image`.
+    #[tokio::test]
+    async fn mirror_aborts_on_tampered_manifest_by_digest() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Pin by a digest the manifest will NOT hash to.
+        let pinned = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v2/.+/manifests/.+$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                    .set_body_string(
+                        r#"{"schemaVersion":2,"config":{"digest":"sha256:abc"},"layers":[]}"#,
+                    ),
+            )
+            .mount(&upstream)
+            .await;
+
+        // Any request to NORA would be a bug — manifest verify happens first.
+        let nora = MockServer::start().await;
+
+        let image = ImageRef {
+            registry: upstream.uri(),
+            name: "library/tampered".to_string(),
+            reference: pinned.to_string(),
+        };
+        let client = Client::new();
+        let result = run_docker_mirror(&client, &nora.uri(), std::slice::from_ref(&image), 1)
+            .await
+            .expect("mirror run should complete");
+
+        assert_eq!(result.failed, 1, "digest-mismatched manifest must fail");
+        assert_eq!(result.fetched, 0);
+        let nora_hits = nora.received_requests().await.unwrap_or_default().len();
+        assert_eq!(
+            nora_hits, 0,
+            "must abort at manifest verify, before any NORA contact"
+        );
+    }
+
+    /// Integration regression for #608 (multi-arch): a manifest LIST entry is
+    /// content-addressed by digest, so the fetched platform sub-manifest must
+    /// hash to that digest. A tampered sub-manifest body must abort the mirror —
+    /// driving the real `resolve_platform_manifest` gate.
+    #[tokio::test]
+    async fn mirror_aborts_on_tampered_platform_submanifest() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // List references a linux/amd64 sub-manifest at this digest; the body
+        // served for it will NOT hash to it.
+        let sub_digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let list = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[{{"digest":"{sub_digest}","platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#
+        );
+
+        let upstream = MockServer::start().await;
+        // Top-level (by tag) → the list.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/manifests/latest$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.list.v2+json",
+                    )
+                    .set_body_string(list),
+            )
+            .mount(&upstream)
+            .await;
+        // The platform sub-manifest fetched by digest → tampered body.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/manifests/sha256:.+$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                    .set_body_string(r#"{"schemaVersion":2,"layers":[]}"#), // != sub_digest
+            )
+            .mount(&upstream)
+            .await;
+
+        let nora = MockServer::start().await;
+
+        let image = ImageRef {
+            registry: upstream.uri(),
+            name: "library/multiarch".to_string(),
+            reference: "latest".to_string(),
+        };
+        let client = Client::new();
+        let result = run_docker_mirror(&client, &nora.uri(), std::slice::from_ref(&image), 1)
+            .await
+            .expect("mirror run should complete");
+
+        assert_eq!(
+            result.failed, 1,
+            "tampered sub-manifest must fail the image"
+        );
+        assert_eq!(result.fetched, 0);
+        let nora_hits = nora.received_requests().await.unwrap_or_default().len();
+        assert_eq!(nora_hits, 0, "must abort before pushing the swapped layers");
     }
 
     // --- parse_image_ref tests ---
