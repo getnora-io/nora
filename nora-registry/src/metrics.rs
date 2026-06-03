@@ -31,6 +31,40 @@ pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create HTTP_REQUESTS_TOTAL metric at startup")
 });
 
+/// Conditional revalidations where upstream answered 304 Not Modified — the
+/// cached body was reused and no body bytes were downloaded (#596).
+pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_upstream_304_total",
+        "Upstream 304 Not Modified responses on revalidation",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_UPSTREAM_304_TOTAL metric at startup")
+});
+
+/// Body bytes saved by revalidation (size of the cached body that did NOT have
+/// to be re-downloaded because upstream returned 304) (#596).
+pub static PROXY_REVALIDATION_BYTES_SAVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_revalidation_bytes_saved_total",
+        "Body bytes not re-downloaded thanks to a 304 revalidation",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_REVALIDATION_BYTES_SAVED_TOTAL metric at startup")
+});
+
+/// Revalidation attempts that failed (conditional request error, corrupt
+/// validator sidecar, missing cached body) and fell back to a full fetch.
+/// Nonzero signals the feature is silently degrading (#596).
+pub static PROXY_REVALIDATION_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_revalidation_errors_total",
+        "Revalidation attempts that fell back to a full fetch",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_REVALIDATION_ERRORS_TOTAL metric at startup")
+});
+
 /// HTTP request duration histogram
 pub static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
