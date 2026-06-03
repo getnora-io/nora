@@ -120,10 +120,35 @@ impl Storage {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 if let Some(ref pins) = self.pin_store {
                     let pins = Arc::clone(pins);
-                    let key = key.to_string();
-                    let data = data.to_vec();
-                    // SHA-256 + sync file append — offload from tokio worker
-                    tokio::task::spawn_blocking(move || pins.record(&key, &data));
+                    let key_owned = key.to_string();
+                    let data_owned = data.to_vec();
+                    // Await the pin record (SHA-256 + ndjson append, offloaded
+                    // from the tokio worker) so `put()` does not return until the
+                    // pin is durable. Previously this was fire-and-forget, which
+                    // left a window where the artifact was readable but unpinned —
+                    // a `get()` after a completed `put()` could serve it
+                    // unverified (#604) — and silently dropped the pin if the task
+                    // panicked. Fail-closed (mirroring `get()`): if integrity
+                    // cannot be recorded, the write reports failure rather than
+                    // leaving an unverifiable artifact.
+                    //
+                    // NOTE: a `get()` racing *during* an in-flight `put()` (between
+                    // the inner write and this record) can still briefly observe
+                    // the artifact unpinned. Fully closing that requires
+                    // serializing get/put per key; it is benign (it serves NORA's
+                    // own just-written bytes) and out of scope here.
+                    match tokio::task::spawn_blocking(move || pins.record(&key_owned, &data_owned))
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -279,9 +304,24 @@ impl Storage {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 if let (Some(hash), Some(ref pins)) = (sha256, &self.pin_store) {
                     let pins = Arc::clone(pins);
-                    let key = key.to_string();
+                    let key_owned = key.to_string();
                     let hash = hash.to_string();
-                    tokio::task::spawn_blocking(move || pins.record_hash(&key, &hash));
+                    // Await the pin record so it is durable before this returns —
+                    // the streaming write counterpart of the `put()` fix (#604).
+                    // `record_hash` uses the pre-computed digest (no re-hash), so
+                    // the await is near-free. Fail-closed on a panicking task.
+                    match tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -329,7 +369,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    /// Wait until the fire-and-forget pin record from `put()` has landed.
+    /// Wait until the pin record from `put()` is visible. Since #604 `put()`
+    /// awaits the pin, so this returns on the first poll; kept for robustness.
     async fn await_pin(storage: &Storage, key: &str) {
         for _ in 0..200 {
             if storage.get_pin_hash(key).is_some() {
@@ -338,6 +379,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("pin for {key} was never recorded");
+    }
+
+    /// Regression for #604: `put()` must record the hash-pin BEFORE it returns,
+    /// so there is no window where a completed put leaves the artifact readable
+    /// but unpinned (which a later `get()` would serve unverified). Exercises
+    /// the real call path `Storage::put()` → `get_pin_hash()` — the pin is
+    /// observable synchronously, with no polling.
+    #[tokio::test]
+    async fn put_records_pin_before_returning() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+
+        storage.put("raw/x/app.bin", b"payload").await.unwrap();
+
+        assert!(
+            storage.get_pin_hash("raw/x/app.bin").is_some(),
+            "put() must record the hash-pin before returning (#604)"
+        );
+        // And the recorded pin must match the bytes (a subsequent get verifies).
+        assert_eq!(&storage.get("raw/x/app.bin").await.unwrap()[..], b"payload");
+    }
+
+    /// Regression for #604: the streaming write path `put_from_path()` must also
+    /// record its pin BEFORE returning (same fire-and-forget gap as `put()`,
+    /// on the path that handles Docker blobs). Exercises the real call path.
+    #[tokio::test]
+    async fn put_from_path_records_pin_before_returning() {
+        use sha2::{Digest, Sha256};
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+
+        let src = dir.path().join("incoming.bin");
+        std::fs::write(&src, b"streamed-bytes").unwrap();
+        let sha = hex::encode(Sha256::digest(b"streamed-bytes"));
+
+        let key = "docker/x/blobs/sha256:abc";
+        storage.put_from_path(key, &src, Some(&sha)).await.unwrap();
+
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(sha.as_str()),
+            "put_from_path must record the hash-pin before returning (#604)"
+        );
     }
 
     /// Regression for #582: a pinned artifact corrupted on disk must NOT be
