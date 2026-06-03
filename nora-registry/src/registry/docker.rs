@@ -2180,7 +2180,14 @@ pub async fn fetch_blob_from_upstream(
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        cb.record_failure(&cb_key);
+        if (400..500).contains(&status) {
+            // 4xx — upstream is alive and answered (e.g. blob not found); not an
+            // availability failure, so recover the breaker instead of counting
+            // it against the upstream (#606).
+            cb.record_alive(&cb_key);
+        } else {
+            cb.record_failure(&cb_key);
+        }
         return Err(ProxyError::Upstream(status));
     }
 
@@ -2343,7 +2350,13 @@ pub async fn fetch_manifest_from_upstream(
     if !response.status().is_success() {
         let status = response.status().as_u16();
         tracing::warn!(status = %response.status(), "Upstream returned non-success status");
-        cb.record_failure(&cb_key);
+        if (400..500).contains(&status) {
+            // 4xx — upstream is alive and answered (e.g. manifest not found);
+            // recover the breaker rather than counting it as a failure (#606).
+            cb.record_alive(&cb_key);
+        } else {
+            cb.record_failure(&cb_key);
+        }
         return Err(ProxyError::Upstream(status));
     }
 

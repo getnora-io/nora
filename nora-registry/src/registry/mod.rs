@@ -114,6 +114,10 @@ where
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
                         cb.record_success(registry_str);
+                    } else {
+                        // 2xx but the body could not be read (e.g. a mid-stream
+                        // drop) — treat as a fetch failure for the breaker.
+                        cb.record_failure(registry_str);
                     }
                     return result;
                 }
@@ -122,6 +126,12 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "4xx"])
                         .observe(elapsed);
+                    // A 4xx means the upstream is alive and answered — not an
+                    // availability failure. `record_alive` closes the breaker
+                    // from HalfOpen (so it recovers instead of slow-probing) but
+                    // is a no-op in Closed, so a 4xx never clears a real failure
+                    // tally (#606).
+                    cb.record_alive(registry_str);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {

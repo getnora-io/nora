@@ -160,10 +160,10 @@ impl CircuitBreakerRegistry {
                 // degenerate "retry immediately" mode and keeps the strict
                 // single-probe behavior.
                 //
-                // NOTE: this is a reliability floor, not the full fix. A 4xx
-                // upstream probe means the upstream is alive and should
-                // `record_success` at the call-site (else the breaker keeps
-                // slow-probing and never closes). Tracked in #606.
+                // The complementary fix (#606): a 4xx upstream probe means the
+                // upstream is alive, so call-sites now `record_alive()` which
+                // closes the breaker from HalfOpen instead of leaving it to
+                // slow-probe here forever.
                 let reset = self.reset_timeout_for(registry);
                 let probe_stalled = reset > 0
                     && breaker
@@ -216,6 +216,42 @@ impl CircuitBreakerRegistry {
         CIRCUIT_BREAKER_STATE
             .with_label_values(&[registry])
             .set(BreakerState::Closed.as_gauge());
+    }
+
+    /// Record that the upstream is alive and answered, without it being a
+    /// successful fetch — specifically a 4xx response (e.g. artifact not found).
+    ///
+    /// In **HalfOpen** this closes the breaker: the probe proved the upstream is
+    /// reachable, which is exactly the recovery #606 wants. In **Closed** it is a
+    /// deliberate no-op — a 4xx must NOT reset the accumulated failure count, or
+    /// an upstream interleaving 4xx (cache-miss probes) with 5xx (real failures)
+    /// would never trip the breaker. This is stronger than `record_success`,
+    /// which always resets `failures` and would mask such a partial outage.
+    pub(crate) fn record_alive(&self, registry: &str) {
+        if !self.config.enabled {
+            return;
+        }
+
+        let mut breakers = self.breakers.write();
+        let breaker = breakers
+            .entry(registry.to_string())
+            .or_insert_with(BreakerInner::new);
+
+        // Only HalfOpen transitions on an "alive" signal; Closed/Open are left
+        // untouched so a 4xx never clears a real failure tally.
+        if breaker.state == BreakerState::HalfOpen {
+            tracing::info!(
+                registry = registry,
+                "Circuit breaker probe answered (4xx) — closing"
+            );
+            breaker.state = BreakerState::Closed;
+            breaker.failures = 0;
+            breaker.half_open_in_flight = false;
+            breaker.half_open_started = None;
+            CIRCUIT_BREAKER_STATE
+                .with_label_values(&[registry])
+                .set(BreakerState::Closed.as_gauge());
+        }
     }
 
     /// Record a failed upstream response.
@@ -361,6 +397,39 @@ mod tests {
         for _ in 0..4 {
             cb.record_failure("npm");
         }
+        assert!(cb.check("npm").is_ok());
+    }
+
+    /// #606: a 4xx (`record_alive`) in the Closed state must NOT reset the
+    /// failure counter — otherwise an upstream interleaving 4xx with 5xx would
+    /// never trip the breaker. This is the masking regression a plain
+    /// `record_success` on 4xx would introduce.
+    #[test]
+    fn test_record_alive_closed_preserves_failure_count() {
+        let cb = CircuitBreakerRegistry::new(enabled_config(5, 30));
+        for _ in 0..4 {
+            cb.record_failure("npm");
+        }
+        // An "alive" 4xx must leave the 4 accumulated failures intact...
+        cb.record_alive("npm");
+        // ...so the 5th real failure still trips the breaker.
+        cb.record_failure("npm");
+        assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
+    }
+
+    /// #606: a 4xx (`record_alive`) on the half-open probe means the upstream is
+    /// alive, so it closes the breaker (recovery), unlike the Closed-state no-op.
+    #[test]
+    fn test_record_alive_halfopen_closes() {
+        let cb = CircuitBreakerRegistry::new(enabled_config(2, 0));
+        cb.record_failure("npm");
+        cb.record_failure("npm");
+        // Open + reset_timeout 0 → next check transitions to HalfOpen (probe).
+        assert!(cb.check("npm").is_ok());
+        // The probe answered 4xx → upstream alive → breaker closes.
+        cb.record_alive("npm");
+        // Closed: repeated checks pass (not the single-probe HalfOpen behavior).
+        assert!(cb.check("npm").is_ok());
         assert!(cb.check("npm").is_ok());
     }
 
@@ -635,5 +704,51 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         assert_eq!(&body[..], b"fake-tarball");
+    }
+
+    /// Regression for #606: a 4xx from upstream means the upstream is alive, so
+    /// the half-open probe must `record_success` and close the breaker — not be
+    /// "lost" (leaving it to slow-probe forever). Drives the real proxy path
+    /// (`proxy_fetch_core`) against a mock upstream returning 404.
+    #[tokio::test]
+    async fn test_circuit_recovers_on_4xx_probe() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Upstream that is alive but answers 404 to everything.
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 0; // Open → HalfOpen immediately
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+
+        // Trip the breaker into Open.
+        ctx.state.circuit_breaker.record_failure("npm");
+        ctx.state.circuit_breaker.record_failure("npm");
+
+        // Request now: Open + reset_timeout 0 → HalfOpen probe → upstream answers
+        // 404 → record_success → breaker closes. The probe must reach upstream,
+        // not be rejected with 503.
+        let resp = send(&ctx.app, Method::GET, "/npm/nonexistent-pkg", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the half-open probe must reach upstream, not be rejected with 503"
+        );
+
+        // The 4xx probe recovered the breaker — it is Closed again. Before #606
+        // the probe was 'lost' (no record), so the breaker stayed half-open and
+        // this check would return CircuitOpen.
+        assert!(
+            ctx.state.circuit_breaker.check("npm").is_ok(),
+            "a 4xx upstream response must close the breaker (#606)"
+        );
     }
 }
