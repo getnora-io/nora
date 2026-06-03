@@ -169,8 +169,23 @@ async fn handle_request(
             let ttl = state.config.npm.metadata_ttl;
             if let Some(meta) = state.storage.stat(&key).await {
                 if !crate::cache_ttl::is_within_ttl(meta.modified, ttl) {
-                    if let Some(fresh) = refetch_metadata(&state, &path, &key).await {
-                        return with_content_type(false, fresh.into()).into_response();
+                    // Single-flight: when a popular packument expires and a CI
+                    // fleet stampedes the same key, one request revalidates
+                    // upstream and the rest serve its in-memory result (#595).
+                    let fresh = if state.config.server.proxy_coalesce {
+                        let budget =
+                            crate::proxy_coalesce::follower_budget(state.config.npm.proxy_timeout);
+                        state
+                            .proxy_coalesce
+                            .coalesced(&key, "npm", budget, || async {
+                                refetch_metadata(&state, &path, &key).await.map(Bytes::from)
+                            })
+                            .await
+                    } else {
+                        refetch_metadata(&state, &path, &key).await.map(Bytes::from)
+                    };
+                    if let Some(fresh) = fresh {
+                        return with_content_type(false, fresh).into_response();
                     }
                     // Upstream failed — serve stale if configured, otherwise 502
                     if state.config.npm.serve_stale {
@@ -1527,5 +1542,139 @@ mod spec_conformance_tests {
             .with_label_values(&["npm"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// #595: a thundering herd of concurrent requests for the same expired
+    /// metadata key must collapse to a SINGLE upstream fetch. M clients race
+    /// `GET /npm/testpkg` while the key is stale; a counting mock upstream
+    /// (delayed so followers pile up) must observe exactly one request, and
+    /// every client must receive the leader's body.
+    #[tokio::test]
+    async fn test_npm_concurrent_metadata_miss_coalesces_to_one_upstream_fetch() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Delay the response so all followers reach the single-flight election
+        // while the leader is still fetching. Body is not valid JSON, so the
+        // handler's byte-level URL rewrite passes it through unchanged.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("FRESH-PACKUMENT")
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0; // always stale → always refetch
+            cfg.npm.revalidate = false; // plain 200, no conditional headers
+            cfg.npm.serve_stale = false;
+            // proxy_coalesce defaults to true.
+        });
+
+        // Pre-seed a stale cached body so the stale-metadata refetch path runs.
+        let key = "npm/testpkg/metadata.json";
+        ctx.state.storage.put(key, b"STALE").await.unwrap();
+
+        let before = crate::metrics::PROXY_COALESCED_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+
+        const M: usize = 16;
+        let app = Arc::new(ctx.app.clone());
+        let mut handles = Vec::new();
+        for _ in 0..M {
+            let app = Arc::clone(&app);
+            handles.push(tokio::spawn(async move {
+                let resp = send(&app, Method::GET, "/npm/testpkg", "").await;
+                let status = resp.status();
+                let body = body_bytes(resp).await;
+                (status, body)
+            }));
+        }
+
+        for h in handles {
+            let (status, body) = h.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], b"FRESH-PACKUMENT", "every client gets the body");
+        }
+
+        let upstream_hits = upstream.received_requests().await.unwrap().len();
+        assert_eq!(
+            upstream_hits, 1,
+            "M concurrent requests for one key must hit upstream exactly once"
+        );
+
+        let after = crate::metrics::PROXY_COALESCED_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+        assert_eq!(
+            after - before,
+            (M - 1) as u64,
+            "M-1 followers must be served without their own upstream fetch"
+        );
+    }
+
+    /// #595 kill-switch: with `server.proxy_coalesce = false`, the coalescer is
+    /// bypassed and every concurrent request fetches independently — so the
+    /// counting upstream observes one hit per client (proves the gate works).
+    #[tokio::test]
+    async fn test_npm_coalesce_disabled_lets_every_request_fetch() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("FRESH-PACKUMENT")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = false;
+            cfg.npm.serve_stale = false;
+            cfg.server.proxy_coalesce = false; // kill-switch off
+        });
+
+        let key = "npm/testpkg/metadata.json";
+        ctx.state.storage.put(key, b"STALE").await.unwrap();
+
+        const M: usize = 8;
+        let app = Arc::new(ctx.app.clone());
+        let mut handles = Vec::new();
+        for _ in 0..M {
+            let app = Arc::clone(&app);
+            handles.push(tokio::spawn(async move {
+                let resp = send(&app, Method::GET, "/npm/testpkg", "").await;
+                let status = resp.status();
+                let _ = body_bytes(resp).await;
+                status
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
+
+        let upstream_hits = upstream.received_requests().await.unwrap().len();
+        assert_eq!(
+            upstream_hits, M,
+            "with coalescing disabled every request fetches independently"
+        );
     }
 }
