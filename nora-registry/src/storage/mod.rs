@@ -12,6 +12,7 @@ use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURAT
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -62,6 +63,24 @@ fn registry_label(key: &str) -> &str {
     } else {
         "other"
     }
+}
+
+/// Outcome of [`Storage::repin`] — an operator integrity-recovery action (#601).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RepinOutcome {
+    /// The disk matched `expected` and the pin was updated from `old` to `new`.
+    Updated { old: Option<String>, new: String },
+    /// Dry run: the disk matched `expected` and the pin would change.
+    WouldUpdate { old: Option<String>, new: String },
+    /// The disk already matched `expected` and the pin already equalled it —
+    /// nothing to do.
+    AlreadyPinned { hash: String },
+    /// Refused: the on-disk bytes hash to `disk`, not `expected`. The artifact
+    /// is genuinely corrupt/tampered — re-pin cannot heal it; restore from
+    /// backup. The pin is left unchanged.
+    DiskMismatch { disk: String, expected: String },
+    /// This backend has no pin store (S3) — there is nothing to re-pin.
+    NoPinStore,
 }
 
 /// Storage backend trait
@@ -311,6 +330,51 @@ impl Storage {
     /// Look up the pinned SHA-256 hash for a storage key (None if pin store is disabled or key is unknown).
     pub fn get_pin_hash(&self, key: &str) -> Option<String> {
         self.pin_store.as_ref().and_then(|p| p.get(key))
+    }
+
+    /// Operator recovery for an artifact whose hash pin no longer matches its
+    /// stored bytes (#601). Reads the raw bytes *bypassing* verification — the
+    /// whole point, since [`Storage::get`] fails closed on the very mismatch we
+    /// are recovering from — and updates the pin to `expected` **only if the
+    /// on-disk bytes already hash to `expected`**.
+    ///
+    /// `expected` is the SHA-256 the operator independently knows to be
+    /// canonical for this key (from a CI manifest, upstream checksum, lockfile,
+    /// …). Requiring it is the security guard that keeps this from becoming an
+    /// integrity bypass: a plain "recompute the hash from disk" would let
+    /// corrupted or tampered bytes silently re-bless themselves, re-opening the
+    /// hole #582 closed. By demanding `disk == expected`, re-pin can only ever
+    /// set the pin to a hash the disk *already* has **and** the operator has
+    /// vouched for. If the disk is genuinely corrupt (`disk != expected`) it
+    /// refuses — re-pin cannot heal corruption; the operator must restore from
+    /// backup first.
+    ///
+    /// `apply == false` is a dry run (computes and compares, writes nothing).
+    /// Local backend only — S3 has no pin store.
+    pub async fn repin(&self, key: &str, expected: &str, apply: bool) -> Result<RepinOutcome> {
+        validate_storage_key(key)?;
+        let Some(ref pins) = self.pin_store else {
+            return Ok(RepinOutcome::NoPinStore);
+        };
+        let expected = expected.to_ascii_lowercase();
+        // Raw read — deliberately bypasses `Storage::get()`'s verification,
+        // which would fail closed on the mismatch we are recovering from.
+        let data = self.inner.get(key).await?;
+        let disk = hex::encode(Sha256::digest(&data));
+        if disk != expected {
+            // The bytes on disk are not the ones the operator vouched for —
+            // genuine corruption/tampering. Re-pin must NOT bless them.
+            return Ok(RepinOutcome::DiskMismatch { disk, expected });
+        }
+        let old = pins.get(key);
+        if old.as_deref() == Some(expected.as_str()) {
+            return Ok(RepinOutcome::AlreadyPinned { hash: expected });
+        }
+        if !apply {
+            return Ok(RepinOutcome::WouldUpdate { old, new: expected });
+        }
+        pins.record_hash(key, &expected);
+        Ok(RepinOutcome::Updated { old, new: expected })
     }
 
     /// Number of pinned hashes (0 if pin store is disabled).
@@ -571,5 +635,105 @@ mod tests {
         let unpinned = "raw/ok/unpinned.bin";
         std::fs::write(dir.path().join(unpinned), b"no-pin").unwrap();
         assert_eq!(&storage.get(unpinned).await.unwrap()[..], b"no-pin");
+    }
+
+    fn sha_hex(data: &[u8]) -> String {
+        hex::encode(Sha256::digest(data))
+    }
+
+    /// #601 happy path: an artifact legitimately replaced out-of-band (disk now
+    /// holds new canonical bytes, pin still references the old ones) fails
+    /// closed, then `re-pin --expected <hash-of-new>` restores service because
+    /// the disk already matches `expected`. Exercises the real `repin()` +
+    /// `get()` call path (PM-4).
+    #[tokio::test]
+    async fn repin_fixes_stale_pin_when_disk_matches_expected() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/app/release.bin";
+
+        storage.put(key, b"v1-bytes").await.unwrap();
+        await_pin(&storage, key).await;
+
+        // Operator replaces the file out-of-band with new canonical bytes.
+        std::fs::write(dir.path().join(key), b"v2-canonical").unwrap();
+        // Now the pin (hash of v1) no longer matches the disk → fail-closed.
+        assert!(matches!(
+            storage.get(key).await,
+            Err(StorageError::IntegrityViolation)
+        ));
+
+        let expected = sha_hex(b"v2-canonical");
+
+        // Dry run reports the change without writing.
+        assert_eq!(
+            storage.repin(key, &expected, false).await.unwrap(),
+            RepinOutcome::WouldUpdate {
+                old: Some(sha_hex(b"v1-bytes")),
+                new: expected.clone(),
+            }
+        );
+        // ...and the pin is untouched, so it still fails closed.
+        assert!(storage.get(key).await.is_err());
+
+        // Apply: the disk matches `expected`, so the pin is updated.
+        assert_eq!(
+            storage.repin(key, &expected, true).await.unwrap(),
+            RepinOutcome::Updated {
+                old: Some(sha_hex(b"v1-bytes")),
+                new: expected,
+            }
+        );
+        // Service restored — the new canonical bytes are served.
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"v2-canonical");
+    }
+
+    /// #601 security guard: re-pin must NOT bless corrupt/tampered bytes. When
+    /// the disk does not match `--expected`, it refuses and leaves the pin
+    /// unchanged, so the artifact keeps failing closed (no integrity bypass).
+    #[tokio::test]
+    async fn repin_refuses_when_disk_does_not_match_expected() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/app/payload.bin";
+
+        storage.put(key, b"genuine").await.unwrap();
+        await_pin(&storage, key).await;
+
+        // Disk is tampered; operator (correctly) supplies the genuine hash.
+        std::fs::write(dir.path().join(key), b"TAMPERED").unwrap();
+        let genuine = sha_hex(b"genuine");
+
+        // disk (hash of TAMPERED) != expected (hash of genuine) → refuse.
+        assert_eq!(
+            storage.repin(key, &genuine, true).await.unwrap(),
+            RepinOutcome::DiskMismatch {
+                disk: sha_hex(b"TAMPERED"),
+                expected: genuine.clone(),
+            }
+        );
+        // The pin was not changed to the tampered bytes — still fails closed.
+        assert!(matches!(
+            storage.get(key).await,
+            Err(StorageError::IntegrityViolation)
+        ));
+        assert_eq!(storage.get_pin_hash(key).as_deref(), Some(genuine.as_str()));
+    }
+
+    /// Re-pinning a key whose pin already equals `expected` is a no-op.
+    #[tokio::test]
+    async fn repin_already_pinned_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/app/ok.bin";
+        storage.put(key, b"stable").await.unwrap();
+        await_pin(&storage, key).await;
+
+        assert_eq!(
+            storage.repin(key, &sha_hex(b"stable"), true).await.unwrap(),
+            RepinOutcome::AlreadyPinned {
+                hash: sha_hex(b"stable")
+            }
+        );
     }
 }

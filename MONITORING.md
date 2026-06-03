@@ -49,7 +49,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_storage_bytes` | gauge | registry | Storage size in bytes per registry |
-| `nora_storage_operations_total` | counter | operation, status | Storage operations (put, get, delete) |
+| `nora_storage_operations_total` | counter | operation, status | Storage operations (put, get, delete). `status="integrity_fail"`/`"verify_error"` on `operation="get"` mean a stored artifact failed hash-pin verification and was refused (fail-closed, #582) — see [Integrity recovery](#integrity-recovery). |
 
 ### Circuit Breaker
 
@@ -142,4 +142,36 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "Upstream URL leak detected in NORA responses"
+
+      - alert: NoraIntegrityFailure
+        expr: increase(nora_storage_operations_total{operation="get",status=~"integrity_fail|verify_error"}[5m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "NORA refusing to serve an artifact (hash-pin integrity failure)"
 ```
+
+A ready-to-load version of these rules ships at [`deploy/prometheus-rules.yml`](deploy/prometheus-rules.yml); point Prometheus at it via `rule_files:`.
+
+## Integrity recovery
+
+When `nora_storage_operations_total{operation="get",status="integrity_fail"}`
+fires, a stored artifact's bytes no longer match its hash pin (bit rot or
+tampering) and `Storage::get()` returns 5xx on every read (fail-closed, #582).
+The offending key is in the `integrity violation` error log line.
+
+- **Cache/proxy artifacts** self-heal: the next request treats the failure as a
+  cache miss, re-fetches from upstream, and re-pins.
+- **Locally-authored artifacts** (e.g. uploaded `raw` blobs) have no upstream.
+  Verify the on-disk bytes against a hash you trust, then:
+
+  ```sh
+  # Dry run — shows old → new pin without writing:
+  nora re-pin raw/myorg/app-1.0.0.bin --expected <sha256>
+  # Apply once you've confirmed:
+  nora re-pin raw/myorg/app-1.0.0.bin --expected <sha256> --yes
+  ```
+
+  `--expected` is **mandatory**: re-pin updates the pin only if the on-disk
+  bytes already hash to it. If they do not, the disk is genuinely corrupt — the
+  command refuses (re-pin cannot heal corruption); restore from backup first.

@@ -1,0 +1,31 @@
+# Prometheus alerting rules for NORA.
+#
+# Load alongside your scrape config:
+#
+#   # prometheus.yml
+#   rule_files:
+#     - /etc/prometheus/prometheus-rules.yml
+#
+# These rules surface the fail-closed integrity path (#582/#601): when a stored
+# artifact's bytes no longer match its hash pin, `Storage::get()` returns 5xx on
+# every read. Without an alert that silently becomes "service down on a hot key"
+# with no diagnosis.
+groups:
+  - name: nora-integrity
+    rules:
+      - alert: NoraIntegrityFailure
+        # `status` (not `result`) is the metric's label; matches
+        # nora_storage_operations_total{operation="get",status="integrity_fail"}
+        # and "verify_error" emitted by storage::Storage::get().
+        expr: increase(nora_storage_operations_total{operation="get",status=~"integrity_fail|verify_error"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NORA is refusing to serve an artifact (hash-pin integrity failure)"
+          description: >-
+            Storage get() failed closed on a hash-pin mismatch (bit rot or
+            tampering); the artifact returns 5xx on every read. Find the key in
+            the `integrity violation` error log, verify the on-disk bytes, then
+            recover with `nora re-pin <key> --expected <sha256> --yes` (or
+            restore from backup if the disk is genuinely corrupt).

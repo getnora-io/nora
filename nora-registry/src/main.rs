@@ -136,6 +136,22 @@ enum Commands {
         #[arg(long, default_value = "false")]
         dry_run: bool,
     },
+    /// Recover an artifact whose hash pin no longer matches its bytes (#601).
+    ///
+    /// Updates the pin to `--expected` only if the on-disk bytes already hash
+    /// to it. If the disk is genuinely corrupt (does not match), it refuses —
+    /// re-pin cannot heal corruption; restore from backup first.
+    RePin {
+        /// Storage key, e.g. `raw/myorg/app-1.0.0.bin`
+        key: String,
+        /// The SHA-256 (64-char hex) the operator knows to be canonical for
+        /// this key — from a CI manifest, upstream checksum, or lockfile.
+        #[arg(long)]
+        expected: String,
+        /// Apply the change. Without this, prints what would change (dry run).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -631,6 +647,53 @@ async fn main() {
                 }
                 Err(e) => {
                     error!("Docker key migration failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::RePin { key, expected, yes }) => {
+            let expected = expected.to_ascii_lowercase();
+            if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+                error!("--expected must be a 64-character hex SHA-256");
+                std::process::exit(2);
+            }
+            match storage.repin(&key, &expected, yes).await {
+                Ok(storage::RepinOutcome::NoPinStore) => {
+                    println!("Backend has no pin store (S3) — nothing to re-pin.");
+                }
+                Ok(storage::RepinOutcome::DiskMismatch { disk, expected }) => {
+                    error!(
+                        key = %key,
+                        on_disk = %disk,
+                        expected = %expected,
+                        "re-pin refused: on-disk bytes do not match --expected — the artifact is corrupt. Restore it from backup, then re-pin."
+                    );
+                    std::process::exit(1);
+                }
+                Ok(storage::RepinOutcome::AlreadyPinned { hash }) => {
+                    println!("Pin already matches {hash} — nothing to do.");
+                }
+                Ok(storage::RepinOutcome::WouldUpdate { old, new }) => {
+                    println!(
+                        "Would re-pin {key}:\n  old: {}\n  new: {new}\nRe-run with --yes to apply.",
+                        old.as_deref().unwrap_or("(none)")
+                    );
+                }
+                Ok(storage::RepinOutcome::Updated { old, new }) => {
+                    // Loud audit trail — re-pin is a privileged integrity override.
+                    warn!(
+                        key = %key,
+                        old = ?old,
+                        new = %new,
+                        "INTEGRITY RE-PIN: hash pin updated by operator (#601)"
+                    );
+                    println!(
+                        "Re-pinned {key}:\n  old: {}\n  new: {new}",
+                        old.as_deref().unwrap_or("(none)")
+                    );
+                }
+                Err(e) => {
+                    error!(key = %key, "re-pin failed: {}", e);
                     std::process::exit(1);
                 }
             }
