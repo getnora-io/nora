@@ -391,6 +391,26 @@ fn primary_key_for_checksum(key: &str) -> Option<&str> {
     None
 }
 
+/// Revalidation validator sidecars (`<key>.meta`, #596) are produced ONLY for
+/// npm metadata, so the orphan rule is scoped to the npm prefix — otherwise a
+/// Maven artifact that legitimately ends in `.meta` could be false-deleted.
+fn is_meta_sidecar(key: &str) -> bool {
+    key.starts_with("npm/") && ends_with_ci(key, ".meta")
+}
+
+/// True for any sidecar whose orphan rule is "primary artifact absent".
+fn is_orphanable_sidecar(key: &str) -> bool {
+    is_checksum_sidecar(key) || is_meta_sidecar(key)
+}
+
+/// Primary artifact key a sidecar belongs to (checksum or `.meta`).
+fn primary_key_for_sidecar(key: &str) -> Option<&str> {
+    if is_meta_sidecar(key) {
+        return key.strip_suffix(".meta");
+    }
+    primary_key_for_checksum(key)
+}
+
 async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
     let mut checksums: Vec<String> = Vec::new();
 
@@ -401,7 +421,7 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
             Vec::new()
         });
         for key in keys {
-            if is_checksum_sidecar(&key) {
+            if is_orphanable_sidecar(&key) {
                 checksums.push(key);
             }
         }
@@ -411,7 +431,7 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
     let mut orphans = Vec::new();
 
     for checksum_key in &checksums {
-        if let Some(primary) = primary_key_for_checksum(checksum_key) {
+        if let Some(primary) = primary_key_for_sidecar(checksum_key) {
             // If the primary artifact doesn't exist, the checksum is orphaned
             if storage.stat(primary).await.is_none() {
                 orphans.push(checksum_key.clone());
@@ -1066,6 +1086,52 @@ mod tests {
         );
         assert_eq!(result.skipped_recent, 1);
         assert!(storage.get(key).await.is_ok());
+    }
+
+    /// #596: a `.meta` validator sidecar is reaped when its npm metadata body is
+    /// gone (orphan), kept when the body is present, and — crucially — a Maven
+    /// artifact ending in `.meta` is NOT treated as a sidecar (no false delete).
+    #[tokio::test]
+    async fn test_gc_meta_sidecar_orphan_rule_is_npm_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Orphan npm .meta (no primary body) → reaped.
+        storage
+            .put("npm/orphan/metadata.json.meta", br#"{"etag":"v1"}"#)
+            .await
+            .unwrap();
+        // npm .meta WITH its primary body → kept.
+        storage
+            .put("npm/live/metadata.json", b"body")
+            .await
+            .unwrap();
+        storage
+            .put("npm/live/metadata.json.meta", br#"{"etag":"v2"}"#)
+            .await
+            .unwrap();
+        // Maven artifact literally ending in .meta, no primary → must NOT be a
+        // sidecar candidate (false-delete guard).
+        storage
+            .put("maven/com/x/1.0/thing.meta", b"real-artifact")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        assert!(result.deleted >= 1);
+
+        assert!(
+            storage.get("npm/orphan/metadata.json.meta").await.is_err(),
+            "orphan npm .meta must be reaped"
+        );
+        assert!(
+            storage.get("npm/live/metadata.json.meta").await.is_ok(),
+            "npm .meta with a live body must be kept"
+        );
+        assert!(
+            storage.get("maven/com/x/1.0/thing.meta").await.is_ok(),
+            "a Maven .meta artifact must never be treated as a sidecar"
+        );
     }
 
     #[tokio::test]

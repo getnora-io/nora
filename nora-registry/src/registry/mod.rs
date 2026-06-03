@@ -213,6 +213,143 @@ pub(crate) async fn proxy_fetch_text(
     .await
 }
 
+// ============================================================================
+// Conditional revalidation (#596)
+// ============================================================================
+
+/// Upstream cache validators persisted next to a cached object so a later
+/// revalidation can send `If-None-Match` / `If-Modified-Since`. Stored as a
+/// `<key>.meta` JSON sidecar — filesystem-first, survives restarts (ADR-2).
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Validators {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    /// True if at least one validator is present to drive a conditional request.
+    pub fn is_some(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
+}
+
+/// Outcome of a conditional upstream request.
+pub(crate) enum Revalidation {
+    /// Upstream answered `304 Not Modified` — the cached body is still valid.
+    NotModified,
+    /// Upstream answered `200` with a (possibly) new body and fresh validators.
+    Modified {
+        body: Vec<u8>,
+        validators: Validators,
+    },
+}
+
+/// Storage key of the validator sidecar for a cached object.
+pub(crate) fn validators_key(key: &str) -> String {
+    format!("{key}.meta")
+}
+
+/// Read the stored upstream validators for `key`, if any. Fail-open: any
+/// read/parse error yields `None` (caller does a full fetch).
+pub(crate) async fn read_validators(storage: &crate::Storage, key: &str) -> Option<Validators> {
+    let data = storage.get(&validators_key(key)).await.ok()?;
+    serde_json::from_slice::<Validators>(&data).ok()
+}
+
+/// Persist upstream validators next to `key`. Written AFTER the body so a
+/// sidecar never advertises freshness for a body that is not there. A no-op
+/// when there is nothing to store.
+pub(crate) async fn write_validators(storage: &crate::Storage, key: &str, v: &Validators) {
+    if !v.is_some() {
+        return;
+    }
+    if let Ok(data) = serde_json::to_vec(v) {
+        if let Err(e) = storage.put(&validators_key(key), &data).await {
+            tracing::warn!(key = %key, error = ?e, "failed to write validator sidecar");
+        }
+    }
+}
+
+fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Conditional upstream fetch (#596). Sends `If-None-Match`/`If-Modified-Since`
+/// from `validators`; returns `NotModified` on 304 (no body downloaded) or
+/// `Modified { body, validators }` on 200. With empty `validators` it sends no
+/// conditional headers, so it always yields `Modified` — that is how the full
+/// fetch path captures validators for the first time.
+///
+/// Circuit breaker: 304/200 record success; transport/5xx record failure; 4xx
+/// returns `NotFound` (matching `proxy_fetch_core`). No retry — revalidation is
+/// a lightweight check and the caller falls back to a full fetch on error.
+pub(crate) async fn proxy_fetch_conditional(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+) -> Result<Revalidation, ProxyError> {
+    let registry_str = registry.as_str();
+    cb.check(registry_str)?;
+
+    let mut request = client.get(url).timeout(timeout);
+    if let Some(credentials) = auth {
+        request = request.header(header::AUTHORIZATION, basic_auth_header(credentials));
+    }
+    if let Some(ref etag) = validators.etag {
+        request = request.header(header::IF_NONE_MATCH, etag);
+    }
+    if let Some(ref lm) = validators.last_modified {
+        request = request.header(header::IF_MODIFIED_SINCE, lm);
+    }
+
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_MODIFIED {
+                cb.record_success(registry_str);
+                return Ok(Revalidation::NotModified);
+            }
+            if status.is_success() {
+                let new_validators = Validators {
+                    etag: header_string(&response, header::ETAG),
+                    last_modified: header_string(&response, header::LAST_MODIFIED),
+                };
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|e| ProxyError::Network(e.to_string()))?;
+                cb.record_success(registry_str);
+                return Ok(Revalidation::Modified {
+                    body: body.to_vec(),
+                    validators: new_validators,
+                });
+            }
+            let code = status.as_u16();
+            if (400..500).contains(&code) {
+                // 4xx — upstream alive; recover the breaker without clearing a
+                // real failure tally, consistent with proxy_fetch_core (#606).
+                cb.record_alive(registry_str);
+                return Err(ProxyError::NotFound);
+            }
+            cb.record_failure(registry_str);
+            Err(ProxyError::Upstream(code))
+        }
+        Err(e) => {
+            cb.record_failure(registry_str);
+            Err(ProxyError::Network(e.to_string()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +370,121 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProxyError::Network(_))));
+    }
+
+    // --- Conditional revalidation (#596) ---
+
+    fn noop_cb() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig::default())
+    }
+
+    /// With no stored validators, the conditional fetch sends no `If-None-Match`,
+    /// always gets a 200, and captures the upstream validators (this is also the
+    /// full-fetch path that seeds the sidecar for next time).
+    #[tokio::test]
+    async fn conditional_200_captures_validators() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_string("BODY-V1"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let cb = noop_cb();
+        let out = proxy_fetch_conditional(
+            &reqwest::Client::new(),
+            &upstream.uri(),
+            Duration::from_secs(5),
+            None,
+            &Validators::default(),
+            &cb,
+            RegistryType::Npm,
+        )
+        .await
+        .unwrap();
+
+        match out {
+            Revalidation::Modified { body, validators } => {
+                assert_eq!(body, b"BODY-V1");
+                assert_eq!(validators.etag.as_deref(), Some("\"v1\""));
+            }
+            Revalidation::NotModified => panic!("expected Modified"),
+        }
+    }
+
+    /// When validators are present they are sent as `If-None-Match`, and a 304
+    /// yields `NotModified` with NO body download. The mock only answers 304 when
+    /// the header is present, so a pass proves the header was sent.
+    #[tokio::test]
+    async fn conditional_304_sends_if_none_match_and_returns_not_modified() {
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let validators = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        let cb = noop_cb();
+        let out = proxy_fetch_conditional(
+            &reqwest::Client::new(),
+            &upstream.uri(),
+            Duration::from_secs(5),
+            None,
+            &validators,
+            &cb,
+            RegistryType::Npm,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(out, Revalidation::NotModified));
+    }
+
+    /// Validators round-trip through storage (the sidecar lives on disk, so they
+    /// survive a restart) — acceptance criterion for #596.
+    #[tokio::test]
+    async fn validators_sidecar_roundtrips_through_storage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::Storage::new_local(dir.path().to_str().unwrap());
+
+        // No body yet, but the sidecar is just another key — write then read.
+        let key = "npm/pkg/metadata.json";
+        let v = Validators {
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".to_string()),
+        };
+        write_validators(&storage, key, &v).await;
+
+        // Fresh Storage over the same dir = "after restart".
+        let reloaded = crate::Storage::new_local(dir.path().to_str().unwrap());
+        let got = read_validators(&reloaded, key)
+            .await
+            .expect("sidecar persists");
+        assert_eq!(got, v);
+        assert_eq!(validators_key(key), "npm/pkg/metadata.json.meta");
+    }
+
+    /// An empty validator set writes no sidecar (nothing to persist).
+    #[tokio::test]
+    async fn empty_validators_write_no_sidecar() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::Storage::new_local(dir.path().to_str().unwrap());
+        write_validators(&storage, "npm/x/metadata.json", &Validators::default()).await;
+        assert!(read_validators(&storage, "npm/x/metadata.json")
+            .await
+            .is_none());
     }
 }

@@ -6,7 +6,8 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
+    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
+    read_validators, write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -341,38 +342,90 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
     let proxy_url = state.config.npm.proxy.as_ref()?;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
-    let data = proxy_fetch(
+    // Revalidate with a conditional request when enabled and we have stored
+    // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
+    // which is also how the first fetch captures validators for next time (#596).
+    let validators = if state.config.npm.revalidate {
+        read_validators(&state.storage, key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         expose_opt(&state.config.npm.proxy_auth),
+        &validators,
         &state.circuit_breaker,
         RegistryType::Npm,
     )
     .await
-    .ok()?;
-
-    let nora_base = nora_base_url(state);
-    let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
-        tracing::warn!(
-            path = %path,
-            "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
-        );
-        let upstream_trimmed = proxy_url.trim_end_matches('/');
-        let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-        replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
-    });
-
-    let storage = state.storage.clone();
-    let key_clone = key.to_string();
-    let cache_data = rewritten.clone();
-    tokio::spawn(async move {
-        if let Err(e) = storage.put(&key_clone, &cache_data).await {
-            tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
+    {
+        // Upstream unchanged — serve the cached (already-rewritten) body and
+        // refresh its freshness so we don't revalidate again until the next TTL
+        // window. No body was downloaded.
+        Ok(Revalidation::NotModified) => {
+            let cached = state.storage.get(key).await.ok()?; // body gone → fail-open
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["npm"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["npm"])
+                .inc_by(cached.len() as u64);
+            // Re-put bumps the file mtime (the freshness source) without an
+            // upstream download.
+            let storage = state.storage.clone();
+            let key_clone = key.to_string();
+            let body = cached.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &body).await;
+            });
+            Some(cached.to_vec())
         }
-    });
+        // New body — rewrite, cache it, then persist the fresh validators.
+        Ok(Revalidation::Modified { body, validators }) => {
+            let nora_base = nora_base_url(state);
+            let rewritten =
+                rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
+                    tracing::warn!(
+                        path = %path,
+                        "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
+                    );
+                    let upstream_trimmed = proxy_url.trim_end_matches('/');
+                    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+                    replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
+                });
 
-    Some(rewritten)
+            let storage = state.storage.clone();
+            let key_clone = key.to_string();
+            let cache_data = rewritten.clone();
+            tokio::spawn(async move {
+                // Body first; the validator sidecar must never advertise
+                // freshness for a body that isn't there (#596).
+                if let Err(e) = storage.put(&key_clone, &cache_data).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
+
+            Some(rewritten)
+        }
+        // Upstream unavailable / error — fall back to the caller's serve_stale /
+        // 502 path exactly as before.
+        Err(_) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["npm"])
+                    .inc();
+            }
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -1414,5 +1467,65 @@ mod spec_conformance_tests {
             json["homepage"].as_str().unwrap(),
             "https://pkg.example.com"
         );
+    }
+
+    /// #596 acceptance: with a cached metadata body + stored validators, a stale
+    /// request revalidates with `If-None-Match`; on upstream 304 the cached body
+    /// is served and NO 200-with-body is ever fetched. Drives the real handler.
+    #[tokio::test]
+    async fn test_npm_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 here (no mount), so any full fetch would visibly fail —
+        // proving the 304 path served from cache.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0; // always stale → always revalidate
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+
+        // Pre-seed the cache body + validator sidecar (as a prior 200 would have).
+        let key = "npm/testpkg/metadata.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"CACHED-PACKUMENT", "must serve the cached body");
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }

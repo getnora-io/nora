@@ -19,6 +19,11 @@ pub struct NpmConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Revalidate stale metadata with a conditional request (`If-None-Match`)
+    /// instead of always re-downloading the full body (#596). Fail-open: any
+    /// error falls back to a full fetch.
+    #[serde(default = "super::super::default_true")]
+    pub revalidate: bool,
 }
 
 impl Default for NpmConfig {
@@ -30,6 +35,7 @@ impl Default for NpmConfig {
             proxy_timeout: 30,
             metadata_ttl: 300,
             serve_stale: true,
+            revalidate: true,
         }
     }
 }
@@ -57,6 +63,9 @@ impl NpmConfig {
         }
         if let Ok(val) = env::var("NORA_NPM_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_NPM_REVALIDATE") {
+            self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
     }
 }
