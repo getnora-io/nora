@@ -1013,6 +1013,61 @@ mod tests {
             .is_err());
     }
 
+    /// #610 (hardening for #584): an orphan whose mtime is in the FUTURE (clock
+    /// skew, or a file copied with a forward timestamp) must be protected, not
+    /// deleted. The grace check uses `saturating_sub`, so `now - future` is 0
+    /// (< grace) — never a wrap-around that would make it look ancient.
+    #[tokio::test]
+    async fn test_gc_grace_protects_future_mtime_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+
+        let key = "docker/test/blobs/sha256:future00";
+        storage.put(key, b"x").await.unwrap();
+
+        // Backdate-forward the file's mtime to one hour ahead.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(data.join(key))
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        // A short grace: a normal old orphan would be deleted, but a future
+        // mtime must still be treated as "too young" and kept.
+        let result = run_gc(&storage, &test_publish_locks(), false, 60).await;
+        assert_eq!(
+            result.skipped_recent, 1,
+            "future-mtime orphan must be protected (saturating_sub)"
+        );
+        assert_eq!(result.deleted, 0);
+        assert!(storage.get(key).await.is_ok());
+    }
+
+    /// #610: the grace period applies uniformly to all orphan classes, not just
+    /// Docker blobs. A freshly-written non-Docker orphan (here a Maven checksum
+    /// sidecar with no primary artifact) must also be protected.
+    #[tokio::test]
+    async fn test_gc_grace_protects_non_docker_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // A checksum sidecar with no primary artifact → orphan (checksum class).
+        let key = "maven/com/example/1.0/old.jar.sha256";
+        storage.put(key, b"deadbeef").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600).await;
+        assert_eq!(result.orphaned, 1, "checksum orphan should be detected");
+        assert_eq!(
+            result.deleted, 0,
+            "young non-docker orphan must be protected"
+        );
+        assert_eq!(result.skipped_recent, 1);
+        assert!(storage.get(key).await.is_ok());
+    }
+
     #[tokio::test]
     async fn test_gc_docker_deletes_orphans() {
         let dir = tempfile::tempdir().unwrap();
