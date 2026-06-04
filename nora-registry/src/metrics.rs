@@ -31,6 +31,20 @@ pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create HTTP_REQUESTS_TOTAL metric at startup")
 });
 
+/// Curation engine decisions, by effective outcome. Makes allow/deny visible in
+/// telemetry — previously curation only kept internal counters, so an operator
+/// could not see from Prometheus how often curation allowed vs blocked.
+/// Labels: `decision` ∈ {allow, block, audit (would-block, allowed in audit
+/// mode), skip}.
+pub static CURATION_DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_curation_decisions_total",
+        "Curation engine decisions by effective outcome",
+        &["decision"]
+    )
+    .expect("failed to create CURATION_DECISIONS_TOTAL metric at startup")
+});
+
 /// Conditional revalidations where upstream answered 304 Not Modified — the
 /// cached body was reused and no body bytes were downloaded (#596).
 pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
