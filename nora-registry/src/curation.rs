@@ -155,6 +155,22 @@ impl CurationEngine {
     /// - **Enforce**: Block decisions are final.
     /// - All Skip → Allow.
     pub fn evaluate(&self, request: &FilterRequest) -> EvaluationResult {
+        let result = self.evaluate_inner(request);
+        // Expose the effective curation decision in Prometheus — previously only
+        // internal counters existed, so allow/block was invisible in telemetry.
+        let decision = match &result.decision {
+            Decision::Allow => "allow",
+            Decision::Block { .. } if result.audited => "audit",
+            Decision::Block { .. } => "block",
+            Decision::Skip => "skip",
+        };
+        crate::metrics::CURATION_DECISIONS_TOTAL
+            .with_label_values(&[decision])
+            .inc();
+        result
+    }
+
+    fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
         // Namespace isolation: ALWAYS active, even in Off mode.
         // Prevents dependency confusion regardless of curation config.
         if let Some(ref ns_filter) = self.namespace_filter {
