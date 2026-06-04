@@ -1407,11 +1407,18 @@ async fn run_server(mut config: Config, storage: Storage) {
                 metrics::STORAGE_BYTES
                     .with_label_values(&["total"])
                     .set(metrics_state.storage.total_size().await as i64);
-                // Per-registry artifact counts + process uptime (#446)
+                // Per-registry artifact counts + logical bytes from the cached index,
+                // plus process uptime (#446). The "total" storage_bytes label above is
+                // the full physical footprint; per-registry is summed artifact size.
                 for (rt, count) in metrics_state.repo_index.counts() {
                     metrics::ARTIFACTS_TOTAL
                         .with_label_values(&[rt.as_str()])
                         .set(count as i64);
+                }
+                for (rt, bytes) in metrics_state.repo_index.sizes() {
+                    metrics::STORAGE_BYTES
+                        .with_label_values(&[rt.as_str()])
+                        .set(bytes as i64);
                 }
                 metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
             }
