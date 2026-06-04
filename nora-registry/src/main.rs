@@ -1407,6 +1407,13 @@ async fn run_server(mut config: Config, storage: Storage) {
                 metrics::STORAGE_BYTES
                     .with_label_values(&["total"])
                     .set(metrics_state.storage.total_size().await as i64);
+                // Per-registry artifact counts + process uptime (#446)
+                for (rt, count) in metrics_state.repo_index.counts() {
+                    metrics::ARTIFACTS_TOTAL
+                        .with_label_values(&[rt.as_str()])
+                        .set(count as i64);
+                }
+                metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
             }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks

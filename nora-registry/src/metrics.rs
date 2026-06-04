@@ -160,12 +160,11 @@ pub static NAMESPACE_SCOPE_DECISIONS: LazyLock<IntCounterVec> = LazyLock::new(||
     .expect("failed to create NAMESPACE_SCOPE_DECISIONS metric at startup")
 });
 
-/// Artifacts count by registry
-#[allow(dead_code)]
-pub static ARTIFACTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
+/// Current number of artifacts by registry (gauge — rises and falls with GC)
+pub static ARTIFACTS_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "nora_artifacts_total",
-        "Total artifacts stored",
+        "Current number of artifacts by registry",
         &["registry"]
     )
     .expect("failed to create ARTIFACTS_TOTAL metric at startup")
@@ -277,6 +276,12 @@ pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["registry"]
     )
     .expect("failed to create STORAGE_BYTES metric at startup")
+});
+
+/// Process uptime in seconds (gauge)
+pub static UPTIME_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("nora_uptime_seconds", "Process uptime in seconds")
+        .expect("failed to create UPTIME_SECONDS metric at startup")
 });
 
 /// Cache write errors by registry and operation (#500)
