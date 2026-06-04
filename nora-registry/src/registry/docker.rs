@@ -236,6 +236,82 @@ async fn storage_get_reader_with_fallback(
     }
 }
 
+/// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
+/// mismatch at EOF, fails the stream instead of letting a tampered blob complete
+/// cleanly. `get_reader` (#580) streams large docker blobs without buffering, so
+/// the buffered-`get()` fail-closed verify (#582) does not run on this path; this
+/// restores NORA-side tamper *detection* for the streaming path (the docker
+/// client's own content-digest check is the complementary layer). It cannot
+/// un-send bytes already streamed, but it errors the response and logs on tamper
+/// rather than serving a clean 200. Recomputing the digest on the streaming path
+/// is the same deliberate cost #582 accepts for buffered reads.
+struct VerifyingReader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+    expected_hex: String,
+    finished: bool,
+}
+
+impl<R> VerifyingReader<R> {
+    fn new(inner: R, digest: &str) -> Self {
+        let expected_hex = digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase();
+        Self {
+            inner,
+            hasher: sha2::Sha256::default(),
+            expected_hex,
+            finished: false,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VerifyingReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use sha2::Digest as _;
+        use std::task::Poll;
+        // VerifyingReader<R: Unpin> is itself Unpin, so this projection is safe
+        // (no `unsafe`, honouring `#![forbid(unsafe_code)]`).
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let filled = buf.filled();
+                if filled.len() > before {
+                    this.hasher.update(&filled[before..]);
+                    Poll::Ready(Ok(()))
+                } else {
+                    // EOF — verify the accumulated digest before a clean end.
+                    this.finished = true;
+                    let got = hex::encode(this.hasher.clone().finalize());
+                    if got == this.expected_hex {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        tracing::error!(
+                            expected = %this.expected_hex,
+                            got = %got,
+                            "blob integrity verification failed while streaming — aborting response"
+                        );
+                        Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "blob integrity verification failed",
+                        )))
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Check if a key exists in namespaced or legacy location.
 async fn storage_stat_with_fallback(
     storage: &Storage,
@@ -868,7 +944,7 @@ async fn download_blob(
             "docker",
             "LOCAL",
         ));
-        let stream = ReaderStream::new(reader);
+        let stream = ReaderStream::new(VerifyingReader::new(reader, &digest));
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -975,7 +1051,8 @@ async fn download_blob(
                         // Successfully stored — stream from storage
                         match state.storage.get_reader(&key).await {
                             Ok((size, reader)) => {
-                                let stream = ReaderStream::new(reader);
+                                let stream =
+                                    ReaderStream::new(VerifyingReader::new(reader, &digest));
                                 return Response::builder()
                                     .status(StatusCode::OK)
                                     .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -999,7 +1076,7 @@ async fn download_blob(
                         // put_from_path failed — stream from temp file directly
                         match tokio::fs::File::open(&fetched.path).await {
                             Ok(file) => {
-                                let stream = ReaderStream::new(file);
+                                let stream = ReaderStream::new(VerifyingReader::new(file, &digest));
                                 return Response::builder()
                                     .status(StatusCode::OK)
                                     .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -2631,6 +2708,34 @@ async fn update_metadata_on_pull(state: AppState, storage: Storage, meta_key: St
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verifying_reader_passes_match_and_aborts_mismatch() {
+        use sha2::Digest as _;
+        use tokio::io::AsyncReadExt;
+
+        let data = b"hello-blob-content-1234567890";
+        let good = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+
+        // Matching digest: the stream reads fully with no error.
+        let mut ok = VerifyingReader::new(&data[..], &good);
+        let mut buf = Vec::new();
+        assert!(ok.read_to_end(&mut buf).await.is_ok());
+        assert_eq!(buf, data);
+
+        // Wrong digest: the error surfaces at EOF, aborting the stream rather
+        // than letting a tampered blob complete cleanly.
+        let bad = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"different-bytes"))
+        );
+        let mut tampered = VerifyingReader::new(&data[..], &bad);
+        let mut buf2 = Vec::new();
+        assert!(
+            tampered.read_to_end(&mut buf2).await.is_err(),
+            "a digest mismatch must error the stream, not complete cleanly"
+        );
+    }
 
     #[test]
     fn test_image_metadata_default() {
