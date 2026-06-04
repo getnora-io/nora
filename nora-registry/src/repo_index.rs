@@ -70,6 +70,11 @@ impl RegistryIndex {
     pub fn count(&self) -> usize {
         self.data.read().len()
     }
+
+    /// Sum of artifact bytes in this registry's cached index (no rebuild).
+    pub fn total_size(&self) -> u64 {
+        self.data.read().iter().map(|r| r.size).sum()
+    }
 }
 
 impl Default for RegistryIndex {
@@ -161,6 +166,14 @@ impl RepoIndex {
         self.indexes
             .iter()
             .map(|(rt, idx)| (*rt, idx.count()))
+            .collect()
+    }
+
+    /// Get total artifact bytes per registry from the cached index (no rebuild).
+    pub fn sizes(&self) -> HashMap<RegistryType, u64> {
+        self.indexes
+            .iter()
+            .map(|(rt, idx)| (*rt, idx.total_size()))
             .collect()
     }
 }
