@@ -159,11 +159,23 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // For local storage, just check if base directory exists or can be created
-        if self.base_path.exists() {
-            return true;
+        // A real write-probe — `base_path.exists()` is not a health signal: a
+        // read-only mount or a full disk where the directory already exists would
+        // still report healthy. Create + write + fsync + remove a unique temp
+        // file; only a genuinely writable backing store passes.
+        if fs::create_dir_all(&self.base_path).await.is_err() {
+            return false;
         }
-        fs::create_dir_all(&self.base_path).await.is_ok()
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe =
+            self.base_path
+                .join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
+        let writable = match fs::File::create(&probe).await {
+            Ok(mut file) => file.write_all(b"ok").await.is_ok() && file.sync_all().await.is_ok(),
+            Err(_) => false,
+        };
+        let _ = fs::remove_file(&probe).await; // best-effort cleanup
+        writable
     }
 
     async fn total_size(&self) -> u64 {
@@ -343,6 +355,22 @@ mod tests {
         assert!(!new_path.exists());
         assert!(storage.health_check().await);
         assert!(new_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_fails_when_unwritable() {
+        // base_path *under a regular file* can't be created or written: `open`
+        // fails with ENOTDIR — a structural error the kernel returns even to
+        // root, unlike a chmod'd read-only dir which root bypasses via
+        // DAC_OVERRIDE. The old `exists()`-only check would have missed this.
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let storage = LocalStorage::new(file.join("store").to_str().unwrap());
+        assert!(
+            !storage.health_check().await,
+            "an unwritable backing store must report unhealthy"
+        );
     }
 
     #[tokio::test]
