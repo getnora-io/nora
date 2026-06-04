@@ -325,6 +325,20 @@ impl Config {
         if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
             tracing::warn!("Cargo proxy credentials in config.toml are plaintext — consider NORA_CARGO_PROXY_AUTH env var");
         }
+        // Auth posture: a silently-unauthenticated instance must not look safe.
+        // The zero-config default is auth.enabled=false, which accepts BOTH reads
+        // and writes from anyone; surface it loudly so it is a deliberate choice.
+        if !self.auth.enabled {
+            tracing::warn!(
+                "auth.enabled=false — NORA is accepting UNAUTHENTICATED reads AND writes. \
+                 Set auth.enabled=true (with htpasswd/tokens/OIDC) before exposing this instance."
+            );
+        } else if self.auth.anonymous_read {
+            tracing::warn!(
+                "auth.anonymous_read=true — pulls/downloads are served without authentication \
+                 (writes still require a token); ensure this is intended for this deployment."
+            );
+        }
     }
 
     /// Collect all configured upstream hostnames for leak detection (#386).
