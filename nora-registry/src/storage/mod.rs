@@ -172,15 +172,36 @@ impl Storage {
                     // the artifact unpinned. Fully closing that requires
                     // serializing get/put per key; it is benign (it serves NORA's
                     // own just-written bytes) and out of scope here.
+                    // `record` now returns its I/O result: handle the inner
+                    // failure (ENOSPC/EACCES/EIO/read-only FS) the same way as a
+                    // panicked task — fail closed. Previously that error was
+                    // swallowed inside `record`, so `put()` returned Ok while the
+                    // pin never reached disk, silently downgrading the key to
+                    // open-world after the next restart (the #582/#604 bypass).
+                    //
+                    // NOTE (immutable registries): `self.inner.put` already
+                    // succeeded, so on an immutable registry the client's retry
+                    // hits the immutability guard (409) and never re-runs this pin
+                    // write — the orphaned body stays unpinned until an operator
+                    // `repin`s it. That is still strictly better than the prior
+                    // silent success and is the documented recovery path;
+                    // auto-cleanup of the orphan body is a separate follow-up.
                     match tokio::task::spawn_blocking(move || pins.record(&key_owned, &data_owned))
                         .await
                     {
-                        Ok(()) => {}
-                        Err(e) => {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
                             STORAGE_OPERATIONS
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
                             return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
                         }
                     }
@@ -281,9 +302,31 @@ impl Storage {
                     .inc();
                 if let Some(ref pins) = self.pin_store {
                     let pins = Arc::clone(pins);
-                    let key = key.to_string();
-                    // Sync file append — offload from tokio worker
-                    tokio::task::spawn_blocking(move || pins.remove(&key));
+                    let key_owned = key.to_string();
+                    // Await the tombstone write so a failure is observable rather
+                    // than fire-and-forget. A lost tombstone is fail-safe (a stale
+                    // pin at worst yields a future IntegrityViolation, healable via
+                    // `repin`), so `delete()` still reports success — the
+                    // authoritative action (byte removal) already succeeded.
+                    match tokio::task::spawn_blocking(move || pins.remove(&key_owned)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["delete", "pin_error"])
+                                .inc();
+                            tracing::warn!(
+                                error = %e,
+                                key = %key,
+                                "hash-pin tombstone write failed; stale pin left (repin to heal)"
+                            );
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["delete", "pin_error"])
+                                .inc();
+                            tracing::warn!(error = %e, key = %key, "hash-pin tombstone task panicked");
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -373,7 +416,8 @@ impl Storage {
         if !apply {
             return Ok(RepinOutcome::WouldUpdate { old, new: expected });
         }
-        pins.record_hash(key, &expected);
+        pins.record_hash(key, &expected)
+            .map_err(|e| StorageError::Io(format!("hash-pin record failed: {e}")))?;
         Ok(RepinOutcome::Updated { old, new: expected })
     }
 
@@ -411,12 +455,19 @@ impl Storage {
                     match tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
                         .await
                     {
-                        Ok(()) => {}
-                        Err(e) => {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
                             STORAGE_OPERATIONS
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
                             return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
                         }
                     }
@@ -735,5 +786,45 @@ mod tests {
                 hash: sha_hex(b"stable")
             }
         );
+    }
+
+    /// Documents the recovery contract for the immutable-publish unpin trap:
+    /// when a `put()` body write succeeds but the pin write fails (now surfaced
+    /// as `StorageError::Io` instead of swallowed), the artifact is left durably
+    /// on disk *unpinned* (open-world). On an immutable registry the client
+    /// cannot self-heal — its retry hits the 409 guard — so that orphaned state
+    /// must be recoverable via operator `repin`. Models the orphaned state with
+    /// `put_from_path(.., None)`, which stores the body without recording a pin.
+    #[tokio::test]
+    async fn orphaned_unpinned_body_is_repin_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+        let key = "raw/app/orphan.bin";
+
+        // Stage the post-failure state: body on disk, no pin recorded.
+        let src = dir.path().join("incoming.bin");
+        std::fs::write(&src, b"orphan-bytes").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+        assert_eq!(
+            storage.get_pin_hash(key),
+            None,
+            "precondition: the orphaned body must be stored without a pin"
+        );
+
+        // Operator re-pins with the independently-known canonical hash; the disk
+        // already matches it, so the pin is set and service verifies again.
+        let expected = sha_hex(b"orphan-bytes");
+        assert_eq!(
+            storage.repin(key, &expected, true).await.unwrap(),
+            RepinOutcome::Updated {
+                old: None,
+                new: expected.clone(),
+            }
+        );
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"orphan-bytes");
     }
 }
