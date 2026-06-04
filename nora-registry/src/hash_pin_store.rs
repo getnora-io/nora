@@ -116,13 +116,19 @@ impl HashPinStore {
     /// retried `put()` would skip the (still-missing) append.
     pub fn record(&self, key: &str, data: &[u8]) -> io::Result<()> {
         let hash = Self::sha256_hex(data);
-        let needs_write = {
-            let pins = self.pins.read();
-            pins.get(key).is_none_or(|existing| *existing != hash)
-        };
-        if needs_write {
+        // Atomic per key: hold the write lock across check → append → insert.
+        // The disk append happens before the in-memory update (durability), and
+        // no concurrent record() for the same key can interleave its append and
+        // insert with ours, so disk and memory cannot diverge. (An earlier
+        // two-lock version — read-check, release, append, write-insert — had a
+        // TOCTOU where two same-key writers' append and insert orders disagreed.)
+        // The append is a ~100-byte line and record() runs on a blocking thread
+        // (`spawn_blocking`), so holding the lock across it trades a little read
+        // contention for correctness — the right call for a tamper-detection store.
+        let mut pins = self.pins.write();
+        if pins.get(key).is_none_or(|existing| *existing != hash) {
             Self::append_to_file(&self.path, key, &hash)?;
-            self.pins.write().insert(key.to_string(), hash);
+            pins.insert(key.to_string(), hash);
         }
         Ok(())
     }
@@ -141,13 +147,11 @@ impl HashPinStore {
             "record_hash: expected 64-char hex SHA-256, got: {hash}"
         );
 
-        let needs_write = {
-            let pins = self.pins.read();
-            pins.get(key).is_none_or(|existing| *existing != hash)
-        };
-        if needs_write {
+        // Same atomic check → append → insert under one write lock as record().
+        let mut pins = self.pins.write();
+        if pins.get(key).is_none_or(|existing| *existing != hash) {
             Self::append_to_file(&self.path, key, hash)?;
-            self.pins.write().insert(key.to_string(), hash.to_string());
+            pins.insert(key.to_string(), hash.to_string());
         }
         Ok(())
     }
@@ -182,10 +186,11 @@ impl HashPinStore {
     /// before verification, and a later `put()` of the key overwrites the pin —
     /// so callers may treat a remove failure as non-fatal.
     pub fn remove(&self, key: &str) -> io::Result<()> {
-        let present = self.pins.read().contains_key(key);
-        if present {
+        // Atomic tombstone: append + drop under one write lock (see record()).
+        let mut pins = self.pins.write();
+        if pins.contains_key(key) {
             Self::append_to_file(&self.path, key, "")?;
-            self.pins.write().remove(key);
+            pins.remove(key);
         }
         Ok(())
     }
@@ -457,5 +462,43 @@ mod tests {
             "record_hash must propagate the same I/O error"
         );
         assert_eq!(store.len(), 0, "failed record_hash must not update memory");
+    }
+
+    /// Regression for the disk-first TOCTOU: concurrent record() calls for the
+    /// SAME key with DIFFERENT data must leave the in-memory pin equal to what a
+    /// fresh reload from disk sees — disk and memory cannot diverge. Holding the
+    /// write lock across check → append → insert makes each record() atomic per
+    /// key; the earlier two-lock version could append in one order but insert in
+    /// the other.
+    #[test]
+    fn test_concurrent_same_key_disk_memory_consistent() {
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let store = Arc::new(HashPinStore::new(&path));
+        let key = "concurrent/key";
+
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let s = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let _ = s.record(key, format!("data-{i}").as_bytes());
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let in_memory = store.get(key);
+        drop(store);
+        // What survives a restart must equal what the live process holds.
+        let reloaded = HashPinStore::new(&path);
+        assert_eq!(
+            in_memory,
+            reloaded.get(key),
+            "in-memory pin must match the durably-recorded pin (no TOCTOU divergence)"
+        );
+        assert!(in_memory.is_some(), "some writer must have recorded a pin");
     }
 }
