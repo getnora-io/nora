@@ -105,30 +105,50 @@ async fn handle(
     // Immutable: .info, .mod, .zip — once cached, never overwrite
     let is_immutable = !is_mutable;
 
-    // 1. Try local cache (for immutable files, this is authoritative)
-    if let Ok(data) = state.storage.get(&storage_key).await {
-        // Curation integrity verification (issue #189)
-        if let Some((ref module_name, ref version)) = go_curation {
-            if let Some(response) = crate::curation::verify_integrity(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Go,
-                module_name,
-                version.as_deref(),
-                &data,
-            ) {
-                return response;
+    // 1. Try local cache.
+    //    Immutable files (.info/.mod/.zip) are content-addressed by an exact version and are
+    //    authoritative once cached. The mutable listing endpoints (@v/list, @latest) must be
+    //    revalidated against upstream before serving — otherwise a newly published version never
+    //    appears — unless there is no upstream (locally authoritative) or the cached copy is still
+    //    within the positive `metadata_ttl` window. `cached` is kept for the stale-on-error path.
+    let cached = state.storage.get(&storage_key).await.ok();
+    let modified = if cached.is_some() && is_mutable {
+        state.storage.stat(&storage_key).await.map(|m| m.modified)
+    } else {
+        None
+    };
+    let cache_fresh = cached.is_some()
+        && go_cache_fresh(
+            is_immutable,
+            state.config.go.proxy.is_some(),
+            state.config.go.metadata_ttl,
+            modified,
+        );
+    if let Some(ref data) = cached {
+        if cache_fresh {
+            // Curation integrity verification (issue #189)
+            if let Some((ref module_name, ref version)) = go_curation {
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Go,
+                    module_name,
+                    version.as_deref(),
+                    data,
+                ) {
+                    return response;
+                }
             }
-        }
 
-        state.metrics.record_download("go");
-        state.metrics.record_cache_hit("go");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            format_artifact(&module_encoded, &file),
-            "go",
-            "CACHE",
-        ));
-        return with_content_type(data.to_vec(), content_type, is_mutable);
+            state.metrics.record_download("go");
+            state.metrics.record_cache_hit("go");
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                format_artifact(&module_encoded, &file),
+                "go",
+                "CACHE",
+            ));
+            return with_content_type(data.to_vec(), content_type, is_mutable);
+        }
     }
 
     // 2. Try upstream proxy
@@ -214,16 +234,36 @@ async fn handle(
 
             with_content_type(bytes, content_type, is_mutable)
         }
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
-            tracing::debug!(
-                module = module_encoded,
-                file = file,
-                error = ?e,
-                "Go upstream proxy error"
-            );
-            StatusCode::BAD_GATEWAY.into_response()
+            // Upstream unreachable — serve the stale cached copy if we have one (graceful).
+            // Only the mutable listing endpoints reach here with a cached copy; immutable hits
+            // returned above, so this never serves a wrong content-addressed file.
+            if let Some(ref data) = cached {
+                tracing::warn!(
+                    module = module_encoded,
+                    file = file,
+                    "Go upstream failed, serving stale cached copy"
+                );
+                let mut response = with_content_type(data.to_vec(), content_type, is_mutable);
+                response.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-nora-stale"),
+                    axum::http::header::HeaderValue::from_static("true"),
+                );
+                return response;
+            }
+            match e {
+                ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
+                ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
+                _ => {
+                    tracing::debug!(
+                        module = module_encoded,
+                        file = file,
+                        error = ?e,
+                        "Go upstream proxy error"
+                    );
+                    StatusCode::BAD_GATEWAY.into_response()
+                }
+            }
         }
     }
 }
@@ -356,6 +396,22 @@ fn format_artifact(module: &str, file: &str) -> String {
     } else {
         format!("{}/{}", module, file)
     }
+}
+
+/// Whether a cached Go proxy response may be served without revalidating against upstream.
+///
+/// Immutable per-version files (`.info`/`.mod`/`.zip`) are content-addressed by an exact version
+/// and are authoritative once cached. The mutable listing endpoints (`@v/list`, `@latest`) defer
+/// to [`crate::cache_ttl::mutable_ref_fresh`]: a hosted registry (no upstream) is locally
+/// authoritative, a positive `metadata_ttl` allows a bounded staleness window, and otherwise the
+/// listing is revalidated against upstream so a newly published version appears.
+fn go_cache_fresh(
+    is_immutable: bool,
+    has_upstream: bool,
+    metadata_ttl: i64,
+    modified: Option<u64>,
+) -> bool {
+    is_immutable || crate::cache_ttl::mutable_ref_fresh(has_upstream, metadata_ttl, modified)
 }
 
 /// Build response with Content-Type and Cache-Control headers.
@@ -565,6 +621,35 @@ mod tests {
     #[test]
     fn test_content_type_list() {
         assert_eq!(content_type_for("@v/list"), "text/plain; charset=utf-8");
+    }
+
+    // ── Cache freshness (revalidation) ────────────────────────────────────
+
+    #[test]
+    fn test_go_cache_fresh_immutable_always() {
+        // Per-version files are content-addressed → always servable from cache, even proxied.
+        assert!(go_cache_fresh(true, true, -1, Some(0)));
+        assert!(go_cache_fresh(true, true, 0, None));
+    }
+
+    #[test]
+    fn test_go_cache_fresh_mutable_hosted() {
+        // Hosted (no upstream) listing is locally authoritative → fresh regardless of ttl.
+        assert!(go_cache_fresh(false, false, 0, None));
+    }
+
+    #[test]
+    fn test_go_cache_fresh_mutable_proxied_revalidates() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Proxied listing with non-positive ttl → revalidate every pull (the fix).
+        assert!(!go_cache_fresh(false, true, 0, Some(now)));
+        // Proxied listing within a positive ttl window → bounded staleness, served from cache.
+        assert!(go_cache_fresh(false, true, 300, Some(now - 10)));
+        // Proxied listing beyond the window → revalidate.
+        assert!(!go_cache_fresh(false, true, 300, Some(now - 600)));
     }
 
     // ── Cache-Control headers ─────────────────────────────────────────────

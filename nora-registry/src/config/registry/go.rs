@@ -19,6 +19,11 @@ pub struct GoConfig {
     pub proxy_timeout_zip: u64,
     #[serde(default = "default_go_max_zip_size")]
     pub max_zip_size: u64,
+    /// Staleness window (seconds) for the mutable listing endpoints (`@v/list`, `@latest`); a
+    /// non-positive value revalidates every pull. Per-version files (.info/.mod/.zip) are
+    /// content-addressed and always immutable.
+    #[serde(default = "super::super::default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 fn default_go_proxy() -> Option<String> {
@@ -42,6 +47,7 @@ impl Default for GoConfig {
             proxy_timeout: 30,
             proxy_timeout_zip: 120,
             max_zip_size: 104_857_600,
+            metadata_ttl: 300,
         }
     }
 }
@@ -73,6 +79,9 @@ impl GoConfig {
         }
         if let Ok(val) = env::var("NORA_GO_MAX_ZIP_SIZE") {
             super::super::parse_env_warn("NORA_GO_MAX_ZIP_SIZE", &val, &mut self.max_zip_size);
+        }
+        if let Ok(val) = env::var("NORA_GO_METADATA_TTL") {
+            super::super::parse_env_warn("NORA_GO_METADATA_TTL", &val, &mut self.metadata_ttl);
         }
     }
 }

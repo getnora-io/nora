@@ -122,6 +122,7 @@ fn build_context(
             proxy_timeout: 5,
             proxy_timeout_zip: 30,
             max_zip_size: 10_485_760,
+            metadata_ttl: 300,
         },
         cargo: CargoConfig {
             enabled: true,
