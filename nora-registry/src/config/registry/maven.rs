@@ -19,6 +19,10 @@ pub struct MavenConfig {
     /// Prevent overwriting released (non-SNAPSHOT) artifacts
     #[serde(default = "super::super::default_true")]
     pub immutable_releases: bool,
+    /// Staleness window (seconds) for mutable metadata (maven-metadata.xml, SNAPSHOT); a
+    /// non-positive value revalidates every pull. Release artifacts are always immutable.
+    #[serde(default = "super::super::default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 /// Maven upstream proxy configuration
@@ -63,6 +67,7 @@ impl Default for MavenConfig {
             proxy_timeout: 30,
             checksum_verify: true,
             immutable_releases: true,
+            metadata_ttl: 300,
         }
     }
 }
@@ -97,6 +102,9 @@ impl MavenConfig {
         }
         if let Ok(val) = env::var("NORA_MAVEN_IMMUTABLE_RELEASES") {
             self.immutable_releases = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_MAVEN_METADATA_TTL") {
+            super::super::parse_env_warn("NORA_MAVEN_METADATA_TTL", &val, &mut self.metadata_ttl);
         }
     }
 }

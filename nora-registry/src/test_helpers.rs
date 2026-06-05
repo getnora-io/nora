@@ -99,6 +99,7 @@ fn build_context(
             proxy_timeout: 5,
             checksum_verify: true,
             immutable_releases: true,
+            metadata_ttl: 300,
         },
         npm: NpmConfig {
             enabled: true,

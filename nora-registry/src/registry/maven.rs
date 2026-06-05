@@ -100,6 +100,21 @@ fn is_snapshot(version: &str) -> bool {
     version.ends_with("-SNAPSHOT")
 }
 
+/// Whether a Maven path points at a MUTABLE resource that must be revalidated when proxied:
+/// `maven-metadata.xml` (and its checksums) is rewritten as versions are deployed, and SNAPSHOT
+/// version files are republished in place. Release artifacts are immutable.
+fn is_mutable_maven_path(path: &str) -> bool {
+    if ends_with_ci(path, "maven-metadata.xml")
+        || ends_with_ci(path, "maven-metadata.xml.sha1")
+        || ends_with_ci(path, "maven-metadata.xml.md5")
+        || ends_with_ci(path, "maven-metadata.xml.sha256")
+        || ends_with_ci(path, "maven-metadata.xml.sha512")
+    {
+        return true;
+    }
+    matches!(classify_path(path), MavenPathKind::VersionFile(c) if is_snapshot(&c.version))
+}
+
 // ============================================================================
 // Download
 // ============================================================================
@@ -155,32 +170,54 @@ async fn download(
         }
     }
 
-    if let Ok(data) = state.storage.get(&key).await {
-        // Curation integrity verification (issue #189)
-        if let Some((ref maven_name, ref maven_version)) = curation_coords {
-            if let Some(response) = crate::curation::verify_integrity(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Maven,
-                maven_name,
-                Some(maven_version),
-                &data,
-            ) {
-                return response;
-            }
-        }
+    // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
+    let cached = state.storage.get(&key).await.ok();
 
-        state.metrics.record_download("maven");
-        state.metrics.record_cache_hit("maven");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            artifact_name,
-            "maven",
-            "CACHE",
-        ));
-        state
-            .audit
-            .log(AuditEntry::new("cache_hit", "api", "", "maven", ""));
-        return with_content_type(&path, data).into_response();
+    // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
+    // proxied mutable path must be revalidated against upstream unless within a positive
+    // metadata_ttl window — otherwise newly deployed versions / SNAPSHOT updates never appear.
+    // Release artifacts are immutable and served from cache; a hosted artifact is authoritative.
+    let cache_fresh = match &cached {
+        None => false,
+        Some(_) if !is_mutable_maven_path(&path) => true,
+        Some(_) => {
+            let modified = state.storage.stat(&key).await.map(|m| m.modified);
+            crate::cache_ttl::mutable_ref_fresh(
+                !state.config.maven.proxies.is_empty(),
+                state.config.maven.metadata_ttl,
+                modified,
+            )
+        }
+    };
+
+    if let Some(ref data) = cached {
+        if cache_fresh {
+            // Curation integrity verification (issue #189)
+            if let Some((ref maven_name, ref maven_version)) = curation_coords {
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Maven,
+                    maven_name,
+                    Some(maven_version),
+                    data,
+                ) {
+                    return response;
+                }
+            }
+
+            state.metrics.record_download("maven");
+            state.metrics.record_cache_hit("maven");
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                artifact_name.clone(),
+                "maven",
+                "CACHE",
+            ));
+            state
+                .audit
+                .log(AuditEntry::new("cache_hit", "api", "", "maven", ""));
+            return with_content_type(&path, data.clone()).into_response();
+        }
     }
 
     for proxy in &state.config.maven.proxies {
@@ -219,6 +256,17 @@ async fn download(
                 continue;
             }
         }
+    }
+
+    // All proxies failed — serve the stale cached artifact if we have one (graceful).
+    if let Some(ref data) = cached {
+        tracing::warn!(registry = "maven", path = %path, "Maven upstream failed, serving stale cached artifact");
+        let mut response = with_content_type(&path, data.clone()).into_response();
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-nora-stale"),
+            axum::http::header::HeaderValue::from_static("true"),
+        );
+        return response;
     }
 
     if !state.config.maven.proxies.is_empty() {
@@ -651,6 +699,28 @@ mod tests {
         let body = Bytes::from("test-jar-content");
         let (_, _, data) = with_content_type("test.jar", body.clone());
         assert_eq!(data, body);
+    }
+
+    #[test]
+    fn test_is_mutable_maven_path() {
+        // maven-metadata.xml and its checksums are mutable (rewritten as versions deploy).
+        assert!(is_mutable_maven_path(
+            "com/example/mylib/maven-metadata.xml"
+        ));
+        assert!(is_mutable_maven_path(
+            "com/example/mylib/maven-metadata.xml.sha1"
+        ));
+        // SNAPSHOT version files are republished in place → mutable.
+        assert!(is_mutable_maven_path(
+            "com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-SNAPSHOT.jar"
+        ));
+        // Released artifacts are immutable.
+        assert!(!is_mutable_maven_path(
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar"
+        ));
+        assert!(!is_mutable_maven_path(
+            "com/example/mylib/1.0.0/mylib-1.0.0.pom"
+        ));
     }
 
     // ── Path classification ─────────────────────────────────────────────
