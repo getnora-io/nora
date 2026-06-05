@@ -15,6 +15,8 @@ pub struct CargoConfig {
     pub proxy_auth: Option<ProtectedString>,
     #[serde(default = "super::super::default_timeout")]
     pub proxy_timeout: u64,
+    #[serde(default = "super::super::default_metadata_ttl")]
+    pub metadata_ttl: i64,
 }
 
 fn default_cargo_proxy() -> Option<String> {
@@ -28,6 +30,7 @@ impl Default for CargoConfig {
             proxy: default_cargo_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
+            metadata_ttl: 300,
         }
     }
 }
@@ -49,6 +52,9 @@ impl CargoConfig {
         }
         if let Ok(val) = env::var("NORA_CARGO_PROXY_TIMEOUT") {
             super::super::parse_env_warn("NORA_CARGO_PROXY_TIMEOUT", &val, &mut self.proxy_timeout);
+        }
+        if let Ok(val) = env::var("NORA_CARGO_METADATA_TTL") {
+            super::super::parse_env_warn("NORA_CARGO_METADATA_TTL", &val, &mut self.metadata_ttl);
         }
     }
 }

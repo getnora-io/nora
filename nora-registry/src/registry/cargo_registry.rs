@@ -105,24 +105,45 @@ async fn sparse_index(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Try local index first
     let index_key = format!("cargo/index/{}/{}", expected_prefix, crate_name);
-    if let Ok(data) = state.storage.get(&index_key).await {
-        state.metrics.record_download("cargo");
-        state.metrics.record_cache_hit("cargo");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            crate_name.to_string(),
-            "cargo",
-            "CACHE",
-        ));
-        return sparse_index_conditional(data.to_vec(), &headers);
+
+    // Read the cached index eagerly — kept for the freshness check and the stale-on-error fallback.
+    let cached = state.storage.get(&index_key).await.ok();
+
+    // The sparse index is MUTABLE (new versions append and `yanked` flips at any time), so a
+    // proxied index must be revalidated against upstream before it is served — otherwise newly
+    // published versions / yanks never appear. A hosted index (no upstream) is locally
+    // authoritative, and a positive `metadata_ttl` re-introduces a bounded staleness window.
+    if let Some(ref data) = cached {
+        let modified = state.storage.stat(&index_key).await.map(|m| m.modified);
+        if crate::cache_ttl::mutable_ref_fresh(
+            state.config.cargo.proxy.is_some(),
+            state.config.cargo.metadata_ttl,
+            modified,
+        ) {
+            state.metrics.record_download("cargo");
+            state.metrics.record_cache_hit("cargo");
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                crate_name.to_string(),
+                "cargo",
+                "CACHE",
+            ));
+            return sparse_index_conditional(data.to_vec(), &headers);
+        }
     }
 
-    // Try upstream sparse index (sparse+https://index.crates.io/)
+    // Revalidate / fetch from upstream (no cache, or the cached index is stale).
     let proxy_url = match &state.config.cargo.proxy {
         Some(url) => url.clone(),
-        None => return StatusCode::NOT_FOUND.into_response(),
+        None => {
+            // Hosted (no upstream): a cached index is locally authoritative.
+            if let Some(ref data) = cached {
+                state.metrics.record_cache_hit("cargo");
+                return sparse_index_conditional(data.to_vec(), &headers);
+            }
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
 
     // crates.io sparse index lives at index.crates.io
@@ -166,15 +187,32 @@ async fn sparse_index(
 
             sparse_index_conditional(data, &headers)
         }
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(crate::registry::ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::debug!(
-                crate_name = crate_name,
-                error = ?e,
-                "Cargo sparse index upstream error"
-            );
-            StatusCode::NOT_FOUND.into_response()
+            // Upstream unreachable — serve the stale cached index if we have one (graceful).
+            if let Some(ref data) = cached {
+                tracing::warn!(
+                    crate_name = crate_name,
+                    "Cargo upstream failed, serving stale cached index"
+                );
+                let mut response = sparse_index_conditional(data.to_vec(), &headers);
+                response.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-nora-stale"),
+                    axum::http::header::HeaderValue::from_static("true"),
+                );
+                return response;
+            }
+            match e {
+                ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
+                ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
+                _ => {
+                    tracing::debug!(
+                        crate_name = crate_name,
+                        error = ?e,
+                        "Cargo sparse index upstream error"
+                    );
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }
         }
     }
 }

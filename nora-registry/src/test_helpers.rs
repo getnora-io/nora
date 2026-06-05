@@ -128,6 +128,7 @@ fn build_context(
             proxy: None,
             proxy_auth: None,
             proxy_timeout: 5,
+            metadata_ttl: 300,
         },
         docker: DockerConfig {
             enabled: true,

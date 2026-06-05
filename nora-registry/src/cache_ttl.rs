@@ -33,6 +33,21 @@ pub fn is_within_ttl(modified_unix: u64, ttl_secs: i64) -> bool {
     }
 }
 
+/// Whether a cached MUTABLE proxy resource (a cargo sparse index, a docker tag, a version
+/// listing, …) may be served WITHOUT revalidating against upstream: only when there is no
+/// upstream to revalidate against (the resource is locally authoritative) or it is still within
+/// a POSITIVE `metadata_ttl` staleness window. A non-positive ttl revalidates every pull, so a
+/// newly published version or yank appears.
+pub fn mutable_ref_fresh(has_upstream: bool, metadata_ttl: i64, modified: Option<u64>) -> bool {
+    if !has_upstream {
+        return true;
+    }
+    metadata_ttl > 0
+        && modified
+            .map(|m| is_within_ttl(m, metadata_ttl))
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +92,22 @@ mod tests {
         assert!(!is_within_ttl(now - 300, 300));
         // One second less — still fresh
         assert!(is_within_ttl(now - 299, 300));
+    }
+
+    #[test]
+    fn mutable_ref_fresh_hosted_and_proxied() {
+        let now = now_secs();
+        // Hosted (no upstream to revalidate against) → always fresh, regardless of ttl.
+        assert!(mutable_ref_fresh(false, -1, Some(now)));
+        assert!(mutable_ref_fresh(false, 0, None));
+        // Proxied + non-positive ttl → revalidate every pull (not fresh) — the fix.
+        assert!(!mutable_ref_fresh(true, -1, Some(now)));
+        assert!(!mutable_ref_fresh(true, 0, Some(now)));
+        // Proxied + positive ttl within the window → fresh (bounded staleness).
+        assert!(mutable_ref_fresh(true, 300, Some(now - 10)));
+        // Proxied + positive ttl beyond the window → revalidate.
+        assert!(!mutable_ref_fresh(true, 300, Some(now - 600)));
+        // Proxied + unknown mtime → revalidate.
+        assert!(!mutable_ref_fresh(true, 300, None));
     }
 }
