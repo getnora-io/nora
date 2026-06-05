@@ -1652,6 +1652,28 @@ async fn try_fetch_and_cache(
     None
 }
 
+/// Whether a cached manifest may be served WITHOUT revalidating against upstream.
+///
+/// A **digest** reference is immutable (content-addressed) → always fresh. A **tag** on a
+/// **hosted** name (no upstream to revalidate against) is locally authoritative → fresh. A
+/// **tag** on a **proxied** name is mutable: it must be revalidated against upstream unless it
+/// is still within a POSITIVE `metadata_ttl` staleness window. The default (and any non-positive
+/// ttl) revalidates every pull, so a re-pushed upstream tag is reflected (#638).
+fn manifest_cache_fresh(
+    is_digest: bool,
+    has_upstream: bool,
+    metadata_ttl: i64,
+    modified: Option<u64>,
+) -> bool {
+    if is_digest || !has_upstream {
+        return true;
+    }
+    metadata_ttl > 0
+        && modified
+            .map(|m| crate::cache_ttl::is_within_ttl(m, metadata_ttl))
+            .unwrap_or(false)
+}
+
 async fn get_manifest(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1697,14 +1719,29 @@ async fn get_manifest(
     let key = manifest_key(ns.as_deref(), &name, &reference);
     let legacy_key = manifest_key(None, &name, &reference);
 
-    // Try local storage first, with TTL-based revalidation (namespaced key, then legacy fallback)
+    // Try local storage first (namespaced key, then legacy fallback).
     let cached = storage_get_with_fallback(&state.storage, &key, &legacy_key)
         .await
         .ok();
+    // Digest references are immutable (content-addressed) → the cache is authoritative forever.
+    // Tag references are MUTABLE: a tag can be re-pushed to point at a different manifest, so a
+    // proxied tag must be revalidated against upstream before it is served — otherwise a
+    // re-pushed upstream tag is never reflected (#638). `metadata_ttl` is an optional staleness
+    // window for tags: only a POSITIVE value serves a tag from cache without revalidating (within
+    // the window); otherwise the latest is fetched. A tag with no upstream (hosted) is
+    // authoritative and served from cache; when upstream is unreachable the stale-while-error
+    // path below still serves the cached manifest.
+    let is_digest = reference.starts_with("sha256:");
     let cache_fresh = if cached.is_some() {
-        let meta = storage_stat_with_fallback(&state.storage, &key, &legacy_key).await;
-        meta.map(|m| crate::cache_ttl::is_within_ttl(m.modified, state.config.docker.metadata_ttl))
-            .unwrap_or(false)
+        let modified = storage_stat_with_fallback(&state.storage, &key, &legacy_key)
+            .await
+            .map(|m| m.modified);
+        manifest_cache_fresh(
+            is_digest,
+            !upstreams_to_try.is_empty(),
+            state.config.docker.metadata_ttl,
+            modified,
+        )
     } else {
         false
     };
@@ -4004,6 +4041,39 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_manifest_cache_fresh_tag_vs_digest() {
+        use super::manifest_cache_fresh;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Digest references are immutable → always fresh, regardless of upstream/ttl.
+        assert!(manifest_cache_fresh(true, true, -1, Some(now)));
+        assert!(manifest_cache_fresh(true, true, 0, None));
+
+        // Hosted tag (no upstream to revalidate against) is authoritative → fresh.
+        assert!(manifest_cache_fresh(false, false, -1, Some(now)));
+
+        // Proxied tag with the default ttl (-1) must REVALIDATE (#638) — not fresh.
+        assert!(!manifest_cache_fresh(false, true, -1, Some(now)));
+        // ttl=0 also revalidates every pull.
+        assert!(!manifest_cache_fresh(false, true, 0, Some(now)));
+
+        // Proxied tag within a POSITIVE ttl window → may serve from cache.
+        assert!(manifest_cache_fresh(false, true, 3600, Some(now)));
+        // Proxied tag beyond the window → revalidate.
+        assert!(!manifest_cache_fresh(
+            false,
+            true,
+            3600,
+            Some(now.saturating_sub(7200))
+        ));
+        // Proxied tag with unknown mtime → revalidate.
+        assert!(!manifest_cache_fresh(false, true, 3600, None));
+    }
+
+    #[test]
     fn test_canonicalize_multi_upstream() {
         let upstreams = vec![
             crate::config::DockerUpstream {
@@ -4179,6 +4249,71 @@ mod integration_tests {
             .map(|rd| rd.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert_eq!(leftover, 0, "temp files must be cleaned up after rejection");
+    }
+
+    /// #638 regression: a proxied tag whose cached manifest is outdated must be revalidated
+    /// against upstream, not served stale. The cache is pre-seeded with the OLD manifest
+    /// (deterministic — manifest caching on the proxy path is spawned async, so a back-to-back
+    /// pull would race the write). RED on the pre-fix code (a cached tag was served forever
+    /// because the metadata_ttl default is -1), GREEN after proxied tags are revalidated.
+    #[tokio::test]
+    async fn test_docker_proxy_tag_revalidates_on_upstream_change() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+        let manifest_old =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        let manifest_new =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:bbbb"},"layers":[{"digest":"sha256:cccc"}]}"#.to_vec();
+
+        // Upstream now serves the NEW manifest for the tag.
+        Mock::given(method("GET"))
+            .and(path("/v2/library/test/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", ct)
+                    .set_body_bytes(manifest_new.clone()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream.uri(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        // Pre-seed the cache with the OLD manifest (what NORA fetched earlier).
+        let c = super::canonicalize("library/test", &ctx.state.config.docker);
+        let key = super::manifest_key(c.namespace.as_deref(), &c.name, "latest");
+        ctx.state
+            .storage
+            .put(&key, &manifest_old)
+            .await
+            .expect("seed cache");
+
+        // Pull the tag: the cached manifest is outdated, so a proxied (mutable) tag must be
+        // revalidated and return the upstream NEW manifest — not the stale cached OLD one (#638).
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/test/manifests/latest",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(resp).await.as_ref(),
+            manifest_new.as_slice(),
+            "a proxied tag with an outdated cached manifest must revalidate and return the upstream version (#638)"
+        );
     }
 
     /// Positive control for the integrity check: when the upstream bytes hash to
