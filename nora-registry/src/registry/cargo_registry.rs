@@ -568,33 +568,36 @@ async fn publish(
 
     let entry_line = serde_json::to_string(&index_entry).unwrap_or_default();
 
-    // Write index FIRST — if it fails, no orphaned .crate file
-    // If .crate write fails later, re-publish is possible (immutability checks .crate, not index)
-    let index_key = index_lock_key.clone();
-
-    let mut index_content = state
-        .storage
-        .get(&index_key)
-        .await
-        .map(|d| d.to_vec())
-        .unwrap_or_default();
-
-    // Ensure newline separator
-    if !index_content.is_empty() && !index_content.ends_with(b"\n") {
-        index_content.push(b'\n');
-    }
-    index_content.extend_from_slice(entry_line.as_bytes());
-    index_content.push(b'\n');
-
-    // Store .crate tarball FIRST — if this fails, index remains unchanged
+    // Store the .crate tarball FIRST (immutable, per-version). If the index write fails after,
+    // re-publish is possible (immutability checks the .crate, not the index).
     if state.storage.put(&crate_key, crate_data).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Update sparse index SECOND — only after tarball is safely persisted
-    if state.storage.put(&index_key, &index_content).await.is_err() {
-        // Tarball written but index failed — remove tarball to avoid orphan
+    // Migrate an old single-file sparse index to per-version entries BEFORE writing the new one,
+    // so the regenerate below lists both the migrated and the new versions (no loss).
+    migrate_cargo_index(&state, &prefix, &name).await;
+
+    // Write this version's index line as its OWN immutable key. Concurrent publishes of DIFFERENT
+    // versions write distinct keys, so none is lost — the #39 fix (vs the old read-modify-write of
+    // the shared index file under a process-local lock).
+    let entry_key = format!("cargo/index-entries/{}/{}/{}.json", prefix, name, vers);
+    if state
+        .storage
+        .put(&entry_key, entry_line.as_bytes())
+        .await
+        .is_err()
+    {
         let _ = state.storage.delete(&crate_key).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Regenerate the sparse index by listing the per-version entry keys (multi-replica-safe).
+    if regenerate_cargo_index(&state, &prefix, &name)
+        .await
+        .is_err()
+    {
+        tracing::error!(crate_name = %name, "cargo publish: failed to regenerate sparse index");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -634,6 +637,62 @@ async fn publish(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Regenerate the cargo sparse index (`cargo/index/{prefix}/{crate}`) by LISTING the immutable
+/// per-version entry keys and concatenating their lines. Multi-replica-safe: concurrent publishes
+/// write distinct entry keys, so no version line is lost (vs the old read-modify-write of the
+/// shared index file). Mirrors maven scan-regenerate.
+async fn regenerate_cargo_index(state: &AppState, prefix: &str, name: &str) -> Result<(), ()> {
+    let entries_prefix = format!("cargo/index-entries/{}/{}/", prefix, name);
+    let mut keys = state
+        .storage
+        .list(&entries_prefix)
+        .await
+        .unwrap_or_default();
+    keys.sort(); // deterministic order (cargo accepts any line order)
+    let mut index: Vec<u8> = Vec::new();
+    for key in &keys {
+        if let Ok(line) = state.storage.get(key).await {
+            index.extend_from_slice(&line);
+            if !line.ends_with(b"\n") {
+                index.push(b'\n');
+            }
+        }
+    }
+    let index_key = format!("cargo/index/{}/{}", prefix, name);
+    state.storage.put(&index_key, &index).await.map_err(|_| ())
+}
+
+/// Seed per-version entry keys from an old single-file sparse index (one JSON line per version, no
+/// per-version keys). Idempotent; a no-op once the crate has per-version entries. Runs BEFORE the
+/// new version is written.
+async fn migrate_cargo_index(state: &AppState, prefix: &str, name: &str) {
+    let entries_prefix = format!("cargo/index-entries/{}/{}/", prefix, name);
+    if !state
+        .storage
+        .list(&entries_prefix)
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return; // already migrated
+    }
+    let index_key = format!("cargo/index/{}/{}", prefix, name);
+    let Ok(data) = state.storage.get(&index_key).await else {
+        return;
+    };
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let Some(vers) = entry.get("vers").and_then(|v| v.as_str()) {
+                let key = format!("cargo/index-entries/{}/{}/{}.json", prefix, name, vers);
+                let _ = state.storage.put(&key, line).await;
+            }
+        }
+    }
+}
 
 /// Compute sparse index prefix for a crate name (RFC 2789).
 fn crate_index_prefix(name: &str) -> String {
@@ -1267,6 +1326,68 @@ mod integration_tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("0.1.0"));
         assert!(lines[1].contains("0.2.0"));
+
+        // Each version is also its own immutable entry key (the #39 scan-regenerate source).
+        assert!(ctx
+            .state
+            .storage
+            .get("cargo/index-entries/mu/lt/multi-ver/0.1.0.json")
+            .await
+            .is_ok());
+        assert!(ctx
+            .state
+            .storage
+            .get("cargo/index-entries/mu/lt/multi-ver/0.2.0.json")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_migrates_single_file_index() {
+        // An old single-file sparse index (one line per version, no per-version entry keys) is
+        // lazily migrated on the next publish, preserving the old version (#39).
+        let ctx = create_test_context();
+        let old_line = serde_json::json!({
+            "name": "legacy-crate", "vers": "1.0.0", "deps": [], "cksum": "a",
+            "features": {}, "yanked": false
+        })
+        .to_string();
+        ctx.state
+            .storage
+            .put(
+                "cargo/index/le/ga/legacy-crate",
+                format!("{}\n", old_line).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let m = serde_json::json!({"name": "legacy-crate", "vers": "2.0.0", "deps": [], "features": {}});
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            Body::from(build_publish_payload(&m, b"crate2")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // old version migrated to its own per-version entry key
+        assert!(
+            ctx.state
+                .storage
+                .get("cargo/index-entries/le/ga/legacy-crate/1.0.0.json")
+                .await
+                .is_ok(),
+            "old single-file version not migrated to a per-version key"
+        );
+        // the regenerated index has BOTH the migrated old and the new version
+        let index = ctx
+            .state
+            .storage
+            .get("cargo/index/le/ga/legacy-crate")
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&index);
+        assert!(s.contains("\"vers\":\"1.0.0\""), "migrated v1 lost");
+        assert!(s.contains("\"vers\":\"2.0.0\""), "new v2 lost");
     }
 
     #[tokio::test]

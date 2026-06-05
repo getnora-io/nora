@@ -504,9 +504,13 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
     let mut index_entries: HashSet<String> = HashSet::new(); // "name"
     let mut crate_keys: Vec<String> = Vec::new();
     let mut index_keys: Vec<String> = Vec::new();
+    let mut index_entry_keys: Vec<String> = Vec::new(); // per-version cargo/index-entries/ (#39)
 
     for key in &keys {
-        if key.starts_with("cargo/index/") {
+        if key.starts_with("cargo/index-entries/") {
+            // cargo/index-entries/XX/XX/name/version.json — the scan-regenerate source of truth
+            index_entry_keys.push(key.clone());
+        } else if key.starts_with("cargo/index/") {
             // cargo/index/XX/XX/name
             if let Some(name) = key
                 .strip_prefix("cargo/index/")
@@ -541,6 +545,18 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
             if !crate_files.contains(name) {
                 info!("Cargo orphan index: {} (no .crate files)", key);
                 orphans.push(key.clone());
+                // Also remove the per-version entry keys for this fully-deleted crate (#39
+                // layout), else a later publish's regenerate would resurrect index lines that
+                // point at missing .crate files.
+                let entries_prefix = format!(
+                    "{}/",
+                    key.replacen("cargo/index/", "cargo/index-entries/", 1)
+                );
+                for ek in &index_entry_keys {
+                    if ek.starts_with(&entries_prefix) {
+                        orphans.push(ek.clone());
+                    }
+                }
             }
         }
     }
