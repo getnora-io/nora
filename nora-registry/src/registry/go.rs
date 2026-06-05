@@ -100,9 +100,11 @@ async fn handle(
     let storage_key = format!("go/{}", path);
     let content_type = content_type_for(&file);
 
-    // Mutable endpoints: @v/list and @latest can be refreshed from upstream
-    let is_mutable = file == "@v/list" || file == "@latest";
-    // Immutable: .info, .mod, .zip — once cached, never overwrite
+    // Mutable endpoints: @v/list, @latest, and a non-canonical `@v/<query>.info` (a branch,
+    // revision, or partial version like `v1`/`v1.2`) all resolve to a moving target and may be
+    // refreshed from upstream. A canonical-version .info/.mod/.zip names an immutable snapshot.
+    let is_mutable = file == "@v/list" || file == "@latest" || is_noncanonical_info_query(&file);
+    // Immutable: once cached, never overwrite.
     let is_immutable = !is_mutable;
 
     // 1. Try local cache.
@@ -398,6 +400,58 @@ fn format_artifact(module: &str, file: &str) -> String {
     }
 }
 
+/// Whether a Go version string is a canonical semantic version — one that names an immutable
+/// snapshot.
+///
+/// Canonical = `vMAJOR.MINOR.PATCH` (all three present, each a digit run with no leading zeros)
+/// with an optional `-prerelease` and/or `+build` suffix. This admits pseudo-versions
+/// (`v0.0.0-20210101000000-abcdef123456`) and `+incompatible`. It rejects branch names
+/// (`master`), revisions (`abcdef`), partial queries (`v1`, `v1.2`), and operators (`latest`),
+/// all of which resolve to a moving target. When in doubt this returns `false` (treat as mutable
+/// → revalidate), which is the fail-safe for freshness.
+fn is_canonical_go_version(v: &str) -> bool {
+    let Some(rest) = v.strip_prefix('v') else {
+        return false;
+    };
+    // Peel off the optional `+build` then the optional `-prerelease`; the remainder is the core.
+    let core_pre = rest.split('+').next().unwrap_or(rest);
+    let core = core_pre.split('-').next().unwrap_or(core_pre);
+    // The suffix (everything after the core) must be non-empty if a separator was present.
+    if core.len() != core_pre.len() && core_pre[core.len()..].len() < 2 {
+        return false; // a bare trailing `-` or empty prerelease
+    }
+    if core_pre.len() != rest.len() && rest[core_pre.len()..].len() < 2 {
+        return false; // a bare trailing `+` or empty build
+    }
+    // Core must be exactly MAJOR.MINOR.PATCH, each a digit run with no leading zeros.
+    let mut segments = core.split('.');
+    let (Some(major), Some(minor), Some(patch), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    [major, minor, patch].iter().all(|s| is_numeric_id(s))
+}
+
+/// A numeric identifier: a non-empty run of ASCII digits with no leading zero (except `"0"`).
+fn is_numeric_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s.len() == 1 || s.as_bytes()[0] != b'0')
+}
+
+/// Whether `file` is a `@v/<version>.info` request whose version is NON-canonical — a branch,
+/// revision, or partial query that resolves to a moving target and so must be revalidated, unlike
+/// a canonical-version `.info` (or any `.mod`/`.zip`) which names an immutable snapshot.
+fn is_noncanonical_info_query(file: &str) -> bool {
+    file.strip_prefix("@v/")
+        .and_then(|rest| rest.strip_suffix(".info"))
+        .is_some_and(|ver| !is_canonical_go_version(ver))
+}
+
 /// Whether a cached Go proxy response may be served without revalidating against upstream.
 ///
 /// Immutable per-version files (`.info`/`.mod`/`.zip`) are content-addressed by an exact version
@@ -446,6 +500,7 @@ fn with_content_type(data: Vec<u8>, content_type: &'static str, is_mutable: bool
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── Encoding/decoding ───────────────────────────────────────────────
 
@@ -650,6 +705,91 @@ mod tests {
         assert!(go_cache_fresh(false, true, 300, Some(now - 10)));
         // Proxied listing beyond the window → revalidate.
         assert!(!go_cache_fresh(false, true, 300, Some(now - 600)));
+    }
+
+    // ── Canonical version / non-canonical .info mutability ─────────────────
+
+    #[test]
+    fn test_is_canonical_go_version() {
+        // Canonical: full vMAJOR.MINOR.PATCH, pseudo-versions, +incompatible, prerelease.
+        for v in [
+            "v1.0.0",
+            "v0.0.0",
+            "v10.20.30",
+            "v1.2.3-rc.1",
+            "v2.0.0+incompatible",
+            "v0.0.0-20210101000000-abcdef123456",
+            "v1.2.4-0.20210101000000-abcdef123456",
+            "v1.0.0-rc.1+build.5",
+        ] {
+            assert!(is_canonical_go_version(v), "expected canonical: {v}");
+        }
+        // Non-canonical: partial queries, branches, revisions, operators, malformed.
+        for v in [
+            "v1",
+            "v1.2",
+            "master",
+            "main",
+            "latest",
+            "abcdef123456",
+            "v2",
+            "1.0.0",
+            "v01.2.3",
+            "v1.0.0-",
+            "v1.0.0+",
+            "v1.2.3.4",
+            "",
+        ] {
+            assert!(!is_canonical_go_version(v), "expected non-canonical: {v}");
+        }
+    }
+
+    #[test]
+    fn test_is_noncanonical_info_query() {
+        // Non-canonical .info → mutable (the fix).
+        assert!(is_noncanonical_info_query("@v/v1.info"));
+        assert!(is_noncanonical_info_query("@v/v1.2.info"));
+        assert!(is_noncanonical_info_query("@v/master.info"));
+        assert!(is_noncanonical_info_query("@v/abcdef123456.info"));
+        // Canonical .info → not mutable (immutable snapshot).
+        assert!(!is_noncanonical_info_query("@v/v1.2.3.info"));
+        assert!(!is_noncanonical_info_query(
+            "@v/v0.0.0-20210101000000-abcdef123456.info"
+        ));
+        // Non-.info files are never matched here (handled by the immutable path).
+        assert!(!is_noncanonical_info_query("@v/v1.2.3.mod"));
+        assert!(!is_noncanonical_info_query("@v/master.zip"));
+        assert!(!is_noncanonical_info_query("@v/list"));
+        assert!(!is_noncanonical_info_query("@latest"));
+    }
+
+    proptest! {
+        // Any fully-formed vMAJOR.MINOR.PATCH (no leading zeros) is canonical → immutable.
+        #[test]
+        fn canonical_triples_are_immutable(
+            maj in 0u32..100000, min in 0u32..100000, pat in 0u32..100000
+        ) {
+            let v = format!("v{maj}.{min}.{pat}");
+            let info = format!("@v/{}.info", v);
+            prop_assert!(is_canonical_go_version(&v));
+            prop_assert!(!is_noncanonical_info_query(&info));
+        }
+
+        // A two-segment query (vMAJOR.MINOR) is never canonical → always revalidated.
+        #[test]
+        fn partial_queries_are_mutable(maj in 0u32..100000, min in 0u32..100000) {
+            let v = format!("v{maj}.{min}");
+            let info = format!("@v/{}.info", v);
+            prop_assert!(!is_canonical_go_version(&v));
+            prop_assert!(is_noncanonical_info_query(&info));
+        }
+
+        // Branch/revision-like names (the charset has no `.`, so no MAJOR.MINOR.PATCH core can
+        // form) are never canonical → always revalidated.
+        #[test]
+        fn branch_names_are_mutable(name in "[a-zA-Z][a-zA-Z0-9_/-]{0,30}") {
+            prop_assert!(!is_canonical_go_version(&name));
+        }
     }
 
     // ── Cache-Control headers ─────────────────────────────────────────────
