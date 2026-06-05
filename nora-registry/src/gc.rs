@@ -703,6 +703,12 @@ async fn clean_npm_metadata(
                 time_obj.remove(phantom.as_str());
             }
         }
+        // Also delete the per-version index key (the scan-regenerate source of truth, #39) so a
+        // later publish's regenerate does not re-add the phantom from disk.
+        for phantom in &phantoms {
+            let version_key = format!("npm/{}/versions/{}.json", package_name, phantom);
+            let _ = storage.delete(&version_key).await;
+        }
         // Rewrite metadata
         if let Ok(new_data) = serde_json::to_vec(&json) {
             if let Err(e) = storage.put(meta_key, &new_data).await {
