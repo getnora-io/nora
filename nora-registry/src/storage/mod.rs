@@ -112,6 +112,34 @@ pub trait StorageBackend: Send + Sync {
     /// Local backend: `tokio::fs::File::open` + metadata.
     /// S3 backend: `object_store::get` → byte-stream wrapped in `StreamReader`.
     async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
+
+    /// Stream the inclusive byte range `[start, end]` of an object, returning the object's
+    /// total size and a reader over exactly those bytes. The default reads from the start and
+    /// discards the prefix; backends override with an efficient seek / ranged GET.
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        use tokio::io::AsyncReadExt;
+        let (size, mut reader) = self.get_reader(key).await?;
+        let mut to_skip = start;
+        let mut buf = [0u8; 64 * 1024];
+        while to_skip > 0 {
+            let want = to_skip.min(buf.len() as u64) as usize;
+            let n = reader
+                .read(&mut buf[..want])
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            to_skip -= n as u64;
+        }
+        let len = end.saturating_sub(start) + 1;
+        Ok((size, Box::pin(reader.take(len))))
+    }
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
@@ -504,6 +532,30 @@ impl Storage {
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["get_reader", "error"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream the inclusive byte range `[start, end]` of an object (see the trait method).
+    pub async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        validate_storage_key(key)?;
+        match self.inner.get_range(key, start, end).await {
+            Ok(r) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get_range", "ok"])
+                    .inc();
+                Ok(r)
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get_range", "error"])
                     .inc();
                 Err(e)
             }

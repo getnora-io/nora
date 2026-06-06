@@ -256,6 +256,34 @@ impl StorageBackend for S3Storage {
         let reader = tokio_util::io::StreamReader::new(stream);
         Ok((size as u64, Box::pin(reader)))
     }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        let make_opts = || object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(start..(end + 1))),
+            ..Default::default()
+        };
+        let path = Path::from(encode_s3_key(key));
+        let result = match self.store.get_opts(&path, make_opts()).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                self.store
+                    .get_opts(&legacy_path, make_opts())
+                    .await
+                    .map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
+        let size = result.meta.size;
+        let stream = result.into_stream().map_err(std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(stream);
+        Ok((size as u64, Box::pin(reader)))
+    }
 }
 
 #[cfg(test)]

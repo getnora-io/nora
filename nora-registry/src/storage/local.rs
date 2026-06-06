@@ -275,6 +275,35 @@ impl StorageBackend for LocalStorage {
             .map_err(|e| StorageError::Io(e.to_string()))?;
         Ok((meta.len(), Box::pin(file)))
     }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.key_to_path(key);
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e.to_string())
+            }
+        })?;
+        let size = file
+            .metadata()
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?
+            .len();
+        if start > 0 {
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+        let len = end.saturating_sub(start) + 1;
+        Ok((size, Box::pin(file.take(len))))
+    }
 }
 
 #[cfg(test)]

@@ -236,6 +236,54 @@ async fn storage_get_reader_with_fallback(
     }
 }
 
+/// Parse a single `Range: bytes=start-end` header against a known object size, returning the
+/// inclusive `(start, end)` clamped to the object, or `None` if it is absent, unparsable,
+/// multipart, or unsatisfiable (the caller then serves the full object). Suffix ranges
+/// (`bytes=-N`, the last N bytes) are supported.
+fn parse_byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
+    let spec = value.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = if s.is_empty() {
+        let n: u64 = e.trim().parse().ok()?;
+        if n == 0 || size == 0 {
+            return None;
+        }
+        (size.saturating_sub(n), size - 1)
+    } else {
+        let start: u64 = s.trim().parse().ok()?;
+        let end = if e.trim().is_empty() {
+            size.saturating_sub(1)
+        } else {
+            e.trim().parse::<u64>().ok()?.min(size.saturating_sub(1))
+        };
+        (start, end)
+    };
+    if size == 0 || start > end || start >= size {
+        return None;
+    }
+    Some((start, end))
+}
+
+async fn storage_get_range_with_fallback(
+    storage: &Storage,
+    ns_key: &str,
+    legacy_key: &str,
+    start: u64,
+    end: u64,
+) -> Result<
+    (
+        u64,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    ),
+    crate::storage::StorageError,
+> {
+    match storage.get_range(ns_key, start, end).await {
+        Ok(r) => Ok(r),
+        Err(_) if ns_key != legacy_key => storage.get_range(legacy_key, start, end).await,
+        Err(e) => Err(e),
+    }
+}
+
 /// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
 /// mismatch at EOF, fails the stream instead of letting a tampered blob complete
 /// cleanly. `get_reader` (#580) streams large docker blobs without buffering, so
@@ -936,6 +984,46 @@ async fn download_blob(
             return response;
         }
 
+        // Range request: serve the requested byte range (206 Partial Content). A ranged
+        // response is partial, so the streaming SHA-256 verify (full-GET only) does not
+        // apply — a ranged serve relies on the content-addressed storage key plus the
+        // client's own content-digest check, as Docker/Harbor do. An absent/invalid range
+        // falls through to the full 200 below.
+        if let Some((start, end)) = headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_byte_range(v, size))
+        {
+            drop(reader);
+            let ranged = match storage_get_range_with_fallback(
+                &state.storage,
+                &key,
+                &legacy_key,
+                start,
+                end,
+            )
+            .await
+            {
+                Ok((_, r)) => r,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            state.metrics.record_download("docker");
+            state.metrics.record_cache_hit("docker");
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_LENGTH, end - start + 1)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, size),
+                )
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .header("docker-content-digest", &digest)
+                .body(Body::from_stream(ReaderStream::new(ranged)))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+
         state.metrics.record_download("docker");
         state.metrics.record_cache_hit("docker");
         state.activity.push(ActivityEntry::new(
@@ -949,6 +1037,7 @@ async fn download_blob(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CONTENT_LENGTH, size)
+            .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .header("docker-content-digest", &digest)
             .body(Body::from_stream(stream))
@@ -3416,6 +3505,64 @@ mod integration_tests {
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = body_bytes(get_resp).await;
         assert_eq!(body.as_ref(), &blob_data[..]);
+    }
+
+    #[test]
+    fn test_parse_byte_range() {
+        use super::parse_byte_range;
+        assert_eq!(parse_byte_range("bytes=0-3", 10), Some((0, 3)));
+        assert_eq!(parse_byte_range("bytes=5-", 10), Some((5, 9))); // open-ended
+        assert_eq!(parse_byte_range("bytes=-4", 10), Some((6, 9))); // suffix (last 4)
+        assert_eq!(parse_byte_range("bytes=8-100", 10), Some((8, 9))); // clamp end to size
+        assert_eq!(parse_byte_range("bytes=10-12", 10), None); // start past end
+        assert_eq!(parse_byte_range("bytes=5-3", 10), None); // reversed
+        assert_eq!(parse_byte_range("nonsense", 10), None); // unparsable
+        assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
+    }
+
+    #[tokio::test]
+    async fn test_docker_blob_range_request() {
+        use tower::ServiceExt;
+        let ctx = create_test_context();
+        let blob = b"0123456789abcdef";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob)));
+
+        let post = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/rng/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        let loc = post
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let uuid = loc.rsplit('/').next().unwrap();
+        let put_url = format!("/v2/rng/blobs/uploads/{}?digest={}", uuid, digest);
+        send(&ctx.app, Method::PUT, &put_url, Body::from(&blob[..])).await;
+
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v2/rng/blobs/{}", digest))
+            .header(header::RANGE, "bytes=4-7")
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 4-7/{}", blob.len())
+        );
+        let body = body_bytes(resp).await;
+        assert_eq!(body.as_ref(), &blob[4..=7]);
     }
 
     #[tokio::test]
