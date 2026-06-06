@@ -1110,6 +1110,143 @@ mod tests {
         assert!(storage.get(key).await.is_ok());
     }
 
+    /// #610: a backend whose `stat` always returns `None`, to drive GC's
+    /// fail-closed "age unknown → keep and count" branch. `list("docker/")`
+    /// surfaces a single orphan blob; the rest of the surface is unused on this
+    /// code path, so the other methods are inert stubs.
+    struct StatNoneBackend {
+        orphan: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for StatNoneBackend {
+        async fn stat(&self, _key: &str) -> Option<crate::storage::FileMeta> {
+            None
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            Ok(if prefix == "docker/" {
+                vec![self.orphan.clone()]
+            } else {
+                Vec::new()
+            })
+        }
+        async fn put(&self, _key: &str, _data: &[u8]) -> crate::storage::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::storage::Result<axum::body::Bytes> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn delete(&self, _key: &str) -> crate::storage::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "stat-none-test"
+        }
+        async fn put_from_path(
+            &self,
+            _key: &str,
+            _src: &std::path::Path,
+        ) -> crate::storage::Result<()> {
+            Ok(())
+        }
+        async fn get_reader(
+            &self,
+            _key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+    }
+
+    /// #610 (hardening for #584): an orphan whose age cannot be determined
+    /// (`stat` returns `None`) is FAIL-CLOSED — kept (never reaped) and counted
+    /// in `stat_failures`, which feeds `nora_gc_stat_failures_total` so operators
+    /// can alert on GC being unable to reclaim space.
+    #[tokio::test]
+    async fn test_gc_stat_failure_keeps_orphan_and_counts() {
+        let before = GC_STAT_FAILURES.get();
+        let storage = Storage::from_backend(std::sync::Arc::new(StatNoneBackend {
+            orphan: format!("docker/lib/blobs/sha256:{}", "a".repeat(64)),
+        }));
+
+        // grace=0 would collect any normal orphan; the un-stattable one must
+        // still survive because its age is unknown.
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+
+        assert_eq!(result.orphaned, 1, "the blob is detected as an orphan");
+        assert_eq!(
+            result.deleted, 0,
+            "an orphan that cannot be stat'd must be kept (fail-closed)"
+        );
+        assert_eq!(
+            result.stat_failures, 1,
+            "the kept orphan is counted as a stat failure"
+        );
+        // The per-run count feeds the global counter. A strict `>` over the
+        // pre-run value stays robust against other tests touching the same
+        // monotonic metric (they only ever add).
+        assert!(
+            GC_STAT_FAILURES.get() > before,
+            "nora_gc_stat_failures_total must increment"
+        );
+    }
+
+    /// #610 (hardening for #584): the GC delete path and a concurrent publish to
+    /// the same key serialise through `publish_lock` — never a torn write, panic
+    /// or deadlock. This races `run_gc(grace=0)` (which reaps orphans under the
+    /// lock) against a writer re-putting the same keys under the SAME locks.
+    /// Non-deterministic by nature; it asserts only that every key ends in a
+    /// clean terminal state.
+    #[tokio::test]
+    async fn test_gc_concurrent_push_and_gc_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let locks = test_publish_locks();
+
+        let keys: Vec<String> = (0..16)
+            .map(|i| format!("docker/race/blobs/sha256:race{:04}", i))
+            .collect();
+        for k in &keys {
+            storage.put(k, b"orphan").await.unwrap();
+        }
+
+        let writer = {
+            let storage = storage.clone();
+            let locks = locks.clone();
+            let keys = keys.clone();
+            async move {
+                for k in &keys {
+                    let lock = crate::acquire_publish_lock(&locks, k);
+                    let _guard = lock.lock().await;
+                    let _ = storage.put(k, b"rewritten-by-concurrent-push").await;
+                }
+            }
+        };
+
+        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0), writer);
+
+        // Every key is either reaped by GC or present with exactly one of the two
+        // intended bodies — atomic writes guarantee no partial/torn content.
+        for k in &keys {
+            if let Ok(bytes) = storage.get(k).await {
+                assert!(
+                    bytes.as_ref() == b"orphan"
+                        || bytes.as_ref() == b"rewritten-by-concurrent-push",
+                    "key {k} has a torn body: {:?}",
+                    bytes
+                );
+            }
+        }
+    }
+
     /// #596: a `.meta` validator sidecar is reaped when its npm metadata body is
     /// gone (orphan), kept when the body is present, and — crucially — a Maven
     /// artifact ending in `.meta` is NOT treated as a sidecar (no false delete).
