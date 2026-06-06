@@ -1879,6 +1879,58 @@ fn serve_cached_manifest(
     manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
 
+/// Return the first blob / sub-manifest digest a manifest references that is NOT present
+/// in storage, or `None` when every referenced item exists. Per the OCI Distribution Spec
+/// a manifest pointing at content we do not have must be rejected (`MANIFEST_BLOB_UNKNOWN`)
+/// rather than stored as a broken image. Bodies we cannot parse return `None` — malformed
+/// manifests are out of scope here.
+async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Option<String> {
+    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+
+    // Image index / manifest list: referenced sub-manifests live under manifests/.
+    if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
+        for m in manifests {
+            if let Some(d) = m.get("digest").and_then(|v| v.as_str()) {
+                if storage
+                    .stat(&format!("docker/{}/manifests/{}.json", name, d))
+                    .await
+                    .is_none()
+                {
+                    return Some(d.to_string());
+                }
+            }
+        }
+        return None;
+    }
+
+    // Image manifest: the config descriptor and every layer are blobs.
+    let mut refs: Vec<&str> = Vec::new();
+    if let Some(d) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+    {
+        refs.push(d);
+    }
+    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+        for l in layers {
+            if let Some(d) = l.get("digest").and_then(|v| v.as_str()) {
+                refs.push(d);
+            }
+        }
+    }
+    for d in refs {
+        if storage
+            .stat(&format!("docker/{}/blobs/{}", name, d))
+            .await
+            .is_none()
+        {
+            return Some(d.to_string());
+        }
+    }
+    None
+}
+
 async fn put_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
@@ -1889,6 +1941,7 @@ async fn put_manifest(
         return r;
     }
     let name = c.name;
+    let ns = c.namespace;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1900,14 +1953,40 @@ async fn put_manifest(
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
 
+    // Reject a manifest that references content (config / layers / sub-manifests) we do
+    // not have — a broken image must not be pushable (OCI MANIFEST_BLOB_UNKNOWN).
+    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &name).await {
+        tracing::warn!(
+            name = %name,
+            reference = %reference,
+            missing = %missing,
+            "rejecting manifest push: references an absent blob/sub-manifest"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "errors": [{
+                    "code": "MANIFEST_BLOB_UNKNOWN",
+                    "message": "manifest references an unknown blob",
+                    "detail": { "digest": missing }
+                }]
+            })),
+        )
+            .into_response();
+    }
+
     // Local push → mark as immediately mature in quarantine store
     let (q_mode, q_secs) = resolve_quarantine(&state);
     if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         state.digest_store.record_trusted("docker", &digest, q_secs);
     }
 
-    // Store by tag/reference
+    // Store by tag/reference. Hold the SAME publish_lock key as delete_manifest so a
+    // concurrent push/push or push/delete of one tag cannot interleave (the tag + digest
+    // + metadata writes below stay consistent). Held until the end of the handler.
     let key = format!("docker/{}/manifests/{}.json", name, reference);
+    let manifest_lock = state.publish_lock(&manifest_key(ns.as_deref(), &name, &reference));
+    let _manifest_guard = manifest_lock.lock().await;
     if state.storage.put(&key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -3163,6 +3242,21 @@ mod integration_tests {
         assert!(json["repositories"].as_array().unwrap().is_empty());
     }
 
+    /// Seed the all-zero config blob a test manifest references, so the manifest PUT passes
+    /// the OCI blob-existence check (real clients push referenced blobs before the manifest).
+    async fn seed_zero_config(state: &crate::AppState, name: &str) {
+        let _ = state
+            .storage
+            .put(
+                &format!(
+                    "docker/{}/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    name
+                ),
+                b"x",
+            )
+            .await;
+    }
+
     #[tokio::test]
     async fn test_docker_put_get_manifest() {
         let ctx = create_test_context();
@@ -3178,6 +3272,7 @@ mod integration_tests {
         });
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
 
+        seed_zero_config(&ctx.state, "alpine").await;
         let put_resp = send(
             &ctx.app,
             Method::PUT,
@@ -3216,6 +3311,34 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_push_rejects_absent_blob() {
+        let ctx = create_test_context();
+        // A manifest referencing a config blob we never uploaded must be rejected
+        // (OCI MANIFEST_BLOB_UNKNOWN) rather than stored as a broken image.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            },
+            "layers": []
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/reject/manifests/latest",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+    }
+
+    #[tokio::test]
     async fn test_docker_list_tags() {
         let ctx = create_test_context();
         let manifest = serde_json::json!({
@@ -3228,6 +3351,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "alpine").await;
         send(
             &ctx.app,
             Method::PUT,
@@ -3258,6 +3382,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "alpine").await;
         let put_resp = send(
             &ctx.app,
             Method::PUT,
@@ -3469,6 +3594,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "library/alpine").await;
         let put_resp = send(
             &ctx.app,
             Method::PUT,
@@ -3692,6 +3818,7 @@ mod integration_tests {
             "layers": []
         });
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        seed_zero_config(&ctx.state, "verify").await;
         send(
             &ctx.app,
             Method::PUT,
@@ -3739,6 +3866,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "ctcheck").await;
         send(
             &ctx.app,
             Method::PUT,
@@ -3778,6 +3906,7 @@ mod integration_tests {
             },
             "layers": []
         });
+        seed_zero_config(&ctx.state, "clcheck").await;
         send(
             &ctx.app,
             Method::PUT,
