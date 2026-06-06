@@ -3698,6 +3698,25 @@ mod integration_tests {
         assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
     }
 
+    proptest::proptest! {
+        /// Property test (#3): fuzz the string LEXER of `parse_byte_range` — the
+        /// part Kani cannot symbolically execute. Over biased range-like strings
+        /// and any size it must never panic, and any `Some((s, e))` is
+        /// well-formed: `s <= e < size`. Pairs with the Kani proof of
+        /// `byte_range_core` (the arithmetic) for full-function coverage.
+        #[test]
+        fn parse_byte_range_lexer_invariant(
+            value in "bytes=-?[0-9]{0,9}-?[0-9]{0,9}",
+            size in proptest::prelude::any::<u64>(),
+        ) {
+            if let Some((s, e)) = super::parse_byte_range(&value, size) {
+                proptest::prop_assert!(s <= e, "inverted: {} > {}", s, e);
+                proptest::prop_assert!(e < size, "oob end: {} >= {}", e, size);
+                proptest::prop_assert!(s < size, "oob start: {} >= {}", s, size);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_docker_blob_range_request() {
         use tower::ServiceExt;
