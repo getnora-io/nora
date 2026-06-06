@@ -3696,6 +3696,10 @@ mod integration_tests {
         assert_eq!(parse_byte_range("bytes=5-3", 10), None); // reversed
         assert_eq!(parse_byte_range("nonsense", 10), None); // unparsable
         assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
+        // mutation-found gaps (cargo-mutants): exercise the single-byte range
+        // and the suffix form against an empty object.
+        assert_eq!(parse_byte_range("bytes=5-5", 10), Some((5, 5))); // single byte (kills `>`→`>=`)
+        assert_eq!(parse_byte_range("bytes=-5", 0), None); // suffix + empty (kills `||`→`&&`)
     }
 
     proptest::proptest! {
