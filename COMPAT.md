@@ -31,7 +31,7 @@ This document describes which parts of each registry protocol are implemented in
 - Max 2-level image path: `org/image:tag` works, `org/sub/path/image:tag` returns 404
 - Large monolithic blob PUT (>~500MB) may fail even with high body limit
 - No cross-repository blob mounting
-- Registry-mirror caching requires Docker's containerd image store. On hosts using the legacy `overlay2` graph driver, Docker's built-in registry client does not send the mirror's `?ns=` parameter or follow its Bearer-token challenge, so pulls silently fall back to the upstream and nothing is cached. Enable the containerd image store (`{"features": {"containerd-snapshotter": true}}` in `daemon.json`) to use NORA as a pull-through mirror (#578).
+- Registry-mirror caching depends on Docker's image store / distribution client, not the storage driver. Docker applies the wrong credentials to mirror endpoints — it sends the upstream registry's credentials to the mirror (and on the containerd path clobbers per-mirror `hosts.toml` credentials), so an authenticated mirror pull fails and Docker falls back to the upstream, skipping the cache. Both the legacy and containerd code paths are affected ([moby/moby#30880](https://github.com/moby/moby/issues/30880), [#42022](https://github.com/moby/moby/issues/42022); upstream fix in progress in [#52532](https://github.com/moby/moby/pull/52532)). An unauthenticated mirror avoids it. For pull-through caching of non-Docker-Hub registries, the containerd image store additionally tags mirror requests with the `?ns=` upstream namespace ([containerd hosts.md](https://github.com/containerd/containerd/blob/main/docs/hosts.md)). (#578)
 
 ## npm
 
