@@ -31,6 +31,7 @@ This document describes which parts of each registry protocol are implemented in
 - Max 2-level image path: `org/image:tag` works, `org/sub/path/image:tag` returns 404
 - Large monolithic blob PUT (>~500MB) may fail even with high body limit
 - No cross-repository blob mounting
+- Registry-mirror caching requires Docker's containerd image store. On hosts using the legacy `overlay2` graph driver, Docker's built-in registry client does not send the mirror's `?ns=` parameter or follow its Bearer-token challenge, so pulls silently fall back to the upstream and nothing is cached. Enable the containerd image store (`{"features": {"containerd-snapshotter": true}}` in `daemon.json`) to use NORA as a pull-through mirror (#578).
 
 ## npm
 
