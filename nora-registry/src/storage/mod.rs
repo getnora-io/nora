@@ -176,6 +176,18 @@ impl Storage {
         }
     }
 
+    /// Test-only: wrap an arbitrary backend so unit tests can inject behaviour
+    /// the real backends can't easily produce — e.g. a `stat`-failing backend
+    /// driving GC's fail-closed "age unknown → keep and count" branch (#610).
+    /// No pin store.
+    #[cfg(test)]
+    pub(crate) fn from_backend(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            pin_store: None,
+        }
+    }
+
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         validate_storage_key(key)?;
         match self.inner.put(key, data).await {
