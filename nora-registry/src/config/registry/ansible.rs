@@ -19,6 +19,14 @@ pub struct AnsibleConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Revalidate stale metadata with a conditional request (`If-None-Match` /
+    /// `If-Modified-Since`) instead of always re-downloading the full body.
+    /// Fail-open: any error falls back to a full fetch. Note: self-hosted Galaxy
+    /// NG / pulp_ansible does not emit HTTP validators on the versions list, so a
+    /// 304 only occurs behind a validator-adding CDN (e.g. galaxy.ansible.com);
+    /// otherwise this degrades to a full fetch — never worse than before.
+    #[serde(default = "super::super::default_true")]
+    pub revalidate: bool,
 }
 
 fn default_ansible_proxy() -> Option<String> {
@@ -38,6 +46,7 @@ impl Default for AnsibleConfig {
             proxy_timeout: 30,
             metadata_ttl: 3600,
             serve_stale: true,
+            revalidate: true,
         }
     }
 }
@@ -69,6 +78,9 @@ impl AnsibleConfig {
         }
         if let Ok(val) = env::var("NORA_ANSIBLE_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_ANSIBLE_REVALIDATE") {
+            self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
     }
 }
