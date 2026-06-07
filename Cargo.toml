@@ -37,7 +37,9 @@ large_types_passed_by_value = "deny"
 assigning_clones = "deny"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [] }
+# `cfg(kani)` is set only by the Kani verifier (`cargo kani`); declare it so the
+# `#[cfg(kani)]` proof harnesses don't trip `unexpected_cfgs` under `-D warnings`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [profile.release]
 debug = false

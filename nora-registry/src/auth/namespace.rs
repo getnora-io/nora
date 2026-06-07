@@ -86,6 +86,11 @@ pub fn enforce_namespace_scope(
             mode,
         } => (patterns, provider, *mode),
     };
+    // Use `provider` as `&str` for the metric label slices below. The mixed
+    // `&[&Arc<str>, &'static str]` array relied on element LUB coercion, which the
+    // Kani verifier's pinned rustc rejects (E0308) where stable accepts it — this
+    // explicit deref makes both elements `&str` and compiles under both toolchains.
+    let provider: &str = provider;
 
     if patterns.iter().any(|p| namespace_match(p, namespace)) {
         NAMESPACE_SCOPE_DECISIONS
