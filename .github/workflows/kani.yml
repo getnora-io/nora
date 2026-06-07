@@ -1,0 +1,47 @@
+name: Kani
+
+# Bounded model checking (Kani / CBMC) proves the `#[kani::proof]` harnesses —
+# e.g. `byte_range_core` is total and bounds-safe for ALL u64 inputs. This is a
+# SEPARATE workflow from CI: Kani installs its own toolchain and runs CBMC, which
+# is far heavier than the unit suite, so it is path-scoped and manually
+# dispatchable rather than run on every push. Harnesses are `#[cfg(kani)]` —
+# invisible to the normal build, clippy, and tests.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nora-registry/src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+
+permissions: read-all
+
+concurrency:
+  group: kani-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # Install Kani via cargo (pinned version) rather than a third-party action,
+      # to keep the supply chain pinned the same way the rest of CI pins action
+      # SHAs. `cargo kani setup` fetches the Kani toolchain + CBMC backend.
+      - name: Install Kani
+        run: |
+          cargo install --locked --version 0.67.0 kani-verifier
+          cargo kani setup
+
+      - name: Run Kani proofs
+        run: cargo kani --package nora-registry

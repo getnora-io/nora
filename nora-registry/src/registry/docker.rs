@@ -296,12 +296,11 @@ fn byte_range_core(
 /// `(suffix, start_in, end_empty, end_in, size)` over the full `u64` space it
 /// never panics or overflows, and any `Some((start, end))` is well-formed:
 /// `start <= end < size` — the whole "out-of-bounds / inverted Range" bug-class
-/// discharged at verification time, not at runtime. (Verified GREEN standalone
-/// in ~0.35s, 17/17 checks; the in-crate `cargo kani` run currently needs a
-/// prometheus/Kani-toolchain dependency alignment to compile the full crate.)
+/// discharged at verification time, not at runtime. (Verified GREEN in-crate,
+/// 17/17 checks in ~0.3s.)
 ///
-/// Run: `cargo kani -p nora-registry --harness byte_range_core_is_bounds_safe`
-/// (compiled only under `--cfg kani`; invisible to the normal build/clippy/test).
+/// Run: `make kani`, or `cargo kani -p nora-registry` (CI: `.github/workflows/kani.yml`).
+/// Compiled only under `--cfg kani`; invisible to the normal build/clippy/test.
 #[cfg(kani)]
 #[kani::proof]
 fn byte_range_core_is_bounds_safe() {
@@ -3696,6 +3695,7 @@ mod integration_tests {
         assert_eq!(parse_byte_range("bytes=5-3", 10), None); // reversed
         assert_eq!(parse_byte_range("nonsense", 10), None); // unparsable
         assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
+
         // mutation-found gaps (cargo-mutants): exercise the single-byte range
         // and the suffix form against an empty object.
         assert_eq!(parse_byte_range("bytes=5-5", 10), Some((5, 5))); // single byte (kills `>`→`>=`)
