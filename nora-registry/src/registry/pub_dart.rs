@@ -18,7 +18,9 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::cache_ttl::is_within_ttl;
 use crate::registry::{
-    circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch, ProxyError,
+    circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch,
+    proxy_fetch_conditional, read_validators, write_validators, ProxyError, Revalidation,
+    Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -180,17 +182,72 @@ async fn package_listing(
         encode_segment(&package)
     );
 
-    match fetch_pub_api(&state, &url, &state.circuit_breaker).await {
-        Ok(data) => {
+    // Revalidate stale metadata with a conditional request when enabled (a cheap
+    // 304 — pub.dev returns validators) and fall back to a full fetch otherwise.
+    // Empty validators ⇒ no conditional headers ⇒ always a 200, which is also how
+    // the first fetch captures validators for next time.
+    let validators = if state.config.pub_dart.revalidate {
+        read_validators(&state.storage, &key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.pub_dart.proxy_timeout),
+        expose_opt(&state.config.pub_dart.proxy_auth),
+        &validators,
+        &state.circuit_breaker,
+        RegistryType::PubDart,
+    )
+    .await
+    {
+        // Upstream unchanged — serve the cached (already-rewritten) body and bump
+        // its freshness. No body downloaded.
+        Ok(Revalidation::NotModified) => {
+            let body = match state.storage.get(&key).await {
+                Ok(b) => b,
+                Err(_) => match &cached_data {
+                    Some(b) => b.clone(),
+                    None => return StatusCode::BAD_GATEWAY.into_response(),
+                },
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["pub"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["pub"])
+                .inc_by(body.len() as u64);
+            let storage = state.storage.clone();
+            let key_clone = key.clone();
+            let bump = body.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &bump).await;
+            });
+            pub_json_response(body.to_vec())
+        }
+        // New body — rewrite, cache the rewritten body first, then persist the
+        // fresh validators (body-before-sidecar ordering).
+        Ok(Revalidation::Modified { body, validators }) => {
             let nora_base = pub_base_url(&state);
-            let rewritten = rewrite_package_response(&data, &nora_base, &package).unwrap_or(data);
-            cache_bytes(&state, key, rewritten.clone()).await;
+            let rewritten = rewrite_package_response(&body, &nora_base, &package).unwrap_or(body);
+            cache_bytes(&state, key.clone(), rewritten.clone()).await;
+            write_validators(&state.storage, &key, &validators).await;
             state.repo_index.invalidate("pub");
             pub_json_response(rewritten)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["pub"])
+                    .inc();
+            }
             if let Some(ref data) = cached_data {
                 if state.config.pub_dart.serve_stale {
                     tracing::warn!(
@@ -1161,5 +1218,67 @@ mod tests {
 
         let result = super::extract_pub_publish_date(&storage, "nonexistent", "1.0.0").await;
         assert!(result.is_none());
+    }
+
+    /// #52 acceptance: with a cached package listing + stored validators, a stale
+    /// request revalidates with `If-None-Match`; on upstream 304 the cached body
+    /// is served with no 200-body download. pub.dev returns validators on the
+    /// package-listing endpoint, so this is a real revalidation.
+    #[tokio::test]
+    async fn test_pub_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 (no other mount), so any full fetch would visibly fail.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pub_dart.enabled = true;
+            cfg.pub_dart.proxy = Some(upstream.uri());
+            cfg.pub_dart.metadata_ttl = 0; // always stale → always revalidate
+            cfg.pub_dart.revalidate = true;
+            cfg.pub_dart.serve_stale = false;
+        });
+
+        let key = "pub/api/packages/http.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"name":"http","versions":[{"version":"1.0.0"}]}"#)
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["pub"])
+            .get();
+
+        let resp = send(&ctx.app, Method::GET, "/pub/api/packages/http", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("1.0.0"),
+            "must serve the cached package listing"
+        );
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["pub"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }
