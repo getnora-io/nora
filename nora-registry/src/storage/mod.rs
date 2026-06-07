@@ -333,6 +333,50 @@ impl Storage {
         }
     }
 
+    /// Buffered, integrity-gated read returning a compile-time integrity
+    /// witness (typestate pilot — see [`crate::verified`]).
+    ///
+    /// Runs the same fail-closed gate as [`get`](Self::get): on tamper or a
+    /// verify-task panic it returns [`StorageError::IntegrityViolation`] and
+    /// yields no witness. It then reflects the outcome in the type:
+    ///
+    /// - a pin existed and the bytes matched it → [`GateOutcome::Verified`]
+    ///   carrying a `Blob<Verified>` (a proof the bytes hash to the recorded
+    ///   pin);
+    /// - no pin existed for the key, or this backend has no pin store (S3) →
+    ///   [`GateOutcome::Unpinned`], so a caller cannot mistake the open-world
+    ///   case for a verified read.
+    ///
+    /// [`GateOutcome::Verified`]: nora_registry::verified::GateOutcome::Verified
+    /// [`GateOutcome::Unpinned`]: nora_registry::verified::GateOutcome::Unpinned
+    ///
+    /// The witness is minted by the sound smart-constructor
+    /// [`Blob::<Verified>::verify`](nora_registry::verified::Blob::verify), which
+    /// re-hashes the bytes — one extra SHA-256 over [`get`] on the pinned path.
+    /// The pilot accepts that cost to keep the witness sound-by-construction
+    /// without duplicating the security-critical gate; folding the witness into
+    /// `get` so the hash runs once is the rollout step.
+    pub async fn get_verified(&self, key: &str) -> Result<nora_registry::verified::GateOutcome> {
+        // Validate locally as the first act, like every Storage wrapper method:
+        // a choke point that does not depend on the transitive get() validation
+        // below surviving a future refactor (trust-boundary invariant).
+        validate_storage_key(key)?;
+        use nora_registry::verified::{Blob, GateOutcome};
+        // Reuse the fail-closed gate: get() returns Ok only after a digest
+        // match (Ok(true)) or the open-world / no-pin branch.
+        let data = self.get(key).await?;
+        match self.get_pin_hash(key) {
+            Some(pin) => match Blob::verify(data, &pin) {
+                Ok(blob) => Ok(GateOutcome::Verified(blob)),
+                // get() already verified these bytes against the same in-memory
+                // pin, so a mismatch here is unreachable in practice; treat it
+                // as a tamper signal and fail closed rather than downgrade.
+                Err(_) => Err(StorageError::IntegrityViolation),
+            },
+            None => Ok(GateOutcome::Unpinned(Blob::raw(data))),
+        }
+    }
+
     pub async fn delete(&self, key: &str) -> Result<()> {
         validate_storage_key(key)?;
         match self.inner.delete(key).await {
@@ -750,6 +794,40 @@ mod tests {
         let unpinned = "raw/ok/unpinned.bin";
         std::fs::write(dir.path().join(unpinned), b"no-pin").unwrap();
         assert_eq!(&storage.get(unpinned).await.unwrap()[..], b"no-pin");
+    }
+
+    /// `get_verified` reflects the gate outcome in the type: a pinned key yields
+    /// `GateOutcome::Verified`, an unpinned (open-world) key yields `Unpinned`,
+    /// and a tampered pinned artifact still fails closed — no witness is minted
+    /// for bytes that fail the gate (the typestate cannot launder tampered data).
+    #[tokio::test]
+    async fn get_verified_reflects_pin_state_and_fails_closed() {
+        use nora_registry::verified::GateOutcome;
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+
+        // Pinned + matching → Verified, bytes intact.
+        let key = "raw/v/app.bin";
+        storage.put(key, b"verified-bytes").await.unwrap();
+        match storage.get_verified(key).await.unwrap() {
+            GateOutcome::Verified(blob) => assert_eq!(&blob.into_inner()[..], b"verified-bytes"),
+            GateOutcome::Unpinned(_) => panic!("pinned key must yield Verified"),
+        }
+
+        // Unpinned key (written straight to disk, no pin) → Unpinned (open-world).
+        let unpinned = "raw/v/unpinned.bin";
+        std::fs::write(dir.path().join(unpinned), b"no-pin").unwrap();
+        match storage.get_verified(unpinned).await.unwrap() {
+            GateOutcome::Unpinned(blob) => assert_eq!(&blob.into_inner()[..], b"no-pin"),
+            GateOutcome::Verified(_) => panic!("unpinned key must yield Unpinned"),
+        }
+
+        // Tamper the pinned artifact on disk → fail closed, no witness produced.
+        std::fs::write(dir.path().join(key), b"TAMPERED").unwrap();
+        assert!(matches!(
+            storage.get_verified(key).await,
+            Err(StorageError::IntegrityViolation)
+        ));
     }
 
     fn sha_hex(data: &[u8]) -> String {

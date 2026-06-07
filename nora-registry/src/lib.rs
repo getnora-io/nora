@@ -3,6 +3,7 @@
 //! NORA Registry — library interface for fuzzing and testing
 
 pub mod validation;
+pub mod verified;
 
 /// Re-export Docker manifest parsing for fuzz targets
 pub mod docker_fuzz {

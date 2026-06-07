@@ -81,8 +81,8 @@ async fn download(
         }
     }
 
-    match state.storage.get(&key).await {
-        Ok(data) => {
+    match state.storage.get_verified(&key).await {
+        Ok(outcome) => {
             state.metrics.record_download("raw");
             state
                 .activity
@@ -90,6 +90,18 @@ async fn download(
             state
                 .audit
                 .log(AuditEntry::new("pull", "api", "", "raw", ""));
+
+            // Discharge the integrity witness once, here at the serve site. A
+            // cryptographically Verified read flows through `verified_body`,
+            // which accepts *only* a `Blob<Verified>` — serving raw or merely
+            // tamper-evident bytes on this path is a compile error. An
+            // open-world read (unpinned key / S3 backend) is served knowingly,
+            // never silently. (Typestate pilot — see `crate::verified`.)
+            use nora_registry::verified::{verified_body, GateOutcome};
+            let data = match outcome {
+                GateOutcome::Verified(blob) => verified_body(blob),
+                GateOutcome::Unpinned(blob) => blob.into_inner(),
+            };
 
             // Guess content type from extension
             let content_type = guess_content_type(&key);
