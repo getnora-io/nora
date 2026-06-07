@@ -34,6 +34,22 @@ impl BreakerState {
     }
 }
 
+/// Identifies the probe a caller was allowed to run, so a later
+/// `record_success`/`record_failure`/`record_alive` can be FENCED. When the
+/// #585 stall-recovery starts a fresh probe, the old probe is superseded; its
+/// late report carries an older generation and must NOT mutate the breaker
+/// ("treat as lost" — the comment's intent, now enforced). A non-probe
+/// (Closed-path) request carries [`ProbeToken::BACKGROUND`], which is never
+/// fenced — its failure simply accrues to the Closed-path tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeToken(u64);
+
+impl ProbeToken {
+    /// Not a probe — a Closed-path request. Its outcome accrues normally and is
+    /// never fenced.
+    pub(crate) const BACKGROUND: ProbeToken = ProbeToken(0);
+}
+
 #[derive(Debug)]
 struct BreakerInner {
     state: BreakerState,
@@ -45,6 +61,12 @@ struct BreakerInner {
     /// caller exited without `record_success`/`record_failure`, e.g. a 4xx or
     /// body-extract path), so the breaker cannot wedge at 503 forever (#585).
     half_open_started: Option<Instant>,
+    /// Monotonic generation of the CURRENT probe. Bumped each time `check()`
+    /// grants a probe slot (Open→HalfOpen, or a fresh probe after a #585 stall).
+    /// A probe holds the generation it was granted; `record_*` fence on it so a
+    /// superseded ("lost") probe's late report is ignored (contract
+    /// `circuit-breaker-probe-fenced`).
+    probe_gen: u64,
 }
 
 impl BreakerInner {
@@ -55,7 +77,22 @@ impl BreakerInner {
             last_failure: None,
             half_open_in_flight: false,
             half_open_started: None,
+            probe_gen: 0,
         }
+    }
+
+    /// Grant a fresh probe slot: bump the generation and return its token.
+    fn grant_probe(&mut self) -> ProbeToken {
+        self.probe_gen += 1;
+        self.half_open_in_flight = true;
+        self.half_open_started = Some(Instant::now());
+        ProbeToken(self.probe_gen)
+    }
+
+    /// True if `token` is NOT the current probe and not a background request —
+    /// i.e. a superseded "lost" probe whose report must be ignored.
+    fn is_stale(&self, token: ProbeToken) -> bool {
+        token != ProbeToken::BACKGROUND && token.0 != self.probe_gen
     }
 }
 
@@ -112,10 +149,15 @@ impl CircuitBreakerRegistry {
     }
 
     /// Check if a request to `registry` should proceed.
+    ///
+    /// On success returns a [`ProbeToken`] the caller MUST pass back to
+    /// `record_success`/`record_failure`/`record_alive` so a superseded probe's
+    /// report can be fenced (#585 stall recovery). A Closed-path request gets
+    /// [`ProbeToken::BACKGROUND`]; a HalfOpen probe gets its generation's token.
     /// Returns `Err(ProxyError::CircuitOpen)` if the breaker is open.
-    pub(crate) fn check(&self, registry: &str) -> Result<(), ProxyError> {
+    pub(crate) fn check(&self, registry: &str) -> Result<ProbeToken, ProxyError> {
         if !self.config.enabled {
-            return Ok(());
+            return Ok(ProbeToken::BACKGROUND);
         }
 
         let mut breakers = self.breakers.write();
@@ -124,17 +166,16 @@ impl CircuitBreakerRegistry {
             .or_insert_with(BreakerInner::new);
 
         match breaker.state {
-            BreakerState::Closed => Ok(()),
+            BreakerState::Closed => Ok(ProbeToken::BACKGROUND),
             BreakerState::Open => {
                 let elapsed = breaker
                     .last_failure
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX);
                 if elapsed >= self.reset_timeout_for(registry) {
-                    // Transition to HalfOpen — allow one probe
+                    // Transition to HalfOpen — allow one probe (fresh generation).
                     breaker.state = BreakerState::HalfOpen;
-                    breaker.half_open_in_flight = true;
-                    breaker.half_open_started = Some(Instant::now());
+                    let token = breaker.grant_probe();
                     CIRCUIT_BREAKER_STATE
                         .with_label_values(&[registry])
                         .set(BreakerState::HalfOpen.as_gauge());
@@ -142,7 +183,7 @@ impl CircuitBreakerRegistry {
                         registry = registry,
                         "Circuit breaker half-open, allowing probe"
                     );
-                    Ok(())
+                    Ok(token)
                 } else {
                     CIRCUIT_BREAKER_REJECTIONS
                         .with_label_values(&[registry])
@@ -182,17 +223,19 @@ impl CircuitBreakerRegistry {
                             "Circuit breaker probe stalled (no result within reset timeout) — starting fresh probe"
                         );
                     }
-                    // Slot free, or previous probe was lost — start a fresh probe.
-                    breaker.half_open_in_flight = true;
-                    breaker.half_open_started = Some(Instant::now());
-                    Ok(())
+                    // Slot free, or previous probe was lost — start a fresh probe
+                    // (new generation supersedes the lost one; its late report is
+                    // fenced in record_*).
+                    let token = breaker.grant_probe();
+                    Ok(token)
                 }
             }
         }
     }
 
-    /// Record a successful upstream response.
-    pub(crate) fn record_success(&self, registry: &str) {
+    /// Record a successful upstream response. `token` is the [`ProbeToken`] from
+    /// the matching `check()`; a superseded ("lost") probe's report is fenced.
+    pub(crate) fn record_success(&self, registry: &str, token: ProbeToken) {
         if !self.config.enabled {
             return;
         }
@@ -201,6 +244,12 @@ impl CircuitBreakerRegistry {
         let breaker = breakers
             .entry(registry.to_string())
             .or_insert_with(BreakerInner::new);
+
+        // Fence: ignore a superseded ("lost") probe's late report (#585) so it
+        // cannot close/free a breaker that a newer probe now owns.
+        if breaker.is_stale(token) {
+            return;
+        }
 
         if breaker.state != BreakerState::Closed {
             tracing::info!(
@@ -227,7 +276,7 @@ impl CircuitBreakerRegistry {
     /// an upstream interleaving 4xx (cache-miss probes) with 5xx (real failures)
     /// would never trip the breaker. This is stronger than `record_success`,
     /// which always resets `failures` and would mask such a partial outage.
-    pub(crate) fn record_alive(&self, registry: &str) {
+    pub(crate) fn record_alive(&self, registry: &str, token: ProbeToken) {
         if !self.config.enabled {
             return;
         }
@@ -236,6 +285,11 @@ impl CircuitBreakerRegistry {
         let breaker = breakers
             .entry(registry.to_string())
             .or_insert_with(BreakerInner::new);
+
+        // Fence: ignore a superseded ("lost") probe's late report (#585).
+        if breaker.is_stale(token) {
+            return;
+        }
 
         // Only HalfOpen transitions on an "alive" signal; Closed/Open are left
         // untouched so a 4xx never clears a real failure tally.
@@ -254,8 +308,10 @@ impl CircuitBreakerRegistry {
         }
     }
 
-    /// Record a failed upstream response.
-    pub(crate) fn record_failure(&self, registry: &str) {
+    /// Record a failed upstream response. `token` is the [`ProbeToken`] from the
+    /// matching `check()`; a superseded ("lost") probe's report is fenced so it
+    /// cannot re-open or ghost-increment a breaker a newer probe now owns.
+    pub(crate) fn record_failure(&self, registry: &str, token: ProbeToken) {
         if !self.config.enabled {
             return;
         }
@@ -265,6 +321,11 @@ impl CircuitBreakerRegistry {
         let breaker = breakers
             .entry(registry.to_string())
             .or_insert_with(BreakerInner::new);
+
+        // Fence: ignore a superseded ("lost") probe's late report (#585).
+        if breaker.is_stale(token) {
+            return;
+        }
 
         match breaker.state {
             BreakerState::Closed => {
@@ -360,7 +421,7 @@ mod tests {
         let cb = CircuitBreakerRegistry::new(disabled_config());
         // Even with many failures, check always succeeds
         for _ in 0..100 {
-            cb.record_failure("npm");
+            cb.record_failure("npm", ProbeToken::BACKGROUND);
         }
         assert!(cb.check("npm").is_ok());
     }
@@ -377,12 +438,12 @@ mod tests {
         let cb = CircuitBreakerRegistry::new(enabled_config(5, 30));
         // 4 failures should not trip
         for _ in 0..4 {
-            cb.record_failure("npm");
+            cb.record_failure("npm", ProbeToken::BACKGROUND);
         }
         assert!(cb.check("npm").is_ok());
 
         // 5th failure trips
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
     }
 
@@ -390,12 +451,12 @@ mod tests {
     fn test_success_resets_failure_count() {
         let cb = CircuitBreakerRegistry::new(enabled_config(5, 30));
         for _ in 0..4 {
-            cb.record_failure("npm");
+            cb.record_failure("npm", ProbeToken::BACKGROUND);
         }
-        cb.record_success("npm");
+        cb.record_success("npm", ProbeToken::BACKGROUND);
         // After reset, 4 more failures should not trip
         for _ in 0..4 {
-            cb.record_failure("npm");
+            cb.record_failure("npm", ProbeToken::BACKGROUND);
         }
         assert!(cb.check("npm").is_ok());
     }
@@ -408,12 +469,12 @@ mod tests {
     fn test_record_alive_closed_preserves_failure_count() {
         let cb = CircuitBreakerRegistry::new(enabled_config(5, 30));
         for _ in 0..4 {
-            cb.record_failure("npm");
+            cb.record_failure("npm", ProbeToken::BACKGROUND);
         }
         // An "alive" 4xx must leave the 4 accumulated failures intact...
-        cb.record_alive("npm");
+        cb.record_alive("npm", ProbeToken::BACKGROUND);
         // ...so the 5th real failure still trips the breaker.
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
     }
 
@@ -422,12 +483,12 @@ mod tests {
     #[test]
     fn test_record_alive_halfopen_closes() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 0));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // Open + reset_timeout 0 → next check transitions to HalfOpen (probe).
         assert!(cb.check("npm").is_ok());
         // The probe answered 4xx → upstream alive → breaker closes.
-        cb.record_alive("npm");
+        cb.record_alive("npm", ProbeToken::BACKGROUND);
         // Closed: repeated checks pass (not the single-probe HalfOpen behavior).
         assert!(cb.check("npm").is_ok());
         assert!(cb.check("npm").is_ok());
@@ -436,8 +497,8 @@ mod tests {
     #[test]
     fn test_open_to_halfopen_after_timeout() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 0)); // 0s timeout = immediate
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // Should be open, but timeout=0 means immediate half-open transition
         assert!(cb.check("npm").is_ok()); // transitions to HalfOpen, probe allowed
     }
@@ -445,12 +506,12 @@ mod tests {
     #[test]
     fn test_halfopen_probe_success_closes() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 0));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // Transition to half-open
         assert!(cb.check("npm").is_ok());
         // Probe success
-        cb.record_success("npm");
+        cb.record_success("npm", ProbeToken::BACKGROUND);
         // Should be closed now
         assert!(cb.check("npm").is_ok());
     }
@@ -458,12 +519,12 @@ mod tests {
     #[test]
     fn test_halfopen_probe_failure_reopens() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 0));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // Transition to half-open
         assert!(cb.check("npm").is_ok());
         // Probe fails
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // Should be open again — next check transitions to half-open (timeout=0)
         // but the FIRST check after re-open with timeout=0 transitions immediately
         let result = cb.check("npm");
@@ -473,8 +534,8 @@ mod tests {
     #[test]
     fn test_halfopen_rejects_concurrent() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 0));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // First check — probe allowed
         assert!(cb.check("npm").is_ok());
         // Second check — probe in flight, reject
@@ -489,8 +550,8 @@ mod tests {
     #[test]
     fn test_halfopen_stalled_probe_recovers() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 1));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
 
         // Backdate last_failure so the Open→HalfOpen transition fires now.
         {
@@ -522,8 +583,8 @@ mod tests {
     #[test]
     fn test_per_registry_isolation() {
         let cb = CircuitBreakerRegistry::new(enabled_config(2, 30));
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         // npm is open
         assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
         // pypi is unaffected
@@ -543,8 +604,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
                     let _ = cb.check(&registry);
-                    cb.record_failure(&registry);
-                    cb.record_success(&registry);
+                    cb.record_failure(&registry, ProbeToken::BACKGROUND);
+                    cb.record_success(&registry, ProbeToken::BACKGROUND);
                 }
             }));
         }
@@ -577,22 +638,72 @@ mod tests {
         let cb = CircuitBreakerRegistry::new(config);
 
         // Default key trips after 2 failures
-        cb.record_failure("npm");
-        cb.record_failure("npm");
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
+        cb.record_failure("npm", ProbeToken::BACKGROUND);
         assert!(matches!(cb.check("npm"), Err(ProxyError::CircuitOpen(_))));
 
         // Docker Hub override requires 10 failures
         let docker_key = "docker:https://registry-1.docker.io";
         for _ in 0..9 {
-            cb.record_failure(docker_key);
+            cb.record_failure(docker_key, ProbeToken::BACKGROUND);
         }
         assert!(cb.check(docker_key).is_ok());
         // 10th trips it
-        cb.record_failure(docker_key);
+        cb.record_failure(docker_key, ProbeToken::BACKGROUND);
         assert!(matches!(
             cb.check(docker_key),
             Err(ProxyError::CircuitOpen(_))
         ));
+    }
+
+    /// Regression for the #585 stale-probe race (found by TLA+ model checking of
+    /// the probe lifecycle): a probe the breaker has SUPERSEDED (a fresh probe started
+    /// after it stalled) must NOT mutate the breaker when it finally reports — its
+    /// ProbeToken is fenced. Before the fix, the stale report closed/ghost-failed a
+    /// breaker a newer probe owned.
+    #[test]
+    fn stale_probe_report_is_fenced() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let cb = CircuitBreakerRegistry::new(enabled_config(1, 1)); // threshold 1, reset 1s
+        let reg = "stale_probe_fence_test";
+
+        // Trip to Open (threshold 1).
+        cb.record_failure(reg, ProbeToken::BACKGROUND);
+        assert!(matches!(cb.check(reg), Err(ProxyError::CircuitOpen(_))));
+
+        // After reset_timeout -> HalfOpen, probe g1.
+        sleep(Duration::from_millis(1100));
+        let t1 = cb.check(reg).expect("half-open should grant probe g1");
+
+        // g1 stalls (outlives reset_timeout) -> a fresh check grants probe g2;
+        // g1 is now superseded ("lost").
+        sleep(Duration::from_millis(1100));
+        let t2 = cb.check(reg).expect("stalled probe -> fresh probe g2");
+        assert_ne!(t1, t2, "fresh probe must be a new generation");
+
+        // The STALE probe g1 reports SUCCESS late: FENCED, so it must NOT close the
+        // breaker — g2 is still the live in-flight probe.
+        cb.record_success(reg, t1);
+        assert!(
+            matches!(cb.check(reg), Err(ProxyError::CircuitOpen(_))),
+            "stale probe success must not close the breaker (g2 still in flight)"
+        );
+
+        // The CURRENT probe g2 closes it correctly.
+        cb.record_success(reg, t2);
+        assert!(
+            cb.check(reg).is_ok(),
+            "current probe success closes the breaker"
+        );
+
+        // A late STALE g1 FAILURE on the now-Closed breaker must also be fenced — no
+        // ghost-increment that could re-trip Open at threshold 1.
+        cb.record_failure(reg, t1);
+        assert!(
+            cb.check(reg).is_ok(),
+            "stale probe failure must not ghost-increment / re-open a recovered breaker"
+        );
     }
 }
 
@@ -600,6 +711,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    use super::ProbeToken;
     use crate::test_helpers::*;
     use axum::http::{Method, StatusCode};
 
@@ -615,8 +727,12 @@ mod integration_tests {
         });
 
         // Trip the breaker
-        ctx.state.circuit_breaker.record_failure("npm");
-        ctx.state.circuit_breaker.record_failure("npm");
+        ctx.state
+            .circuit_breaker
+            .record_failure("npm", ProbeToken::BACKGROUND);
+        ctx.state
+            .circuit_breaker
+            .record_failure("npm", ProbeToken::BACKGROUND);
 
         // Request a package NOT in local storage → proxy path → cb.check() → 503
         let response = send(&ctx.app, Method::GET, "/npm/nonexistent-pkg", "").await;
@@ -643,8 +759,12 @@ mod integration_tests {
             cfg.pypi.proxy = Some("http://127.0.0.1:1".into());
         });
 
-        ctx.state.circuit_breaker.record_failure("pypi");
-        ctx.state.circuit_breaker.record_failure("pypi");
+        ctx.state
+            .circuit_breaker
+            .record_failure("pypi", ProbeToken::BACKGROUND);
+        ctx.state
+            .circuit_breaker
+            .record_failure("pypi", ProbeToken::BACKGROUND);
 
         let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
 
@@ -669,7 +789,9 @@ mod integration_tests {
 
         // Flood failures — should be ignored
         for _ in 0..100 {
-            ctx.state.circuit_breaker.record_failure("npm");
+            ctx.state
+                .circuit_breaker
+                .record_failure("npm", ProbeToken::BACKGROUND);
         }
 
         let response = send(&ctx.app, Method::GET, "/npm/nonexistent-pkg", "").await;
@@ -696,7 +818,9 @@ mod integration_tests {
             .unwrap();
 
         // Trip the breaker
-        ctx.state.circuit_breaker.record_failure("pypi");
+        ctx.state
+            .circuit_breaker
+            .record_failure("pypi", ProbeToken::BACKGROUND);
 
         // Local read should still succeed
         let response = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
@@ -730,8 +854,12 @@ mod integration_tests {
         });
 
         // Trip the breaker into Open.
-        ctx.state.circuit_breaker.record_failure("npm");
-        ctx.state.circuit_breaker.record_failure("npm");
+        ctx.state
+            .circuit_breaker
+            .record_failure("npm", ProbeToken::BACKGROUND);
+        ctx.state
+            .circuit_breaker
+            .record_failure("npm", ProbeToken::BACKGROUND);
 
         // Request now: Open + reset_timeout 0 → HalfOpen probe → upstream answers
         // 404 → record_success → breaker closes. The probe must reach upstream,
