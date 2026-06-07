@@ -21,6 +21,13 @@ pub struct NugetConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Revalidate stale metadata with a conditional request (`If-None-Match` /
+    /// `If-Modified-Since`) instead of always re-downloading the full body.
+    /// Fail-open: any error falls back to a full fetch. nuget.org returns
+    /// validators (ETag + Last-Modified) on both the flat-container version list
+    /// and the registration index, so a 304 avoids the download.
+    #[serde(default = "super::super::default_true")]
+    pub revalidate: bool,
     #[serde(default = "default_nuget_search")]
     pub search_service: String,
     #[serde(default = "default_nuget_autocomplete")]
@@ -53,6 +60,7 @@ impl Default for NugetConfig {
             metadata_proxy_timeout: 2,
             metadata_ttl: 300,
             serve_stale: true,
+            revalidate: true,
             search_service: default_nuget_search(),
             autocomplete: default_nuget_autocomplete(),
         }
@@ -89,6 +97,9 @@ impl NugetConfig {
         }
         if let Ok(val) = env::var("NORA_NUGET_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_NUGET_REVALIDATE") {
+            self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
         if let Ok(val) = env::var("NORA_NUGET_SEARCH_SERVICE") {
             if !val.is_empty() {

@@ -16,7 +16,8 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text,
+    read_validators, write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -419,18 +420,64 @@ async fn registration_index(
         id_lower
     );
 
-    match proxy_fetch_text(
+    // Revalidate stale metadata with a conditional request when enabled (a cheap
+    // 304 — nuget.org returns validators) and fall back to a full fetch otherwise.
+    let validators = if state.config.nuget.revalidate {
+        read_validators(&state.storage, &storage_key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         expose_opt(&state.config.nuget.proxy_auth),
-        None,
+        &validators,
         &state.circuit_breaker,
         RegistryType::Nuget,
     )
     .await
     {
-        Ok(text) => {
+        // Upstream unchanged — serve the cached body (rewritten on read) and bump
+        // its freshness so we do not revalidate again until the next TTL window.
+        Ok(Revalidation::NotModified) => {
+            let body = match state.storage.get(&storage_key).await {
+                Ok(b) => b,
+                Err(_) => {
+                    let rewrite = Some((upstream.as_str(), base_url.as_str()));
+                    return serve_stale_or_not_found(
+                        &state,
+                        cached_data,
+                        "registration_index",
+                        rewrite,
+                    );
+                }
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["nuget"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["nuget"])
+                .inc_by(body.len() as u64);
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let bump = body.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &bump).await;
+            });
+            let text = String::from_utf8_lossy(&body);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            with_json_gzip(rewritten.into_bytes())
+        }
+        // New body — cache the raw bytes first, then persist the fresh validators,
+        // and serve the rewritten form.
+        Ok(Revalidation::Modified { body, validators }) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -443,14 +490,29 @@ async fn registration_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            // Cache raw response, rewrite on serve
-            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
+            let raw = Bytes::from(body);
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let raw_for_cache = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache registration");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
+            let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             with_json_gzip(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["nuget"])
+                    .inc();
+            }
             tracing::debug!(error = ?e, "NuGet registration error");
             let rewrite = Some((upstream.as_str(), base_url.as_str()));
             serve_stale_or_not_found(&state, cached_data, "registration_index", rewrite)
@@ -593,18 +655,57 @@ async fn version_list(state: AppState, id: &str) -> Response {
         id_lower
     );
 
-    match proxy_fetch_text(
+    // Revalidate stale metadata with a conditional request when enabled (a cheap
+    // 304 — nuget.org returns validators) and fall back to a full fetch otherwise.
+    // Empty validators ⇒ no conditional headers ⇒ always a 200, which is also how
+    // the first fetch captures validators for next time.
+    let validators = if state.config.nuget.revalidate {
+        read_validators(&state.storage, &storage_key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         expose_opt(&state.config.nuget.proxy_auth),
-        None,
+        &validators,
         &state.circuit_breaker,
         RegistryType::Nuget,
     )
     .await
     {
-        Ok(text) => {
+        // Upstream unchanged — serve the cached body and bump its freshness so we
+        // do not revalidate again until the next TTL window. No body downloaded.
+        Ok(Revalidation::NotModified) => {
+            let body = match state.storage.get(&storage_key).await {
+                Ok(b) => b,
+                Err(_) => {
+                    return serve_stale_or_not_found(&state, cached_data, "version_list", None)
+                }
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["nuget"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["nuget"])
+                .inc_by(body.len() as u64);
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let bump = body.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &bump).await;
+            });
+            with_json(body.to_vec())
+        }
+        // New body — cache the raw bytes first, then persist the fresh validators.
+        Ok(Revalidation::Modified { body, validators }) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -617,12 +718,27 @@ async fn version_list(state: AppState, id: &str) -> Response {
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
 
-            state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
-            with_json(text.into_bytes())
+            let raw = Bytes::from(body);
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let raw_for_cache = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache version list");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
+            with_json(raw.to_vec())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["nuget"])
+                    .inc();
+            }
             tracing::debug!(error = ?e, "NuGet version list error");
             serve_stale_or_not_found(&state, cached_data, "version_list", None)
         }
@@ -2534,5 +2650,74 @@ mod spec_conformance_tests {
             "nupkg must have immutable cache-control, got: {}",
             cache_control
         );
+    }
+
+    /// #52 acceptance: with a cached flat-container version list + stored
+    /// validators, a stale request revalidates with `If-None-Match`; on upstream
+    /// 304 the cached body is served with no 200-body download. nuget.org returns
+    /// validators on this endpoint, so this is a real revalidation.
+    #[tokio::test]
+    async fn test_nuget_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 (no other mount), so any full fetch would visibly fail.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(upstream.uri());
+            cfg.nuget.metadata_ttl = 0; // always stale → always revalidate
+            cfg.nuget.revalidate = true;
+            cfg.nuget.serve_stale = false;
+        });
+
+        let key = "nuget/flatcontainer/test-package/index.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"versions":["1.0.0","2.0.0"]}"#)
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["nuget"])
+            .get();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/test-package/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("2.0.0"),
+            "must serve the cached version list"
+        );
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["nuget"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }
