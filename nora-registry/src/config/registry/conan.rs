@@ -21,6 +21,14 @@ pub struct ConanConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Revalidate stale metadata with a conditional request (`If-None-Match` /
+    /// `If-Modified-Since`) instead of always re-downloading the full body.
+    /// Fail-open: any error falls back to a full fetch. Note: ConanCenter
+    /// (center2.conan.io) does not emit HTTP validators, so a 304 only occurs
+    /// behind a validator-adding CDN / Artifactory; otherwise this degrades to a
+    /// full fetch — never worse than before.
+    #[serde(default = "super::super::default_true")]
+    pub revalidate: bool,
 }
 
 fn default_conan_proxy() -> Option<String> {
@@ -37,6 +45,7 @@ impl Default for ConanConfig {
             proxy_timeout_dl: 120,
             metadata_ttl: 300,
             serve_stale: true,
+            revalidate: true,
         }
     }
 }
@@ -71,6 +80,9 @@ impl ConanConfig {
         }
         if let Ok(val) = env::var("NORA_CONAN_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_CONAN_REVALIDATE") {
+            self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
     }
 }

@@ -27,7 +27,10 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{
+    circuit_open_response, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text, read_validators,
+    write_validators, ProxyError, Revalidation, Validators,
+};
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
 use crate::AppState;
@@ -680,18 +683,59 @@ async fn fetch_and_cache_json(
     artifact: &str,
     cached: Option<Bytes>,
 ) -> Response {
-    match proxy_fetch_text(
+    // Revalidate stale metadata with a conditional request when enabled and fall
+    // back to a full fetch otherwise. Empty validators ⇒ no conditional headers ⇒
+    // always a 200, which is also how the first fetch captures validators.
+    let validators = if state.config.conan.revalidate {
+        read_validators(&state.storage, storage_key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         url,
         Duration::from_secs(state.config.conan.proxy_timeout),
         expose_opt(&state.config.conan.proxy_auth),
-        None,
+        &validators,
         &state.circuit_breaker,
         RegistryType::Conan,
     )
     .await
     {
-        Ok(text) => {
+        // Upstream unchanged — serve the cached body and bump its freshness so we
+        // do not revalidate again until the next TTL window. No body downloaded.
+        Ok(Revalidation::NotModified) => {
+            let body = match state.storage.get(storage_key).await {
+                Ok(b) => b,
+                // Body vanished under us — use the eagerly-read copy, or 502.
+                Err(_) => match cached {
+                    Some(b) => b,
+                    None => return StatusCode::BAD_GATEWAY.into_response(),
+                },
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["conan"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["conan"])
+                .inc_by(body.len() as u64);
+            state.metrics.record_download("conan");
+            state.metrics.record_cache_hit("conan");
+            // Re-put bumps the file mtime (the freshness source) without download.
+            let storage = state.storage.clone();
+            let key_clone = storage_key.to_string();
+            let bump = body.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &bump).await;
+            });
+            with_json(body.to_vec())
+        }
+        // New body — cache the raw bytes first, then persist the fresh validators.
+        Ok(Revalidation::Modified { body, validators }) => {
             state.metrics.record_download("conan");
             state.metrics.record_cache_miss("conan");
             state.activity.push(ActivityEntry::new(
@@ -704,12 +748,27 @@ async fn fetch_and_cache_json(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
 
-            state.spawn_cache("conan", storage_key.to_string(), Bytes::from(text.clone()));
-            with_json(text.into_bytes())
+            let raw = Bytes::from(body);
+            let storage = state.storage.clone();
+            let key_clone = storage_key.to_string();
+            let raw_for_cache = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "conan proxy: failed to cache metadata");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
+            with_json(raw.to_vec())
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["conan"])
+                    .inc();
+            }
             if let Some(ref data) = cached {
                 if state.config.conan.serve_stale {
                     tracing::warn!(
@@ -1262,5 +1321,72 @@ mod integration_tests {
         let result =
             super::extract_conan_publish_date(&storage, "nonexistent", "1.0", "_", "_").await;
         assert!(result.is_none());
+    }
+
+    /// #52 acceptance: a stale recipe-revision read revalidates with
+    /// `If-None-Match`; on upstream 304 the cached body is served with no
+    /// 200-body download. (ConanCenter sends no validators in production, but this
+    /// proves NORA uses them when a fronting CDN / Artifactory does.)
+    #[tokio::test]
+    async fn test_conan_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 (no other mount), so any full fetch would visibly fail.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(upstream.uri());
+            cfg.conan.metadata_ttl = 0; // always stale → always revalidate
+            cfg.conan.revalidate = true;
+            cfg.conan.serve_stale = false;
+        });
+
+        let key = "conan/zlib/1.3/_/_/latest.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"revision":"abc123"}"#)
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["conan"])
+            .get();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/conan/v2/conans/zlib/1.3/_/_/latest",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("abc123"),
+            "must serve the cached recipe revision"
+        );
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["conan"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }
