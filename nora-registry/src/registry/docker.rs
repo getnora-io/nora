@@ -2412,7 +2412,7 @@ pub async fn fetch_blob_from_upstream(
     );
 
     let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
-    cb.check(&cb_key)?;
+    let probe = cb.check(&cb_key)?;
 
     let url = format!(
         "{}/v2/{}/blobs/{}",
@@ -2427,7 +2427,7 @@ pub async fn fetch_blob_from_upstream(
         request = request.header("Authorization", basic_auth_header(credentials));
     }
     let response = request.send().await.map_err(|e| {
-        cb.record_failure(&cb_key);
+        cb.record_failure(&cb_key, probe);
         ProxyError::Network(e.to_string())
     })?;
 
@@ -2449,7 +2449,7 @@ pub async fn fetch_blob_from_upstream(
                 .send()
                 .await
                 .map_err(|e| {
-                    cb.record_failure(&cb_key);
+                    cb.record_failure(&cb_key, probe);
                     ProxyError::Network(e.to_string())
                 })?
         } else {
@@ -2466,9 +2466,9 @@ pub async fn fetch_blob_from_upstream(
             // 4xx — upstream is alive and answered (e.g. blob not found); not an
             // availability failure, so recover the breaker instead of counting
             // it against the upstream (#606).
-            cb.record_alive(&cb_key);
+            cb.record_alive(&cb_key, probe);
         } else {
-            cb.record_failure(&cb_key);
+            cb.record_failure(&cb_key, probe);
         }
         return Err(ProxyError::Upstream(status));
     }
@@ -2503,12 +2503,12 @@ pub async fn fetch_blob_from_upstream(
                 bytes_written += chunk.len() as u64;
             }
             Ok(Some(Err(e))) => {
-                cb.record_failure(&cb_key);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(format!("chunk read error: {}", e)));
             }
             Ok(None) => break, // stream finished
             Err(_) => {
-                cb.record_failure(&cb_key);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(format!(
                     "read timeout ({}s per chunk)",
                     read_timeout
@@ -2525,7 +2525,7 @@ pub async fn fetch_blob_from_upstream(
     drop(file);
 
     let sha256 = hex::encode(sha2::Digest::finalize(hasher));
-    cb.record_success(&cb_key);
+    cb.record_success(&cb_key, probe);
     PROXY_DOWNLOAD_BYTES.inc_by(bytes_written);
 
     tracing::info!(
@@ -2559,7 +2559,7 @@ pub async fn fetch_manifest_from_upstream(
     cb: &CircuitBreakerRegistry,
 ) -> Result<(Vec<u8>, String), ProxyError> {
     let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
-    cb.check(&cb_key)?;
+    let probe = cb.check(&cb_key)?;
 
     let url = format!(
         "{}/v2/{}/manifests/{}",
@@ -2586,7 +2586,7 @@ pub async fn fetch_manifest_from_upstream(
     }
     let response = request.send().await.map_err(|e| {
         tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
-        cb.record_failure(&cb_key);
+        cb.record_failure(&cb_key, probe);
         ProxyError::Network(e.to_string())
     })?;
 
@@ -2615,7 +2615,7 @@ pub async fn fetch_manifest_from_upstream(
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Failed to send authenticated request");
-                    cb.record_failure(&cb_key);
+                    cb.record_failure(&cb_key, probe);
                     ProxyError::Network(e.to_string())
                 })?
         } else {
@@ -2635,9 +2635,9 @@ pub async fn fetch_manifest_from_upstream(
         if (400..500).contains(&status) {
             // 4xx — upstream is alive and answered (e.g. manifest not found);
             // recover the breaker rather than counting it as a failure (#606).
-            cb.record_alive(&cb_key);
+            cb.record_alive(&cb_key, probe);
         } else {
-            cb.record_failure(&cb_key);
+            cb.record_failure(&cb_key, probe);
         }
         return Err(ProxyError::Upstream(status));
     }
@@ -2650,11 +2650,11 @@ pub async fn fetch_manifest_from_upstream(
         .to_string();
 
     let bytes = response.bytes().await.map_err(|e| {
-        cb.record_failure(&cb_key);
+        cb.record_failure(&cb_key, probe);
         ProxyError::Network(e.to_string())
     })?;
 
-    cb.record_success(&cb_key);
+    cb.record_success(&cb_key, probe);
     Ok((bytes.to_vec(), content_type))
 }
 
@@ -3253,6 +3253,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    use crate::circuit_breaker::ProbeToken;
     use crate::test_helpers::{body_bytes, create_test_context, send};
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
@@ -3853,10 +3854,10 @@ mod integration_tests {
         // Trip the breaker for this upstream
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1");
+            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1");
+            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
 
         // Request a manifest NOT in local storage → proxy path → cb.check() → 503
         let response = send(
@@ -4111,10 +4112,10 @@ mod integration_tests {
         // Trip only upstream A
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1");
+            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1");
+            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
 
         // Upstream A should be open
         assert!(ctx

@@ -90,7 +90,7 @@ where
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
     let registry_str = registry.as_str();
-    cb.check(registry_str)?;
+    let probe = cb.check(registry_str)?;
 
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
@@ -113,11 +113,11 @@ where
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
-                        cb.record_success(registry_str);
+                        cb.record_success(registry_str, probe);
                     } else {
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
-                        cb.record_failure(registry_str);
+                        cb.record_failure(registry_str, probe);
                     }
                     return result;
                 }
@@ -131,7 +131,7 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
-                    cb.record_alive(registry_str);
+                    cb.record_alive(registry_str, probe);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
@@ -145,7 +145,7 @@ where
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, "5xx"])
                     .observe(elapsed);
-                cb.record_failure(registry_str);
+                cb.record_failure(registry_str, probe);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
@@ -159,12 +159,12 @@ where
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str);
+                cb.record_failure(registry_str, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str);
+    cb.record_failure(registry_str, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -298,7 +298,7 @@ pub(crate) async fn proxy_fetch_conditional(
     registry: RegistryType,
 ) -> Result<Revalidation, ProxyError> {
     let registry_str = registry.as_str();
-    cb.check(registry_str)?;
+    let probe = cb.check(registry_str)?;
 
     let mut request = client.get(url).timeout(timeout);
     if let Some(credentials) = auth {
@@ -315,7 +315,7 @@ pub(crate) async fn proxy_fetch_conditional(
         Ok(response) => {
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(registry_str);
+                cb.record_success(registry_str, probe);
                 return Ok(Revalidation::NotModified);
             }
             if status.is_success() {
@@ -327,7 +327,7 @@ pub(crate) async fn proxy_fetch_conditional(
                     .bytes()
                     .await
                     .map_err(|e| ProxyError::Network(e.to_string()))?;
-                cb.record_success(registry_str);
+                cb.record_success(registry_str, probe);
                 return Ok(Revalidation::Modified {
                     body: body.to_vec(),
                     validators: new_validators,
@@ -337,14 +337,14 @@ pub(crate) async fn proxy_fetch_conditional(
             if (400..500).contains(&code) {
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(registry_str);
+                cb.record_alive(registry_str, probe);
                 return Err(ProxyError::NotFound);
             }
-            cb.record_failure(registry_str);
+            cb.record_failure(registry_str, probe);
             Err(ProxyError::Upstream(code))
         }
         Err(e) => {
-            cb.record_failure(registry_str);
+            cb.record_failure(registry_str, probe);
             Err(ProxyError::Network(e.to_string()))
         }
     }
