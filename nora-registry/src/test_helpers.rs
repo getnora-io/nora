@@ -157,6 +157,7 @@ fn build_context(
             anonymous_read,
             htpasswd_file: String::new(),
             token_storage: tempdir.path().join("tokens").to_str().unwrap().to_string(),
+            token_cache_ttl: 300,
             trusted_proxies: crate::config::TrustedProxies::default_loopback(),
             oidc: crate::config::OidcConfig::default(),
         },

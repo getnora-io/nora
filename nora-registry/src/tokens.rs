@@ -19,8 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// TTL for cached token verifications (avoids Argon2 per request)
-const CACHE_TTL: Duration = Duration::from_secs(300);
+/// Default TTL for cached token verifications (avoids Argon2 per request).
+/// Overridable per-store via [`TokenStore::with_cache_ttl`] (config
+/// `auth.token_cache_ttl`) to bound the cross-replica revocation window.
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Cached verification result
 #[derive(Clone)]
@@ -98,13 +100,23 @@ pub struct TokenStore {
     storage_path: PathBuf,
     /// In-memory cache: SHA256(token) -> verified result (avoids Argon2 per request)
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
+    /// How long a cached verification is trusted before the slow path re-checks
+    /// disk. Shorter = smaller cross-replica revocation window.
+    cache_ttl: Duration,
     /// Pending last_used updates: file_id_prefix -> timestamp (flushed periodically)
     pending_last_used: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl TokenStore {
-    /// Create a new token store
+    /// Create a new token store with the default verify-cache TTL.
     pub fn new(storage_path: &Path) -> Self {
+        Self::with_cache_ttl(storage_path, DEFAULT_CACHE_TTL)
+    }
+
+    /// Create a token store with an explicit verify-cache TTL. A shorter TTL
+    /// bounds the window in which a token revoked on another replica is still
+    /// served from this replica's cache.
+    pub fn with_cache_ttl(storage_path: &Path, cache_ttl: Duration) -> Self {
         // Ensure directory exists with restricted permissions
         let _ = fs::create_dir_all(storage_path);
         #[cfg(unix)]
@@ -114,6 +126,7 @@ impl TokenStore {
         Self {
             storage_path: storage_path.to_path_buf(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -178,7 +191,7 @@ impl TokenStore {
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.get(&cache_key) {
-                if cached.cached_at.elapsed() < CACHE_TTL {
+                if cached.cached_at.elapsed() < self.cache_ttl {
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -474,6 +487,43 @@ mod tests {
 
         assert!(token.starts_with("nra_"));
         assert_eq!(token.len(), 4 + 32); // prefix + uuid without dashes
+    }
+
+    /// The verify-cache TTL bounds the cross-replica revocation window. Two
+    /// stores share one token dir (= two HA replicas, each with its own in-memory
+    /// cache). A token revoked on replica A is still served from replica B's cache
+    /// until B's `cache_ttl` elapses — and a short TTL bounds exactly that window.
+    #[test]
+    fn cache_ttl_bounds_cross_replica_revocation_window() {
+        use std::thread::sleep;
+        let dir = TempDir::new().unwrap();
+        let replica_a = TokenStore::new(dir.path());
+        let replica_b = TokenStore::with_cache_ttl(dir.path(), Duration::from_secs(1));
+
+        let token = replica_a.create_token("u", 30, None, Role::Write).unwrap();
+
+        // B verifies and caches the token.
+        assert!(replica_b.verify_token(&token).is_ok());
+
+        // A revokes it (removes the on-disk token + clears A's cache). B's cache is
+        // untouched — there is no cross-pod invalidation.
+        let hash_prefix = sha256_hex(&token)[..16].to_string();
+        replica_a.revoke_token(&hash_prefix).unwrap();
+
+        // WITHIN cache_ttl, B still serves the revoked token from cache — the
+        // documented window.
+        assert!(
+            replica_b.verify_token(&token).is_ok(),
+            "within cache_ttl, B serves from cache (bounded window)"
+        );
+
+        // After cache_ttl, B's entry is stale -> slow path re-reads disk -> the
+        // revoked (deleted) token is rejected. The TTL bounds the window.
+        sleep(Duration::from_millis(1100));
+        assert!(
+            matches!(replica_b.verify_token(&token), Err(TokenError::NotFound)),
+            "after cache_ttl, B re-reads disk and rejects the revoked token"
+        );
     }
 
     #[test]
