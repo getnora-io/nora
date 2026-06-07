@@ -157,6 +157,13 @@ pub struct AuthConfig {
     pub htpasswd_file: String,
     #[serde(default = "default_token_storage")]
     pub token_storage: String,
+    /// In-memory token-verify cache TTL (seconds). Lower it to bound the
+    /// cross-replica revocation window: under a multi-replica deployment a token
+    /// revoked on one replica is still served from another replica's cache until
+    /// its entry expires.
+    /// Default 300. ENV: NORA_AUTH_TOKEN_CACHE_TTL.
+    #[serde(default = "default_token_cache_ttl")]
+    pub token_cache_ttl: u64,
     /// Trusted proxy IPs/CIDRs — only these sources have XFF/X-Real-IP honored.
     /// Default: 127.0.0.1,::1 (loopback only).
     /// ENV: NORA_AUTH_TRUSTED_PROXIES=127.0.0.1,::1,10.0.0.0/8
@@ -309,6 +316,10 @@ pub(super) fn default_token_storage() -> String {
     "data/tokens".to_string()
 }
 
+pub(super) fn default_token_cache_ttl() -> u64 {
+    300
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -316,6 +327,7 @@ impl Default for AuthConfig {
             anonymous_read: false,
             htpasswd_file: "users.htpasswd".to_string(),
             token_storage: "data/tokens".to_string(),
+            token_cache_ttl: 300,
             trusted_proxies: TrustedProxies::default_loopback(),
             oidc: OidcConfig::default(),
         }
@@ -333,6 +345,11 @@ impl AuthConfig {
         }
         if let Ok(val) = env::var("NORA_AUTH_HTPASSWD_FILE") {
             self.htpasswd_file = val;
+        }
+        if let Ok(val) = env::var("NORA_AUTH_TOKEN_CACHE_TTL") {
+            if let Ok(secs) = val.parse() {
+                self.token_cache_ttl = secs;
+            }
         }
         if let Ok(val) = env::var("NORA_AUTH_TRUSTED_PROXIES") {
             self.trusted_proxies = TrustedProxies::parse(&val);

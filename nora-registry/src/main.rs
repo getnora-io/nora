@@ -1088,7 +1088,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     let tokens = if config.auth.enabled {
         let token_path = Path::new(&config.auth.token_storage);
         info!(path = %config.auth.token_storage, "Token storage initialized");
-        Some(TokenStore::new(token_path))
+        Some(TokenStore::with_cache_ttl(
+            token_path,
+            std::time::Duration::from_secs(config.auth.token_cache_ttl),
+        ))
     } else {
         None
     };
