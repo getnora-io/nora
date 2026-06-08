@@ -365,7 +365,15 @@ async fn download_archive(
 
     let key = format!("pub/packages/{}/versions/{}.tar.gz", package, version);
 
-    if let Ok(data) = state.storage.get(&key).await {
+    // get_verified discharges the integrity witness at the serve site (compile-time
+    // guarantee — see crate::verified). The .sha256 sidecar check below is kept: it
+    // is the integrity check on S3 (storage pins are local-only).
+    if let Ok(outcome) = state.storage.get_verified(&key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Integrity verification (curation allowlist)
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
