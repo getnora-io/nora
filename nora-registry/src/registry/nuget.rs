@@ -675,8 +675,14 @@ async fn flatcontainer_download(
         "application/octet-stream"
     };
 
-    // Immutable cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable cache. get_verified discharges the integrity witness at serve
+    // (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         if ends_with_ci(filename, ".nupkg") {
             if let Some(response) = crate::curation::verify_integrity(
                 &state.curation().curation_engine,
