@@ -296,8 +296,14 @@ async fn provider_download_binary(
 
     let storage_key = format!("terraform/download/{}", path);
 
-    // Immutable: if cached, serve directly
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable: if cached, serve directly. get_verified discharges the integrity
+    // witness at serve (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         state.metrics.record_download("terraform");
         state.metrics.record_cache_hit("terraform");
         state.activity.push(ActivityEntry::new(
@@ -552,8 +558,14 @@ async fn module_source_download(
         ns, name, provider, ver
     );
 
-    // Immutable: if cached, serve directly
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable: if cached, serve directly. get_verified discharges the integrity
+    // witness at serve (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         state.metrics.record_download("terraform");
         state.metrics.record_cache_hit("terraform");
         return with_binary(data.to_vec());
