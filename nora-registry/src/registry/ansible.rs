@@ -269,8 +269,14 @@ async fn download_tarball(
         return response;
     }
 
-    // Immutable cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable cache. get_verified discharges the integrity witness at serve
+    // (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Integrity check
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
