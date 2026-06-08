@@ -307,8 +307,14 @@ async fn download_gem(
         return response;
     }
 
-    // Immutable: if cached, serve directly
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable: if cached, serve directly. get_verified discharges the integrity
+    // witness at the serve site (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Curation integrity
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
@@ -390,8 +396,13 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
     let artifact = format!("{}-{}", name, version);
     let storage_key = format!("gems/quick/Marshal.4.8/{}.gemspec.rz", artifact);
 
-    // Immutable cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable cache. get_verified discharges the integrity witness at serve.
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         state.metrics.record_download("gems");
         state.metrics.record_cache_hit("gems");
         state.activity.push(ActivityEntry::new(
