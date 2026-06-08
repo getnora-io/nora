@@ -323,8 +323,14 @@ async fn recipe_file_download(
 
     let storage_key = format!("conan/{}/revisions/{}/files/{}", ref_str, rrev, filename);
 
-    // Immutable cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable cache. get_verified discharges the integrity witness at serve
+    // (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Curation integrity
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
@@ -599,8 +605,14 @@ async fn package_file_download(
         ref_str, rrev, pkg_id, prev, filename
     );
 
-    // Immutable cache
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    // Immutable cache. get_verified discharges the integrity witness at serve
+    // (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Curation integrity
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
