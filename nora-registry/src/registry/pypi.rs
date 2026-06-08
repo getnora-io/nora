@@ -249,8 +249,14 @@ async fn download_file(
 
     let key = format!("pypi/{}/{}", normalized, filename);
 
-    // Try local storage first
-    if let Ok(data) = state.storage.get(&key).await {
+    // Try local storage first. get_verified discharges the integrity witness at
+    // the serve site (compile-time guarantee — see crate::verified).
+    if let Ok(outcome) = state.storage.get_verified(&key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Curation integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
