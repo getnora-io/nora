@@ -16,7 +16,10 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
+use crate::registry::{
+    circuit_open_response, proxy_fetch, proxy_fetch_conditional, read_validators, write_validators,
+    ProxyError, Revalidation, Validators,
+};
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
 use crate::AppState;
@@ -199,18 +202,60 @@ async fn compact_index(
     let proxy_url = upstream_url(&state);
     let url = format!("{}/info/{}", proxy_url.trim_end_matches('/'), name);
 
-    match proxy_fetch_text(
+    // Revalidate stale metadata with a conditional request when enabled (a cheap
+    // 304 — RubyGems compact-index endpoints support validators) and fall back to
+    // a full fetch otherwise. Empty validators ⇒ no conditional headers ⇒ always
+    // a 200, which is also how the first fetch captures validators for next time.
+    let validators = if state.config.gems.revalidate {
+        read_validators(&state.storage, &storage_key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.gems.proxy_timeout),
         expose_opt(&state.config.gems.proxy_auth),
-        None,
+        &validators,
         &state.circuit_breaker,
         RegistryType::Gems,
     )
     .await
     {
-        Ok(text) => {
+        // Upstream unchanged — serve the cached body and bump its freshness so we
+        // do not revalidate again until the next TTL window. No body downloaded.
+        Ok(Revalidation::NotModified) => {
+            let cached = match state.storage.get(&storage_key).await {
+                Ok(b) => b,
+                // Body vanished under us — use the eagerly-read copy, or 502.
+                Err(_) => match cached_data {
+                    Some(b) => b,
+                    None => return StatusCode::BAD_GATEWAY.into_response(),
+                },
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["gems"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["gems"])
+                .inc_by(cached.len() as u64);
+            state.metrics.record_download("gems");
+            state.metrics.record_cache_hit("gems");
+            // Re-put bumps the file mtime (the freshness source) without download.
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let body = cached.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &body).await;
+            });
+            with_text(cached.to_vec())
+        }
+        // New body — cache the raw bytes first, then persist the fresh validators.
+        Ok(Revalidation::Modified { body, validators }) => {
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
@@ -223,12 +268,27 @@ async fn compact_index(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
-            state.spawn_cache("gems", storage_key, Bytes::from(text.clone()));
-            with_text(text.into_bytes())
+            let raw = Bytes::from(body);
+            let storage = state.storage.clone();
+            let key_clone = storage_key.clone();
+            let raw_for_cache = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "gems proxy: failed to cache compact index");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
+            with_text(raw.to_vec())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["gems"])
+                    .inc();
+            }
             if let Some(ref data) = cached_data {
                 if state.config.gems.serve_stale {
                     tracing::warn!(
@@ -843,5 +903,67 @@ mod integration_tests {
         // Off mode: no filtering
         let resp = send(&ctx.app, Method::GET, "/gems/gems/evil-gem-1.0.0.gem", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #52 acceptance: with a cached compact-index body + stored validators, a
+    /// stale request revalidates with `If-None-Match`; on upstream 304 the cached
+    /// body is served and NO 200-with-body is ever fetched. Drives the real
+    /// handler (RubyGems compact-index endpoints support validators per the
+    /// official Compact Index API guide).
+    #[tokio::test]
+    async fn test_gems_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 (no other mount), so any full fetch would visibly fail.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some(upstream.uri());
+            cfg.gems.metadata_ttl = 0; // always stale → always revalidate
+            cfg.gems.revalidate = true;
+            cfg.gems.serve_stale = false;
+        });
+
+        let key = "gems/info/rails";
+        ctx.state
+            .storage
+            .put(key, b"---\n1.0.0 |checksum:abc\n")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["gems"])
+            .get();
+
+        let resp = send(&ctx.app, Method::GET, "/gems/info/rails", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("1.0.0"),
+            "must serve the cached compact-index body"
+        );
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["gems"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }
