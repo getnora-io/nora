@@ -303,9 +303,21 @@ async fn download(
         crate_name, version, crate_name, version
     );
 
-    // Try local storage first
-    if let Ok(data) = state.storage.get(&key).await {
-        // Post-download integrity verification (issue #189)
+    // Try local storage first. `get_verified` runs the same fail-closed pin gate
+    // as `get`, but reflects the outcome in the type: the integrity witness is
+    // discharged once, here at the serve site, through `verified_body` — serving
+    // raw or merely tamper-evident bytes on this path is a compile error. An
+    // open-world read (unpinned key / S3 backend) is served knowingly, never
+    // silently. (Typestate rollout — see `crate::verified`, raw.rs is the PoC.)
+    if let Ok(outcome) = state.storage.get_verified(&key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
+
+        // Post-download integrity verification (issue #189) — a curation policy
+        // check, separate from the typestate pin gate, run on the witnessed bytes.
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Cargo,
