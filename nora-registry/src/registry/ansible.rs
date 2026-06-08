@@ -22,7 +22,8 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, read_validators,
+    write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -364,19 +365,65 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key:
         }
     }
 
-    // Cache miss or stale — fetch from upstream.
-    match proxy_fetch_text(
+    // Cache miss or stale — revalidate with a conditional request when enabled
+    // (a cheap 304 when the upstream sends validators) and fall back to a full
+    // fetch otherwise. Empty validators ⇒ no conditional headers ⇒ always a 200,
+    // which is also how the first fetch captures validators for next time.
+    let validators = if state.config.ansible.revalidate {
+        read_validators(&state.storage, cache_key)
+            .await
+            .unwrap_or_default()
+    } else {
+        Validators::default()
+    };
+    let had_validators = validators.is_some();
+
+    match proxy_fetch_conditional(
         &state.http_client,
         url,
         Duration::from_secs(state.config.ansible.proxy_timeout),
         expose_opt(&state.config.ansible.proxy_auth),
-        None,
+        &validators,
         &state.circuit_breaker,
         RegistryType::Ansible,
     )
     .await
     {
-        Ok(text) => {
+        // Upstream unchanged — serve the cached body (rewritten at read time) and
+        // bump its freshness so we don't revalidate again until the next TTL
+        // window. No body was downloaded.
+        Ok(Revalidation::NotModified) => {
+            let Ok(cached) = state.storage.get(cache_key).await else {
+                // Body vanished under us — fall back to serve-stale / 502.
+                return serve_stale_or_bad_gateway(
+                    state,
+                    cached_data,
+                    cache_key,
+                    &upstream,
+                    &base_url,
+                );
+            };
+            crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                .with_label_values(&["ansible"])
+                .inc();
+            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                .with_label_values(&["ansible"])
+                .inc_by(cached.len() as u64);
+            state.metrics.record_download("ansible");
+            state.metrics.record_cache_hit("ansible");
+            // Re-put bumps the file mtime (the freshness source) without download.
+            let storage = state.storage.clone();
+            let key_clone = cache_key.to_string();
+            let body = cached.clone();
+            tokio::spawn(async move {
+                let _ = storage.put(&key_clone, &body).await;
+            });
+            let text = String::from_utf8_lossy(&cached);
+            let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
+            with_json(rewritten.into_bytes())
+        }
+        // New body — cache the raw bytes first, then persist the fresh validators.
+        Ok(Revalidation::Modified { body, validators }) => {
             state.metrics.record_download("ansible");
             state.metrics.record_cache_miss("ansible");
             state.activity.push(ActivityEntry::new(
@@ -389,9 +436,22 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key:
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
 
-            // Cache raw response (before URL rewriting) for serve-stale.
-            state.spawn_cache("ansible", cache_key.to_string(), Bytes::from(text.clone()));
+            // Cache raw response (before URL rewriting) for serve-stale; the
+            // validator sidecar is written AFTER the body so it never advertises
+            // freshness for a body that is not there.
+            let raw = Bytes::from(body);
+            let storage = state.storage.clone();
+            let key_clone = cache_key.to_string();
+            let raw_for_cache = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
+                    tracing::warn!(key = %key_clone, error = ?e, "ansible proxy: failed to cache metadata");
+                    return;
+                }
+                write_validators(&storage, &key_clone, &validators).await;
+            });
 
+            let text = String::from_utf8_lossy(&raw);
             let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
             state.repo_index.invalidate("ansible");
             with_json(rewritten.into_bytes())
@@ -399,6 +459,11 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key:
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
+            if had_validators {
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["ansible"])
+                    .inc();
+            }
             tracing::debug!(error = ?e, "Ansible Galaxy upstream error");
             serve_stale_or_bad_gateway(state, cached_data, cache_key, &upstream, &base_url)
         }
@@ -996,5 +1061,76 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #52 acceptance: with a cached versions-list body + stored validators, a
+    /// stale request revalidates with `If-None-Match`; on upstream 304 the cached
+    /// body is served and NO 200-with-body is ever fetched. Drives the real
+    /// handler. (Self-hosted Galaxy NG sends no validators, but a fronting CDN
+    /// like galaxy.ansible.com does — this proves NORA uses them when present.)
+    #[tokio::test]
+    async fn test_ansible_revalidation_304_serves_cache_no_body_download() {
+        use crate::registry::{write_validators, Validators};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Conditional request (has If-None-Match) → 304. A request WITHOUT it
+        // would 404 (no other mount), so any full fetch would visibly fail —
+        // proving the 304 path served from cache.
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some(upstream.uri());
+            cfg.ansible.metadata_ttl = 0; // always stale → always revalidate
+            cfg.ansible.revalidate = true;
+            cfg.ansible.serve_stale = false;
+        });
+
+        // Pre-seed the cached versions body + validator sidecar (as a prior 200
+        // would have).
+        let key = "ansible/metadata/community/general/versions.json";
+        ctx.state
+            .storage
+            .put(key, br#"{"data":[{"version":"1.0.0"}]}"#)
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let before = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["ansible"])
+            .get();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/general/versions/",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("1.0.0"),
+            "must serve the cached versions body"
+        );
+
+        let after = crate::metrics::PROXY_UPSTREAM_304_TOTAL
+            .with_label_values(&["ansible"])
+            .get();
+        assert!(after > before, "a 304 revalidation must be recorded");
     }
 }
