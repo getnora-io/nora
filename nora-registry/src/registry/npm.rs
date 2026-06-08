@@ -163,7 +163,17 @@ async fn handle_request(
     }
 
     // --- Cache hit path ---
-    if let Ok(data) = state.storage.get(&key).await {
+    // get_verified discharges the integrity witness at the serve site (compile-time
+    // guarantee — see crate::verified). Both the tarball serve (pinned, Verified arm)
+    // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. The
+    // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
+    // pins are local-only).
+    if let Ok(outcome) = state.storage.get_verified(&key).await {
+        use nora_registry::verified::{verified_body, GateOutcome};
+        let data = match outcome {
+            GateOutcome::Verified(blob) => verified_body(blob),
+            GateOutcome::Unpinned(blob) => blob.into_inner(),
+        };
         // Metadata TTL: if stale, try to refetch from upstream
         if !is_tarball {
             let ttl = state.config.npm.metadata_ttl;
