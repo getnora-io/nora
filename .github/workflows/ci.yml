@@ -102,7 +102,10 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Run on every PR (so the fail-under floor actually gates merges) and on
+    # main pushes (to refresh the badge). Previously main-push-only, so the
+    # floor never ran on the PRs it was meant to protect.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     permissions:
       contents: read
     steps:
@@ -118,13 +121,19 @@ jobs:
         run: cargo install cargo-tarpaulin --locked
 
       - name: Run coverage
+        # No pipe: tarpaulin's exit code (non-zero when coverage < fail-under)
+        # must reach the runner. The old `| tee` masked it behind tee's exit 0,
+        # so the fail-under floor never failed the build.
         run: |
-          cargo tarpaulin --config tarpaulin.toml 2>&1 | tee /tmp/tarpaulin.log
+          cargo tarpaulin --config tarpaulin.toml
           COVERAGE=$(python3 -c "import json; d=json.load(open('coverage/tarpaulin-report.json')); print(f\"{d['coverage']:.1f}\")")
           echo "COVERAGE=$COVERAGE" >> $GITHUB_ENV
           echo "Coverage: $COVERAGE%"
 
       - name: Update coverage badge
+        # Badge needs the GIST_TOKEN secret and only makes sense for the
+        # canonical branch — skip on PRs (incl. forks without secrets).
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: schneegans/dynamic-badges-action@0e50b8bad39e7e1afd3e4e9c2b7dd145fad07501 # v1.8.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}
