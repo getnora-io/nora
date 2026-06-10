@@ -14,7 +14,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, Header};
 
 /// Backup metadata stored in metadata.json
@@ -60,8 +60,17 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         println!("Found {} artifacts", keys.len());
     }
 
-    // Create output file
-    let file = File::create(output).map_err(|e| format!("Failed to create output file: {}", e))?;
+    // Write to a sibling temp file, then fsync + atomically rename, so a crash
+    // mid-write leaves the previous backup (or nothing) intact — never a truncated
+    // archive at the real path. `output_size > 0` is the only success signal and is
+    // true for a truncated file too, so a partial archive at `output` reads as valid.
+    let tmp_output = {
+        let mut p = output.as_os_str().to_owned();
+        p.push(".tmp");
+        PathBuf::from(p)
+    };
+    let file =
+        File::create(&tmp_output).map_err(|e| format!("Failed to create output file: {}", e))?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut archive = Builder::new(encoder);
 
@@ -142,9 +151,25 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     let encoder = archive
         .into_inner()
         .map_err(|e| format!("Failed to finish archive: {}", e))?;
-    encoder
+    let file = encoder
         .finish()
         .map_err(|e| format!("Failed to finish compression: {}", e))?;
+    // Durability + atomic publish: fsync the archive bytes, rename into place, then
+    // fsync the parent directory so the rename itself survives power-loss.
+    file.sync_all()
+        .map_err(|e| format!("Failed to fsync backup archive: {}", e))?;
+    drop(file);
+    std::fs::rename(&tmp_output, output)
+        .map_err(|e| format!("Failed to publish backup archive: {}", e))?;
+    {
+        let dir = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
 
     pb.finish_with_message("Backup complete");
 
