@@ -18,6 +18,10 @@ RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 
+# Pin the build toolchain: rustup reads rust-toolchain.toml and installs the
+# exact channel, so the release binary is reproducible regardless of the base
+# image's bundled rustc.
+COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
 
@@ -45,9 +49,12 @@ RUN apk add --no-cache musl-dev \
 ENV PATH="/opt/aarch64-linux-musl-cross/bin:$PATH" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
 
+WORKDIR /build
+# Pin the toolchain before adding the cross target so the target lands on the
+# pinned channel (rust-toolchain.toml), keeping the arm64 build reproducible.
+COPY rust-toolchain.toml ./
 RUN rustup target add aarch64-unknown-linux-musl
 
-WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
 RUN sed -i '/"fuzz"/d' Cargo.toml
