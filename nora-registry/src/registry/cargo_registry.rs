@@ -18,6 +18,7 @@ use crate::registry::{
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
+use crate::storage::Storage;
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -605,7 +606,7 @@ async fn publish(
     }
 
     // Regenerate the sparse index by listing the per-version entry keys (multi-replica-safe).
-    if regenerate_cargo_index(&state, &prefix, &name)
+    if regenerate_cargo_index(&state.storage, &prefix, &name)
         .await
         .is_err()
     {
@@ -654,25 +655,25 @@ async fn publish(
 /// per-version entry keys and concatenating their lines. Multi-replica-safe: concurrent publishes
 /// write distinct entry keys, so no version line is lost (vs the old read-modify-write of the
 /// shared index file). Mirrors maven scan-regenerate.
-async fn regenerate_cargo_index(state: &AppState, prefix: &str, name: &str) -> Result<(), ()> {
+async fn regenerate_cargo_index(storage: &Storage, prefix: &str, name: &str) -> Result<(), ()> {
     let entries_prefix = format!("cargo/index-entries/{}/{}/", prefix, name);
-    let mut keys = state
-        .storage
-        .list(&entries_prefix)
-        .await
-        .unwrap_or_default();
+    // All-or-fail: a transient list/read error must NOT silently produce a
+    // truncated (or empty) index and publish it as authoritative — that would
+    // drop versions a client already saw as published. Abort instead; the caller
+    // returns 500 and the existing index stays intact until a clean rebuild. An
+    // empty list is a legitimate empty crate, not an error, and is preserved.
+    let mut keys = storage.list(&entries_prefix).await.map_err(|_| ())?;
     keys.sort(); // deterministic order (cargo accepts any line order)
     let mut index: Vec<u8> = Vec::new();
     for key in &keys {
-        if let Ok(line) = state.storage.get(key).await {
-            index.extend_from_slice(&line);
-            if !line.ends_with(b"\n") {
-                index.push(b'\n');
-            }
+        let line = storage.get(key).await.map_err(|_| ())?;
+        index.extend_from_slice(&line);
+        if !line.ends_with(b"\n") {
+            index.push(b'\n');
         }
     }
     let index_key = format!("cargo/index/{}/{}", prefix, name);
-    state.storage.put(&index_key, &index).await.map_err(|_| ())
+    storage.put(&index_key, &index).await.map_err(|_| ())
 }
 
 /// Seed per-version entry keys from an old single-file sparse index (one JSON line per version, no
@@ -855,6 +856,74 @@ mod tests {
     fn test_crate_name_max_length() {
         assert!(is_valid_crate_name(&"a".repeat(64)));
         assert!(!is_valid_crate_name(&"a".repeat(65)));
+    }
+
+    // ── Index rebuild is all-or-fail ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_regenerate_cargo_index_aborts_on_read_error() {
+        // A transient read error on a per-version entry must ABORT the rebuild,
+        // never silently drop the version and publish a truncated index as
+        // authoritative. The list reports two versions; every get fails, so a
+        // correct rebuild returns Err and writes nothing — the `put` mock panics
+        // if it is ever reached, proving the old "skip and write empty" path is
+        // gone.
+        use crate::storage::{Result as StorageResult, StorageBackend, StorageError};
+        use axum::body::Bytes;
+        use std::path::Path;
+        use std::pin::Pin;
+        use tokio::io::AsyncRead;
+
+        struct FailingGetBackend;
+
+        #[async_trait::async_trait]
+        impl StorageBackend for FailingGetBackend {
+            async fn list(&self, _prefix: &str) -> StorageResult<Vec<String>> {
+                Ok(vec![
+                    "cargo/index-entries/fa/il/failcrate/0.1.0.json".to_string(),
+                    "cargo/index-entries/fa/il/failcrate/0.2.0.json".to_string(),
+                ])
+            }
+            async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+                Err(StorageError::Io(
+                    "injected transient read error".to_string(),
+                ))
+            }
+            async fn put(&self, _key: &str, _data: &[u8]) -> StorageResult<()> {
+                panic!("regenerate must abort before writing a truncated index");
+            }
+            async fn delete(&self, _key: &str) -> StorageResult<()> {
+                Ok(())
+            }
+            async fn stat(&self, _key: &str) -> Option<crate::storage::FileMeta> {
+                None
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "failing-get-test"
+            }
+            async fn put_from_path(&self, _key: &str, _src: &Path) -> StorageResult<()> {
+                Ok(())
+            }
+            async fn get_reader(
+                &self,
+                _key: &str,
+            ) -> StorageResult<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        let storage = Storage::from_backend(std::sync::Arc::new(FailingGetBackend));
+        let result = regenerate_cargo_index(&storage, "fa/il", "failcrate").await;
+        assert!(
+            result.is_err(),
+            "a transient read error must abort the rebuild, not publish a truncated index"
+        );
     }
 }
 
