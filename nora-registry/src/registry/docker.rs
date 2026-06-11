@@ -581,10 +581,14 @@ fn validate_upload_uuid(uuid: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Remove stale temp files from the Docker upload directory on startup.
+/// Remove stale temp files from the Docker upload directory.
 ///
 /// Files older than `SESSION_TTL` are removed regardless of name format.
-/// This catches orphans from previous crashes, TOCTOU races, and legacy naming.
+/// Called at startup and periodically from the background task (mirrors
+/// [`cleanup_proxy_temp_dir`]), so an upload temp orphaned by a storage-write
+/// failure — whose session entry is already gone, so `cleanup_expired_sessions`
+/// will never free it — is reclaimed without waiting for a restart. The
+/// `SESSION_TTL` age guard keeps in-progress uploads safe under the periodic call.
 pub fn cleanup_upload_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
     let entries = match std::fs::read_dir(&dir) {
@@ -608,7 +612,7 @@ pub fn cleanup_upload_temp_dir(data_dir: &str) {
         }
     }
     if removed > 0 {
-        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files on startup");
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files");
     }
 }
 
