@@ -1053,15 +1053,32 @@ impl ProxyFilter for MinReleaseAgeFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
-        let Some(publish_ts) = request.publish_date else {
-            return Decision::Skip; // Unknown date — don't block
-        };
-
-        // Use per-registry override if available, otherwise global default
+        // Resolve the threshold for this registry first: a per-registry override
+        // takes precedence over the global default.
         let (threshold, label) = if let Some((secs, lbl)) = self.overrides.get(&request.registry) {
             (*secs, lbl.as_str())
         } else {
             (self.min_age_secs, self.label.as_str())
+        };
+
+        let Some(publish_ts) = request.publish_date else {
+            // Fail-closed: an unknown publish date must NOT bypass an active
+            // quarantine. Curation is fail-closed by design — the config layer
+            // rejects on_failure="open" — so this filter, the one place that
+            // defers on missing data, must not be the lone fail-open hole. If the
+            // quarantine is disabled for this registry (threshold 0) there is
+            // nothing to enforce, so defer to the next filter.
+            return if threshold > 0 {
+                Decision::Block {
+                    rule: "min-release-age".to_string(),
+                    reason: format!(
+                        "publish date unknown — cannot verify the {} minimum age; blocked fail-closed",
+                        label,
+                    ),
+                }
+            } else {
+                Decision::Skip
+            };
         };
 
         let now = std::time::SystemTime::now()
@@ -3070,8 +3087,28 @@ mod min_release_age_tests {
     }
 
     #[test]
-    fn test_min_release_age_unknown_date_skips() {
+    fn test_min_release_age_unknown_date_blocked_fail_closed() {
+        // An unknown publish date must NOT bypass an active quarantine: curation
+        // is fail-closed, so a package whose age cannot be verified is blocked.
         let filter = MinReleaseAgeFilter::new(604800, "7d");
+        let request = FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "unknown-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        assert!(matches!(filter.evaluate(&request), Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_min_release_age_unknown_date_skips_when_disabled() {
+        // With the quarantine disabled for this registry (threshold 0) an unknown
+        // date has nothing to enforce against, so it defers — operators can opt a
+        // registry out of the age quarantine.
+        let filter = MinReleaseAgeFilter::new(0, "0");
         let request = FilterRequest {
             registry: RegistryType::Npm,
             upstream: None,
