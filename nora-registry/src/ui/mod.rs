@@ -12,9 +12,11 @@ use crate::repo_index::paginate;
 use crate::tokens::Role;
 use crate::AppState;
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
 };
@@ -162,6 +164,65 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ui/{registry_type}/list", get(api_list))
         .route("/api/ui/{registry_type}/{name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
+}
+
+/// Prefix NORA's root-absolute UI self-links with `base` so the UI works when
+/// NORA is mounted under a sub-path. Anchored on the quote that opens an HTML
+/// attribute or JS string, so only emitted links (`href`/`src`/`hx-*`/`fetch(`)
+/// are rewritten — never a link-like substring in page text. No-op when empty.
+fn apply_base_path(html: &str, base: &str) -> String {
+    if base.is_empty() {
+        return html.to_string();
+    }
+    html.replace("\"/ui", &format!("\"{base}/ui"))
+        .replace("'/ui", &format!("'{base}/ui"))
+        .replace("\"/api/ui", &format!("\"{base}/api/ui"))
+        .replace("'/api/ui", &format!("'{base}/api/ui"))
+}
+
+/// Response middleware: rewrite the UI's root-absolute self-links to carry the
+/// configured `public_url` path prefix. Covers HTML bodies (links + inline JS
+/// `fetch`) and redirect `Location` headers. A no-op when `base_path` is empty
+/// (the router keeps serving `/ui` and `/api/ui`; the proxy strips the prefix).
+pub(crate) async fn rewrite_ui_base_path(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let base = state.config.server.base_path();
+    let mut resp = next.run(req).await;
+    if base.is_empty() {
+        return resp;
+    }
+    // A redirect target (e.g. "/" -> "/ui/") must carry the prefix too.
+    if let Some(loc) = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if (loc.starts_with("/ui") || loc.starts_with("/api/ui")) && !loc.starts_with(&base) {
+            if let Ok(hv) = HeaderValue::from_str(&format!("{base}{loc}")) {
+                resp.headers_mut().insert(header::LOCATION, hv);
+            }
+        }
+    }
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.contains("text/html"));
+    if !is_html {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let rewritten = apply_base_path(&String::from_utf8_lossy(&bytes), &base);
+    // The body length changed; drop the stale Content-Length so it is recomputed.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(rewritten))
 }
 
 // Dashboard page
@@ -915,5 +976,43 @@ async fn tokens_revoke(
             );
             (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
         }
+    }
+}
+
+#[cfg(test)]
+mod base_path_tests {
+    use super::*;
+
+    #[test]
+    fn apply_base_path_is_noop_when_empty() {
+        let html = r#"<a href="/ui/docker">d</a><script src="/ui/static/x.js"></script>"#;
+        assert_eq!(apply_base_path(html, ""), html);
+    }
+
+    #[test]
+    fn apply_base_path_prefixes_ui_and_api_links() {
+        let html = concat!(
+            r#"<link href="/ui/static/tailwind.css">"#,
+            r#"<a href="/ui/docker">d</a>"#,
+            r#"<script>fetch('/api/ui/dashboard')</script>"#,
+            r#"<form action="/api/ui/tokens/create">"#,
+        );
+        let out = apply_base_path(html, "/nora");
+        assert!(out.contains(r#"href="/nora/ui/static/tailwind.css""#));
+        assert!(out.contains(r#"href="/nora/ui/docker""#));
+        assert!(out.contains("fetch('/nora/api/ui/dashboard')"));
+        assert!(out.contains(r#"action="/nora/api/ui/tokens/create""#));
+        // No leftover bare links, no double-prefix.
+        assert!(!out.contains(r#"href="/ui/"#));
+        assert!(!out.contains("fetch('/api/ui"));
+        assert!(!out.contains("/nora/nora/"));
+    }
+
+    #[test]
+    fn apply_base_path_leaves_non_link_text_untouched() {
+        // A link-like substring not anchored on an attribute/JS quote (e.g. in
+        // body text) is not a self-link and must not be rewritten.
+        let html = r#"<p>the path /ui/docker is shown</p>"#;
+        assert_eq!(apply_base_path(html, "/nora"), html);
     }
 }

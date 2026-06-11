@@ -1340,6 +1340,13 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.clone(),
             metrics::leak_detection_middleware,
         ))
+        // Prefix the UI's root-absolute self-links + redirects with the public_url
+        // path so the UI works under a sub-path behind a proxy. No-op when unset;
+        // only buffers text/html (UI pages), so blob streams pass through untouched.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ui::rewrite_ui_base_path,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

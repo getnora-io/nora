@@ -91,6 +91,23 @@ impl ServerConfig {
             .to_string()
     }
 
+    /// Path prefix the UI must prepend to its root-absolute self-links so it
+    /// works when NORA is mounted under a sub-path behind a reverse proxy
+    /// (`location /nora/ { proxy_pass http://nora:4000/; }`, trailing slash
+    /// strips `/nora`). Derived from the path component of `public_url`, trailing
+    /// slash trimmed. Empty when `public_url` is unset or has no path — a no-op
+    /// for every root-vhost deploy, which is the common case.
+    pub fn base_path(&self) -> String {
+        let Some(url) = self.public_url.as_deref() else {
+            return String::new();
+        };
+        // Path component without a URL crate: drop the scheme, then the authority
+        // (up to the first '/'), keep the rest.
+        let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let path = after_scheme.find('/').map_or("", |i| &after_scheme[i..]);
+        path.trim_end_matches('/').to_string()
+    }
+
     /// Apply environment variable overrides for server config.
     pub(super) fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("NORA_HOST") {
@@ -165,6 +182,26 @@ mod tests {
             "http://[2001:db8::1]:4000"
         );
         assert_eq!(server("::1", 4000).public_host(), "[::1]:4000");
+    }
+
+    #[test]
+    fn base_path_extracts_public_url_path_or_empty() {
+        // No public_url → empty (no-op for root-vhost deploys).
+        assert_eq!(server("127.0.0.1", 4000).base_path(), "");
+
+        let mut s = server("h", 4000);
+        // public_url with no path → empty.
+        s.public_url = Some("https://nora.example.com".into());
+        assert_eq!(s.base_path(), "");
+        s.public_url = Some("https://nora.example.com:8443".into());
+        assert_eq!(s.base_path(), "");
+        // Sub-path mount → the path prefix, trailing slash trimmed.
+        s.public_url = Some("https://example.com/nora".into());
+        assert_eq!(s.base_path(), "/nora");
+        s.public_url = Some("https://example.com/nora/".into());
+        assert_eq!(s.base_path(), "/nora");
+        s.public_url = Some("https://example.com:8443/team/nora".into());
+        assert_eq!(s.base_path(), "/team/nora");
     }
 
     #[test]
