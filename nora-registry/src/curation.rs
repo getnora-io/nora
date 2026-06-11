@@ -1005,9 +1005,12 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
 
 /// Filter that blocks packages published less than `min_age_secs` ago.
 ///
-/// If `publish_date` is `None` (unknown), the filter returns `Skip` (no opinion).
-/// Supports per-registry overrides: if a registry has its own threshold,
-/// it takes precedence over the global `min_age_secs`.
+/// If `publish_date` is `None` (unknown), the filter fails **closed**: it returns
+/// `Block` when the quarantine is active (threshold > 0), so an unverifiable age
+/// cannot slip past the cooldown, and `Skip` only when the quarantine is disabled
+/// for that registry (threshold `0`). Supports per-registry overrides: if a
+/// registry has its own threshold, it takes precedence over the global
+/// `min_age_secs`.
 pub struct MinReleaseAgeFilter {
     min_age_secs: i64,
     label: String,
