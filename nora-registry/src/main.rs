@@ -1427,13 +1427,20 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
-            // + clean up stale proxy temp files (#580)
+            // + clean up stale proxy and upload temp files (#580)
             if tick_count.is_multiple_of(10) {
                 let mut locks = metrics_state.publish_locks.lock();
                 locks.retain(|_, arc| Arc::strong_count(arc) > 1);
                 let storage_path = metrics_state.config.storage.path.clone();
                 tokio::task::spawn_blocking(move || {
                     registry::docker::cleanup_proxy_temp_dir(&storage_path);
+                    // Reclaim upload temp files orphaned by a storage-write failure
+                    // without waiting for a restart. cleanup_expired_sessions only
+                    // frees temps still tracked by a live (expired) session, so an
+                    // orphan whose session entry is already gone would otherwise
+                    // survive on disk until the next boot. Age-guarded by SESSION_TTL,
+                    // so in-progress uploads are never reaped.
+                    registry::docker::cleanup_upload_temp_dir(&storage_path);
                 });
             }
         }

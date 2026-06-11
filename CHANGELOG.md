@@ -2,6 +2,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **Docker upload temp files orphaned by a write failure are now reclaimed periodically** — `cleanup_upload_temp_dir` ran only at startup, so a temp file left behind by a storage-write failure — whose upload session entry is already gone, and so is never freed by the expired-session sweep — survived on disk until the next restart, slowly leaking disk. It now also runs on the 5-minute background sweep (mirroring the proxy temp dir); the `SESSION_TTL` age guard keeps in-progress uploads safe (#683).
 - **Cargo sparse-index rebuild is now all-or-fail** — regenerating the index swallowed a transient list/read error (`unwrap_or_default()` on the entry listing, `if let Ok` per entry), so an I/O blip could publish a truncated — or empty — index as authoritative and silently drop versions a client had already published successfully. A read error now aborts the rebuild (the publish returns `500` and the existing index stays intact); a genuinely empty crate is still handled as empty (#681).
 - **Docker pull command in the UI** — the package detail view built `docker pull` from `public_url` verbatim, so a configured `public_url` with a scheme produced an invalid `docker pull https://host/image`. The pull command now uses the bare host authority.
 - **IPv6 fallback base URL** — when `public_url` is unset and the bind host is an IPv6 literal, the advertised base URL now brackets the address (`http://[::1]:4000`), matching the listen address format.
