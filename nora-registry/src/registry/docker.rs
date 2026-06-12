@@ -2239,6 +2239,69 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
 // Delete handlers (Docker Registry V2 spec)
 // ============================================================================
 
+/// Delete every tag manifest that resolves to `digest` (#658).
+///
+/// NORA stores a tag and its digest as independent files, so deleting a manifest
+/// by digest would otherwise leave the tag still serving it. Each candidate tag
+/// is locked and re-read under the lock, and only deleted if it *still* hashes to
+/// `digest`, so a concurrent re-tag is never clobbered.
+async fn delete_tags_for_digest(state: &AppState, ns: Option<&str>, name: &str, digest: &str) {
+    use sha2::Digest as _;
+
+    let prefix = manifest_prefix(ns, name);
+    let legacy_prefix = manifest_prefix(None, name);
+    let mut keys = state.storage.list(&prefix).await.unwrap_or_default();
+    if prefix != legacy_prefix {
+        if let Ok(legacy) = state.storage.list(&legacy_prefix).await {
+            keys.extend(legacy);
+        }
+    }
+    // Distinct tag references only — skip digest files and `.meta` sidecars.
+    let mut tags: Vec<String> = keys
+        .iter()
+        .filter_map(|k| {
+            k.strip_prefix(&prefix)
+                .or_else(|| k.strip_prefix(&legacy_prefix))
+                .and_then(|t| t.strip_suffix(".json"))
+                .map(String::from)
+        })
+        .filter(|t| !t.starts_with("sha256:") && !ends_with_ci(t, ".meta") && !t.contains(".meta."))
+        .collect();
+    tags.sort();
+    tags.dedup();
+
+    for tag in tags {
+        let key = manifest_key(ns, name, &tag);
+        let legacy_key = manifest_key(None, name, &tag);
+        // Serialize with put_manifest on this tag.
+        let lock = state.publish_lock(&key);
+        let _guard = lock.lock().await;
+        // Re-read under the lock; only delete if it STILL resolves to `digest`.
+        let data = match storage_get_with_fallback(&state.storage, &key, &legacy_key).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let resolved = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+        if resolved != digest {
+            continue;
+        }
+        let _ = state.storage.delete(&key).await;
+        let _ = state.storage.delete(&legacy_key).await;
+        let _ = state
+            .storage
+            .delete(&manifest_meta_key(ns, name, &tag))
+            .await;
+        let _ = state
+            .storage
+            .delete(&manifest_meta_key(None, name, &tag))
+            .await;
+        tracing::info!(
+            name = %name, tag = %tag, digest = %digest,
+            "Docker tag removed because its manifest was deleted by digest (#658)"
+        );
+    }
+}
+
 async fn delete_manifest(
     State(state): State<AppState>,
     Path((name, reference)): Path<(String, String)>,
@@ -2288,6 +2351,10 @@ async fn delete_manifest(
                 .delete(&manifest_meta_key(None, &name, &digest))
                 .await;
         }
+    } else {
+        // #658: deleting by digest must also drop the tags that resolve to it,
+        // so the registry stops serving a tag whose manifest is now gone.
+        delete_tags_for_digest(&state, ns.as_deref(), &name, &reference).await;
     }
 
     // Delete manifest — try namespaced key first, then legacy fallback
@@ -3552,6 +3619,72 @@ mod integration_tests {
         )
         .await;
         assert_eq!(del.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_docker_delete_by_digest_removes_tag() {
+        // #658: deleting a manifest by digest must also drop the tags that
+        // resolve to it, so the registry stops serving a now-gone manifest.
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "alpine").await;
+        let put_resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/alpine/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        let digest = put_resp
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Delete the manifest by digest.
+        let del = send(
+            &ctx.app,
+            Method::DELETE,
+            &format!("/v2/alpine/manifests/{}", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::ACCEPTED);
+
+        // The tag must no longer resolve.
+        let tag_get = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/alpine/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            tag_get.status(),
+            StatusCode::NOT_FOUND,
+            "tag must 404 after its manifest is deleted by digest (#658)"
+        );
+
+        // ...and it must not appear in tags/list.
+        let list = send(&ctx.app, Method::GET, "/v2/alpine/tags/list", Body::empty()).await;
+        let body = body_bytes(list).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tags = json["tags"].as_array().unwrap();
+        assert!(
+            !tags.contains(&serde_json::json!("v1")),
+            "v1 must be gone from tags/list after digest delete (#658)"
+        );
     }
 
     #[tokio::test]
