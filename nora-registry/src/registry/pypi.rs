@@ -16,7 +16,6 @@ use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
 use crate::registry_type::RegistryType;
-use crate::secrets::expose_opt;
 use crate::ui::components::html_escape;
 use crate::validation::ends_with_ci;
 use crate::AppState;
@@ -163,49 +162,62 @@ async fn package_versions(
     // When proxy is configured, fetch upstream index and merge with local files.
     // This fixes the case where a cp314 wheel is cached but pip 3.10 needs to
     // see the full upstream file list to find a compatible cp310 wheel.
-    if let Some(proxy_url) = &state.config.pypi.proxy {
-        let url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
-
-        match proxy_fetch_text(
-            &state.http_client,
-            &url,
-            Duration::from_secs(state.config.pypi.proxy_timeout),
-            expose_opt(&state.config.pypi.proxy_auth),
-            Some(("Accept", "text/html")),
-            &state.circuit_breaker,
-            RegistryType::PyPI,
-        )
-        .await
-        {
-            Ok(html) => {
-                let upstream_files = parse_upstream_files(&html);
-                let merged = merge_file_lists(upstream_files, &local_files);
-
-                if !merged.is_empty() {
-                    return if wants_json(&headers) {
-                        versions_json_response(&normalized, &merged, &base_url)
-                    } else {
-                        versions_html_response(&normalized, &merged, &base_url)
-                    };
+    // Fetch each configured upstream's index and merge them (#663). Precedence is
+    // the upstream order: the first upstream that lists a file wins (local files
+    // win over all upstreams). One upstream's failure or open breaker must not
+    // sink the others — skip it and serve the merge of what answered.
+    let upstreams = state.config.pypi.upstreams();
+    let mut circuit_open = false;
+    if !upstreams.is_empty() {
+        let mut upstream_files: Vec<FileEntry> = Vec::new();
+        for up in &upstreams {
+            let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
+            match proxy_fetch_text(
+                &state.http_client,
+                &url,
+                Duration::from_secs(state.config.pypi.proxy_timeout),
+                up.auth(),
+                Some(("Accept", "text/html")),
+                &state.circuit_breaker,
+                RegistryType::PyPI,
+            )
+            .await
+            {
+                Ok(html) => upstream_files.extend(parse_upstream_files(&html)),
+                Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                    circuit_open = true;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
+                    continue;
                 }
             }
-            Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
-                return circuit_open_response(&reg)
-            }
-            Err(e) => {
-                tracing::debug!(error = ?e, package = %normalized, "PyPI versions proxy fetch failed, falling through to local-only");
-            }
         }
-        tracing::warn!(registry = "pypi", package = %normalized, "Proxy failed, returning 404");
+        let merged = merge_file_lists(upstream_files, &local_files);
+        if !merged.is_empty() {
+            return if wants_json(&headers) {
+                versions_json_response(&normalized, &merged, &base_url)
+            } else {
+                versions_html_response(&normalized, &merged, &base_url)
+            };
+        }
     }
 
-    // No proxy configured, or proxy failed — return local files only
+    // Local files only — degrade gracefully when upstreams list nothing or are down.
     if !local_files.is_empty() {
         return if wants_json(&headers) {
             versions_json_response(&normalized, &local_files, &base_url)
         } else {
             versions_html_response(&normalized, &local_files, &base_url)
         };
+    }
+
+    // No upstream result and no local copy: a tripped breaker means the upstream is
+    // temporarily down — return 503 (retryable) rather than 404, which would poison
+    // pip's negative cache.
+    if circuit_open {
+        return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -292,82 +304,97 @@ async fn download_file(
             .into_response();
     }
 
-    // Try proxy if configured
-    if let Some(proxy_url) = &state.config.pypi.proxy {
-        let page_url = format!("{}/{}/", proxy_url.trim_end_matches('/'), normalized);
+    // Try each configured upstream in order; the first whose index lists the file
+    // serves it, fetched from that same upstream with that upstream's auth. One
+    // upstream's failure or open breaker skips to the next rather than failing (#663).
+    let mut circuit_open = false;
+    for up in &state.config.pypi.upstreams() {
+        let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
-        match proxy_fetch_text(
+        let html = match proxy_fetch_text(
             &state.http_client,
             &page_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            expose_opt(&state.config.pypi.proxy_auth),
+            up.auth(),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
             RegistryType::PyPI,
         )
         .await
         {
-            Ok(html) => {
-                if let Some(file_url) = find_file_url(&html, &filename) {
-                    match proxy_fetch(
-                        &state.http_client,
-                        &file_url,
-                        Duration::from_secs(state.config.pypi.proxy_timeout),
-                        expose_opt(&state.config.pypi.proxy_auth),
-                        &state.circuit_breaker,
-                        RegistryType::PyPI,
-                    )
-                    .await
-                    {
-                        Ok(data) => {
-                            state.metrics.record_download("pypi");
-                            state.metrics.record_cache_miss("pypi");
-                            state.activity.push(ActivityEntry::new(
-                                ActionType::ProxyFetch,
-                                format!("{}/{}", name, filename),
-                                "pypi",
-                                "PROXY",
-                            ));
-                            state
-                                .audit
-                                .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
-
-                            // Cache in background + compute hash, invalidate AFTER write
-                            let storage = state.storage.clone();
-                            let key_clone = key.clone();
-                            let data_clone = data.clone();
-                            let repo_index = Arc::clone(&state.repo_index);
-                            tokio::spawn(async move {
-                                if storage.put(&key_clone, &data_clone).await.is_ok() {
-                                    let hash = hex::encode(sha2::Sha256::digest(&data_clone));
-                                    let _ = storage
-                                        .put(&format!("{}.sha256", key_clone), hash.as_bytes())
-                                        .await;
-                                    repo_index.invalidate("pypi");
-                                }
-                            });
-
-                            let content_type = pypi_content_type(&filename);
-                            return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
-                                .into_response();
-                        }
-                        Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
-                            return circuit_open_response(&reg)
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = ?e, package = %normalized, filename = %filename, "PyPI file proxy fetch failed");
-                        }
-                    }
-                }
-            }
-            Err(crate::registry::ProxyError::CircuitOpen(reg)) => {
-                return circuit_open_response(&reg)
+            Ok(html) => html,
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                circuit_open = true;
+                continue;
             }
             Err(e) => {
-                tracing::debug!(error = ?e, package = %normalized, "PyPI page proxy fetch failed");
+                tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
+                continue;
+            }
+        };
+
+        // The file may live on a later upstream — keep walking the list.
+        let Some(file_url) = find_file_url(&html, &filename) else {
+            continue;
+        };
+
+        match proxy_fetch(
+            &state.http_client,
+            &file_url,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
+            up.auth(),
+            &state.circuit_breaker,
+            RegistryType::PyPI,
+        )
+        .await
+        {
+            Ok(data) => {
+                state.metrics.record_download("pypi");
+                state.metrics.record_cache_miss("pypi");
+                state.activity.push(ActivityEntry::new(
+                    ActionType::ProxyFetch,
+                    format!("{}/{}", name, filename),
+                    "pypi",
+                    "PROXY",
+                ));
+                state
+                    .audit
+                    .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
+
+                // Cache in background + compute hash, invalidate AFTER write
+                let storage = state.storage.clone();
+                let key_clone = key.clone();
+                let data_clone = data.clone();
+                let repo_index = Arc::clone(&state.repo_index);
+                tokio::spawn(async move {
+                    if storage.put(&key_clone, &data_clone).await.is_ok() {
+                        let hash = hex::encode(sha2::Sha256::digest(&data_clone));
+                        let _ = storage
+                            .put(&format!("{}.sha256", key_clone), hash.as_bytes())
+                            .await;
+                        repo_index.invalidate("pypi");
+                    }
+                });
+
+                let content_type = pypi_content_type(&filename);
+                return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)
+                    .into_response();
+            }
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                circuit_open = true;
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(error = ?e, package = %normalized, filename = %filename, upstream = %up.url(), "PyPI file proxy fetch failed, trying next upstream");
+                continue;
             }
         }
-        tracing::warn!(registry = "pypi", package = %normalized, filename = %filename, "Proxy failed, returning 404");
+    }
+
+    // A tripped breaker means an upstream is temporarily down — 503 (retryable)
+    // rather than 404, which would poison pip's negative cache.
+    if circuit_open {
+        return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -717,18 +744,27 @@ fn parse_upstream_files(html: &str) -> Vec<FileEntry> {
 /// Local entries take precedence (they have verified hashes from storage).
 /// Upstream entries are added only if no local file with the same name exists.
 fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEntry> {
-    let seen: std::collections::HashSet<&str> = local.iter().map(|f| f.filename.as_str()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(upstream.len() + local.len());
 
+    // Local first (highest precedence). Dedup local against itself too: storage
+    // listings are unique by construction, but keep the merge total so the output
+    // never carries a duplicate filename regardless of caller input.
     for f in local {
-        result.push(FileEntry {
-            filename: f.filename.clone(),
-            sha256: f.sha256.clone(),
-        });
+        if seen.insert(f.filename.clone()) {
+            result.push(FileEntry {
+                filename: f.filename.clone(),
+                sha256: f.sha256.clone(),
+            });
+        }
     }
 
+    // `upstream` is concatenated across upstreams in precedence order; keep the
+    // first entry seen for each filename so the highest-precedence upstream wins
+    // and a file present on several upstreams (or already local) is not listed
+    // twice (#663).
     for f in upstream {
-        if !seen.contains(f.filename.as_str()) {
+        if seen.insert(f.filename.clone()) {
             result.push(f);
         }
     }
@@ -1095,6 +1131,72 @@ mod tests {
     fn test_merge_both_empty() {
         let merged = merge_file_lists(vec![], &[]);
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_first_upstream_wins_and_dedups() {
+        // Multi-upstream (#663): `upstream` is the upstreams concatenated in
+        // precedence order. The same filename from upstream A (first) and B must
+        // be deduped to a single entry, and A wins.
+        let upstream = vec![
+            FileEntry {
+                filename: "torch-1.0.whl".to_string(),
+                sha256: Some("from-A".to_string()),
+            },
+            FileEntry {
+                filename: "torch-1.0.whl".to_string(),
+                sha256: Some("from-B".to_string()),
+            },
+            FileEntry {
+                filename: "torchvision-1.0.whl".to_string(),
+                sha256: Some("from-B".to_string()),
+            },
+        ];
+        let merged = merge_file_lists(upstream, &[]);
+        assert_eq!(
+            merged.len(),
+            2,
+            "duplicate filename across upstreams deduped"
+        );
+        let torch = merged
+            .iter()
+            .find(|f| f.filename == "torch-1.0.whl")
+            .unwrap();
+        assert_eq!(
+            torch.sha256.as_deref(),
+            Some("from-A"),
+            "first upstream (A) wins precedence"
+        );
+        assert!(merged.iter().any(|f| f.filename == "torchvision-1.0.whl"));
+    }
+
+    proptest! {
+        #[test]
+        fn prop_merge_no_duplicate_filenames_and_local_wins(
+            upstream_names in prop::collection::vec("[a-z]{1,6}", 0..20),
+            local_names in prop::collection::vec("[a-z]{1,6}", 0..6),
+        ) {
+            let upstream: Vec<FileEntry> = upstream_names
+                .iter()
+                .map(|n| FileEntry { filename: n.clone(), sha256: None })
+                .collect();
+            let local: Vec<FileEntry> = local_names
+                .iter()
+                .map(|n| FileEntry { filename: n.clone(), sha256: Some("L".to_string()) })
+                .collect();
+            let merged = merge_file_lists(upstream, &local);
+            // No filename appears twice.
+            let mut seen = std::collections::HashSet::new();
+            for f in &merged {
+                prop_assert!(seen.insert(f.filename.clone()), "duplicate filename in merge");
+            }
+            // Every local file survives, and local wins on collision.
+            for ln in &local_names {
+                let e = merged.iter().find(|f| &f.filename == ln);
+                prop_assert!(e.is_some());
+                prop_assert_eq!(e.unwrap().sha256.as_deref(), Some("L"));
+            }
+        }
     }
 }
 

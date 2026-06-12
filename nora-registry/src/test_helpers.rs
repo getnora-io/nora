@@ -114,6 +114,7 @@ fn build_context(
             enabled: true,
             proxy: None,
             proxy_auth: None,
+            proxies: Vec::new(),
             proxy_timeout: 5,
         },
         go: GoConfig {
