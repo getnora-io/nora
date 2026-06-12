@@ -81,7 +81,7 @@ RUN microdnf install -y ca-certificates shadow-utils curl \
 COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
-    NORA_HOST=0.0.0.0 \
+    NORA_HOST=:: \
     NORA_PORT=4000 \
     NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \
@@ -109,7 +109,7 @@ RUN apt-get update \
 COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
-    NORA_HOST=0.0.0.0 \
+    NORA_HOST=:: \
     NORA_PORT=4000 \
     NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \
@@ -136,7 +136,7 @@ RUN apk upgrade --no-cache \
 COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
-    NORA_HOST=0.0.0.0 \
+    NORA_HOST=:: \
     NORA_PORT=4000 \
     NORA_PUBLIC_URL=http://localhost:4000 \
     NORA_STORAGE_PATH=/data/storage \

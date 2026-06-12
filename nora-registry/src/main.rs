@@ -460,6 +460,66 @@ mod healthcheck_tests {
     }
 }
 
+/// Bind the server's TCP listener, preferring dual-stack for the IPv6 wildcard.
+///
+/// For `::` we create the socket explicitly and clear `IPV6_V6ONLY`, so the
+/// listener accepts both IPv4 and IPv6 regardless of the host's `bindv6only`
+/// sysctl (#574). If IPv6 is unavailable, we fall back to `0.0.0.0` (IPv4-only)
+/// rather than failing to start. Any other host (specific IP or name) binds
+/// normally.
+async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    if host == "::" || host == "0:0:0:0:0:0:0:0" {
+        let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+        match bind_v6_dual_stack(v6) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "dual-stack bind on [::] failed; falling back to 0.0.0.0 (IPv4-only)"
+                );
+                let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+                return tokio::net::TcpListener::bind(v4).await;
+            }
+        }
+    }
+    tokio::net::TcpListener::bind((host, port)).await
+}
+
+/// Create a dual-stack (`IPV6_V6ONLY = false`) IPv6 listener via `socket2`,
+/// returning it as a non-blocking `tokio` listener.
+fn bind_v6_dual_stack(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::bind_listener;
+
+    #[tokio::test]
+    async fn dual_stack_listener_accepts_ipv4() {
+        // A "::" bind must accept IPv4 clients — via dual-stack, or via the
+        // 0.0.0.0 fallback when IPv6 is unavailable. Guards against an IPv4
+        // regression from defaulting the container bind to "::".
+        let listener = bind_listener("::", 0).await.expect("bind ::");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("IPv4 loopback connects to a :: listener");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1462,10 +1522,14 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
 
-    let addr = state.config.server.bind_addr();
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let listener = bind_listener(&state.config.server.host, state.config.server.port)
         .await
         .expect("Failed to bind");
+    // Report the address actually bound (reflects any IPv6 -> IPv4 fallback).
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| state.config.server.bind_addr());
 
     info!(
         address = %addr,
