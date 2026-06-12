@@ -152,6 +152,16 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Check a running NORA server's health endpoint (for Docker HEALTHCHECK).
+    ///
+    /// Reads `NORA_HOST`/`NORA_PORT` the same way the server does, probes
+    /// `GET /health`, and exits 0 on a 2xx response, 1 otherwise. Needs no
+    /// external tools (curl/wget) and no hardcoded address.
+    Healthcheck {
+        /// Request timeout in seconds.
+        #[arg(long, default_value = "5")]
+        timeout_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -369,6 +379,87 @@ fn build_http_client(tls: &TlsConfig, timeout: Option<std::time::Duration>) -> r
     builder.build().expect("Failed to build HTTP client")
 }
 
+/// Build the `/health` probe URL from the configured listen host. Wildcard
+/// binds are probed over loopback — you cannot connect *to* `0.0.0.0` / `::`.
+fn healthcheck_url(host: &str, port: u16) -> String {
+    let h = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        other => other,
+    };
+    // Bracket a bare IPv6 literal for the URL authority.
+    if h.contains(':') && !h.starts_with('[') {
+        format!("http://[{h}]:{port}/health")
+    } else {
+        format!("http://{h}:{port}/health")
+    }
+}
+
+/// Probe a running server's `/health` and map the result to a process exit
+/// code: 0 if it returns 2xx (server up), 1 otherwise. Backs the `healthcheck`
+/// subcommand so Docker HEALTHCHECK needs no curl/wget and no hardcoded address.
+async fn run_healthcheck(timeout_secs: u64) -> i32 {
+    // Read the listen host/port the same way the server does (env vars), without
+    // loading or validating the full config — a probe must not abort on a missing
+    // NORA_PUBLIC_URL or any other server-only requirement.
+    let host = std::env::var("NORA_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port: u16 = std::env::var("NORA_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4000);
+    let url = healthcheck_url(&host, port);
+    // Reuse the project's central HTTP client builder (a loopback probe needs no
+    // upstream TLS) rather than constructing a reqwest client directly.
+    let client = build_http_client(
+        &TlsConfig::default(),
+        Some(std::time::Duration::from_secs(timeout_secs)),
+    );
+    match client.get(&url).send().await {
+        // /health returns 200 when healthy, 503 when storage is unreachable.
+        Ok(resp) if resp.status().is_success() => 0,
+        Ok(resp) => {
+            eprintln!("healthcheck: {url} -> HTTP {}", resp.status());
+            1
+        }
+        Err(e) => {
+            eprintln!("healthcheck: {url} -> {e}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod healthcheck_tests {
+    use super::healthcheck_url;
+
+    #[test]
+    fn wildcard_hosts_probe_loopback() {
+        assert_eq!(
+            healthcheck_url("0.0.0.0", 4000),
+            "http://127.0.0.1:4000/health"
+        );
+        assert_eq!(healthcheck_url("::", 4000), "http://[::1]:4000/health");
+        assert_eq!(healthcheck_url("[::]", 4000), "http://[::1]:4000/health");
+    }
+
+    #[test]
+    fn specific_hosts_pass_through_with_ipv6_bracketing() {
+        assert_eq!(
+            healthcheck_url("127.0.0.1", 8080),
+            "http://127.0.0.1:8080/health"
+        );
+        assert_eq!(
+            healthcheck_url("example.com", 80),
+            "http://example.com:80/health"
+        );
+        assert_eq!(healthcheck_url("::1", 4000), "http://[::1]:4000/health");
+        assert_eq!(
+            healthcheck_url("[2001:db8::1]", 4000),
+            "http://[2001:db8::1]:4000/health"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -376,6 +467,13 @@ async fn main() {
     // Initialize logging (JSON for server, plain for CLI commands)
     let is_server = matches!(cli.command, None | Some(Commands::Serve));
     let _log_guard = init_logging(is_server);
+
+    // Healthcheck is a client-side probe (Docker HEALTHCHECK) — handle it before
+    // loading the full server config, which it does not need and which can abort
+    // (e.g. NORA_PUBLIC_URL is required on a 0.0.0.0 bind).
+    if let Some(Commands::Healthcheck { timeout_secs }) = &cli.command {
+        std::process::exit(run_healthcheck(*timeout_secs).await);
+    }
 
     let config = Config::load();
 
@@ -698,6 +796,9 @@ async fn main() {
                 }
             }
         }
+        // Handled before storage init by the early dispatch above; the process
+        // has already exited by the time control would reach here.
+        Some(Commands::Healthcheck { .. }) => unreachable!(),
     }
 }
 
