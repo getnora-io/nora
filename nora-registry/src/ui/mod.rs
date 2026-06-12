@@ -178,29 +178,41 @@ fn apply_base_path(html: &str, base: &str) -> String {
         .replace("'/ui", &format!("'{base}/ui"))
         .replace("\"/api/ui", &format!("\"{base}/api/ui"))
         .replace("'/api/ui", &format!("'{base}/api/ui"))
+        // The API-docs (Swagger UI) entry link in the nav and the root-absolute
+        // spec URL the Swagger initializer embeds ("/api-docs/openapi.json").
+        .replace("\"/api-docs", &format!("\"{base}/api-docs"))
+        .replace("'/api-docs", &format!("'{base}/api-docs"))
 }
 
 /// Response middleware: rewrite the UI's root-absolute self-links to carry the
 /// configured `public_url` path prefix. Covers HTML bodies (links + inline JS
-/// `fetch`) and redirect `Location` headers. A no-op when `base_path` is empty
-/// (the router keeps serving `/ui` and `/api/ui`; the proxy strips the prefix).
+/// `fetch`), the Swagger UI initializer's spec URL, and redirect `Location`
+/// headers. A no-op when `base_path` is empty (the router keeps serving `/ui`,
+/// `/api/ui` and `/api-docs`; the proxy strips the prefix).
 pub(crate) async fn rewrite_ui_base_path(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
     let base = state.config.server.base_path();
+    // Capture the path before the request is consumed: the Swagger initializer
+    // is served as JS (not HTML) yet embeds a root-absolute spec URL that needs
+    // the same prefix, so it is rewritten by path rather than by content type.
+    let path = req.uri().path().to_string();
     let mut resp = next.run(req).await;
     if base.is_empty() {
         return resp;
     }
-    // A redirect target (e.g. "/" -> "/ui/") must carry the prefix too.
+    // A redirect target (e.g. "/" -> "/ui/", "/api-docs" -> "/api-docs/") must
+    // carry the prefix too.
     if let Some(loc) = resp
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
     {
-        if (loc.starts_with("/ui") || loc.starts_with("/api/ui")) && !loc.starts_with(&base) {
+        if (loc.starts_with("/ui") || loc.starts_with("/api/ui") || loc.starts_with("/api-docs"))
+            && !loc.starts_with(&base)
+        {
             if let Ok(hv) = HeaderValue::from_str(&format!("{base}{loc}")) {
                 resp.headers_mut().insert(header::LOCATION, hv);
             }
@@ -211,7 +223,11 @@ pub(crate) async fn rewrite_ui_base_path(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|c| c.contains("text/html"));
-    if !is_html {
+    // The Swagger UI initializer is JS but embeds a root-absolute spec URL
+    // ("/api-docs/openapi.json"); rewrite it too so the docs load under a
+    // sub-path. Scoped to that one small file — large JS bundles pass through.
+    let is_swagger_init = path.ends_with("/swagger-initializer.js");
+    if !is_html && !is_swagger_init {
         return resp;
     }
     let (mut parts, body) = resp.into_parts();
@@ -1006,6 +1022,21 @@ mod base_path_tests {
         assert!(!out.contains(r#"href="/ui/"#));
         assert!(!out.contains("fetch('/api/ui"));
         assert!(!out.contains("/nora/nora/"));
+    }
+
+    #[test]
+    fn apply_base_path_prefixes_api_docs_link_and_spec_url() {
+        // The "API Docs" nav link (HTML) and the Swagger initializer's embedded
+        // spec URL (JS) are both root-absolute /api-docs paths that break under a
+        // sub-path unless prefixed. Regression guard for the #686 residual.
+        let html = r#"<a href="/api-docs" title="API Docs">d</a>"#;
+        let init = r#"window.ui = SwaggerUIBundle({ "url": "/api-docs/openapi.json" });"#;
+        assert!(apply_base_path(html, "/nora").contains(r#"href="/nora/api-docs""#));
+        let out = apply_base_path(init, "/nora");
+        assert!(out.contains(r#""url": "/nora/api-docs/openapi.json""#));
+        assert!(!out.contains(r#""/api-docs/openapi.json""#));
+        // Empty base is still a no-op for the api-docs paths.
+        assert_eq!(apply_base_path(html, ""), html);
     }
 
     #[test]
