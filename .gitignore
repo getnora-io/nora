@@ -29,6 +29,9 @@ nora-review.sh
 coverage/
 target/criterion/
 
+# proptest failure seeds — local replay only; regressions are locked by explicit unit tests
+proptest-regressions/
+
 # Internal tooling (not for public repo)
 scripts/docs-quality-gate.py
 docs-manifest.json

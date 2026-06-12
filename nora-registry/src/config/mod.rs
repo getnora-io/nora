@@ -321,6 +321,15 @@ impl Config {
         if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
             tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
         }
+        // PyPI multi-upstream proxies (#663)
+        for proxy in &self.pypi.proxies {
+            if proxy.auth().is_some() && std::env::var("NORA_PYPI_PROXIES").is_err() {
+                tracing::warn!(
+                    url = %proxy.url(),
+                    "PyPI upstream credentials in config.toml are plaintext — consider NORA_PYPI_PROXIES env var"
+                );
+            }
+        }
         // Cargo
         if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
             tracing::warn!("Cargo proxy credentials in config.toml are plaintext — consider NORA_CARGO_PROXY_AUTH env var");
@@ -364,7 +373,6 @@ impl Config {
         // Simple proxy: Option<String>
         let simple = [
             ("npm", self.npm.proxy.as_deref()),
-            ("pypi", self.pypi.proxy.as_deref()),
             ("cargo", self.cargo.proxy.as_deref()),
             ("go", self.go.proxy.as_deref()),
             ("gems", self.gems.proxy.as_deref()),
@@ -401,6 +409,16 @@ impl Config {
         for proxy in &self.maven.proxies {
             if let Some(host) = extract_host(proxy.url()) {
                 result.push(("maven".to_string(), host));
+            }
+        }
+
+        // PyPI upstreams: Vec<PypiProxyEntry> via upstreams() so the multi-upstream
+        // list (#663) AND the legacy single `proxy` are both registered with the
+        // leak detector — otherwise a secondary upstream's host (e.g. an internal
+        // mirror with embedded credentials) would be invisible to leak scanning.
+        for up in self.pypi.upstreams() {
+            if let Some(host) = extract_host(up.url()) {
+                result.push(("pypi".to_string(), host));
             }
         }
 
@@ -2362,6 +2380,43 @@ mod tests {
             .collect();
         assert!(docker_hosts.contains(&"registry-1.docker.io"));
         assert!(docker_hosts.contains(&"ghcr.io"));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_pypi_multi_upstream() {
+        // #663: every configured pypi upstream host must reach the leak detector,
+        // not just the legacy single `proxy`. A secondary upstream (e.g. an internal
+        // mirror carrying credentials) was previously invisible to leak scanning.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            path = "/tmp/nora-test"
+
+            [[pypi.proxies]]
+            url = "https://pypi.org/simple"
+
+            [[pypi.proxies]]
+            url = "https://internal-nexus.corp/pypi"
+            auth = "secret-token"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let hosts = config.upstream_hostnames();
+        let pypi_hosts: Vec<&str> = hosts
+            .iter()
+            .filter(|(r, _)| r == "pypi")
+            .map(|(_, h)| h.as_str())
+            .collect();
+        assert!(
+            pypi_hosts.contains(&"pypi.org"),
+            "primary upstream registered"
+        );
+        assert!(
+            pypi_hosts.contains(&"internal-nexus.corp"),
+            "secondary upstream host must be registered with the leak detector"
+        );
     }
 
     #[test]
