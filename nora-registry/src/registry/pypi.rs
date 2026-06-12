@@ -747,7 +747,12 @@ fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
             let url = &remaining[..href_end];
 
             if let Some(filename) = extract_filename(url) {
-                if filename == target_filename {
+                // Index hrefs percent-encode characters such as '+' (PyTorch's
+                // "+cu124" -> "%2Bcu124"); the requested filename arrives already
+                // decoded, so compare decoded forms. The URL itself is returned
+                // unchanged — it must stay encoded to fetch from the upstream (#664).
+                let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
+                if decoded.as_ref() == target_filename {
                     return Some(url.split('#').next().unwrap_or(url).to_string());
                 }
             }
@@ -823,6 +828,30 @@ mod tests {
     fn test_normalize_name_lowercase() {
         assert_eq!(normalize_name("Flask"), "flask");
         assert_eq!(normalize_name("REQUESTS"), "requests");
+    }
+
+    #[test]
+    fn find_file_url_matches_percent_encoded_plus() {
+        // #664: PyTorch indexes encode '+' as %2B in hrefs, but the requested
+        // filename arrives decoded — matching must decode, and the returned URL
+        // must stay encoded so the upstream fetch resolves.
+        let html = concat!(
+            r#"<a href="https://download.pytorch.org/whl/cu124/"#,
+            r#"torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl#sha256=abc">"#,
+            r#"torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl</a>"#,
+        );
+        assert_eq!(
+            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl").as_deref(),
+            Some(
+                "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl"
+            )
+        );
+        // A plain filename (no encoding) still matches.
+        let plain = r#"<a href="https://x/torch-0.1.10-cp36-cp36m-macosx.whl">x</a>"#;
+        assert_eq!(
+            find_file_url(plain, "torch-0.1.10-cp36-cp36m-macosx.whl").as_deref(),
+            Some("https://x/torch-0.1.10-cp36-cp36m-macosx.whl")
+        );
     }
 
     #[test]
