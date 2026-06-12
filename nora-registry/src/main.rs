@@ -345,13 +345,24 @@ fn log_outbound_proxy() {
 /// Build HTTP client with optional custom CA certificate support.
 ///
 /// When `timeout` is `Some`, a default request timeout is set on the client
-/// (used by `nora mirror` for long-running downloads).
-fn build_http_client(tls: &TlsConfig, timeout: Option<std::time::Duration>) -> reqwest::Client {
+/// (used by `nora mirror` for long-running downloads). When `no_proxy` is true
+/// the client ignores any `HTTP(S)_PROXY` env — required for loopback probes
+/// (the healthcheck) that must reach the local server directly, not via an
+/// upstream proxy.
+fn build_http_client(
+    tls: &TlsConfig,
+    timeout: Option<std::time::Duration>,
+    no_proxy: bool,
+) -> reqwest::Client {
     let mut builder =
         reqwest::ClientBuilder::new().user_agent(format!("nora/{}", env!("CARGO_PKG_VERSION")));
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
+    }
+
+    if no_proxy {
+        builder = builder.no_proxy();
     }
 
     if let Some(ref ca_path) = tls.ca_cert {
@@ -381,10 +392,12 @@ fn build_http_client(tls: &TlsConfig, timeout: Option<std::time::Duration>) -> r
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
 /// binds are probed over loopback — you cannot connect *to* `0.0.0.0` / `::`.
+/// Both wildcards probe `127.0.0.1`: a `::` server is dual-stack (or falls back
+/// to `0.0.0.0`), so IPv4 loopback reaches it in every case, whereas `::1` would
+/// miss the fallback.
 fn healthcheck_url(host: &str, port: u16) -> String {
     let h = match host {
-        "0.0.0.0" => "127.0.0.1",
-        "::" | "[::]" => "::1",
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
         other => other,
     };
     // Bracket a bare IPv6 literal for the URL authority.
@@ -408,11 +421,13 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
         .and_then(|p| p.parse().ok())
         .unwrap_or(4000);
     let url = healthcheck_url(&host, port);
-    // Reuse the project's central HTTP client builder (a loopback probe needs no
-    // upstream TLS) rather than constructing a reqwest client directly.
+    // Reuse the central HTTP client builder, but with no_proxy: a loopback probe
+    // must reach the local server directly, never through an upstream HTTP proxy
+    // (which would 502 the local address when HTTP_PROXY is set).
     let client = build_http_client(
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
+        true,
     );
     match client.get(&url).send().await {
         // /health returns 200 when healthy, 503 when storage is unreachable.
@@ -438,8 +453,13 @@ mod healthcheck_tests {
             healthcheck_url("0.0.0.0", 4000),
             "http://127.0.0.1:4000/health"
         );
-        assert_eq!(healthcheck_url("::", 4000), "http://[::1]:4000/health");
-        assert_eq!(healthcheck_url("[::]", 4000), "http://[::1]:4000/health");
+        // Both wildcards probe IPv4 loopback (reaches dual-stack and the
+        // 0.0.0.0 fallback alike).
+        assert_eq!(healthcheck_url("::", 4000), "http://127.0.0.1:4000/health");
+        assert_eq!(
+            healthcheck_url("[::]", 4000),
+            "http://127.0.0.1:4000/health"
+        );
     }
 
     #[test]
@@ -716,7 +736,11 @@ async fn main() {
             concurrency,
             json,
         }) => {
-            let client = build_http_client(&config.tls, Some(std::time::Duration::from_secs(300)));
+            let client = build_http_client(
+                &config.tls,
+                Some(std::time::Duration::from_secs(300)),
+                false,
+            );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
                 error!("Mirror failed: {}", e);
@@ -1263,7 +1287,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None);
+    let http_client = build_http_client(&config.tls, None, false);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
