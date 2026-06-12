@@ -423,7 +423,7 @@ pub fn render_global_stats(
     let t = get_translations(lang);
     format!(
         r##"
-        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-6">
+        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-2">
             <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
                 <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
@@ -445,6 +445,7 @@ pub fn render_global_stats(
                 <div id="stat-storage" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
             </div>
         </div>
+        <div class="text-slate-500 text-xs mb-6">&#9432; {}</div>
         "##,
         t.stat_downloads,
         downloads,
@@ -455,7 +456,8 @@ pub fn render_global_stats(
         t.stat_cache_hit,
         cache_hit_percent,
         t.stat_storage,
-        format_size(storage_bytes)
+        format_size(storage_bytes),
+        t.stats_since_restart
     )
 }
 
