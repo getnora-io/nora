@@ -778,7 +778,26 @@ async fn docker_v2_dispatch(
         }
         return if after.is_empty() {
             match method {
-                Method::POST => start_upload(state, Path(name.to_string())).await,
+                Method::POST => {
+                    let params = parse_query_string(uri.query());
+                    if params.contains_key("digest") {
+                        // OCI single-POST monolithic upload (#688): the blob is in
+                        // the body and ?digest= is set, so complete it in one
+                        // request instead of opening a session. Reuse the upload
+                        // finalizer with a fresh upload id — no session exists, so
+                        // it takes the monolithic branch.
+                        let upload_id = uuid::Uuid::new_v4().to_string();
+                        upload_blob(
+                            state,
+                            Path((name.to_string(), upload_id)),
+                            axum::extract::Query(params),
+                            body,
+                        )
+                        .await
+                    } else {
+                        start_upload(state, Path(name.to_string())).await
+                    }
+                }
                 _ => method_not_allowed("POST"),
             }
         } else {
@@ -3580,6 +3599,65 @@ mod integration_tests {
         let put_url = format!("/v2/alpine/blobs/uploads/{}?digest={}", uuid, digest);
         let put_resp = send(&ctx.app, Method::PUT, &put_url, Body::from(&blob_data[..])).await;
         assert_eq!(put_resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_docker_single_post_monolithic_upload() {
+        // #688: POST /blobs/uploads/?digest= with the blob in the body must store
+        // it and return 201 in one request (the OCI "single POST" form).
+        let ctx = create_test_context();
+        let blob_data = b"single-post monolithic blob";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob_data)));
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/alpine/blobs/uploads/?digest={}", digest),
+            Body::from(&blob_data[..]),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "single-POST monolithic upload must return 201"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("docker-content-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            digest
+        );
+
+        // The blob must now exist.
+        let head = send(
+            &ctx.app,
+            Method::HEAD,
+            &format!("/v2/alpine/blobs/{}", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "blob must exist after a single-POST upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_docker_single_post_digest_mismatch_rejected() {
+        // A single-POST upload whose body does not match ?digest= must be rejected.
+        let ctx = create_test_context();
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/alpine/blobs/uploads/?digest={}", wrong),
+            Body::from(&b"some other bytes"[..]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
