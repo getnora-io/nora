@@ -6,6 +6,25 @@ use super::i18n::{get_translations, Lang, Translations};
 /// Application version from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Enabled-registry set for the sidebar nav — immutable process config, set once
+/// at startup via [`set_enabled_registries`]. The sole reader is [`layout_dark`],
+/// which hands it to the sidebar filter so the nav lists exactly the enabled
+/// registries (matching the dashboard body, which filters by the same set).
+/// Threading `Option<&HashSet<RegistryType>>` through the ~30 page-render call
+/// sites would be the type-honest alternative; this global is `accepted` because
+/// the set is immutable config (cf. the metrics registry) — the upgrade path is
+/// that explicit threading. `None` until set (unit tests), where the sidebar
+/// falls back to showing every supported format.
+static ENABLED_REGISTRIES: std::sync::OnceLock<
+    std::collections::HashSet<crate::registry_type::RegistryType>,
+> = std::sync::OnceLock::new();
+
+/// Record the enabled-registry set for the sidebar. Call once at startup; later
+/// calls are ignored (the set is immutable config).
+pub fn set_enabled_registries(set: std::collections::HashSet<crate::registry_type::RegistryType>) {
+    let _ = ENABLED_REGISTRIES.set(set);
+}
+
 /// Dark theme layout wrapper for dashboard
 pub fn layout_dark(
     title: &str,
@@ -22,7 +41,7 @@ pub fn layout_dark(
         extra_scripts,
         lang,
         auth_enabled,
-        None,
+        ENABLED_REGISTRIES.get(),
     )
 }
 
@@ -303,6 +322,23 @@ pub fn sidebar_dark_with_registries(
             render_nav_item(id, href, label, icon, *is_stroke)
         })
         .collect();
+
+    // Suppress the whole registries section (header + items) when nothing is
+    // enabled — otherwise an empty "REGISTRIES" header would sit alone (#704).
+    let registries_section = if registries_html.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r##"<div class="border-t border-slate-700 mt-4 pt-4">
+                    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mb-3">
+                        {}
+                    </div>
+                    {}
+                </div>"##,
+            t.nav_registries, registries_html
+        )
+    };
+
     // Flat sidebar items (no umbrella category)
     let admin_section = if auth_enabled {
         let tokens_active = if active == "tokens" {
@@ -342,12 +378,7 @@ pub fn sidebar_dark_with_registries(
             </div>
             <nav class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
                 {}
-                <div class="border-t border-slate-700 mt-4 pt-4">
-                    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mb-3">
-                        {}
-                    </div>
-                    {}
-                </div>
+                {}
                 {}
             </nav>
             <div class="px-4 py-4 border-t border-slate-700">
@@ -357,7 +388,7 @@ pub fn sidebar_dark_with_registries(
             </div>
         </div>
     "#,
-        dashboard_html, t.nav_registries, registries_html, admin_section, VERSION
+        dashboard_html, registries_section, admin_section, VERSION
     )
 }
 
@@ -983,7 +1014,58 @@ pub fn format_expiry(ts: u64) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_type::RegistryType;
     use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    // #704: the sidebar nav must list exactly the enabled registries (matching the
+    // dashboard body). These exercise the `Some(&set)` filter branch — the same
+    // branch production takes (`layout_dark` passes the global set via
+    // `ENABLED_REGISTRIES.get()`). The thin `get()` glue itself is not unit-tested
+    // (trivial delegation); it is verified end-to-end against a running default
+    // instance. No test touches the `OnceLock` global, so there is no cross-test
+    // pollution.
+    fn enabled_set(regs: &[RegistryType]) -> HashSet<RegistryType> {
+        regs.iter().copied().collect()
+    }
+
+    #[test]
+    fn sidebar_lists_only_enabled_registries() {
+        let t = get_translations(Lang::En);
+        let set = enabled_set(&[RegistryType::Docker, RegistryType::Npm]);
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
+        assert!(html.contains("/ui/docker"), "enabled docker present");
+        assert!(html.contains("/ui/npm"), "enabled npm present");
+        assert!(!html.contains("/ui/gems"), "disabled gems absent");
+        assert!(!html.contains("/ui/conan"), "disabled conan absent");
+        assert!(html.contains("\"/ui/\""), "dashboard nav always present");
+    }
+
+    #[test]
+    fn sidebar_unset_filter_shows_all_formats() {
+        // `None` (the unit-test context where the global is never set) falls back
+        // to showing every supported format — preserves the documented fallback.
+        let t = get_translations(Lang::En);
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, None);
+        assert!(html.contains("/ui/gems"), "fallback shows all formats");
+        assert!(html.contains("/ui/conan"));
+        assert!(html.contains("/ui/docker"));
+    }
+
+    #[test]
+    fn sidebar_empty_enabled_set_hides_registries_section() {
+        // All-disabled config is reachable (config returns an empty set with only a
+        // warning); the sidebar shows Dashboard only — no lone "REGISTRIES" header.
+        let t = get_translations(Lang::En);
+        let set: HashSet<RegistryType> = HashSet::new();
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
+        assert!(!html.contains("/ui/docker"), "no registry items");
+        assert!(
+            !html.contains(t.nav_registries),
+            "no empty REGISTRIES header"
+        );
+        assert!(html.contains("\"/ui/\""), "dashboard still present");
+    }
 
     #[test]
     fn sanitize_href_allows_https() {

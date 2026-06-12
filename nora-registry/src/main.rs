@@ -1313,6 +1313,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Determine enabled registries from config
     let enabled_registries = config.enabled_registries();
 
+    // Make the enabled set available to the UI sidebar so its nav lists exactly
+    // the enabled registries (matching the dashboard body). Set once, immutable.
+    ui::components::set_enabled_registries(enabled_registries.clone());
+
     // Registry routes — only merge enabled registries
     let mut registry_routes = Router::new();
     for reg in &enabled_registries {
