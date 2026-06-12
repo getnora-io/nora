@@ -1,50 +1,49 @@
 # Benchmarks
 
-Reproducible performance benchmarks for NORA.
-All numbers are collected by CI on each release using the methodology described below.
+Reproducible performance figures for NORA.
 
-## Quick Summary (v0.9.0)
+> **Scope.** The figures below cover what CI measures today on each release:
+> binary size, cold-start time, and idle memory, plus Criterion micro-benchmarks.
+> Load-test figures — throughput, request latency, and memory under concurrent
+> load — are **not yet measured**: the k6 load harness is not implemented (tracked
+> in #693). The rows under "Targets" are goals, not measurements, until then.
+
+## Measured (v0.9.0)
 
 | Metric | Value |
 |--------|-------|
-| Cold start | < 3s |
+| Cold start | < 3 s |
 | RAM (idle) | < 50 MB |
-| RAM (100 concurrent pulls) | < 100 MB |
-| Binary size | 23 MB |
-| Docker pull p95 (cached) | < 50ms |
-| npm install p95 (cached) | < 30ms |
-| Backup (10 GB data) | `cp -r`: ~10s |
-| Restore (10 GB data) | `cp -r`: ~10s |
+| Binary size | ~23 MB |
 
-> All numbers measured in CI on GitHub Actions (`ubuntu-latest`, 2 vCPU, 4 GB RAM). See methodology below.
+> Measured in CI on GitHub Actions (`ubuntu-latest`, 2 vCPU, 4 GB RAM) for v0.9.0;
+> current per-release values are attached as release artifacts. See methodology below.
+
+## Targets (not yet measured — see #693)
+
+These need the k6 load harness, which does not exist yet:
+
+| Metric | Target |
+|--------|--------|
+| RAM (100 concurrent pulls) | < 100 MB |
+| Docker pull p95 (cached) | < 50 ms |
+| npm install p95 (cached) | < 30 ms |
 
 ## Methodology
 
-All NORA benchmarks run on a clean environment:
+On each release, the `benchmarks.yml` workflow measures:
 
-- **Hardware**: 2 vCPU, 4 GB RAM (GitHub Actions `ubuntu-latest` or equivalent)
-- **Scenario**: fresh NORA binary, default config, local filesystem storage
-- **Tool**: [k6](https://k6.io) for HTTP load, `/usr/bin/time -v` for resource tracking
-- **Reproducibility**: every run is triggered by the `benchmarks.yml` workflow and results are attached as release artifacts
+- **Cold start** — wall-clock from `nora serve` to the first successful `/health` response.
+- **Idle memory** — `VmRSS` from `/proc/PID/status` after startup, with no requests.
+- **Binary size** — `stat` of the stripped release binary.
+- **Micro-benchmarks** — `cargo bench -p nora-registry` (parsing and validation).
 
-### Startup Time
+Hardware: 2 vCPU, 4 GB RAM (GitHub Actions `ubuntu-latest` or equivalent). Results
+are attached as release artifacts.
 
-```bash
-/usr/bin/time -v ./nora serve &
-# Measured: wall-clock from exec to first successful /health response
-```
+### Throughput and latency (planned — #693)
 
-### Memory Footprint
-
-| State | How measured |
-|-------|-------------|
-| Idle | `VmRSS` from `/proc/PID/status` after startup, no requests |
-| 100 concurrent pulls | k6 with 100 VUs doing Docker manifest GET for 30s, peak `VmRSS` |
-| 1000 concurrent pulls | k6 with 1000 VUs, same scenario, peak `VmRSS` |
-
-### Throughput
-
-Measured with k6 using realistic request distribution:
+The intended k6 request distribution, once the harness lands:
 
 | Operation | Scenario |
 |-----------|----------|
@@ -54,26 +53,30 @@ Measured with k6 using realistic request distribution:
 | Maven resolve | GET `/maven2/.../{artifact}.jar` — cached artifacts |
 | Raw upload | PUT `/raw/{file}` — 1–100 KB files |
 
-Reported metrics: total req/s, p50, p95, p99 latency.
+Planned reported metrics: total req/s, p50, p95, p99 latency.
 
-### Storage Overhead
+### Storage overhead
+
+An architectural property, not a load measurement: NORA stores raw, content-addressable
+files, so identical blobs are stored once.
 
 | Solution | 1000 Docker images | Overhead |
 |----------|-------------------|----------|
 | NORA (local) | Raw files on disk | ~0% (content-addressable dedup) |
 | NORA (S3) | S3 objects | ~0% |
-| DB-backed registry | DB + filesystem | 10–30% (indexes, WAL, metadata tables) |
+| DB-backed registry | DB + filesystem | indexes, WAL, metadata tables |
 
-### Backup / Restore
+### Backup / restore
+
+NORA's data is plain files, so backup and restore are a file copy — no database dumps,
+no index rebuilds, no multi-step procedures.
 
 | Operation | Command |
 |-----------|---------|
 | Backup | `cp -r /data/ backup/` or `nora backup` |
 | Restore | `cp -r backup/ /data/` or `nora restore` |
 
-No database dumps, no index rebuilds, no multi-step procedures.
-
-## Running Benchmarks Locally
+## Running benchmarks locally
 
 ### Micro-benchmarks (Criterion)
 
@@ -83,58 +86,28 @@ cargo bench -p nora-registry
 
 Runs parsing and validation benchmarks. Results in `target/criterion/`.
 
-### Load Tests (k6)
+### Load tests
 
-Requires a running NORA instance and [k6](https://k6.io/docs/get-started/installation/).
+The k6 load harness (`scripts/load-test.sh` scenarios and `scripts/bench-regression.sh`
+regression check) is **not yet implemented** — see #693. Until it lands, there is no
+local load-test command.
 
-```bash
-# Start NORA
-NORA_HOST=0.0.0.0 NORA_PORT=4000 NORA_STORAGE_PATH=./bench-data \
-  NORA_RATE_LIMIT_ENABLED=false ./target/release/nora serve &
+## CI integration
 
-# Run scenarios
-./scripts/load-test.sh smoke          # 10 VUs, 30s — CI sanity
-./scripts/load-test.sh average        # 50 VUs, 5min — typical load
-./scripts/load-test.sh stress         # ramp to 200 VUs, 10min
-./scripts/load-test.sh spike          # 0→500→0 VUs burst
-./scripts/load-test.sh soak           # 50 VUs, 30min — leak detection
-./scripts/load-test.sh breakpoint     # ramp until failure
-```
+The `benchmarks.yml` workflow runs on each release:
 
-Reports are written to `/tmp/nora-load-reports/` in JSON and text format.
+1. Builds the release binary
+2. Records binary size, cold-start time, and idle memory
+3. Runs the Criterion micro-benchmarks
+4. Uploads a JSON report as a release artifact
 
-### Regression Check
+Load testing, throughput/latency measurement, and baseline regression comparison are
+pending the harness in #693.
 
-```bash
-# Save baseline
-./scripts/bench-regression.sh baseline
+## Historical results
 
-# After changes, compare
-./scripts/bench-regression.sh compare
-```
-
-Fails if any metric degrades by more than 15% (configurable via `NORA_BENCH_THRESHOLD`).
-
-## CI Integration
-
-The `benchmarks.yml` workflow runs on every release:
-
-1. Builds release binary
-2. Starts NORA with default config
-3. Runs `load-test.sh smoke` (k6)
-4. Records startup time, peak memory, request throughput
-5. Uploads JSON report as release artifact
-6. Compares with previous release baseline (fails on >15% regression)
-
-## Historical Results
-
-Results are published as GitHub Release artifacts. Compare any two releases:
+Release reports are published as GitHub Release artifacts:
 
 ```bash
-# Download reports
-gh release download v0.9.0 --pattern 'bench-*.json' --dir /tmp/v090
-gh release download v0.8.3 --pattern 'bench-*.json' --dir /tmp/v083
-
-# Compare
-diff /tmp/v090/bench-smoke.json /tmp/v083/bench-smoke.json
+gh release download <tag> --pattern 'bench-*.json' --dir /tmp/<tag>
 ```

@@ -4,16 +4,6 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      scenario:
-        description: 'Load test scenario'
-        required: false
-        default: 'smoke'
-        type: choice
-        options:
-          - smoke
-          - average
-          - stress
 
 permissions: read-all
 
@@ -51,6 +41,7 @@ jobs:
           echo "Binary size: ${SIZE_MB} MB"
 
       - name: Start NORA
+        id: start
         run: |
           mkdir -p /tmp/nora-bench-data
           NORA_HOST=0.0.0.0 \
@@ -62,7 +53,7 @@ jobs:
           NORA_PID=$!
           echo "NORA_PID=$NORA_PID" >> "$GITHUB_ENV"
 
-          # Wait for startup
+          # Measure cold start: wall-clock from exec to first successful /health.
           START=$(date +%s%N)
           for i in $(seq 1 30); do
             if curl -sf http://localhost:4000/health > /dev/null 2>&1; then
@@ -83,30 +74,6 @@ jobs:
           echo "idle_kb=$VMRSS" >> "$GITHUB_OUTPUT"
           echo "Idle VmRSS: ${VMRSS} kB"
 
-      - name: Install k6
-        run: |
-          curl -fsSL https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz | tar xzf -
-          sudo mv k6-v0.55.0-linux-amd64/k6 /usr/local/bin/
-
-      - name: Run load test (smoke)
-        id: loadtest
-        env:
-          NORA_TEST_HOST: http://localhost:4000
-          NORA_TEST_USER: ''
-          NORA_TEST_PASS: ''
-          REPORT_DIR: /tmp/nora-load-reports
-        run: |
-          SCENARIO="${{ inputs.scenario || 'smoke' }}"
-          mkdir -p /tmp/nora-load-reports
-          scripts/load-test.sh "$SCENARIO" || true
-
-      - name: Record peak memory under load
-        id: peak_memory
-        run: |
-          VMRSS=$(grep VmRSS /proc/$NORA_PID/status 2>/dev/null | awk '{print $2}' || echo "0")
-          echo "peak_kb=$VMRSS" >> "$GITHUB_OUTPUT"
-          echo "Peak VmRSS: ${VMRSS} kB"
-
       - name: Run criterion benchmarks
         run: cargo bench -p nora-registry -- --output-format bencher 2>/dev/null | tee /tmp/criterion-results.txt || true
 
@@ -121,15 +88,11 @@ jobs:
             "version": "$VERSION",
             "timestamp": "$TIMESTAMP",
             "binary_size_bytes": ${{ steps.binary.outputs.size_bytes }},
-            "startup_ms": ${{ steps.memory.outputs.idle_kb && '0' || '0' }},
-            "memory_idle_kb": ${{ steps.memory.outputs.idle_kb || '0' }},
-            "memory_peak_kb": ${{ steps.peak_memory.outputs.peak_kb || '0' }},
-            "scenario": "${{ inputs.scenario || 'smoke' }}"
+            "startup_ms": ${{ steps.start.outputs.startup_ms || '0' }},
+            "memory_idle_kb": ${{ steps.memory.outputs.idle_kb || '0' }}
           }
           EOF
-
-          # Copy load test reports if they exist
-          cp /tmp/nora-load-reports/*.json /tmp/ 2>/dev/null || true
+          cat /tmp/nora-bench-report.json
 
       - name: Stop NORA
         if: always()
@@ -142,7 +105,6 @@ jobs:
           name: bench-results-${{ github.sha }}
           path: |
             /tmp/nora-bench-report.json
-            /tmp/nora-load-reports/
             /tmp/criterion-results.txt
           retention-days: 90
 
@@ -154,6 +116,3 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}" \
             /tmp/nora-bench-report.json \
             --clobber || true
-          for f in /tmp/nora-load-reports/*.json; do
-            [ -f "$f" ] && gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber || true
-          done
