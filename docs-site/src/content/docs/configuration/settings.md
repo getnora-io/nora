@@ -117,7 +117,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Upstream registries. Format: `url1,url2` or `url1\|auth1,url2\|auth2` |
-| `NORA_DOCKER_PROXY_TIMEOUT` | `60` | Proxy timeout in seconds |
+| `NORA_DOCKER_PROXY_TIMEOUT` | `300` | Proxy timeout in seconds |
 | `NORA_DOCKER_READ_TIMEOUT` | `60` | Per-chunk read timeout for streaming blob downloads |
 | `NORA_DOCKER_METADATA_TTL` | `-1` | Metadata cache TTL in seconds (-1 = forever, 0 = always refetch) |
 | `NORA_DOCKER_SERVE_STALE` | `true` | Serve stale cached manifests when upstream is unreachable |
@@ -154,7 +154,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | `NORA_GEMS_PROXY` | `https://rubygems.org` | Upstream RubyGems registry |
 | `NORA_GEMS_PROXY_AUTH` | *(none)* | Upstream auth (`user:pass`) |
 | `NORA_GEMS_PROXY_TIMEOUT` | `30` | Proxy timeout in seconds |
-| `NORA_GEMS_INDEX_TTL` | `300` | Index cache TTL in seconds |
+| `NORA_GEMS_METADATA_TTL` | `300` | Compact-index metadata cache TTL in seconds |
 
 ### Terraform
 
@@ -250,7 +250,7 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NORA_SECRETS_PROVIDER` | `env` | Secrets provider: `env`, `aws-secrets`, `vault`, `k8s` |
+| `NORA_SECRETS_PROVIDER` | `env` | Secrets provider (only `env` is currently implemented) |
 | `NORA_SECRETS_CLEAR_ENV` | `false` | Clear env vars after reading (env provider) |
 
 ### TLS
@@ -317,7 +317,7 @@ token_storage = "data/tokens"
 # Secrets
 # =============================================================================
 [secrets]
-provider = "env"        # "env", "aws-secrets", "vault", "k8s"
+provider = "env"        # only "env" is currently implemented
 clear_env = false
 
 # =============================================================================
@@ -416,7 +416,7 @@ enabled = false
 proxy = "https://rubygems.org"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-index_ttl = 300
+metadata_ttl = 300
 
 # =============================================================================
 # Terraform Provider Registry

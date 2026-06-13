@@ -149,7 +149,7 @@ enabled = true
 [auth.oidc]
 enabled = true
 leeway_secs = 60          # Clock skew tolerance (default: 60)
-jwks_cache_secs = 300     # JWKS key cache TTL (default: 300)
+jwks_cache_secs = 3600    # JWKS key cache TTL (default: 3600)
 
 [[auth.oidc.providers]]
 name = "github-actions"

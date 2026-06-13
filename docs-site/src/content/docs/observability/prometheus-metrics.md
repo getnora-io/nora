@@ -47,7 +47,7 @@ The `registry` label is derived from the request path:
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_storage_operations_total` | Counter | `operation`, `status` | Storage operations (`get`, `put`, `delete`, `list`) with `ok` or `error` status |
-| `nora_artifacts_total` | Counter | `registry` | Total artifacts stored per registry |
+| `nora_artifacts_total` | Gauge | `registry` | Artifacts currently stored per registry (rises and falls with GC) |
 
 ## Circuit breaker metrics
 

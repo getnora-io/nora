@@ -149,7 +149,7 @@ enabled = true
 [auth.oidc]
 enabled = true
 leeway_secs = 60          # Допуск расхождения часов (по умолчанию: 60)
-jwks_cache_secs = 300     # TTL кеша JWKS-ключей (по умолчанию: 300)
+jwks_cache_secs = 3600    # TTL кеша JWKS-ключей (по умолчанию: 3600)
 
 [[auth.oidc.providers]]
 name = "github-actions"

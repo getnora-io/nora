@@ -99,7 +99,7 @@ NORA использует многоуровневую модель конфиг
 | Переменная | По умолчанию | Описание |
 |----------|---------|-------------|
 | `NORA_DOCKER_PROXIES` | `https://registry-1.docker.io` | Вышестоящие реестры. Формат: `url1,url2` или `url1\|auth1,url2\|auth2` |
-| `NORA_DOCKER_PROXY_TIMEOUT` | `60` | Таймаут прокси в секундах |
+| `NORA_DOCKER_PROXY_TIMEOUT` | `300` | Таймаут прокси в секундах |
 
 ### Go
 
@@ -133,7 +133,7 @@ NORA использует многоуровневую модель конфиг
 | `NORA_GEMS_PROXY` | `https://rubygems.org` | Вышестоящий реестр RubyGems |
 | `NORA_GEMS_PROXY_AUTH` | *(нет)* | Аутентификация вышестоящего реестра (`user:pass`) |
 | `NORA_GEMS_PROXY_TIMEOUT` | `30` | Таймаут прокси в секундах |
-| `NORA_GEMS_INDEX_TTL` | `300` | TTL кэша индекса в секундах |
+| `NORA_GEMS_METADATA_TTL` | `300` | TTL кэша метаданных compact-index в секундах |
 
 ### Terraform
 
@@ -229,7 +229,7 @@ NORA использует многоуровневую модель конфиг
 
 | Переменная | По умолчанию | Описание |
 |----------|---------|-------------|
-| `NORA_SECRETS_PROVIDER` | `env` | Провайдер секретов: `env`, `aws-secrets`, `vault`, `k8s` |
+| `NORA_SECRETS_PROVIDER` | `env` | Провайдер секретов (реализован только `env`) |
 | `NORA_SECRETS_CLEAR_ENV` | `false` | Очищать переменные окружения после чтения (провайдер env) |
 
 ---
@@ -275,7 +275,7 @@ token_storage = "data/tokens"
 # Secrets
 # =============================================================================
 [secrets]
-provider = "env"        # "env", "aws-secrets", "vault", "k8s"
+provider = "env"        # реализован только "env"
 clear_env = false
 
 # =============================================================================
@@ -371,7 +371,7 @@ enabled = false
 proxy = "https://rubygems.org"
 # proxy_auth = "user:pass"
 proxy_timeout = 30
-index_ttl = 300
+metadata_ttl = 300
 
 # =============================================================================
 # Terraform Provider Registry

@@ -151,14 +151,13 @@ nora/
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
 │   ├── secrets/             # Secret value handling (env vars, redaction)
 │   ├── request_id.rs        # X-Request-Id middleware
-│   ├── error.rs             # Error types
 │   ├── repo_index.rs        # In-memory repository index
 │   └── test_helpers.rs      # Shared test utilities
 │
 ├── fuzz/                    # Cargo-fuzz targets
 ├── scripts/
 │   ├── coherence-check.sh   # CI: code ↔ config consistency
-│   └── docs-quality-gate.py # CI: docs ↔ code fact verification (13 checks)
+│   └── verify-changelog.sh  # CI: CHANGELOG ↔ release version
 └── docs-site/               # Documentation (Astro/Starlight)
 ```
 
@@ -362,7 +361,7 @@ Adding a new registry format requires 24 insertion points across
 
 Several subsystems auto-discover new formats via `RegistryType::all()`
 and require no per-format edits: health checks, curation engine,
-dashboard statistics, and `docs-quality-gate.py`.
+and dashboard statistics.
 
 ## Known Trade-offs
 

@@ -37,3 +37,7 @@ scripts/docs-quality-gate.py
 docs-manifest.json
 ARCHITECTURE.ru.md
 docs-site/
+
+# Local pipeline orchestration state (never commit)
+.nora-pipeline.json
+.nora-pipeline-claims.jsonl
