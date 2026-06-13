@@ -15,7 +15,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use utoipa::ToSchema;
 
 #[derive(Serialize)]
@@ -239,8 +238,8 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
     }
 
     let global_stats = GlobalStats {
-        downloads: state.metrics.downloads.load(Ordering::Relaxed),
-        uploads: state.metrics.uploads.load(Ordering::Relaxed),
+        downloads: state.metrics.downloads(),
+        uploads: state.metrics.uploads(),
         artifacts: total_artifacts as u64,
         cache_hit_percent: state.metrics.cache_hit_rate(),
         storage_bytes: total_storage,

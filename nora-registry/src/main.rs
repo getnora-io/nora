@@ -1420,7 +1420,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         startup_duration_ms,
         auth: auth.map(Arc::new),
         tokens,
-        metrics: Arc::new(DashboardMetrics::with_persistence(&storage_path)),
+        metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
@@ -1585,7 +1585,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         "System endpoints"
     );
 
-    // Background task: persist metrics and flush token last_used every 30 seconds
+    // Background task: flush token last_used + periodic maintenance every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1593,7 +1593,6 @@ async fn run_server(mut config: Config, storage: Storage) {
         loop {
             interval.tick().await;
             tick_count += 1;
-            metrics_state.metrics.save().await;
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used().await;
             }
@@ -1689,9 +1688,6 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Drain audit log — AFTER schedulers finish so their final entries are captured (#543)
     state.audit.shutdown().await;
-
-    // Save metrics on shutdown
-    state.metrics.save().await;
 
     // Flush token last_used timestamps to disk
     if let Some(ref token_store) = state.tokens {
