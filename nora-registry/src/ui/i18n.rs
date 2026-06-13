@@ -162,7 +162,7 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     stat_artifacts: "Artifacts",
     stat_cache_hit: "Cache Hit",
     stat_storage: "Storage",
-    stats_since_restart: "Counters since restart",
+    stats_since_restart: "since restart",
 
     // Registry cards
     active: "ACTIVE",
@@ -271,7 +271,7 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     stat_artifacts: "Артефакты",
     stat_cache_hit: "Кэш",
     stat_storage: "Хранилище",
-    stats_since_restart: "счётчики с момента перезапуска",
+    stats_since_restart: "с момента перезапуска",
 
     // Registry cards
     active: "АКТИВЕН",

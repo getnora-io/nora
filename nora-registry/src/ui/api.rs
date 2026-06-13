@@ -219,7 +219,13 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
                 .collect(),
             RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
             RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-            RegistryType::PyPI => state.config.pypi.proxy.clone().into_iter().collect(),
+            RegistryType::PyPI => state
+                .config
+                .pypi
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
             RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
             RegistryType::Raw => vec![],
             RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
