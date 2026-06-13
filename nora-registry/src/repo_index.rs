@@ -68,7 +68,14 @@ impl RegistryIndex {
     }
 
     pub fn count(&self) -> usize {
-        self.data.read().len()
+        // A directory that holds only generated metadata/sidecars — e.g. Maven's
+        // artifact-level `maven-metadata.xml`, which lands in the parent dir of
+        // the version dirs — materialises as a RepoInfo with zero versions. It
+        // is not a repository, so it must not inflate the per-registry count
+        // that `/api/ui/stats` and `nora_artifacts_total` report (it would show
+        // maven:2 for a single pushed jar). Size is unaffected: `total_size`
+        // sums every bucket, so `storage_bytes` stays == on-disk `du`.
+        self.data.read().iter().filter(|r| r.versions > 0).count()
     }
 
     /// Sum of artifact bytes in this registry's cached index (no rebuild).
@@ -789,6 +796,40 @@ mod tests {
         // size still sums every file on disk (du).
         let size: u64 = repos.iter().map(|r| r.size).sum();
         assert_eq!(size, 200 + 50 + 4 + 30);
+    }
+
+    #[tokio::test]
+    async fn maven_stats_count_excludes_metadata_only_dir() {
+        // Real layout (what a `mvn deploy` / proxy produces): the
+        // artifact-level `maven-metadata.xml` lands in the PARENT dir of the
+        // version dirs, so the on-disk tree has two directories for one jar:
+        //   maven/com/example/a/            <- metadata only (zero artifacts)
+        //   maven/com/example/a/1.0/        <- the jar (one artifact)
+        // The metadata-only dir is not a repository. `/api/ui/stats` and
+        // `nora_artifacts_total` (both read RegistryIndex::count via counts())
+        // must report maven:1 for the single pushed jar, NOT 2.
+        let (_d, s) = temp_storage();
+        s.put("maven/com/example/a/1.0/a-1.0.jar", &[0u8; 200])
+            .await
+            .unwrap();
+        s.put("maven/com/example/a/maven-metadata.xml", &[0u8; 30])
+            .await
+            .unwrap();
+
+        // Exercise the exact prod path /api/ui/stats walks: RepoIndex::get(...)
+        // builds + caches the index, then counts() reads it.
+        let idx = RepoIndex::new();
+        let repos = idx.get("maven", &s).await;
+        // Two on-disk dir buckets, but only one carries an artifact.
+        assert_eq!(repos.len(), 2, "both dirs are indexed buckets");
+        assert_eq!(
+            idx.counts().get(&RegistryType::Maven).copied().unwrap_or(0),
+            1,
+            "count must exclude the versions:0 metadata-only dir"
+        );
+        // Size still sums every on-disk file (du), metadata bytes included.
+        let size: u64 = repos.iter().map(|r| r.size).sum();
+        assert_eq!(size, 200 + 30, "metadata bytes still count toward size==du");
     }
 
     #[tokio::test]
