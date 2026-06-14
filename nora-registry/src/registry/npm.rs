@@ -3,7 +3,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
-use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
 use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
@@ -106,12 +106,28 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
     result
 }
 
+/// npm whoami handler: returns `{"username": "..."}`
+async fn handle_whoami(user: &AuthenticatedUser) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!(r#"{{"username":"{}"}}"#, user.0),
+    )
+        .into_response()
+}
+
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn handle_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
+    // Handle npm whoami endpoint
+    if path == "-/whoami" {
+        return handle_whoami(&user).await;
+    }
+
     let is_tarball = path.contains("/-/");
 
     let key = if is_tarball {
@@ -1184,7 +1200,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_auth, send, send_with_headers,
+    };
 
     #[tokio::test]
     async fn test_npm_namespace_scope_enforced() {
@@ -1513,6 +1531,53 @@ mod integration_tests {
         let response = send(&ctx.app, Method::PUT, "/npm/newpkg", Body::from(body_bytes)).await;
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_npm_whoami_anonymous() {
+        use axum::http::StatusCode;
+
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, axum::http::Method::GET, "/npm/-/whoami", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["username"], "anonymous");
+    }
+
+    #[tokio::test]
+    async fn test_npm_whoami_authenticated() {
+        use axum::http::StatusCode;
+        use base64::Engine;
+
+        let ctx = create_test_context_with_auth(&[("alice", "hunter2")]);
+
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:hunter2")
+        );
+        let resp = send_with_headers(
+            &ctx.app,
+            axum::http::Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &basic)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["username"], "alice");
+    }
+
+    #[tokio::test]
+    async fn test_npm_whoami_requires_auth() {
+        use axum::http::StatusCode;
+
+        let ctx = create_test_context_with_auth(&[("alice", "hunter2")]);
+
+        let resp = send(&ctx.app, axum::http::Method::GET, "/npm/-/whoami", "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
 

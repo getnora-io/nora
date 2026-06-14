@@ -18,6 +18,10 @@ pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
 pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 
+/// Authenticated username carried in request extensions after successful auth.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedUser(pub String);
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -177,6 +181,9 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(NamespaceAuthority::Unrestricted);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedUser("anonymous".to_string()));
         return next.run(request).await;
     }
 
@@ -185,6 +192,9 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(NamespaceAuthority::Unrestricted);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedUser("anonymous".to_string()));
         return next.run(request).await;
     }
 
@@ -199,7 +209,10 @@ pub async fn auth_middleware(
     // Token management always requires auth, even with anonymous_read
     let is_token_management = path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens");
 
-    // Allow anonymous read if configured (but not for Docker /v2/ or token management)
+    // npm whoami always requires auth (otherwise it returns "anonymous" for every user)
+    let is_whoami = path.ends_with("/-/whoami");
+
+    // Allow anonymous read if configured (but not for Docker /v2/, token management, or whoami)
     let is_read_method = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
@@ -208,11 +221,15 @@ pub async fn auth_middleware(
         && is_read_method
         && !is_docker_challenge
         && !is_token_management
+        && !is_whoami
     {
         // Read requests allowed without auth
         request
             .extensions_mut()
             .insert(NamespaceAuthority::Unrestricted);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedUser("anonymous".to_string()));
         return next.run(request).await;
     }
 
@@ -254,7 +271,7 @@ pub async fn auth_middleware(
         // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
-                Ok((_user, role)) => {
+                Ok((user, role)) => {
                     if let Some(ip) = client_ip {
                         state.auth_failures.record_success(&ip);
                     }
@@ -271,6 +288,7 @@ pub async fn auth_middleware(
                     request
                         .extensions_mut()
                         .insert(NamespaceAuthority::Unrestricted);
+                    request.extensions_mut().insert(AuthenticatedUser(user));
                     return next.run(request).await;
                 }
                 Err(_) => {
@@ -311,6 +329,9 @@ pub async fn auth_middleware(
                             identity.namespace_scope_enforcement,
                         );
                         request.extensions_mut().insert(authority);
+                        request
+                            .extensions_mut()
+                            .insert(AuthenticatedUser(identity.subject.clone()));
                         return next.run(request).await;
                     }
                     Err(_) => {
@@ -370,6 +391,9 @@ pub async fn auth_middleware(
     request
         .extensions_mut()
         .insert(NamespaceAuthority::Unrestricted);
+    request
+        .extensions_mut()
+        .insert(AuthenticatedUser(username.to_string()));
     next.run(request).await
 }
 
