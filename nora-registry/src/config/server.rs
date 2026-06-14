@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_server_host")]
     pub host: String,
