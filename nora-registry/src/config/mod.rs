@@ -98,7 +98,7 @@ pub(crate) fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -832,52 +832,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig {
-                host: String::from("127.0.0.1"),
-                port: 4000,
-                public_url: None,
-                body_limit_mb: 2048,
-                proxy_coalesce: true,
-            },
-            storage: StorageConfig {
-                mode: StorageMode::Local,
-                path: String::from("data/storage"),
-                s3_url: String::from("http://127.0.0.1:9000"),
-                bucket: String::from("registry"),
-                s3_access_key: None,
-                s3_secret_key: None,
-                s3_region: String::from("us-east-1"),
-            },
-            maven: MavenConfig::default(),
-            npm: NpmConfig::default(),
-            pypi: PypiConfig::default(),
-            go: GoConfig::default(),
-            cargo: CargoConfig::default(),
-            docker: DockerConfig::default(),
-            raw: RawConfig::default(),
-            gems: GemsConfig::default(),
-            terraform: TerraformConfig::default(),
-            ansible: AnsibleConfig::default(),
-            nuget: NugetConfig::default(),
-            pub_dart: PubDartConfig::default(),
-            conan: ConanConfig::default(),
-            auth: AuthConfig::default(),
-            rate_limit: RateLimitConfig::default(),
-            secrets: SecretsConfig::default(),
-            gc: GcConfig::default(),
-            retention: RetentionConfig::default(),
-            curation: CurationConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            tls: TlsConfig::default(),
-            audit: AuditConfig::default(),
-            registries: None,
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1356,6 +1310,35 @@ mod tests {
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.storage.mode, StorageMode::Local);
+    }
+
+    /// Invariant: the field-level `#[serde(default)]` path and the `Default` impl
+    /// must produce identical values. `Config` derives `Default` (so `Config::default()`
+    /// is compiler-generated from each field's `Default`), leaving the `default_*`
+    /// helpers as the single root; the only way a default can drift is a
+    /// `serde(default = ...)` helper diverging from a type's `Default` impl — this
+    /// test fails loudly if that ever happens.
+    #[test]
+    fn test_serde_defaults_match_default_impl() {
+        // [server]: derived PartialEq gives exhaustive, future-field-proof coverage.
+        let from_empty: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(from_empty, ServerConfig::default());
+
+        // [storage]: ProtectedString does not implement PartialEq, so compare the
+        // comparable fields explicitly and assert the secret fields stay unset.
+        let s: StorageConfig = toml::from_str("").unwrap();
+        let d = StorageConfig::default();
+        assert_eq!(s.mode, d.mode);
+        assert_eq!(s.path, d.path);
+        assert_eq!(s.s3_url, d.s3_url);
+        assert_eq!(s.bucket, d.bucket);
+        assert_eq!(s.s3_region, d.s3_region);
+        assert!(s.s3_access_key.is_none() && d.s3_access_key.is_none());
+        assert!(s.s3_secret_key.is_none() && d.s3_secret_key.is_none());
+
+        // And the whole-Config fallback agrees with deserializing an empty file.
+        let from_empty_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(from_empty_cfg.server, ServerConfig::default());
     }
 
     #[test]
