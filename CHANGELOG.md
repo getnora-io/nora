@@ -3,6 +3,7 @@
 
 ### Fixed
 - **Partial `config.toml`** — missing `[server]`, `[storage]`, or fields like `host`/`port` no longer prevent startup; serde defaults are applied for all unset values.
+- **Container image no longer overrides `config.toml`** — the image shipped config *values* (`NORA_PUBLIC_URL`, `NORA_PORT`, `NORA_STORAGE_PATH`, `NORA_AUTH_TOKEN_STORAGE`) as baked `ENV`, which silently won over a user-provided `config.toml` (env has the highest precedence in `Config::load`). Defaults now ship as a file (`/etc/nora/config.toml`, loaded via `NORA_CONFIG_PATH`); a bind-mounted `config.toml` takes full effect. Only `NORA_HOST` stays in `ENV` so binding survives a partial mounted config and the container stays reachable (#719).
 
 ## [0.9.4] - 2026-06-13
 

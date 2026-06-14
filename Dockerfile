@@ -82,10 +82,13 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
     NORA_HOST=:: \
-    NORA_PORT=4000 \
-    NORA_PUBLIC_URL=http://localhost:4000 \
-    NORA_STORAGE_PATH=/data/storage \
-    NORA_AUTH_TOKEN_STORAGE=/data/tokens
+    NORA_CONFIG_PATH=/etc/nora/config.toml
+
+# Config *values* ship as a FILE, not ENV: env has the highest precedence in
+# Config::load and would silently override a user-provided config.toml (#719).
+# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
+# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
+COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
 
 EXPOSE 4000
 VOLUME ["/data"]
@@ -110,10 +113,13 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
     NORA_HOST=:: \
-    NORA_PORT=4000 \
-    NORA_PUBLIC_URL=http://localhost:4000 \
-    NORA_STORAGE_PATH=/data/storage \
-    NORA_AUTH_TOKEN_STORAGE=/data/tokens
+    NORA_CONFIG_PATH=/etc/nora/config.toml
+
+# Config *values* ship as a FILE, not ENV: env has the highest precedence in
+# Config::load and would silently override a user-provided config.toml (#719).
+# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
+# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
+COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
 
 EXPOSE 4000
 VOLUME ["/data"]
@@ -137,10 +143,13 @@ COPY --from=builder --chown=nora:nora /nora /usr/local/bin/nora
 
 ENV RUST_LOG=info \
     NORA_HOST=:: \
-    NORA_PORT=4000 \
-    NORA_PUBLIC_URL=http://localhost:4000 \
-    NORA_STORAGE_PATH=/data/storage \
-    NORA_AUTH_TOKEN_STORAGE=/data/tokens
+    NORA_CONFIG_PATH=/etc/nora/config.toml
+
+# Config *values* ship as a FILE, not ENV: env has the highest precedence in
+# Config::load and would silently override a user-provided config.toml (#719).
+# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
+# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
+COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
 
 EXPOSE 4000
 VOLUME ["/data"]

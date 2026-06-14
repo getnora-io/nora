@@ -1341,6 +1341,28 @@ mod tests {
         assert_eq!(from_empty_cfg.server, ServerConfig::default());
     }
 
+    /// The config shipped in the container image (deploy/config.docker.toml,
+    /// loaded via NORA_CONFIG_PATH) must be valid for THIS struct and yield the
+    /// intended container defaults — so the image is zero-config out of the box
+    /// without baking config values as env (#719). A renamed/typo'd key would
+    /// otherwise fall back to a default silently, reintroducing the bug. Host is
+    /// deliberately absent (the container sets it via NORA_HOST).
+    #[test]
+    fn test_shipped_docker_config_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/config.docker.toml");
+        let content =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(
+            config.server.public_url.as_deref(),
+            Some("http://localhost:4000")
+        );
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        assert_eq!(config.storage.path, "/data/storage");
+        assert_eq!(config.auth.token_storage, "/data/tokens");
+    }
+
     #[test]
     fn test_config_toml_docker_upstreams() {
         let toml = r#"

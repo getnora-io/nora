@@ -1,0 +1,25 @@
+# Default configuration baked into the NORA container image, loaded via
+# NORA_CONFIG_PATH (set in the Dockerfile). It exists so the image is zero-config
+# out of the box WITHOUT baking config *values* as `ENV` defaults — `ENV` has the
+# highest precedence in Config::load and silently overrides a user-provided
+# config.toml (#719).
+#
+# The bind address is intentionally NOT here: the container sets it via the
+# `NORA_HOST` env var, so binding survives even when you bind-mount your own
+# (possibly partial) config.toml over this file — the container stays reachable.
+# Override with `-e NORA_HOST=0.0.0.0`.
+#
+# To customise the values below: bind-mount your own file over
+# /etc/nora/config.toml, or point NORA_CONFIG_PATH elsewhere. Individual
+# `-e NORA_*` env vars still override, by design (12-factor).
+
+[server]
+port = 4000
+public_url = "http://localhost:4000" # override for real deployments
+
+[storage]
+mode = "local"
+path = "/data/storage"               # backed by the /data volume
+
+[auth]
+token_storage = "/data/tokens"
