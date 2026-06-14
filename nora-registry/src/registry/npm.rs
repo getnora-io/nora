@@ -108,12 +108,10 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
 
 /// npm whoami handler: returns `{"username": "..."}`
 async fn handle_whoami(user: &AuthenticatedUser) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        format!(r#"{{"username":"{}"}}"#, user.0),
-    )
-        .into_response()
+    // Serialize via serde_json, NOT format!: a username can contain `"` (e.g. the
+    // OIDC `sub` claim, which is not charset-validated) and would otherwise break
+    // the JSON or inject extra fields into the response.
+    axum::Json(serde_json::json!({ "username": user.0 })).into_response()
 }
 
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
@@ -1578,6 +1576,20 @@ mod integration_tests {
 
         let resp = send(&ctx.app, axum::http::Method::GET, "/npm/-/whoami", "").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // A username containing `"` (reachable via the OIDC `sub` claim) must NOT
+    // break the JSON or inject extra fields — handle_whoami serializes via serde.
+    #[tokio::test]
+    async fn test_npm_whoami_escapes_username() {
+        use crate::auth::AuthenticatedUser;
+
+        let evil = r#"a","admin":"x"#;
+        let resp = super::handle_whoami(&AuthenticatedUser(evil.to_string())).await;
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["username"], evil);
+        assert!(json.get("admin").is_none());
     }
 }
 
