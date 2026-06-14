@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **Partial `config.toml`** — missing `[server]`, `[storage]`, or fields like `host`/`port` no longer prevent startup; serde defaults are applied for all unset values.
+
 ## [0.9.4] - 2026-06-13
 
 ### Added

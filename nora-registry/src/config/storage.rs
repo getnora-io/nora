@@ -52,6 +52,20 @@ pub(super) fn default_bucket() -> String {
     "registry".to_string()
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mode: StorageMode::Local,
+            path: default_storage_path(),
+            s3_url: default_s3_url(),
+            bucket: default_bucket(),
+            s3_access_key: None,
+            s3_secret_key: None,
+            s3_region: default_s3_region(),
+        }
+    }
+}
+
 impl StorageConfig {
     /// Apply environment variable overrides for storage config.
     ///

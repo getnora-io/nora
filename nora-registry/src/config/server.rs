@@ -8,7 +8,9 @@ use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_server_host")]
     pub host: String,
+    #[serde(default = "default_server_port")]
     pub port: u16,
     /// Public URL for generating pull commands (e.g., "registry.example.com")
     #[serde(default)]
@@ -21,6 +23,14 @@ pub struct ServerConfig {
     /// every concurrent request fetch independently (kill-switch).
     #[serde(default = "default_proxy_coalesce")]
     pub proxy_coalesce: bool,
+}
+
+pub(super) fn default_server_host() -> String {
+    String::from("127.0.0.1")
+}
+
+pub(super) fn default_server_port() -> u16 {
+    4000
 }
 
 pub(super) fn default_body_limit_mb() -> usize {
@@ -37,6 +47,18 @@ pub struct TlsConfig {
     /// Path to PEM-encoded CA certificate bundle (appended to system CAs)
     #[serde(default)]
     pub ca_cert: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_server_host(),
+            port: default_server_port(),
+            public_url: None,
+            body_limit_mb: default_body_limit_mb(),
+            proxy_coalesce: default_proxy_coalesce(),
+        }
+    }
 }
 
 impl ServerConfig {

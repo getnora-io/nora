@@ -100,7 +100,9 @@ pub(crate) fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub maven: MavenConfig,
@@ -1320,6 +1322,40 @@ mod tests {
         assert_eq!(config.docker.upstreams.len(), 1);
         assert!(config.raw.enabled);
         assert!(!config.auth.enabled);
+    }
+
+    #[test]
+    fn test_config_from_toml_partial() {
+        // Missing host and port in [server] — should use defaults
+        let toml = r#"
+            [server]
+            [storage]
+            mode = "local"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.storage.path, "data/storage");
+
+        // Missing [server] entirely — should use defaults
+        let toml = r#"
+            [storage]
+            mode = "local"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+
+        // Missing [storage] entirely — should use defaults
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 8080
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.storage.mode, StorageMode::Local);
     }
 
     #[test]
