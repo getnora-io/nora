@@ -41,3 +41,8 @@ doc = false
 name = "fuzz_config_toml"
 path = "fuzz_targets/fuzz_config_toml.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_url_leak"
+path = "fuzz_targets/fuzz_url_leak.rs"
+doc = false
