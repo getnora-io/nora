@@ -90,6 +90,42 @@ pub mod npm_fuzz {
         result.extend_from_slice(&data[start..]);
         result
     }
+
+    #[cfg(test)]
+    mod url_leak_tests {
+        //! #385: a rewrite must never leak the configured upstream host into
+        //! client-facing output. The fuzz target `fuzz_url_leak` explores this;
+        //! these deterministic cases enforce it on every CI run (there is no
+        //! fuzz CI job, so this is the front-loop guard).
+        use super::rewrite_tarball_urls;
+
+        const UPSTREAM: &str = "https://upstream-host.invalid";
+        const NORA: &str = "http://nora.test";
+
+        #[test]
+        fn tarball_rewrite_drops_upstream_host() {
+            let meta = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://upstream-host.invalid/p/-/p-1.0.0.tgz"}}}}"#;
+            let out = rewrite_tarball_urls(meta, NORA, UPSTREAM).expect("valid json");
+            let out = String::from_utf8(out).expect("json is utf-8");
+            assert!(!out.contains(UPSTREAM), "upstream host leaked: {out}");
+            assert!(
+                out.contains("http://nora.test/npm/p/-/p-1.0.0.tgz"),
+                "tarball not rewritten to nora base: {out}"
+            );
+        }
+
+        #[test]
+        fn byte_safety_net_scrubs_upstream_outside_dist() {
+            // An upstream URL hidden in a non-`dist` field must still be removed
+            // by the #439 byte-level safety-net before the client sees it.
+            let meta = br#"{"_note":"mirror of https://upstream-host.invalid/x","versions":{}}"#;
+            let out = rewrite_tarball_urls(meta, NORA, UPSTREAM).expect("valid json");
+            assert!(
+                !String::from_utf8_lossy(&out).contains(UPSTREAM),
+                "byte safety-net let the upstream host through"
+            );
+        }
+    }
 }
 
 /// Re-export PyPI HTML parsing for fuzz targets
