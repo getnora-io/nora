@@ -288,6 +288,18 @@ async fn handle_request(
         return with_content_type(true, data).into_response();
     }
 
+    // --- Namespace isolation: prevent proxying internal namespaces ---
+    // Metadata requests skip the curation check_download (which only runs for
+    // tarballs), so we must protect the proxy path separately. This runs after
+    // cache lookup so locally-published packages are still served from cache.
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        &package_name,
+    ) {
+        return response;
+    }
+
     // --- Proxy fetch path ---
     if let Some(proxy_url) = &state.config.npm.proxy {
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
