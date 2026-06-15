@@ -102,7 +102,7 @@ Check MinIO Console at `http://localhost:9001` — you should see objects in the
 
 ## RustFS
 
-[RustFS](https://github.com/nicholasrust/rustfs) is a lightweight S3-compatible storage written in Rust. Configuration is identical to MinIO with one difference: the health check endpoint is `/health` instead of `/minio/health/live`.
+[RustFS](https://github.com/rustfs/rustfs) is a lightweight S3-compatible storage written in Rust. Configuration is identical to MinIO with one difference: the health check endpoint is `/health` instead of `/minio/health/live`.
 
 ### Docker Compose
 
