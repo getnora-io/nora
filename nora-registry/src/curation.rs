@@ -2734,8 +2734,7 @@ mod tests {
         let mut engine = CurationEngine::new(CurationConfig::default());
         let ns_filter = super::NamespaceFilter::new(vec!["@internal/*".to_string()]);
         engine.set_namespace_filter(Box::new(ns_filter));
-        let result =
-            super::check_namespace_isolation(&engine, RegistryType::Npm, "public-pkg");
+        let result = super::check_namespace_isolation(&engine, RegistryType::Npm, "public-pkg");
         assert!(result.is_none());
     }
 
