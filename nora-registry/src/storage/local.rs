@@ -13,6 +13,25 @@ use super::{FileMeta, Result, StorageBackend, StorageError};
 /// Monotonic counter for unique temp file names (atomic — no collisions).
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// fsync the parent directory of `path` so the directory entry written by a
+/// just-completed `rename` is durable across power-loss. The file's own data is
+/// fsync'd (`sync_all`) before the rename; the rename only becomes crash-durable
+/// once the *parent directory* is also fsync'd. Without this, a power-loss after
+/// `Ok` was returned can leave the file missing (or the old version) — violating
+/// the "Ok implies durable" contract (L3 durability). Fails closed: a parent that
+/// cannot be fsync'd means durability is not guaranteed, so we return Err.
+async fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        dir.sync_all()
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Local filesystem storage backend (zero-config default)
 pub struct LocalStorage {
     base_path: PathBuf,
@@ -84,6 +103,8 @@ impl StorageBackend for LocalStorage {
             fs::rename(&tmp, &path)
                 .await
                 .map_err(|e| StorageError::Io(e.to_string()))?;
+            // Durability: make the rename's directory entry survive power-loss.
+            sync_parent_dir(&path).await?;
             Ok(())
         }
         .await;
@@ -215,7 +236,11 @@ impl StorageBackend for LocalStorage {
         // Try atomic rename first; fall back to streaming copy on EXDEV
         // (cross-device link — src and dest on different filesystems).
         match fs::rename(src, &dest).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Durability: make the rename's directory entry survive power-loss.
+                sync_parent_dir(&dest).await?;
+                Ok(())
+            }
             Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
                 let mut reader = fs::File::open(src)
                     .await
@@ -243,9 +268,19 @@ impl StorageBackend for LocalStorage {
                         .flush()
                         .await
                         .map_err(|e| StorageError::Io(e.to_string()))?;
+                    // Durability: fsync the copied data before publishing it.
+                    // flush() only pushes to the OS; sync_all() makes it crash-
+                    // durable, matching the put() path (the direct-rename branch
+                    // relies on the caller having fsync'd src).
+                    writer
+                        .sync_all()
+                        .await
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
                     fs::rename(&tmp, &dest)
                         .await
                         .map_err(|e| StorageError::Io(e.to_string()))?;
+                    // Durability: make the rename's directory entry durable.
+                    sync_parent_dir(&dest).await?;
                     Ok(())
                 }
                 .await;
