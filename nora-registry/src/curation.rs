@@ -329,6 +329,48 @@ pub fn check_download(
     }
 }
 
+/// Check namespace isolation only — no full curation pipeline.
+///
+/// Returns `Some(Response)` if the package name matches an internal namespace
+/// pattern. This prevents dependency confusion by ensuring internal packages
+/// are never fetched from upstream registries.
+///
+/// Unlike [`check_download`], this does NOT run the blocklist, allowlist, or
+/// min-release-age filters — it only evaluates the namespace filter.
+pub fn check_namespace_isolation(
+    engine: &CurationEngine,
+    registry: RegistryType,
+    name: &str,
+) -> Option<Response> {
+    let request = FilterRequest {
+        registry,
+        upstream: None,
+        name: name.to_string(),
+        version: None,
+        integrity: None,
+        bypass: false,
+        publish_date: None,
+    };
+
+    if let Some(ref ns_filter) = engine.namespace_filter {
+        let decision = ns_filter.evaluate(&request);
+        if let Decision::Block { rule, reason } = &decision {
+            engine.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+            return Some(
+                BlockedResponse {
+                    rule: rule.clone(),
+                    reason: reason.clone(),
+                    registry: registry.to_string(),
+                    package: name.to_string(),
+                    version: None,
+                }
+                .into_response(),
+            );
+        }
+    }
+    None
+}
+
 /// Extract publish date from file mtime. ONLY for hosted registries —
 /// proxy mtime reflects cache time, not actual publish date.
 // TODO(#513): trust_upstream_dates config for high-security installs
@@ -2675,6 +2717,46 @@ mod tests {
             None,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_namespace_isolation_matches_blocks() {
+        let mut engine = CurationEngine::new(CurationConfig::default());
+        let ns_filter = super::NamespaceFilter::new(vec!["@internal/*".to_string()]);
+        engine.set_namespace_filter(Box::new(ns_filter));
+        let result = super::check_namespace_isolation(&engine, RegistryType::Npm, "@internal/pkg");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_check_namespace_isolation_no_match_returns_none() {
+        let mut engine = CurationEngine::new(CurationConfig::default());
+        let ns_filter = super::NamespaceFilter::new(vec!["@internal/*".to_string()]);
+        engine.set_namespace_filter(Box::new(ns_filter));
+        let result =
+            super::check_namespace_isolation(&engine, RegistryType::Npm, "public-pkg");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_namespace_isolation_no_filter_returns_none() {
+        let engine = CurationEngine::new(CurationConfig::default());
+        let result = super::check_namespace_isolation(&engine, RegistryType::Npm, "@internal/pkg");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_namespace_isolation_active_even_in_off_mode() {
+        // Namespace isolation is always active, even when curation is Off
+        let mut engine = CurationEngine::new(CurationConfig {
+            mode: CurationMode::Off,
+            ..CurationConfig::default()
+        });
+        let ns_filter = super::NamespaceFilter::new(vec!["@internal/*".to_string()]);
+        engine.set_namespace_filter(Box::new(ns_filter));
+        let result = super::check_namespace_isolation(&engine, RegistryType::Npm, "@internal/pkg");
+        assert!(result.is_some());
     }
 
     // ================================================================
