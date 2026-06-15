@@ -83,6 +83,10 @@ fn build_context(
             public_url: None,
             body_limit_mb: 2048,
             proxy_coalesce: true,
+            // Permissive test fixture: trust upstream dates so existing handler
+            // tests exercise the upstream-date path (prod default is false/secure;
+            // the trust=false path has its own dedicated tests).
+            trust_upstream_dates: true,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,

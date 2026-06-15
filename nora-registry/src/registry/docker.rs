@@ -2855,8 +2855,9 @@ fn detect_manifest_media_type(data: &[u8]) -> String {
 /// Extract publish date from Docker manifest `.meta.json` sidecar.
 ///
 /// Docker metadata sidecar stores `push_timestamp` (Unix seconds) when the
-/// manifest was first pushed or cached.
-// TODO(#513): trust_upstream_dates config for high-security installs
+/// manifest was first pushed or cached. This is a NORA-side timestamp (not an
+/// upstream-supplied date), so it is unaffected by `server.trust_upstream_dates`
+/// (#513) — there is no spoofable upstream date on this path.
 async fn extract_docker_publish_date(
     storage: &Storage,
     name: &str,

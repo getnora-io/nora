@@ -309,7 +309,15 @@ async fn recipe_file_download(
     let artifact = format!("{} rrev={} {}", ref_str, rrev, filename);
 
     // Extract publish date from cached revision metadata
-    let publish_date = extract_conan_publish_date(&state.storage, &name, &ver, &user, &chan).await;
+    let publish_date = extract_conan_publish_date(
+        &state.storage,
+        &name,
+        &ver,
+        &user,
+        &chan,
+        state.config.server.trust_upstream_dates,
+    )
+    .await;
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
@@ -588,7 +596,15 @@ async fn package_file_download(
     let artifact = format!("{}#{}:{}#{} {}", ref_str, rrev, pkg_id, prev, filename);
 
     // Extract publish date from cached revision metadata
-    let publish_date = extract_conan_publish_date(&state.storage, &name, &ver, &user, &chan).await;
+    let publish_date = extract_conan_publish_date(
+        &state.storage,
+        &name,
+        &ver,
+        &user,
+        &chan,
+        state.config.server.trust_upstream_dates,
+    )
+    .await;
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
@@ -871,16 +887,20 @@ async fn fetch_and_cache_immutable_json(
 /// ```json
 /// { "revision": "abc123", "time": "2024-01-15T10:30:00.000+0000" }
 /// ```
-// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_conan_publish_date(
     storage: &crate::storage::Storage,
     name: &str,
     ver: &str,
     user: &str,
     chan: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let meta_key = format!("conan/{}/latest.json", ref_str);
+    // #513: untrusted upstream dates → NORA cache mtime, never upstream time.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+    }
     let data = storage.get(&meta_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let date_str = json.get("time")?.as_str()?;
@@ -1304,8 +1324,51 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_").await;
+        let result =
+            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_conan_untrusted_dates_use_cache_mtime_not_upstream() {
+        // #513: with trust=false, a spoofed-OLD upstream `time` must be ignored
+        // and NORA's own cache mtime used instead, so an attacker cannot backdate
+        // a freshly-published package past the min-release-age quarantine.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let meta = serde_json::json!({ "revision": "r1", "time": "2000-01-01T00:00:00.000+0000" });
+        storage
+            .put(
+                "conan/zlib/1.3/_/_/latest.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let trusted =
+            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
+        let untrusted =
+            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", false).await;
+
+        // trust=true honors the (spoofed, old) upstream date
+        assert_eq!(trusted, Some(946_684_800)); // 2000-01-01T00:00:00Z
+                                                // trust=false ignores it and uses the recent cache mtime instead
+        let untrusted = untrusted.expect("cached file has an mtime");
+        assert!(
+            untrusted > 946_684_800,
+            "trust=false must use recent cache mtime, not the old upstream date (got {untrusted})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conan_untrusted_dates_fail_closed_when_uncached() {
+        // #513 fail-closed: trust=false with no cached metadata yields None, which
+        // curation's min-release-age treats as Block — never a bypass.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let result =
+            super::extract_conan_publish_date(&storage, "uncached", "1.0", "_", "_", false).await;
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -1321,7 +1384,8 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_").await;
+        let result =
+            super::extract_conan_publish_date(&storage, "zlib", "1.3", "_", "_", true).await;
         assert!(result.is_none());
     }
 
@@ -1331,7 +1395,7 @@ mod integration_tests {
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
 
         let result =
-            super::extract_conan_publish_date(&storage, "nonexistent", "1.0", "_", "_").await;
+            super::extract_conan_publish_date(&storage, "nonexistent", "1.0", "_", "_", true).await;
         assert!(result.is_none());
     }
 

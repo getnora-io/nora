@@ -628,25 +628,30 @@ async fn module_source_download(
 ///
 /// Terraform registry API does not reliably include `published_at` in the
 /// versions listing. Falls back to mtime for hosted-only mode.
-// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_terraform_publish_date(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
 ) -> Option<i64> {
-    // Try download metadata JSON (per-version cached file)
-    let storage_key = format!("terraform/providers/{}/{}/{}/download.json", ns, ptype, ver);
-    if let Ok(data) = state.storage.get(&storage_key).await {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-            if let Some(date_str) = json.get("published_at").and_then(|v| v.as_str()) {
-                return crate::curation::parse_iso8601_to_unix(date_str);
+    // #513: only consult the upstream-provided `published_at` when configured to
+    // trust upstream dates (an attacker controlling upstream could spoof it).
+    if state.config.server.trust_upstream_dates {
+        // Try download metadata JSON (per-version cached file)
+        let storage_key = format!("terraform/providers/{}/{}/{}/download.json", ns, ptype, ver);
+        if let Ok(data) = state.storage.get(&storage_key).await {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(date_str) = json.get("published_at").and_then(|v| v.as_str()) {
+                    return crate::curation::parse_iso8601_to_unix(date_str);
+                }
             }
         }
     }
 
-    // mtime fallback — only for hosted mode (proxy mtime = cache time)
-    if state.config.terraform.proxy.is_none() {
+    // mtime fallback — NORA's own cache time. Fires for hosted mode (where mtime
+    // ≈ first-publish) and whenever upstream dates are not trusted (#513). In
+    // proxy mode with trust=true it stays disabled (cache time != publish time).
+    if state.config.terraform.proxy.is_none() || !state.config.server.trust_upstream_dates {
         // Try any cached platform-specific metadata
         for suffix in &["linux_amd64.json", "linux_arm64.json", "darwin_amd64.json"] {
             let meta_key = format!("terraform/providers/{}/{}/{}/{}", ns, ptype, ver, suffix);

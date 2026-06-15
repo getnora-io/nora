@@ -769,7 +769,13 @@ async fn flatcontainer_download(
     // Curation check for .nupkg downloads
     if ends_with_ci(filename, ".nupkg") {
         // Extract publish date from cached registration index
-        let publish_date = extract_nuget_publish_date(&state.storage, &id_lower, ver).await;
+        let publish_date = extract_nuget_publish_date(
+            &state.storage,
+            &id_lower,
+            ver,
+            state.config.server.trust_upstream_dates,
+        )
+        .await;
 
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
@@ -1000,13 +1006,17 @@ fn serve_stale_or_not_found(
 /// ```json
 /// { "items": [{ "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
 /// ```
-// TODO(#513): trust_upstream_dates config for high-security installs
 async fn extract_nuget_publish_date(
     storage: &crate::storage::Storage,
     id: &str,
     version: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
     let meta_key = format!("nuget/registration/{}/index.json", id.to_lowercase());
+    // #513: untrusted upstream dates → NORA cache mtime, never upstream published.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+    }
     let data = storage.get(&meta_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let pages = json.get("items")?.as_array()?;
@@ -1869,7 +1879,8 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_nuget_publish_date(&storage, "newtonsoft.json", "6.0.0").await;
+        let result =
+            super::extract_nuget_publish_date(&storage, "newtonsoft.json", "6.0.0", true).await;
         assert!(result.is_some());
     }
 
@@ -1888,7 +1899,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_nuget_publish_date(&storage, "test", "9.9.9").await;
+        let result = super::extract_nuget_publish_date(&storage, "test", "9.9.9", true).await;
         assert!(result.is_none());
     }
 
@@ -1897,7 +1908,8 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0").await;
+        let result =
+            super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0", true).await;
         assert!(result.is_none());
     }
 
@@ -1931,7 +1943,7 @@ mod integration_tests {
             .unwrap();
 
         // Before #535 fix: this returned None because page 0 had no "items".
-        let result = super::extract_nuget_publish_date(&storage, "sparse-pkg", "2.0.0").await;
+        let result = super::extract_nuget_publish_date(&storage, "sparse-pkg", "2.0.0", true).await;
         assert!(result.is_some(), "date must be found despite sparse page 0");
     }
 

@@ -158,7 +158,13 @@ async fn handle_request(
         // Extract publish date from cached metadata (npm time field)
         let publish_date = if let Some(ref ver) = tarball_version {
             let meta_key = format!("npm/{}/metadata.json", package_name);
-            extract_npm_publish_date(&state.storage, &meta_key, ver).await
+            extract_npm_publish_date(
+                &state.storage,
+                &meta_key,
+                ver,
+                state.config.server.trust_upstream_dates,
+            )
+            .await
         } else {
             None
         };
@@ -872,7 +878,14 @@ async fn extract_npm_publish_date(
     storage: &crate::storage::Storage,
     metadata_key: &str,
     version: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
+    // #513: when upstream dates are not trusted, derive age from NORA's own
+    // cache mtime instead of the (spoofable) upstream metadata date. Never fall
+    // back to the upstream date here — that would reopen the spoof vector.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+    }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let date_str = json.get("time")?.get(version)?.as_str()?;

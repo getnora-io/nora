@@ -405,7 +405,13 @@ async fn download_archive(
     }
 
     // Extract publish date from cached metadata (works for both hosted and proxy)
-    let publish_date = extract_pub_publish_date(&state.storage, &package, version).await;
+    let publish_date = extract_pub_publish_date(
+        &state.storage,
+        &package,
+        version,
+        state.config.server.trust_upstream_dates,
+    )
+    .await;
 
     // Curation check
     if let Some(response) = crate::curation::check_download(
@@ -784,8 +790,13 @@ async fn extract_pub_publish_date(
     storage: &crate::storage::Storage,
     package: &str,
     version: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
     let meta_key = format!("pub/api/packages/{}.json", package);
+    // #513: untrusted upstream dates → NORA cache mtime, never upstream published.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+    }
     let data = storage.get(&meta_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let versions = json.get("versions")?.as_array()?;
@@ -1195,7 +1206,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = super::extract_pub_publish_date(&storage, "http", "1.0.0").await;
+        let result = super::extract_pub_publish_date(&storage, "http", "1.0.0", true).await;
         assert!(result.is_some());
     }
 
@@ -1215,7 +1226,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = super::extract_pub_publish_date(&storage, "http", "2.0.0").await;
+        let result = super::extract_pub_publish_date(&storage, "http", "2.0.0", true).await;
         assert!(result.is_none());
     }
 
@@ -1224,7 +1235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = super::extract_pub_publish_date(&storage, "nonexistent", "1.0.0").await;
+        let result = super::extract_pub_publish_date(&storage, "nonexistent", "1.0.0", true).await;
         assert!(result.is_none());
     }
 

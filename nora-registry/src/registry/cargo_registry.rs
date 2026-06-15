@@ -283,7 +283,13 @@ async fn download(
     // Extract publish date from cached Cargo metadata
     let publish_date = {
         let meta_key = format!("cargo/{}/metadata.json", crate_name);
-        extract_cargo_publish_date(&state.storage, &meta_key, &version).await
+        extract_cargo_publish_date(
+            &state.storage,
+            &meta_key,
+            &version,
+            state.config.server.trust_upstream_dates,
+        )
+        .await
     };
 
     // Curation check — before storage access
@@ -779,7 +785,12 @@ async fn extract_cargo_publish_date(
     storage: &crate::storage::Storage,
     metadata_key: &str,
     version: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
+    // #513: untrusted upstream dates → NORA cache mtime, never upstream created_at.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+    }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let versions = json.get("versions")?.as_array()?;

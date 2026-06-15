@@ -242,7 +242,13 @@ async fn download_file(
     // Extract publish date from cached PyPI metadata
     let publish_date = if let Some(ref ver) = version {
         let meta_key = format!("pypi/{}/metadata.json", normalized);
-        extract_pypi_publish_date(&state.storage, &meta_key, ver).await
+        extract_pypi_publish_date(
+            &state.storage,
+            &meta_key,
+            ver,
+            state.config.server.trust_upstream_dates,
+        )
+        .await
     } else {
         None
     };
@@ -651,7 +657,13 @@ async fn extract_pypi_publish_date(
     storage: &crate::storage::Storage,
     metadata_key: &str,
     version: &str,
+    trust_upstream: bool,
 ) -> Option<i64> {
+    // #513: untrusted upstream dates → use NORA's own cache mtime, never the
+    // (spoofable) upstream upload_time.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+    }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let files = json.get("releases")?.get(version)?.as_array()?;

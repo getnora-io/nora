@@ -23,6 +23,18 @@ pub struct ServerConfig {
     /// every concurrent request fetch independently (kill-switch).
     #[serde(default = "default_proxy_coalesce")]
     pub proxy_coalesce: bool,
+    /// Trust upstream-provided publish dates (`published`/`time`/`created_at`/
+    /// `upload_time`/etc.) when enforcing `min_release_age` curation. Default
+    /// `false` (secure, ADR-8): an attacker controlling/MITM-ing an upstream
+    /// registry could spoof an OLD date so a freshly-published malicious package
+    /// appears old and bypasses the new-package quarantine. When `false`, NORA
+    /// derives the package age from its OWN cache timestamp (mtime) instead.
+    /// Set `true` to restore the legacy behavior of trusting upstream dates.
+    /// NB: with `false`, age is measured from when NORA first cached the
+    /// artifact (cache-age), not its real publish date — a long-published
+    /// package just cached will be quarantined for `min_release_age`.
+    #[serde(default = "default_trust_upstream_dates")]
+    pub trust_upstream_dates: bool,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -41,6 +53,10 @@ pub(super) fn default_proxy_coalesce() -> bool {
     true
 }
 
+pub(super) fn default_trust_upstream_dates() -> bool {
+    false
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -57,6 +73,7 @@ impl Default for ServerConfig {
             public_url: None,
             body_limit_mb: default_body_limit_mb(),
             proxy_coalesce: default_proxy_coalesce(),
+            trust_upstream_dates: default_trust_upstream_dates(),
         }
     }
 }
@@ -144,6 +161,13 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
             super::parse_env_warn("NORA_BODY_LIMIT_MB", &val, &mut self.body_limit_mb);
         }
+        if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
+            super::parse_env_warn(
+                "NORA_TRUST_UPSTREAM_DATES",
+                &val,
+                &mut self.trust_upstream_dates,
+            );
+        }
     }
 }
 
@@ -158,6 +182,7 @@ mod tests {
             public_url: None,
             body_limit_mb: 2048,
             proxy_coalesce: true,
+            trust_upstream_dates: false,
         }
     }
 

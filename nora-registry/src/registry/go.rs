@@ -79,7 +79,12 @@ async fn handle(
         // Extract publish date from cached .info file
         let publish_date = if let Some(ref ver) = version {
             let info_key = format!("go/{}/@v/{}.info", module_encoded, ver);
-            extract_go_publish_date(&state.storage, &info_key).await
+            extract_go_publish_date(
+                &state.storage,
+                &info_key,
+                state.config.server.trust_upstream_dates,
+            )
+            .await
         } else {
             None
         };
@@ -280,7 +285,15 @@ async fn handle(
 /// ```json
 /// { "Version": "v1.0.0", "Time": "2024-01-15T10:30:00Z" }
 /// ```
-async fn extract_go_publish_date(storage: &crate::storage::Storage, info_key: &str) -> Option<i64> {
+async fn extract_go_publish_date(
+    storage: &crate::storage::Storage,
+    info_key: &str,
+    trust_upstream: bool,
+) -> Option<i64> {
+    // #513: untrusted upstream dates → NORA cache mtime, never upstream .info Time.
+    if !trust_upstream {
+        return crate::curation::extract_mtime_as_publish_date(storage, info_key).await;
+    }
     let data = storage.get(info_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let date_str = json.get("Time")?.as_str()?;

@@ -371,9 +371,11 @@ pub fn check_namespace_isolation(
     None
 }
 
-/// Extract publish date from file mtime. ONLY for hosted registries —
-/// proxy mtime reflects cache time, not actual publish date.
-// TODO(#513): trust_upstream_dates config for high-security installs
+/// Extract publish date from file mtime. Used for hosted registries, and — when
+/// `server.trust_upstream_dates = false` — for proxy registries too (#513): the
+/// NORA-cache mtime is NORA-controlled, so it cannot be spoofed by an upstream
+/// registry the way an upstream-supplied `published`/`time`/etc. date can. NB in
+/// proxy mode this measures cache-age, not real publish date.
 pub async fn extract_mtime_as_publish_date(
     storage: &crate::storage::Storage,
     key: &str,
