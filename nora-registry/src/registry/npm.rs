@@ -596,7 +596,18 @@ async fn handle_publish(
 
     // Store tarballs
     for (filename, attachment_data) in attachments {
-        if !is_valid_attachment_name(filename) {
+        // Scoped packages (e.g. @scope/name) may have attachment filenames
+        // like "@scope/name-1.0.0.tgz". Strip the scope prefix since it is
+        // already captured in the package name — the filename part must be a
+        // flat name without path separators to prevent path traversal.
+        let normalized_name = if let Some(scope_end) = package_name.find('/') {
+            let scope_prefix = &package_name[..=scope_end];
+            filename.strip_prefix(scope_prefix).unwrap_or(filename)
+        } else {
+            filename
+        };
+
+        if !is_valid_attachment_name(normalized_name) {
             tracing::warn!(
                 filename = %filename,
                 package = %package_name,
@@ -617,7 +628,7 @@ async fn handle_publish(
             }
         };
 
-        let tarball_key = format!("npm/{}/tarballs/{}", package_name, filename);
+        let tarball_key = format!("npm/{}/tarballs/{}", package_name, normalized_name);
         if let Err(e) = state.storage.put(&tarball_key, &tarball_bytes).await {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1439,6 +1450,54 @@ mod integration_tests {
         let versions = json["versions"].as_object().unwrap();
         assert!(versions.contains_key("1.0.0"), "migrated v1 lost");
         assert!(versions.contains_key("2.0.0"), "new v2 lost");
+    }
+
+    #[tokio::test]
+    async fn test_npm_publish_scoped_with_prefixed_attachment() {
+        use crate::auth::NamespaceAuthority;
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::Extension;
+
+        let ctx = create_test_context();
+
+        let tarball_data = b"fake-tarball";
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+
+        // Scoped package where the attachment filename includes the scope prefix
+        // (e.g. "@scope/pkg-1.0.0.tgz" instead of "pkg-1.0.0.tgz"). The handler
+        // must normalize this by stripping the scope prefix.
+        let payload = serde_json::json!({
+            "name": "@scope/mypkg",
+            "versions": {
+                "1.0.0": { "dist": {} }
+            },
+            "_attachments": {
+                "@scope/mypkg-1.0.0.tgz": { "data": base64_data }
+            },
+            "dist-tags": { "latest": "1.0.0" }
+        });
+
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+
+        let resp = super::handle_publish(
+            State(ctx.state.clone()),
+            Path("@scope/mypkg".to_string()),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(body_bytes),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Verify tarball was stored with the normalized (scope-stripped) filename
+        let stored_tarball = ctx
+            .state
+            .storage
+            .get("npm/@scope/mypkg/tarballs/mypkg-1.0.0.tgz")
+            .await
+            .unwrap();
+        assert_eq!(&stored_tarball[..], tarball_data);
     }
 
     #[tokio::test]
