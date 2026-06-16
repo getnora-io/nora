@@ -169,6 +169,30 @@ async fn handle(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // #68 namespace isolation: an internal-namespace module must never be fetched
+    // upstream (dependency confusion). The fresh-cache fast path above already served
+    // a fresh copy; here, serve any stale cached copy rather than re-proxying, and
+    // block only when nothing is cached — never proxy. (The .zip artifact path also
+    // runs check_download.)
+    let module_path =
+        decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Go,
+        &module_path,
+    ) {
+        if let Some(ref data) = cached {
+            state.metrics.record_cache_hit("go");
+            return with_content_type(data.to_vec(), content_type, is_mutable);
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Go,
+            &module_path,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let upstream_url = format!(
         "{}/{}",
         proxy_url.trim_end_matches('/'),

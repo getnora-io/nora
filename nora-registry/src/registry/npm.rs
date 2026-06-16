@@ -199,6 +199,18 @@ async fn handle_request(
             let ttl = state.config.npm.metadata_ttl;
             if let Some(meta) = state.storage.stat(&key).await {
                 if !crate::cache_ttl::is_within_ttl(meta.modified, ttl) {
+                    // #68 namespace isolation: a stale internal-namespace package must
+                    // NOT be revalidated upstream (dependency confusion) — refetch_metadata
+                    // proxies the name. Serve the cached copy already in hand instead; an
+                    // internal package is owned/hosted locally, never upstream-refreshed.
+                    // (The cache-miss proxy path is guarded separately below.)
+                    if crate::curation::is_internal_namespace(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Npm,
+                        &package_name,
+                    ) {
+                        return with_content_type(false, data).into_response();
+                    }
                     // Single-flight: when a popular packument expires and a CI
                     // fleet stampedes the same key, one request revalidates
                     // upstream and the rest serve its in-memory result (#595).

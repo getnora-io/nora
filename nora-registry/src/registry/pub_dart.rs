@@ -287,6 +287,25 @@ async fn version_metadata(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace package's version metadata must
+    // never be fetched upstream (dependency confusion). Serve any local copy (fresh
+    // path returned above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PubDart,
+        &package,
+    ) {
+        if let Some(ref data) = cached_data {
+            return pub_json_response(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PubDart,
+            &package,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -346,6 +365,25 @@ async fn package_advisories(
                 return pub_json_response(data.to_vec());
             }
         }
+    }
+
+    // #68 namespace isolation: an internal-namespace package's advisories must never
+    // be fetched upstream (dependency confusion). Serve any local copy (fresh path
+    // returned above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PubDart,
+        &package,
+    ) {
+        if let Some(ref data) = cached_data {
+            return pub_json_response(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PubDart,
+            &package,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {

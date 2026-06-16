@@ -120,6 +120,16 @@ async fn search(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // #68 namespace isolation: never forward a search term matching an internal
+    // namespace upstream (dependency confusion) — return an empty result set.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &query,
+    ) {
+        return with_json(br#"{"results":[]}"#.to_vec());
+    }
+
     let proxy_url = upstream_url(&state);
     // Percent-encode query for upstream
     let encoded_query: String = query
@@ -201,6 +211,27 @@ async fn recipe_latest(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace recipe must never be fetched
+    // upstream (dependency confusion). Serve any local copy (the fresh path returned
+    // above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("conan");
+            state.metrics.record_cache_hit("conan");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let proxy_url = upstream_url(&state);
     let url = format!(
         "{}/v2/conans/{}/latest",
@@ -233,6 +264,27 @@ async fn recipe_revisions(
                 return with_json(data.to_vec());
             }
         }
+    }
+
+    // #68 namespace isolation: an internal-namespace recipe must never be fetched
+    // upstream (dependency confusion). Serve any local copy (the fresh path returned
+    // above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("conan");
+            state.metrics.record_cache_hit("conan");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);
@@ -268,6 +320,16 @@ async fn recipe_file_list(
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
+    }
+
+    // #68 namespace isolation: a cached internal recipe's file list was served above;
+    // an internal name with no local copy must not be fetched upstream.
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        return response;
     }
 
     let proxy_url = upstream_url(&state);
@@ -449,6 +511,27 @@ async fn package_latest(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace package must never be fetched
+    // upstream (dependency confusion). Serve any local copy (the fresh path returned
+    // above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("conan");
+            state.metrics.record_cache_hit("conan");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let proxy_url = upstream_url(&state);
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/latest",
@@ -501,6 +584,27 @@ async fn package_revisions(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace package must never be fetched
+    // upstream (dependency confusion). Serve any local copy (the fresh path returned
+    // above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("conan");
+            state.metrics.record_cache_hit("conan");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let proxy_url = upstream_url(&state);
     let url = format!(
         "{}/v2/conans/{}/revisions/{}/packages/{}/revisions",
@@ -549,6 +653,16 @@ async fn package_file_list(
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
+    }
+
+    // #68 namespace isolation: a cached internal package's file list was served above;
+    // an internal name with no local copy must not be fetched upstream.
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Conan,
+        &name,
+    ) {
+        return response;
     }
 
     let proxy_url = upstream_url(&state);

@@ -134,6 +134,27 @@ async fn sparse_index(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace crate must never be revalidated
+    // or fetched upstream (dependency confusion). Serve any local index (hosted or
+    // cached) without contacting upstream; block only when nothing is published
+    // locally. The fresh-cache fast path above already returned a fresh copy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Cargo,
+        &crate_name,
+    ) {
+        if let Some(ref data) = cached {
+            state.metrics.record_cache_hit("cargo");
+            return sparse_index_conditional(data.to_vec(), &headers);
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Cargo,
+            &crate_name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     // Revalidate / fetch from upstream (no cache, or the cached index is stale).
     let proxy_url = match &state.config.cargo.proxy {
         Some(url) => url.clone(),
@@ -232,6 +253,16 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
 
     if let Ok(data) = state.storage.get(&key).await {
         return (StatusCode::OK, data).into_response();
+    }
+
+    // #68 namespace isolation: a locally-published internal crate was served above;
+    // an internal name with no local copy must not be fetched upstream.
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Cargo,
+        &crate_name,
+    ) {
+        return response;
     }
 
     // Proxy fetch metadata from upstream

@@ -166,9 +166,20 @@ async fn package_versions(
     // the upstream order: the first upstream that lists a file wins (local files
     // win over all upstreams). One upstream's failure or open breaker must not
     // sink the others — skip it and serve the merge of what answered.
+    // #68 namespace isolation: an internal-namespace package must never be fetched
+    // upstream (dependency confusion). Skip the upstream merge entirely; a locally
+    // published copy is still served from the local-only branch below, and an
+    // internal name with no local copy is blocked (never proxied). Computed without
+    // the `blocked` metric — the metric fires only on the actual block path below.
+    let is_internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        &normalized,
+    );
+
     let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
-    if !upstreams.is_empty() {
+    if !is_internal && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
             let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
@@ -211,6 +222,19 @@ async fn package_versions(
         } else {
             versions_html_response(&normalized, &local_files, &base_url)
         };
+    }
+
+    // #68: an internal-namespace package with no local copy is blocked, never
+    // proxied — return the namespace 403 (the only pypi metadata path that
+    // increments the blocked metric).
+    if is_internal {
+        if let Some(response) = crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+        ) {
+            return response;
+        }
     }
 
     // No upstream result and no local copy: a tripped breaker means the upstream is

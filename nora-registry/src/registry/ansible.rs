@@ -116,7 +116,7 @@ async fn collection_list(State(state): State<AppState>, RawQuery(raw_query): Raw
         None => "ansible/metadata/collections.json".to_string(),
     };
 
-    proxy_json(&state, &url, "ansible-collections", &cache_key).await
+    proxy_json(&state, &url, "ansible-collections", &cache_key, None).await
 }
 
 // ── Collection detail ──────────────────────────────────────────────────
@@ -139,7 +139,14 @@ async fn collection_detail(
     );
 
     let cache_key = format!("ansible/metadata/{}/{}.json", ns, name);
-    proxy_json(&state, &url, &format!("{}.{}", ns, name), &cache_key).await
+    proxy_json(
+        &state,
+        &url,
+        &format!("{}.{}", ns, name),
+        &cache_key,
+        Some(&format!("{}.{}", ns, name)),
+    )
+    .await
 }
 
 // ── Version listing ────────────────────────────────────────────────────
@@ -176,6 +183,7 @@ async fn version_list(
         &url,
         &format!("{}.{}/versions", ns, name),
         &cache_key,
+        Some(&format!("{}.{}", ns, name)),
     )
     .await
 }
@@ -220,6 +228,7 @@ async fn version_detail(
         &url,
         &format!("{}.{} v{}", ns, name, ver),
         &cache_key,
+        Some(&format!("{}.{}", ns, name)),
     )
     .await
 }
@@ -351,7 +360,13 @@ async fn download_tarball(
 ///
 /// `cache_key` is the storage path for the cached response (e.g.
 /// `ansible/metadata/community/general.json`).
-async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key: &str) -> Response {
+async fn proxy_json(
+    state: &AppState,
+    url: &str,
+    artifact_name: &str,
+    cache_key: &str,
+    package_name: Option<&str>,
+) -> Response {
     let base_url = nora_base_url(state);
     let upstream = upstream_url(state);
 
@@ -368,6 +383,32 @@ async fn proxy_json(state: &AppState, url: &str, artifact_name: &str, cache_key:
                 let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
                 return with_json(rewritten.into_bytes());
             }
+        }
+    }
+
+    // #68 namespace isolation: an internal-namespace collection's metadata must never
+    // be fetched upstream (dependency confusion). Serve any local copy (fresh path
+    // returned above), else block — never proxy. (collection_list passes None: the
+    // catalog index has no single package name to gate.)
+    if let Some(pkg) = package_name {
+        if crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Ansible,
+            pkg,
+        ) {
+            if let Some(ref data) = cached_data {
+                state.metrics.record_download("ansible");
+                state.metrics.record_cache_hit("ansible");
+                let text = String::from_utf8_lossy(data);
+                let rewritten = rewrite_ansible_urls(&text, &upstream, &base_url);
+                return with_json(rewritten.into_bytes());
+            }
+            return crate::curation::check_namespace_isolation(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Ansible,
+                pkg,
+            )
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
         }
     }
 

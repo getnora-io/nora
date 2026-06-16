@@ -16,6 +16,10 @@ mod pypi;
 mod raw;
 pub(crate) mod terraform;
 
+// Cross-registry regression suite for namespace isolation on metadata paths (contrib-kit#68).
+#[cfg(test)]
+mod ns_isolation_metadata_tests;
+
 pub use ansible::routes as ansible_routes;
 pub use cargo_registry::routes as cargo_routes;
 pub use conan::routes as conan_routes;

@@ -244,6 +244,25 @@ async fn search_query(
         return with_json(data);
     }
 
+    // #68 namespace isolation: never forward a search term that matches an internal
+    // namespace upstream (dependency confusion) — serve local results only.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &query,
+    ) {
+        let data = local_search_results(
+            &state,
+            &query,
+            skip,
+            take,
+            prerelease,
+            sem_ver_level.as_deref(),
+        )
+        .await;
+        return with_json(data);
+    }
+
     // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
     let url = format!("{}?{}", state.config.nuget.search_service, qs);
@@ -308,6 +327,24 @@ async fn autocomplete_query(
 
     // No upstream proxy configured → local autocomplete from cache
     if state.config.nuget.proxy.is_none() {
+        let data = local_autocomplete_results(
+            &state,
+            &query,
+            skip,
+            take,
+            prerelease,
+            sem_ver_level.as_deref(),
+        )
+        .await;
+        return with_json(data);
+    }
+
+    // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &query,
+    ) {
         let data = local_autocomplete_results(
             &state,
             &query,
@@ -561,6 +598,29 @@ async fn registration_page(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace package's registration must
+    // never be fetched upstream (dependency confusion). Serve any local copy
+    // (hosted/cached; the fresh path returned above), else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let text = String::from_utf8_lossy(data);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            return with_json_gzip(rewritten.into_bytes());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let url = format!(
         "{}/v3/registration5-gz-semver2/{}/page/{}/{}.json",
         upstream.trim_end_matches('/'),
@@ -646,6 +706,26 @@ async fn version_list(state: AppState, id: &str) -> Response {
                 return with_json(data.to_vec());
             }
         }
+    }
+
+    // #68 namespace isolation: serve any local version list for an internal package,
+    // else block — never fetch upstream (dependency confusion).
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);

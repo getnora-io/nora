@@ -474,6 +474,16 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
         return with_binary(data.to_vec(), "application/octet-stream");
     }
 
+    // #68 namespace isolation: a cached internal gem's spec was served above; an
+    // internal name with no local copy must not be fetched upstream.
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Gems,
+        &name,
+    ) {
+        return response;
+    }
+
     let proxy_url = upstream_url(&state);
     let url = format!(
         "{}/quick/Marshal.4.8/{}.gemspec.rz",

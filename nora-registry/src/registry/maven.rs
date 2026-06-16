@@ -220,6 +220,37 @@ async fn download(
         }
     }
 
+    // #68 namespace isolation: the maven-metadata.xml (ArtifactMeta) path is not
+    // covered by the VersionFile check_download above. An internal group:artifact's
+    // metadata must never be fetched upstream (dependency confusion): serve any local
+    // copy (deployed/cached metadata; the fresh path already returned above) and block
+    // only when nothing is hosted locally — never proxy.
+    if let MavenPathKind::ArtifactMeta {
+        group_path,
+        artifact_id,
+        ..
+    } = classify_path(&path)
+    {
+        let maven_name = format!("{}:{}", group_path.replace('/', "."), artifact_id);
+        if crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Maven,
+            &maven_name,
+        ) {
+            if let Some(ref data) = cached {
+                state.metrics.record_download("maven");
+                state.metrics.record_cache_hit("maven");
+                return with_content_type(&path, data.clone()).into_response();
+            }
+            return crate::curation::check_namespace_isolation(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Maven,
+                &maven_name,
+            )
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        }
+    }
+
     for proxy in &state.config.maven.proxies {
         let url = format!("{}/{}", proxy.url().trim_end_matches('/'), path);
 

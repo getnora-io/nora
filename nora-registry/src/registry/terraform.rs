@@ -130,6 +130,28 @@ async fn provider_versions(
         }
     }
 
+    // #68 namespace isolation: an internal-namespace provider's version list must
+    // never be fetched upstream (dependency confusion). Serve any local copy (fresh
+    // path returned above), else block — never proxy. Name form matches the existing
+    // provider check_download: "{ns}/{ptype}".
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Terraform,
+        &format!("{}/{}", ns, ptype),
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_hit("terraform");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}", ns, ptype),
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
     let proxy_url = upstream_url(&state);
     let url = format!(
         "{}/v1/providers/{}/{}/versions",
@@ -391,6 +413,27 @@ async fn module_versions(
                 return with_json(data.to_vec());
             }
         }
+    }
+
+    // #68 namespace isolation: an internal-namespace module's version list must never
+    // be fetched upstream (dependency confusion). Serve any local copy (fresh path
+    // returned above), else block — never proxy. Module name form: "{ns}/{name}/{provider}".
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Terraform,
+        &format!("{}/{}/{}", ns, name, provider),
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_hit("terraform");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}/{}", ns, name, provider),
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);

@@ -371,6 +371,31 @@ pub fn check_namespace_isolation(
     None
 }
 
+/// Predicate: does `name` match a configured internal-namespace pattern?
+///
+/// Side-effect-free companion to [`check_namespace_isolation`] — it does NOT
+/// increment the `blocked` metric or build a [`Response`]. Use it to DECIDE
+/// whether to skip an upstream fetch (dependency-confusion defense) while still
+/// serving a locally-published/cached copy; reserve [`check_namespace_isolation`]
+/// for the branch that actually returns the 403 block, so the metric counts only
+/// client-facing blocks (matching the download path). Returns `false` when no
+/// namespace filter is configured.
+pub fn is_internal_namespace(engine: &CurationEngine, registry: RegistryType, name: &str) -> bool {
+    let Some(ref ns_filter) = engine.namespace_filter else {
+        return false;
+    };
+    let request = FilterRequest {
+        registry,
+        upstream: None,
+        name: name.to_string(),
+        version: None,
+        integrity: None,
+        bypass: false,
+        publish_date: None,
+    };
+    matches!(ns_filter.evaluate(&request), Decision::Block { .. })
+}
+
 /// Extract publish date from file mtime. Used for hosted registries, and — when
 /// `server.trust_upstream_dates = false` — for proxy registries too (#513): the
 /// NORA-cache mtime is NORA-controlled, so it cannot be spoofed by an upstream

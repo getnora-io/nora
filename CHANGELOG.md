@@ -4,6 +4,7 @@
 ### Fixed
 - **Partial `config.toml`** — missing `[server]`, `[storage]`, or fields like `host`/`port` no longer prevent startup; serde defaults are applied for all unset values.
 - **Container image no longer overrides `config.toml`** — the image shipped config *values* (`NORA_PUBLIC_URL`, `NORA_PORT`, `NORA_STORAGE_PATH`, `NORA_AUTH_TOKEN_STORAGE`) as baked `ENV`, which silently won over a user-provided `config.toml` (env has the highest precedence in `Config::load`). Defaults now ship as a file (`/etc/nora/config.toml`, loaded via `NORA_CONFIG_PATH`); a bind-mounted `config.toml` takes full effect. Only `NORA_HOST` stays in `ENV` so binding survives a partial mounted config and the container stays reachable (#719).
+- **Namespace isolation now covers every proxy registry's metadata path** — `internal_namespaces` (the dependency-confusion defense, always active) previously gated only the download/tarball path, so a metadata / index / version-list / search request for an internal-namespace package leaked its name upstream on every proxy registry except npm. The guard now runs on the metadata path of PyPI, Cargo, Maven, Go, NuGet, Conan, pub.dev, Terraform, Ansible and RubyGems — and on the NuGet/Conan search query — serving any locally-published or cached copy first and blocking only the genuine upstream fetch (no leak, and no false 403 on a locally-published internal package). The npm TTL-stale metadata refetch is also guarded, closing a residual of #725 (contrib-kit#68).
 
 ## [0.9.4] - 2026-06-13
 
