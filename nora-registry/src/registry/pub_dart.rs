@@ -149,17 +149,25 @@ async fn package_listing(
         );
     }
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::PubDart,
         &package,
-        None,
-        None,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::PubDart,
+            &package,
+            None,
+            None,
+        ) {
+            return response;
+        }
     }
 
     let key = format!("pub/api/packages/{}.json", package);
@@ -170,6 +178,19 @@ async fn package_listing(
                 return pub_json_response(data.to_vec());
             }
         }
+    }
+
+    // #733: an internal-namespace package — serve any (stale) local copy, else block; never proxy.
+    if internal {
+        if let Some(ref data) = cached_data {
+            return pub_json_response(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PubDart,
+            &package,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {
@@ -451,17 +472,25 @@ async fn download_archive(
     )
     .await;
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::PubDart,
         &package,
-        Some(version),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::PubDart,
+            &package,
+            Some(version),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let key = format!("pub/packages/{}/versions/{}.tar.gz", package, version);
@@ -508,6 +537,16 @@ async fn download_archive(
             .log(AuditEntry::new("pull", "api", "", "pub", ""));
 
         return archive_response(data.to_vec());
+    }
+
+    // #733: an internal-namespace package with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PubDart,
+            &package,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let Some(proxy_url) = &state.config.pub_dart.proxy else {

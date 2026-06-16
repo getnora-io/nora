@@ -323,17 +323,26 @@ async fn download(
         .await
     };
 
-    // Curation check — before storage access
-    if let Some(response) = crate::curation::check_download(
+    // Curation check — before storage access. #733 serve-local: an internal-namespace crate
+    // is operator-owned — skip curation and serve any local copy below; the upstream branch is
+    // blocked separately (never proxy an internal name).
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Cargo,
         &crate_name,
-        Some(&version),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Cargo,
+            &crate_name,
+            Some(&version),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let key = format!(
@@ -392,6 +401,16 @@ async fn download(
             data,
         )
             .into_response();
+    }
+
+    // #733: an internal-namespace crate with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Cargo,
+            &crate_name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Proxy fetch from upstream

@@ -1027,17 +1027,26 @@ async fn download_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Curation check — defense in depth: check blobs too
-    if let Some(response) = crate::curation::check_download(
+    // Curation check — defense in depth: check blobs too. #733 serve-local: an internal-namespace
+    // image is operator-owned — skip curation and serve any local blob below; block the upstream
+    // branch separately (never proxy an internal name).
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Docker,
         &name,
-        Some(&digest),
-        None,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&digest),
+            None,
+        ) {
+            return response;
+        }
     }
 
     let key = blob_key(ns.as_deref(), &name, &digest);
@@ -1117,6 +1126,16 @@ async fn download_blob(
             .header("docker-content-digest", &digest)
             .body(Body::from_stream(stream))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    // #733: an internal-namespace image's blob with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Docker,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let temp_dir = proxy_temp_dir(&state.config.storage.path);
@@ -1867,17 +1886,26 @@ async fn get_manifest(
     )
     .await;
 
-    // Curation check — manifests carry the image identity
-    if let Some(response) = crate::curation::check_download(
+    // Curation check — manifests carry the image identity. #733 serve-local: an internal-namespace
+    // image is operator-owned — skip curation and serve any local manifest below; block the
+    // upstream branch separately (never proxy an internal name).
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Docker,
         &name,
-        Some(&reference),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Docker,
+            &name,
+            Some(&reference),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let key = manifest_key(ns.as_deref(), &name, &reference);
@@ -1915,6 +1943,20 @@ async fn get_manifest(
         if cache_fresh {
             return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
         }
+    }
+
+    // #733: an internal-namespace image's manifest — serve any (stale) local copy, else block;
+    // never proxy upstream (the fresh path already returned above).
+    if internal {
+        if let Some(ref data) = cached {
+            return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Docker,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Try upstream proxies (always if no cache, or if cache is stale)

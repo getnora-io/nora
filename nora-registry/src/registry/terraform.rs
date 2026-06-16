@@ -218,17 +218,25 @@ async fn provider_download_meta(
     // Extract publish date from cached metadata
     let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver).await;
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace provider is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Terraform,
         &format!("{}/{}", ns, ptype),
-        Some(&ver),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}", ns, ptype),
+            Some(&ver),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let storage_key = format!(
@@ -254,6 +262,21 @@ async fn provider_download_meta(
                 return with_json(data.to_vec());
             }
         }
+    }
+
+    // #733: an internal-namespace provider — serve any (stale) local copy, else block; never proxy.
+    if internal {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_hit("terraform");
+            return with_json(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}", ns, ptype),
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);

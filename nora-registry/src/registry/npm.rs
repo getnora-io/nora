@@ -169,16 +169,25 @@ async fn handle_request(
             None
         };
 
-        if let Some(response) = crate::curation::check_download(
+        // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
+        // serve below handles a locally-published tarball, and the namespace guard at the
+        // cache-miss boundary (below) blocks the upstream branch for internal names.
+        if !crate::curation::is_internal_namespace(
             &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
-            tarball_version.as_deref(),
-            publish_date,
         ) {
-            return response;
+            if let Some(response) = crate::curation::check_download(
+                &state.curation().curation_engine,
+                state.bypass_token().as_deref(),
+                &headers,
+                crate::curation::RegistryType::Npm,
+                &package_name,
+                tarball_version.as_deref(),
+                publish_date,
+            ) {
+                return response;
+            }
         }
     }
 

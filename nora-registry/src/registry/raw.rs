@@ -55,17 +55,25 @@ async fn download(
     // mtime fallback — Raw is always hosted (no proxy)
     let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await;
 
-    // Curation check — raw files are treated as name=path, no version
-    if let Some(response) = crate::curation::check_download(
+    // Curation check — raw files are treated as name=path, no version. #733: raw is hosted-only
+    // (no upstream), so an internal-namespace file is operator-owned — skip curation and serve the
+    // local copy below; a missing one 404s naturally (nothing is ever proxied).
+    if !crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Raw,
         &path,
-        None,
-        publish_date,
     ) {
-        return response;
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Raw,
+            &path,
+            None,
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     // Conditional GET — If-None-Match

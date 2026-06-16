@@ -417,17 +417,25 @@ async fn registration_index(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Nuget,
         &id_lower,
-        None,
-        None,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+            None,
+            None,
+        ) {
+            return response;
+        }
     }
 
     let storage_key = format!("nuget/registration/{}/index.json", id_lower);
@@ -449,6 +457,23 @@ async fn registration_index(
                 return with_json_gzip(rewritten.into_bytes());
             }
         }
+    }
+
+    // #733: an internal-namespace package — serve any (stale) local registration, else block; never proxy.
+    if internal {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("nuget");
+            state.metrics.record_cache_hit("nuget");
+            let text = String::from_utf8_lossy(data);
+            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            return with_json_gzip(rewritten.into_bytes());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let url = format!(
@@ -846,8 +871,17 @@ async fn flatcontainer_download(
 
     let id_lower = id.to_lowercase();
 
+    // #733 serve-local: an internal-namespace package is operator-owned — skip curation and serve
+    // any local copy below; block the upstream branch separately. (.nupkg only; .nuspec is uncurated.)
+    let internal = ends_with_ci(filename, ".nupkg")
+        && crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+        );
+
     // Curation check for .nupkg downloads
-    if ends_with_ci(filename, ".nupkg") {
+    if ends_with_ci(filename, ".nupkg") && !internal {
         // Extract publish date from cached registration index
         let publish_date = extract_nuget_publish_date(
             &state.storage,
@@ -929,6 +963,16 @@ async fn flatcontainer_download(
             data.to_vec(),
         )
             .into_response();
+    }
+
+    // #733: an internal-namespace .nupkg with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream
