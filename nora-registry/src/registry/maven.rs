@@ -148,6 +148,20 @@ async fn download(
         None
     };
 
+    // #733 serve-local: an internal-namespace artifact is operator-owned — skip curation and
+    // serve any local copy (fresh below, or stale before the proxy loop); the upstream branch is
+    // blocked separately (never proxy an internal name).
+    let internal = curation_coords
+        .as_ref()
+        .map(|(n, _)| {
+            crate::curation::is_internal_namespace(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Maven,
+                n,
+            )
+        })
+        .unwrap_or(false);
+
     // Curation check — only for versioned artifact files, not metadata
     if let Some((ref maven_name, ref maven_version)) = curation_coords {
         // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
@@ -157,16 +171,18 @@ async fn download(
             None
         };
 
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Maven,
-            maven_name,
-            Some(maven_version),
-            publish_date,
-        ) {
-            return response;
+        if !internal {
+            if let Some(response) = crate::curation::check_download(
+                &state.curation().curation_engine,
+                state.bypass_token().as_deref(),
+                &headers,
+                crate::curation::RegistryType::Maven,
+                maven_name,
+                Some(maven_version),
+                publish_date,
+            ) {
+                return response;
+            }
         }
     }
 
@@ -249,6 +265,25 @@ async fn download(
             )
             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
         }
+    }
+
+    // #733: an internal-namespace VersionFile artifact with no fresh copy — serve any stale
+    // local copy, else block; never proxy upstream. (The ArtifactMeta path is handled above.)
+    if internal {
+        if let Some(ref data) = cached {
+            state.metrics.record_download("maven");
+            state.metrics.record_cache_hit("maven");
+            return with_content_type(&path, data.clone()).into_response();
+        }
+        if let Some((ref maven_name, _)) = curation_coords {
+            return crate::curation::check_namespace_isolation(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Maven,
+                maven_name,
+            )
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        }
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     for proxy in &state.config.maven.proxies {

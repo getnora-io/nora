@@ -381,17 +381,25 @@ async fn recipe_file_download(
     )
     .await;
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace recipe is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Conan,
         &name,
-        Some(&ver),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Conan,
+            &name,
+            Some(&ver),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let storage_key = format!("conan/{}/revisions/{}/files/{}", ref_str, rrev, filename);
@@ -424,6 +432,16 @@ async fn recipe_file_download(
             "CACHE",
         ));
         return with_binary(data.to_vec());
+    }
+
+    // #733: an internal-namespace recipe with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);
@@ -720,17 +738,25 @@ async fn package_file_download(
     )
     .await;
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace package is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Conan,
         &name,
-        Some(&ver),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Conan,
+            &name,
+            Some(&ver),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let storage_key = format!(
@@ -766,6 +792,16 @@ async fn package_file_download(
             "CACHE",
         ));
         return with_binary(data.to_vec());
+    }
+
+    // #733: an internal-namespace package with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);

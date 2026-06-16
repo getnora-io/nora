@@ -315,3 +315,195 @@ async fn npm_internal_stale_not_refetched() {
     let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
     assert!(body.contains("internalpkg"));
 }
+
+// ── #733: serve-local for internal on download + check_download metadata paths ──
+// An internal-namespace package that is locally published/cached must be SERVED (not 403'd by
+// the pre-serve check_download), while an internal name with no local copy is still blocked.
+
+#[tokio::test]
+async fn pypi_internal_download_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.pypi.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put("pypi/internalpkg/internalpkg-1.0.tar.gz", b"sdist")
+        .await
+        .unwrap();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/simple/internalpkg/internalpkg-1.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "locally-published internal sdist must be downloadable, not 403'd (#733)"
+    );
+}
+
+#[tokio::test]
+async fn pypi_internal_download_no_local_blocked() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.pypi.proxy = Some(BLACKHOLE.to_string());
+    });
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/simple/internalpkg/internalpkg-9.9.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "internal download with no local copy is blocked, never proxied"
+    );
+}
+
+#[tokio::test]
+async fn cargo_internal_download_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.cargo.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put(
+            "cargo/internalcrate/1.0.0/internalcrate-1.0.0.crate",
+            b"crate-bytes",
+        )
+        .await
+        .unwrap();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/cargo/api/v1/crates/internalcrate/1.0.0/download",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "locally-published internal crate must be downloadable (#733)"
+    );
+}
+
+#[tokio::test]
+async fn raw_internal_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    ctx.state
+        .storage
+        .put("raw/internal/secret.txt", b"data")
+        .await
+        .unwrap();
+    let resp = send(&ctx.app, Method::GET, "/raw/internal/secret.txt", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "locally-stored internal raw file must be served (#733; raw has no upstream)"
+    );
+}
+
+#[tokio::test]
+async fn nuget_internal_registration_index_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.nuget.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    ctx.state
+        .storage
+        .put(
+            "nuget/registration/internalpkg/index.json",
+            br#"{"count":0,"items":[]}"#,
+        )
+        .await
+        .unwrap();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/nuget/v3/registration/internalpkg/index.json",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "internal registration index must be served from local (#733 over-block fix)"
+    );
+}
+
+#[tokio::test]
+async fn pubdart_internal_listing_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.pub_dart.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    ctx.state
+        .storage
+        .put(
+            "pub/api/packages/internalpkg.json",
+            br#"{"name":"internalpkg","versions":[]}"#,
+        )
+        .await
+        .unwrap();
+    let resp = send(&ctx.app, Method::GET, "/pub/api/packages/internalpkg", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "internal package listing must be served from local (#733 over-block fix)"
+    );
+}
+
+#[tokio::test]
+async fn gems_internal_compact_index_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.gems.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    ctx.state
+        .storage
+        .put("gems/info/internalgem", b"---\n1.0.0 |checksum:abc\n")
+        .await
+        .unwrap();
+    let resp = send(&ctx.app, Method::GET, "/gems/info/internalgem", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "internal gem compact-index must be served from local (#733 over-block fix)"
+    );
+}
+
+#[tokio::test]
+async fn conan_internal_recipe_file_served_local() {
+    let ctx = create_test_context_with_config(|c| {
+        c.conan.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    ctx.state
+        .storage
+        .put(
+            "conan/internalpkg/1.0/user/stable/revisions/rev1/files/conanfile.py",
+            b"from conan import ConanFile",
+        )
+        .await
+        .unwrap();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/conan/v2/conans/internalpkg/1.0/user/stable/revisions/rev1/files/conanfile.py",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "locally-cached internal conan recipe file must be served (#733)"
+    );
+}

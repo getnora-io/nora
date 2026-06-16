@@ -199,17 +199,24 @@ async fn version_detail(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733: an internal-namespace collection is operator-owned — skip curation;
+    // proxy_json below already serves any local copy and blocks the upstream branch for internal.
+    if !crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
-        Some(&ver),
-        None,
     ) {
-        return response;
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Ansible,
+            &format!("{}.{}", ns, name),
+            Some(&ver),
+            None,
+        ) {
+            return response;
+        }
     }
 
     let proxy_url = upstream_url(&state);
@@ -266,17 +273,25 @@ async fn download_tarball(
         None
     };
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace collection is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Ansible,
         &format!("{}.{}", ns, name),
-        Some(ver),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Ansible,
+            &format!("{}.{}", ns, name),
+            Some(ver),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     // Immutable cache. get_verified discharges the integrity witness at serve
@@ -307,6 +322,16 @@ async fn download_tarball(
             "CACHE",
         ));
         return with_binary(data.to_vec());
+    }
+
+    // #733: an internal-namespace collection with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Ansible,
+            &format!("{}.{}", ns, name),
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream

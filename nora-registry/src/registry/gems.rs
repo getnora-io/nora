@@ -166,17 +166,25 @@ async fn compact_index(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace gem is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Gems,
         &name,
-        None,
-        None,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Gems,
+            &name,
+            None,
+            None,
+        ) {
+            return response;
+        }
     }
 
     let storage_key = format!("gems/info/{}", name);
@@ -197,6 +205,21 @@ async fn compact_index(
                 return with_text(data.to_vec());
             }
         }
+    }
+
+    // #733: an internal-namespace gem — serve any (stale) local index, else block; never proxy.
+    if internal {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_download("gems");
+            state.metrics.record_cache_hit("gems");
+            return with_text(data.to_vec());
+        }
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Gems,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     let proxy_url = upstream_url(&state);
@@ -354,17 +377,25 @@ async fn download_gem(
         None
     };
 
-    // Curation check
-    if let Some(response) = crate::curation::check_download(
+    // Curation check. #733 serve-local: an internal-namespace gem is operator-owned — skip
+    // curation and serve any local copy below; block the upstream branch separately.
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::Gems,
         &name,
-        Some(&version),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Gems,
+            &name,
+            Some(&version),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
@@ -395,6 +426,16 @@ async fn download_gem(
             "CACHE",
         ));
         return with_binary(data.to_vec(), "application/octet-stream");
+    }
+
+    // #733: an internal-namespace gem with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Gems,
+            &name,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream

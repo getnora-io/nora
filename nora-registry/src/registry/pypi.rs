@@ -277,16 +277,25 @@ async fn download_file(
         None
     };
 
-    if let Some(response) = crate::curation::check_download(
+    // #733 serve-local: an internal-namespace package is operator-owned — skip curation
+    // and serve any local copy below; the upstream branch is blocked separately (never proxy).
+    let internal = crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
         crate::curation::RegistryType::PyPI,
         &normalized,
-        version.as_deref(),
-        publish_date,
-    ) {
-        return response;
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+            version.as_deref(),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let key = format!("pypi/{}/{}", normalized, filename);
@@ -332,6 +341,16 @@ async fn download_file(
             data,
         )
             .into_response();
+    }
+
+    // #733: an internal-namespace package with no local copy is never proxied upstream.
+    if internal {
+        return crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+        )
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Try each configured upstream in order; the first whose index lists the file

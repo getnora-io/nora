@@ -89,16 +89,24 @@ async fn handle(
             None
         };
 
-        if let Some(response) = crate::curation::check_download(
+        // #733: an internal-namespace module is operator-owned — skip curation; the namespace
+        // guard below (after the cache serve) serves any local copy and blocks the upstream branch.
+        if !crate::curation::is_internal_namespace(
             &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
             crate::curation::RegistryType::Go,
             module_name,
-            version.as_deref(),
-            publish_date,
         ) {
-            return response;
+            if let Some(response) = crate::curation::check_download(
+                &state.curation().curation_engine,
+                state.bypass_token().as_deref(),
+                &headers,
+                crate::curation::RegistryType::Go,
+                module_name,
+                version.as_deref(),
+                publish_date,
+            ) {
+                return response;
+            }
         }
     }
 
