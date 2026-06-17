@@ -375,8 +375,37 @@ pub async fn auth_middleware(
         None => return unauthorized_response("Invalid credentials format", realm),
     };
 
-    // Verify credentials
+    // Verify credentials. htpasswd first; if that fails, the password may be an API
+    // token (`nra_…`). Docker, twine and Maven send the token as the Basic-auth
+    // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
+    // path must fall through to token verification for token auth to work at all. (#736)
     if !auth.authenticate(username, password) {
+        if let Some((token_user, role)) = state
+            .tokens
+            .as_ref()
+            .and_then(|ts| ts.verify_token(password).ok())
+        {
+            if let Some(ip) = client_ip {
+                state.auth_failures.record_success(&ip);
+            }
+            let method = request.method().clone();
+            if (method == axum::http::Method::PUT
+                || method == axum::http::Method::POST
+                || method == axum::http::Method::DELETE
+                || method == axum::http::Method::PATCH)
+                && !role.can_write()
+            {
+                return (StatusCode::FORBIDDEN, "Read-only token").into_response();
+            }
+            // Opaque (nra_) tokens are not namespace-scoped (#583 is OIDC-only).
+            request
+                .extensions_mut()
+                .insert(NamespaceAuthority::Unrestricted);
+            request
+                .extensions_mut()
+                .insert(AuthenticatedUser(token_user));
+            return next.run(request).await;
+        }
         if let Some(ip) = client_ip {
             state.auth_failures.record_failure(ip);
         }
@@ -812,6 +841,56 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #736: an API token presented as the Basic-auth password (any username) must
+    /// authenticate — Docker/twine/Maven send the token as the Basic password and never
+    /// use Bearer, so without this the documented `docker login -u token -p nra_…` fails.
+    #[tokio::test]
+    async fn test_basic_auth_accepts_api_token() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        // Docker sends Basic base64("<user>:<token>"); the username is ignored.
+        let header_val = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// #736: a read-only API token as the Basic-auth password must be rejected for writes,
+    /// matching the Bearer path's role gate.
+    #[tokio::test]
+    async fn test_basic_auth_read_only_token_cannot_write() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        let header_val = format!("Basic {}", STANDARD.encode(format!("token:{token}")));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
