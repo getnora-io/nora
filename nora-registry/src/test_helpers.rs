@@ -265,6 +265,7 @@ fn build_context(
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         leak_finders,
+        cancel_token: tokio_util::sync::CancellationToken::new(),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
@@ -324,6 +325,7 @@ fn build_context(
     let app = Router::new()
         .merge(public_routes)
         .merge(app_routes)
+        .merge(crate::admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
         ))

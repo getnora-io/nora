@@ -123,6 +123,18 @@ fn is_docker_auth_challenge_path(path: &str) -> bool {
     matches!(path, "/v2/" | "/v2")
 }
 
+/// Check if path is an admin-only control-plane endpoint.
+///
+/// Admin paths require a token whose role satisfies `can_admin()` regardless of
+/// HTTP method, and are never served anonymously (not even under
+/// `anonymous_read`). Basic-auth has no role concept, so it can never satisfy
+/// an admin path — it is denied fail-closed. Scoped strictly to `/api/v1/admin/`
+/// so it never widens the privilege bar of existing routes (e.g. `/raw/-/reindex`
+/// stays at write-level).
+fn is_admin_path(path: &str) -> bool {
+    path.starts_with("/api/v1/admin/")
+}
+
 /// Extract client IP from request, honoring XFF/X-Real-IP only from trusted proxies.
 ///
 /// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
@@ -212,7 +224,12 @@ pub async fn auth_middleware(
     // npm whoami always requires auth (otherwise it returns "anonymous" for every user)
     let is_whoami = path.ends_with("/-/whoami");
 
-    // Allow anonymous read if configured (but not for Docker /v2/, token management, or whoami)
+    // Admin control-plane paths always require an admin token — never anonymous,
+    // even under anonymous_read, and method-independent (covers a future GET).
+    let is_admin = is_admin_path(path);
+
+    // Allow anonymous read if configured (but not for Docker /v2/, token management,
+    // whoami, or admin paths)
     let is_read_method = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
@@ -222,6 +239,7 @@ pub async fn auth_middleware(
         && !is_docker_challenge
         && !is_token_management
         && !is_whoami
+        && !is_admin
     {
         // Read requests allowed without auth
         request
@@ -284,6 +302,9 @@ pub async fn auth_middleware(
                     {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
+                    if is_admin && !role.can_admin() {
+                        return (StatusCode::FORBIDDEN, "Admin role required").into_response();
+                    }
                     // Opaque (nra_) tokens are not namespace-scoped (#583 is OIDC-only).
                     request
                         .extensions_mut()
@@ -320,6 +341,9 @@ pub async fn auth_middleware(
                         {
                             return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
                                 .into_response();
+                        }
+                        if is_admin && !identity.role.can_admin() {
+                            return (StatusCode::FORBIDDEN, "Admin role required").into_response();
                         }
                         // Carry the provider's namespace_scope into the request so
                         // write handlers can enforce it on the artifact coordinate (#583).
@@ -397,6 +421,12 @@ pub async fn auth_middleware(
             {
                 return (StatusCode::FORBIDDEN, "Read-only token").into_response();
             }
+            // An API token sent as the Basic password is a full bearer identity
+            // (#737), so it must clear the admin gate too — else a write token via
+            // Basic would reach /api/v1/admin/* unchecked.
+            if is_admin && !role.can_admin() {
+                return (StatusCode::FORBIDDEN, "Admin role required").into_response();
+            }
             // Opaque (nra_) tokens are not namespace-scoped (#583 is OIDC-only).
             request
                 .extensions_mut()
@@ -415,6 +445,11 @@ pub async fn auth_middleware(
     // Auth successful — clear failure counter
     if let Some(ip) = client_ip {
         state.auth_failures.record_success(&ip);
+    }
+    // Basic-auth carries no role, so it can never satisfy an admin path: deny
+    // fail-closed (403 — authenticated but not authorized).
+    if is_admin {
+        return (StatusCode::FORBIDDEN, "Admin role required").into_response();
     }
     // Basic-auth identities are not namespace-scoped (#583 is OIDC-only).
     request
@@ -1295,6 +1330,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
             digest_store: ctx.state.digest_store.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         };
 
         // Rebuild router with new state

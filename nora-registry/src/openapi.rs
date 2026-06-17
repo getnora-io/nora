@@ -115,6 +115,8 @@ use crate::AppState;
         crate::openapi::create_token,
         crate::openapi::list_tokens,
         crate::openapi::revoke_token,
+        // Admin
+        crate::openapi::admin_reindex,
     ),
     components(
         schemas(
@@ -1042,6 +1044,34 @@ pub async fn list_tokens() {}
     )
 )]
 pub async fn revoke_token() {}
+
+/// Trigger an in-memory index rebuild from storage (admin only)
+///
+/// Marks index(es) dirty and warms them in the background so the UI reflects
+/// artifacts copied in out-of-band (rsync, BTRFS send/receive, S3 sync) without
+/// a restart or dummy client pull. Optional `registry` query scopes to one
+/// registry; absent reindexes all. Requires an `Admin`-role token.
+///
+/// On a large S3-backed store, prefer scoping to the synced registry
+/// (`?registry=<name>`): an unscoped reindex rebuilds every registry, and each
+/// rebuild currently issues one HEAD per object on S3. Local storage is cheap
+/// (a metadata `stat` per key).
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/reindex",
+    tag = "admin",
+    params(
+        ("registry" = Option<String>, Query, description = "Single registry to reindex; all if omitted")
+    ),
+    responses(
+        (status = 202, description = "Reindex accepted; rebuild runs in background"),
+        (status = 400, description = "Unknown registry name"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required"),
+        (status = 429, description = "Reindex debounced. Retry-After header indicates wait time")
+    )
+)]
+pub async fn admin_reindex() {}
 
 // ============ Routes ============
 

@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::large_stack_frames, clippy::large_futures)]
 mod activity_log;
+mod admin;
 mod audit;
 mod auth;
 mod backup;
@@ -236,6 +237,9 @@ pub struct AppState {
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Pre-compiled upstream hostname searchers for leak detection (#386)
     pub leak_finders: metrics::LeakFinders,
+    /// Shared shutdown signal so on-demand background tasks (e.g. the admin
+    /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {
@@ -1416,6 +1420,9 @@ async fn run_server(mut config: Config, storage: Storage) {
     let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
 
     let enabled_registries = Arc::new(enabled_registries);
+    // Cancellation token for graceful shutdown of background tasks (#306). Created
+    // before AppState so on-demand handlers (admin reindex warm-up) can observe it.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -1439,6 +1446,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
         digest_store,
         leak_finders,
+        cancel_token: cancel_token.clone(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
@@ -1448,8 +1456,6 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
-    // Cancellation token for graceful shutdown of background schedulers (#306)
-    let cancel_token = tokio_util::sync::CancellationToken::new();
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Spawn background GC scheduler if enabled
@@ -1495,6 +1501,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     let app = Router::new()
         .merge(public_routes)
         .merge(app_routes)
+        // Admin control-plane routes — gated admin-only by auth_middleware
+        // (auth::is_admin_path); abuse is bounded by the in-handler reindex
+        // debounce rather than the optional HTTP rate limiter.
+        .merge(admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
         ))
