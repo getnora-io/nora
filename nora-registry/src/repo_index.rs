@@ -16,7 +16,7 @@ use crate::validation::ends_with_ci;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -93,6 +93,10 @@ impl Default for RegistryIndex {
 /// Main repository index for all registries
 pub struct RepoIndex {
     indexes: HashMap<RegistryType, RegistryIndex>,
+    /// Epoch-seconds of the last accepted admin reindex (0 = never). Used to
+    /// debounce operator-triggered reindex so a tight `reindex + read` loop
+    /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
+    last_reindex: AtomicU64,
 }
 
 impl RepoIndex {
@@ -101,7 +105,10 @@ impl RepoIndex {
         for rt in RegistryType::all() {
             indexes.insert(*rt, RegistryIndex::new());
         }
-        Self { indexes }
+        Self {
+            indexes,
+            last_reindex: AtomicU64::new(0),
+        }
     }
 
     /// Invalidate a specific registry index
@@ -111,6 +118,31 @@ impl RepoIndex {
                 idx.invalidate();
             }
         }
+    }
+
+    /// Invalidate every registry index so each rebuilds from storage on next read.
+    /// Backs the admin reindex endpoint for the "rescan all paths" case.
+    pub fn invalidate_all(&self) {
+        for idx in self.indexes.values() {
+            idx.invalidate();
+        }
+    }
+
+    /// Debounce gate for operator-triggered reindex. Returns `Ok(())` and records
+    /// `now_epoch` if at least `min_interval` seconds have passed since the last
+    /// accepted reindex; otherwise returns `Err(retry_after_secs)` without
+    /// recording. This is the one DoS control that holds even when HTTP rate
+    /// limiting is disabled in config.
+    pub fn try_accept_reindex(&self, now_epoch: u64, min_interval: u64) -> Result<(), u64> {
+        let last = self.last_reindex.load(Ordering::Acquire);
+        if last != 0 {
+            let elapsed = now_epoch.saturating_sub(last);
+            if elapsed < min_interval {
+                return Err(min_interval - elapsed);
+            }
+        }
+        self.last_reindex.store(now_epoch, Ordering::Release);
+        Ok(())
     }
 
     /// Get index with double-checked locking (prevents race condition)
@@ -161,8 +193,22 @@ impl RepoIndex {
                 }
                 RegistryType::Conan => build_conan_index(storage).await,
             };
-            info!(registry = registry, count = data.len(), "Index rebuilt");
-            index.set(data);
+            match data {
+                Some(data) => {
+                    info!(registry = registry, count = data.len(), "Index rebuilt");
+                    index.set(data);
+                }
+                None => {
+                    // Storage list failed mid-rebuild. Leave the index dirty so the
+                    // next read retries instead of caching an empty result as fresh:
+                    // otherwise a transient storage error during a restore/resync
+                    // would make the UI report zero artifacts on healthy data.
+                    tracing::warn!(
+                        registry = registry,
+                        "index rebuild skipped: storage list failed; serving stale index"
+                    );
+                }
+            }
         }
 
         index.get_cached()
@@ -195,8 +241,21 @@ impl Default for RepoIndex {
 // Index builders
 // ============================================================================
 
-async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("docker/").await.unwrap_or_default();
+/// List storage keys under `prefix` for an index rebuild. Returns `None` (not an
+/// empty Vec) when the listing itself fails, so the caller can keep the existing
+/// index dirty and retry rather than caching a falsely-empty result as fresh.
+async fn list_keys(storage: &Storage, prefix: &str) -> Option<Vec<String>> {
+    match storage.list(prefix).await {
+        Ok(keys) => Some(keys),
+        Err(e) => {
+            tracing::warn!(prefix, error = %e, "index rebuild: storage list failed");
+            None
+        }
+    }
+}
+
+async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "docker/").await?;
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -248,11 +307,11 @@ async fn build_docker_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(repos)
+    Some(to_sorted_vec(repos))
 }
 
-async fn build_maven_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("maven/").await.unwrap_or_default();
+async fn build_maven_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "maven/").await?;
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -281,11 +340,11 @@ async fn build_maven_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(repos)
+    Some(to_sorted_vec(repos))
 }
 
-async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("npm/").await.unwrap_or_default();
+async fn build_npm_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "npm/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     // Count tarballs instead of parsing metadata.json (faster than parsing JSON)
@@ -316,11 +375,11 @@ async fn build_npm_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(packages)
+    Some(to_sorted_vec(packages))
 }
 
-async fn build_cargo_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("cargo/").await.unwrap_or_default();
+async fn build_cargo_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "cargo/").await?;
     let mut crates: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -343,11 +402,11 @@ async fn build_cargo_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(crates)
+    Some(to_sorted_vec(crates))
 }
 
-async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("pypi/").await.unwrap_or_default();
+async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "pypi/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -373,11 +432,11 @@ async fn build_pypi_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(packages)
+    Some(to_sorted_vec(packages))
 }
 
-async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("go/").await.unwrap_or_default();
+async fn build_go_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "go/").await?;
     let mut modules: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -402,11 +461,11 @@ async fn build_go_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(modules)
+    Some(to_sorted_vec(modules))
 }
 
-async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("raw/").await.unwrap_or_default();
+async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "raw/").await?;
     // (count, size, modified, is_file)
     let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
 
@@ -442,13 +501,17 @@ async fn build_raw_index(storage: &Storage) -> Vec<RepoInfo> {
 
     // Directories first (alphabetical), then files (alphabetical)
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
-    result
+    Some(result)
 }
 
 /// Generic index builder: groups files under `prefix` by first path segment.
 /// Only counts files matching `suffix` (e.g. ".gem", ".nupkg", ".tar.gz").
-async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> Vec<RepoInfo> {
-    let keys = storage.list(prefix).await.unwrap_or_default();
+async fn build_generic_index(
+    storage: &Storage,
+    prefix: &str,
+    suffix: &str,
+) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, prefix).await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -471,13 +534,13 @@ async fn build_generic_index(storage: &Storage, prefix: &str, suffix: &str) -> V
         }
     }
 
-    to_sorted_vec(packages)
+    Some(to_sorted_vec(packages))
 }
 
 /// Gems index: keys like gems/gems/{name}-{version}.gem
 /// Uses split_gem_filename to extract package name from flat file layout.
-async fn build_gems_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("gems/gems/").await.unwrap_or_default();
+async fn build_gems_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "gems/gems/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -504,12 +567,12 @@ async fn build_gems_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(packages)
+    Some(to_sorted_vec(packages))
 }
 
 /// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
-async fn build_conan_index(storage: &Storage) -> Vec<RepoInfo> {
-    let keys = storage.list("conan/").await.unwrap_or_default();
+async fn build_conan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "conan/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for key in &keys {
@@ -530,7 +593,7 @@ async fn build_conan_index(storage: &Storage) -> Vec<RepoInfo> {
         }
     }
 
-    to_sorted_vec(packages)
+    Some(to_sorted_vec(packages))
 }
 
 /// Convert HashMap to sorted Vec<RepoInfo>
@@ -570,6 +633,51 @@ pub fn paginate<T: Clone>(data: &[T], page: usize, limit: usize) -> (Vec<T>, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_accept_reindex_first_call_accepted() {
+        let idx = RepoIndex::new();
+        assert!(idx.try_accept_reindex(1000, 10).is_ok());
+    }
+
+    #[test]
+    fn try_accept_reindex_debounces_within_window() {
+        let idx = RepoIndex::new();
+        assert!(idx.try_accept_reindex(1000, 10).is_ok());
+        // 3s later, still inside the 10s window -> rejected with remaining secs.
+        assert_eq!(idx.try_accept_reindex(1003, 10), Err(7));
+    }
+
+    #[test]
+    fn try_accept_reindex_allows_after_window() {
+        let idx = RepoIndex::new();
+        assert!(idx.try_accept_reindex(1000, 10).is_ok());
+        assert!(idx.try_accept_reindex(1010, 10).is_ok());
+    }
+
+    #[test]
+    fn rejected_reindex_does_not_advance_window() {
+        let idx = RepoIndex::new();
+        assert!(idx.try_accept_reindex(1000, 10).is_ok());
+        // A rejected call must NOT record its timestamp, otherwise a tight loop
+        // would keep sliding the window forward and never accept.
+        assert!(idx.try_accept_reindex(1005, 10).is_err());
+        assert!(idx.try_accept_reindex(1010, 10).is_ok());
+    }
+
+    #[test]
+    fn invalidate_all_marks_every_index_dirty() {
+        let idx = RepoIndex::new();
+        // Clear dirty on every index (they start dirty).
+        for ri in idx.indexes.values() {
+            ri.set(Vec::new());
+            assert!(!ri.is_dirty());
+        }
+        idx.invalidate_all();
+        for ri in idx.indexes.values() {
+            assert!(ri.is_dirty());
+        }
+    }
 
     #[test]
     fn test_paginate_first_page() {
@@ -763,7 +871,7 @@ mod tests {
             .await
             .unwrap();
 
-        let repos = build_pypi_index(&s).await;
+        let repos = build_pypi_index(&s).await.expect("index built");
         assert_eq!(repos.len(), 1);
         // ONE artifact, not two — the .sha256 sidecar is not an artifact (#588).
         assert_eq!(repos[0].versions, 1, "checksum sidecar must not be counted");
@@ -788,7 +896,7 @@ mod tests {
             .await
             .unwrap();
 
-        let repos = build_maven_index(&s).await;
+        let repos = build_maven_index(&s).await.expect("index built");
         let total: usize = repos.iter().map(|r| r.versions).sum();
         // jar + pom = 2 primary; the 4 checksums + metadata.xml are NOT counted
         // (old code reported 7) (#588).
@@ -864,7 +972,7 @@ mod tests {
             .await
             .unwrap();
 
-        let repos = build_docker_index(&s).await;
+        let repos = build_docker_index(&s).await.expect("index built");
         assert_eq!(repos.len(), 1);
         // Count = 1 tag, NOT 2 (the digest manifest is not a separate image).
         assert_eq!(repos[0].versions, 1, "tag + digest manifest double-counted");
