@@ -162,6 +162,24 @@ async fn handle(
                 "go",
                 "CACHE",
             ));
+            // Quarantine only the .zip module archive (the artifact). The
+            // .info/.mod/@v/list/@latest endpoints serve metadata — never gate them.
+            if ends_with_ci(&file, ".zip") {
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.quarantine.as_ref(),
+                    state.config.curation.quarantine_ttl.as_deref(),
+                );
+                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    &state.digest_store,
+                    "go",
+                    data,
+                    &q_mode,
+                    q_secs,
+                    "cache",
+                ) {
+                    return resp;
+                }
+            }
             return with_content_type(data.to_vec(), content_type, is_mutable);
         }
     }
@@ -271,6 +289,23 @@ async fn handle(
                 state.spawn_cache("go", storage_key, Bytes::from(bytes.clone()));
             }
 
+            // Quarantine only the .zip module archive; metadata endpoints pass through.
+            if ends_with_ci(&file, ".zip") {
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.quarantine.as_ref(),
+                    state.config.curation.quarantine_ttl.as_deref(),
+                );
+                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    &state.digest_store,
+                    "go",
+                    &bytes,
+                    &q_mode,
+                    q_secs,
+                    &upstream_url,
+                ) {
+                    return resp;
+                }
+            }
             with_content_type(bytes, content_type, is_mutable)
         }
         Err(e) => {
