@@ -358,8 +358,18 @@ async fn provider_download_binary(
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.quarantine.as_ref(),
-            state.config.curation.quarantine_ttl.as_deref(),
+            state.config.curation.terraform.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .terraform
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
         );
         if let Some(resp) = crate::digest_quarantine::proxy_gate(
             &state.digest_store,
@@ -413,8 +423,18 @@ async fn provider_download_binary(
             // Immutable cache
             state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.quarantine.as_ref(),
-                state.config.curation.quarantine_ttl.as_deref(),
+                state.config.curation.terraform.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .terraform
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
             );
             if let Some(resp) = crate::digest_quarantine::proxy_gate(
                 &state.digest_store,
@@ -663,8 +683,18 @@ async fn module_source_download(
         state.metrics.record_download("terraform");
         state.metrics.record_cache_hit("terraform");
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.quarantine.as_ref(),
-            state.config.curation.quarantine_ttl.as_deref(),
+            state.config.curation.terraform.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .terraform
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
         );
         if let Some(resp) = crate::digest_quarantine::proxy_gate(
             &state.digest_store,
@@ -720,8 +750,18 @@ async fn module_source_download(
             // Immutable cache
             state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.quarantine.as_ref(),
-                state.config.curation.quarantine_ttl.as_deref(),
+                state.config.curation.terraform.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .terraform
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
             );
             if let Some(resp) = crate::digest_quarantine::proxy_gate(
                 &state.digest_store,

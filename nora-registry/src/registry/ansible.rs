@@ -322,8 +322,18 @@ async fn download_tarball(
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.quarantine.as_ref(),
-            state.config.curation.quarantine_ttl.as_deref(),
+            state.config.curation.ansible.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .ansible
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
         );
         if let Some(resp) = crate::digest_quarantine::proxy_gate(
             &state.digest_store,
@@ -383,8 +393,18 @@ async fn download_tarball(
 
             state.spawn_cache_immutable("ansible", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.quarantine.as_ref(),
-                state.config.curation.quarantine_ttl.as_deref(),
+                state.config.curation.ansible.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .ansible
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
             );
             if let Some(resp) = crate::digest_quarantine::proxy_gate(
                 &state.digest_store,

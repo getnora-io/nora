@@ -237,8 +237,18 @@ async fn download(
             // never quarantine it or its digest would change forever.
             if curation_coords.is_some() {
                 let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.quarantine.as_ref(),
-                    state.config.curation.quarantine_ttl.as_deref(),
+                    state.config.curation.maven.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state
+                        .config
+                        .curation
+                        .maven
+                        .quarantine_ttl
+                        .as_deref()
+                        .or(state.config.curation.quarantine_ttl.as_deref()),
                 );
                 if let Some(resp) = crate::digest_quarantine::proxy_gate(
                     &state.digest_store,
@@ -336,8 +346,18 @@ async fn download(
                 // Quarantine only real version artifacts; never maven-metadata.xml.
                 if curation_coords.is_some() {
                     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                        state.config.curation.quarantine.as_ref(),
-                        state.config.curation.quarantine_ttl.as_deref(),
+                        state.config.curation.maven.quarantine.as_ref().or(state
+                            .config
+                            .curation
+                            .quarantine
+                            .as_ref()),
+                        state
+                            .config
+                            .curation
+                            .maven
+                            .quarantine_ttl
+                            .as_deref()
+                            .or(state.config.curation.quarantine_ttl.as_deref()),
                     );
                     if let Some(resp) = crate::digest_quarantine::proxy_gate(
                         &state.digest_store,

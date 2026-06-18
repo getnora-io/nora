@@ -955,8 +955,18 @@ async fn flatcontainer_download(
         }
 
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.quarantine.as_ref(),
-            state.config.curation.quarantine_ttl.as_deref(),
+            state.config.curation.nuget.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .nuget
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
         );
         if let Some(resp) = crate::digest_quarantine::proxy_gate(
             &state.digest_store,
@@ -1067,8 +1077,18 @@ async fn flatcontainer_download(
                 });
             }
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.quarantine.as_ref(),
-                state.config.curation.quarantine_ttl.as_deref(),
+                state.config.curation.nuget.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .nuget
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
             );
             if let Some(resp) = crate::digest_quarantine::proxy_gate(
                 &state.digest_store,

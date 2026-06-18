@@ -166,8 +166,16 @@ async fn handle(
             // .info/.mod/@v/list/@latest endpoints serve metadata — never gate them.
             if ends_with_ci(&file, ".zip") {
                 let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.quarantine.as_ref(),
-                    state.config.curation.quarantine_ttl.as_deref(),
+                    state.config.curation.go.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state.config.curation.go.quarantine_ttl.as_deref().or(state
+                        .config
+                        .curation
+                        .quarantine_ttl
+                        .as_deref()),
                 );
                 if let Some(resp) = crate::digest_quarantine::proxy_gate(
                     &state.digest_store,
@@ -292,8 +300,16 @@ async fn handle(
             // Quarantine only the .zip module archive; metadata endpoints pass through.
             if ends_with_ci(&file, ".zip") {
                 let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.quarantine.as_ref(),
-                    state.config.curation.quarantine_ttl.as_deref(),
+                    state.config.curation.go.quarantine.as_ref().or(state
+                        .config
+                        .curation
+                        .quarantine
+                        .as_ref()),
+                    state.config.curation.go.quarantine_ttl.as_deref().or(state
+                        .config
+                        .curation
+                        .quarantine_ttl
+                        .as_deref()),
                 );
                 if let Some(resp) = crate::digest_quarantine::proxy_gate(
                     &state.digest_store,
