@@ -386,6 +386,20 @@ async fn download(
         state
             .audit
             .log(AuditEntry::new("pull", "api", "", "cargo", ""));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "cargo",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return (
             StatusCode::OK,
             [
@@ -449,6 +463,20 @@ async fn download(
             state
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "cargo",
+                &data,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             (
                 StatusCode::OK,
                 [
