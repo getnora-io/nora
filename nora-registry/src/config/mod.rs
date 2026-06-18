@@ -634,6 +634,52 @@ impl Config {
                 "curation.on_failure=\"open\" is not implemented and would silently degrade to fail-closed. Remove the setting or set on_failure=\"closed\" explicitly. This field will be removed in v0.9".to_string(),
             );
         }
+        // min_release_age on a proxy registry needs a date source or a quarantine,
+        // else it produces NO age control. min-age judges the REAL upstream
+        // release age; with an unknown date it DEFERS (Skip) to digest-quarantine
+        // rather than fail-closed-blocking every download (#741,
+        // curation-minage-real-age-defer). To keep that deferral from being a
+        // silent fail-open, refuse a config where min_release_age is set on an
+        // enabled proxy registry yet neither a trusted date source
+        // (server.trust_upstream_dates) nor an active quarantine is configured.
+        {
+            use crate::digest_quarantine::QuarantineMode;
+            let q_on =
+                |q: &Option<QuarantineMode>| matches!(q, Some(m) if *m != QuarantineMode::Off);
+            let quarantine_active = q_on(&self.curation.quarantine)
+                || q_on(&self.curation.npm.quarantine)
+                || q_on(&self.curation.pypi.quarantine)
+                || q_on(&self.curation.cargo.quarantine)
+                || q_on(&self.curation.go.quarantine)
+                || q_on(&self.curation.maven.quarantine)
+                || q_on(&self.curation.gems.quarantine)
+                || q_on(&self.curation.terraform.quarantine)
+                || q_on(&self.curation.ansible.quarantine)
+                || q_on(&self.curation.nuget.quarantine)
+                || q_on(&self.curation.pub_dart.quarantine)
+                || q_on(&self.curation.conan.quarantine);
+            let any_enabled_proxy = (self.pypi.enabled
+                && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty()))
+                || (self.npm.enabled && self.npm.proxy.is_some())
+                || (self.cargo.enabled && self.cargo.proxy.is_some())
+                || (self.gems.enabled && self.gems.proxy.is_some())
+                || (self.maven.enabled && !self.maven.proxies.is_empty())
+                || (self.nuget.enabled && self.nuget.proxy.is_some())
+                || (self.go.enabled && self.go.proxy.is_some())
+                || (self.conan.enabled && self.conan.proxy.is_some())
+                || (self.pub_dart.enabled && self.pub_dart.proxy.is_some())
+                || (self.terraform.enabled && self.terraform.proxy.is_some())
+                || (self.ansible.enabled && self.ansible.proxy.is_some());
+            if self.curation.min_release_age.is_some()
+                && !self.server.trust_upstream_dates
+                && !quarantine_active
+                && any_enabled_proxy
+            {
+                errors.push(
+                    "curation.min_release_age is set with an enabled proxy registry but no age control would be active: an upstream publish date is unsigned/spoofable (and absent on several registries), so min-release-age cannot verify the real release age and defers. Set server.trust_upstream_dates=true (trust the upstream's date) OR enable curation.quarantine=\"observe\"|\"enforce\" (unspoofable first-seen hold). (#741)".to_string(),
+                );
+            }
+        }
 
         // 9. Docker upstream prefix validation
         {
@@ -2023,6 +2069,62 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("allowlist_path")),
             "enforce without allowlist should be an error"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_without_date_source_or_quarantine_rejected() {
+        // min_release_age on an enabled proxy registry with neither
+        // trust_upstream_dates nor an active quarantine = no age control would be
+        // active => rejected (curation-minage-real-age-defer, #741).
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "min-age on a proxy with neither trust nor quarantine must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_with_quarantine_ok() {
+        // Escape hatch 1: an active quarantine is the unspoofable age control.
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "an active quarantine should satisfy the age-control requirement"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_with_trust_ok() {
+        // Escape hatch 2: trusting the upstream's date enables real-age control.
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = true;
+        config.curation.quarantine = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "trust_upstream_dates should satisfy the age-control requirement"
         );
     }
 

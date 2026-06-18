@@ -1134,23 +1134,17 @@ impl ProxyFilter for MinReleaseAgeFilter {
         };
 
         let Some(publish_ts) = request.publish_date else {
-            // Fail-closed: an unknown publish date must NOT bypass an active
-            // quarantine. Curation is fail-closed by design — the config layer
-            // rejects on_failure="open" — so this filter, the one place that
-            // defers on missing data, must not be the lone fail-open hole. If the
-            // quarantine is disabled for this registry (threshold 0) there is
-            // nothing to enforce, so defer to the next filter.
-            return if threshold > 0 {
-                Decision::Block {
-                    rule: "min-release-age".to_string(),
-                    reason: format!(
-                        "publish date unknown — cannot verify the {} minimum age; blocked fail-closed",
-                        label,
-                    ),
-                }
-            } else {
-                Decision::Skip
-            };
+            // Defer to digest-quarantine — the unspoofable first-seen holder
+            // (curation-quarantine-uniform). An unknown upstream publish date is
+            // not min-release-age's to hold: this filter judges the REAL release
+            // age and can only do so with a trusted date. The "hold new/unknown"
+            // duty belongs to digest-quarantine, which keys on the content digest
+            // and NORA's own clock (no upstream date needed). Config validation
+            // guarantees an age control (trust_upstream_dates OR an active
+            // quarantine) is configured whenever min_release_age is set on a proxy
+            // registry (curation-minage-real-age-defer, #741), so this Skip is not
+            // a fail-open hole.
+            return Decision::Skip;
         };
 
         let now = std::time::SystemTime::now()
@@ -3198,9 +3192,13 @@ mod min_release_age_tests {
     }
 
     #[test]
-    fn test_min_release_age_unknown_date_blocked_fail_closed() {
-        // An unknown publish date must NOT bypass an active quarantine: curation
-        // is fail-closed, so a package whose age cannot be verified is blocked.
+    fn test_min_release_age_unknown_date_defers_to_quarantine() {
+        // An unknown upstream publish date is not min-release-age's to hold: it
+        // judges the REAL release age and needs a trusted date, so it defers
+        // (Skip). Holding new/unknown artifacts is digest-quarantine's job
+        // (curation-quarantine-uniform). Config validation guarantees an age
+        // control is active when min_release_age is set on a proxy
+        // (curation-minage-real-age-defer, #741), so this Skip is not fail-open.
         let filter = MinReleaseAgeFilter::new(604800, "7d");
         let request = FilterRequest {
             registry: RegistryType::Npm,
@@ -3211,7 +3209,7 @@ mod min_release_age_tests {
             bypass: false,
             publish_date: None,
         };
-        assert!(matches!(filter.evaluate(&request), Decision::Block { .. }));
+        assert!(matches!(filter.evaluate(&request), Decision::Skip));
     }
 
     #[test]
