@@ -536,6 +536,20 @@ async fn download_archive(
             .audit
             .log(AuditEntry::new("pull", "api", "", "pub", ""));
 
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "pub",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return archive_response(data.to_vec());
     }
 
@@ -598,6 +612,20 @@ async fn download_archive(
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "pub", ""));
 
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "pub",
+                &data,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             archive_response(data)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),

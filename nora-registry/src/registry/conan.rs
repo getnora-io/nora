@@ -431,6 +431,20 @@ async fn recipe_file_download(
             "conan",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "conan",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec());
     }
 
@@ -478,6 +492,20 @@ async fn recipe_file_download(
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "conan",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -791,6 +819,20 @@ async fn package_file_download(
             "conan",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "conan",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec());
     }
 
@@ -840,6 +882,20 @@ async fn package_file_download(
 
             // Immutable cache
             state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "conan",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),

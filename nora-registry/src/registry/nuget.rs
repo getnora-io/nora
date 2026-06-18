@@ -954,6 +954,20 @@ async fn flatcontainer_download(
             });
         }
 
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "nuget",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return (
             StatusCode::OK,
             [
@@ -1051,6 +1065,20 @@ async fn flatcontainer_download(
                     let meta = format!(r#"{{"last_downloaded_at":{}}}"#, now);
                     let _ = storage3.put(&meta_key, meta.as_bytes()).await;
                 });
+            }
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "nuget",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
             }
             (
                 StatusCode::OK,

@@ -425,6 +425,20 @@ async fn download_gem(
             "gems",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "gems",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec(), "application/octet-stream");
     }
 
@@ -467,6 +481,20 @@ async fn download_gem(
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "gems",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -512,6 +540,20 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
             "gems",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "gems",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec(), "application/octet-stream");
     }
 
@@ -556,6 +598,20 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
                 .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
 
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.quarantine.as_ref(),
+                state.config.curation.quarantine_ttl.as_deref(),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "gems",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes, "application/octet-stream")
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
