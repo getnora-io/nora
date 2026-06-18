@@ -383,6 +383,36 @@ async fn download(
     // All proxies failed — serve the stale cached artifact if we have one (graceful).
     if let Some(ref data) = cached {
         tracing::warn!(registry = "maven", path = %path, "Maven upstream failed, serving stale cached artifact");
+        // Quarantine still applies to a version artifact served from a stale cache:
+        // a held SNAPSHOT must not be released just because the upstream went down
+        // (mutable SNAPSHOT artifacts reach this path; immutable releases serve from
+        // the fresh-cache branch above, which is already gated).
+        if curation_coords.is_some() {
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.maven.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .maven
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "maven",
+                data,
+                &q_mode,
+                q_secs,
+                "cache-stale",
+            ) {
+                return resp;
+            }
+        }
         let mut response = with_content_type(&path, data.clone()).into_response();
         response.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-nora-stale"),
