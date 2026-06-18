@@ -232,6 +232,25 @@ async fn download(
             state
                 .audit
                 .log(AuditEntry::new("cache_hit", "api", "", "maven", ""));
+            // Quarantine only real version artifacts (.jar/.pom/.sha1, immutable
+            // per version). maven-metadata.xml is mutable (curation_coords=None) —
+            // never quarantine it or its digest would change forever.
+            if curation_coords.is_some() {
+                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                    state.config.curation.quarantine.as_ref(),
+                    state.config.curation.quarantine_ttl.as_deref(),
+                );
+                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    &state.digest_store,
+                    "maven",
+                    data,
+                    &q_mode,
+                    q_secs,
+                    "cache",
+                ) {
+                    return resp;
+                }
+            }
             return with_content_type(&path, data.clone()).into_response();
         }
     }
@@ -314,6 +333,23 @@ async fn download(
 
                 state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
 
+                // Quarantine only real version artifacts; never maven-metadata.xml.
+                if curation_coords.is_some() {
+                    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                        state.config.curation.quarantine.as_ref(),
+                        state.config.curation.quarantine_ttl.as_deref(),
+                    );
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                        &state.digest_store,
+                        "maven",
+                        &data,
+                        &q_mode,
+                        q_secs,
+                        &url,
+                    ) {
+                        return resp;
+                    }
+                }
                 return with_content_type(&path, data.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
