@@ -300,6 +300,13 @@ async fn download_file(
 
     let key = format!("pypi/{}/{}", normalized, filename);
 
+    // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
+    // Docker-only wiring). Resolved once; applied at each serve point below.
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.quarantine.as_ref(),
+        state.config.curation.quarantine_ttl.as_deref(),
+    );
+
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
     if let Ok(outcome) = state.storage.get_verified(&key).await {
@@ -330,6 +337,17 @@ async fn download_file(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "api", "", "pypi", ""));
+
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "pypi",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
 
         let content_type = pypi_content_type(&filename);
         return (
@@ -424,6 +442,17 @@ async fn download_file(
                         repo_index.invalidate("pypi");
                     }
                 });
+
+                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    &state.digest_store,
+                    "pypi",
+                    &data,
+                    &q_mode,
+                    q_secs,
+                    &file_url,
+                ) {
+                    return resp;
+                }
 
                 let content_type = pypi_content_type(&filename);
                 return (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data)

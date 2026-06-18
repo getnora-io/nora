@@ -312,6 +312,20 @@ async fn handle_request(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "api", "", "npm", ""));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.quarantine.as_ref(),
+            state.config.curation.quarantine_ttl.as_deref(),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "npm",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_content_type(true, data).into_response();
     }
 
@@ -401,6 +415,22 @@ async fn handle_request(
                     }
                 });
 
+                if is_tarball {
+                    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                        state.config.curation.quarantine.as_ref(),
+                        state.config.curation.quarantine_ttl.as_deref(),
+                    );
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                        &state.digest_store,
+                        "npm",
+                        &data_to_serve,
+                        &q_mode,
+                        q_secs,
+                        &url,
+                    ) {
+                        return resp;
+                    }
+                }
                 return with_content_type(is_tarball, data_to_serve.into()).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),

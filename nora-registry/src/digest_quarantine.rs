@@ -20,6 +20,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
+use axum::http::{header, HeaderName, StatusCode};
+use axum::response::{IntoResponse, Response};
+
 /// Stale entry TTL: entries older than 90 days are pruned on startup.
 const PRUNE_TTL_SECS: i64 = 90 * 24 * 3600;
 
@@ -282,6 +285,100 @@ impl DigestStore {
     pub fn is_empty(&self) -> bool {
         self.entries.read().is_empty()
     }
+}
+
+// ============================================================================
+// Generic proxy quarantine gate
+// ============================================================================
+//
+// Registry-agnostic generalization of the digest-quarantine wiring that
+// previously lived only in the Docker handler. min-release-age cannot give a
+// trustworthy release age on the proxy path (upstream dates are unsigned and
+// spoofable, and several registries expose no date at all), so first-seen
+// quarantine — keyed on the artifact's content digest and NORA's own clock — is
+// the unspoofable supply-chain control that works for every proxy registry.
+
+/// Resolve the effective quarantine `(mode, ttl_secs)` from the global curation
+/// config. Returns `(Off, 0)` when disabled. Per-registry overrides can be
+/// layered on top later; the proxy gate uses the global setting for now.
+pub fn resolve_global(mode: Option<&QuarantineMode>, ttl: Option<&str>) -> (QuarantineMode, i64) {
+    let mode = mode.cloned().unwrap_or(QuarantineMode::Off);
+    if matches!(mode, QuarantineMode::Off) {
+        return (QuarantineMode::Off, 0);
+    }
+    let secs = crate::curation::parse_duration(ttl.unwrap_or("14d")).unwrap_or(14 * 86400);
+    (mode, secs)
+}
+
+/// Post-fetch / pre-serve quarantine gate for a proxy-fetched artifact.
+///
+/// Records the artifact's content digest as first-seen, then checks maturity.
+/// Returns `Some(403)` to BLOCK (enforce mode, not yet mature), `None` to serve.
+/// In observe mode it logs but never blocks. Idempotent: `record` preserves the
+/// earliest `first_seen`, so calling this on every request (proxy fetch or cache
+/// hit) is safe and the quarantine clock does not reset.
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
+pub fn proxy_gate(
+    store: &DigestStore,
+    registry: &str,
+    bytes: &[u8],
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    use sha2::Digest;
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+    store.record(registry, &digest, upstream);
+    let status = store.check(registry, &digest, quarantine_secs);
+    if matches!(status, QuarantineStatus::Mature) {
+        return None;
+    }
+    warn!(
+        registry = %registry,
+        digest = %digest,
+        status = %status.header_value(),
+        mode = %mode,
+        "quarantine: proxy artifact held (new to this mirror)"
+    );
+    if matches!(mode, QuarantineMode::Enforce) {
+        Some(quarantine_forbidden(&digest, &status, quarantine_secs))
+    } else {
+        None
+    }
+}
+
+/// Build a generic 403 for a quarantined proxy artifact (non-Docker shape).
+fn quarantine_forbidden(digest: &str, status: &QuarantineStatus, quarantine_secs: i64) -> Response {
+    let remaining = match status {
+        QuarantineStatus::New => quarantine_secs,
+        QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
+        QuarantineStatus::Mature => 0,
+    };
+    let quarantine_until = Utc::now().timestamp() + remaining;
+    let body = serde_json::json!({
+        "error": "quarantine",
+        "message": "artifact held: new to this mirror",
+        "detail": {
+            "digest": digest,
+            "quarantine_until": quarantine_until,
+            "remaining_secs": remaining,
+        }
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (
+                HeaderName::from_static("x-nora-quarantine"),
+                status.header_value(),
+            ),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 // ============================================================================
