@@ -634,14 +634,15 @@ impl Config {
                 "curation.on_failure=\"open\" is not implemented and would silently degrade to fail-closed. Remove the setting or set on_failure=\"closed\" explicitly. This field will be removed in v0.9".to_string(),
             );
         }
-        // min_release_age on a proxy registry needs a date source or a quarantine,
-        // else it produces NO age control. min-age judges the REAL upstream
-        // release age; with an unknown date it DEFERS (Skip) to digest-quarantine
-        // rather than fail-closed-blocking every download (#741,
-        // curation-minage-real-age-defer). To keep that deferral from being a
-        // silent fail-open, refuse a config where min_release_age is set on an
-        // enabled proxy registry yet neither a trusted date source
-        // (server.trust_upstream_dates) nor an active quarantine is configured.
+        // min_release_age on a proxy registry requires an active quarantine. On the
+        // proxy path the upstream publish date is unsigned/spoofable AND, for most
+        // registries, not resolvable at all (the date-bearing upstream metadata is
+        // not cached at the curation point — the same root cause as #741), so
+        // min-age DEFERS (Skip). server.trust_upstream_dates yields a real date only
+        // where the registry caches one (npm); for pypi/cargo/nuget/gems/… it stays
+        // None and min-age silently does nothing — so trust is NOT a sufficient age
+        // control, only the unspoofable quarantine is. Refuse min-age on an enabled
+        // proxy without a quarantine (curation-minage-real-age-defer, #741).
         {
             use crate::digest_quarantine::QuarantineMode;
             let q_on =
@@ -670,13 +671,9 @@ impl Config {
                 || (self.pub_dart.enabled && self.pub_dart.proxy.is_some())
                 || (self.terraform.enabled && self.terraform.proxy.is_some())
                 || (self.ansible.enabled && self.ansible.proxy.is_some());
-            if self.curation.min_release_age.is_some()
-                && !self.server.trust_upstream_dates
-                && !quarantine_active
-                && any_enabled_proxy
-            {
+            if self.curation.min_release_age.is_some() && !quarantine_active && any_enabled_proxy {
                 errors.push(
-                    "curation.min_release_age is set with an enabled proxy registry but no age control would be active: an upstream publish date is unsigned/spoofable (and absent on several registries), so min-release-age cannot verify the real release age and defers. Set server.trust_upstream_dates=true (trust the upstream's date) OR enable curation.quarantine=\"observe\"|\"enforce\" (unspoofable first-seen hold). (#741)".to_string(),
+                    "curation.min_release_age is set with an enabled proxy registry but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine=\"observe\"|\"enforce\" (the unspoofable first-seen age control). server.trust_upstream_dates enhances min-release-age with real upstream dates where a registry caches one (e.g. npm) but is NOT a substitute for the quarantine. (#741)".to_string(),
                 );
             }
         }
@@ -2111,8 +2108,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_minage_proxy_with_trust_ok() {
-        // Escape hatch 2: trusting the upstream's date enables real-age control.
+    fn test_validate_minage_proxy_trust_alone_still_rejected() {
+        // trust_upstream_dates is NOT a sufficient substitute for the quarantine: it
+        // yields a real date only where a registry caches one (npm); for pypi/cargo/
+        // nuget/gems/… publish_date stays None and min-age silently does nothing, so
+        // min-age on a proxy still requires an active quarantine. (#741)
         let mut config = Config::default();
         config.npm.enabled = true;
         config.npm.proxy = Some("https://registry.npmjs.org".to_string());
@@ -2121,10 +2121,10 @@ mod tests {
         config.curation.quarantine = None;
         let (_, errors) = config.validate_with_config_path(None);
         assert!(
-            !errors
+            errors
                 .iter()
                 .any(|e| e.contains("no age control would be active")),
-            "trust_upstream_dates should satisfy the age-control requirement"
+            "trust alone (no quarantine) must still be rejected — trust is not a substitute"
         );
     }
 
