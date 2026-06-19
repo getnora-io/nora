@@ -14,6 +14,8 @@ fuzz/
 coverage/
 data/
 deploy/
+# but keep the baked container config the image stages COPY (#719)
+!deploy/config.docker.toml
 dist/
 docs-ru/
 docs-site/
