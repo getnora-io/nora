@@ -235,6 +235,17 @@ async fn revoke_token(
         }
     };
 
+    // Owner-scope: a self-service caller may revoke only its own tokens. 404 (not
+    // 403) so a non-owner cannot probe which token IDs exist
+    // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
+    if !token_store
+        .list_tokens(&req.username)
+        .iter()
+        .any(|t| t.file_id == req.hash_prefix)
+    {
+        return (StatusCode::NOT_FOUND, "Token not found").into_response();
+    }
+
     match token_store.revoke_token(&req.hash_prefix) {
         Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
