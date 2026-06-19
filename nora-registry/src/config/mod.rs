@@ -603,13 +603,42 @@ impl Config {
             );
         }
 
-        // 8. Curation validation
-        if self.curation.mode == CurationMode::Enforce && self.curation.allowlist_path.is_none() {
-            errors.push(
-                "curation.mode=enforce requires curation.allowlist_path to be set".to_string(),
-            );
-        }
+        // 8. Curation validation.
+        // Compute once: is any first-seen quarantine active (global or per-registry)?
+        // Used by both the enforce "at least one control" check and the
+        // min-release-age age-control requirement below.
+        use crate::digest_quarantine::QuarantineMode;
+        let q_on = |q: &Option<QuarantineMode>| matches!(q, Some(m) if *m != QuarantineMode::Off);
+        let quarantine_active = q_on(&self.curation.quarantine)
+            || q_on(&self.curation.npm.quarantine)
+            || q_on(&self.curation.pypi.quarantine)
+            || q_on(&self.curation.cargo.quarantine)
+            || q_on(&self.curation.go.quarantine)
+            || q_on(&self.curation.maven.quarantine)
+            || q_on(&self.curation.gems.quarantine)
+            || q_on(&self.curation.terraform.quarantine)
+            || q_on(&self.curation.ansible.quarantine)
+            || q_on(&self.curation.nuget.quarantine)
+            || q_on(&self.curation.pub_dart.quarantine)
+            || q_on(&self.curation.conan.quarantine);
+
+        // Enforce mode must have at least ONE active control, otherwise it blocks
+        // nothing. An allowlist is one option, not the only one — a blocklist,
+        // min-release-age, an active quarantine, namespace isolation, or integrity
+        // checking each make enforce meaningful, so a deny-list-only / age-only /
+        // quarantine-only policy is valid (#740).
         if self.curation.mode == CurationMode::Enforce {
+            let any_control = self.curation.allowlist_path.is_some()
+                || self.curation.blocklist_path.is_some()
+                || self.curation.min_release_age.is_some()
+                || quarantine_active
+                || !self.curation.internal_namespaces.is_empty()
+                || self.curation.require_integrity;
+            if !any_control {
+                errors.push(
+                    "curation.mode=enforce but no active control is configured — enforce would block nothing. Set at least one of: allowlist_path, blocklist_path, min_release_age, quarantine, internal_namespaces, or require_integrity.".to_string(),
+                );
+            }
             if let Some(ref path) = self.curation.allowlist_path {
                 if !std::path::Path::new(path).exists() {
                     errors.push(format!(
@@ -644,21 +673,6 @@ impl Config {
         // control, only the unspoofable quarantine is. Refuse min-age on an enabled
         // proxy without a quarantine (curation-minage-real-age-defer, #741).
         {
-            use crate::digest_quarantine::QuarantineMode;
-            let q_on =
-                |q: &Option<QuarantineMode>| matches!(q, Some(m) if *m != QuarantineMode::Off);
-            let quarantine_active = q_on(&self.curation.quarantine)
-                || q_on(&self.curation.npm.quarantine)
-                || q_on(&self.curation.pypi.quarantine)
-                || q_on(&self.curation.cargo.quarantine)
-                || q_on(&self.curation.go.quarantine)
-                || q_on(&self.curation.maven.quarantine)
-                || q_on(&self.curation.gems.quarantine)
-                || q_on(&self.curation.terraform.quarantine)
-                || q_on(&self.curation.ansible.quarantine)
-                || q_on(&self.curation.nuget.quarantine)
-                || q_on(&self.curation.pub_dart.quarantine)
-                || q_on(&self.curation.conan.quarantine);
             let any_enabled_proxy = (self.pypi.enabled
                 && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty()))
                 || (self.npm.enabled && self.npm.proxy.is_some())
@@ -2058,14 +2072,34 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_curation_enforce_no_allowlist() {
+    fn test_validate_curation_enforce_no_controls() {
+        // Enforce with no control of any kind enforces nothing → error (#740).
         let mut config = Config::default();
         config.curation.mode = CurationMode::Enforce;
         config.curation.allowlist_path = None;
         let (_, errors) = config.validate_with_config_path(None);
         assert!(
-            errors.iter().any(|e| e.contains("allowlist_path")),
-            "enforce without allowlist should be an error"
+            errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "enforce with no controls should be an error"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_blocklist_only_ok() {
+        // #740: enforce must NOT require an allowlist — a blocklist alone is a valid
+        // control. A deny-list-only (or min-age-only / quarantine-only) policy is legit.
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = None;
+        config.curation.blocklist_path = Some("/etc/nora/blocklist.json".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "a blocklist alone should satisfy enforce — no allowlist required"
         );
     }
 
