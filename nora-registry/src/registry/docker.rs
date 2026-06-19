@@ -725,6 +725,65 @@ fn quarantine_forbidden(
         .into_response()
 }
 
+/// Cache-serve quarantine gate for an already-cached artifact with a known digest.
+///
+/// Blocks (403 in enforce) ONLY when a proxy record for this digest is still
+/// `Pending`. A digest with no proxy record (`New` — a locally-pushed or internal
+/// artifact, or a record pruned past 90d) is served, and `Mature` is served. Local
+/// pushes are not recorded, so they always read as `New` and serve; a trusted push
+/// can therefore neither hold nor mature a digest on the proxy path. Returns
+/// `Some(403)` to block, `None` to proceed.
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves it"]
+fn quarantine_cache_serve_gate(state: &AppState, digest: &str) -> Option<Response> {
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        return None;
+    }
+    let status = state.digest_store.check("docker", digest, q_secs);
+    if let crate::digest_quarantine::QuarantineStatus::Pending { .. } = status {
+        tracing::warn!(
+            digest = %digest,
+            status = %status.header_value(),
+            mode = ?q_mode,
+            "Quarantine: held cached artifact (proxy cooldown)"
+        );
+        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+            return Some(quarantine_forbidden(digest, &status, q_secs));
+        }
+    }
+    None
+}
+
+/// Post-proxy-fetch quarantine gate for a blob with a known content digest.
+///
+/// Records the digest as first-seen on the proxy path, then blocks (403 in enforce)
+/// until it matures. Mirrors the manifest proxy-fetch path. `record` is idempotent,
+/// so the cooldown clock starts at the first proxy fetch and never resets. The caller
+/// caches the blob before calling this, so a held blob is still cached (the client is
+/// blocked, not the cache) — identical to the manifest behaviour.
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves it"]
+fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
+    let (q_mode, q_secs) = resolve_quarantine(state);
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        return None;
+    }
+    state.digest_store.record("docker", digest, upstream);
+    let status = state.digest_store.check("docker", digest, q_secs);
+    if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature) {
+        tracing::warn!(
+            digest = %digest,
+            upstream = %upstream,
+            status = %status.header_value(),
+            mode = ?q_mode,
+            "Quarantine: proxy-fetched blob held (new to this mirror)"
+        );
+        if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+            return Some(quarantine_forbidden(digest, &status, q_secs));
+        }
+    }
+    None
+}
+
 /// Docker v2 routes.
 /// Uses a `{*rest}` wildcard to support image names with arbitrary path depth
 /// (e.g., `library/astra/ubi18-cpp122`), per OCI Distribution spec.
@@ -999,11 +1058,19 @@ async fn check_blob(
     // Use stat() instead of get() to avoid loading multi-GB blobs into memory
     // just to return Content-Length on a HEAD request (#526).
     match storage_stat_with_fallback(&state.storage, &key, &legacy_key).await {
-        Some(meta) => (
-            StatusCode::OK,
-            [(header::CONTENT_LENGTH, meta.size.to_string())],
-        )
-            .into_response(),
+        Some(meta) => {
+            // Mirror download_blob / HEAD-manifest: a proxy-cached blob still within its
+            // cooldown is reported as held (403), not available — so HEAD and GET agree.
+            // A local/internal blob has no proxy record (`New`) and acks normally.
+            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
+                return resp;
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_LENGTH, meta.size.to_string())],
+            )
+                .into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1066,6 +1133,14 @@ async fn download_blob(
             &digest,
         ) {
             return response;
+        }
+
+        // Quarantine: a proxy-cached blob still within its cooldown window is held.
+        // A blob with no proxy record (a local push, or an entry pruned past 90d)
+        // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
+        // the 206 range serve and the 200 full serve below.
+        if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
+            return resp;
         }
 
         // Range request: serve the requested byte range (206 Partial Content). A ranged
@@ -1226,6 +1301,15 @@ async fn download_blob(
                             );
                             // Guard will clean up temp file on drop
                         }
+                    }
+
+                    // Quarantine: the blob is cached above; hold it during the cooldown.
+                    // Records the digest as first-seen on the proxy path and 403s in
+                    // enforce until it matures (mirrors the manifest proxy path). Covers
+                    // both serve paths below (stored and temp-file fallback).
+                    if let Some(resp) = quarantine_proxy_fetch_gate(&state, &digest, &upstream.url)
+                    {
+                        return resp;
                     }
 
                     // Serve response via streaming — never load full blob into RAM (#580).
@@ -2049,24 +2133,12 @@ fn serve_cached_manifest(
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
 
-    // Quarantine check (local cache hit may still be pending)
-    let (q_mode, q_secs) = resolve_quarantine(state);
-    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-        let q_status = state.digest_store.check("docker", &digest, q_secs);
-        match &q_status {
-            crate::digest_quarantine::QuarantineStatus::Mature => {}
-            _ => {
-                tracing::warn!(
-                    digest = %digest,
-                    status = %q_status.header_value(),
-                    mode = ?q_mode,
-                    "Quarantine: cached manifest"
-                );
-                if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
-                    return quarantine_forbidden(&digest, &q_status, q_secs);
-                }
-            }
-        }
+    // Quarantine: a cached manifest still within its proxy cooldown is held. A manifest
+    // with no proxy record (a local push, or a pruned entry) reads as `New` and serves —
+    // only `Pending` blocks, so a local push is never held and never matures a proxy
+    // digest. (A just-proxied manifest is recorded + checked on the fetch path above.)
+    if let Some(resp) = quarantine_cache_serve_gate(state, &digest) {
+        return resp;
     }
 
     // Detect manifest media type from content
@@ -2181,11 +2253,10 @@ async fn put_manifest(
             .into_response();
     }
 
-    // Local push → mark as immediately mature in quarantine store
-    let (q_mode, q_secs) = resolve_quarantine(&state);
-    if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-        state.digest_store.record_trusted("docker", &digest, q_secs);
-    }
+    // Local push: NOT recorded in the quarantine ledger. The cooldown is a control on
+    // content arriving from upstream; a local push has no proxy record, so the
+    // cache-serve gate reads it as `New` and serves it. Not recording here also keeps a
+    // local push from setting the first-seen clock for a digest later fetched upstream.
 
     // Store by tag/reference. Hold the SAME publish_lock key as delete_manifest so a
     // concurrent push/push or push/delete of one tag cannot interleave (the tag + digest

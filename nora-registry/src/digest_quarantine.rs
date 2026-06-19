@@ -236,24 +236,12 @@ impl DigestStore {
         entry
     }
 
-    /// Record a locally-pushed digest as immediately mature.
-    ///
-    /// Sets `first_seen` to `now - quarantine_secs - 1` so the digest
-    /// passes any quarantine check with threshold <= `quarantine_secs`.
-    pub fn record_trusted(&self, registry: &str, digest: &str, quarantine_secs: i64) {
-        let key = format!("{}:{}", registry, digest);
-        let mut entries = self.entries.write();
-
-        let entry = DigestEntry {
-            registry: registry.to_string(),
-            digest: digest.to_string(),
-            first_seen: Utc::now().timestamp() - quarantine_secs - 1,
-            upstream: "local".to_string(),
-        };
-
-        entries.insert(key, entry.clone());
-        append_jsonl(&self.path, &entry);
-    }
+    // NOTE: the ledger records PROXY-fetched content only. Locally-pushed artifacts
+    // are intentionally NOT recorded — the cooldown is a control on content arriving
+    // from upstream, and the serve gate treats an unrecorded digest (`New`) as "serve".
+    // A prior `record_trusted` matured local pushes here; it was removed because it
+    // wrote the same key the proxy `check` reads, letting a local push set the
+    // first-seen clock for a digest later fetched from upstream.
 
     /// Check quarantine status for a digest.
     #[must_use = "ignoring quarantine status may serve blocked artifacts"]
@@ -563,14 +551,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_record_trusted_immediately_mature() {
+    async fn test_unrecorded_digest_is_new() {
+        // The ledger tracks proxy-fetched content only. A digest that was never
+        // proxy-recorded (e.g. a locally-pushed artifact, which is deliberately not
+        // recorded) reads as `New`. The cache-serve gate treats `New` as "serve" and
+        // blocks only `Pending`, so a local push is served and can never set the
+        // first-seen clock for — or mature — a digest on the proxy path.
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
 
-        store.record_trusted("docker", "sha256:local123", 86400);
-
-        let status = store.check("docker", "sha256:local123", 86400);
-        assert_eq!(status, QuarantineStatus::Mature);
+        let status = store.check("docker", "sha256:never_seen", 86400);
+        assert_eq!(status, QuarantineStatus::New);
     }
 
     #[tokio::test]
