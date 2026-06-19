@@ -880,10 +880,12 @@ async fn flatcontainer_download(
             &id_lower,
         );
 
+    // Hoisted to function scope for the digest-quarantine serve gate (#750).
+    let mut publish_date: Option<i64> = None;
     // Curation check for .nupkg downloads
     if ends_with_ci(filename, ".nupkg") && !internal {
         // Extract publish date from cached registration index
-        let publish_date = extract_nuget_publish_date(
+        publish_date = extract_nuget_publish_date(
             &state.storage,
             &id_lower,
             ver,
@@ -968,13 +970,14 @@ async fn flatcontainer_download(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "nuget",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -1090,13 +1093,14 @@ async fn flatcontainer_download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "nuget",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }

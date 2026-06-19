@@ -206,7 +206,18 @@ impl DigestStore {
     ///
     /// Idempotent: if the digest already exists, the original entry is returned.
     /// New entries are appended to JSONL asynchronously.
-    pub fn record(&self, registry: &str, digest: &str, upstream: &str) -> DigestEntry {
+    /// `first_seen` overrides the recorded first-seen timestamp with a trusted
+    /// upstream release date (only when `server.trust_upstream_dates` is set and
+    /// the registry caches one, #750); `None` uses NORA's own clock — the
+    /// unspoofable default. SECURITY: a trusted date is upstream-supplied and
+    /// spoofable, so it is opt-in via `trust_upstream_dates`.
+    pub fn record(
+        &self,
+        registry: &str,
+        digest: &str,
+        upstream: &str,
+        first_seen: Option<i64>,
+    ) -> DigestEntry {
         let key = format!("{}:{}", registry, digest);
 
         // Fast path: read lock
@@ -227,7 +238,7 @@ impl DigestStore {
         let entry = DigestEntry {
             registry: registry.to_string(),
             digest: digest.to_string(),
-            first_seen: Utc::now().timestamp(),
+            first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
             upstream: upstream.to_string(),
         };
 
@@ -314,12 +325,39 @@ pub fn proxy_gate(
     quarantine_secs: i64,
     upstream: &str,
 ) -> Option<Response> {
+    proxy_gate_dated(
+        store,
+        registry,
+        bytes,
+        mode,
+        quarantine_secs,
+        upstream,
+        None,
+    )
+}
+
+/// Like [`proxy_gate`], but seeds the first-seen clock from a trusted upstream
+/// release date (#750). When `trusted_first_seen` is `Some` — only when
+/// `server.trust_upstream_dates` is set and the registry caches a date — an
+/// artifact whose release date is already older than the TTL matures
+/// immediately, so a provably-old package is not held as "new to this mirror".
+/// `None` falls back to NORA's own clock (the unspoofable default).
+#[must_use = "the returned response blocks a quarantined artifact; dropping it serves the artifact"]
+pub fn proxy_gate_dated(
+    store: &DigestStore,
+    registry: &str,
+    bytes: &[u8],
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
     if matches!(mode, QuarantineMode::Off) {
         return None;
     }
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-    store.record(registry, &digest, upstream);
+    store.record(registry, &digest, upstream, trusted_first_seen);
     let status = store.check(registry, &digest, quarantine_secs);
     if matches!(status, QuarantineStatus::Mature) {
         return None;
@@ -526,7 +564,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
 
-        store.record("docker", "sha256:abc123", "registry-1.docker.io");
+        store.record("docker", "sha256:abc123", "registry-1.docker.io", None);
 
         let status = store.check("docker", "sha256:abc123", 86400);
         match status {
@@ -543,7 +581,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
 
-        store.record("docker", "sha256:abc123", "registry-1.docker.io");
+        store.record("docker", "sha256:abc123", "registry-1.docker.io", None);
 
         // TTL=0 → immediately mature
         let status = store.check("docker", "sha256:abc123", 0);
@@ -569,8 +607,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
 
-        let entry1 = store.record("docker", "sha256:abc", "upstream1");
-        let entry2 = store.record("docker", "sha256:abc", "upstream2");
+        let entry1 = store.record("docker", "sha256:abc", "upstream1", None);
+        let entry2 = store.record("docker", "sha256:abc", "upstream2", None);
 
         assert_eq!(entry1.first_seen, entry2.first_seen);
         assert_eq!(entry1.upstream, entry2.upstream);
@@ -582,8 +620,44 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
 
-        store.record("docker", "sha256:abc", "docker-upstream");
-        store.record("npm", "sha256:abc", "npmjs.org");
+        store.record("docker", "sha256:abc", "docker-upstream", None);
+        store.record("npm", "sha256:abc", "npmjs.org", None);
+
+        assert_eq!(store.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_trusted_first_seen_matures_old_release() {
+        // #750: when a trusted upstream release date is supplied, the artifact's
+        // first_seen is that date — so a package released long ago is immediately
+        // Mature (served), not held as "new to this mirror".
+        let tmp = TempDir::new().unwrap();
+        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let two_years_ago = Utc::now().timestamp() - 2 * 365 * 86400;
+
+        store.record(
+            "pypi",
+            "sha256:old",
+            "files.pythonhosted.org",
+            Some(two_years_ago),
+        );
+        // 14-day TTL: a 2-year-old release is well past it.
+        assert_eq!(
+            store.check("pypi", "sha256:old", 14 * 86400),
+            QuarantineStatus::Mature
+        );
+
+        // A freshly-released artifact (date = now) is still held.
+        store.record(
+            "pypi",
+            "sha256:fresh",
+            "files.pythonhosted.org",
+            Some(Utc::now().timestamp()),
+        );
+        assert!(matches!(
+            store.check("pypi", "sha256:fresh", 14 * 86400),
+            QuarantineStatus::Pending { .. }
+        ));
 
         assert_eq!(store.len(), 2);
     }

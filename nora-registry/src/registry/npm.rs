@@ -153,22 +153,25 @@ async fn handle_request(
         None
     };
 
+    // Extract publish date from cached metadata (npm `time` field). Hoisted to
+    // function scope so the digest-quarantine serve gate below can seed first_seen
+    // from a trusted upstream release date (#750). Non-tarball requests have no
+    // version, so this is `None` without any extra storage read.
+    let publish_date = if let Some(ref ver) = tarball_version {
+        let meta_key = format!("npm/{}/metadata.json", package_name);
+        extract_npm_publish_date(
+            &state.storage,
+            &meta_key,
+            ver,
+            state.config.server.trust_upstream_dates,
+        )
+        .await
+    } else {
+        None
+    };
+
     // Curation check — tarball downloads only (metadata passes through)
     if is_tarball {
-        // Extract publish date from cached metadata (npm time field)
-        let publish_date = if let Some(ref ver) = tarball_version {
-            let meta_key = format!("npm/{}/metadata.json", package_name);
-            extract_npm_publish_date(
-                &state.storage,
-                &meta_key,
-                ver,
-                state.config.server.trust_upstream_dates,
-            )
-            .await
-        } else {
-            None
-        };
-
         // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
         // serve below handles a locally-published tarball, and the namespace guard at the
         // cache-miss boundary (below) blocks the upstream branch for internal names.
@@ -324,13 +327,14 @@ async fn handle_request(
                 .quarantine_ttl
                 .as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "npm",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -436,13 +440,14 @@ async fn handle_request(
                             .quarantine_ttl
                             .as_deref()),
                     );
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                         &state.digest_store,
                         "npm",
                         &data_to_serve,
                         &q_mode,
                         q_secs,
                         &url,
+                        publish_date,
                     ) {
                         return resp;
                     }

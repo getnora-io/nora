@@ -445,13 +445,14 @@ async fn recipe_file_download(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "conan",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -516,13 +517,14 @@ async fn recipe_file_download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "conan",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }
@@ -853,13 +855,14 @@ async fn package_file_download(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "conan",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -926,13 +929,14 @@ async fn package_file_download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "conan",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }

@@ -263,19 +263,21 @@ async fn download_file(
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
 
-    // Extract publish date from cached PyPI metadata
-    let publish_date = if let Some(ref ver) = version {
-        let meta_key = format!("pypi/{}/metadata.json", normalized);
-        extract_pypi_publish_date(
-            &state.storage,
-            &meta_key,
-            ver,
-            state.config.server.trust_upstream_dates,
-        )
-        .await
-    } else {
-        None
-    };
+    // Extract the upstream release date for this file (PEP 700 `upload-time` from
+    // the PEP 691 simple JSON, cached as dates.json). Seeds the digest-quarantine
+    // first-seen clock so a provably-old release is not held as "new to this
+    // mirror" (#748/#750). Only consulted when upstream dates are trusted.
+    let dates_key = format!("pypi/{}/dates.json", normalized);
+    if state.config.server.trust_upstream_dates {
+        ensure_pypi_dates_cached(&state, &normalized).await;
+    }
+    let publish_date = extract_pypi_publish_date(
+        &state.storage,
+        &dates_key,
+        &filename,
+        state.config.server.trust_upstream_dates,
+    )
+    .await;
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -348,13 +350,14 @@ async fn download_file(
             .audit
             .log(AuditEntry::new("cache_hit", "api", "", "pypi", ""));
 
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "pypi",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -453,13 +456,14 @@ async fn download_file(
                     }
                 });
 
-                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "pypi",
                     &data,
                     &q_mode,
                     q_secs,
                     &file_url,
+                    publish_date,
                 ) {
                     return resp;
                 }
@@ -729,28 +733,74 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 // Helpers
 // ============================================================================
 
-/// Extract publish date for a specific version from cached PyPI metadata.
-///
-/// PyPI metadata JSON has `releases` mapping versions to file arrays:
-/// ```json
-/// { "releases": { "1.0.0": [{ "upload_time_iso_8601": "2024-01-15T10:30:00Z" }] } }
-/// ```
+/// Extract a file's upstream upload-time from the cached `dates.json`
+/// (filename → PEP 700 `upload-time`, populated by [`ensure_pypi_dates_cached`]).
 async fn extract_pypi_publish_date(
     storage: &crate::storage::Storage,
-    metadata_key: &str,
-    version: &str,
+    dates_key: &str,
+    filename: &str,
     trust_upstream: bool,
 ) -> Option<i64> {
     // #513: untrusted upstream dates → use NORA's own cache mtime, never the
-    // (spoofable) upstream upload_time.
+    // (spoofable) upstream upload-time.
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+        return crate::curation::extract_mtime_as_publish_date(storage, dates_key).await;
     }
-    let data = storage.get(metadata_key).await.ok()?;
+    let data = storage.get(dates_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let files = json.get("releases")?.get(version)?.as_array()?;
-    let date_str = files.first()?.get("upload_time_iso_8601")?.as_str()?;
+    let date_str = json.get(filename)?.as_str()?;
     crate::curation::parse_iso8601_to_unix(date_str)
+}
+
+/// Cache a `filename → upload-time` map (`pypi/{name}/dates.json`) from the
+/// upstream PEP 691 simple JSON (PEP 700 `upload-time`). No-op if already cached
+/// or no upstream supplies a date. Best-effort: any failure leaves no dates and
+/// the quarantine clock falls back to NORA's own time. The PEP 503 HTML index
+/// NORA fetches for the file *listing* carries no dates, hence this JSON fetch.
+async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
+    let key = format!("pypi/{}/dates.json", normalized);
+    if state.storage.get(&key).await.is_ok() {
+        return;
+    }
+    let mut map = serde_json::Map::new();
+    for up in &state.config.pypi.upstreams() {
+        let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
+        let Ok(text) = proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
+            up.auth(),
+            Some(("Accept", PEP691_JSON)),
+            &state.circuit_breaker,
+            RegistryType::PyPI,
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(files) = json.get("files").and_then(|f| f.as_array()) {
+            for fe in files {
+                if let (Some(fname), Some(ut)) = (
+                    fe.get("filename").and_then(|v| v.as_str()),
+                    fe.get("upload-time").and_then(|v| v.as_str()),
+                ) {
+                    map.entry(fname.to_string())
+                        .or_insert_with(|| serde_json::Value::String(ut.to_string()));
+                }
+            }
+        }
+        if !map.is_empty() {
+            break; // first upstream that listed dated files wins
+        }
+    }
+    if !map.is_empty() {
+        if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(map)) {
+            let _ = state.storage.put(&key, &bytes).await;
+        }
+    }
 }
 
 /// Normalize package name according to PEP 503.

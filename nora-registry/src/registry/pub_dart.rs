@@ -550,13 +550,14 @@ async fn download_archive(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "pub",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -636,13 +637,14 @@ async fn download_archive(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "pub",
                 &data,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }

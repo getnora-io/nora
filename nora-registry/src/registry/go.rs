@@ -74,10 +74,13 @@ async fn handle(
         None
     };
 
+    // Hoisted to function scope so the digest-quarantine serve gate can seed
+    // first_seen from a trusted upstream release date (#750).
+    let mut publish_date: Option<i64> = None;
     // Curation check — .zip downloads only (metadata passes through)
     if let Some((ref module_name, ref version)) = go_curation {
         // Extract publish date from cached .info file
-        let publish_date = if let Some(ref ver) = version {
+        publish_date = if let Some(ref ver) = version {
             let info_key = format!("go/{}/@v/{}.info", module_encoded, ver);
             extract_go_publish_date(
                 &state.storage,
@@ -177,13 +180,14 @@ async fn handle(
                         .quarantine_ttl
                         .as_deref()),
                 );
-                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "go",
                     data,
                     &q_mode,
                     q_secs,
                     "cache",
+                    publish_date,
                 ) {
                     return resp;
                 }
@@ -311,13 +315,14 @@ async fn handle(
                         .quarantine_ttl
                         .as_deref()),
                 );
-                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "go",
                     &bytes,
                     &q_mode,
                     q_secs,
                     &upstream_url,
+                    publish_date,
                 ) {
                     return resp;
                 }

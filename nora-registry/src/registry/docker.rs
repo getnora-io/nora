@@ -767,7 +767,9 @@ fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         return None;
     }
-    state.digest_store.record("docker", digest, upstream);
+    // Docker quarantine never trusts an upstream date (digest-addressed) —
+    // always NORA's own clock, preserving the GHSA-4j4m fix.
+    state.digest_store.record("docker", digest, upstream, None);
     let status = state.digest_store.check("docker", digest, q_secs);
     if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature) {
         tracing::warn!(
@@ -1820,7 +1822,9 @@ async fn try_fetch_and_cache(
                 // Quarantine: record digest, check status
                 let (q_mode, q_secs) = resolve_quarantine(state);
                 if !matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
-                    state.digest_store.record("docker", &digest, &upstream.url);
+                    state
+                        .digest_store
+                        .record("docker", &digest, &upstream.url, None);
                     let q_status = state.digest_store.check("docker", &digest, q_secs);
                     match &q_status {
                         crate::digest_quarantine::QuarantineStatus::Mature => {}
