@@ -116,6 +116,24 @@ async fn create_token(
                 .into_response()
         }
     };
+    // Block role self-escalation: an admin token may be minted via this public
+    // route only by an account listed in auth.admin_users. Read/write are
+    // unaffected (GHSA-78cx-cfhm-rgmx).
+    if role == Role::Admin
+        && !state
+            .config
+            .auth
+            .admin_users
+            .iter()
+            .any(|u| u == &req.username)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin role is not permitted for this account; add it to auth.admin_users",
+        )
+            .into_response();
+    }
+
     match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
         Ok(token) => Json(CreateTokenResponse {
             token,
