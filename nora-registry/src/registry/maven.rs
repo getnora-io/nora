@@ -214,30 +214,31 @@ async fn download(
     // exposes no per-artifact upload date, so for a Maven Central upstream we query
     // the Central search API (gated to a Central proxy to avoid leaking coordinates);
     // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
-    let publish_date: Option<i64> =
-        if let Some((ref maven_name, ref maven_version)) = curation_coords {
-            if state.config.maven.proxies.is_empty() {
-                crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
-            } else if state.config.server.trust_upstream_dates && maven_upstream_is_central(&state) {
-                match maven_name.split_once(':') {
-                    Some((group, artifact)) => {
-                        fetch_maven_central_date(
-                            &state.http_client,
-                            group,
-                            artifact,
-                            maven_version,
-                            state.config.maven.proxy_timeout,
-                        )
-                        .await
-                    }
-                    None => None,
+    let publish_date: Option<i64> = if let Some((ref maven_name, ref maven_version)) =
+        curation_coords
+    {
+        if state.config.maven.proxies.is_empty() {
+            crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+        } else if state.config.server.trust_upstream_dates && maven_upstream_is_central(&state) {
+            match maven_name.split_once(':') {
+                Some((group, artifact)) => {
+                    fetch_maven_central_date(
+                        &state.http_client,
+                        group,
+                        artifact,
+                        maven_version,
+                        state.config.maven.proxy_timeout,
+                    )
+                    .await
                 }
-            } else {
-                None
+                None => None,
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     // Curation check — only for versioned artifact files, not metadata
     if let Some((ref maven_name, ref maven_version)) = curation_coords {

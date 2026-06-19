@@ -240,6 +240,51 @@ async fn version_detail(
     .await
 }
 
+/// Per-version `created_at` from cached Galaxy metadata (#748/#750).
+///
+/// Prefers the per-version detail JSON (`{ver}.json`, cached when the client
+/// fetches version metadata immediately before download) — it carries the exact
+/// version's `created_at` at top level with no pagination concern. Falls back to
+/// the first page of the versions listing (`versions.json`), which only holds the
+/// most recent versions for large collections (Galaxy paginates). Any miss →
+/// `None` (the quarantine falls back to NORA's own first-seen clock).
+async fn extract_ansible_publish_date(
+    storage: &crate::storage::Storage,
+    ns: &str,
+    name: &str,
+    ver: &str,
+) -> Option<i64> {
+    // Per-version detail (top-level created_at; works for any version).
+    let ver_key = format!("ansible/metadata/{}/{}/{}.json", ns, name, ver);
+    if let Ok(data) = storage.get(&ver_key).await {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(date_str) = json
+                .get("created_at")
+                .or_else(|| json.get("created"))
+                .and_then(|v| v.as_str())
+            {
+                if let Some(ts) = crate::curation::parse_iso8601_to_unix(date_str) {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+
+    // First-page versions listing (data[]; recent versions only).
+    let key = format!("ansible/metadata/{}/{}/versions.json", ns, name);
+    let data = storage.get(&key).await.ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let entries = json.get("data").and_then(|d| d.as_array())?;
+    let entry = entries
+        .iter()
+        .find(|e| e.get("version").and_then(|v| v.as_str()) == Some(ver))?;
+    let date_str = entry
+        .get("created_at")
+        .or_else(|| entry.get("created"))?
+        .as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
+
 // ── Tarball download (immutable) ───────────────────────────────────────
 
 async fn download_tarball(
@@ -266,9 +311,13 @@ async fn download_tarball(
 
     let storage_key = format!("ansible/download/{}", filename);
 
-    // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
+    // Release date for the digest-quarantine first-seen clock (#748/#750): the
+    // Galaxy versions metadata (cached by version_list) carries per-version
+    // created_at. Hosted-only uses mtime.
     let publish_date = if state.config.ansible.proxy.is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
+    } else if state.config.server.trust_upstream_dates {
+        extract_ansible_publish_date(&state.storage, ns, name, ver).await
     } else {
         None
     };
@@ -335,13 +384,14 @@ async fn download_tarball(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "ansible",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -406,13 +456,14 @@ async fn download_tarball(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "ansible",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }

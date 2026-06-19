@@ -341,6 +341,16 @@ async fn provider_download_binary(
 
     let storage_key = format!("terraform/download/{}", path);
 
+    // Release date for the quarantine first-seen clock (#748/#750). The rewritten
+    // binary path is {ns}/{ptype}/{ver}/{file}, so reuse the cached provider
+    // metadata date (gated internally on trust_upstream_dates; None → NORA's clock).
+    let bin_coords: Vec<&str> = path.split('/').collect();
+    let publish_date = if bin_coords.len() >= 3 {
+        extract_terraform_publish_date(&state, bin_coords[0], bin_coords[1], bin_coords[2]).await
+    } else {
+        None
+    };
+
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
     if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
@@ -371,13 +381,14 @@ async fn provider_download_binary(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "terraform",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -436,13 +447,14 @@ async fn provider_download_binary(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "terraform",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }
@@ -786,42 +798,92 @@ async fn module_source_download(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Extract publish date from cached Terraform provider versions metadata.
+/// True when a configured Terraform proxy points at the official
+/// registry.terraform.io — the only upstream with a per-version date source (its
+/// `/v2` API). Gates the v2 query so internal namespaces are never sent there.
+fn terraform_upstream_is_official(state: &AppState) -> bool {
+    upstream_url(state).contains("registry.terraform.io")
+}
+
+/// Best-effort release date for a Terraform provider version via the
+/// registry.terraform.io `/v2` API. The *standard* provider protocol exposes no
+/// date (neither `versions` nor `download/{os}/{arch}` carry one — verified
+/// against the live API), so this v2 endpoint is the only trusted source, and it
+/// only exists on the official registry. Any failure → `None`.
+async fn fetch_terraform_registry_date(
+    client: &reqwest::Client,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+    timeout_secs: u64,
+) -> Option<i64> {
+    let url = format!(
+        "https://registry.terraform.io/v2/providers/{}/{}?include=provider-versions",
+        ns, ptype
+    );
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let included = json.get("included")?.as_array()?;
+    for item in included {
+        let attrs = match item.get("attributes") {
+            Some(a) => a,
+            None => continue,
+        };
+        if attrs.get("version").and_then(|v| v.as_str()) == Some(ver) {
+            let date_str = attrs.get("published-at").and_then(|v| v.as_str())?;
+            return crate::curation::parse_iso8601_to_unix(date_str);
+        }
+    }
+    None
+}
+
+/// Release date for the quarantine first-seen clock (#748/#750).
 ///
-/// Terraform registry API does not reliably include `published_at` in the
-/// versions listing. Falls back to mtime for hosted-only mode.
+/// The standard Terraform provider protocol carries no publish date, so the only
+/// trusted source is registry.terraform.io's `/v2` API (official upstream only,
+/// and spoofable → gated on `trust_upstream_dates` per #513). For self-hosted
+/// providers the mtime of cached metadata ≈ first-publish. Otherwise `None` and
+/// the quarantine falls back to NORA's own first-seen clock.
 async fn extract_terraform_publish_date(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
 ) -> Option<i64> {
-    // #513: only consult the upstream-provided `published_at` when configured to
-    // trust upstream dates (an attacker controlling upstream could spoof it).
-    if state.config.server.trust_upstream_dates {
-        // Try download metadata JSON (per-version cached file)
-        let storage_key = format!("terraform/providers/{}/{}/{}/download.json", ns, ptype, ver);
-        if let Ok(data) = state.storage.get(&storage_key).await {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(date_str) = json.get("published_at").and_then(|v| v.as_str()) {
-                    return crate::curation::parse_iso8601_to_unix(date_str);
-                }
-            }
+    // Proxy mode: only the official registry has a per-version date, and only when
+    // we're configured to trust upstream-provided dates (#513 — an attacker on a
+    // custom mirror could spoof it; we never query v2 for internal namespaces).
+    if state.config.terraform.proxy.is_some() {
+        if state.config.server.trust_upstream_dates && terraform_upstream_is_official(state) {
+            return fetch_terraform_registry_date(
+                &state.http_client,
+                ns,
+                ptype,
+                ver,
+                state.config.terraform.proxy_timeout,
+            )
+            .await;
         }
+        return None;
     }
 
-    // mtime fallback — NORA's own cache time. Fires for hosted mode (where mtime
-    // ≈ first-publish) and whenever upstream dates are not trusted (#513). In
-    // proxy mode with trust=true it stays disabled (cache time != publish time).
-    if state.config.terraform.proxy.is_none() || !state.config.server.trust_upstream_dates {
-        // Try any cached platform-specific metadata
-        for suffix in &["linux_amd64.json", "linux_arm64.json", "darwin_amd64.json"] {
-            let meta_key = format!("terraform/providers/{}/{}/{}/{}", ns, ptype, ver, suffix);
-            if let Some(ts) =
-                crate::curation::extract_mtime_as_publish_date(&state.storage, &meta_key).await
-            {
-                return Some(ts);
-            }
+    // Hosted mode: mtime of any cached platform metadata ≈ first-publish time.
+    // This is NORA's own observation (not upstream-controlled), so it is safe
+    // regardless of the trust flag.
+    for suffix in &["linux_amd64.json", "linux_arm64.json", "darwin_amd64.json"] {
+        let meta_key = format!("terraform/providers/{}/{}/{}/{}", ns, ptype, ver, suffix);
+        if let Some(ts) =
+            crate::curation::extract_mtime_as_publish_date(&state.storage, &meta_key).await
+        {
+            return Some(ts);
         }
     }
     None
