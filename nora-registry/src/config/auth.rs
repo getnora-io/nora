@@ -172,6 +172,14 @@ pub struct AuthConfig {
     /// OIDC providers for workload identity (CI/CD zero-secret auth)
     #[serde(default)]
     pub oidc: OidcConfig,
+    /// htpasswd usernames permitted to mint `admin`-role API tokens via the
+    /// public `POST /api/tokens` route. Empty (default) means no account can
+    /// self-mint an admin token there — set this to bootstrap admins. Read and
+    /// write tokens are unaffected (GHSA-78cx-cfhm-rgmx — block role
+    /// self-escalation).
+    /// ENV: NORA_AUTH_ADMIN_USERS=alice,ops
+    #[serde(default)]
+    pub admin_users: Vec<String>,
 }
 
 /// OIDC configuration — multiple providers for workload identity auth.
@@ -330,6 +338,7 @@ impl Default for AuthConfig {
             token_cache_ttl: 300,
             trusted_proxies: TrustedProxies::default_loopback(),
             oidc: OidcConfig::default(),
+            admin_users: Vec::new(),
         }
     }
 }
@@ -353,6 +362,13 @@ impl AuthConfig {
         }
         if let Ok(val) = env::var("NORA_AUTH_TRUSTED_PROXIES") {
             self.trusted_proxies = TrustedProxies::parse(&val);
+        }
+        if let Ok(val) = env::var("NORA_AUTH_ADMIN_USERS") {
+            self.admin_users = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Ok(val) = env::var("NORA_AUTH_OIDC_ENABLED") {
             self.oidc.enabled = val.to_lowercase() == "true" || val == "1";

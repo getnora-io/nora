@@ -18,9 +18,10 @@ use axum::{
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
-    Form, Router,
+    Extension, Form, Router,
 };
 
+use crate::auth::{AuthenticatedRole, AuthenticatedUser};
 use api::*;
 use i18n::Lang;
 use templates::*;
@@ -841,12 +842,17 @@ async fn ansible_browse(
 /// Token management page (GET /ui/tokens)
 async fn tokens_page(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_headers(&headers);
 
+    // Owner-scope: non-admins see only their own tokens; admins see all
+    // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
     let tokens = match &state.tokens {
-        Some(store) => store.list_all_tokens(),
+        Some(store) if role.0.can_admin() => store.list_all_tokens(),
+        Some(store) => store.list_tokens(&user.0),
         None => vec![],
     };
 
@@ -930,12 +936,17 @@ async fn tokens_create(
 /// List tokens HTMX fragment (GET /api/ui/tokens/list)
 async fn tokens_list(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang_from_headers(&headers);
 
+    // Owner-scope: non-admins see only their own tokens; admins see all
+    // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
     let tokens = match &state.tokens {
-        Some(store) => store.list_all_tokens(),
+        Some(store) if role.0.can_admin() => store.list_all_tokens(),
+        Some(store) => store.list_tokens(&user.0),
         None => vec![],
     };
 
@@ -946,6 +957,8 @@ async fn tokens_list(
 async fn tokens_revoke(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // CSRF check
@@ -973,10 +986,27 @@ async fn tokens_revoke(
         }
     };
 
+    // Owner-scope: non-admins may revoke only their own tokens. Return 404 (not
+    // 403) so a non-owner cannot probe which token IDs exist
+    // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
+    let is_admin = role.0.can_admin();
+    if !is_admin
+        && !store
+            .list_tokens(&user.0)
+            .iter()
+            .any(|t| t.file_id == file_id)
+    {
+        return (StatusCode::NOT_FOUND, Html("Token not found".to_string()));
+    }
+
     match store.revoke_token(&file_id) {
         Ok(()) => {
-            // Return refreshed token list
-            let tokens = store.list_all_tokens();
+            // Return refreshed token list (same owner-scope as the list view)
+            let tokens = if is_admin {
+                store.list_all_tokens()
+            } else {
+                store.list_tokens(&user.0)
+            };
             (
                 StatusCode::OK,
                 Html(render_token_list_fragment(&tokens, lang)),

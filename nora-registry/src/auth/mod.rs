@@ -22,6 +22,12 @@ pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
 #[derive(Clone, Debug)]
 pub struct AuthenticatedUser(pub String);
 
+/// The verified role carried in request extensions after successful auth.
+/// Basic-auth (htpasswd) identities have no role concept and are recorded as
+/// `Write` (never admin), so role-gated owner-scope treats them as non-admin.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedRole(pub crate::tokens::Role);
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -248,6 +254,9 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(AuthenticatedUser("anonymous".to_string()));
+        request
+            .extensions_mut()
+            .insert(AuthenticatedRole(crate::tokens::Role::Read));
         return next.run(request).await;
     }
 
@@ -310,6 +319,7 @@ pub async fn auth_middleware(
                         .extensions_mut()
                         .insert(NamespaceAuthority::Unrestricted);
                     request.extensions_mut().insert(AuthenticatedUser(user));
+                    request.extensions_mut().insert(AuthenticatedRole(role));
                     return next.run(request).await;
                 }
                 Err(_) => {
@@ -356,6 +366,9 @@ pub async fn auth_middleware(
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));
+                        request
+                            .extensions_mut()
+                            .insert(AuthenticatedRole(identity.role));
                         return next.run(request).await;
                     }
                     Err(_) => {
@@ -434,6 +447,7 @@ pub async fn auth_middleware(
             request
                 .extensions_mut()
                 .insert(AuthenticatedUser(token_user));
+            request.extensions_mut().insert(AuthenticatedRole(role));
             return next.run(request).await;
         }
         if let Some(ip) = client_ip {
@@ -458,6 +472,9 @@ pub async fn auth_middleware(
     request
         .extensions_mut()
         .insert(AuthenticatedUser(username.to_string()));
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRole(crate::tokens::Role::Write));
     next.run(request).await
 }
 

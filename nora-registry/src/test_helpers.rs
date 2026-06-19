@@ -165,6 +165,7 @@ fn build_context(
             token_cache_ttl: 300,
             trusted_proxies: crate::config::TrustedProxies::default_loopback(),
             oidc: crate::config::OidcConfig::default(),
+            admin_users: Vec::new(),
         },
         rate_limit: RateLimitConfig {
             enabled: false,
