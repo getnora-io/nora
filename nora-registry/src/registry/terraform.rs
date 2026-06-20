@@ -215,8 +215,10 @@ async fn provider_download_meta(
     let base_url = nora_base_url(&state);
     let artifact = format!("{}/{} v{} {}/{}", ns, ptype, ver, os, arch);
 
-    // Extract publish date from cached metadata
-    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver).await;
+    // Extract publish date from cached metadata. The download-metadata endpoint is
+    // not the artifact serve path (no quarantine here), so the /v2 lookup is not
+    // gated on cache state — `already_cached = false`.
+    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, &ver, false).await;
 
     // Curation check. #733 serve-local: an internal-namespace provider is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
@@ -344,9 +346,18 @@ async fn provider_download_binary(
     // Release date for the quarantine first-seen clock (#748/#750). The rewritten
     // binary path is {ns}/{ptype}/{ver}/{file}, so reuse the cached provider
     // metadata date (gated internally on trust_upstream_dates; None → NORA's clock).
+    // #754: skip the /v2 round-trip on a cache hit (the digest is already recorded).
+    let already_cached = state.storage.stat(&storage_key).await.is_some();
     let bin_coords: Vec<&str> = path.split('/').collect();
     let publish_date = if bin_coords.len() >= 3 {
-        extract_terraform_publish_date(&state, bin_coords[0], bin_coords[1], bin_coords[2]).await
+        extract_terraform_publish_date(
+            &state,
+            bin_coords[0],
+            bin_coords[1],
+            bin_coords[2],
+            already_cached,
+        )
+        .await
     } else {
         None
     };
@@ -801,8 +812,16 @@ async fn module_source_download(
 /// True when a configured Terraform proxy points at the official
 /// registry.terraform.io — the only upstream with a per-version date source (its
 /// `/v2` API). Gates the v2 query so internal namespaces are never sent there.
+/// True when a URL points at the official registry.terraform.io — the only Terraform
+/// upstream with a per-version date source (its `/v2` API). A private/self-hosted
+/// registry returns false, so its coordinates are never sent to the public host
+/// (#68/#733).
+fn url_is_official_terraform(u: &str) -> bool {
+    u.contains("registry.terraform.io")
+}
+
 fn terraform_upstream_is_official(state: &AppState) -> bool {
-    upstream_url(state).contains("registry.terraform.io")
+    url_is_official_terraform(&upstream_url(state))
 }
 
 /// Best-effort release date for a Terraform provider version via the
@@ -857,6 +876,7 @@ async fn extract_terraform_publish_date(
     ns: &str,
     ptype: &str,
     ver: &str,
+    already_cached: bool,
 ) -> Option<i64> {
     // Proxy mode: only the official registry has a per-version date, and only when
     // we're configured to trust upstream-provided dates (#513 — an attacker on a
@@ -872,7 +892,12 @@ async fn extract_terraform_publish_date(
         ) {
             return None;
         }
-        if state.config.server.trust_upstream_dates && terraform_upstream_is_official(state) {
+        // #754: only query /v2 on a cache MISS — on a cache hit the digest is already
+        // recorded (idempotent `record` ignores the date), so skip the round-trip.
+        if !already_cached
+            && state.config.server.trust_upstream_dates
+            && terraform_upstream_is_official(state)
+        {
             return fetch_terraform_registry_date(
                 &state.http_client,
                 ns,
@@ -1235,6 +1260,20 @@ fn is_safe_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_url_is_official_terraform() {
+        // official registry → true (the /v2 date source)
+        assert!(url_is_official_terraform("https://registry.terraform.io"));
+        assert!(url_is_official_terraform(
+            "https://registry.terraform.io/v2/providers"
+        ));
+        // private/self-hosted registries → false: coordinates must NEVER reach the
+        // public registry.terraform.io/v2 (#68/#733)
+        assert!(!url_is_official_terraform("https://tf.internal.corp"));
+        assert!(!url_is_official_terraform("https://app.terraform.io")); // TFC, not the public registry host
+        assert!(!url_is_official_terraform(""));
+    }
 
     #[test]
     fn test_valid_names() {

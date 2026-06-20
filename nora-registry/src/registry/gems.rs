@@ -405,9 +405,13 @@ async fn download_gem(
     // Release date for the digest-quarantine first-seen clock (#748/#750). The
     // compact index carries no dates, so fetch the per-version created_at from the
     // RubyGems API when upstream dates are trusted. Hosted-only uses mtime.
+    //
+    // #754: only fetch on a cache MISS — on a cache hit the digest is already recorded
+    // (quarantine `record` is idempotent), so a cheap local stat skips the round-trip.
+    let already_cached = state.storage.stat(&storage_key).await.is_some();
     let publish_date = if state.config.gems.proxy.is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
-    } else if state.config.server.trust_upstream_dates {
+    } else if !already_cached && state.config.server.trust_upstream_dates {
         match state.config.gems.proxy.as_deref() {
             Some(proxy) => {
                 fetch_gems_date(
@@ -596,24 +600,28 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
     let storage_key = format!("gems/quick/Marshal.4.8/{}.gemspec.rz", artifact);
 
     // Mirror the .gem's release date so the gemspec matures together (#748/#750).
-    let publish_date =
-        if state.config.gems.proxy.is_some() && state.config.server.trust_upstream_dates {
-            match state.config.gems.proxy.as_deref() {
-                Some(proxy) => {
-                    fetch_gems_date(
-                        &state.http_client,
-                        proxy,
-                        &name,
-                        &version,
-                        state.config.gems.proxy_timeout,
-                    )
-                    .await
-                }
-                None => None,
+    // #754: only fetch on a cache MISS (idempotent record → date ignored on a hit).
+    let already_cached = state.storage.stat(&storage_key).await.is_some();
+    let publish_date = if !already_cached
+        && state.config.gems.proxy.is_some()
+        && state.config.server.trust_upstream_dates
+    {
+        match state.config.gems.proxy.as_deref() {
+            Some(proxy) => {
+                fetch_gems_date(
+                    &state.http_client,
+                    proxy,
+                    &name,
+                    &version,
+                    state.config.gems.proxy_timeout,
+                )
+                .await
             }
-        } else {
-            None
-        };
+            None => None,
+        }
+    } else {
+        None
+    };
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
     if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
