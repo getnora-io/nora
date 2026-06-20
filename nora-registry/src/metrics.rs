@@ -45,6 +45,19 @@ pub static CURATION_DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create CURATION_DECISIONS_TOTAL metric at startup")
 });
 
+/// Proxy artifacts held by the digest quarantine, by registry and outcome
+/// (`blocked` = enforce returned 403; `observed` = observe served but recorded).
+/// Gives the operator an alertable/graphable signal — the quarantine was
+/// previously visible only in WARN logs.
+pub static QUARANTINE_HOLDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_quarantine_holds_total",
+        "Proxy artifacts held by the digest quarantine, by registry and outcome",
+        &["registry", "outcome"]
+    )
+    .expect("failed to create QUARANTINE_HOLDS_TOTAL metric at startup")
+});
+
 /// Conditional revalidations where upstream answered 304 Not Modified — the
 /// cached body was reused and no body bytes were downloaded (#596).
 pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
