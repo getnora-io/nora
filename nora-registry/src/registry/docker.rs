@@ -703,9 +703,14 @@ fn quarantine_forbidden(
     let body = json!({
         "errors": [{
             "code": "DENIED",
-            "message": "digest is in quarantine",
+            "message": "held by quarantine policy on registry 'docker': digest must age past the quarantine window",
             "detail": {
+                "registry": "docker",
                 "digest": digest,
+                "policy": {
+                    "control": "quarantine",
+                    "quarantine_ttl_secs": quarantine_secs,
+                },
                 "quarantine_until": quarantine_until,
             }
         }]
@@ -741,10 +746,19 @@ fn quarantine_cache_serve_gate(state: &AppState, digest: &str) -> Option<Respons
     }
     let status = state.digest_store.check("docker", digest, q_secs);
     if let crate::digest_quarantine::QuarantineStatus::Pending { .. } = status {
+        let outcome = if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+            "blocked"
+        } else {
+            "observed"
+        };
+        crate::metrics::QUARANTINE_HOLDS_TOTAL
+            .with_label_values(&["docker", outcome])
+            .inc();
         tracing::warn!(
             digest = %digest,
             status = %status.header_value(),
             mode = ?q_mode,
+            quarantine_ttl_secs = q_secs,
             "Quarantine: held cached artifact (proxy cooldown)"
         );
         if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
@@ -772,11 +786,20 @@ fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -
     state.digest_store.record("docker", digest, upstream, None);
     let status = state.digest_store.check("docker", digest, q_secs);
     if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature) {
+        let outcome = if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
+            "blocked"
+        } else {
+            "observed"
+        };
+        crate::metrics::QUARANTINE_HOLDS_TOTAL
+            .with_label_values(&["docker", outcome])
+            .inc();
         tracing::warn!(
             digest = %digest,
             upstream = %upstream,
             status = %status.header_value(),
             mode = ?q_mode,
+            quarantine_ttl_secs = q_secs,
             "Quarantine: proxy-fetched blob held (new to this mirror)"
         );
         if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
@@ -1829,11 +1852,23 @@ async fn try_fetch_and_cache(
                     match &q_status {
                         crate::digest_quarantine::QuarantineStatus::Mature => {}
                         _ => {
+                            let outcome = if matches!(
+                                q_mode,
+                                crate::digest_quarantine::QuarantineMode::Enforce
+                            ) {
+                                "blocked"
+                            } else {
+                                "observed"
+                            };
+                            crate::metrics::QUARANTINE_HOLDS_TOTAL
+                                .with_label_values(&["docker", outcome])
+                                .inc();
                             tracing::warn!(
                                 digest = %digest,
                                 upstream = %upstream.url,
                                 status = %q_status.header_value(),
                                 mode = ?q_mode,
+                                quarantine_ttl_secs = q_secs,
                                 "Quarantine: proxy-fetched manifest"
                             );
                         }

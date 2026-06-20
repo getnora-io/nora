@@ -115,6 +115,62 @@ fn is_mutable_maven_path(path: &str) -> bool {
     matches!(classify_path(path), MavenPathKind::VersionFile(c) if is_snapshot(&c.version))
 }
 
+/// True when a URL points at Maven Central (one of its canonical hosts) — the only
+/// Maven upstream with a per-artifact date source (its search API). A private mirror
+/// (Nexus/Artifactory) returns false, so its coordinates are never sent to the public
+/// search.maven.org (#68/#733).
+fn url_is_maven_central(u: &str) -> bool {
+    u.contains("repo1.maven.org")
+        || u.contains("repo.maven.apache.org")
+        || u.contains("search.maven.org")
+        || u.contains("central.sonatype")
+}
+
+/// True when a configured Maven proxy points at Maven Central. Gates the search
+/// query so internal coordinates are never sent to search.maven.org.
+fn maven_upstream_is_central(state: &AppState) -> bool {
+    state
+        .config
+        .maven
+        .proxies
+        .iter()
+        .any(|p| url_is_maven_central(p.url()))
+}
+
+/// Best-effort upload timestamp for a Maven Central GAV via the Central search
+/// API. Maven's repo protocol exposes no per-artifact date, so this is the only
+/// source; any failure → `None` (the quarantine falls back to NORA's own clock).
+async fn fetch_maven_central_date(
+    client: &reqwest::Client,
+    group: &str,
+    artifact: &str,
+    version: &str,
+    timeout_secs: u64,
+) -> Option<i64> {
+    let url = format!(
+        "https://search.maven.org/solrsearch/select?q=g:%22{}%22+AND+a:%22{}%22+AND+v:%22{}%22&core=gav&rows=1&wt=json",
+        group, artifact, version
+    );
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let ts_ms = json
+        .get("response")?
+        .get("docs")?
+        .as_array()?
+        .first()?
+        .get("timestamp")?
+        .as_i64()?;
+    Some(ts_ms / 1000)
+}
+
 // ============================================================================
 // Download
 // ============================================================================
@@ -162,15 +218,49 @@ async fn download(
         })
         .unwrap_or(false);
 
-    // Curation check — only for versioned artifact files, not metadata
-    if let Some((ref maven_name, ref maven_version)) = curation_coords {
-        // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
-        let publish_date = if state.config.maven.proxies.is_empty() {
-            crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+    // Release date for the digest-quarantine first-seen clock (#748/#750), hoisted
+    // to function scope so the serve gate below can use it. Maven's repo layout
+    // exposes no per-artifact upload date, so for a Maven Central upstream we query
+    // the Central search API (gated to a Central proxy to avoid leaking coordinates);
+    // other proxies have no date (None → NORA's own clock). Hosted-only uses mtime.
+    //
+    // #754: the Central query only happens on a cache MISS. On a cache hit the digest
+    // is already recorded (quarantine `record` is idempotent → the date is ignored),
+    // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
+    let already_cached = state.storage.stat(&key).await.is_some();
+    let publish_date: Option<i64> =
+        if let Some((ref maven_name, ref maven_version)) = curation_coords {
+            if state.config.maven.proxies.is_empty() {
+                crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await
+            } else if !already_cached
+                && !internal
+                && state.config.server.trust_upstream_dates
+                && maven_upstream_is_central(&state)
+            {
+                // #68/#733: never send an internal-namespace GAV to the hardcoded public
+                // search.maven.org — that would leak operator-internal coordinates.
+                match maven_name.split_once(':') {
+                    Some((group, artifact)) => {
+                        fetch_maven_central_date(
+                            &state.http_client,
+                            group,
+                            artifact,
+                            maven_version,
+                            state.config.maven.proxy_timeout,
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
 
+    // Curation check — only for versioned artifact files, not metadata
+    if let Some((ref maven_name, ref maven_version)) = curation_coords {
         if !internal {
             if let Some(response) = crate::curation::check_download(
                 &state.curation().curation_engine,
@@ -250,13 +340,14 @@ async fn download(
                         .as_deref()
                         .or(state.config.curation.quarantine_ttl.as_deref()),
                 );
-                if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "maven",
                     data,
                     &q_mode,
                     q_secs,
                     "cache",
+                    publish_date,
                 ) {
                     return resp;
                 }
@@ -359,13 +450,14 @@ async fn download(
                             .as_deref()
                             .or(state.config.curation.quarantine_ttl.as_deref()),
                     );
-                    if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                         &state.digest_store,
                         "maven",
                         &data,
                         &q_mode,
                         q_secs,
                         &url,
+                        publish_date,
                     ) {
                         return resp;
                     }
@@ -402,13 +494,14 @@ async fn download(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "maven",
                 data,
                 &q_mode,
                 q_secs,
                 "cache-stale",
+                publish_date,
             ) {
                 return resp;
             }
@@ -794,6 +887,22 @@ fn with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_url_is_maven_central() {
+        // canonical Central hosts → true (date source available)
+        assert!(url_is_maven_central("https://repo1.maven.org/maven2"));
+        assert!(url_is_maven_central("https://repo.maven.apache.org/maven2"));
+        assert!(url_is_maven_central("https://search.maven.org"));
+        assert!(url_is_maven_central("https://central.sonatype.com"));
+        // private mirrors → false: their coordinates must NEVER reach search.maven.org (#68/#733)
+        assert!(!url_is_maven_central(
+            "https://nexus.internal.corp/repository/maven"
+        ));
+        assert!(!url_is_maven_central("https://artifactory.acme.io/maven"));
+        assert!(!url_is_maven_central("https://maven.pkg.github.com/acme"));
+        assert!(!url_is_maven_central(""));
+    }
 
     #[test]
     fn test_content_type_pom() {

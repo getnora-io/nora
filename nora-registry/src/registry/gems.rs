@@ -347,6 +347,38 @@ async fn compact_index(
     }
 }
 
+/// Best-effort per-version `created_at` from the RubyGems API (the compact index
+/// has no dates). Any failure → `None` (quarantine falls back to NORA's clock).
+async fn fetch_gems_date(
+    client: &reqwest::Client,
+    proxy: &str,
+    name: &str,
+    version: &str,
+    timeout_secs: u64,
+) -> Option<i64> {
+    let url = format!(
+        "{}/api/v1/versions/{}.json",
+        proxy.trim_end_matches('/'),
+        name
+    );
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: Vec<serde_json::Value> = resp.json().await.ok()?;
+    let date_str = arr
+        .iter()
+        .find(|v| v.get("number").and_then(|n| n.as_str()) == Some(version))?
+        .get("created_at")?
+        .as_str()?;
+    crate::curation::parse_iso8601_to_unix(date_str)
+}
+
 // ── Gem download (immutable) ───────────────────────────────────────────
 
 async fn download_gem(
@@ -370,9 +402,29 @@ async fn download_gem(
     let artifact = format!("{}-{}", name, version);
     let storage_key = format!("gems/gems/{}.gem", artifact);
 
-    // mtime fallback for hosted-only mode (proxy mtime = cache time, not publish time)
+    // Release date for the digest-quarantine first-seen clock (#748/#750). The
+    // compact index carries no dates, so fetch the per-version created_at from the
+    // RubyGems API when upstream dates are trusted. Hosted-only uses mtime.
+    //
+    // #754: only fetch on a cache MISS — on a cache hit the digest is already recorded
+    // (quarantine `record` is idempotent), so a cheap local stat skips the round-trip.
+    let already_cached = state.storage.stat(&storage_key).await.is_some();
     let publish_date = if state.config.gems.proxy.is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
+    } else if !already_cached && state.config.server.trust_upstream_dates {
+        match state.config.gems.proxy.as_deref() {
+            Some(proxy) => {
+                fetch_gems_date(
+                    &state.http_client,
+                    proxy,
+                    &name,
+                    &version,
+                    state.config.gems.proxy_timeout,
+                )
+                .await
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -439,13 +491,14 @@ async fn download_gem(
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "gems",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -505,13 +558,14 @@ async fn download_gem(
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "gems",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }
@@ -545,6 +599,30 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
     let artifact = format!("{}-{}", name, version);
     let storage_key = format!("gems/quick/Marshal.4.8/{}.gemspec.rz", artifact);
 
+    // Mirror the .gem's release date so the gemspec matures together (#748/#750).
+    // #754: only fetch on a cache MISS (idempotent record → date ignored on a hit).
+    let already_cached = state.storage.stat(&storage_key).await.is_some();
+    let publish_date = if !already_cached
+        && state.config.gems.proxy.is_some()
+        && state.config.server.trust_upstream_dates
+    {
+        match state.config.gems.proxy.as_deref() {
+            Some(proxy) => {
+                fetch_gems_date(
+                    &state.http_client,
+                    proxy,
+                    &name,
+                    &version,
+                    state.config.gems.proxy_timeout,
+                )
+                .await
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Immutable cache. get_verified discharges the integrity witness at serve.
     if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
         use nora_registry::verified::{verified_body, GateOutcome};
@@ -574,13 +652,14 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
                 .as_deref()
                 .or(state.config.curation.quarantine_ttl.as_deref()),
         );
-        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+        if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "gems",
             &data,
             &q_mode,
             q_secs,
             "cache",
+            publish_date,
         ) {
             return resp;
         }
@@ -642,13 +721,14 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
                     .as_deref()
                     .or(state.config.curation.quarantine_ttl.as_deref()),
             );
-            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "gems",
                 &bytes,
                 &q_mode,
                 q_secs,
                 &url,
+                publish_date,
             ) {
                 return resp;
             }

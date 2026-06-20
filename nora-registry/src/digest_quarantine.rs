@@ -362,22 +362,48 @@ pub fn proxy_gate_dated(
     if matches!(status, QuarantineStatus::Mature) {
         return None;
     }
+    // Operator-facing signal: previously a held artifact was visible only in this
+    // WARN line. The metric lets the operator alert/graph on it, and the log + the
+    // 403 now name the responsible policy (registry + quarantine_ttl + remaining).
+    let outcome = if matches!(mode, QuarantineMode::Enforce) {
+        "blocked"
+    } else {
+        "observed"
+    };
+    crate::metrics::QUARANTINE_HOLDS_TOTAL
+        .with_label_values(&[registry, outcome])
+        .inc();
     warn!(
         registry = %registry,
         digest = %digest,
         status = %status.header_value(),
         mode = %mode,
-        "quarantine: proxy artifact held (new to this mirror)"
+        quarantine_ttl_secs = quarantine_secs,
+        "quarantine: proxy artifact held by registry policy"
     );
     if matches!(mode, QuarantineMode::Enforce) {
-        Some(quarantine_forbidden(&digest, &status, quarantine_secs))
+        Some(quarantine_forbidden(
+            registry,
+            &digest,
+            &status,
+            quarantine_secs,
+        ))
     } else {
         None
     }
 }
 
 /// Build a generic 403 for a quarantined proxy artifact (non-Docker shape).
-fn quarantine_forbidden(digest: &str, status: &QuarantineStatus, quarantine_secs: i64) -> Response {
+///
+/// Names the responsible policy (`registry` + `quarantine_ttl_secs` + how much
+/// longer the hold lasts) so the client — and an operator reading the body — can
+/// tell WHY it was held, not just that it was.
+fn quarantine_forbidden(
+    registry: &str,
+    digest: &str,
+    status: &QuarantineStatus,
+    quarantine_secs: i64,
+) -> Response {
     let remaining = match status {
         QuarantineStatus::New => quarantine_secs,
         QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
@@ -386,9 +412,17 @@ fn quarantine_forbidden(digest: &str, status: &QuarantineStatus, quarantine_secs
     let quarantine_until = Utc::now().timestamp() + remaining;
     let body = serde_json::json!({
         "error": "quarantine",
-        "message": "artifact held: new to this mirror",
+        "message": format!(
+            "held by quarantine policy on registry '{}': artifact must age past the quarantine window before it is served",
+            registry
+        ),
         "detail": {
+            "registry": registry,
             "digest": digest,
+            "policy": {
+                "control": "quarantine",
+                "quarantine_ttl_secs": quarantine_secs,
+            },
             "quarantine_until": quarantine_until,
             "remaining_secs": remaining,
         }
