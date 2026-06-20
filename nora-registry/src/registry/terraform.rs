@@ -860,8 +860,18 @@ async fn extract_terraform_publish_date(
 ) -> Option<i64> {
     // Proxy mode: only the official registry has a per-version date, and only when
     // we're configured to trust upstream-provided dates (#513 — an attacker on a
-    // custom mirror could spoof it; we never query v2 for internal namespaces).
+    // custom mirror could spoof it).
     if state.config.terraform.proxy.is_some() {
+        // #68/#733 dependency-confusion: an internal-namespace provider's coordinates
+        // must never be sent to the hardcoded public registry.terraform.io/v2 — that
+        // would leak them upstream. Block the date query for internal namespaces.
+        if crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}", ns, ptype),
+        ) {
+            return None;
+        }
         if state.config.server.trust_upstream_dates && terraform_upstream_is_official(state) {
             return fetch_terraform_registry_date(
                 &state.http_client,
