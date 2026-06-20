@@ -113,7 +113,7 @@ NORA is a multi-protocol artifact registry written in Rust. It serves Docker ima
 - 13 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), Cargo sparse index (RFC 2789), Go module proxy, Raw files, RubyGems, Terraform, Ansible Galaxy (v3), NuGet (v3), Pub (Dart/Flutter), Conan (v2 revisions)
 - Helm OCI charts via the Docker/OCI endpoint — `helm push`/`pull` work out of the box
 - Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI, rubygems.org, registry.terraform.io, galaxy.ansible.com, api.nuget.org, pub.dev, ConanCenter
-- Curation layer: blocklist, allowlist, namespace isolation, integrity verification (SHA256/SHA512). Modes: off, audit, enforce. CLI: `nora curation validate`, `nora curation explain`
+- Curation layer: blocklist, allowlist, namespace isolation, integrity verification (SHA256), digest quarantine. Modes: off, audit, enforce. CLI: `nora curation validate`, `nora curation explain`
 - Dynamic registry loading: enable/disable registries via config or env vars (`NORA_*_ENABLED`)
 - S3 storage backend (AWS S3, Ceph RGW, any S3-compatible) with migration CLI
 - Web UI with dashboard, search, browse, i18n (English and Russian)
