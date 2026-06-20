@@ -344,6 +344,9 @@ jobs:
       contents: read
 
     strategy:
+      # One package format failing (e.g. a flaky tool download) must not cancel
+      # the other three — each row is independent.
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -379,9 +382,25 @@ jobs:
 
       - name: Install nfpm
         run: |
+          set -o pipefail
           NFPM_VERSION=2.46.3
+          # Prefer a matching nfpm already on the runner (persistent self-hosted
+          # box) — avoids a per-release fetch from the GitHub release CDN, which
+          # has no SLA and has hung mid-stream on transient network blips.
+          if command -v nfpm >/dev/null 2>&1 && nfpm --version 2>/dev/null | grep -q "$NFPM_VERSION"; then
+            echo "using pre-installed nfpm at $(command -v nfpm)"
+            nfpm --version
+            exit 0
+          fi
+          # Fallback: fetch the pinned release, hardened against transient CDN
+          # failures (retries on connection/HTTP errors, bounded timeouts,
+          # pipefail so a truncated download fails the step instead of feeding
+          # tar an empty stream).
           mkdir -p "$RUNNER_TEMP/bin"
-          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | tar xz -C "$RUNNER_TEMP/bin" nfpm
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 120 \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/bin" nfpm
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/nfpm" --version
 
