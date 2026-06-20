@@ -12,10 +12,12 @@ env:
 
 jobs:
   build:
-    name: Build & Push
+    name: Build & Push (amd64 + binaries)
     runs-on: [self-hosted, nora]
     outputs:
       hash: ${{ steps.hash.outputs.hash }}
+      version: ${{ steps.sha.outputs.version }}
+      short: ${{ steps.sha.outputs.short }}
     permissions:
       contents: read
       packages: write
@@ -46,11 +48,9 @@ jobs:
             exit 1
           fi
 
-      - name: Set up QEMU for multi-platform builds
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
-        with:
-          platforms: arm64
-
+      # No QEMU: the arm64 binary is cross-compiled (rust on amd64), and the arm64
+      # image is built natively on ubuntu-24.04-arm (see build-image-arm64). Emulated
+      # arm64 apk on the self-hosted runner crashes ("Illegal instruction") — #ci.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
         with:
@@ -102,31 +102,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ── Alpine (default target — last stage in Dockerfile) ─────────────────
-      - name: Extract metadata (alpine)
-        id: meta-alpine
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/getnora/nora
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
-            type=raw,value=latest
-
-      - name: Build and push (alpine)
+      # ── Alpine amd64 — pushed BY DIGEST (no tag); the manifest list is assembled
+      #    in merge-image from the amd64 + arm64 (native runner) digests. ───────────
+      - name: Build and push alpine (amd64, by digest)
+        id: build-amd64
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: deploy/Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta-alpine.outputs.tags }}
-          labels: ${{ steps.meta-alpine.outputs.labels }}
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
-      # ── RED OS ───────────────────────────────────────────────────────────────
+      - name: Export amd64 digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build-amd64.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload amd64 digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-amd64-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+      # ── RED OS (amd64 only) ───────────────────────────────────────────────────
       - name: Extract metadata (redos)
         id: meta-redos
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -151,7 +151,7 @@ jobs:
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
 
-      # ── Astra Linux SE ───────────────────────────────────────────────────────
+      # ── Astra Linux SE (amd64 only) ───────────────────────────────────────────
       - name: Extract metadata (astra)
         id: meta-astra
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -176,7 +176,130 @@ jobs:
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
 
-      # ── Sign & Smoke test ───────────────────────────────────────────────────
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          docker system prune -af --volumes || true
+          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
+
+  # ── Alpine arm64 — built NATIVELY on a GitHub-hosted arm64 runner (no QEMU). ───
+  build-image-arm64:
+    name: Build alpine image (arm64, native)
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push alpine (arm64, by digest)
+        id: build-arm64
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export arm64 digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build-arm64.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload arm64 digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-arm64-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+  # ── Assemble the multi-arch manifest list (amd64 + arm64) for both registries. ─
+  merge-image:
+    name: Merge alpine manifest + sign + smoke
+    runs-on: [self-hosted, nora]
+    needs: [build, build-image-arm64]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # cosign keyless
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        with:
+          driver-opts: network=host
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # GHCR-only tags (the arch images were pushed by-digest to GHCR). Docker Hub
+      # tags are produced by copying the assembled multi-arch GHCR manifest below.
+      - name: Extract metadata (alpine, GHCR)
+        id: meta-alpine
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.build.outputs.version }}-${{ needs.build.outputs.short }}
+            type=raw,value=latest
+
+      - name: Create multi-arch manifest in GHCR, then copy to Docker Hub
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # 1) assemble the amd64+arm64 by-digest images into one manifest list per GHCR tag
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # 2) copy each multi-arch GHCR tag to the matching Docker Hub tag
+          for t in $(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            dh="docker.io/getnora/nora:${t##*:}"
+            echo "copy $t -> $dh"
+            docker buildx imagetools create -t "$dh" "$t"
+          done
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}"
+          docker buildx imagetools inspect "docker.io/getnora/nora:${{ needs.build.outputs.version }}"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
 
@@ -191,7 +314,7 @@ jobs:
       - name: Smoke test — verify alpine image starts and responds
         run: |
           docker rm -f nora-smoke 2>/dev/null || true
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 -e NORA_PUBLIC_URL=http://localhost:5555 ghcr.io/${{ github.repository }}:${{ steps.meta-alpine.outputs.version }}
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 -e NORA_PUBLIC_URL=http://localhost:5555 ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
           for i in $(seq 1 10); do
             curl -sf http://localhost:5555/health && break || sleep 2
           done
@@ -202,7 +325,6 @@ jobs:
         if: always()
         run: |
           docker system prune -af --volumes || true
-          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
 
   package:
     name: Package (${{ matrix.format }}-${{ matrix.arch }})
@@ -272,7 +394,7 @@ jobs:
   scan:
     name: Scan (${{ matrix.name }})
     runs-on: [self-hosted, nora]
-    needs: build
+    needs: merge-image
     permissions:
       contents: read
       packages: read
@@ -326,7 +448,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: [self-hosted, nora]
-    needs: [build, package, provenance]
+    needs: [build, package, provenance, merge-image]
     permissions:
       contents: write
       id-token: write  # Sigstore cosign keyless signing
