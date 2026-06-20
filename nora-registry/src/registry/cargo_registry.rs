@@ -300,6 +300,53 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
     }
 }
 
+/// Self-prime `cargo/{name}/metadata.json` so the release-age date (#748) is
+/// available on the download path itself.
+///
+/// `cargo build` uses the sparse index (`/cargo/index/...`) and then the download
+/// endpoint; it never calls `/api/v1/crates/{name}`, which is the only writer of
+/// `metadata.json` (the carrier of per-version `created_at`). Without this, the
+/// quarantine on a proxied crate always falls back to NORA's own clock and the
+/// release-age maturation never fires. Synchronous `put` (not `spawn_cache`) so the
+/// date is readable on the same request. Best-effort: any failure leaves the date
+/// `None` (fail-safe — the crate is held as new). Namespace-safe: an internal crate
+/// is never fetched upstream (#68). Mirrors PyPI's `ensure_pypi_dates_cached`.
+async fn ensure_cargo_metadata_cached(state: &AppState, crate_name: &str) {
+    let key = format!("cargo/{}/metadata.json", crate_name);
+    if state.storage.get(&key).await.is_ok() {
+        return;
+    }
+    // #68: never fetch an internal-namespace crate's metadata upstream.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Cargo,
+        crate_name,
+    ) {
+        return;
+    }
+    let proxy_url = match &state.config.cargo.proxy {
+        Some(url) => url.clone(),
+        None => return,
+    };
+    let url = format!(
+        "{}/api/v1/crates/{}",
+        proxy_url.trim_end_matches('/'),
+        crate_name
+    );
+    if let Ok(data) = proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.cargo.proxy_timeout),
+        expose_opt(&state.config.cargo.proxy_auth),
+        &state.circuit_breaker,
+        RegistryType::Cargo,
+    )
+    .await
+    {
+        let _ = state.storage.put(&key, &data).await;
+    }
+}
+
 /// GET /cargo/api/v1/crates/{name}/{version}/download — download .crate file.
 async fn download(
     State(state): State<AppState>,
@@ -314,6 +361,16 @@ async fn download(
     // Extract publish date from cached Cargo metadata
     let publish_date = {
         let meta_key = format!("cargo/{}/metadata.json", crate_name);
+        // #748: a `cargo build` resolves via the sparse index and reaches this
+        // download endpoint WITHOUT ever calling /api/v1/crates/{name} (the only
+        // writer of metadata.json), so the per-version `created_at` would never be
+        // cached and the quarantine would fall back to NORA's own clock. Self-prime
+        // the metadata here (synchronously, so the date is readable on this same
+        // request) — gated on trust, namespace-safe, best-effort. Mirrors PyPI's
+        // ensure_pypi_dates_cached.
+        if state.config.server.trust_upstream_dates {
+            ensure_cargo_metadata_cached(&state, &crate_name).await;
+        }
         extract_cargo_publish_date(
             &state.storage,
             &meta_key,
