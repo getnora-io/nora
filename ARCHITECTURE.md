@@ -4,7 +4,7 @@ This document describes the high-level architecture of NORA, a multi-protocol
 artifact registry. It is intended for contributors who want to understand the
 codebase and for operators evaluating NORA for production use.
 
-NORA is a single Rust binary (~34k lines) that implements up to 13
+NORA is a single Rust binary (~42k lines of production code) that implements up to 13
 registry protocols over one HTTP port. It is a registry — it provides
 protocol-compliant interfaces for package managers (docker, npm, cargo,
 pip, etc.), not a storage system. There is no database, no JVM, no
@@ -55,7 +55,7 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
    │   Docker    │           │     Maven     │   ...    │    Conan      │
-   │  /v2/*      │           │  /maven/*     │  (x13)   │   /conan/*    │
+   │  /v2/*      │           │  /maven2/*    │  (x13)   │   /conan/*    │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -73,16 +73,31 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
 ```
 
 Every HTTP request follows this path top-to-bottom. The registry handler is
-selected by URL prefix (`/v2/` = Docker, `/maven/` = Maven, etc.). Curation
+selected by URL prefix (`/v2/` = Docker, `/maven2/` = Maven, etc.). Curation
 runs only on proxy downloads — hosted artifacts are trusted at publish time.
 
 ### Trust Boundaries
 
 User input enters the system at the registry handler layer. Each handler
 validates package names, versions, and paths before constructing storage keys.
-The `validation.rs` module provides `validate_storage_key()` which rejects
-path traversal, null bytes, and excessively long keys. All 13 handlers call
-this function before any storage operation.
+The `validation.rs` module provides `validate_storage_key()`, which rejects
+path traversal, null bytes, and excessively long keys.
+
+The storage-key trust boundary is enforced centrally, not per handler. The
+`Storage` wrapper in `storage/mod.rs` calls `validate_storage_key()` as the
+first act of every method that takes a key — `put`, `get`, `delete`, `stat`,
+`list`, `get_verified`, and the range/reader variants. A handler cannot reach
+the underlying `StorageBackend` without passing through this choke point, so
+the invariant holds even if a new handler forgets to validate. A few handlers
+(`raw`, `cargo_registry`, `pub_dart`) also validate at the edge as
+defence-in-depth, but the load-bearing check lives in the wrapper.
+
+Integrity verification is a typed gate on the read path. `Storage::get_verified`
+returns a `GateOutcome` (`verified.rs`): `Verified` when a recorded hash pin
+matched the bytes, or `Unpinned` for an open-world key with no pin. Callers must
+`match` on the outcome — the open-world case cannot be silently mistaken for a
+verified one. A pin mismatch returns `IntegrityViolation` rather than the bytes,
+so the gate fails closed.
 
 The curation layer is a second trust boundary for proxy traffic. When mode is
 `enforce`, a package must pass all filters (blocklist, allowlist, namespace,
@@ -92,17 +107,32 @@ engine errors, the request is blocked (fail-closed).
 
 ## Code Map
 
+The tree below tracks the module declarations in `main.rs` (the binary) and
+`lib.rs` (the library surface used by tests and fuzz targets).
+
 ```
 nora/
 ├── nora-registry/src/
-│   ├── main.rs              # CLI (clap), server startup, route assembly
-│   ├── config.rs            # All configuration: structs, defaults, env overrides
+│   ├── main.rs              # CLI (clap), server startup, route + middleware assembly
+│   ├── lib.rs              # Library surface: re-exports validation + verified for tests/fuzz
 │   ├── registry_type.rs     # RegistryType enum shared across all modules
+│   │
+│   ├── config/             # Configuration (split by concern, not one file)
+│   │   ├── mod.rs           #   Top-level Config, defaults, env-override wiring
+│   │   ├── server.rs        #   Server + TLS settings
+│   │   ├── storage.rs       #   Storage backend selection (local/s3)
+│   │   ├── auth.rs          #   Auth, OIDC, trusted-proxy settings
+│   │   ├── registries.rs    #   Declarative [registries] selection
+│   │   ├── curation.rs      #   Curation mode + rule paths
+│   │   ├── rate_limit.rs    #   Rate-limit tiers
+│   │   ├── circuit_breaker.rs # Circuit-breaker thresholds
+│   │   ├── gc.rs / retention.rs / audit_cfg.rs # GC, retention, audit config
+│   │   └── registry/        #   Per-format config structs (docker.rs, maven.rs, ...)
 │   │
 │   ├── registry/            # One file per format — routes + handlers
 │   │   ├── docker.rs        #   Docker Registry v2 (OCI distribution spec)
 │   │   ├── docker_auth.rs   #   Docker token auth (Bearer challenges)
-│   │   ├── maven.rs         #   Maven repository (POM/JAR)
+│   │   ├── maven.rs         #   Maven repository (POM/JAR), mounted at /maven2/
 │   │   ├── npm.rs           #   npm registry (packument + tarball)
 │   │   ├── cargo_registry.rs #  Cargo sparse index (RFC 2789)
 │   │   ├── pypi.rs          #   PyPI (PEP 503/691)
@@ -117,15 +147,28 @@ nora/
 │   │   └── mod.rs           #   Re-exports: docker_routes(), maven_routes(), ...
 │   │
 │   ├── storage/
-│   │   ├── mod.rs           #   StorageBackend trait (put/get/delete/list/stat)
+│   │   ├── mod.rs           #   StorageBackend trait + Storage wrapper (validate + pin gate)
 │   │   ├── local.rs         #   Local filesystem implementation
 │   │   └── s3.rs            #   S3-compatible implementation
 │   │
-│   ├── auth.rs              # htpasswd parsing, token issuance, middleware
+│   ├── auth/               # Authentication (middleware + providers)
+│   │   ├── mod.rs           #   auth_middleware, provider dispatch
+│   │   ├── htpasswd.rs      #   htpasswd parsing
+│   │   ├── oidc.rs          #   OIDC workload-identity provider
+│   │   ├── namespace.rs     #   OIDC namespace_scope authorization
+│   │   └── token_routes.rs  #   Token management API routes
 │   ├── tokens.rs            # API token CRUD (tokens.json persistence)
 │   ├── rate_limit.rs        # Token-bucket rate limiting (tower middleware)
 │   ├── curation.rs          # Filter chain: blocklist, allowlist, namespace, integrity
-│   ├── validation.rs        # Input validation: storage keys, package names
+│   ├── validation.rs        # Input validation: storage keys, package names, null bytes
+│   │
+│   ├── verified.rs          # Compile-time integrity witnesses (GateOutcome typestate)
+│   ├── hash_pin_store.rs    # SHA-256 pins recorded on put(), verified on get()
+│   ├── digest_quarantine.rs # First-seen tracking for proxy-fetched digests
+│   ├── circuit_breaker.rs   # Per-registry circuit breaker for upstream proxy calls
+│   ├── proxy_coalesce.rs    # Single-flight coalescing on the proxy cache-miss path
+│   ├── cache_ttl.rs         # Unified cache TTL logic for proxy registries
+│   ├── docker_key_migration.rs # Migrate legacy flat Docker keys to namespaced form
 │   │
 │   ├── gc.rs                # Garbage collection (orphan blob cleanup)
 │   ├── retention.rs         # Retention policies (keep-N, max-age)
@@ -134,19 +177,21 @@ nora/
 │   ├── mirror/              # Pre-fetch CLI (nora mirror npm/docker)
 │   │
 │   ├── health.rs            # /health endpoint (per-registry health)
-│   ├── metrics.rs           # /metrics endpoint (Prometheus format)
+│   ├── metrics.rs           # /metrics endpoint (Prometheus format) + leak detection
 │   ├── audit.rs             # Audit log (append-only JSONL)
 │   ├── activity_log.rs      # Recent activity (in-memory ring buffer)
 │   ├── dashboard_metrics.rs # Aggregated stats for UI dashboard
+│   ├── admin.rs             # Admin control-plane API (/api/v1/admin/, admin-gated)
 │   │
 │   ├── ui/                  # Embedded web UI (server-rendered HTML)
-│   │   ├── mod.rs           #   Routes (/ui/*)
+│   │   ├── mod.rs           #   Routes (/ui/*), public-path rewrite middleware
 │   │   ├── templates.rs     #   HTML templates (inline, no template engine)
 │   │   ├── components.rs    #   Sidebar, nav, icons
 │   │   ├── api.rs           #   Dashboard JSON API
 │   │   ├── i18n.rs          #   English/Russian UI strings
-│   │   ├── logo.rs          #   Embedded JPEG logo (base64)
-│   │   └── static_assets.rs #   Embedded CSS/JS (Tailwind, htmx)
+│   │   ├── static_assets.rs #   Embedded CSS/JS (Tailwind, htmx)
+│   │   ├── static/          #   tailwind.css, htmx.min.js
+│   │   └── logo.jpg         #   UI logo asset
 │   │
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
 │   ├── secrets/             # Secret value handling (env vars, redaction)
@@ -155,11 +200,24 @@ nora/
 │   └── test_helpers.rs      # Shared test utilities
 │
 ├── fuzz/                    # Cargo-fuzz targets
-├── scripts/
-│   ├── coherence-check.sh   # CI: code ↔ config consistency
-│   └── verify-changelog.sh  # CI: CHANGELOG ↔ release version
-└── docs-site/               # Documentation (Astro/Starlight)
+├── scripts/                # CI helpers: coherence-check.sh, verify-changelog.sh,
+│                           # lock-audit.sh, pre-commit-check.sh, post-release-gate.sh, ...
+└── docs-site/              # Documentation (Astro/Starlight)
 ```
+
+### Middleware Order
+
+Request middleware order is load-bearing and must not be reordered. In axum the
+last applied `.layer()` is the outermost (runs first), so the assembly in
+`main.rs` produces this execution order, outermost to innermost:
+
+```
+reject_null_bytes → metrics → auth → ui-rewrite → leak_detection → request_id → handler
+```
+
+`reject_null_bytes` is outermost so null-byte path attacks are blocked before
+anything else touches the request; `request_id` is innermost so the request ID
+is available to handlers.
 
 ## Architecture Decisions
 
@@ -237,7 +295,7 @@ too broad (leaking abstraction through dozens of `Option<T>` fields).
 The explicit approach has practical advantages:
 
 - **Testability.** Each handler is a standalone module with its own test
-  block. All 851 tests run in ~15 seconds with `cargo test`. No plugin
+  block. Over 1,400 unit and integration tests run with `cargo test`. No plugin
   loading, no mock trait implementations, no integration harness.
 - **Compile-time completeness.** When a new `RegistryType` variant is
   added, the compiler flags every unhandled match arm. Missing a
@@ -351,7 +409,7 @@ Adding a new registry format requires 24 insertion points across
 | 1 | `registry/<format>.rs` | 1 | **New file.** Routes, handlers, proxy logic, curation calls, tests. 400-1200 lines. |
 | 2 | `registry/mod.rs` | 2 | `mod <format>;` and `pub use <format>::routes as <format>_routes;` |
 | 3 | `registry_type.rs` | 6 | Enum variant + match arms in `as_str()`, `mount_point()`, `display_name()`, `all()`, `from_str_opt()` |
-| 4 | `config.rs` | 6 | Struct field in Config, `<Format>Config` struct + Default impl, `enabled_registries()`, `NORA_<FORMAT>_ENABLED` env, proxy env block, `Config::default()` |
+| 4 | `config/` | 6 | `<Format>Config` struct + Default impl + `NORA_<FORMAT>_ENABLED` env in `config/registry/<format>.rs`; field in top-level `Config`, `enabled_registries()`, and `Config::default()` in `config/mod.rs` |
 | 5 | `main.rs` | 1 | Route merge match arm in `run_server()` |
 | 6 | `metrics.rs` | 1 | Path branch in `detect_registry()` |
 | 7 | `openapi.rs` | 4 | Tag in `tags()`, description string, path entries, stub functions |
