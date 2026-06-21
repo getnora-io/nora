@@ -1,6 +1,6 @@
 # NORA
 
-A lightweight, open-source artifact registry. 13 formats in a single < 27 MB binary: Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
+A lightweight, open-source artifact registry. 13 formats in a single binary (< 27 MB on disk): Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
 
 > The artifact registry that grows with you. Zero-config to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
 
@@ -198,7 +198,7 @@ cd nora && cargo build --release
 - Language: Rust
 - Platforms: Linux (amd64, arm64). Docker images: Alpine, Astra Linux SE, RED OS
 - Binary name: nora (crate name: nora-registry)
-- Tests: 1200+ (unit + integration + proptest)
+- Tests: comprehensive suite (unit + integration + property-based/proptest)
 - No garbage collector pauses (Rust, not Java/Go)
 - Async I/O with Tokio, Axum web framework
 - SHA256 digest verification on every blob upload
