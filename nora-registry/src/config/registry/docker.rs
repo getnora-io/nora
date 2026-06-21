@@ -44,7 +44,7 @@ pub struct DockerConfig {
     /// `allow` (default) = fall through to first upstream; `deny` = reject with 403.
     #[serde(default)]
     pub default_action: DefaultAction,
-    #[serde(default)]
+    #[serde(default = "default_docker_upstreams")]
     pub upstreams: Vec<DockerUpstream>,
 }
 
@@ -97,6 +97,19 @@ fn default_docker_metadata_ttl() -> i64 {
     -1
 }
 
+/// Default Docker upstream. Single source for the serde field-default and the
+/// `Default` impl so a present-but-empty `[docker]` table keeps the upstream
+/// instead of silently going local-only (the npm/pypi `#[serde(default)]`
+/// divergence class — a bare default on a `Vec` yields an empty list).
+fn default_docker_upstreams() -> Vec<DockerUpstream> {
+    vec![DockerUpstream {
+        url: "https://registry-1.docker.io".to_string(),
+        auth: None,
+        namespace: None,
+        prefix: None,
+    }]
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
@@ -106,12 +119,7 @@ impl Default for DockerConfig {
             metadata_ttl: -1,
             serve_stale: true,
             default_action: DefaultAction::default(),
-            upstreams: vec![DockerUpstream {
-                url: "https://registry-1.docker.io".to_string(),
-                auth: None,
-                namespace: None,
-                prefix: None,
-            }],
+            upstreams: default_docker_upstreams(),
         }
     }
 }

@@ -9,7 +9,7 @@ use std::env;
 pub struct MavenConfig {
     #[serde(default = "super::super::default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_maven_proxies")]
     pub proxies: Vec<MavenProxyEntry>,
     #[serde(default = "super::super::default_timeout")]
     pub proxy_timeout: u64,
@@ -57,13 +57,21 @@ impl MavenProxyEntry {
     }
 }
 
+/// Default Maven upstream. Single source for the serde field-default and the
+/// `Default` impl so a present-but-empty `[maven]` table keeps the upstream
+/// instead of silently going local-only (the npm/pypi `#[serde(default)]`
+/// divergence class — a bare default on a `Vec` yields an empty list).
+fn default_maven_proxies() -> Vec<MavenProxyEntry> {
+    vec![MavenProxyEntry::Simple(
+        "https://repo1.maven.org/maven2".to_string(),
+    )]
+}
+
 impl Default for MavenConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            proxies: vec![MavenProxyEntry::Simple(
-                "https://repo1.maven.org/maven2".to_string(),
-            )],
+            proxies: default_maven_proxies(),
             proxy_timeout: 30,
             checksum_verify: true,
             immutable_releases: true,
