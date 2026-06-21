@@ -578,36 +578,75 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_read_during_write() {
+        // The put path writes a temp file, fsyncs it, and atomically renames it
+        // into place, so a concurrent reader observes either the complete old
+        // object or the complete new one — never a torn mix of both, never a
+        // partial length, and never a missing key (the destination always
+        // resolves to one inode or the other). This asserts that invariant under
+        // contention: a non-atomic write (write-in-place, or unlink-then-write)
+        // would expose a torn read or a NotFound here and fail.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const LEN: usize = 1 << 16; // 64 KiB — wide enough that a non-atomic write tears
+
         let temp_dir = TempDir::new().unwrap();
         let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+        storage
+            .put("rw/key", &vec![0u8; LEN])
+            .await
+            .expect("seed put");
 
-        let old_data = vec![0u8; 4096];
-        storage.put("rw/key", &old_data).await.expect("seed put");
+        let done = std::sync::Arc::new(AtomicBool::new(false));
 
-        let new_data = vec![1u8; 4096];
         let sw = storage.clone();
+        let dw = done.clone();
         let writer = tokio::spawn(async move {
-            sw.put("rw/key", &new_data).await.expect("put failed");
+            // Alternate all-0x00 and all-0x01 payloads so any torn read is a
+            // visible mix of the two.
+            for i in 0..100u32 {
+                let byte = if i % 2 == 0 { 0u8 } else { 1u8 };
+                sw.put("rw/key", &vec![byte; LEN])
+                    .await
+                    .expect("put failed");
+            }
+            dw.store(true, Ordering::Release);
         });
 
         let sr = storage.clone();
+        let dr = done.clone();
         let reader = tokio::spawn(async move {
-            match sr.get("rw/key").await {
-                Ok(_data) => {
-                    // tokio::fs::write is not atomic, so partial reads
-                    // (mix of old and new bytes) are expected — not a bug.
-                    // We only verify the final state after both tasks complete.
+            // Spin for the whole write loop so the concurrent window is exercised.
+            while !dr.load(Ordering::Acquire) {
+                match sr.get("rw/key").await {
+                    Ok(data) => {
+                        assert_eq!(data.len(), LEN, "torn/partial read: wrong object length");
+                        let first = data[0];
+                        assert!(
+                            data.iter().all(|&b| b == first),
+                            "torn read: object mixes old (0x00) and new (0x01) bytes — atomic rename violated"
+                        );
+                    }
+                    Err(crate::storage::StorageError::NotFound) => {
+                        panic!(
+                            "key vanished mid-write — atomic rename violated (unlink-then-write?)"
+                        )
+                    }
+                    Err(e) => panic!("unexpected error: {}", e),
                 }
-                Err(crate::storage::StorageError::NotFound) => {}
-                Err(e) => panic!("unexpected error: {}", e),
             }
         });
 
         writer.await.expect("writer panicked");
         reader.await.expect("reader panicked");
 
+        // Final state is a complete, uniform object.
         let data = storage.get("rw/key").await.expect("final get");
-        assert_eq!(&*data, &vec![1u8; 4096]);
+        assert_eq!(data.len(), LEN);
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "final state must be a uniform object"
+        );
     }
 
     #[tokio::test]
