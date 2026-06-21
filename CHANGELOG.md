@@ -1,4 +1,9 @@
 # Changelog
+## [Unreleased]
+
+### Fixed
+- **A present-but-empty `[<registry>]` table now keeps the default upstream** — npm/pypi `proxy` and maven/docker `proxies`/`upstreams` used a bare `#[serde(default)]` that deserialized to `None`/`[]`, diverging from the `Default` impl's real upstream. Writing `[npm]` (or `[pypi]`/`[maven]`/`[docker]`) in `config.toml` to set, say, a timeout — without restating the proxy key — silently disabled proxying for that registry, while omitting the table entirely kept the upstream. The serde field-default is now single-sourced with the `Default` impl, and a guard test asserts this for every registry section so the class cannot recur. **Behavior change:** if you relied on a present-but-proxy-less table to run a registry local-only (air-gapped), set the proxy env var to empty instead — `NORA_NPM_PROXY=""`, `NORA_PYPI_PROXY=""`, `NORA_MAVEN_PROXIES=""`, `NORA_DOCKER_PROXIES=""`.
+
 ## [0.9.5] - 2026-06-19
 
 ### Security
