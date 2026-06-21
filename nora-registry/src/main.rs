@@ -1395,8 +1395,14 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cb_config = config.circuit_breaker.clone();
     let audit_mode = config.audit.mode.clone();
 
-    // Initialize digest quarantine store
-    let digest_store = if config.curation.quarantine.is_some() {
+    // Initialize digest quarantine store. Load the durable on-disk store whenever
+    // ANY quarantine is effectively active — global OR a per-registry override
+    // (e.g. docker-only [curation.docker] quarantine). Gating on the global field
+    // alone built an empty() store for per-registry-only configs, so after a
+    // restart a still-young cached digest read as `New` and was served early —
+    // a fail-open the check-only cache-serve gate cannot catch (#765). The
+    // predicate is the same one config validation uses, so they cannot diverge.
+    let digest_store = if config.any_quarantine_active() {
         Arc::new(digest_quarantine::DigestStore::load(&storage_path))
     } else {
         Arc::new(digest_quarantine::DigestStore::empty(&storage_path))

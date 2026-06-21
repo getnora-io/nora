@@ -255,6 +255,82 @@ impl Config {
         set
     }
 
+    /// Whether `rt` is an enabled registry with at least one upstream proxy configured.
+    ///
+    /// The `match` is exhaustive over [`RegistryType`], so adding a variant is a
+    /// compile error until its proxy shape is declared here — the single source of
+    /// truth for "is this an enabled proxy?". Raw has no upstream and is always false.
+    /// Per-registry shapes differ: most carry `proxy: Option<String>`, PyPI also has a
+    /// multi-upstream `proxies` list, Maven uses `proxies`, Docker uses `upstreams`.
+    fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
+        match rt {
+            RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
+            RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
+            RegistryType::Npm => self.npm.enabled && self.npm.proxy.is_some(),
+            RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
+            RegistryType::PyPI => {
+                self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
+            }
+            RegistryType::Go => self.go.enabled && self.go.proxy.is_some(),
+            RegistryType::Raw => false, // raw file storage has no upstream
+            RegistryType::Gems => self.gems.enabled && self.gems.proxy.is_some(),
+            RegistryType::Terraform => self.terraform.enabled && self.terraform.proxy.is_some(),
+            RegistryType::Ansible => self.ansible.enabled && self.ansible.proxy.is_some(),
+            RegistryType::Nuget => self.nuget.enabled && self.nuget.proxy.is_some(),
+            RegistryType::PubDart => self.pub_dart.enabled && self.pub_dart.proxy.is_some(),
+            RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
+        }
+    }
+
+    /// The effective quarantine mode for `rt`: the per-registry override if set,
+    /// else the global `curation.quarantine`, else `Off`.
+    ///
+    /// The `match` is exhaustive over [`RegistryType`] and the precedence is
+    /// byte-identical to the handler resolution (`per.or(global)`, e.g.
+    /// `registry/docker.rs::resolve_quarantine`), so config validation and the
+    /// runtime DigestStore gate compute the SAME value and cannot diverge — that
+    /// divergence was the #765 bug (docker dropped from the hand-rolled chains).
+    /// `Raw` has no curation override and no quarantine-enforcing path → always
+    /// `Off` (counting it would be a phantom control: `any_quarantine_active`
+    /// true while nothing enforces).
+    fn quarantine_mode_for(&self, rt: RegistryType) -> crate::digest_quarantine::QuarantineMode {
+        use crate::digest_quarantine::QuarantineMode;
+        let global = self.curation.quarantine.as_ref();
+        let per = match rt {
+            RegistryType::Docker => self.curation.docker.quarantine.as_ref(),
+            RegistryType::Maven => self.curation.maven.quarantine.as_ref(),
+            RegistryType::Npm => self.curation.npm.quarantine.as_ref(),
+            RegistryType::Cargo => self.curation.cargo.quarantine.as_ref(),
+            RegistryType::PyPI => self.curation.pypi.quarantine.as_ref(),
+            RegistryType::Go => self.curation.go.quarantine.as_ref(),
+            RegistryType::Gems => self.curation.gems.quarantine.as_ref(),
+            RegistryType::Terraform => self.curation.terraform.quarantine.as_ref(),
+            RegistryType::Ansible => self.curation.ansible.quarantine.as_ref(),
+            RegistryType::Nuget => self.curation.nuget.quarantine.as_ref(),
+            RegistryType::PubDart => self.curation.pub_dart.quarantine.as_ref(),
+            RegistryType::Conan => self.curation.conan.quarantine.as_ref(),
+            // Raw has no curation override and no quarantine gate in its handler.
+            RegistryType::Raw => return QuarantineMode::Off,
+        };
+        per.or(global).cloned().unwrap_or(QuarantineMode::Off)
+    }
+
+    /// Whether any registry has an effective quarantine mode other than `Off`.
+    ///
+    /// Single source of truth for both config validation (the #741 min-release-age
+    /// guard and the enforce "at least one control" check) and the runtime
+    /// DigestStore gate in `main.rs`. Because it folds [`Self::quarantine_mode_for`]
+    /// over [`RegistryType::all`], a per-registry quarantine (e.g. docker-only)
+    /// counts everywhere it should: the durable store is loaded iff some registry
+    /// actually enforces, closing the #765 fail-open where a docker-only quarantine
+    /// got an empty (non-durable) store.
+    pub(crate) fn any_quarantine_active(&self) -> bool {
+        use crate::digest_quarantine::QuarantineMode;
+        RegistryType::all()
+            .iter()
+            .any(|&rt| self.quarantine_mode_for(rt) != QuarantineMode::Off)
+    }
+
     /// Warn if legacy NORA_*_ENABLED env vars are set while using the new
     /// `[registries].enable` or `NORA_REGISTRIES_ENABLE`.
     fn warn_legacy_env_vars_if_present() {
@@ -607,20 +683,13 @@ impl Config {
         // Compute once: is any first-seen quarantine active (global or per-registry)?
         // Used by both the enforce "at least one control" check and the
         // min-release-age age-control requirement below.
-        use crate::digest_quarantine::QuarantineMode;
-        let q_on = |q: &Option<QuarantineMode>| matches!(q, Some(m) if *m != QuarantineMode::Off);
-        let quarantine_active = q_on(&self.curation.quarantine)
-            || q_on(&self.curation.npm.quarantine)
-            || q_on(&self.curation.pypi.quarantine)
-            || q_on(&self.curation.cargo.quarantine)
-            || q_on(&self.curation.go.quarantine)
-            || q_on(&self.curation.maven.quarantine)
-            || q_on(&self.curation.gems.quarantine)
-            || q_on(&self.curation.terraform.quarantine)
-            || q_on(&self.curation.ansible.quarantine)
-            || q_on(&self.curation.nuget.quarantine)
-            || q_on(&self.curation.pub_dart.quarantine)
-            || q_on(&self.curation.conan.quarantine);
+        // Exhaustive over RegistryType via any_quarantine_active (a compiler-enforced
+        // match): the hand-rolled OR-chain here previously omitted docker, so a
+        // docker-only [curation.docker] quarantine read as "inactive" and falsely
+        // failed this validation (#765). Counts a registry iff its effective mode
+        // (per-registry override .or(global)) is not Off — the same value the
+        // handlers and the main.rs store gate use.
+        let quarantine_active = self.any_quarantine_active();
 
         // Enforce mode must have at least ONE active control, otherwise it blocks
         // nothing. An allowlist is one option, not the only one — a blocklist,
@@ -673,18 +742,14 @@ impl Config {
         // control, only the unspoofable quarantine is. Refuse min-age on an enabled
         // proxy without a quarantine (curation-minage-real-age-defer, #741).
         {
-            let any_enabled_proxy = (self.pypi.enabled
-                && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty()))
-                || (self.npm.enabled && self.npm.proxy.is_some())
-                || (self.cargo.enabled && self.cargo.proxy.is_some())
-                || (self.gems.enabled && self.gems.proxy.is_some())
-                || (self.maven.enabled && !self.maven.proxies.is_empty())
-                || (self.nuget.enabled && self.nuget.proxy.is_some())
-                || (self.go.enabled && self.go.proxy.is_some())
-                || (self.conan.enabled && self.conan.proxy.is_some())
-                || (self.pub_dart.enabled && self.pub_dart.proxy.is_some())
-                || (self.terraform.enabled && self.terraform.proxy.is_some())
-                || (self.ansible.enabled && self.ansible.proxy.is_some());
+            // Exhaustive over RegistryType via is_enabled_proxy (a compiler-enforced
+            // match): adding a registry variant forces a new arm, so this guard can
+            // never silently forget one again. The hand-rolled list here previously
+            // omitted docker, leaving a docker-only proxy with min_release_age and no
+            // quarantine unwarned (#741 follow-up).
+            let any_enabled_proxy = RegistryType::all()
+                .iter()
+                .any(|&rt| self.is_enabled_proxy(rt));
             if self.curation.min_release_age.is_some() && !quarantine_active && any_enabled_proxy {
                 errors.push(
                     "curation.min_release_age is set with an enabled proxy registry but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine=\"observe\"|\"enforce\" (the unspoofable first-seen age control). server.trust_upstream_dates enhances min-release-age with real upstream dates where a registry caches one (e.g. npm) but is NOT a substitute for the quarantine. (#741)".to_string(),
@@ -2184,6 +2249,114 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("no age control would be active")),
             "trust alone (no quarantine) must still be rejected — trust is not a substitute"
+        );
+    }
+
+    #[test]
+    fn test_is_enabled_proxy_counts_docker_and_excludes_raw() {
+        // #765: docker was dropped from the any_enabled_proxy chain. The exhaustive
+        // helper must count docker (enabled + has upstream) and never count raw.
+        let mut config = Config::default();
+        // Config::default() already carries the registry-1.docker.io upstream.
+        assert!(
+            config.is_enabled_proxy(RegistryType::Docker),
+            "enabled docker with an upstream is a proxy"
+        );
+        config.docker.upstreams = vec![];
+        assert!(
+            !config.is_enabled_proxy(RegistryType::Docker),
+            "docker without upstreams is not a proxy"
+        );
+        assert!(
+            !config.is_enabled_proxy(RegistryType::Raw),
+            "raw has no upstream and is never a proxy"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_mode_for_docker_precedence_and_raw_off() {
+        // Per-registry override wins over global (.or precedence, matching
+        // docker.rs::resolve_quarantine); raw is always Off (no enforcement path).
+        let mut config = Config::default();
+        config.curation.quarantine = Some(QuarantineMode::Off);
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Docker),
+            QuarantineMode::Enforce,
+            "docker override Enforce beats global Off"
+        );
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Npm),
+            QuarantineMode::Off,
+            "npm with no override inherits global Off"
+        );
+        // raw stays Off even under a global Enforce — counting it would be a phantom control.
+        config.curation.quarantine = Some(QuarantineMode::Enforce);
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Raw),
+            QuarantineMode::Off,
+            "raw must never report an active quarantine"
+        );
+    }
+
+    #[test]
+    fn test_any_quarantine_active_counts_docker_only_override() {
+        // #765 core: a docker-only [curation.docker] quarantine, no global, must count.
+        // The main.rs DigestStore gate depends on this — otherwise it builds an
+        // empty() (non-durable) store and serves young digests early after restart.
+        let mut config = Config::default();
+        config.curation.quarantine = None;
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        assert!(
+            config.any_quarantine_active(),
+            "docker-only quarantine override must count as active"
+        );
+    }
+
+    #[test]
+    fn test_any_quarantine_active_false_when_global_fully_overridden_off() {
+        // A global Enforce with EVERY registry overridden to Off enforces nothing,
+        // so quarantine is not active. (The old flat-OR counted the global term and
+        // wrongly reported active — which would suppress the #741 min-age guard.)
+        let mut config = Config::default();
+        config.curation.quarantine = Some(QuarantineMode::Enforce);
+        for o in [
+            &mut config.curation.docker,
+            &mut config.curation.maven,
+            &mut config.curation.npm,
+            &mut config.curation.cargo,
+            &mut config.curation.pypi,
+            &mut config.curation.go,
+            &mut config.curation.gems,
+            &mut config.curation.terraform,
+            &mut config.curation.ansible,
+            &mut config.curation.nuget,
+            &mut config.curation.pub_dart,
+            &mut config.curation.conan,
+        ] {
+            o.quarantine = Some(QuarantineMode::Off);
+        }
+        assert!(
+            !config.any_quarantine_active(),
+            "global Enforce fully overridden to Off everywhere enforces nothing"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_docker_only_quarantine_ok() {
+        // #765: a docker-only quarantine must SATISFY the #741 min-age guard. The
+        // old quarantine_active chain omitted docker and falsely rejected this config.
+        let mut config = Config::default();
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "a docker-only quarantine should satisfy the age-control requirement (#765)"
         );
     }
 
