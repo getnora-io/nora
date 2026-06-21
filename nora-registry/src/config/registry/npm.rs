@@ -9,7 +9,7 @@ use std::env;
 pub struct NpmConfig {
     #[serde(default = "super::super::default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_npm_proxy")]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
     pub proxy_auth: Option<ProtectedString>,
@@ -26,11 +26,19 @@ pub struct NpmConfig {
     pub revalidate: bool,
 }
 
+/// Default npm upstream. Single source for both the serde field-default and the
+/// `Default` impl, so the "table present without `proxy`" path and the "table
+/// omitted" path produce the same upstream (they diverged before — `#[serde(default)]`
+/// on an `Option` yields `None`, silently disabling proxying when `[npm]` is present).
+fn default_npm_proxy() -> Option<String> {
+    Some("https://registry.npmjs.org".to_string())
+}
+
 impl Default for NpmConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            proxy: Some("https://registry.npmjs.org".to_string()),
+            proxy: default_npm_proxy(),
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,

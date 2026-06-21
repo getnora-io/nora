@@ -1398,6 +1398,30 @@ mod tests {
         assert_eq!(from_empty_cfg.server, ServerConfig::default());
     }
 
+    /// A registry table present in config.toml WITHOUT a `proxy` key must yield
+    /// the SAME upstream as omitting the table entirely. Otherwise a user who
+    /// writes `[npm]` (e.g. just to set a timeout) silently loses the default
+    /// upstream and proxying breaks. This was wrong for npm/pypi: their `proxy`
+    /// field used a bare `#[serde(default)]` (→ None) that diverged from their
+    /// `Default` impl (Some(registry)). The existing guard above only covers
+    /// ServerConfig/StorageConfig, so the drift went unnoticed.
+    #[test]
+    fn registry_proxy_present_table_matches_omitted_table() {
+        let omitted: Config = toml::from_str("").unwrap();
+
+        let npm_present: Config = toml::from_str("[npm]\nenabled = true\n").unwrap();
+        assert_eq!(
+            npm_present.npm.proxy, omitted.npm.proxy,
+            "[npm] without a proxy key must default to the same upstream as omitting [npm]"
+        );
+
+        let pypi_present: Config = toml::from_str("[pypi]\nenabled = true\n").unwrap();
+        assert_eq!(
+            pypi_present.pypi.proxy, omitted.pypi.proxy,
+            "[pypi] without a proxy key must default to the same upstream as omitting [pypi]"
+        );
+    }
+
     /// The config shipped in the container image (deploy/config.docker.toml,
     /// loaded via NORA_CONFIG_PATH) must be valid for THIS struct and yield the
     /// intended container defaults — so the image is zero-config out of the box

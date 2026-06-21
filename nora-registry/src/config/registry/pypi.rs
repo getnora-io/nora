@@ -11,7 +11,7 @@ pub struct PypiConfig {
     pub enabled: bool,
     /// Single upstream — retained for back-compat (`NORA_PYPI_PROXY`, old TOML).
     /// Used only when `proxies` is empty; see [`PypiConfig::upstreams`].
-    #[serde(default)]
+    #[serde(default = "default_pypi_proxy")]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
     pub proxy_auth: Option<ProtectedString>,
@@ -56,11 +56,19 @@ impl PypiProxyEntry {
     }
 }
 
+/// Default PyPI upstream. Single source for both the serde field-default and the
+/// `Default` impl so the "table present without `proxy`" and "table omitted" paths
+/// agree (`#[serde(default)]` on an `Option` yields `None`, which silently dropped
+/// the upstream when `[pypi]` was present).
+fn default_pypi_proxy() -> Option<String> {
+    Some("https://pypi.org/simple/".to_string())
+}
+
 impl Default for PypiConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            proxy: Some("https://pypi.org/simple/".to_string()),
+            proxy: default_pypi_proxy(),
             proxy_auth: None,
             proxies: Vec::new(),
             proxy_timeout: 30,
