@@ -154,6 +154,39 @@ impl StorageBackend for S3Storage {
             .collect())
     }
 
+    async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        let encoded = encode_s3_key(prefix);
+        let prefix_path = Path::from(encoded);
+        let list_prefix = if prefix.is_empty() {
+            None
+        } else {
+            Some(&prefix_path)
+        };
+
+        let objects: Vec<_> = self
+            .store
+            .list(list_prefix)
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::Network(e.to_string()))?;
+
+        // The LIST response already carries size/last_modified — reuse it
+        // instead of issuing a HEAD per key (#738).
+        Ok(objects
+            .into_iter()
+            .map(|meta| {
+                let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
+                (
+                    decode_s3_key(meta.location.as_ref()),
+                    FileMeta {
+                        size: meta.size,
+                        modified,
+                    },
+                )
+            })
+            .collect())
+    }
+
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_s3_key(key);
         let path = Path::from(encoded);

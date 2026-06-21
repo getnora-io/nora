@@ -66,6 +66,48 @@ impl LocalStorage {
             }
         }
     }
+
+    /// Like [`Self::list_files_sync`] but also captures size/mtime from each
+    /// file's metadata during the walk, so callers do not need a follow-up
+    /// `stat()` per key (#738). Uses `std::fs::metadata` (symlink-following) to
+    /// match the semantics of [`StorageBackend::stat`].
+    fn list_files_with_meta_sync(
+        dir: &PathBuf,
+        base: &PathBuf,
+        prefix: &str,
+        results: &mut Vec<(String, FileMeta)>,
+    ) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_file() {
+                    if let Ok(rel_path) = path.strip_prefix(base) {
+                        let key = rel_path.to_string_lossy().replace('\\', "/");
+                        if key.starts_with(prefix) || prefix.is_empty() {
+                            let modified = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            results.push((
+                                key,
+                                FileMeta {
+                                    size: metadata.len(),
+                                    modified,
+                                },
+                            ));
+                        }
+                    }
+                } else if metadata.is_dir() {
+                    Self::list_files_with_meta_sync(&path, base, prefix, results);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -158,6 +200,22 @@ impl StorageBackend for LocalStorage {
                 Self::list_files_sync(&base, &base, &prefix, &mut results);
             }
             results.sort();
+            results
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("list task panicked: {e}")))
+    }
+
+    async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        let base = self.base_path.clone();
+        let prefix = prefix.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            if base.exists() {
+                Self::list_files_with_meta_sync(&base, &base, &prefix, &mut results);
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0));
             results
         })
         .await
