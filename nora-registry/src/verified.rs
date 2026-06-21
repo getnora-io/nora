@@ -259,7 +259,8 @@ impl<T> GateOutcome<T> {
 /// use nora_registry::verified::{verified_body, Blob, Verified};
 /// // sha256("abc")
 /// let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-/// let blob = Blob::<Verified, _>::verify(b"abc".to_vec(), digest).unwrap();
+/// let blob = Blob::<Verified, _>::verify(b"abc".to_vec(), digest)
+///     .expect("abc hashes to the digest above");
 /// assert_eq!(verified_body(blob), b"abc".to_vec());
 /// ```
 ///
