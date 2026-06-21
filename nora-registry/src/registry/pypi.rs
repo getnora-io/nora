@@ -343,7 +343,7 @@ async fn download_file(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             format!("{}/{}", name, filename),
-            "pypi",
+            crate::registry_type::RegistryType::PyPI,
             "CACHE",
         ));
         state
@@ -434,7 +434,7 @@ async fn download_file(
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     format!("{}/{}", name, filename),
-                    "pypi",
+                    crate::registry_type::RegistryType::PyPI,
                     "PROXY",
                 ));
                 state
@@ -627,7 +627,7 @@ async fn upload(
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         artifact,
-        "pypi",
+        crate::registry_type::RegistryType::PyPI,
         "LOCAL",
     ));
     state.repo_index.invalidate("pypi");

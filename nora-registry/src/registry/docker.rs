@@ -1213,7 +1213,7 @@ async fn download_blob(
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", name, &digest[..19.min(digest.len())]),
-            "docker",
+            crate::registry_type::RegistryType::Docker,
             "LOCAL",
         ));
         let stream = ReaderStream::new(VerifyingReader::new(reader, &digest));
@@ -1296,7 +1296,7 @@ async fn download_blob(
                     state.activity.push(ActivityEntry::new(
                         ActionType::ProxyFetch,
                         format!("{}@{}", try_name, &digest[..19.min(digest.len())]),
-                        "docker",
+                        crate::registry_type::RegistryType::Docker,
                         "PROXY",
                     ));
 
@@ -1773,7 +1773,7 @@ async fn upload_blob(
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 format!("{}@{}", name, &digest[..19.min(digest.len())]),
-                "docker",
+                crate::registry_type::RegistryType::Docker,
                 "LOCAL",
             ));
             state.repo_index.invalidate("docker");
@@ -1834,7 +1834,7 @@ async fn try_fetch_and_cache(
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     format!("{}:{}", name, reference),
-                    "docker",
+                    crate::registry_type::RegistryType::Docker,
                     "PROXY",
                 ));
 
@@ -2164,7 +2164,7 @@ fn serve_cached_manifest(
     state.activity.push(ActivityEntry::new(
         ActionType::Pull,
         format!("{}:{}", name, reference),
-        "docker",
+        crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
 
@@ -2338,7 +2338,7 @@ async fn put_manifest(
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         format!("{}:{}", name, reference),
-        "docker",
+        crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
     state.audit.log(AuditEntry::new(

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+use crate::registry_type::RegistryType;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -38,12 +39,12 @@ pub struct ActivityEntry {
 }
 
 impl ActivityEntry {
-    pub fn new(action: ActionType, artifact: String, registry: &str, source: &str) -> Self {
+    pub fn new(action: ActionType, artifact: String, registry: RegistryType, source: &str) -> Self {
         Self {
             timestamp: Utc::now(),
             action,
             artifact,
-            registry: registry.to_string(),
+            registry: registry.as_str().to_string(),
             source: source.to_string(),
         }
     }
@@ -124,7 +125,7 @@ mod tests {
         let entry = ActivityEntry::new(
             ActionType::Pull,
             "nginx:latest".to_string(),
-            "docker",
+            crate::registry_type::RegistryType::Docker,
             "LOCAL",
         );
         assert_eq!(entry.action, ActionType::Pull);
@@ -142,7 +143,7 @@ mod tests {
         log.push(ActivityEntry::new(
             ActionType::Push,
             "test:v1".to_string(),
-            "docker",
+            crate::registry_type::RegistryType::Docker,
             "LOCAL",
         ));
         assert!(!log.is_empty());
@@ -156,7 +157,7 @@ mod tests {
             log.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("image:{}", i),
-                "docker",
+                crate::registry_type::RegistryType::Docker,
                 "LOCAL",
             ));
         }
@@ -176,7 +177,7 @@ mod tests {
             log.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("pkg:{}", i),
-                "npm",
+                crate::registry_type::RegistryType::Npm,
                 "PROXY",
             ));
         }
@@ -193,7 +194,7 @@ mod tests {
             log.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("item:{}", i),
-                "cargo",
+                crate::registry_type::RegistryType::Cargo,
                 "CACHE",
             ));
         }
@@ -212,7 +213,7 @@ mod tests {
         log.push(ActivityEntry::new(
             ActionType::Push,
             "one".to_string(),
-            "maven",
+            crate::registry_type::RegistryType::Maven,
             "LOCAL",
         ));
 
@@ -229,7 +230,7 @@ mod tests {
             log.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("x:{}", i),
-                "docker",
+                crate::registry_type::RegistryType::Docker,
                 "LOCAL",
             ));
         }

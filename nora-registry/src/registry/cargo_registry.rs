@@ -127,7 +127,7 @@ async fn sparse_index(
             state.activity.push(ActivityEntry::new(
                 ActionType::CacheHit,
                 crate_name.to_string(),
-                "cargo",
+                crate::registry_type::RegistryType::Cargo,
                 "CACHE",
             ));
             return sparse_index_conditional(data.to_vec(), &headers);
@@ -197,7 +197,7 @@ async fn sparse_index(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 crate_name.to_string(),
-                "cargo",
+                crate::registry_type::RegistryType::Cargo,
                 "PROXY",
             ));
             state
@@ -437,7 +437,7 @@ async fn download(
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", crate_name, version),
-            "cargo",
+            crate::registry_type::RegistryType::Cargo,
             "LOCAL",
         ));
         state
@@ -525,7 +525,7 @@ async fn download(
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("{}@{}", crate_name, version),
-                "cargo",
+                crate::registry_type::RegistryType::Cargo,
                 "PROXY",
             ));
             state
@@ -785,7 +785,7 @@ async fn publish(
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         artifact,
-        "cargo",
+        crate::registry_type::RegistryType::Cargo,
         "LOCAL",
     ));
     state.repo_index.invalidate("cargo");

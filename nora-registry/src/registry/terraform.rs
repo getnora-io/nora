@@ -177,7 +177,7 @@ async fn provider_versions(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}", ns, ptype),
-                "terraform",
+                crate::registry_type::RegistryType::Terraform,
                 "PROXY",
             ));
             state
@@ -312,7 +312,7 @@ async fn provider_download_meta(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
-                "terraform",
+                crate::registry_type::RegistryType::Terraform,
                 "PROXY",
             ));
             state
@@ -375,7 +375,7 @@ async fn provider_download_binary(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             path.clone(),
-            "terraform",
+            crate::registry_type::RegistryType::Terraform,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -435,7 +435,7 @@ async fn provider_download_binary(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 path,
-                "terraform",
+                crate::registry_type::RegistryType::Terraform,
                 "PROXY",
             ));
             state
@@ -556,7 +556,7 @@ async fn module_versions(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}/{}", ns, name, provider),
-                "terraform",
+                crate::registry_type::RegistryType::Terraform,
                 "PROXY",
             ));
             state
@@ -639,7 +639,7 @@ async fn module_download(
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     format!("{}/{}/{} v{}", ns, name, provider, ver),
-                    "terraform",
+                    crate::registry_type::RegistryType::Terraform,
                     "PROXY",
                 ));
 
@@ -766,7 +766,7 @@ async fn module_source_download(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}/{} v{}", ns, name, provider, ver),
-                "terraform",
+                crate::registry_type::RegistryType::Terraform,
                 "PROXY",
             ));
 

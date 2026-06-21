@@ -162,7 +162,7 @@ async fn handle(
             state.activity.push(ActivityEntry::new(
                 ActionType::CacheHit,
                 format_artifact(&module_encoded, &file),
-                "go",
+                crate::registry_type::RegistryType::Go,
                 "CACHE",
             ));
             // Quarantine only the .zip module archive (the artifact). The
@@ -287,7 +287,7 @@ async fn handle(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format_artifact(&module_encoded, &file),
-                "go",
+                crate::registry_type::RegistryType::Go,
                 "PROXY",
             ));
             state

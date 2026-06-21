@@ -309,7 +309,7 @@ async fn handle_request(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             package_name,
-            "npm",
+            crate::registry_type::RegistryType::Npm,
             "CACHE",
         ));
         state
@@ -387,7 +387,7 @@ async fn handle_request(
                     state.activity.push(ActivityEntry::new(
                         ActionType::ProxyFetch,
                         package_name,
-                        "npm",
+                        crate::registry_type::RegistryType::Npm,
                         "PROXY",
                     ));
                     state
@@ -804,7 +804,7 @@ async fn handle_publish(
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         package_name,
-        "npm",
+        crate::registry_type::RegistryType::Npm,
         "LOCAL",
     ));
     state.repo_index.invalidate("npm");
