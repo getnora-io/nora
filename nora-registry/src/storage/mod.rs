@@ -91,6 +91,23 @@ pub trait StorageBackend: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
+    /// List keys under `prefix` together with their size/mtime.
+    ///
+    /// Returns the metadata the listing already carries instead of forcing a
+    /// per-key `stat()` — an extra HEAD per key on S3 (#738). The default impl
+    /// falls back to `list()` + per-key `stat()`, so backends that do not
+    /// override stay correct; Local and S3 override to reuse the metadata the
+    /// listing itself produces.
+    async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        let keys = self.list(prefix).await?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(meta) = self.stat(&key).await {
+                out.push((key, meta));
+            }
+        }
+        Ok(out)
+    }
     async fn health_check(&self) -> bool;
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
@@ -432,6 +449,20 @@ impl Storage {
         Ok(keys
             .into_iter()
             .filter(|k| !k.starts_with(".nora-"))
+            .collect())
+    }
+
+    /// List keys under `prefix` with their size/mtime, applying the same
+    /// `.nora-` internal-file filter as [`list`]. Backends carry the metadata
+    /// from the listing itself, avoiding a per-key `stat()` (#738).
+    pub async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        if !prefix.is_empty() {
+            validate_storage_key(prefix)?;
+        }
+        let entries = self.inner.list_with_meta(prefix).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(".nora-"))
             .collect())
     }
 

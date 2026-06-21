@@ -10,7 +10,7 @@
 //! - Single rebuild at a time per registry (rebuild_lock)
 
 use crate::registry_type::RegistryType;
-use crate::storage::Storage;
+use crate::storage::{FileMeta, Storage};
 use crate::ui::components::format_timestamp;
 use crate::validation::ends_with_ci;
 use parking_lot::RwLock;
@@ -244,8 +244,8 @@ impl Default for RepoIndex {
 /// List storage keys under `prefix` for an index rebuild. Returns `None` (not an
 /// empty Vec) when the listing itself fails, so the caller can keep the existing
 /// index dirty and retry rather than caching a falsely-empty result as fresh.
-async fn list_keys(storage: &Storage, prefix: &str) -> Option<Vec<String>> {
-    match storage.list(prefix).await {
+async fn list_keys(storage: &Storage, prefix: &str) -> Option<Vec<(String, FileMeta)>> {
+    match storage.list_with_meta(prefix).await {
         Ok(keys) => Some(keys),
         Err(e) => {
             tracing::warn!(prefix, error = %e, "index rebuild: storage list failed");
@@ -258,7 +258,7 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "docker/").await?;
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if ends_with_ci(key, ".meta.json") {
             continue;
         }
@@ -285,11 +285,9 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             // declared config+layer sizes — a "virtual" size that multi-counts
             // layers shared across tags and ignores real storage, so a 7.2G
             // image tree could be reported as something else entirely (#588).
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
 
             // Count = number of distinct tags. Each push writes BOTH a
@@ -314,7 +312,7 @@ async fn build_maven_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "maven/").await?;
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("maven/") {
             let parts: Vec<_> = rest.split('/').collect();
             if parts.len() >= 2 {
@@ -330,11 +328,9 @@ async fn build_maven_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                     entry.0 += 1;
                 }
 
-                if let Some(meta) = storage.stat(key).await {
-                    entry.1 += meta.size;
-                    if meta.modified > entry.2 {
-                        entry.2 = meta.modified;
-                    }
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
                 }
             }
         }
@@ -348,7 +344,7 @@ async fn build_npm_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     // Count tarballs instead of parsing metadata.json (faster than parsing JSON)
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("npm/") {
             // Pattern: npm/{package}/tarballs/{file}.tgz
             // Scoped:  npm/@scope/package/tarballs/{file}.tgz
@@ -364,11 +360,9 @@ async fn build_npm_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                     let entry = packages.entry(name).or_insert((0, 0, 0));
                     entry.0 += 1;
 
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.1 += meta.size;
-                        if meta.modified > entry.2 {
-                            entry.2 = meta.modified;
-                        }
+                    entry.1 += meta.size;
+                    if meta.modified > entry.2 {
+                        entry.2 = meta.modified;
                     }
                 }
             }
@@ -382,7 +376,7 @@ async fn build_cargo_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "cargo/").await?;
     let mut crates: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if ends_with_ci(key, ".crate") {
             if let Some(rest) = key.strip_prefix("cargo/") {
                 let parts: Vec<_> = rest.split('/').collect();
@@ -391,11 +385,9 @@ async fn build_cargo_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                     let entry = crates.entry(name).or_insert((0, 0, 0));
                     entry.0 += 1;
 
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.1 += meta.size;
-                        if meta.modified > entry.2 {
-                            entry.2 = meta.modified;
-                        }
+                    entry.1 += meta.size;
+                    if meta.modified > entry.2 {
+                        entry.2 = meta.modified;
                     }
                 }
             }
@@ -409,7 +401,7 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "pypi/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("pypi/") {
             let parts: Vec<_> = rest.split('/').collect();
             if parts.len() >= 2 {
@@ -422,11 +414,9 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                     entry.0 += 1;
                 }
 
-                if let Some(meta) = storage.stat(key).await {
-                    entry.1 += meta.size;
-                    if meta.modified > entry.2 {
-                        entry.2 = meta.modified;
-                    }
+                entry.1 += meta.size;
+                if meta.modified > entry.2 {
+                    entry.2 = meta.modified;
                 }
             }
         }
@@ -439,7 +429,7 @@ async fn build_go_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "go/").await?;
     let mut modules: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("go/") {
             // Pattern: go/{module}/@v/{version}.zip
             // Count .zip files as versions (authoritative artifacts)
@@ -450,11 +440,9 @@ async fn build_go_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                     let entry = modules.entry(module.to_string()).or_insert((0, 0, 0));
                     entry.0 += 1;
 
-                    if let Some(meta) = storage.stat(key).await {
-                        entry.1 += meta.size;
-                        if meta.modified > entry.2 {
-                            entry.2 = meta.modified;
-                        }
+                    entry.1 += meta.size;
+                    if meta.modified > entry.2 {
+                        entry.2 = meta.modified;
                     }
                 }
             }
@@ -469,17 +457,15 @@ async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     // (count, size, modified, is_file)
     let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("raw/") {
             let is_root_file = !rest.contains('/');
             let group = rest.split('/').next().unwrap_or(rest).to_string();
             let entry = groups.entry(group).or_insert((0, 0, 0, is_root_file));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
         }
     }
@@ -514,7 +500,7 @@ async fn build_generic_index(
     let keys = list_keys(storage, prefix).await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if !key.ends_with(suffix) {
             continue;
         }
@@ -525,11 +511,9 @@ async fn build_generic_index(
             }
             let entry = packages.entry(name).or_insert((0, 0, 0));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
         }
     }
@@ -543,7 +527,7 @@ async fn build_gems_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "gems/gems/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if !key.ends_with(".gem") {
             continue;
         }
@@ -558,11 +542,9 @@ async fn build_gems_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             }
             let entry = packages.entry(name).or_insert((0, 0, 0));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
         }
     }
@@ -575,7 +557,7 @@ async fn build_conan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "conan/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("conan/") {
             // First segment is the package name
             let name = rest.split('/').next().unwrap_or(rest).to_string();
@@ -584,11 +566,9 @@ async fn build_conan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             }
             let entry = packages.entry(name).or_insert((0, 0, 0));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
+            entry.1 += meta.size;
+            if meta.modified > entry.2 {
+                entry.2 = meta.modified;
             }
         }
     }
@@ -984,5 +964,118 @@ mod tests {
             "size must be on-disk du, not virtual"
         );
         assert!(repos[0].size < 10_000_000, "must not report virtual size");
+    }
+
+    /// #738 A/B: an index rebuild must read size/mtime from the listing
+    /// (`list_with_meta`) and NEVER issue a per-key `stat()` — which on S3 is a
+    /// HEAD per key (N+1). A backend that counts `stat()` calls and serves the
+    /// metadata via `list_with_meta` proves the rebuild does ZERO stats (стало)
+    /// while still computing the correct on-disk size (было = one HEAD per key).
+    #[tokio::test]
+    async fn docker_index_uses_list_with_meta_not_per_key_stat() {
+        use crate::storage::{FileMeta, StorageBackend};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingBackend {
+            entries: Vec<(String, FileMeta)>,
+            stat_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for CountingBackend {
+            async fn stat(&self, _key: &str) -> Option<FileMeta> {
+                self.stat_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+                Ok(self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .map(|(k, _)| k.clone())
+                    .collect())
+            }
+            async fn list_with_meta(
+                &self,
+                prefix: &str,
+            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+                Ok(self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .cloned()
+                    .collect())
+            }
+            async fn put(&self, _k: &str, _d: &[u8]) -> crate::storage::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _k: &str) -> crate::storage::Result<axum::body::Bytes> {
+                Err(crate::storage::StorageError::NotFound)
+            }
+            async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
+                Ok(())
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "counting-test"
+            }
+            async fn put_from_path(
+                &self,
+                _k: &str,
+                _s: &std::path::Path,
+            ) -> crate::storage::Result<()> {
+                Ok(())
+            }
+            async fn get_reader(
+                &self,
+                _k: &str,
+            ) -> crate::storage::Result<(
+                u64,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+            )> {
+                Err(crate::storage::StorageError::NotFound)
+            }
+        }
+
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let entries = vec![
+            (
+                "docker/library/app/manifests/latest.json".to_string(),
+                FileMeta {
+                    size: 100,
+                    modified: 5,
+                },
+            ),
+            (
+                "docker/library/app/blobs/sha256:lyr".to_string(),
+                FileMeta {
+                    size: 340,
+                    modified: 9,
+                },
+            ),
+        ];
+        let storage = Storage::from_backend(Arc::new(CountingBackend {
+            entries,
+            stat_calls: Arc::clone(&stat_calls),
+        }));
+
+        let repos = build_docker_index(&storage).await.expect("index built");
+
+        // стало: the rebuild made ZERO per-key stat() calls.
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            0,
+            "#738: index rebuild must not stat() per key — size/mtime come from list_with_meta"
+        );
+        // Correctness preserved: size = sum of listed sizes (100 + 340), 1 tag.
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].versions, 1);
+        assert_eq!(repos[0].size, 440);
     }
 }
