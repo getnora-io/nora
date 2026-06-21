@@ -100,7 +100,7 @@ See [full documentation](https://getnora.dev) for all registries.
 
 - **Web UI** — dashboard with search, browse, i18n (EN/RU)
 - **Proxy & Cache** — transparent proxy to upstream registries with local cache
-- **Curation** — blocklist, allowlist, namespace isolation, integrity verification, min-release-age filter
+- **Curation** — blocklist, allowlist, namespace isolation, integrity verification, min-release-age filter, digest quarantine
 - **Token RBAC** — read/write/admin roles, expiry tracking, deferred last_used flush
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
 - **Backup & Restore** — `nora backup` / `nora restore`
