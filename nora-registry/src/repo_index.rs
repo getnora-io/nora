@@ -969,8 +969,8 @@ mod tests {
     /// #738 A/B: an index rebuild must read size/mtime from the listing
     /// (`list_with_meta`) and NEVER issue a per-key `stat()` — which on S3 is a
     /// HEAD per key (N+1). A backend that counts `stat()` calls and serves the
-    /// metadata via `list_with_meta` proves the rebuild does ZERO stats (стало)
-    /// while still computing the correct on-disk size (было = one HEAD per key).
+    /// metadata via `list_with_meta` proves the rebuild now does ZERO stats
+    /// while still computing the correct on-disk size (the old path did one HEAD per key).
     #[tokio::test]
     async fn docker_index_uses_list_with_meta_not_per_key_stat() {
         use crate::storage::{FileMeta, StorageBackend};
@@ -1067,7 +1067,7 @@ mod tests {
 
         let repos = build_docker_index(&storage).await.expect("index built");
 
-        // стало: the rebuild made ZERO per-key stat() calls.
+        // After the fix: the rebuild made ZERO per-key stat() calls.
         assert_eq!(
             stat_calls.load(Ordering::SeqCst),
             0,
