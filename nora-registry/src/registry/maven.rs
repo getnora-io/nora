@@ -316,7 +316,7 @@ async fn download(
             state.activity.push(ActivityEntry::new(
                 ActionType::CacheHit,
                 artifact_name.clone(),
-                "maven",
+                crate::registry_type::RegistryType::Maven,
                 "CACHE",
             ));
             state
@@ -425,7 +425,7 @@ async fn download(
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
                     artifact_name,
-                    "maven",
+                    crate::registry_type::RegistryType::Maven,
                     "PROXY",
                 ));
                 state
@@ -632,7 +632,7 @@ async fn upload(
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 artifact_name,
-                "maven",
+                crate::registry_type::RegistryType::Maven,
                 "LOCAL",
             ));
             state.repo_index.invalidate("maven");
@@ -664,7 +664,7 @@ async fn upload(
                 state.activity.push(ActivityEntry::new(
                     ActionType::Push,
                     artifact_name,
-                    "maven",
+                    crate::registry_type::RegistryType::Maven,
                     "LOCAL",
                 ));
                 state.repo_index.invalidate("maven");

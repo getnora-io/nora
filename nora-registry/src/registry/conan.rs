@@ -172,7 +172,7 @@ async fn search(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("search:{}", query),
-                "conan",
+                crate::registry_type::RegistryType::Conan,
                 "PROXY",
             ));
             with_json(text.into_bytes())
@@ -428,7 +428,7 @@ async fn recipe_file_download(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
-            "conan",
+            crate::registry_type::RegistryType::Conan,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -494,7 +494,7 @@ async fn recipe_file_download(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
-                "conan",
+                crate::registry_type::RegistryType::Conan,
                 "PROXY",
             ));
             state
@@ -838,7 +838,7 @@ async fn package_file_download(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
-            "conan",
+            crate::registry_type::RegistryType::Conan,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -906,7 +906,7 @@ async fn package_file_download(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
-                "conan",
+                crate::registry_type::RegistryType::Conan,
                 "PROXY",
             ));
             state
@@ -1019,7 +1019,7 @@ async fn fetch_and_cache_json(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact.to_string(),
-                "conan",
+                crate::registry_type::RegistryType::Conan,
                 "PROXY",
             ));
             state
@@ -1106,7 +1106,7 @@ async fn fetch_and_cache_immutable_json(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact.to_string(),
-                "conan",
+                crate::registry_type::RegistryType::Conan,
                 "PROXY",
             ));
             state

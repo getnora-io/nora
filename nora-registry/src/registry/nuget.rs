@@ -209,7 +209,7 @@ async fn service_index(State(state): State<AppState>) -> Response {
     state.activity.push(ActivityEntry::new(
         ActionType::CacheHit,
         "service-index".to_string(),
-        "nuget",
+        crate::registry_type::RegistryType::Nuget,
         "LOCAL",
     ));
 
@@ -287,7 +287,7 @@ async fn search_query(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("search?{}", qs.chars().take(50).collect::<String>()),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
             with_json(rewritten.into_bytes())
@@ -380,7 +380,7 @@ async fn autocomplete_query(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("autocomplete?{}", qs.chars().take(50).collect::<String>()),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
             with_json(rewritten.into_bytes())
@@ -545,7 +545,7 @@ async fn registration_index(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 id_lower.clone(),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
             state
@@ -671,7 +671,7 @@ async fn registration_page(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/page/{}/{}", id_lower, lower, upper),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
 
@@ -816,7 +816,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/versions", id_lower),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
             state
@@ -938,7 +938,7 @@ async fn flatcontainer_download(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             format!("{}/{}", id_lower, filename),
-            "nuget",
+            crate::registry_type::RegistryType::Nuget,
             "CACHE",
         ));
 
@@ -1028,7 +1028,7 @@ async fn flatcontainer_download(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 format!("{}/{}", id_lower, filename),
-                "nuget",
+                crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
             state

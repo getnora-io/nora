@@ -367,7 +367,7 @@ async fn download_tarball(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             filename,
-            "ansible",
+            crate::registry_type::RegistryType::Ansible,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -434,7 +434,7 @@ async fn download_tarball(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 filename,
-                "ansible",
+                crate::registry_type::RegistryType::Ansible,
                 "PROXY",
             ));
             state
@@ -600,7 +600,7 @@ async fn proxy_json(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact_name.to_string(),
-                "ansible",
+                crate::registry_type::RegistryType::Ansible,
                 "PROXY",
             ));
             state

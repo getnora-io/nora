@@ -78,7 +78,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
                 state.activity.push(ActivityEntry::new(
                     ActionType::CacheHit,
                     filename.to_string(),
-                    "gems",
+                    crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
                 return with_binary(data.to_vec(), "application/gzip");
@@ -106,7 +106,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 filename.to_string(),
-                "gems",
+                crate::registry_type::RegistryType::Gems,
                 "PROXY",
             ));
             state
@@ -199,7 +199,7 @@ async fn compact_index(
                 state.activity.push(ActivityEntry::new(
                     ActionType::CacheHit,
                     name.clone(),
-                    "gems",
+                    crate::registry_type::RegistryType::Gems,
                     "CACHE",
                 ));
                 return with_text(data.to_vec());
@@ -284,7 +284,7 @@ async fn compact_index(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 name,
-                "gems",
+                crate::registry_type::RegistryType::Gems,
                 "PROXY",
             ));
             state
@@ -474,7 +474,7 @@ async fn download_gem(
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
-            "gems",
+            crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -535,7 +535,7 @@ async fn download_gem(
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
-                "gems",
+                crate::registry_type::RegistryType::Gems,
                 "PROXY",
             ));
             state
@@ -635,7 +635,7 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
         state.activity.push(ActivityEntry::new(
             ActionType::CacheHit,
             artifact,
-            "gems",
+            crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -699,7 +699,7 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
             state.activity.push(ActivityEntry::new(
                 ActionType::ProxyFetch,
                 artifact,
-                "gems",
+                crate::registry_type::RegistryType::Gems,
                 "PROXY",
             ));
             state

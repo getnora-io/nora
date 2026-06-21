@@ -92,9 +92,12 @@ async fn download(
     match state.storage.get_verified(&key).await {
         Ok(outcome) => {
             state.metrics.record_download("raw");
-            state
-                .activity
-                .push(ActivityEntry::new(ActionType::Pull, path, "raw", "LOCAL"));
+            state.activity.push(ActivityEntry::new(
+                ActionType::Pull,
+                path,
+                crate::registry_type::RegistryType::Raw,
+                "LOCAL",
+            ));
             state
                 .audit
                 .log(AuditEntry::new("pull", "api", "", "raw", ""));
@@ -262,9 +265,12 @@ async fn upload(
             state
                 .audit
                 .log(AuditEntry::new("push", "api", &path, "raw", ""));
-            state
-                .activity
-                .push(ActivityEntry::new(ActionType::Push, path, "raw", "LOCAL"));
+            state.activity.push(ActivityEntry::new(
+                ActionType::Push,
+                path,
+                crate::registry_type::RegistryType::Raw,
+                "LOCAL",
+            ));
             state.repo_index.invalidate("raw");
             StatusCode::CREATED.into_response()
         }
@@ -285,7 +291,7 @@ async fn do_overwrite(state: &AppState, key: &str, path: &str, body: &[u8]) -> R
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 path.to_string(),
-                "raw",
+                crate::registry_type::RegistryType::Raw,
                 "LOCAL",
             ));
             state

@@ -529,7 +529,7 @@ async fn download_archive(
         state.activity.push(ActivityEntry::new(
             ActionType::Pull,
             format!("{}@{}", package, version),
-            "pub",
+            crate::registry_type::RegistryType::PubDart,
             "LOCAL",
         ));
         state
@@ -616,7 +616,7 @@ async fn download_archive(
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
                 format!("{}@{}", package, version),
-                "pub",
+                crate::registry_type::RegistryType::PubDart,
                 "PROXY",
             ));
             state
