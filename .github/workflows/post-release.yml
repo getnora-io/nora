@@ -21,8 +21,10 @@ jobs:
 
       - name: Extract version from triggering tag
         id: ver
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          TAG="${{ github.event.workflow_run.head_branch }}"
+          TAG="${HEAD_BRANCH}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
