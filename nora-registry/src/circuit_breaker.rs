@@ -32,6 +32,33 @@ impl BreakerState {
             BreakerState::HalfOpen => 2,
         }
     }
+
+    /// Stable string used in the `/health` API. Mirrors the
+    /// `nora_circuit_breaker_state` gauge semantics (0=closed, 1=open,
+    /// 2=half_open) so operators see the same labels in both places.
+    fn as_health_str(self) -> &'static str {
+        match self {
+            BreakerState::Closed => "closed",
+            BreakerState::Open => "open",
+            BreakerState::HalfOpen => "half_open",
+        }
+    }
+}
+
+/// Read-only snapshot of one upstream's circuit-breaker state for the `/health`
+/// API. Built from cached in-memory state only — never triggers a live upstream
+/// probe, so the health endpoint stays fast and non-blocking.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct UpstreamHealth {
+    /// Breaker state: `closed` (healthy), `open` (failing fast), or
+    /// `half_open` (probing recovery). The caller reports `disabled` when the
+    /// circuit-breaker feature is off.
+    pub status: &'static str,
+    /// Accumulated consecutive-failure count (resets to 0 on success).
+    pub failure_count: u32,
+    /// Seconds since the most recent recorded failure, or `null` if the
+    /// upstream has not failed since startup.
+    pub last_failure_seconds_ago: Option<u64>,
 }
 
 /// Identifies the probe a caller was allowed to run, so a later
@@ -128,6 +155,30 @@ impl CircuitBreakerRegistry {
                 .with_label_values(&[name])
                 .set(BreakerState::Closed.as_gauge());
         }
+    }
+
+    /// Whether the circuit-breaker feature is enabled (it is disabled by
+    /// default). Used by `/health` to report `disabled` instead of a state.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Read-only health snapshot for `registry` from cached in-memory state.
+    ///
+    /// Never performs a live upstream probe, so it is safe to call from the
+    /// `/health` request path. Returns `None` when no breaker has been recorded
+    /// for `registry` yet (no proxy traffic since startup), which the caller
+    /// renders as a healthy `closed` default. The `last_failure` `Instant` is a
+    /// monotonic clock, so the snapshot reports *seconds ago* rather than a
+    /// wall-clock timestamp.
+    pub(crate) fn health_snapshot(&self, registry: &str) -> Option<UpstreamHealth> {
+        let breakers = self.breakers.read();
+        let breaker = breakers.get(registry)?;
+        Some(UpstreamHealth {
+            status: breaker.state.as_health_str(),
+            failure_count: breaker.failures,
+            last_failure_seconds_ago: breaker.last_failure.map(|t| t.elapsed().as_secs()),
+        })
     }
 
     /// Resolve the failure threshold for a given registry key, checking overrides first.
