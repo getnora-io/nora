@@ -65,6 +65,13 @@ curl -fsSL https://github.com/getnora-io/nora/releases/latest/download/nora-linu
 chmod +x nora && ./nora
 ```
 
+`./nora` listens on `127.0.0.1:4000`. To expose it on a network, set the bind
+address and the public URL clients should use for download links:
+
+```bash
+NORA_HOST=0.0.0.0 NORA_PUBLIC_URL=https://registry.example.com ./nora
+```
+
 ### Kubernetes (Helm)
 
 ```bash
