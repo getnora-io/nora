@@ -160,6 +160,8 @@ docker run -d -p 4000:4000 \
 - ~~NuGet V3 stabilization, Cargo ETag, 1049 tests~~ ✅ v0.9.1
 - ~~Prometheus metrics, Ansible Galaxy v3, security fixes, 1086 tests~~ ✅ v0.9.2
 - ~~Security hardening, null byte protection, config refactor, 1204 tests~~ ✅ v0.9.3
+- ~~Multi-upstream PyPI, conditional-request revalidation, single-flight coalescing, per-registry metrics~~ ✅ v0.9.4
+- ~~Digest quarantine across all registries, trusted upstream dates, token access-control hardening~~ ✅ v0.9.5
 - **Image Signing Policy** — cosign verification on upstream pulls
 - **Semver contract** — stable API, configuration format, and storage layout
 
