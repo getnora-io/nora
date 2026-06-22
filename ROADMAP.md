@@ -16,6 +16,8 @@ For completed milestones, see [CHANGELOG.md](CHANGELOG.md).
 - **v0.8.0** — Hash Pin Store, auth rate limiting, trusted proxies, Cache-Control
 - **v0.8.3** — Outbound HTTP/SOCKS5 proxy, structured audit log, 994 tests
 - **v0.9.0** — Circuit breaker, OIDC, hot reload, arm64, streaming uploads, Docker namespacing, metadata TTL, Cache-Control completeness
+- **v0.9.4** — Conditional-request revalidation, single-flight coalescing, per-registry observability, dual-stack IPv4+IPv6 bind, Docker Range pulls
+- **v0.9.5** — First-seen digest quarantine across all 11 proxy registries, release-age with trusted upstream dates, token access-control and Docker quarantine-bypass hardening ([#213](https://github.com/getnora-io/nora/issues/213))
 
 ## v1.0 — Stability
 
@@ -24,7 +26,6 @@ Focus: API stability guarantee and production confidence.
 - **Semver contract** — stable API, configuration format, and storage layout
 - **`nora integrity verify`** — CLI command to verify all stored artifacts against pinned hashes
 - **Migration guide** — upgrade path from any v0.x release
-- **Digest quarantine** — age-based hold for newly pushed Docker images ([#213](https://github.com/getnora-io/nora/issues/213))
 
 ## Post-1.0
 
@@ -34,7 +35,6 @@ These features are planned but not targeted for the initial stable release:
 - **`nora-migrate` CLI** — batch migration from Nexus, Artifactory, GitLab registries ([#172](https://github.com/getnora-io/nora/issues/172))
 - **Image signing policy** — cosign verification on upstream pulls
 - **Windows binary** ([#210](https://github.com/getnora-io/nora/issues/210))
-- **Docker min-release-age** — age-based filtering for container images
 - **npm search API** — full-text search across cached packages
 
 ## How to Influence the Roadmap
