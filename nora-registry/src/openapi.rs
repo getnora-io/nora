@@ -123,6 +123,7 @@ use crate::AppState;
             HealthResponse,
             StorageHealth,
             RegistriesHealth,
+            UpstreamHealthSchema,
             DashboardResponse,
             GlobalStats,
             RegistryCardStats,
@@ -158,6 +159,23 @@ pub struct HealthResponse {
     pub storage: StorageHealth,
     /// Registry health status
     pub registries: RegistriesHealth,
+    /// Per-upstream circuit-breaker state, keyed by registry name. Read from
+    /// cached state — `/health` never performs a live upstream probe.
+    pub upstreams: std::collections::HashMap<String, UpstreamHealthSchema>,
+}
+
+/// Circuit-breaker state for a single upstream registry, as surfaced in
+/// `/health`.
+#[derive(Serialize, ToSchema)]
+pub struct UpstreamHealthSchema {
+    /// `closed` (healthy), `open` (failing fast), `half_open` (probing
+    /// recovery), or `disabled` (circuit breaker turned off).
+    pub status: String,
+    /// Consecutive-failure count (resets to 0 on a successful fetch).
+    pub failure_count: u32,
+    /// Seconds since the most recent recorded failure, or `null` if the
+    /// upstream has not failed since startup.
+    pub last_failure_seconds_ago: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
