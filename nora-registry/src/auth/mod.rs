@@ -122,11 +122,16 @@ fn is_public_path(path: &str) -> bool {
         || path.starts_with("/api/ui")
 }
 
-/// Check if path is a Docker V2 auth challenge endpoint.
-/// Per Docker Registry V2 spec, /v2/ must return 401 with WWW-Authenticate
-/// header when auth is enabled, so Docker clients know to send credentials.
-fn is_docker_auth_challenge_path(path: &str) -> bool {
-    matches!(path, "/v2/" | "/v2")
+/// Check if a path belongs to the Docker/OCI registry (`/v2`, `/v2/…`).
+///
+/// Docker anonymous access is governed by `docker_anon_pull` (separate from
+/// the general `anonymous_read`), so all `/v2` paths are matched as one group:
+/// the `/v2/` auth-challenge ping and every manifest/blob/tag endpoint. Per the
+/// Docker Registry V2 spec, an unauthenticated `GET /v2/` returns 401 with a
+/// WWW-Authenticate header (so clients send credentials) UNLESS anonymous Docker
+/// pull is explicitly enabled.
+fn is_docker_path(path: &str) -> bool {
+    path == "/v2" || path.starts_with("/v2/")
 }
 
 /// Check if path is an admin-only control-plane endpoint.
@@ -188,6 +193,22 @@ fn extract_client_ip(
     Some(resolve_client_ip(peer, request.headers(), trusted_proxies))
 }
 
+/// Insert the anonymous identity (read-only role, unrestricted namespace) and
+/// run the downstream handler. Shared by the `anonymous_read` (non-Docker) and
+/// `docker_anon_pull` (Docker `/v2`) bypass paths.
+async fn anonymous_read_passthrough(mut request: Request<Body>, next: Next) -> Response {
+    request
+        .extensions_mut()
+        .insert(NamespaceAuthority::Unrestricted);
+    request
+        .extensions_mut()
+        .insert(AuthenticatedUser("anonymous".to_string()));
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRole(crate::tokens::Role::Read));
+    next.run(request).await
+}
+
 /// Auth middleware - supports Basic auth, Bearer tokens, and OIDC JWT
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -216,13 +237,17 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Docker V2 auth challenge: /v2/ must NOT bypass auth via anonymous_read.
-    // Per Docker Registry V2 spec, unauthenticated GET /v2/ must return 401
-    // with WWW-Authenticate header, so Docker clients send credentials on
-    // subsequent requests. If /v2/ returns 200 without auth, Docker assumes
-    // the registry is anonymous and never sends Authorization headers.
     let path = request.uri().path();
-    let is_docker_challenge = is_docker_auth_challenge_path(path);
+
+    // Docker/OCI paths (`/v2`, `/v2/…`) are governed by `docker_anon_pull`,
+    // NOT the general `anonymous_read`: anonymous Docker pull changes the `/v2/`
+    // auth-challenge handshake, so it is opted into explicitly and enabling
+    // anonymous Maven/raw/npm never silently exposes container images.
+    let is_docker = is_docker_path(path);
+
+    // `/v2/_catalog` enumerates every repository — never served anonymously, even
+    // under docker_anon_pull (anonymous pull-by-name is not list-all-repos).
+    let is_docker_catalog = path == "/v2/_catalog";
 
     // Token management always requires auth, even with anonymous_read
     let is_token_management = path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens");
@@ -234,30 +259,41 @@ pub async fn auth_middleware(
     // even under anonymous_read, and method-independent (covers a future GET).
     let is_admin = is_admin_path(path);
 
-    // Allow anonymous read if configured (but not for Docker /v2/, token management,
-    // whoami, or admin paths)
     let is_read_method = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
     );
+
+    // A request that presents credentials is always validated below (honest
+    // `docker login`, correct audit attribution) — never short-circuited to
+    // anonymous. Anonymous Docker bypass applies only when no Authorization sent.
+    let has_auth_header = request.headers().contains_key(header::AUTHORIZATION);
+
+    // Anonymous read for non-Docker registries (Maven/raw/npm/…) if configured.
+    // Token management, whoami, admin, and all Docker `/v2` paths are excluded.
     if state.config.auth.anonymous_read
         && is_read_method
-        && !is_docker_challenge
+        && !is_docker
         && !is_token_management
         && !is_whoami
         && !is_admin
     {
-        // Read requests allowed without auth
-        request
-            .extensions_mut()
-            .insert(NamespaceAuthority::Unrestricted);
-        request
-            .extensions_mut()
-            .insert(AuthenticatedUser("anonymous".to_string()));
-        request
-            .extensions_mut()
-            .insert(AuthenticatedRole(crate::tokens::Role::Read));
-        return next.run(request).await;
+        return anonymous_read_passthrough(request, next).await;
+    }
+
+    // Anonymous Docker/OCI pull, when explicitly enabled. The `/v2/` ping then
+    // returns 200 (so the client proceeds without a Basic challenge) and
+    // manifest/blob/tag reads are served without auth; writes (POST/PUT/PATCH/
+    // DELETE) are not read methods, so they fall through and still require auth.
+    // With the flag off (default), `/v2/` returns 401 + WWW-Authenticate: Basic
+    // so `docker login` works and the basic-auth-accepts-api-token contract holds.
+    if state.config.auth.docker_anon_pull
+        && is_read_method
+        && is_docker
+        && !is_docker_catalog
+        && !has_auth_header
+    {
+        return anonymous_read_passthrough(request, next).await;
     }
 
     // Compute realm from public_url for WWW-Authenticate header
@@ -549,13 +585,14 @@ mod tests {
         // Docker /v2/ must NOT be public — it needs auth challenge per V2 spec
         assert!(!is_public_path("/v2/"));
         assert!(!is_public_path("/v2"));
-        // But it IS a docker auth challenge path
-        assert!(is_docker_auth_challenge_path("/v2/"));
-        assert!(is_docker_auth_challenge_path("/v2"));
-        // Sub-paths are neither public nor docker challenge
-        assert!(!is_docker_auth_challenge_path(
-            "/v2/alpine/manifests/latest"
-        ));
+        // The /v2/ ping and all sub-paths are Docker registry paths, gated as a
+        // group by docker_anon_pull.
+        assert!(is_docker_path("/v2/"));
+        assert!(is_docker_path("/v2"));
+        assert!(is_docker_path("/v2/alpine/manifests/latest"));
+        // Non-Docker paths are not.
+        assert!(!is_docker_path("/raw/file.txt"));
+        assert!(!is_docker_path("/v2x/sneaky"));
     }
 
     #[test]
@@ -847,6 +884,147 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- #778: anonymous Docker pull via the `docker_anon_pull` opt-in ---
+
+    /// docker_anon_pull=true: the `GET /v2/` ping is served anonymously
+    /// (200, no challenge) so the Docker client proceeds without credentials.
+    #[tokio::test]
+    async fn test_docker_anon_pull_allows_v2_ping() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// docker_anon_pull=true: an anonymous manifest read passes the auth
+    /// gate and reaches the handler (404 for a missing tag, NOT 401).
+    #[tokio::test]
+    async fn test_docker_anon_pull_allows_manifest_read() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+        let response = send(&ctx.app, Method::GET, "/v2/alpine/manifests/latest", "").await;
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous manifest read must pass the auth gate under docker_anon_pull"
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// docker_anon_pull=true: writes are not read methods → still require
+    /// auth. The Docker handler does not self-check role, so the middleware is
+    /// the only write-stop — anonymous push/delete MUST be rejected.
+    #[tokio::test]
+    async fn test_docker_anon_pull_blocks_anonymous_writes() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+
+        // Start a blob upload (push) anonymously -> 401.
+        let response = send(&ctx.app, Method::POST, "/v2/alpine/blobs/uploads/", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Push a manifest anonymously -> 401.
+        let response = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/alpine/manifests/latest",
+            b"{}".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Delete a manifest anonymously -> 401.
+        let response = send(
+            &ctx.app,
+            Method::DELETE,
+            "/v2/alpine/manifests/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// docker_anon_pull=true must NOT break authenticated push: a write with
+    /// valid credentials starts the upload (202), exactly as without the flag.
+    #[tokio::test]
+    async fn test_docker_anon_pull_authenticated_push_still_works() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// docker_anon_pull=true: `/v2/_catalog` stays authenticated — anonymous
+    /// repository enumeration is not part of anonymous pull-by-name.
+    #[tokio::test]
+    async fn test_docker_anon_pull_catalog_requires_auth() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+
+        let response = send(&ctx.app, Method::GET, "/v2/_catalog", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/_catalog",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// docker_anon_pull=true: presented credentials are still validated —
+    /// the anonymous bypass applies only when no Authorization header is sent.
+    /// Wrong creds on the `/v2/` ping return 401 (honest `docker login`).
+    #[tokio::test]
+    async fn test_docker_anon_pull_validates_presented_credentials() {
+        let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
+
+        let bad = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &bad)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let good = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &good)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The general `anonymous_read` switch must NOT open Docker (#778): with
+    /// anonymous_read=true but docker_anon_pull=false, Docker `/v2` paths
+    /// still require auth, so exposing Maven/raw never exposes images.
+    #[tokio::test]
+    async fn test_anonymous_read_does_not_open_docker() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+
+        // /v2/ ping still challenges.
+        let response = send(&ctx.app, Method::GET, "/v2/", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Manifest read still requires auth — the general flag does not open Docker.
+        let response = send(&ctx.app, Method::GET, "/v2/alpine/manifests/latest", "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// When auth is disabled, /v2/ should pass through normally

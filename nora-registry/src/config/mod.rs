@@ -426,6 +426,15 @@ impl Config {
                  (writes still require a token); ensure this is intended for this deployment."
             );
         }
+        // Independent of anonymous_read: anonymous Docker pull serves container
+        // images to anyone (push still requires auth). Surface it on its own.
+        if self.auth.enabled && self.auth.docker_anon_pull {
+            tracing::warn!(
+                "auth.docker_anon_pull=true — Docker/OCI images are served on anonymous \
+                 `docker pull` without authentication (push still requires a token); ensure this \
+                 is intended for this deployment."
+            );
+        }
     }
 
     /// Collect all configured upstream hostnames for leak detection (#386).
@@ -1103,6 +1112,57 @@ mod tests {
         config.apply_env_overrides().unwrap();
         assert!(config.auth.anonymous_read);
         std::env::remove_var("NORA_AUTH_ANONYMOUS_READ");
+    }
+
+    #[test]
+    fn test_docker_anon_pull_defaults_false() {
+        // Fail-closed: absent from config => off, and independent of anonymous_read.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            anonymous_read = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.anonymous_read);
+        assert!(
+            !config.auth.docker_anon_pull,
+            "docker_anon_pull must NOT be implied by anonymous_read"
+        );
+    }
+
+    #[test]
+    fn test_docker_anon_pull_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            docker_anon_pull = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.docker_anon_pull);
+        assert!(!config.auth.anonymous_read);
+    }
+
+    #[test]
+    fn test_env_override_docker_anon_pull() {
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_DOCKER_ANON_PULL", "true");
+        config.apply_env_overrides().unwrap();
+        assert!(config.auth.docker_anon_pull);
+        std::env::remove_var("NORA_AUTH_DOCKER_ANON_PULL");
     }
 
     #[test]
