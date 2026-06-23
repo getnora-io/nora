@@ -150,9 +150,36 @@ impl<'de> Deserialize<'de> for TrustedProxies {
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Allow anonymous read access (pull/download without auth, push requires auth)
+    /// Allow anonymous read access (pull/download without auth, push requires auth).
+    /// Governs all registries EXCEPT Docker/OCI — Docker has its own
+    /// `docker_anon_pull` switch (see below), because anonymous Docker pull
+    /// changes the `/v2/` auth-challenge handshake and must be opted into
+    /// explicitly so enabling anonymous Maven/raw/npm never silently exposes
+    /// container images.
     #[serde(default)]
     pub anonymous_read: bool,
+    /// Allow anonymous Docker/OCI pull (`docker pull` without `docker login`).
+    ///
+    /// Default `false` (fail-closed). Separate from `anonymous_read`: the general
+    /// switch does NOT open Docker, so an operator can serve Maven/raw anonymously
+    /// while keeping images private.
+    ///
+    /// When `true`, the `GET /v2/` ping returns `200` (no auth challenge) so the
+    /// Docker client proceeds anonymously; manifest/blob/tag reads are served
+    /// without auth. Writes (push/delete) are unaffected and still require auth.
+    /// `GET /v2/_catalog` (cross-repo enumeration) stays authenticated — it is
+    /// not part of anonymous pull. Per-image reads needed to resolve a known
+    /// name (manifests, blobs, and `tags/list`) ARE served anonymously. A request
+    /// that DOES carry an `Authorization` header is always validated (honest
+    /// `docker login`, correct audit attribution) rather than treated as anonymous.
+    ///
+    /// Limitation: clients built on `containers/image` (skopeo/podman/buildah)
+    /// read auth parameters only from the `/v2/` ping, so with the ping returning
+    /// `200` their *authenticated* operations degrade (anonymous pull still
+    /// works). Upgrade path for scoped anonymous access: a Docker Bearer-token
+    /// endpoint. ENV: NORA_AUTH_DOCKER_ANON_PULL.
+    #[serde(default)]
+    pub docker_anon_pull: bool,
     #[serde(default = "default_htpasswd_file")]
     pub htpasswd_file: String,
     #[serde(default = "default_token_storage")]
@@ -333,6 +360,7 @@ impl Default for AuthConfig {
         Self {
             enabled: false,
             anonymous_read: false,
+            docker_anon_pull: false,
             htpasswd_file: "users.htpasswd".to_string(),
             token_storage: "data/tokens".to_string(),
             token_cache_ttl: 300,
@@ -351,6 +379,9 @@ impl AuthConfig {
         }
         if let Ok(val) = env::var("NORA_AUTH_ANONYMOUS_READ") {
             self.anonymous_read = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_DOCKER_ANON_PULL") {
+            self.docker_anon_pull = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_AUTH_HTPASSWD_FILE") {
             self.htpasswd_file = val;

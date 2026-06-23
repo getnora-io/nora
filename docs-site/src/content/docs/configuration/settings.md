@@ -57,7 +57,8 @@ These are standard environment variables — not prefixed with `NORA_`. See [Out
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NORA_AUTH_ENABLED` | `false` | Enable authentication |
-| `NORA_AUTH_ANONYMOUS_READ` | `false` | Allow unauthenticated read (pull) access |
+| `NORA_AUTH_ANONYMOUS_READ` | `false` | Allow unauthenticated read (pull) for non-Docker registries (Maven, npm, raw, …). Does **not** open Docker |
+| `NORA_AUTH_DOCKER_ANON_PULL` | `false` | Allow unauthenticated `docker pull` (separate, fail-closed switch — see [Anonymous Docker pull](/configuration/authentication/#anonymous-docker-pull)) |
 | `NORA_AUTH_HTPASSWD_FILE` | `users.htpasswd` | Path to htpasswd file |
 | `NORA_AUTH_TOKEN_STORAGE` | `data/tokens` | Directory for API token storage |
 | `NORA_AUTH_TRUSTED_PROXIES` | `127.0.0.1,::1` | Comma-separated IPs/CIDRs whose `X-Forwarded-For` is trusted |
@@ -308,7 +309,8 @@ s3_region = "us-east-1"
 # =============================================================================
 [auth]
 enabled = false
-anonymous_read = false
+anonymous_read = false        # non-Docker registries only (Maven/npm/raw/…)
+docker_anon_pull = false # separate fail-closed switch for `docker pull`
 htpasswd_file = "users.htpasswd"
 token_storage = "data/tokens"
 # trusted_proxies = "127.0.0.1,::1"  # IPs/CIDRs whose X-Forwarded-For is trusted

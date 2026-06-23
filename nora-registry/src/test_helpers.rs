@@ -57,6 +57,14 @@ pub fn create_test_context_with_anonymous_read(users: &[(&str, &str)]) -> TestCo
     build_context(true, users, true, |_| {})
 }
 
+/// Build a test context with auth + `docker_anon_pull` (general
+/// `anonymous_read` left OFF, to prove Docker is governed by its own switch).
+pub fn create_test_context_with_docker_anon_pull(users: &[(&str, &str)]) -> TestContext {
+    build_context(true, users, false, |cfg| {
+        cfg.auth.docker_anon_pull = true;
+    })
+}
+
 /// Build a test context with raw storage **disabled**.
 pub fn create_test_context_with_raw_disabled() -> TestContext {
     build_context(false, &[], false, |cfg| cfg.raw.enabled = false)
@@ -160,6 +168,7 @@ fn build_context(
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
+            docker_anon_pull: false,
             htpasswd_file: String::new(),
             token_storage: tempdir.path().join("tokens").to_str().unwrap().to_string(),
             token_cache_ttl: 300,

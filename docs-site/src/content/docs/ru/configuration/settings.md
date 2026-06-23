@@ -46,7 +46,8 @@ NORA использует многоуровневую модель конфиг
 | Переменная | По умолчанию | Описание |
 |----------|---------|-------------|
 | `NORA_AUTH_ENABLED` | `false` | Включить аутентификацию |
-| `NORA_AUTH_ANONYMOUS_READ` | `false` | Разрешить неаутентифицированный доступ на чтение (pull) |
+| `NORA_AUTH_ANONYMOUS_READ` | `false` | Анонимное чтение (pull) для не-Docker реестров (Maven, npm, raw, …). Docker **не** открывает |
+| `NORA_AUTH_DOCKER_ANON_PULL` | `false` | Анонимный `docker pull` (отдельный fail-closed переключатель — см. [Анонимный docker pull](/ru/configuration/authentication/#анонимный-docker-pull)) |
 | `NORA_AUTH_HTPASSWD_FILE` | `users.htpasswd` | Путь к файлу htpasswd |
 | `NORA_AUTH_TOKEN_STORAGE` | `data/tokens` | Директория для хранения API-токенов |
 
@@ -267,7 +268,8 @@ s3_region = "us-east-1"
 # =============================================================================
 [auth]
 enabled = false
-anonymous_read = false
+anonymous_read = false        # только не-Docker реестры (Maven/npm/raw/…)
+docker_anon_pull = false # отдельный fail-closed переключатель для `docker pull`
 htpasswd_file = "users.htpasswd"
 token_storage = "data/tokens"
 

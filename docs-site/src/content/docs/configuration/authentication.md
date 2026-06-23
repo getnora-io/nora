@@ -125,6 +125,48 @@ This is useful for organizations that want open read access (e.g., shared librar
 | Push / Upload | Auth required | Auth required |
 | Delete / Admin | Auth required | Auth required |
 
+:::note
+`anonymous_read` governs every registry **except Docker/OCI**. Anonymous `docker pull` is a separate, opt-in switch — see below. Enabling `anonymous_read` therefore never exposes your container images.
+:::
+
+---
+
+## Anonymous Docker pull
+
+Anonymous `docker pull` is controlled by its **own** switch, `docker_anon_pull`, which defaults to `false` (fail-closed) and is independent of `anonymous_read`:
+
+```bash
+export NORA_AUTH_ENABLED=true
+export NORA_AUTH_DOCKER_ANON_PULL=true
+```
+
+```toml
+# config.toml
+[auth]
+enabled = true
+docker_anon_pull = true
+```
+
+A separate switch is required because anonymous Docker pull changes the `/v2/` auth-challenge handshake: when enabled, the `GET /v2/` ping returns `200` (no `WWW-Authenticate` challenge) so the Docker client proceeds without credentials. With it **off** (the default), `GET /v2/` returns `401` with a Basic challenge.
+
+With only `anonymous_read=true` (and `docker_anon_pull` off), the outcome of a logged-out `docker pull` depends on the client's image store: Docker's **containerd** image store tolerates the `/v2/` challenge and pulls anonymously, while the **classic** docker/distribution store caches the Basic challenge and aborts with `no basic auth credentials`. Setting `docker_anon_pull=true` makes anonymous pull work uniformly for both, and gates it behind one explicit switch.
+
+> **Upgrading:** if you relied on `anonymous_read=true` for anonymous `docker pull` (this only worked on the containerd image store), set `docker_anon_pull=true` to keep it — `anonymous_read` no longer opens any `/v2` path.
+
+| Docker operation | `docker_anon_pull = false` | `docker_anon_pull = true` |
+|------------------|--------------------------------|--------------------------------|
+| `docker pull` (logged out) | Auth required | No auth needed |
+| `docker push` | Auth required | Auth required |
+| `GET /v2/_catalog` (repo listing) | Auth required | Auth required |
+| Delete | Auth required | Auth required |
+
+Notes:
+
+- **Push is unaffected.** Writes always require authentication; `docker login` followed by `docker push` works exactly as before.
+- **`/v2/_catalog` stays authenticated** even with the switch on — anonymous pull-by-name does not include enumerating every repository.
+- **Presented credentials are still validated.** A request that carries an `Authorization` header is authenticated normally (so `docker login -u token -p <nra_…>` keeps working and audit logs attribute the real user); the anonymous path applies only when no credentials are sent.
+- **Client limitation.** Clients built on [`containers/image`](https://github.com/containers/image) (skopeo, podman, buildah) read auth parameters only from the `/v2/` ping. With the ping returning `200`, their *anonymous pull* works but their *authenticated* operations may fail. `docker`, `oras`, `nerdctl` and containerd are unaffected. If you need both anonymous pull and authenticated operations for the `containers/image` family, keep `docker_anon_pull=false`.
+
 ---
 
 ## OIDC Workload Identity
