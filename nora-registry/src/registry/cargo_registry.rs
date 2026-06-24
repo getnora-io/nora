@@ -56,7 +56,9 @@ async fn index_config(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
     let config = serde_json::json!({
         "dl": format!("{}/cargo/api/v1/crates", base),
-        "api": format!("{}/cargo/api", base)
+        // Cargo appends `/api/v1/...` to this base for write and metadata requests,
+        // so the advertised API root must be the registry mount, not `/cargo/api`.
+        "api": format!("{}/cargo", base)
     });
     (
         StatusCode::OK,
@@ -1160,8 +1162,8 @@ mod integration_tests {
             dl
         );
         assert!(
-            api.ends_with("/cargo/api"),
-            "api must end with /cargo/api so {{api}}/v1/crates/{{name}} matches routes, got: {}",
+            api.ends_with("/cargo"),
+            "api must end with /cargo so Cargo can build {{api}}/api/v1/crates/... routes, got: {}",
             api
         );
     }
