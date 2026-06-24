@@ -1170,7 +1170,7 @@ mod integration_tests {
 
     /// Verify that config.json `api` field produces correct metadata route (#442).
     ///
-    /// Cargo constructs `{api}/v1/crates/{name}` for metadata requests.
+    /// Cargo constructs `{api}/api/v1/crates/{name}` for metadata requests.
     /// The `api` field must match the route prefix so requests don't 404.
     #[tokio::test]
     async fn test_cargo_config_api_routes_to_metadata() {
@@ -1190,9 +1190,9 @@ mod integration_tests {
         let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap();
         let api_url = config["api"].as_str().unwrap();
 
-        // Construct the metadata URL the way Cargo does: {api}/v1/crates/{name}
+        // Construct the metadata URL the way Cargo does: {api}/api/v1/crates/{name}
         let metadata_path = format!(
-            "{}/v1/crates/serde",
+            "{}/api/v1/crates/serde",
             api_url.trim_start_matches("http://localhost")
         );
 
