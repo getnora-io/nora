@@ -56,7 +56,9 @@ async fn index_config(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
     let config = serde_json::json!({
         "dl": format!("{}/cargo/api/v1/crates", base),
-        "api": format!("{}/cargo/api", base)
+        // Cargo appends `/api/v1/...` to this base for write and metadata requests,
+        // so the advertised API root must be the registry mount, not `/cargo/api`.
+        "api": format!("{}/cargo", base)
     });
     (
         StatusCode::OK,
@@ -1160,15 +1162,15 @@ mod integration_tests {
             dl
         );
         assert!(
-            api.ends_with("/cargo/api"),
-            "api must end with /cargo/api so {{api}}/v1/crates/{{name}} matches routes, got: {}",
+            api.ends_with("/cargo"),
+            "api must end with /cargo so Cargo can build {{api}}/api/v1/crates/... routes, got: {}",
             api
         );
     }
 
     /// Verify that config.json `api` field produces correct metadata route (#442).
     ///
-    /// Cargo constructs `{api}/v1/crates/{name}` for metadata requests.
+    /// Cargo constructs `{api}/api/v1/crates/{name}` for metadata requests.
     /// The `api` field must match the route prefix so requests don't 404.
     #[tokio::test]
     async fn test_cargo_config_api_routes_to_metadata() {
@@ -1188,9 +1190,9 @@ mod integration_tests {
         let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap();
         let api_url = config["api"].as_str().unwrap();
 
-        // Construct the metadata URL the way Cargo does: {api}/v1/crates/{name}
+        // Construct the metadata URL the way Cargo does: {api}/api/v1/crates/{name}
         let metadata_path = format!(
-            "{}/v1/crates/serde",
+            "{}/api/v1/crates/serde",
             api_url.trim_start_matches("http://localhost")
         );
 
@@ -1199,6 +1201,43 @@ mod integration_tests {
             resp.status(),
             StatusCode::OK,
             "metadata request via config.json api field must not 404 (#442)"
+        );
+    }
+
+    /// Verify that config.json `api` field produces the correct publish route.
+    ///
+    /// Cargo constructs `{api}/api/v1/crates/new` for publish requests.
+    /// The advertised `api` base must therefore be the registry mount (`/cargo`),
+    /// not `/cargo/api`, or the client will hit `/cargo/api/api/v1/crates/new`.
+    #[tokio::test]
+    async fn test_cargo_config_api_routes_to_publish() {
+        let ctx = create_test_context();
+
+        // Get config.json to extract the api field
+        let config_resp = send(&ctx.app, Method::GET, "/cargo/index/config.json", "").await;
+        let config_body = body_bytes(config_resp).await;
+        let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap();
+        let api_url = config["api"].as_str().unwrap();
+
+        // Construct the publish URL the way Cargo does: {api}/api/v1/crates/new
+        let publish_path = format!(
+            "{}/api/v1/crates/new",
+            api_url.trim_start_matches("http://localhost")
+        );
+
+        let metadata = serde_json::json!({
+            "name": "publish-from-config",
+            "vers": "0.1.0",
+            "deps": [],
+            "features": {},
+        });
+        let payload = build_publish_payload(&metadata, b"crate-data");
+
+        let resp = send(&ctx.app, Method::PUT, &publish_path, Body::from(payload)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "publish request via config.json api field must not 404"
         );
     }
 
