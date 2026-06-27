@@ -25,14 +25,14 @@ The `registry` label is derived from the request path:
 | `/simple*`, `/packages*` | `pypi` |
 | `/maven2*` | `maven` |
 | `/cargo*` | `cargo` |
-| `/go/*` | `go` |
-| `/raw/*` | `raw` |
-| `/gems/*` | `gems` |
-| `/terraform/*` | `terraform` |
-| `/ansible/*` | `ansible` |
-| `/nuget/*` | `nuget` |
-| `/pub/*` | `pub` |
-| `/conan/*` | `conan` |
+| `/go*` | `go` |
+| `/raw*` | `raw` |
+| `/gems*` | `gems` |
+| `/terraform*` | `terraform` |
+| `/ansible*` | `ansible` |
+| `/nuget*` | `nuget` |
+| `/pub*` | `pub` |
+| `/conan*` | `conan` |
 | `/ui*` | `ui` |
 | *(other paths)* | `other` |
 
