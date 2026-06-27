@@ -110,7 +110,7 @@ while IFS=: read -r file line content; do
     fi
 done < <(grep -rn '_ => None\|_ => {\s*None' \
     "$REPO_ROOT/nora-registry/src/storage/" \
-    "$REPO_ROOT/nora-registry/src/handlers/" \
+    "$REPO_ROOT/nora-registry/src/registry/" \
     2>/dev/null || true)
 
 if [ "$SILENT_ERRORS" -eq 0 ]; then
