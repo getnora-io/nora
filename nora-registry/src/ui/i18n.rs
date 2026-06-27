@@ -10,12 +10,14 @@ pub enum Lang {
     #[default]
     En,
     Ru,
+    Zh,
 }
 
 impl Lang {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "ru" | "rus" | "russian" => Lang::Ru,
+            "zh" | "zho" | "chs" | "chinese" => Lang::Zh,
             _ => Lang::En,
         }
     }
@@ -24,6 +26,7 @@ impl Lang {
         match self {
             Lang::En => "en",
             Lang::Ru => "ru",
+            Lang::Zh => "zh",
         }
     }
 }
@@ -143,6 +146,7 @@ pub fn get_translations(lang: Lang) -> &'static Translations {
     match lang {
         Lang::En => &TRANSLATIONS_EN,
         Lang::Ru => &TRANSLATIONS_RU,
+        Lang::Zh => &TRANSLATIONS_ZH,
     }
 }
 
@@ -362,4 +366,113 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     no_more_items: "На этой странице больше нет элементов",
     one_file: "1 файл",
     items: "Файлы",
+};
+
+pub static TRANSLATIONS_ZH: Translations = Translations {
+    // Navigation
+    nav_dashboard: "仪表盘",
+    nav_registries: "注册表",
+
+    // Dashboard
+    dashboard_title: "仪表盘",
+    dashboard_subtitle: "所有注册表概览",
+    uptime: "运行时间",
+
+    // Stats
+    stat_downloads: "下载量",
+    stat_uploads: "上传量",
+    stat_artifacts: "制品数",
+    stat_cache_hit: "缓存命中",
+    stat_storage: "存储",
+    stats_since_restart: "自重启以来",
+
+    // Registry cards
+    active: "活跃",
+    artifacts: "制品",
+    size: "大小",
+    downloads: "下载",
+    uploads: "上传",
+
+    // Mount points
+    mount_points: "挂载点",
+    registry: "注册表",
+    mount_path: "挂载路径",
+    proxy_upstream: "代理上游",
+
+    // Activity
+    recent_activity: "最近活动",
+    last_n_events: "最近 20 条事件",
+    time: "时间",
+    action: "操作",
+    artifact: "制品",
+    source: "来源",
+    no_activity: "暂无最近活动",
+
+    // Relative time
+    just_now: "刚刚",
+    min_ago: "分钟前",
+    mins_ago: "分钟前",
+    hour_ago: "小时前",
+    hours_ago: "小时前",
+    day_ago: "天前",
+    days_ago: "天前",
+
+    // Registry pages
+    repositories: "个仓库",
+    search_placeholder: "搜索仓库...",
+    no_repos_found: "未找到仓库",
+    push_first_artifact: "推送您的第一个制品即可在此查看",
+    name: "名称",
+    tags: "标签",
+    versions: "版本",
+    updated: "更新于",
+
+    // Detail pages
+    pull_command: "拉取命令",
+    install_command: "安装命令",
+    maven_dependency: "Maven 依赖",
+    total: "共",
+    created: "创建于",
+    published: "发布于",
+    filename: "文件名",
+    files: "个文件",
+
+    // Bragging footer
+    built_for_speed: "为速度而生",
+    docker_image: "Docker 镜像",
+    cold_start: "冷启动",
+    memory: "内存",
+    registries_count: "注册表",
+    multi_arch: "多架构",
+    zero_config: "零配置",
+    tagline: "纯 Rust 实现。单二进制文件。兼容 OCI。",
+
+    // Token management
+    nav_admin: "管理",
+    nav_tokens: "令牌",
+    token_management: "令牌管理",
+    token_management_subtitle: "创建和管理用于程序化访问的 API 令牌",
+    token_create: "创建令牌",
+    token_revoke: "撤销",
+    token_revoke_confirm: "确定要撤销此令牌吗？",
+    token_description: "描述",
+    token_description_placeholder: "例如 CI/CD 流水线",
+    token_role: "角色",
+    token_ttl: "有效期",
+    token_ttl_days: "天",
+    token_created_success: "令牌创建成功。请立即复制 — 它将不再显示。",
+    token_created_warning: "此令牌将不再显示。请妥善保管。",
+    token_copy: "复制",
+    token_no_tokens: "暂无令牌。创建一个即可开始使用。",
+    token_user: "用户",
+    token_expires: "过期时间",
+    token_last_used: "最后使用",
+    token_never_used: "从未使用",
+
+    // Pagination
+    showing_range: "显示第 {start}-{end} 项，共 {total} 项",
+    showing_all: "显示全部 {count} 项",
+    no_more_items: "此页没有更多项目了",
+    one_file: "1 个文件",
+    items: "文件",
 };
