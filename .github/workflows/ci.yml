@@ -133,7 +133,10 @@ jobs:
       - name: Update coverage badge
         # Badge needs the GIST_TOKEN secret and only makes sense for the
         # canonical branch — skip on PRs (incl. forks without secrets).
+        # Cosmetic: a stale/expired GIST_TOKEN (e.g. a 401) must not fail the
+        # Coverage gate — the real fail-under check is the "Run coverage" step.
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        continue-on-error: true
         uses: schneegans/dynamic-badges-action@0e50b8bad39e7e1afd3e4e9c2b7dd145fad07501 # v1.8.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}
