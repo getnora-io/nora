@@ -394,12 +394,19 @@ pub fn sidebar_dark_with_registries(
 
 /// Dark theme header with language switcher
 fn header_dark(lang: Lang) -> String {
-    let (en_class, ru_class) = match lang {
+    let (en_class, ru_class, zh_class) = match lang {
         Lang::En => (
             "text-white font-semibold",
             "text-slate-400 hover:text-slate-200",
+            "text-slate-400 hover:text-slate-200",
         ),
         Lang::Ru => (
+            "text-slate-400 hover:text-slate-200",
+            "text-white font-semibold",
+            "text-slate-400 hover:text-slate-200",
+        ),
+        Lang::Zh => (
+            "text-slate-400 hover:text-slate-200",
             "text-slate-400 hover:text-slate-200",
             "text-white font-semibold",
         ),
@@ -424,6 +431,8 @@ fn header_dark(lang: Lang) -> String {
                     <button onclick="setLang('en')" class="px-3 py-1.5 {} transition-colors">EN</button>
                     <span class="text-slate-600">|</span>
                     <button onclick="setLang('ru')" class="px-3 py-1.5 {} transition-colors">RU</button>
+                    <span class="text-slate-600">|</span>
+                    <button onclick="setLang('zh')" class="px-3 py-1.5 {} transition-colors">中文</button>
                 </div>
                 <a href="https://github.com/getnora-io/nora" target="_blank" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg">
                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
@@ -438,7 +447,7 @@ fn header_dark(lang: Lang) -> String {
             </div>
         </header>
     "##,
-        en_class, ru_class
+        en_class, ru_class, zh_class
     )
 }
 
