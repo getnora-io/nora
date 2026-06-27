@@ -114,4 +114,4 @@ scrape_configs:
 
 - [Settings](/configuration/settings/) — server configuration reference (the `/metrics` endpoint is always enabled)
 - [Circuit Breaker](/configuration/circuit-breaker/) — breaker metrics details
-- [Upgrade Guide](/deployment/upgrade-guide/) — new metrics in v0.9
+- [Upgrade Guide](/deployment/upgrade-guide/) — metric changes across releases
