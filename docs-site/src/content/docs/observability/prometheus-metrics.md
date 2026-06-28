@@ -16,24 +16,26 @@ curl http://localhost:4000/metrics
 | `nora_http_requests_total` | Counter | `registry`, `method`, `status` | Total HTTP requests processed |
 | `nora_http_request_duration_seconds` | Histogram | `registry`, `method` | Request latency (buckets: 1ms to 10s) |
 
-The `registry` label is derived from the request path:
+The `registry` label is derived from the request path by literal prefix
+match (the first matching prefix wins, top to bottom). The trailing slash is
+significant where shown — e.g. `/go/` matches but `/goblin` does not:
 
-| Path prefix | Label |
-|-------------|-------|
-| `/v2*` | `docker` |
-| `/npm*` | `npm` |
-| `/simple*`, `/packages*` | `pypi` |
-| `/maven2*` | `maven` |
-| `/cargo*` | `cargo` |
-| `/go/*` | `go` |
-| `/raw/*` | `raw` |
-| `/gems/*` | `gems` |
-| `/terraform/*` | `terraform` |
-| `/ansible/*` | `ansible` |
-| `/nuget/*` | `nuget` |
-| `/pub/*` | `pub` |
-| `/conan/*` | `conan` |
-| `/ui*` | `ui` |
+| Path prefix (`starts_with`) | Label |
+|-----------------------------|-------|
+| `/v2` | `docker` |
+| `/npm` | `npm` |
+| `/simple`, `/packages` | `pypi` |
+| `/maven2` | `maven` |
+| `/cargo` | `cargo` |
+| `/go/` | `go` |
+| `/raw/` | `raw` |
+| `/gems/` | `gems` |
+| `/terraform/` | `terraform` |
+| `/ansible/` | `ansible` |
+| `/nuget/` | `nuget` |
+| `/pub/` | `pub` |
+| `/conan/` | `conan` |
+| `/ui` | `ui` |
 | *(other paths)* | `other` |
 
 ## Cache metrics
@@ -114,4 +116,4 @@ scrape_configs:
 
 - [Settings](/configuration/settings/) — server configuration reference (the `/metrics` endpoint is always enabled)
 - [Circuit Breaker](/configuration/circuit-breaker/) — breaker metrics details
-- [Upgrade Guide](/deployment/upgrade-guide/) — new metrics in v0.9
+- [Upgrade Guide](/deployment/upgrade-guide/) — metric changes across releases
