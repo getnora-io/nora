@@ -1,5 +1,24 @@
 #![deny(clippy::unwrap_used)]
 #![forbid(unsafe_code)]
+// Test code is linted under `--all-targets` but is not held to the production
+// restriction/style lints: `.unwrap()`/`.expect()` are idiomatic in tests, and
+// the small style nits (redundant clone/field names, `>= x + 1`, etc.) are not
+// worth contorting assertions over. Scoped to `cfg(test)` so production keeps
+// the strict profile (incl. the workspace `redundant_clone = deny`).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::redundant_clone,
+        clippy::int_plus_one,
+        clippy::field_reassign_with_default,
+        clippy::unnecessary_get_then_check,
+        clippy::single_match,
+        clippy::redundant_field_names,
+        clippy::len_zero,
+        clippy::items_after_test_module
+    )
+)]
 //! NORA Registry — library interface for fuzzing and testing
 
 pub mod validation;
