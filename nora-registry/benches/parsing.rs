@@ -1,7 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use nora_registry::validation::{
     validate_digest, validate_docker_name, validate_docker_reference, validate_storage_key,
 };
+use std::hint::black_box;
 
 fn bench_validation(c: &mut Criterion) {
     let mut group = c.benchmark_group("validation");

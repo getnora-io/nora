@@ -17,7 +17,7 @@ fmt:
 	$(CARGO) fmt --check
 
 clippy:
-	$(CARGO) clippy -- -D warnings
+	$(CARGO) clippy --all-targets -- -D warnings
 
 test:
 	$(CARGO) test --lib --bin nora

@@ -3,6 +3,22 @@
 #![deny(clippy::unwrap_used)]
 #![forbid(unsafe_code)]
 #![warn(clippy::large_stack_frames, clippy::large_futures)]
+// Test code is linted under `--all-targets` but is not held to the production
+// restriction/style lints (see lib.rs for rationale). Scoped to `cfg(test)`.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::redundant_clone,
+        clippy::int_plus_one,
+        clippy::field_reassign_with_default,
+        clippy::unnecessary_get_then_check,
+        clippy::single_match,
+        clippy::redundant_field_names,
+        clippy::len_zero,
+        clippy::items_after_test_module
+    )
+)]
 mod activity_log;
 mod admin;
 mod audit;

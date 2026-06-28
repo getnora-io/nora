@@ -79,7 +79,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --package nora-registry -- -D warnings
+        run: cargo clippy --package nora-registry --all-targets -- -D warnings
 
       - name: Run tests
         run: cargo test --package nora-registry
