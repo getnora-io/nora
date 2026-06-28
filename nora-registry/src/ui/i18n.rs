@@ -20,7 +20,10 @@ impl Lang {
         // suffix so BCP-47 / POSIX tags ("zh-CN", "zh-Hans", "ru_RU.UTF-8")
         // resolve the same as their bare code. Simplified Chinese is the only
         // Chinese variant available, so every "zh*" tag maps to it.
-        let primary = lower.split(['-', '_']).next().unwrap_or(&lower);
+        let primary = lower
+            .split(['-', '_'])
+            .next()
+            .expect("str::split always yields at least one segment");
         match primary {
             "ru" | "rus" | "russian" => Lang::Ru,
             "zh" | "zho" | "chs" | "chinese" => Lang::Zh,

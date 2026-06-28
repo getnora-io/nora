@@ -32,6 +32,28 @@ use axum::{
 use sha2::Digest;
 use std::time::Duration;
 
+/// Resolve the effective quarantine mode and TTL for the cargo registry,
+/// falling back to the global curation settings when no cargo-specific
+/// override is configured. Extracted so the two cargo proxy paths stay in sync.
+fn resolve_cargo_quarantine_config(
+    state: &AppState,
+) -> (crate::digest_quarantine::QuarantineMode, i64) {
+    crate::digest_quarantine::resolve_global(
+        state.config.curation.cargo.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .cargo
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    )
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/cargo/index/config.json", get(index_config))
@@ -215,7 +237,7 @@ async fn sparse_index(
             // Upstream unreachable — serve the stale cached index if we have one (graceful).
             if let Some(ref data) = cached {
                 tracing::warn!(
-                    crate_name = crate_name,
+                    crate_name,
                     "Cargo upstream failed, serving stale cached index"
                 );
                 let mut response = sparse_index_conditional(data.to_vec(), &headers);
@@ -230,7 +252,7 @@ async fn sparse_index(
                 ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
                 _ => {
                     tracing::debug!(
-                        crate_name = crate_name,
+                        crate_name,
                         error = ?e,
                         "Cargo sparse index upstream error"
                     );
@@ -445,20 +467,7 @@ async fn download(
         state
             .audit
             .log(AuditEntry::new("pull", "api", "", "cargo", ""));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.cargo.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .cargo
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
+        let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "cargo",
@@ -533,20 +542,7 @@ async fn download(
             state
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.cargo.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .cargo
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
+            let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
             if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "cargo",

@@ -243,7 +243,7 @@ fn build_context(
 
     let bypass_token = config.curation.bypass_token.clone();
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
-        curation_engine: curation_engine,
+        curation_engine,
         bypass_token,
     }));
 
