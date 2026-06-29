@@ -362,6 +362,10 @@ fn log_outbound_proxy() {
     }
 }
 
+/// User-Agent sent by all outbound HTTP clients. Compile-time `&'static str`
+/// via `concat!`/`env!` — no per-call heap allocation.
+const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
+
 /// Build HTTP client with optional custom CA certificate support.
 ///
 /// When `timeout` is `Some`, a default request timeout is set on the client
@@ -374,8 +378,7 @@ fn build_http_client(
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
 ) -> reqwest::Client {
-    let mut builder =
-        reqwest::ClientBuilder::new().user_agent(format!("nora/{}", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
