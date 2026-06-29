@@ -243,9 +243,7 @@ impl StorageBackend for S3Storage {
         // Streaming multipart upload: read file in 8 MiB chunks, feed to
         // WriteMultipart which buffers into 5 MiB parts and uploads in
         // parallel. Never loads the entire file into RAM (#580).
-        let mut file = tokio::fs::File::open(src)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let mut file = tokio::fs::File::open(src).await?;
 
         // CANCEL-SAFETY: if dropped between put_multipart and finish,
         // S3 does NOT automatically abort orphaned parts. Cleanup depends
@@ -258,10 +256,7 @@ impl StorageBackend for S3Storage {
 
         let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB read buffer
         loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let n = file.read(&mut buf).await?;
             if n == 0 {
                 break;
             }

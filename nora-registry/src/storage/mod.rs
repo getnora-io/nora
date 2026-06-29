@@ -35,7 +35,7 @@ pub enum StorageError {
     NotFound,
 
     #[error("IO error: {0}")]
-    Io(String),
+    Io(#[from] std::io::Error),
 
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
@@ -145,10 +145,7 @@ pub trait StorageBackend: Send + Sync {
         let mut buf = [0u8; 64 * 1024];
         while to_skip > 0 {
             let want = to_skip.min(buf.len() as u64) as usize;
-            let n = reader
-                .read(&mut buf[..want])
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let n = reader.read(&mut buf[..want]).await?;
             if n == 0 {
                 break;
             }
@@ -252,14 +249,18 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
-                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
                         }
                         Err(e) => {
                             STORAGE_OPERATIONS
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
-                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
                         }
                     }
                 }
@@ -531,8 +532,11 @@ impl Storage {
         if !apply {
             return Ok(RepinOutcome::WouldUpdate { old, new: expected });
         }
-        pins.record_hash(key, &expected)
-            .map_err(|e| StorageError::Io(format!("hash-pin record failed: {e}")))?;
+        pins.record_hash(key, &expected).map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "hash-pin record failed: {e}"
+            )))
+        })?;
         Ok(RepinOutcome::Updated { old, new: expected })
     }
 
@@ -576,14 +580,18 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
-                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
                         }
                         Err(e) => {
                             STORAGE_OPERATIONS
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
-                            return Err(StorageError::Io(format!("hash-pin record failed: {e}")));
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
                         }
                     }
                 }

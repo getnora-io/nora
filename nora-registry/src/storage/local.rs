@@ -22,12 +22,8 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// cannot be fsync'd means durability is not guaranteed, so we return Err.
 async fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        let dir = fs::File::open(parent)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        dir.sync_all()
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let dir = fs::File::open(parent).await?;
+        dir.sync_all().await?;
     }
     Ok(())
 }
@@ -117,9 +113,7 @@ impl StorageBackend for LocalStorage {
 
         // Create parent directories
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            fs::create_dir_all(parent).await?;
         }
 
         // Atomic write: create temp file in same directory, write, rename.
@@ -130,21 +124,11 @@ impl StorageBackend for LocalStorage {
         let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         let write_result: Result<()> = async {
-            let mut file = fs::File::create(&tmp)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            file.write_all(data)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            file.flush()
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            file.sync_all()
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            fs::rename(&tmp, &path)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let mut file = fs::File::create(&tmp).await?;
+            file.write_all(data).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            fs::rename(&tmp, &path).await?;
             // Durability: make the rename's directory entry survive power-loss.
             sync_parent_dir(&path).await?;
             Ok(())
@@ -163,14 +147,12 @@ impl StorageBackend for LocalStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
             } else {
-                StorageError::Io(e.to_string())
+                StorageError::Io(e)
             }
         })?;
 
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        file.read_to_end(&mut buffer).await?;
 
         Ok(Bytes::from(buffer))
     }
@@ -182,7 +164,7 @@ impl StorageBackend for LocalStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
             } else {
-                StorageError::Io(e.to_string())
+                StorageError::Io(e)
             }
         })?;
 
@@ -203,7 +185,7 @@ impl StorageBackend for LocalStorage {
             results
         })
         .await
-        .map_err(|e| StorageError::Io(format!("list task panicked: {e}")))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
@@ -219,7 +201,7 @@ impl StorageBackend for LocalStorage {
             results
         })
         .await
-        .map_err(|e| StorageError::Io(format!("list task panicked: {e}")))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -287,9 +269,7 @@ impl StorageBackend for LocalStorage {
     async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            fs::create_dir_all(parent).await?;
         }
         // Try atomic rename first; fall back to streaming copy on EXDEV
         // (cross-device link — src and dest on different filesystems).
@@ -300,43 +280,25 @@ impl StorageBackend for LocalStorage {
                 Ok(())
             }
             Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
-                let mut reader = fs::File::open(src)
-                    .await
-                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let mut reader = fs::File::open(src).await?;
                 let tmp = dest.with_extension("tmp");
-                let mut writer = fs::File::create(&tmp)
-                    .await
-                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let mut writer = fs::File::create(&tmp).await?;
                 let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
                 let copy_result: Result<()> = async {
                     loop {
-                        let n = reader
-                            .read(&mut buf)
-                            .await
-                            .map_err(|e| StorageError::Io(e.to_string()))?;
+                        let n = reader.read(&mut buf).await?;
                         if n == 0 {
                             break;
                         }
-                        writer
-                            .write_all(&buf[..n])
-                            .await
-                            .map_err(|e| StorageError::Io(e.to_string()))?;
+                        writer.write_all(&buf[..n]).await?;
                     }
-                    writer
-                        .flush()
-                        .await
-                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    writer.flush().await?;
                     // Durability: fsync the copied data before publishing it.
                     // flush() only pushes to the OS; sync_all() makes it crash-
                     // durable, matching the put() path (the direct-rename branch
                     // relies on the caller having fsync'd src).
-                    writer
-                        .sync_all()
-                        .await
-                        .map_err(|e| StorageError::Io(e.to_string()))?;
-                    fs::rename(&tmp, &dest)
-                        .await
-                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    writer.sync_all().await?;
+                    fs::rename(&tmp, &dest).await?;
                     // Durability: make the rename's directory entry durable.
                     sync_parent_dir(&dest).await?;
                     Ok(())
@@ -349,7 +311,7 @@ impl StorageBackend for LocalStorage {
                 let _ = fs::remove_file(src).await;
                 Ok(())
             }
-            Err(e) => Err(StorageError::Io(e.to_string())),
+            Err(e) => Err(StorageError::Io(e)),
         }
     }
 
@@ -359,13 +321,10 @@ impl StorageBackend for LocalStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
             } else {
-                StorageError::Io(e.to_string())
+                StorageError::Io(e)
             }
         })?;
-        let meta = file
-            .metadata()
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let meta = file.metadata().await?;
         Ok((meta.len(), Box::pin(file)))
     }
 
@@ -381,18 +340,12 @@ impl StorageBackend for LocalStorage {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
             } else {
-                StorageError::Io(e.to_string())
+                StorageError::Io(e)
             }
         })?;
-        let size = file
-            .metadata()
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?
-            .len();
+        let size = file.metadata().await?.len();
         if start > 0 {
-            file.seek(std::io::SeekFrom::Start(start))
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            file.seek(std::io::SeekFrom::Start(start)).await?;
         }
         let len = end.saturating_sub(start) + 1;
         Ok((size, Box::pin(file.take(len))))
