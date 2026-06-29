@@ -1051,9 +1051,9 @@ mod tests {
                 ])
             }
             async fn get(&self, _key: &str) -> StorageResult<Bytes> {
-                Err(StorageError::Io(
-                    "injected transient read error".to_string(),
-                ))
+                Err(StorageError::Io(std::io::Error::other(
+                    "injected transient read error",
+                )))
             }
             async fn put(&self, _key: &str, _data: &[u8]) -> StorageResult<()> {
                 panic!("regenerate must abort before writing a truncated index");
