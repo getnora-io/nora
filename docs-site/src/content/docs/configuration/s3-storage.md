@@ -15,7 +15,7 @@ By default NORA stores artifacts on the local filesystem. For production deploym
 | `NORA_STORAGE_S3_ACCESS_KEY` | — | Access key. If omitted, anonymous access is used |
 | `NORA_STORAGE_S3_SECRET_KEY` | — | Secret key |
 | `NORA_STORAGE_S3_REGION` | `us-east-1` | Region. Required by some S3 implementations |
-| `NORA_STORAGE_S3_VIRTUAL_HOSTED` | `false` | Use virtual-hosted-style requests (`https://<bucket>.<endpoint>/…`) instead of path-style. Required by providers that reject signed path-style requests, e.g. Alibaba Cloud OSS |
+| `NORA_STORAGE_S3_VIRTUAL_HOSTED` | `false` | Use virtual-hosted-style requests: the endpoint is used **as-is** and must include the bucket host (e.g. `https://<bucket>.oss-<region>.aliyuncs.com`). Required by providers that reject signed path-style requests, e.g. Alibaba Cloud OSS |
 
 :::caution
 NORA **does not create buckets automatically**. The bucket must exist before NORA starts. Use an init container or pre-create it manually.
@@ -183,12 +183,12 @@ Use IAM roles instead of static credentials when running on EC2/ECS/EKS. Omit `N
 
 ## Alibaba Cloud OSS
 
-OSS rejects **signed path-style requests** with `403 SecondLevelDomainForbidden` ("Please use virtual hosted style to access"), so `NORA_STORAGE_S3_VIRTUAL_HOSTED` must be enabled. Point the endpoint at the bucket's region (the bucket name is prepended to the host automatically) and use the region ID without the `oss-` prefix:
+OSS rejects **signed path-style requests** with `403 SecondLevelDomainForbidden` ("Please use virtual hosted style to access"), so `NORA_STORAGE_S3_VIRTUAL_HOSTED` must be enabled. With it enabled the endpoint is used **as-is** — it must include the bucket host. Use the region ID without the `oss-` prefix:
 
 ```yaml
 environment:
   NORA_STORAGE_MODE: s3
-  NORA_STORAGE_S3_URL: https://oss-cn-hongkong.aliyuncs.com
+  NORA_STORAGE_S3_URL: https://my-nora-registry.oss-cn-hongkong.aliyuncs.com  # bucket in the host
   NORA_STORAGE_BUCKET: my-nora-registry
   NORA_STORAGE_S3_ACCESS_KEY: LTAI...
   NORA_STORAGE_S3_SECRET_KEY: ...
@@ -196,8 +196,14 @@ environment:
   NORA_STORAGE_S3_VIRTUAL_HOSTED: "true"
 ```
 
+Validated live against OSS (cn-hongkong): pull-through manifests persist to the bucket with this exact shape.
+
+:::caution
+A **bucket-less endpoint** (`https://oss-cn-hongkong.aliyuncs.com`) with `VIRTUAL_HOSTED=true` fails subtly: `/ready` reports healthy (the bucket-less list hits OSS's *ListBuckets* API and parses), but every object write is rejected with `403 PermanentRedirect` — OSS interprets the first key segment (e.g. `docker/`) as a *bucket name*. Always put the bucket in the endpoint host.
+:::
+
 :::tip
-Inside an Alibaba Cloud VPC, use the internal endpoint (`https://oss-<region>-internal.aliyuncs.com`) to avoid public-egress traffic charges.
+Inside an Alibaba Cloud VPC, use the internal endpoint (`https://<bucket>.oss-<region>-internal.aliyuncs.com`) to avoid public-egress traffic charges.
 :::
 
 :::caution
