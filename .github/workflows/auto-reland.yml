@@ -1,0 +1,129 @@
+name: Auto-reland (signed)
+
+# Relands an approved pull request as a single web-flow-signed commit, so it
+# satisfies the `Require signed commits` rule on `main` WITHOUT asking external
+# contributors to set up GPG/SSH commit signing.
+#
+# Trigger: a maintainer adds the `reland` label to an APPROVED PR.
+#
+# How it stays safe on pull_request_target (which runs in the BASE context with
+# secrets): this job NEVER checks out or executes the PR's code. It only reads
+# the diff of already-reviewed content and re-commits it via the GitHub API
+# (`createCommitOnBranch`, which GitHub signs with its web-flow key → verified).
+# It is additionally guarded on: label == "reland", the labeler having write
+# access, and the PR being APPROVED.
+#
+# Why RELAND_TOKEN (a PAT or GitHub App token) instead of GITHUB_TOKEN: commits
+# and PRs created with GITHUB_TOKEN do NOT trigger further workflow runs, so the
+# reland PR would never get its required checks. A PAT/App token both triggers
+# CI and still yields a web-flow-signed (verified) commit.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  reland:
+    if: github.event.label.name == 'reland'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — approved PR + authorized labeler
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          perm=$(gh api "repos/$REPO/collaborators/$LABELER/permission" --jq .permission)
+          case "$perm" in
+            admin|maintain|write) echo "labeler @$LABELER has $perm" ;;
+            *) echo "::error::@$LABELER lacks write access ($perm) — refusing to reland"; exit 1 ;;
+          esac
+          dec=$(gh pr view "$PR" --repo "$REPO" --json reviewDecision --jq .reviewDecision)
+          if [ "$dec" != "APPROVED" ]; then
+            echo "::error::PR #$PR is not APPROVED (reviewDecision=$dec) — refusing to reland"
+            exit 1
+          fi
+
+      - name: Checkout base (main) — never the PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reland as a signed commit
+        env:
+          GH_TOKEN: ${{ secrets.RELAND_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse HEAD)
+          git fetch origin "pull/$PR/head:pr-head"
+
+          # Credit the contributor via a trailer (commit author is the token identity).
+          a_name=$(git log -1 --format='%an' pr-head)
+          a_email=$(git log -1 --format='%ae' pr-head)
+
+          # Squash the PR into the working tree. `git merge --squash` stages files;
+          # it does not execute any code from the PR.
+          if ! git merge --squash pr-head >/dev/null 2>&1; then
+            git merge --abort || true
+            gh pr comment "$PR" --repo "$REPO" \
+              --body "🤖 Auto-reland aborted: this branch conflicts with \`$BASE_REF\`. Rebase onto \`$BASE_REF\` and re-add the \`reland\` label."
+            echo "::error::merge conflict with $BASE_REF"; exit 1
+          fi
+
+          # Build the FileChanges payload for createCommitOnBranch.
+          # --no-renames → renames appear as delete-old + add-new (simplest correct form).
+          additions='[]'; deletions='[]'
+          while IFS=$'\t' read -r status path; do
+            case "$status" in
+              D)
+                # shellcheck disable=SC2016  # $p is a jq variable, not shell
+                deletions=$(jq -c --arg p "$path" '. + [{path:$p}]' <<<"$deletions")
+                ;;
+              A|M)
+                b64=$(base64 -w0 "$path")
+                # shellcheck disable=SC2016  # $p/$c are jq variables, not shell
+                additions=$(jq -c --arg p "$path" --arg c "$b64" '. + [{path:$p, contents:$c}]' <<<"$additions")
+                ;;
+              *)
+                echo "::error::unexpected status '$status' for '$path'"; exit 1
+                ;;
+            esac
+          done < <(git diff --cached --no-renames --name-status)
+
+          file_changes=$(jq -c -n --argjson a "$additions" --argjson d "$deletions" '{additions:$a, deletions:$d}')
+
+          # Create the reland branch at base HEAD.
+          branch="reland/pr-$PR"
+          gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$base_sha" >/dev/null
+
+          # createCommitOnBranch → GitHub web-flow signs the commit (verified).
+          headline="$PR_TITLE"
+          body=$(printf 'Relands #%s.\n\nCo-authored-by: %s <%s>' "$PR" "$a_name" "$a_email")
+          payload=$(jq -c -n \
+            --arg repo "$REPO" --arg br "$branch" --arg oid "$base_sha" \
+            --arg hl "$headline" --arg bd "$body" --argjson fc "$file_changes" \
+            '{query:"mutation($repo:String!,$br:String!,$oid:GitObjectID!,$hl:String!,$bd:String!,$fc:FileChanges!){createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$repo,branchName:$br},expectedHeadOid:$oid,message:{headline:$hl,body:$bd},fileChanges:$fc}){commit{oid url}}}",variables:{repo:$repo,br:$br,oid:$oid,hl:$hl,bd:$bd,fc:$fc}}')
+          commit_url=$(echo "$payload" | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.url')
+          echo "Signed reland commit: $commit_url"
+
+          # Open the reland PR (created with RELAND_TOKEN → required checks run).
+          reland_url=$(gh pr create --repo "$REPO" --base "$BASE_REF" --head "$branch" \
+            --title "$headline" \
+            --body "$(printf 'Signed reland of #%s by @%s.\n\n\`main\` requires verified signatures; the original commits were unsigned, so this re-lands the reviewed diff as one web-flow-signed commit.\n\nOriginal PR: #%s\nSigned commit: %s' "$PR" "$AUTHOR_LOGIN" "$PR" "$commit_url")")
+          echo "Reland PR: $reland_url"
+
+          gh pr comment "$PR" --repo "$REPO" \
+            --body "$(printf '🤖 Relanded as a signed commit: %s (thanks @%s — full authorship credited via `Co-authored-by`). This PR will be closed once the reland merges.' "$reland_url" "$AUTHOR_LOGIN")"
