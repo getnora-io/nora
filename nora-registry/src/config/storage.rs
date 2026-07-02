@@ -34,6 +34,13 @@ pub struct StorageConfig {
     /// S3 region (default: us-east-1)
     #[serde(default = "default_s3_region")]
     pub s3_region: String,
+    /// Use virtual-hosted-style requests. Default: false (path-style, bucket appended
+    /// to the endpoint path). When true, `s3_url` is used VERBATIM and must already
+    /// include the bucket host, e.g. `https://<bucket>.oss-<region>.aliyuncs.com`.
+    /// Some providers reject signed path-style requests entirely — e.g. Alibaba
+    /// Cloud OSS answers them with 403 `SecondLevelDomainForbidden`.
+    #[serde(default)]
+    pub s3_virtual_hosted: bool,
 }
 
 pub(super) fn default_s3_region() -> String {
@@ -62,6 +69,7 @@ impl Default for StorageConfig {
             s3_access_key: None,
             s3_secret_key: None,
             s3_region: default_s3_region(),
+            s3_virtual_hosted: false,
         }
     }
 }
@@ -108,6 +116,9 @@ impl StorageConfig {
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_REGION") {
             self.s3_region = val;
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_S3_VIRTUAL_HOSTED") {
+            self.s3_virtual_hosted = val.to_lowercase() == "true" || val == "1";
         }
 
         Ok(())

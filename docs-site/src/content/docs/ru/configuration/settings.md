@@ -40,6 +40,7 @@ NORA использует многоуровневую модель конфиг
 | `NORA_STORAGE_S3_ACCESS_KEY` | *(нет)* | Ключ доступа S3 |
 | `NORA_STORAGE_S3_SECRET_KEY` | *(нет)* | Секретный ключ S3 |
 | `NORA_STORAGE_S3_REGION` | `us-east-1` | Регион S3 |
+| `NORA_STORAGE_S3_VIRTUAL_HOSTED` | `false` | Virtual-hosted-стиль S3-запросов: `NORA_STORAGE_S3_URL` используется как есть и должен содержать имя бакета в хосте. Обязателен для Alibaba Cloud OSS |
 
 ### Аутентификация
 

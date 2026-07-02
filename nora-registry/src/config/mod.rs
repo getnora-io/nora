@@ -1227,15 +1227,33 @@ mod tests {
         std::env::set_var("NORA_STORAGE_PATH", "/data/nora");
         std::env::set_var("NORA_STORAGE_BUCKET", "my-bucket");
         std::env::set_var("NORA_STORAGE_S3_REGION", "eu-west-1");
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "true");
         config.apply_env_overrides().unwrap();
         assert_eq!(config.storage.mode, StorageMode::S3);
         assert_eq!(config.storage.path, "/data/nora");
         assert_eq!(config.storage.bucket, "my-bucket");
         assert_eq!(config.storage.s3_region, "eu-west-1");
+        assert!(config.storage.s3_virtual_hosted);
         std::env::remove_var("NORA_STORAGE_MODE");
         std::env::remove_var("NORA_STORAGE_PATH");
         std::env::remove_var("NORA_STORAGE_BUCKET");
         std::env::remove_var("NORA_STORAGE_S3_REGION");
+        std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
+    }
+
+    #[test]
+    fn test_env_override_storage_virtual_hosted_default_off() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
+        assert!(!config.storage.s3_virtual_hosted);
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "false");
+        config.apply_env_overrides().unwrap();
+        assert!(!config.storage.s3_virtual_hosted);
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "1");
+        config.apply_env_overrides().unwrap();
+        assert!(config.storage.s3_virtual_hosted);
+        std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
     }
 
     #[test]
@@ -2866,6 +2884,7 @@ mod tests {
                 "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             )),
             s3_region: String::new(),
+            s3_virtual_hosted: false,
         };
         let debug_output = format!("{:?}", config);
         assert!(
