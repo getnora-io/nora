@@ -184,8 +184,14 @@ jobs:
           #   NORA uses rsa crate only for JWT signature *verification* via jsonwebtoken.
           #   Marvin Attack targets RSA PKCS#1 v1.5 *decryption*, a different code path.
           #   No upstream patch exists. See: SECURITY.md
-          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071
-          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --json > /tmp/audit.json || true
+          # RUSTSEC-2026-0194 / -0195: quick-xml <0.41 quadratic-attribute + NsReader
+          #   memory-exhaustion DoS. Transitive via object_store (S3 XML response parsing).
+          #   No upstream fix yet — object_store 0.14 still pins quick-xml ^0.40.1 (<0.41),
+          #   which is also affected. Exposure is low: the parsed XML comes from the
+          #   operator's configured S3 backend, not attacker-controlled input. Remove when
+          #   object_store ships a release using quick-xml >=0.41. Tracking: #799
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --json > /tmp/audit.json || true
 
       - name: Upload cargo-audit results as SARIF
         if: always()
