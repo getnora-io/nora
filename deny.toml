@@ -8,6 +8,13 @@ ignore = [
     # rsa crate Marvin Attack (timing sidechannel). No upstream fix.
     # jsonwebtoken uses rsa for JWK decoding; NORA only verifies signatures.
     "RUSTSEC-2023-0071",
+    # quick-xml <0.41 DoS (quadratic-attr + NsReader memory-exhaustion).
+    # Transitive via object_store (S3 XML parsing); no upstream fix yet
+    # (object_store 0.14 still pins quick-xml <0.41). Low exposure: XML comes
+    # from the configured S3 backend, not attacker input. Remove when
+    # object_store ships quick-xml >=0.41. Tracking: #799
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
