@@ -40,6 +40,7 @@ Config file resolution order:
 | `NORA_STORAGE_S3_ACCESS_KEY` | *(none)* | S3 access key |
 | `NORA_STORAGE_S3_SECRET_KEY` | *(none)* | S3 secret key |
 | `NORA_STORAGE_S3_REGION` | `us-east-1` | S3 region |
+| `NORA_STORAGE_S3_VIRTUAL_HOSTED` | `false` | Virtual-hosted-style S3 requests (bucket in host). Required for Alibaba Cloud OSS |
 
 ### Outbound Proxy
 

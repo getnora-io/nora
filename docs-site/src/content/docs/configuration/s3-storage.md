@@ -15,6 +15,7 @@ By default NORA stores artifacts on the local filesystem. For production deploym
 | `NORA_STORAGE_S3_ACCESS_KEY` | — | Access key. If omitted, anonymous access is used |
 | `NORA_STORAGE_S3_SECRET_KEY` | — | Secret key |
 | `NORA_STORAGE_S3_REGION` | `us-east-1` | Region. Required by some S3 implementations |
+| `NORA_STORAGE_S3_VIRTUAL_HOSTED` | `false` | Use virtual-hosted-style requests (`https://<bucket>.<endpoint>/…`) instead of path-style. Required by providers that reject signed path-style requests, e.g. Alibaba Cloud OSS |
 
 :::caution
 NORA **does not create buckets automatically**. The bucket must exist before NORA starts. Use an init container or pre-create it manually.
@@ -178,6 +179,29 @@ environment:
 
 :::tip
 Use IAM roles instead of static credentials when running on EC2/ECS/EKS. Omit `NORA_STORAGE_S3_ACCESS_KEY` and `NORA_STORAGE_S3_SECRET_KEY` — the AWS SDK will use instance metadata automatically.
+:::
+
+## Alibaba Cloud OSS
+
+OSS rejects **signed path-style requests** with `403 SecondLevelDomainForbidden` ("Please use virtual hosted style to access"), so `NORA_STORAGE_S3_VIRTUAL_HOSTED` must be enabled. Point the endpoint at the bucket's region (the bucket name is prepended to the host automatically) and use the region ID without the `oss-` prefix:
+
+```yaml
+environment:
+  NORA_STORAGE_MODE: s3
+  NORA_STORAGE_S3_URL: https://oss-cn-hongkong.aliyuncs.com
+  NORA_STORAGE_BUCKET: my-nora-registry
+  NORA_STORAGE_S3_ACCESS_KEY: LTAI...
+  NORA_STORAGE_S3_SECRET_KEY: ...
+  NORA_STORAGE_S3_REGION: cn-hongkong
+  NORA_STORAGE_S3_VIRTUAL_HOSTED: "true"
+```
+
+:::tip
+Inside an Alibaba Cloud VPC, use the internal endpoint (`https://oss-<region>-internal.aliyuncs.com`) to avoid public-egress traffic charges.
+:::
+
+:::caution
+Don't be misled by unauthenticated testing: OSS answers *unsigned* path-style requests with a generic `NoSuchBucket`, which makes path-style look supported. The `SecondLevelDomainForbidden` rejection only appears on signed requests.
 :::
 
 ## SeaweedFS
@@ -375,6 +399,7 @@ bucket = "nora-storage"
 s3_access_key = "noraadmin"
 s3_secret_key = "changeme"
 s3_region = "us-east-1"
+s3_virtual_hosted = false
 ```
 
 :::caution
@@ -407,6 +432,10 @@ Ensure the S3 service is healthy before NORA starts. In Docker Compose, use `dep
 ### Bucket does not exist
 
 NORA does not create buckets. Pre-create with `mc mb` or an init container (see examples above).
+
+### 403 SecondLevelDomainForbidden (Alibaba Cloud OSS)
+
+OSS rejects signed path-style requests. Set `NORA_STORAGE_S3_VIRTUAL_HOSTED=true` (see [Alibaba Cloud OSS](#alibaba-cloud-oss)).
 
 ### Proxied packages not visible in UI
 

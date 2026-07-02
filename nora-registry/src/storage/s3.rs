@@ -23,12 +23,18 @@ pub struct S3Storage {
 
 impl S3Storage {
     /// Create new S3 storage with optional credentials.
+    ///
+    /// `virtual_hosted` selects the request addressing style: `false` keeps the
+    /// path-style default (`https://<endpoint>/<bucket>/<key>`), `true` puts the
+    /// bucket in the host (`https://<bucket>.<endpoint>/<key>`) for providers
+    /// that reject signed path-style requests (e.g. Alibaba Cloud OSS).
     pub fn new(
         s3_url: &str,
         bucket: &str,
         region: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
+        virtual_hosted: bool,
     ) -> Self {
         let url = s3_url.trim_end_matches('/');
         let allow_http = url.starts_with("http://");
@@ -38,7 +44,7 @@ impl S3Storage {
             .with_bucket_name(bucket)
             .with_region(region)
             .with_allow_http(allow_http)
-            .with_virtual_hosted_style_request(false);
+            .with_virtual_hosted_style_request(virtual_hosted);
 
         match (access_key, secret_key) {
             (Some(ak), Some(sk)) => {
@@ -326,6 +332,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -338,6 +345,20 @@ mod tests {
             "us-east-1",
             None,
             None,
+            false,
+        );
+        assert_eq!(storage.backend_name(), "s3");
+    }
+
+    #[test]
+    fn test_s3_storage_creation_virtual_hosted() {
+        let storage = S3Storage::new(
+            "https://oss-cn-hongkong.aliyuncs.com",
+            "test-bucket",
+            "cn-hongkong",
+            Some("access"),
+            Some("secret"),
+            true,
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -350,6 +371,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
         );
         assert!(!storage
             .size_cache_initialized

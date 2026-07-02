@@ -178,13 +178,19 @@ impl Storage {
         region: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
+        virtual_hosted: bool,
     ) -> Self {
         tracing::warn!(
             "Hash pin store disabled for S3 backend — integrity verification unavailable"
         );
         Self {
             inner: Arc::new(S3Storage::new(
-                s3_url, bucket, region, access_key, secret_key,
+                s3_url,
+                bucket,
+                region,
+                access_key,
+                secret_key,
+                virtual_hosted,
             )),
             pin_store: None,
         }
