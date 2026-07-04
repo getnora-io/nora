@@ -42,10 +42,10 @@ This document describes which parts of each registry protocol are implemented in
 | Tarball download | Full | SHA256 verified |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
 | Publish (`npm publish`) | Full | Immutable versions |
-| Unpublish | — | Not implemented |
+| Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
 | Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
 | Search (`/-/v1/search`) | — | Not implemented |
-| Audit (`/-/npm/v1/security/advisories`) | — | Not implemented |
+| Audit (`bulk` npm7 / `audits/quick` npm6) | Full | Proxy repos: forwarded to upstream verbatim; internal-namespace names stripped/refused; anonymous-read eligible. Proxied packages only (no local advisory DB). (#597) |
 | Upstream proxy | Full | Configurable TTL |
 
 ## Maven
