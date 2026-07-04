@@ -100,6 +100,58 @@ nora_circuit_breaker_state == 1
 increase(nora_gc_bytes_freed_total[1h])
 ```
 
+## Additional metrics
+
+Every metric below is exposed at `/metrics`. Metrics carrying a `registry` label use the same path-prefix → registry mapping described above.
+
+### Curation & quarantine
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_curation_decisions_total` | counter | `decision` | Curation decisions by outcome (`allow`, `block`, `audit`, `skip`) |
+| `nora_quarantine_holds_total` | counter | `registry`, `outcome` | Proxy artifacts held by the digest quarantine (`outcome`: `blocked`, `observed`) |
+
+### Proxy — revalidation & coalescing
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_proxy_upstream_304_total` | counter | `registry` | Upstream `304 Not Modified` on revalidation (cached body reused) |
+| `nora_proxy_revalidation_bytes_saved_total` | counter | `registry` | Body bytes not re-downloaded thanks to a 304 |
+| `nora_proxy_revalidation_errors_total` | counter | `registry` | Revalidations that fell back to a full fetch (nonzero = degrading) |
+| `nora_proxy_coalesced_total` | counter | `registry` | Followers served from the single-flight leader without an upstream fetch |
+| `nora_proxy_inflight` | gauge | `registry` | Distinct keys currently fetched under single-flight (monotonic climb = guard leak) |
+| `nora_proxy_coalesce_fallthrough_total` | counter | `registry`, `reason` | Followers that fetched on their own (`reason`: `leader`, `budget`) |
+| `nora_proxy_active_downloads` | gauge | — | Docker blob proxy downloads currently in progress |
+| `nora_proxy_download_bytes_total` | counter | — | Total bytes downloaded from upstream Docker registries (use `rate()` for bandwidth) |
+| `nora_upstream_request_duration_seconds` | histogram | `registry`, `status` | Upstream proxy request latency (buckets 1ms–30s) |
+
+### Storage & integrity
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_storage_bytes` | gauge | `registry` | Stored bytes per registry; the special value `registry="total"` is the full footprint incl. metadata |
+| `nora_storage_verify_duration_seconds` | histogram | `registry` | SHA-256 integrity-verify wall-clock per buffered get (incl. blocking-pool queue) |
+| `nora_storage_get_bytes` | histogram | `registry` | Body size of buffered `Storage::get()` reads (buckets 1KB–512MB) |
+| `nora_cache_write_errors_total` | counter | `registry`, `operation` | Cache write failures in background cache tasks |
+| `nora_metadata_corrupt_total` | counter | `registry` | Corrupt metadata detected during publish (parse failure on existing data) |
+| `nora_gc_stat_failures_total` | counter | — | Orphans GC could not stat (kept, age unknown) — **alert on nonzero** |
+
+### Downloads, uploads & process
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_downloads_total` | counter | `registry` | Total artifact downloads |
+| `nora_uploads_total` | counter | `registry` | Total artifact uploads |
+| `nora_uptime_seconds` | gauge | — | Process uptime in seconds |
+
+### Auth & security
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_auth_namespace_scope_total` | counter | `provider`, `decision` | OIDC `namespace_scope` enforcement (`decision`: `allow`, `deny`, `would_deny`) |
+| `nora_response_upstream_url_leak_total` | counter | `registry` | Upstream hostname detected in an outgoing response body (detection only, never blocks) |
+| `nora_leak_detection_skipped_total` | counter | `reason` | Leak scans skipped (`reason`: `own_surface`, `too_large`, `unknown_size`, `body_read_error`, `gzip_truncated`) |
+
 ## Scrape configuration
 
 ```yaml

@@ -339,10 +339,11 @@ general_burst = 200
 # =============================================================================
 [docker]
 enabled = true
-proxy_timeout = 60
-read_timeout = 60
+proxy_timeout = 300            # connection timeout (seconds)
+read_timeout = 60              # per-chunk read timeout while streaming a blob
 metadata_ttl = -1              # -1 = forever, 0 = always refetch, >0 = seconds
 serve_stale = true
+default_action = "allow"       # action when an image matches no upstream prefix: allow | deny
 
 [[docker.upstreams]]
 url = "https://registry-1.docker.io"
@@ -533,6 +534,48 @@ internal_namespaces = []    # e.g., ["@mycompany/**", "com.mycompany.**"]
 [audit]
 mode = "file"               # "file", "stdout", "both", "off"
 ```
+
+---
+
+## Additional options
+
+Options supported by the code but not shown in the tables above.
+
+### Server & auth
+
+| TOML | Env | Default | Description |
+|------|-----|---------|-------------|
+| `server.proxy_coalesce` | *(none)* | `true` | Single-flight coalescing of concurrent identical upstream fetches (kill-switch) |
+| `server.trust_upstream_dates` | `NORA_TRUST_UPSTREAM_DATES` | `false` | Trust upstream publish dates for `min_release_age`. **Default `false`** — NORA uses its own first-seen (cache) time, since upstream dates are unsigned/spoofable. Set `true` to restore pre-0.9 behavior |
+| `auth.token_cache_ttl` | `NORA_AUTH_TOKEN_CACHE_TTL` | `300` | In-memory token-verify cache TTL (seconds); bounds the cross-replica revocation window |
+| `auth.admin_users` | `NORA_AUTH_ADMIN_USERS` | *(empty)* | htpasswd usernames allowed to self-mint an `admin` token via `POST /api/tokens` (bootstrap); see also the admin-gated `POST /api/v1/admin/tokens` |
+| `auth.oidc.providers[].jwks_uri` | *(none)* | *(discovered)* | Explicit JWKS URI, overriding `/.well-known` discovery |
+
+### Per-registry: staleness & revalidation
+
+Most proxy registries support these (defaults shown; `metadata_ttl` in seconds):
+
+| TOML (per registry) | Env pattern | Default | Description |
+|------|-----|---------|-------------|
+| `<reg>.metadata_ttl` | `NORA_<REG>_METADATA_TTL` | `300` (ansible `3600`) | Mutable-metadata cache TTL |
+| `<reg>.serve_stale` | `NORA_<REG>_SERVE_STALE` | `true` | Serve stale metadata when upstream is unreachable |
+| `<reg>.revalidate` | `NORA_<REG>_REVALIDATE` | `true` | Conditional revalidation (`If-None-Match` / `If-Modified-Since`) |
+
+Applies to npm, gems, terraform, ansible, nuget, pub, conan (and `metadata_ttl` to maven/cargo/go). NuGet also has `metadata_proxy_timeout` (`NORA_NUGET_METADATA_TIMEOUT`, default `2`s), `search_service`, and `autocomplete` endpoint overrides. PyPI supports a multi-upstream list `pypi.proxies` (`NORA_PYPI_PROXIES`, takes precedence over `proxy`).
+
+### GC & curation
+
+| TOML | Env | Default | Description |
+|------|-----|---------|-------------|
+| `gc.grace_secs` | `NORA_GC_GRACE` | `604800` (7d) | Minimum orphan age before GC deletes it — protects in-flight push blobs |
+| `curation.quarantine` | `NORA_CURATION_QUARANTINE` | *(off)* | Digest first-seen quarantine: `off` \| `observe` \| `enforce` |
+| `curation.quarantine_ttl` | `NORA_CURATION_QUARANTINE_TTL` | *(none)* | Quarantine hold duration (e.g. `14d`) |
+| `curation.<reg>.min_release_age` | `NORA_CURATION_<REG>_MIN_RELEASE_AGE` | *(none)* | Per-registry override — available for **all** registries (npm, pypi, cargo, go, docker, maven, gems, terraform, ansible, nuget, pub, conan) |
+| `curation.<reg>.quarantine` / `.quarantine_ttl` | `NORA_CURATION_<REG>_QUARANTINE[_TTL]` | *(none)* | Per-registry quarantine override |
+
+:::note[0.9.x defaults to know]
+`server.trust_upstream_dates` defaults to `false` (freshly cached packages are quarantined for the full `min_release_age` window even if published long ago — set `true` to trust upstream dates). `auth.docker_anon_pull` (default `false`) is now separate from `anonymous_read` — anonymous `docker pull` must be opted into explicitly.
+:::
 
 ---
 
