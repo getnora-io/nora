@@ -22,9 +22,12 @@ on:
   pull_request_target:
     types: [labeled]
 
+# Least-privilege GITHUB_TOKEN (Scorecard Token-Permissions): this token is used
+# only to check out the base and for the guard's read-only API calls. All writes
+# (create branch/commit, open the reland PR, comment) go through RELAND_TOKEN.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   reland:
@@ -51,9 +54,14 @@ jobs:
           fi
 
       - name: Checkout base (main) — never the PR head
-        uses: actions/checkout@v4
+        # No explicit `ref:` — under pull_request_target the default checkout is the
+        # BASE branch HEAD (github.sha = base tip), exactly what reland needs. Deriving
+        # the ref from `github.event.pull_request.*` tripped Scorecard Dangerous-Workflow
+        # (it can't tell base.ref (trusted) from head.ref (untrusted)); the default is
+        # equivalent here and untrusted PR content is only fetched+staged below, never
+        # checked out or executed.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
