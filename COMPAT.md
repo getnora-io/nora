@@ -143,18 +143,33 @@ Client: `bundle config mirror.https://rubygems.org http://nora:4000/gems/`
 ## Terraform
 
 Caching proxy for registry.terraform.io. Provider binaries are immutably cached; metadata uses TTL.
+NORA serves both Terraform protocols against the same upstream: the **Registry Protocol**
+(origin-registry, service-discovery based) and the **Network Mirror Protocol** (what
+`network_mirror` speaks).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Service discovery (`.well-known/terraform.json`) | Full | Points to NORA |
+| Service discovery (`.well-known/terraform.json`) | Full | Registry protocol; points to NORA |
 | Provider versions list | Full | TTL-cached |
 | Provider download metadata | Full | `download_url` rewritten to NORA |
 | Provider binary download | Full | Immutable cache |
 | Module versions list | Full | TTL-cached |
 | Module download | Full | `X-Terraform-Get` header pass-through |
+| **Network mirror — `index.json`** | Full | Mirror protocol; list versions (#801) |
+| **Network mirror — `{version}.json`** | Full | Mirror protocol; archives via NORA + `zh:` hash (#801) |
 | Provider publish | — | Proxy-only (read) |
 
-Client: `provider_installation { network_mirror { url = "http://nora:4000/terraform/" } }`
+Client (network mirror — Terraform requires an `https:` URL, trailing slash):
+`provider_installation { network_mirror { url = "https://nora.example.com/terraform/" } }`
+
+**Limitations (accepted):**
+- **Single upstream** — the `{hostname}` in a mirror request is validated but not routed;
+  only the configured `terraform.proxy` upstream's providers resolve.
+- **Mirror-mode integrity is weaker than registry mode** — in `network_mirror` mode
+  Terraform does not run the origin-registry GPG check, and NORA does not itself verify
+  `SHA256SUMS.sig`. Archives carry `zh:<sha256>` from upstream metadata (fail-closed: a
+  platform without a resolvable shasum is omitted). Upgrade path: verify `SHA256SUMS.sig`
+  against a pinned HashiCorp key at ingest.
 
 ## Ansible Galaxy (v3 API)
 

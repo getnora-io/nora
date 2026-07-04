@@ -3,7 +3,9 @@
 
 //! Terraform provider/module registry proxy.
 //!
-//! Implements a caching proxy for registry.terraform.io:
+//! Serves TWO distinct Terraform protocols against the same upstream.
+//!
+//! Provider Registry Protocol (origin-registry, service-discovery based):
 //!   GET /terraform/.well-known/terraform.json     — service discovery
 //!   GET /terraform/v1/providers/{ns}/{type}/versions — list provider versions
 //!   GET /terraform/v1/providers/{ns}/{type}/{ver}/download/{os}/{arch} — download metadata
@@ -11,10 +13,15 @@
 //!   GET /terraform/v1/modules/{ns}/{name}/{provider}/versions — list module versions
 //!   GET /terraform/v1/modules/{ns}/{name}/{provider}/{ver}/download — module download
 //!
-//! Client config:
+//! Provider Network Mirror Protocol (#801 — what `network_mirror` speaks; no service
+//! discovery, coordinates carry the origin {hostname}, providers only):
+//!   GET /terraform/{hostname}/{ns}/{type}/index.json   — list available versions
+//!   GET /terraform/{hostname}/{ns}/{type}/{version}.json — list installation packages
+//!
+//! Client config (network mirror; note: Terraform requires an `https:` URL):
 //!   In ~/.terraformrc:
 //!     provider_installation {
-//!       network_mirror { url = "http://nora:4000/terraform/" }
+//!       network_mirror { url = "https://nora.example.com/terraform/" }
 //!     }
 
 use crate::activity_log::{ActionType, ActivityEntry};
@@ -76,6 +83,21 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/terraform/v1/modules/download/{ns}/{name}/{provider}/{ver}/source",
             get(module_source_download),
+        )
+        // ── Provider Network Mirror Protocol (#801) ──
+        // Distinct from the Registry Protocol above. A Terraform client configured
+        // with `provider_installation { network_mirror { url = ".../terraform/" } }`
+        // does NOT use service discovery; it requests these two endpoints directly.
+        // The `index.json` static segment takes matchit priority over the dynamic
+        // `{version_file}` sibling, and `{hostname}` (param) coexists with the static
+        // `v1`/`.well-known` seg-2 branches (static wins) — verified on axum 0.8/matchit 0.8.
+        .route(
+            "/terraform/{hostname}/{ns}/{ptype}/index.json",
+            get(mirror_provider_index),
+        )
+        .route(
+            "/terraform/{hostname}/{ns}/{ptype}/{version_file}",
+            get(mirror_provider_version),
         )
 }
 
@@ -807,6 +829,333 @@ async fn module_source_download(
     }
 }
 
+// ── Provider Network Mirror Protocol handlers (#801) ───────────────────
+//
+// Terraform's `network_mirror` speaks a different protocol from the Registry
+// Protocol above: no service discovery, provider coordinates carry the origin
+// {hostname}, and metadata is served as `index.json` (version list) and
+// `{version}.json` (per-platform archives). These two handlers are thin adapters
+// that reuse the Registry-Protocol cache/upstream/curation primitives and route
+// the actual binary download through the existing (cached, quarantined,
+// integrity-verified) `/terraform/v1/providers/download/{*path}` handler.
+//
+// Single-upstream limitation (accepted): NORA has one configured Terraform
+// upstream (`terraform.proxy`); the {hostname} path segment is validated but not
+// used to select an upstream, so only the configured upstream's providers resolve.
+//
+// Integrity note (accepted): NORA does not itself GPG-verify SHA256SUMS.sig, and
+// Terraform in network_mirror mode does not run the origin-registry GPG check —
+// so mirror mode is a weaker trust anchor than the Registry Protocol. Archives are
+// served with a `zh:<sha256>` hash from the upstream metadata; any platform whose
+// shasum is unavailable is omitted (fail-closed: never serve an unhashed archive).
+
+/// `index.json` — List Available Versions (network mirror protocol).
+/// Reshapes the Registry-Protocol versions list into `{"versions":{"X":{}}}`.
+async fn mirror_provider_index(
+    State(state): State<AppState>,
+    Path((hostname, ns, ptype)): Path<(String, String, String)>,
+) -> Response {
+    if !is_valid_name(&hostname) || !is_valid_name(&ns) || !is_valid_name(&ptype) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Enforces #68/#733 namespace isolation internally (never proxies an internal ns).
+    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    let mirror = build_mirror_index(&versions_json);
+    debug_assert!(
+        mirror
+            .get("versions")
+            .map(|v| v.is_object())
+            .unwrap_or(false),
+        "mirror index must carry a `versions` object"
+    );
+    state.metrics.record_download("terraform");
+    with_json(serde_json::to_vec(&mirror).unwrap_or_default())
+}
+
+/// `{version}.json` — List Available Installation Packages (network mirror protocol).
+/// Emits `{"archives":{"os_arch":{"url":<NORA path>,"hashes":["zh:<sha256>"]}}}`.
+async fn mirror_provider_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((hostname, ns, ptype, version_file)): Path<(String, String, String, String)>,
+) -> Response {
+    // `{version}.json` — strip the `.json` BEFORE validating (is_valid_version allows
+    // '.', so `1.0.0.json` would otherwise pass the charset check and reach storage keys).
+    let ver = match version_file.strip_suffix(".json") {
+        Some(v) => v,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !is_valid_name(&hostname)
+        || !is_valid_name(&ns)
+        || !is_valid_name(&ptype)
+        || !is_valid_version(ver)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Version list drives the platform enumeration AND enforces namespace isolation.
+    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let platforms = extract_platforms(&versions_json, ver);
+    if platforms.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Curation parity (SEC #2): the binary path runs only the quarantine gate, so
+    // blocklist / min-release-age is enforced ONLY at the download-metadata step.
+    // A mirror client hits the binary path directly, so version.json must run the
+    // same `check_download` or blocked providers leak to mirror clients. Skip for
+    // internal namespaces (operator-owned) — mirror_fetch_versions already served
+    // any local copy / blocked upstream for those.
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Terraform,
+        &format!("{}/{}", ns, ptype),
+    );
+    if !internal {
+        let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, ver, false).await;
+        if let Some(resp) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Terraform,
+            &format!("{}/{}", ns, ptype),
+            Some(ver),
+            publish_date,
+        ) {
+            return resp;
+        }
+    }
+
+    let base_url = nora_base_url(&state);
+    // Fetch every platform's metadata concurrently (bounded by the platform count,
+    // typically ≤ ~14). A cold-cache `terraform init` against a fresh mirror is the
+    // #801 reporter's exact scenario; a serial per-platform fan-out would risk
+    // blowing Terraform's client-side request timeout. Bind shared refs (all Copy) so
+    // each future captures its own copy rather than moving the owned values.
+    let (state_ref, base_ref, ns_ref, ptype_ref) =
+        (&state, base_url.as_str(), ns.as_str(), ptype.as_str());
+    let results = futures::future::join_all(platforms.iter().map(|(os, arch)| async move {
+        let res = mirror_fetch_archive(state_ref, base_ref, ns_ref, ptype_ref, ver, os, arch).await;
+        (os.clone(), arch.clone(), res)
+    }))
+    .await;
+
+    let mut archives = serde_json::Map::new();
+    for (os, arch, res) in results {
+        // Fail-closed (SEC #1): only serve an archive that carries an integrity
+        // hash. `zh:` is Terraform's zip-hash scheme (hex sha256 of the .zip).
+        if let Some((url, Some(shasum))) = res {
+            archives.insert(
+                format!("{}_{}", os, arch),
+                serde_json::json!({ "url": url, "hashes": [format!("zh:{}", shasum)] }),
+            );
+        }
+    }
+    if archives.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    state.metrics.record_download("terraform");
+    with_json(serde_json::to_vec(&serde_json::json!({ "archives": archives })).unwrap_or_default())
+}
+
+/// Fetch + parse the Registry-Protocol versions JSON for the mirror handlers.
+/// Mirrors `provider_versions`' cache/TTL/namespace-isolation/serve-stale logic but
+/// returns parsed JSON. `Err(Response)` carries the terminal response (block, 404,
+/// circuit-open, 502) to return verbatim.
+async fn mirror_fetch_versions(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+) -> Result<serde_json::Value, Box<Response>> {
+    let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
+    let cached_data = state.storage.get(&storage_key).await.ok();
+
+    // TTL cache — serve fresh if within TTL.
+    if let Some(ref data) = cached_data {
+        if let Some(meta) = state.storage.stat(&storage_key).await {
+            if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
+                state.metrics.record_cache_hit("terraform");
+                return parse_json(data);
+            }
+        }
+    }
+
+    // #68/#733 namespace isolation: an internal-namespace provider must never be
+    // fetched upstream. Serve any local copy, else block — never proxy.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Terraform,
+        &format!("{}/{}", ns, ptype),
+    ) {
+        if let Some(ref data) = cached_data {
+            state.metrics.record_cache_hit("terraform");
+            return parse_json(data);
+        }
+        return Err(Box::new(
+            crate::curation::check_namespace_isolation(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Terraform,
+                &format!("{}/{}", ns, ptype),
+            )
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()),
+        ));
+    }
+
+    let proxy_url = upstream_url(state);
+    let url = format!(
+        "{}/v1/providers/{}/{}/versions",
+        proxy_url.trim_end_matches('/'),
+        ns,
+        ptype
+    );
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await
+    {
+        Ok(text) => {
+            state.metrics.record_cache_miss("terraform");
+            state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
+            parse_json(text.as_bytes())
+        }
+        Err(ProxyError::NotFound) => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        Err(ProxyError::CircuitOpen(reg)) => Err(Box::new(circuit_open_response(&reg))),
+        Err(e) => {
+            tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform mirror versions upstream error");
+            // Serve stale parsed metadata if allowed, else 502.
+            if let Some(ref data) = cached_data {
+                if state.config.terraform.serve_stale {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Err(Box::new(StatusCode::BAD_GATEWAY.into_response()))
+        }
+    }
+}
+
+/// Resolve one platform's NORA download URL + upstream shasum for the archives map.
+/// Reuses the download-metadata cache (NORA-rewritten `download_url` via
+/// `rewrite_download_url` — air-gap safe) or fetches + rewrites + caches upstream.
+/// Returns `(nora_url, shasum?)`; `None` if the platform metadata is unavailable.
+async fn mirror_fetch_archive(
+    state: &AppState,
+    base_url: &str,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+    os: &str,
+    arch: &str,
+) -> Option<(String, Option<String>)> {
+    if !is_valid_name(os) || !is_valid_name(arch) {
+        return None;
+    }
+    let storage_key = format!(
+        "terraform/providers/{}/{}/{}/{}_{}.json",
+        ns, ptype, ver, os, arch
+    );
+
+    // Cached metadata already carries the NORA-rewritten download_url; reuse it.
+    let meta_text = match state.storage.get(&storage_key).await.ok() {
+        Some(data) => String::from_utf8_lossy(&data).to_string(),
+        None => {
+            let proxy_url = upstream_url(state);
+            let url = format!(
+                "{}/v1/providers/{}/{}/{}/download/{}/{}",
+                proxy_url.trim_end_matches('/'),
+                ns,
+                ptype,
+                ver,
+                os,
+                arch
+            );
+            let text = proxy_fetch_text(
+                &state.http_client,
+                &url,
+                Duration::from_secs(state.config.terraform.proxy_timeout),
+                expose_opt(&state.config.terraform.proxy_auth),
+                None,
+                &state.circuit_breaker,
+                RegistryType::Terraform,
+            )
+            .await
+            .ok()?;
+            let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
+            state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
+            rewritten
+        }
+    };
+
+    let json: serde_json::Value = serde_json::from_str(&meta_text).ok()?;
+    let url = json
+        .get("download_url")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let shasum = json
+        .get("shasum")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some((url, shasum))
+}
+
+/// Reshape Registry-Protocol `{"versions":[{"version":"X",..}]}` into the network
+/// mirror `{"versions":{"X":{},..}}` form.
+fn build_mirror_index(versions_json: &serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(arr) = versions_json.get("versions").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(ver) = entry.get("version").and_then(|v| v.as_str()) {
+                map.insert(ver.to_string(), serde_json::json!({}));
+            }
+        }
+    }
+    serde_json::json!({ "versions": serde_json::Value::Object(map) })
+}
+
+/// Extract the `[(os, arch)]` platform list for `ver` from the versions JSON.
+fn extract_platforms(versions_json: &serde_json::Value, ver: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(arr) = versions_json.get("versions").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if entry.get("version").and_then(|v| v.as_str()) == Some(ver) {
+                if let Some(plats) = entry.get("platforms").and_then(|v| v.as_array()) {
+                    for p in plats {
+                        if let (Some(os), Some(arch)) = (
+                            p.get("os").and_then(|v| v.as_str()),
+                            p.get("arch").and_then(|v| v.as_str()),
+                        ) {
+                            out.push((os.to_string(), arch.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse cached/proxied JSON bytes, mapping a parse failure to a 502 Response.
+fn parse_json(data: &[u8]) -> Result<serde_json::Value, Box<Response>> {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .map_err(|_| Box::new(StatusCode::BAD_GATEWAY.into_response()))
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// True when a configured Terraform proxy points at the official
@@ -1461,6 +1810,57 @@ mod tests {
         );
     }
 
+    // ── Network Mirror Protocol reshape (#801) ──
+
+    #[test]
+    fn test_build_mirror_index() {
+        let versions = serde_json::json!({
+            "versions": [
+                {"version": "3.2.3", "protocols": ["5.0"], "platforms": [{"os": "linux", "arch": "amd64"}]},
+                {"version": "3.2.2", "platforms": []}
+            ]
+        });
+        let mirror = build_mirror_index(&versions);
+        let obj = mirror.get("versions").and_then(|v| v.as_object()).unwrap();
+        assert!(obj.contains_key("3.2.3"), "version must be a key");
+        assert!(obj.contains_key("3.2.2"));
+        // Each value is an empty object per the mirror protocol.
+        assert!(obj["3.2.3"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_mirror_index_empty() {
+        let mirror = build_mirror_index(&serde_json::json!({"versions": []}));
+        assert_eq!(mirror, serde_json::json!({"versions": {}}));
+        // Malformed input → empty versions, never a panic.
+        let mirror2 = build_mirror_index(&serde_json::json!({"nope": 1}));
+        assert_eq!(mirror2, serde_json::json!({"versions": {}}));
+    }
+
+    #[test]
+    fn test_extract_platforms() {
+        let versions = serde_json::json!({
+            "versions": [
+                {"version": "3.2.3", "platforms": [
+                    {"os": "linux", "arch": "amd64"},
+                    {"os": "darwin", "arch": "arm64"}
+                ]},
+                {"version": "3.2.2", "platforms": [{"os": "windows", "arch": "amd64"}]}
+            ]
+        });
+        let mut p = extract_platforms(&versions, "3.2.3");
+        p.sort();
+        assert_eq!(
+            p,
+            vec![
+                ("darwin".to_string(), "arm64".to_string()),
+                ("linux".to_string(), "amd64".to_string())
+            ]
+        );
+        // Unknown version → no platforms (→ handler returns 404).
+        assert!(extract_platforms(&versions, "9.9.9").is_empty());
+    }
+
     // ========================================================================
     // URL-rewrite systematic tests (#387)
     // ========================================================================
@@ -1864,5 +2264,193 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── Provider Network Mirror Protocol (#801) ──
+
+    /// index.json (mirror) reshapes the cached versions list into {"versions":{"X":{}}}.
+    /// Also proves routing: index.json hits the mirror index handler, not {version_file}.
+    #[tokio::test]
+    async fn test_mirror_index_from_cache() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                br#"{"versions":[{"version":"3.2.3","platforms":[{"os":"linux","arch":"amd64"}]},{"version":"3.2.2","platforms":[]}]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/hashicorp/null/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = json.get("versions").and_then(|v| v.as_object()).unwrap();
+        assert!(versions.contains_key("3.2.3"));
+        assert!(versions.contains_key("3.2.2"));
+        assert!(versions["3.2.3"].as_object().unwrap().is_empty());
+    }
+
+    /// {version}.json (mirror) emits archives with the NORA download URL + zh: hash.
+    /// url must go through NORA (air-gap); hash is zh:<upstream shasum>.
+    #[tokio::test]
+    async fn test_mirror_version_archives_from_cache() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                br#"{"versions":[{"version":"3.2.3","platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+            )
+            .await
+            .unwrap();
+        // Cached download-metadata already carries the NORA-rewritten download_url.
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/3.2.3/linux_amd64.json",
+                br#"{"download_url":"http://localhost:4000/terraform/v1/providers/download/hashicorp/null/3.2.3/terraform-provider-null_3.2.3_linux_amd64.zip","shasum":"deadbeef"}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/hashicorp/null/3.2.3.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arch = &json["archives"]["linux_amd64"];
+        assert!(
+            arch["url"]
+                .as_str()
+                .unwrap()
+                .contains("/terraform/v1/providers/download/"),
+            "url must route through NORA, got {arch}"
+        );
+        assert!(
+            !arch["url"]
+                .as_str()
+                .unwrap()
+                .contains("releases.hashicorp.com"),
+            "upstream host must not leak"
+        );
+        assert_eq!(arch["hashes"][0].as_str().unwrap(), "zh:deadbeef");
+    }
+
+    /// SEC #2: mirror {version}.json MUST enforce the blocklist (curation parity with
+    /// download-meta) — otherwise a mirror client bypasses it via the binary path.
+    #[tokio::test]
+    async fn test_mirror_version_blocklist_enforced() {
+        let blocklist_dir = tempfile::TempDir::new().unwrap();
+        let blocklist_path = blocklist_dir.path().join("blocklist.json");
+        let blocklist = serde_json::json!({
+            "version": 1,
+            "rules": [{"registry": "terraform", "name": "evilcorp/backdoor", "version": "*", "reason": "compromised"}]
+        });
+        std::fs::write(&blocklist_path, serde_json::to_string(&blocklist).unwrap()).unwrap();
+        let bl_path = blocklist_path.to_str().unwrap().to_string();
+
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl_path);
+        });
+        // Seed versions so the platform list resolves from cache (no upstream needed).
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/evilcorp/backdoor/versions.json",
+                br#"{"versions":[{"version":"1.0.0","platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/evilcorp/backdoor/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "blocklisted provider must be blocked on the mirror path too"
+        );
+    }
+
+    /// Internal-namespace providers must never be proxied upstream via the mirror
+    /// path either (#68/#733 dependency confusion).
+    #[tokio::test]
+    async fn test_mirror_internal_namespace_not_proxied() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:1".to_string()); // would 502 if proxied
+            cfg.terraform.proxy_timeout = 1;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["internalcorp/**".to_string()];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/internalcorp/secret/index.json",
+            "",
+        )
+        .await;
+        // Blocked (not proxied): never 200, never a 502 from an upstream attempt.
+        assert!(
+            resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::NOT_FOUND,
+            "internal namespace must be blocked, got {}",
+            resp.status()
+        );
+    }
+
+    /// version_file without a `.json` suffix → 404 (strip guard before validation).
+    #[tokio::test]
+    async fn test_mirror_version_requires_json_suffix() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/hashicorp/null/3.2.3",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Feature flag: terraform disabled → mirror routes are not mounted → 404.
+    #[tokio::test]
+    async fn test_mirror_disabled_returns_404() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = false;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/hashicorp/null/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
