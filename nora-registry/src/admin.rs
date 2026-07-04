@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEntry;
 use crate::auth::AuthenticatedUser;
 use crate::registry_type::RegistryType;
+use crate::tokens::Role;
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -31,7 +32,9 @@ use crate::AppState;
 const REINDEX_MIN_INTERVAL_SECS: u64 = 10;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/v1/admin/reindex", post(reindex))
+    Router::new()
+        .route("/api/v1/admin/reindex", post(reindex))
+        .route("/api/v1/admin/tokens", post(admin_create_token))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -152,6 +155,94 @@ async fn reindex(
         }),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct AdminCreateTokenRequest {
+    /// Subject the token is minted for (a service/user identity, not necessarily
+    /// an htpasswd account — this route does not check a password).
+    username: String,
+    #[serde(default = "default_admin_token_ttl")]
+    ttl_days: u64,
+    description: Option<String>,
+    #[serde(default = "default_admin_token_role")]
+    role: String,
+}
+
+fn default_admin_token_ttl() -> u64 {
+    30
+}
+
+fn default_admin_token_role() -> String {
+    "read".to_string()
+}
+
+#[derive(Serialize)]
+struct AdminCreateTokenResponse {
+    token: String,
+    expires_in_days: u64,
+}
+
+/// Mint an API token of any role — including `admin` — WITHOUT the
+/// `auth.admin_users` self-service check.
+///
+/// Safe because this route lives under `/api/v1/admin/` and is therefore only
+/// reachable by a caller already holding an `Admin`-role token (enforced in the
+/// auth middleware, `auth::is_admin_path`): anonymous and Basic-auth are denied
+/// fail-closed, and a Read/Write token gets 403 before reaching this handler. So
+/// the admin privilege is proven by the gate, not re-derived from an allowlist —
+/// `auth.admin_users` becomes a bootstrap-only fallback on the public
+/// `POST /api/tokens` route (#746, follow-up to GHSA-78cx-cfhm-rgmx).
+async fn admin_create_token(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedUser>,
+    Json(req): Json<AdminCreateTokenRequest>,
+) -> Response {
+    let role = match req.role.as_str() {
+        "read" => Role::Read,
+        "write" => Role::Write,
+        "admin" => Role::Admin,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid role. Use: read, write, admin",
+            )
+                .into_response()
+        }
+    };
+
+    if req.ttl_days == 0 {
+        return (StatusCode::BAD_REQUEST, "ttl_days must be > 0").into_response();
+    }
+
+    let Some(token_store) = &state.tokens else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Token storage not configured",
+        )
+            .into_response();
+    };
+
+    let role_label = role.to_string();
+    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
+        Ok(token) => {
+            // Audit the mint with actor + target + role + ttl (never the token itself).
+            let detail = format!("role={} ttl_days={}", role_label, req.ttl_days);
+            state.audit.log(AuditEntry::new(
+                "admin_token_mint",
+                &caller.0,
+                &req.username,
+                "admin",
+                &detail,
+            ));
+            Json(AdminCreateTokenResponse {
+                token,
+                expires_in_days: req.ttl_days,
+            })
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +397,124 @@ mod tests {
         let tok = mint(&ctx, Role::Write);
         let status = post_bearer(&ctx, "/raw/-/reindex", &tok).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // ── #746: dedicated admin-gated token mint (POST /api/v1/admin/tokens) ──
+
+    const TOK_URI: &str = "/api/v1/admin/tokens";
+
+    async fn post_json_bearer(
+        ctx: &TestContext,
+        token: &str,
+        body: &str,
+    ) -> axum::http::StatusCode {
+        let auth = format!("Bearer {token}");
+        send_with_headers(
+            &ctx.app,
+            Method::POST,
+            TOK_URI,
+            vec![
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            body.to_string(),
+        )
+        .await
+        .status()
+    }
+
+    /// An admin token mints an admin token here WITHOUT auth.admin_users, and the
+    /// minted token is a genuine admin (works on an admin path).
+    #[tokio::test]
+    async fn admin_mint_admin_token_end_to_end() {
+        use crate::test_helpers::body_bytes;
+        let ctx = create_test_context_with_auth(&[]);
+        let admin = mint(&ctx, Role::Admin);
+        let auth = format!("Bearer {admin}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            TOK_URI,
+            vec![
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            r#"{"username":"svc","role":"admin"}"#.to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let minted = json["token"].as_str().expect("token in response");
+        // The freshly minted admin token satisfies the admin gate.
+        assert_eq!(
+            post_bearer(&ctx, "/api/v1/admin/reindex?registry=cargo", minted).await,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    /// The admin gate protects the mint route: a write/read token, Basic-auth, and
+    /// no-auth are all rejected BEFORE minting anything.
+    #[tokio::test]
+    async fn admin_mint_write_token_forbidden() {
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Write);
+        assert_eq!(
+            post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"admin"}"#).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mint_read_token_forbidden() {
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Read);
+        assert_eq!(
+            post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"admin"}"#).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mint_basic_no_role_forbidden() {
+        // htpasswd Basic carries no role → can never reach the mint handler.
+        let ctx = create_test_context_with_auth(&[("alice", "pw")]);
+        assert_eq!(
+            post_basic(&ctx, TOK_URI, "alice:pw").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mint_no_auth_unauthorized() {
+        let ctx = create_test_context_with_auth(&[]);
+        let status = send(&ctx.app, Method::POST, TOK_URI, "").await.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// An admin caller with a bad role string gets 400 (reaches the handler).
+    #[tokio::test]
+    async fn admin_mint_invalid_role_bad_request() {
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Admin);
+        assert_eq!(
+            post_json_bearer(&ctx, &tok, r#"{"username":"svc","role":"superuser"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// ttl_days=0 (an instantly-expired token) is rejected.
+    #[tokio::test]
+    async fn admin_mint_zero_ttl_bad_request() {
+        let ctx = create_test_context_with_auth(&[]);
+        let tok = mint(&ctx, Role::Admin);
+        assert_eq!(
+            post_json_bearer(
+                &ctx,
+                &tok,
+                r#"{"username":"svc","role":"admin","ttl_days":0}"#
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
