@@ -195,6 +195,20 @@ internal_namespaces = ["@mycompany/**", "com.mycompany.**"]
 export NORA_CURATION_INTERNAL_NS="@mycompany/**,com.mycompany.**"
 ```
 
+### Pattern forms
+
+A pattern is matched against a package's **coordinate** — docker `org/image`, raw `org/path`, npm `@scope/name`, Go the module path, Maven the dotted/colon `group.artifact` / `group:artifact`, PyPI/Cargo the normalized name.
+
+| Pattern | Matches | Use for |
+|---------|---------|---------|
+| `prefix/**` | `prefix` itself **and** `prefix/anything/deeper` | slash-pathed coordinates: docker, raw, npm scope, Go |
+| `prefix.**` | `prefix`, `prefix.anything`, `prefix:anything` | dotted/colon coordinates: Maven `group.artifact` / `group:artifact` |
+| `name` (no wildcard) | that **exact** coordinate only — **not** its children | pinning a single package |
+| `prefix*` | any value **starting with** the literal `prefix` (crosses `/` and `.`) | ⚠️ over-matches — `myorg*` also matches `myorganization` |
+| `*` (alone) | everything | rarely useful for an isolation list |
+
+**Rule of thumb:** to isolate a namespace *and everything under it*, use the boundary-aware `prefix/**` (slash coordinates) or `prefix.**` (Maven dotted/colon) forms — **not** a bare name (exact-only, so it misses `myorg/pkg`) and **not** `myorg*` (a raw prefix that also catches siblings like `myorganization`). This is dependency-confusion defense, so err toward `**`.
+
 ---
 
 ## Minimum Release Age Quarantine
