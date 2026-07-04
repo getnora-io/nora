@@ -217,6 +217,111 @@ pub(crate) async fn proxy_fetch_text(
     .await
 }
 
+/// Forward a POST (request body + an allowlist of headers) to an upstream and
+/// return its `(status, body, content-type)` verbatim. Mirrors `proxy_fetch_core`'s
+/// circuit-breaker discipline (`check` → send → `record_success`/`record_alive`/
+/// `record_failure`, one retry on 5xx/network).
+///
+/// Used for `npm audit` (#597): a query POST that must return the upstream's answer
+/// as-is — including a 4xx (a real audit response, upstream is alive) — with only
+/// 5xx / network / circuit-open surfaced as `ProxyError`.
+///
+/// `auth` is the configured proxy credential (Basic); the caller's own
+/// `Authorization` is never forwarded — pass only the intended headers in
+/// `fwd_headers` (allowlist). The body is not inspected or decompressed here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_forward_post(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    fwd_headers: &[(&str, &str)],
+    body: &[u8],
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
+    let registry_str = registry.as_str();
+    let probe = cb.check(registry_str)?;
+
+    for attempt in 0..2 {
+        let mut request = client.post(url).timeout(timeout).body(body.to_vec());
+        if let Some(credentials) = auth {
+            request = request.header("Authorization", basic_auth_header(credentials));
+        }
+        for (k, v) in fwd_headers {
+            request = request.header(*k, *v);
+        }
+
+        let upstream_start = Instant::now();
+        match request.send().await {
+            Ok(response) => {
+                let elapsed = upstream_start.elapsed().as_secs_f64();
+                let code = response.status().as_u16();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                if response.status().is_success() {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "2xx"])
+                        .observe(elapsed);
+                    match response.bytes().await {
+                        Ok(b) => {
+                            cb.record_success(registry_str, probe);
+                            return Ok((code, b.to_vec(), content_type));
+                        }
+                        Err(e) => {
+                            cb.record_failure(registry_str, probe);
+                            return Err(ProxyError::Network(e.to_string()));
+                        }
+                    }
+                }
+                if (400..500).contains(&code) {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "4xx"])
+                        .observe(elapsed);
+                    // Upstream is alive and answered — a 4xx audit response is a real
+                    // answer, forward it verbatim (not an availability failure). #606.
+                    cb.record_alive(registry_str, probe);
+                    let b = response
+                        .bytes()
+                        .await
+                        .map(|b| b.to_vec())
+                        .unwrap_or_default();
+                    return Ok((code, b, content_type));
+                }
+                UPSTREAM_REQUEST_DURATION
+                    .with_label_values(&[registry_str, "5xx"])
+                    .observe(elapsed);
+                if attempt == 0 {
+                    tracing::debug!(url, status = code, "upstream 5xx on POST, retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                cb.record_failure(registry_str, probe);
+                return Err(ProxyError::Upstream(code));
+            }
+            Err(e) => {
+                let elapsed = upstream_start.elapsed().as_secs_f64();
+                let status_label = if e.is_timeout() { "timeout" } else { "error" };
+                UPSTREAM_REQUEST_DURATION
+                    .with_label_values(&[registry_str, status_label])
+                    .observe(elapsed);
+                if attempt == 0 {
+                    tracing::debug!(url, error = %e, "upstream error on POST, retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                cb.record_failure(registry_str, probe);
+                return Err(ProxyError::Network(e.to_string()));
+            }
+        }
+    }
+    cb.record_failure(registry_str, probe);
+    Err(ProxyError::Network("max retries exceeded".into()))
+}
+
 // ============================================================================
 // Conditional revalidation (#596)
 // ============================================================================

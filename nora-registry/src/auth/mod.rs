@@ -264,6 +264,16 @@ pub async fn auth_middleware(
         axum::http::Method::GET | axum::http::Method::HEAD
     );
 
+    // npm audit (#597) is a read-semantics query that npm sends as a POST (npm7
+    // `advisories/bulk`, npm6 `audits/quick`). Treat it as read-eligible under
+    // `anonymous_read` so anonymous `npm audit` works wherever anonymous install
+    // works. Safe: the handler (registry/npm.rs) mutates nothing (forwards to the
+    // configured upstream, returns advisories), caps the body, strips internal
+    // package names under a filter, and never forwards the client credential.
+    let is_npm_audit = *request.method() == axum::http::Method::POST
+        && (path == "/npm/-/npm/v1/security/advisories/bulk"
+            || path == "/npm/-/npm/v1/security/audits/quick");
+
     // A request that presents credentials is always validated below (honest
     // `docker login`, correct audit attribution) — never short-circuited to
     // anonymous. Anonymous Docker bypass applies only when no Authorization sent.
@@ -272,7 +282,7 @@ pub async fn auth_middleware(
     // Anonymous read for non-Docker registries (Maven/raw/npm/…) if configured.
     // Token management, whoami, admin, and all Docker `/v2` paths are excluded.
     if state.config.auth.anonymous_read
-        && is_read_method
+        && (is_read_method || is_npm_audit)
         && !is_docker
         && !is_token_management
         && !is_whoami

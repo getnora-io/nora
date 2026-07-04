@@ -7,7 +7,7 @@ use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority
 use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    read_validators, write_validators, ProxyError, Revalidation, Validators,
+    proxy_forward_post, read_validators, write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -15,7 +15,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Router,
@@ -30,8 +30,163 @@ pub fn routes() -> Router<AppState> {
         "/npm/{*path}",
         get(handle_request)
             .put(handle_publish)
-            .fallback(|| async { method_not_allowed("GET, PUT") }),
+            .post(handle_npm_post)
+            .fallback(|| async { method_not_allowed("GET, PUT, POST") }),
     )
+}
+
+/// Max body accepted on the `npm audit` POST. Real audit payloads are well under
+/// 1 MB; the global `body_limit_mb` (default 2 GB, for tarball PUTs) must not let a
+/// client shove a huge body through NORA into the upstream (#597 SEC).
+const NPM_AUDIT_BODY_CAP: usize = 8 * 1024 * 1024;
+
+/// `npm audit` proxy (#597). npm sends its audit request as a POST — npm7 to
+/// `/-/npm/v1/security/advisories/bulk` (body `{"<pkg>":["<ver>",…]}`), npm6 to
+/// `/-/npm/v1/security/audits/quick` (body = a possibly-gzipped lockfile).
+///
+/// NORA keeps no advisory DB, so for a remote/proxy repo it forwards the request to
+/// the configured upstream and returns the response verbatim. Any other POST path
+/// is a 405. Dependency-confusion guard (#68/#733): internal-namespace package
+/// names must not leak upstream — see `strip_internal_bulk` / the quick refuse.
+async fn handle_npm_post(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let is_bulk = path == "-/npm/v1/security/advisories/bulk";
+    let is_quick = path == "-/npm/v1/security/audits/quick";
+    if !is_bulk && !is_quick {
+        // POST is only meaningful on the audit endpoints.
+        return method_not_allowed("GET, PUT");
+    }
+
+    // Bound the body AT READ TIME. The global DefaultBodyLimit is 2 GB (for tarball
+    // PUTs); audit bodies are <1 MB. `to_bytes` aborts collection past the cap, so a
+    // chunked / no-Content-Length client cannot force NORA to buffer gigabytes (#597).
+    let body = match axum::body::to_bytes(body, NPM_AUDIT_BODY_CAP).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+
+    // Only a remote/proxy repo can answer audits (advisories come from upstream).
+    // Hosted-only (no proxy) → npm-compatible empty result so `npm audit` doesn't
+    // hard-fail — npm treats a 200 `{}` as "no advisories".
+    let Some(proxy_url) = state.config.npm.proxy.clone() else {
+        return npm_empty_audit();
+    };
+
+    // #68/#733 dependency-confusion: never send internal package names upstream.
+    // When a namespace filter is configured we must SEE plaintext names to strip
+    // them, so ANY body we cannot verify — the quick lockfile, an encoded bulk body,
+    // or a bulk body that is not the expected JSON object — is refused (fail CLOSED,
+    // symmetric across both paths). With no filter, nothing is internal → forward
+    // verbatim.
+    let engine = &state.curation().curation_engine;
+    let filter_active = crate::curation::namespace_filter_active(engine);
+    let content_encoded = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.eq_ignore_ascii_case("identity"));
+    let forward_body: Vec<u8> = if !filter_active {
+        body.to_vec()
+    } else if is_quick || content_encoded {
+        return npm_empty_audit();
+    } else {
+        match strip_internal_bulk(&body, engine) {
+            Some(stripped) => stripped,
+            None => return npm_empty_audit(), // unparsable under a filter → refuse
+        }
+    };
+
+    // Allowlist the forwarded headers; carry the configured proxy credential only —
+    // NEVER the client's Authorization (it's the caller's NORA token).
+    let mut fwd: Vec<(&str, &str)> = Vec::new();
+    if let Some(v) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        fwd.push(("content-type", v));
+    }
+    if let Some(v) = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        fwd.push(("content-encoding", v));
+    }
+    if let Some(v) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        fwd.push(("accept", v));
+    }
+
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
+    match proxy_forward_post(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.npm.proxy_timeout),
+        expose_opt(&state.config.npm.proxy_auth),
+        &fwd,
+        &forward_body,
+        &state.circuit_breaker,
+        RegistryType::Npm,
+    )
+    .await
+    {
+        Ok((code, resp_body, resp_ct)) => {
+            state
+                .audit
+                .log(AuditEntry::new("proxy_fetch", "api", "", "npm", "audit"));
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = resp_ct
+                .as_deref()
+                .and_then(|v| HeaderValue::from_str(v).ok())
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+            (status, [(header::CONTENT_TYPE, ct)], resp_body).into_response()
+        }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        // Upstream failure must NOT be masked as `200 {}` — that renders in npm as
+        // "0 vulnerabilities" (a false-clean security signal). Surface 502 so npm
+        // reports an audit-endpoint error instead (non-fatal to the install), and
+        // log it so the failure is observable.
+        Err(e) => {
+            tracing::warn!(error = ?e, "npm audit upstream forward failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+/// npm-compatible "no advisories" response — a `200 {}` that `npm audit` accepts
+/// without erroring.
+fn npm_empty_audit() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        b"{}".to_vec(),
+    )
+        .into_response()
+}
+
+/// Strip internal-namespace package keys from an npm7 bulk-advisories body
+/// (`{"<pkg>":[…]}`). `Some(bytes)` = the (possibly unchanged) body safe to forward;
+/// `None` = the body is NOT the expected JSON object, so the caller must fail closed
+/// under an active namespace filter (we could not verify no internal name is present).
+fn strip_internal_bulk(body: &[u8], engine: &crate::curation::CurationEngine) -> Option<Vec<u8>> {
+    let mut map =
+        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).ok()?;
+    let before = map.len();
+    map.retain(|k, _| {
+        !crate::curation::is_internal_namespace(engine, crate::curation::RegistryType::Npm, k)
+    });
+    if map.len() == before {
+        Some(body.to_vec())
+    } else {
+        // Re-serializing a just-parsed JSON map cannot fail in practice, but if it
+        // ever did, refuse (`None`) rather than fall back to the ORIGINAL body —
+        // that still contains the internal names. Keep the invariant fail-closed.
+        serde_json::to_vec(&map).ok()
+    }
 }
 
 /// Rewrite tarball URLs in npm metadata to point to NORA.
@@ -2170,5 +2325,275 @@ mod spec_conformance_tests {
             upstream_hits, M,
             "with coalescing disabled every request fetches independently"
         );
+    }
+
+    // ── npm audit proxy (#597) ──
+
+    /// bulk audit is forwarded to upstream and returned verbatim; internal-namespace
+    /// package names are stripped from the forwarded body (dependency-confusion).
+    #[tokio::test]
+    async fn test_npm_audit_bulk_forwards_and_strips_internal() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"lodash":[]}"#))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["@internal/*".to_string()];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"lodash":["4.17.0"],"@internal/secret":["1.0.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(
+            &body[..],
+            br#"{"lodash":[]}"#,
+            "upstream body returned verbatim"
+        );
+
+        // The forwarded request must NOT carry the internal package name.
+        let reqs = upstream.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let fwd = String::from_utf8_lossy(&reqs[0].body);
+        assert!(fwd.contains("lodash"), "public pkg forwarded: {fwd}");
+        assert!(
+            !fwd.contains("@internal/secret"),
+            "internal pkg name must be stripped before forwarding: {fwd}"
+        );
+    }
+
+    /// Hosted-only repo (no upstream proxy) → npm-compatible empty result, not 405/500.
+    #[tokio::test]
+    async fn test_npm_audit_no_proxy_returns_empty() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = None;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"lodash":["4.17.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+    }
+
+    /// quick audit (gzipped lockfile — cannot per-name strip) is refused with an
+    /// empty result when an internal-namespace filter is configured; upstream is
+    /// never contacted (no internal-name leak).
+    #[tokio::test]
+    async fn test_npm_audit_quick_refused_under_filter() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("SHOULD-NOT-BE-CALLED"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["@internal/*".to_string()];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/audits/quick",
+            "lockfile-payload",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            0,
+            "quick must not reach upstream under a namespace filter"
+        );
+    }
+
+    /// POST on a non-audit npm path → 405 (POST is only valid on the audit endpoints).
+    #[tokio::test]
+    async fn test_npm_audit_non_audit_post_405() {
+        use crate::test_helpers::{create_test_context, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::POST, "/npm/lodash", "x").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// An oversized audit body is rejected with 413 before any upstream forward.
+    #[tokio::test]
+    async fn test_npm_audit_body_too_large() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+        });
+        let big = "x".repeat(NPM_AUDIT_BODY_CAP + 1);
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            big,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Review #1 regression: a Content-Encoded (e.g. gzipped) bulk body under an
+    /// active namespace filter cannot be name-verified → must fail CLOSED (refuse,
+    /// upstream never contacted), not forward internal names.
+    #[tokio::test]
+    async fn test_npm_audit_bulk_encoded_refused_under_filter() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["@internal/*".to_string()];
+        });
+        // Claims gzip encoding → NORA cannot see the names → must refuse.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![("content-encoding", "gzip")],
+            "gzipped-body-not-inspected-because-refused",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            0,
+            "encoded bulk under a filter must NOT be forwarded"
+        );
+    }
+
+    /// Review #3 regression: upstream 5xx must surface as 502 (audit-endpoint error),
+    /// NOT `200 {}` (which npm renders as a false "0 vulnerabilities").
+    #[tokio::test]
+    async fn test_npm_audit_upstream_5xx_returns_502() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"lodash":["4.17.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Review #5: the client's Authorization (its NORA token) must never be
+    /// forwarded upstream — only the allowlisted headers + configured proxy_auth.
+    #[tokio::test]
+    async fn test_npm_audit_client_authorization_not_forwarded() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![("authorization", "Bearer nora-client-token")],
+            r#"{"lodash":["4.17.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reqs = upstream.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].headers.get("authorization").is_none(),
+            "client Authorization must not be forwarded upstream"
+        );
+    }
+
+    /// Under `anonymous_read`, an unauthenticated `npm audit` POST must pass the
+    /// auth gate (audit is a read-semantics query) and reach the handler — hosted-
+    /// only (no proxy) → 200 `{}`. A non-audit npm POST stays gated → 401.
+    #[tokio::test]
+    async fn test_npm_audit_anonymous_read_allows_post() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.auth.enabled = true;
+            cfg.auth.anonymous_read = true;
+            cfg.npm.proxy = None; // hosted-only → handler returns 200 {}
+        });
+        let audit = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"lodash":["4.17.0"]}"#,
+        )
+        .await;
+        assert_eq!(
+            audit.status(),
+            StatusCode::OK,
+            "anonymous npm audit must pass the auth gate under anonymous_read"
+        );
+        // A non-audit npm POST is not read-eligible → still requires auth.
+        let other = send(&ctx.app, Method::POST, "/npm/somepkg", "x").await;
+        assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
     }
 }

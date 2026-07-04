@@ -396,6 +396,14 @@ pub fn is_internal_namespace(engine: &CurationEngine, registry: RegistryType, na
     matches!(ns_filter.evaluate(&request), Decision::Block { .. })
 }
 
+/// True when an internal-namespace filter is configured at all. Batch endpoints
+/// (e.g. npm audit `audits/quick`, whose package names are inside a gzipped
+/// lockfile and cannot be per-name filtered without inflating) use this to decide
+/// whether they must refuse rather than risk leaking internal names upstream (#597).
+pub fn namespace_filter_active(engine: &CurationEngine) -> bool {
+    engine.namespace_filter.is_some()
+}
+
 /// Extract publish date from file mtime. Used for hosted registries, and — when
 /// `server.trust_upstream_dates = false` — for proxy registries too (#513): the
 /// NORA-cache mtime is NORA-controlled, so it cannot be spoofed by an upstream
