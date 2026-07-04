@@ -248,8 +248,18 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |
-| S3 backend | Full | AWS S3, Ceph RGW, any S3-compatible |
+| S3 backend | Full | AWS S3, Ceph RGW. Basic storage works on any S3-compatible; multi-replica write-serialization has a caveat — see note below. |
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
 | Backup/restore | Full | CLI commands |
 | Mirror CLI | Full | `nora mirror` for npm/pip/cargo/maven/docker |
+
+### Storage backend notes
+
+- **Multi-replica write-serialization needs conditional-write/CAS.** NORA's write lock
+  (`publish_lock`) is safe under a **single writer** — one replica, or an RWO volume
+  single-mounted so only one pod writes. Serializing concurrent writes across multiple
+  replicas requires an object store with atomic conditional-write / compare-and-swap:
+  AWS S3 and Ceph RGW provide it; **Garage** (no consensus layer) and **SeaweedFS**
+  (immature) do not — on those, run single-writer. Not every "S3-compatible" backend is
+  equivalent here.
