@@ -200,9 +200,10 @@ nora/
 │   └── test_helpers.rs      # Shared test utilities
 │
 ├── fuzz/                    # Cargo-fuzz targets
-├── scripts/                # CI helpers: coherence-check.sh, verify-changelog.sh,
-│                           # lock-audit.sh, pre-commit-check.sh, post-release-gate.sh, ...
-└── docs-site/              # Documentation (Astro/Starlight)
+└── scripts/                # CI helpers: coherence-check.sh, verify-changelog.sh,
+                            # lock-audit.sh, pre-commit-check.sh, post-release-gate.sh, ...
+
+# Documentation is maintained separately and published at https://getnora.dev
 ```
 
 ### Middleware Order
