@@ -595,6 +595,7 @@ async fn main() {
                     bucket = %config.storage.bucket,
                     region = %config.storage.s3_region,
                     has_credentials = config.storage.s3_access_key.is_some(),
+                    virtual_hosted = config.storage.s3_virtual_hosted,
                     "Using S3 storage"
                 );
             }
@@ -604,6 +605,7 @@ async fn main() {
                 &config.storage.s3_region,
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
+                config.storage.s3_virtual_hosted,
             )
         }
     };
@@ -779,6 +781,7 @@ async fn main() {
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
+                    config.storage.s3_virtual_hosted,
                 ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local' or 's3'", from);
@@ -794,6 +797,7 @@ async fn main() {
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
+                    config.storage.s3_virtual_hosted,
                 ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local' or 's3'", to);

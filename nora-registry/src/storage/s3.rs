@@ -23,12 +23,19 @@ pub struct S3Storage {
 
 impl S3Storage {
     /// Create new S3 storage with optional credentials.
+    ///
+    /// `virtual_hosted` selects the request addressing style: `false` (default) appends
+    /// the bucket to the endpoint path (`<endpoint>/<bucket>/<key>`); `true` uses the
+    /// endpoint VERBATIM (`<endpoint>/<key>`), so the endpoint itself must include the
+    /// bucket host (e.g. `https://<bucket>.oss-<region>.aliyuncs.com`). Needed for
+    /// providers that reject signed path-style requests, e.g. Alibaba Cloud OSS.
     pub fn new(
         s3_url: &str,
         bucket: &str,
         region: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
+        virtual_hosted: bool,
     ) -> Self {
         let url = s3_url.trim_end_matches('/');
         let allow_http = url.starts_with("http://");
@@ -38,7 +45,7 @@ impl S3Storage {
             .with_bucket_name(bucket)
             .with_region(region)
             .with_allow_http(allow_http)
-            .with_virtual_hosted_style_request(false);
+            .with_virtual_hosted_style_request(virtual_hosted);
 
         match (access_key, secret_key) {
             (Some(ak), Some(sk)) => {
@@ -326,6 +333,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -338,8 +346,51 @@ mod tests {
             "us-east-1",
             None,
             None,
+            false,
         );
         assert_eq!(storage.backend_name(), "s3");
+    }
+
+    /// Empty ListObjectsV2 body so `health_check`'s `list(None)` succeeds against the mock.
+    const EMPTY_LIST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+
+    /// Run one `health_check` (a ListObjectsV2) against a mock server and return the
+    /// request path the client actually used.
+    async fn observed_list_path(virtual_hosted: bool) -> String {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(EMPTY_LIST_XML, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        let storage = S3Storage::new(
+            &server.uri(),
+            "test-bucket",
+            "us-east-1",
+            Some("access"),
+            Some("secret"),
+            virtual_hosted,
+        );
+        assert!(storage.health_check().await);
+        let requests = server.received_requests().await.unwrap();
+        requests[0].url.path().to_string()
+    }
+
+    /// Path-style (default): the bucket is addressed in the URL path.
+    #[tokio::test]
+    async fn test_path_style_addresses_bucket_in_path() {
+        assert_eq!(observed_list_path(false).await, "/test-bucket");
+    }
+
+    /// Virtual-hosted: `object_store` uses the configured endpoint VERBATIM — the bucket is
+    /// not injected into host or path, so the endpoint itself must carry the bucket host
+    /// (e.g. `https://<bucket>.oss-<region>.aliyuncs.com`). This is the contract the docs
+    /// describe; if `object_store` ever changes it, this test flags the doc drift.
+    #[tokio::test]
+    async fn test_virtual_hosted_uses_endpoint_verbatim() {
+        assert_eq!(observed_list_path(true).await, "/");
     }
 
     #[test]
@@ -350,6 +401,7 @@ mod tests {
             "us-east-1",
             Some("access"),
             Some("secret"),
+            false,
         );
         assert!(!storage
             .size_cache_initialized

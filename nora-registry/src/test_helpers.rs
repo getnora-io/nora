@@ -104,6 +104,7 @@ fn build_context(
             s3_access_key: None,
             s3_secret_key: None,
             s3_region: String::new(),
+            s3_virtual_hosted: false,
         },
         maven: MavenConfig {
             enabled: true,
