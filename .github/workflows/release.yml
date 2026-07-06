@@ -621,11 +621,31 @@ jobs:
 
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
 
-      - name: Notify helm-charts repo
+      - name: Mint helm-charts app token
+        id: helm_app
         if: success()
+        # Short-lived installation token (auto-expires ~1h), minted per run from a
+        # GitHub App scoped to Contents:write on helm-charts only. Nothing to rotate,
+        # nothing to expire. continue-on-error so an App/key misconfig degrades to a
+        # warning below rather than failing an already-published release.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NORA_HELM_APP_ID }}
+          private-key: ${{ secrets.NORA_HELM_APP_KEY }}
+          owner: getnora-io
+          repositories: helm-charts
+
+      - name: Notify helm-charts repo
+        if: success() && steps.helm_app.outputs.token != ''
+        # Best-effort downstream bump: the release is already published by this point,
+        # so a dispatch failure must not fail the release. Surface it as a warning.
+        continue-on-error: true
         run: |
-          gh api repos/getnora-io/helm-charts/dispatches \
-            -f event_type=nora-release \
-            -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'
+          if ! gh api repos/getnora-io/helm-charts/dispatches \
+                -f event_type=nora-release \
+                -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'; then
+            echo "::warning title=helm-charts notify failed::dispatch returned non-zero — chart appVersion NOT auto-bumped for ${{ steps.ver.outputs.tag }}; run it manually"
+          fi
         env:
-          GH_TOKEN: ${{ secrets.HELM_CHARTS_PAT }}
+          GH_TOKEN: ${{ steps.helm_app.outputs.token }}
