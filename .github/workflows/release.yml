@@ -623,9 +623,15 @@ jobs:
 
       - name: Notify helm-charts repo
         if: success()
+        # Best-effort downstream notification: the release is already published by
+        # this point, so a dispatch failure (e.g. an expired HELM_CHARTS_PAT) must
+        # not fail the release. Surface it as a warning instead of a red run.
+        continue-on-error: true
         run: |
-          gh api repos/getnora-io/helm-charts/dispatches \
-            -f event_type=nora-release \
-            -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'
+          if ! gh api repos/getnora-io/helm-charts/dispatches \
+                -f event_type=nora-release \
+                -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'; then
+            echo "::warning title=helm-charts notify failed::dispatch returned non-zero (expired HELM_CHARTS_PAT?) — chart appVersion NOT auto-bumped for ${{ steps.ver.outputs.tag }}; run it manually"
+          fi
         env:
           GH_TOKEN: ${{ secrets.HELM_CHARTS_PAT }}
