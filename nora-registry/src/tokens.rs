@@ -117,8 +117,17 @@ impl TokenStore {
     /// bounds the window in which a token revoked on another replica is still
     /// served from this replica's cache.
     pub fn with_cache_ttl(storage_path: &Path, cache_ttl: Duration) -> Self {
-        // Ensure directory exists with restricted permissions
-        let _ = fs::create_dir_all(storage_path);
+        // Ensure directory exists with restricted permissions. The serve path
+        // fail-fasts on this in main.rs (#816); this is best-effort for library /
+        // standalone use, but surface a diagnostic rather than swallowing the error
+        // so a non-writable path is never silently broken until the first write.
+        if let Err(e) = fs::create_dir_all(storage_path) {
+            tracing::warn!(
+                path = %storage_path.display(),
+                error = %e,
+                "TokenStore: could not create storage directory — token writes will fail"
+            );
+        }
         #[cfg(unix)]
         {
             let _ = fs::set_permissions(storage_path, fs::Permissions::from_mode(0o700));

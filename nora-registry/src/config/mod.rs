@@ -646,20 +646,29 @@ impl Config {
                 .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
         }
 
-        // 6. Relative paths with explicit config — may resolve unexpectedly
-        if config_path.is_some() {
-            if self.storage.mode == StorageMode::Local && !self.storage.path.starts_with('/') {
-                warnings.push(format!(
-                    "storage.path=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
-                    self.storage.path
-                ));
-            }
-            if self.auth.enabled && !self.auth.token_storage.starts_with('/') {
-                warnings.push(format!(
-                    "auth.token_storage=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
-                    self.auth.token_storage
-                ));
-            }
+        // 6. Relative paths — may resolve unexpectedly.
+        // The storage.path hint is scoped to explicit-config starts, to avoid noise
+        // on the relative default of a bare `nora serve`.
+        if config_path.is_some()
+            && self.storage.mode == StorageMode::Local
+            && !self.storage.path.starts_with('/')
+        {
+            warnings.push(format!(
+                "storage.path=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
+                self.storage.path
+            ));
+        }
+        // The token_storage hint fires whenever auth is enabled with a relative
+        // path, regardless of config source: env-only (systemd) starts have
+        // config_path=None yet are exactly where a relative token_storage resolves
+        // outside ReadWritePaths and breaks token writes (#816).
+        if self.auth.enabled && !self.auth.token_storage.starts_with('/') {
+            warnings.push(format!(
+                "auth.token_storage=\"{}\" is relative — will resolve from CWD (under systemd it \
+                 resolves outside ReadWritePaths and token writes fail). Set an absolute path, e.g. \
+                 NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens",
+                self.auth.token_storage
+            ));
         }
 
         // 7. Trusted proxies /0 — security footgun
@@ -1856,6 +1865,26 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("token_storage")),
             "should warn about relative token_storage"
+        );
+    }
+
+    #[test]
+    fn test_relative_token_storage_warns_without_config_path() {
+        // #816: env-only (systemd) starts have config_path=None. A relative
+        // token_storage with auth enabled must still warn — that is exactly the
+        // case that escapes the sandbox and breaks token writes.
+        let mut config = Config::default();
+        config.auth.enabled = true; // default token_storage = "data/tokens" (relative)
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("token_storage")),
+            "relative token_storage must warn even with no config file (env-only deploy)"
+        );
+        // The storage.path hint stays scoped to explicit-config starts (no noise on
+        // the bare-serve relative default).
+        assert!(
+            !warnings.iter().any(|w| w.contains("storage.path")),
+            "storage.path hint should remain gated behind an explicit config file"
         );
     }
 
