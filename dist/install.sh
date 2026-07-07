@@ -75,6 +75,9 @@ if [ ! -f "$CONFIG_DIR/nora.env" ]; then
 NORA_HOST=0.0.0.0
 NORA_PORT=4000
 NORA_STORAGE_PATH=/var/lib/nora
+# Absolute path inside ReadWritePaths — the relative built-in default (data/tokens)
+# resolves outside the ProtectSystem=strict sandbox and breaks token writes (#816).
+NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens
 ENVEOF
     sudo mv /tmp/nora.env "$CONFIG_DIR/nora.env"
     sudo chmod 600 "$CONFIG_DIR/nora.env"

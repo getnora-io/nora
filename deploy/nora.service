@@ -17,6 +17,9 @@ Environment=RUST_LOG=info
 Environment=NORA_HOST=0.0.0.0
 Environment=NORA_PORT=4000
 Environment=NORA_STORAGE_PATH=/var/lib/nora
+# Absolute path inside ReadWritePaths — the relative built-in default (data/tokens)
+# resolves outside the ProtectSystem=strict sandbox and breaks token writes (#816).
+Environment=NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens
 EnvironmentFile=-/etc/nora/nora.env
 
 # Security hardening

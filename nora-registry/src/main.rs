@@ -1299,6 +1299,21 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Initialize token store if auth is enabled
     let tokens = if config.auth.enabled {
         let token_path = Path::new(&config.auth.token_storage);
+        // Fail fast: with auth enabled a token store that cannot create/write its
+        // directory is unusable. Surface it at boot with the resolved path instead
+        // of swallowing the mkdir error and failing later with a bare ENOENT on the
+        // first POST /api/tokens (#816). Under a systemd sandbox a relative
+        // token_storage resolves outside ReadWritePaths and is not writable.
+        if let Err(e) = std::fs::create_dir_all(token_path) {
+            error!(
+                path = %config.auth.token_storage,
+                error = %e,
+                "Cannot create token storage directory — auth is enabled but tokens cannot be \
+                 persisted. Set NORA_AUTH_TOKEN_STORAGE to a writable absolute path (e.g. \
+                 /var/lib/nora/tokens, inside the service's ReadWritePaths)."
+            );
+            std::process::exit(1);
+        }
         info!(path = %config.auth.token_storage, "Token storage initialized");
         Some(TokenStore::with_cache_ttl(
             token_path,
