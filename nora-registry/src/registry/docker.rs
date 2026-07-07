@@ -450,8 +450,10 @@ pub struct LayerInfo {
 
 /// In-progress upload session with metadata.
 ///
-/// Blob data is streamed to a temporary file instead of being buffered in memory.
-/// This prevents 100 concurrent 2GB uploads from consuming 200GB of RAM.
+/// Blob data is streamed frame-by-frame to a temporary file, bounded per request
+/// by [`effective_upload_cap`] and globally by [`IN_FLIGHT_UPLOADS`]; the request
+/// body is never fully buffered in RAM (#817). Finalization hashes the temp file
+/// and moves it into storage via `put_from_path` without an in-RAM copy.
 pub struct UploadSession {
     /// Path to the temporary file holding blob data.
     temp_path: std::path::PathBuf,
@@ -485,17 +487,135 @@ fn max_session_size() -> usize {
     mb.saturating_mul(1024 * 1024)
 }
 
+/// Max bytes buffered for a manifest PUT. Manifests/indexes are small JSON
+/// (layer lists + a config reference); a streaming `Body` extractor is not
+/// bounded by `DefaultBodyLimit`, so the dispatcher caps the manifest collect
+/// explicitly — otherwise the OOM this fix removes from blobs would just move to
+/// the manifest path (#817). 4 MiB matches common registry limits.
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-request byte ceiling for a blob upload: the smaller of the upload-session
+/// cap and the operator's global `body_limit_mb`. A streaming `Body` extractor
+/// is NOT subject to `DefaultBodyLimit` (that only bounds `Bytes`-based
+/// extractors), so the streaming paths must re-apply the tuned-down limit
+/// themselves, or lowering `body_limit_mb` would silently stop bounding uploads.
+fn effective_upload_cap(body_limit_mb: usize) -> u64 {
+    let body_limit = (body_limit_mb as u64).saturating_mul(1024 * 1024);
+    std::cmp::min(max_session_size() as u64, body_limit)
+}
+
+/// Global count of in-flight streaming blob uploads. Bounds concurrent uploads —
+/// including monolithic POSTs, which never open a session and so bypass
+/// `max_upload_sessions` — so streaming to disk cannot fan out unboundedly and
+/// exhaust the disk (#817). Ceiling mirrors `max_upload_sessions`.
+static IN_FLIGHT_UPLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard: reserves an in-flight-upload slot, releasing it on drop (all exit
+/// paths incl. cancellation/panic). `try_acquire` returns `None` if the ceiling
+/// is already reached (caller returns 429).
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let prev = IN_FLIGHT_UPLOADS.fetch_add(1, Ordering::AcqRel);
+        if prev >= max_upload_sessions() {
+            IN_FLIGHT_UPLOADS.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(InFlightGuard)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_UPLOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Outcome of streaming a request body to a temp file with a byte budget.
+enum StreamOutcome {
+    /// Wrote N bytes successfully.
+    Ok(u64),
+    /// Budget exceeded — aborted before writing the offending frame (413).
+    TooLarge,
+    /// Request-body stream errored mid-flight (client disconnect).
+    ClientGone,
+    /// Local write/flush failure (500).
+    Io(std::io::Error),
+}
+
+/// Stream `body` into `file`, bounded to `budget` bytes, never holding more than
+/// one frame in RAM (#817). The running total is checked BEFORE each write, so at
+/// most `budget` bytes ever reach disk — a request over budget aborts without
+/// writing the offending frame.
+///
+/// CANCEL-SAFETY: a pure per-frame read→write loop with no lock held and no
+/// shared state mutated. If the future is dropped mid-stream, the partially
+/// written file is reclaimed by the caller's `TempFileGuard`; nothing is left
+/// half-set.
+async fn stream_body_to_file(body: Body, file: &mut tokio::fs::File, budget: u64) -> StreamOutcome {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = body.into_data_stream();
+    let mut written: u64 = 0;
+    while let Some(frame) = stream.next().await {
+        let chunk = match frame {
+            Ok(c) => c,
+            Err(_) => return StreamOutcome::ClientGone,
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > budget {
+            return StreamOutcome::TooLarge;
+        }
+        if let Err(e) = file.write_all(&chunk).await {
+            return StreamOutcome::Io(e);
+        }
+    }
+    if let Err(e) = file.flush().await {
+        return StreamOutcome::Io(e);
+    }
+    // Postcondition: a successful stream never exceeds the budget — the loop
+    // returns TooLarge before writing any frame that would cross it.
+    debug_assert!(
+        written <= budget,
+        "stream_body_to_file wrote {written} bytes > budget {budget}"
+    );
+    StreamOutcome::Ok(written)
+}
+
+/// Parse the `Content-Length` header, if present and well-formed.
+fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 /// Remove expired upload sessions and their temp files (called by background task)
 pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>>) {
     let mut guard = sessions.write();
     let before = guard.len();
     guard.retain(|_, s| {
-        if s.created_at.elapsed() >= SESSION_TTL {
-            let _ = std::fs::remove_file(&s.temp_path);
-            false
-        } else {
-            true
+        // Reap only sessions that are BOTH past their creation TTL AND whose temp
+        // file has not been written recently. `created_at` never advances, so a
+        // slow multi-GB upload that streams for many minutes (#817) would be
+        // unlinked mid-flight if we keyed off creation alone — losing the open
+        // fd's data and 404-ing an otherwise-successful push. The temp's mtime
+        // advances with every frame, so an in-flight stream stays safe (same
+        // active-write-safe check `cleanup_upload_temp_dir` already uses).
+        if s.created_at.elapsed() < SESSION_TTL {
+            return true;
         }
+        let temp_active = std::fs::metadata(&s.temp_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < SESSION_TTL);
+        if temp_active {
+            return true;
+        }
+        let _ = std::fs::remove_file(&s.temp_path);
+        false
     });
     let removed = before - guard.len();
     if removed > 0 {
@@ -832,7 +952,7 @@ async fn docker_v2_dispatch(
     Extension(authority): Extension<NamespaceAuthority>,
     uri: Uri,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let rest = wildcard.trim_start_matches('/');
     if rest.is_empty() {
@@ -859,6 +979,17 @@ async fn docker_v2_dispatch(
         }
         if is_write && enforce_namespace_scope(&authority, name).is_err() {
             return StatusCode::FORBIDDEN.into_response();
+        }
+        // Fast-reject oversized uploads before reading a byte: docker clients send
+        // Content-Length on monolithic PUT/POST. The streaming paths also enforce
+        // this incrementally, but this rejects the common case up front (#817).
+        if is_write {
+            if let Some(len) = content_length(&headers) {
+                if len > effective_upload_cap(state.0.config.server.body_limit_mb) {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "Upload exceeds size limit")
+                        .into_response();
+                }
+            }
         }
         return if after.is_empty() {
             match method {
@@ -953,9 +1084,12 @@ async fn docker_v2_dispatch(
                     resp
                 }
             }
-            Method::PUT => {
-                put_manifest(state, Path((name.to_string(), reference.to_string())), body).await
-            }
+            Method::PUT => match axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await {
+                Ok(b) => {
+                    put_manifest(state, Path((name.to_string(), reference.to_string())), b).await
+                }
+                Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "Manifest too large").into_response(),
+            },
             Method::DELETE => {
                 delete_manifest(state, Path((name.to_string(), reference.to_string()))).await
             }
@@ -1462,7 +1596,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
 async fn patch_blob(
     State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -1476,8 +1610,17 @@ async fn patch_blob(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
 
-    // Phase 1: Validate session under lock, extract temp_path (no file I/O)
-    let (temp_path, new_size) = {
+    // Bound concurrent streaming uploads (covers monolithic POSTs, which bypass
+    // the session map) so streaming to disk cannot fan out unboundedly (#817).
+    let _inflight = match InFlightGuard::try_acquire() {
+        Some(g) => g,
+        None => {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
+        }
+    };
+
+    // Phase 1: Validate session under lock, extract temp_path + current size (no I/O)
+    let (temp_path, current_size) = {
         let mut sessions = state.upload_sessions.write();
         let session = match sessions.get_mut(&uuid) {
             Some(s) => s,
@@ -1508,66 +1651,73 @@ async fn patch_blob(
             return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
         }
 
-        // Check size limit
-        let new_size = session.size as usize + body.len();
-        if new_size > max_session_size() {
-            let _ = std::fs::remove_file(&session.temp_path);
-            sessions.remove(&uuid);
+        (session.temp_path.clone(), session.size)
+    }; // lock released before file I/O
+
+    // Remaining byte budget for this session. The body length is unknown until
+    // streamed, so the cap is enforced incrementally inside the stream loop —
+    // DefaultBodyLimit does NOT bound a streaming Body extractor (#817).
+    //
+    // ACCEPTED LIMITATION: the per-session cap is best-effort under CONCURRENT
+    // PATCHes to the SAME upload uuid — each reads `session.size` before the
+    // other's Phase-3 update, so a single temp can exceed one session cap. No new
+    // exhaustion vector: total upload disk stays <= IN_FLIGHT_UPLOADS * cap
+    // regardless, and blob integrity is still enforced by the finalize digest
+    // check. OCI clients PATCH sequentially (await each 202 Range), so this only
+    // bites a misbehaving client. Upgrade path: per-uuid serialization.
+    let budget =
+        effective_upload_cap(state.config.server.body_limit_mb).saturating_sub(current_size);
+
+    // Phase 2: stream the chunk to the temp file outside the lock, bounded by
+    // `budget`. No .create(true) — the temp file was created by start_upload; if
+    // cleanup deleted it, open() returns NotFound and we 404 rather than
+    // re-creating an orphan (#530).
+    let mut file = match tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&temp_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(uuid = %uuid, "Upload temp file deleted by cleanup during PATCH — session race");
+            state.upload_sessions.write().remove(&uuid);
+            return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open upload temp file");
+            state.upload_sessions.write().remove(&uuid);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    // CANCEL-SAFETY: if this future is dropped mid-stream, `guard` drops and
+    // removes the partially appended temp; on success we disarm to keep it for
+    // the next PATCH/PUT.
+    let mut guard = TempFileGuard::new(temp_path.clone());
+    let written = match stream_body_to_file(body, &mut file, budget).await {
+        StreamOutcome::Ok(n) => {
+            guard.disarm();
+            n
+        }
+        StreamOutcome::TooLarge => {
+            state.upload_sessions.write().remove(&uuid);
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Upload session exceeds size limit",
             )
                 .into_response();
         }
-
-        (session.temp_path.clone(), new_size)
-    }; // lock released before file I/O
-
-    // Phase 2: Append to temp file outside lock (non-blocking).
-    // No .create(true) — temp file was created by start_upload.
-    // If cleanup_expired_sessions deleted the file while we were unlocked,
-    // open() returns NotFound and we return 404 instead of re-creating an orphan (#530).
-    {
-        use tokio::io::AsyncWriteExt;
-        let file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&temp_path)
-            .await;
-        match file {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(&body).await {
-                    tracing::error!(error = %e, "Failed to write to upload temp file");
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    state.upload_sessions.write().remove(&uuid);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                // Flush to ensure data is visible to subsequent reads (e.g.
-                // the PUT handler that finalizes this upload). Without an
-                // explicit flush, data may remain in OS page cache only and
-                // can be invisible on overlay-fs / CI runners under I/O
-                // pressure.
-                if let Err(e) = f.flush().await {
-                    tracing::error!(error = %e, "Failed to flush upload temp file");
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    state.upload_sessions.write().remove(&uuid);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Temp file was deleted by cleanup_expired_sessions between
-                // Phase 1 and Phase 2 — session is gone, return 404.
-                tracing::warn!(uuid = %uuid, "Upload temp file deleted by cleanup during PATCH — session race");
-                state.upload_sessions.write().remove(&uuid);
-                return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to open upload temp file");
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                state.upload_sessions.write().remove(&uuid);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        StreamOutcome::ClientGone => {
+            state.upload_sessions.write().remove(&uuid);
+            return StatusCode::BAD_REQUEST.into_response();
         }
-    }
+        StreamOutcome::Io(e) => {
+            tracing::error!(error = %e, "Failed to write to upload temp file");
+            state.upload_sessions.write().remove(&uuid);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let new_size = current_size + written;
 
     // Phase 3: Update session size (brief lock, no I/O).
     // If session is gone (cleanup raced, or upload_blob consumed it), log and return 404.
@@ -1575,7 +1725,7 @@ async fn patch_blob(
     {
         let mut sessions = state.upload_sessions.write();
         match sessions.get_mut(&uuid) {
-            Some(session) => session.size = new_size as u64,
+            Some(session) => session.size = new_size,
             None => {
                 tracing::warn!(uuid = %uuid, "Upload session disappeared between Phase 1 and Phase 3");
                 return (StatusCode::NOT_FOUND, "Upload session not found or expired")
@@ -1612,7 +1762,7 @@ async fn upload_blob(
     State(state): State<AppState>,
     Path((name, uuid)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -1625,6 +1775,15 @@ async fn upload_blob(
     if let Err(e) = validate_upload_uuid(&uuid) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
+
+    // Bound concurrent streaming uploads. Monolithic POSTs bypass the session
+    // map, so `max_upload_sessions` alone does not cap their concurrency (#817).
+    let _inflight = match InFlightGuard::try_acquire() {
+        Some(g) => g,
+        None => {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
+        }
+    };
 
     let digest = match params.get("digest") {
         Some(d) => d,
@@ -1650,8 +1809,13 @@ async fn upload_blob(
             .into_response();
     }
 
-    // Resolve temp file path: either from a PATCH session or write body to a new temp file
-    let temp_path = if let Some(session) = session_opt {
+    let cap = effective_upload_cap(state.config.server.body_limit_mb);
+
+    // Resolve the temp file and stream the request body into it, bounded by the
+    // per-request cap (DefaultBodyLimit does not bound a streaming Body — #817).
+    // `guard` reclaims a partial temp on ANY early return below (cap exceeded,
+    // client disconnect, digest mismatch, storage failure, cancellation) — #580.
+    let (temp_path, mut guard) = if let Some(session) = session_opt {
         // Verify session belongs to this repository
         if session.name != name {
             tracing::warn!(
@@ -1666,46 +1830,66 @@ async fn upload_blob(
             )
                 .into_response();
         }
-        // If PUT body is non-empty, append it to the temp file
-        if !body.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            match tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&session.temp_path)
-                .await
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&body).await {
-                        tracing::error!(error = %e, "Failed to append PUT body to temp file");
-                        let _ = tokio::fs::remove_file(&session.temp_path).await;
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                    let _ = f.flush().await;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // No temp file (no PATCH was sent) — create one with body
-                    if let Err(e) = tokio::fs::write(&session.temp_path, &body).await {
-                        tracing::error!(error = %e, "Failed to write temp file for PUT body");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open temp file for append");
-                    let _ = tokio::fs::remove_file(&session.temp_path).await;
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
+        // create(true) covers the "no PATCH was sent, data all in the PUT body"
+        // case; the session was already removed from the map, so we own this
+        // temp exclusively.
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session.temp_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to open temp file for PUT body");
+                let _ = tokio::fs::remove_file(&session.temp_path).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let guard = TempFileGuard::new(session.temp_path.clone());
+        let budget = cap.saturating_sub(session.size);
+        // CANCEL-SAFETY: partial temp reclaimed by `guard` if this future drops.
+        match stream_body_to_file(body, &mut file, budget).await {
+            StreamOutcome::Ok(_) => {}
+            StreamOutcome::TooLarge => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Upload session exceeds size limit",
+                )
+                    .into_response()
+            }
+            StreamOutcome::ClientGone => return StatusCode::BAD_REQUEST.into_response(),
+            StreamOutcome::Io(e) => {
+                tracing::error!(error = %e, "Failed to append PUT body to temp file");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
-        session.temp_path
+        (session.temp_path, guard)
     } else {
-        // Monolithic upload (no session): write body to a temp file
+        // Monolithic upload (no session): create a fresh temp and stream into it.
         let temp_dir = upload_temp_dir(&state.config.storage.path);
         let temp_path = temp_dir.join(format!("mono-{}", uuid));
-        if let Err(e) = tokio::fs::write(&temp_path, &body).await {
-            tracing::error!(error = %e, "Failed to write monolithic upload temp file");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        let mut file = match tokio::fs::File::create(&temp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create monolithic upload temp file");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let guard = TempFileGuard::new(temp_path.clone());
+        // CANCEL-SAFETY: partial temp reclaimed by `guard` if this future drops.
+        match stream_body_to_file(body, &mut file, cap).await {
+            StreamOutcome::Ok(_) => {}
+            StreamOutcome::TooLarge => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Upload exceeds size limit").into_response()
+            }
+            StreamOutcome::ClientGone => return StatusCode::BAD_REQUEST.into_response(),
+            StreamOutcome::Io(e) => {
+                tracing::error!(error = %e, "Failed to write monolithic upload temp file");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
-        temp_path
+        (temp_path, guard)
     };
 
     // Verify digest by streaming SHA-256 — O(chunk_size) memory, not O(blob_size)
@@ -1762,6 +1946,7 @@ async fn upload_blob(
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.put_from_path(&key, &temp_path, None).await {
         Ok(()) => {
+            guard.disarm(); // temp moved into storage — nothing left to clean up
             state.metrics.record_upload("docker");
             state.audit.log(AuditEntry::new(
                 "push",
@@ -3549,7 +3734,9 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::circuit_breaker::ProbeToken;
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
     use axum::body::Body;
     use axum::http::{header, Method, StatusCode};
     use sha2::Digest;
@@ -3558,7 +3745,6 @@ mod integration_tests {
     async fn test_docker_namespace_scope_enforced() {
         use crate::auth::NamespaceAuthority;
         use crate::config::ScopeEnforcement;
-        use axum::body::Bytes;
         use axum::extract::{Path, State};
         use axum::http::Uri;
         use axum::Extension;
@@ -3578,7 +3764,7 @@ mod integration_tests {
             Extension(scoped.clone()),
             "/v2/other/app/blobs/uploads/".parse::<Uri>().unwrap(),
             axum::http::HeaderMap::new(),
-            Bytes::new(),
+            Body::empty(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -3591,7 +3777,7 @@ mod integration_tests {
             Extension(scoped.clone()),
             "/v2/myorg/app/blobs/uploads/".parse::<Uri>().unwrap(),
             axum::http::HeaderMap::new(),
-            Bytes::new(),
+            Body::empty(),
         )
         .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
@@ -3604,7 +3790,7 @@ mod integration_tests {
             Extension(scoped.clone()),
             "/v2/other/app/manifests/latest".parse::<Uri>().unwrap(),
             axum::http::HeaderMap::new(),
-            Bytes::new(),
+            Body::empty(),
         )
         .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
@@ -3982,6 +4168,123 @@ mod integration_tests {
         let put_url = format!("/v2/alpine/blobs/uploads/{}?digest={}", uuid, digest);
         let put_resp = send(&ctx.app, Method::PUT, &put_url, Body::empty()).await;
         assert_eq!(put_resp.status(), StatusCode::CREATED);
+    }
+
+    // --- #817: blob-upload memory/disk bounds (streaming) ---
+
+    #[tokio::test]
+    async fn test_monolithic_upload_over_cap_rejected_fast() {
+        // A monolithic PUT whose Content-Length exceeds the effective cap is
+        // rejected up front (413), before any body is read.
+        let ctx = create_test_context_with_config(|c| c.server.body_limit_mb = 1); // 1 MiB
+        let blob = vec![0u8; 2 * 1024 * 1024]; // 2 MiB > cap
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/alpine/blobs/uploads/?digest={}", digest),
+            Body::from(blob),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_upload_over_cap_streamed_rejected() {
+        // The incremental cap must bound a STREAMING body with no Content-Length
+        // — DefaultBodyLimit does not apply to a Body extractor (#817). Without
+        // the in-loop guard this would write unbounded bytes to disk.
+        let ctx = create_test_context_with_config(|c| c.server.body_limit_mb = 1); // 1 MiB
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = (0..4)
+            .map(|_| Ok(axum::body::Bytes::from(vec![0u8; 512 * 1024])))
+            .collect(); // 2 MiB total, streamed
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let digest = format!("sha256:{}", "0".repeat(64)); // irrelevant — rejected before verify
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/alpine/blobs/uploads/?digest={}", digest),
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "streamed body over cap must 413 via the incremental guard, not OOM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_over_cap_rejected() {
+        // Chunked PATCH accumulating past the cap → 413.
+        let ctx = create_test_context_with_config(|c| c.server.body_limit_mb = 1); // 1 MiB
+        let post = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(post.status(), StatusCode::ACCEPTED);
+        let loc = post
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let uuid = loc.rsplit('/').next().unwrap();
+        let big = vec![0u8; 2 * 1024 * 1024]; // 2 MiB > cap
+        let resp = send(
+            &ctx.app,
+            Method::PATCH,
+            &format!("/v2/alpine/blobs/uploads/{}", uuid),
+            Body::from(big),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_over_cap_rejected() {
+        // Manifests stay bounded: a body over MAX_MANIFEST_BYTES → 413, not OOM
+        // (the streaming Body dispatcher bounds the collect explicitly, #817).
+        let ctx = create_test_context();
+        let huge = vec![b'{'; super::MAX_MANIFEST_BYTES + 1]; // just over 4 MiB
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/alpine/manifests/latest",
+            Body::from(huge),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_upload_multiframe_ok() {
+        // A multi-frame streamed blob (no Content-Length) is assembled and
+        // digest-verified correctly — the streaming path is not tiny-body-only.
+        let ctx = create_test_context();
+        let blob = vec![7u8; 1024 * 1024]; // 1 MiB
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = blob
+            .chunks(64 * 1024)
+            .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
+            .collect();
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/alpine/blobs/uploads/?digest={}", digest),
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "multi-frame streamed blob must store and verify"
+        );
     }
 
     #[tokio::test]
