@@ -118,7 +118,8 @@ pub struct Translations {
     pub memory: &'static str,
     pub registries_count: &'static str,
     pub multi_arch: &'static str,
-    pub zero_config: &'static str,
+    pub zero_deps: &'static str,
+    pub deps_label: &'static str,
     pub tagline: &'static str,
 
     // Token management
@@ -235,7 +236,8 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     memory: "Memory",
     registries_count: "Registries",
     multi_arch: "Multi-arch",
-    zero_config: "Zero",
+    zero_deps: "0",
+    deps_label: "Dependencies",
     tagline: "Pure Rust. Single binary. OCI compatible.",
 
     // Token management
@@ -276,7 +278,7 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     // Dashboard
     dashboard_title: "Панель управления",
     dashboard_subtitle: "Обзор всех реестров",
-    uptime: "Аптайм",
+    uptime: "Время работы",
 
     // Stats
     stat_downloads: "Загрузки",
@@ -343,8 +345,9 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     cold_start: "Холодный старт",
     memory: "Память",
     registries_count: "Реестров",
-    multi_arch: "Мульти-арх",
-    zero_config: "Без",
+    multi_arch: "Мультиарх",
+    zero_deps: "0",
+    deps_label: "зависимостей",
     tagline: "Чистый Rust. Один бинарник. OCI совместимый.",
 
     // Token management
@@ -453,7 +456,8 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     memory: "内存",
     registries_count: "注册表",
     multi_arch: "多架构",
-    zero_config: "零配置",
+    zero_deps: "0",
+    deps_label: "依赖",
     tagline: "纯 Rust 实现。单二进制文件。兼容 OCI。",
 
     // Token management

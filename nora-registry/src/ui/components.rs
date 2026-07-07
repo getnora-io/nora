@@ -915,8 +915,8 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
                 <div class="text-xs text-slate-500 mt-1">amd64 / arm64</div>
             </div>
             <div class="p-3">
-                <div class="text-2xl font-bold text-cyan-400">{zero_config}</div>
-                <div class="text-xs text-slate-500 mt-1">Config</div>
+                <div class="text-2xl font-bold text-cyan-400">{zero_deps}</div>
+                <div class="text-xs text-slate-500 mt-1">{deps_label}</div>
             </div>
         </div>
         <div class="text-center mt-4">
@@ -934,7 +934,8 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         reg_count = stats.registry_count,
         reg_label = t.registries_count,
         multi_arch = t.multi_arch,
-        zero_config = t.zero_config,
+        zero_deps = t.zero_deps,
+        deps_label = t.deps_label,
         tagline = t.tagline,
     )
 }
