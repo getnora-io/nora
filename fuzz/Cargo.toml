@@ -46,3 +46,8 @@ doc = false
 name = "fuzz_url_leak"
 path = "fuzz_targets/fuzz_url_leak.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_rewrite_ansible"
+path = "fuzz_targets/fuzz_rewrite_ansible.rs"
+doc = false

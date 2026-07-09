@@ -325,3 +325,111 @@ pub mod version_fuzz {
         Some(version.to_string())
     }
 }
+
+/// Re-export of the escape-aware raw-JSON URL rewrites for fuzz targets (#385).
+///
+/// These MIRROR the private `registry::{ansible,nuget}` rewrites, which live in the
+/// binary crate and are unreachable from this library — so a fuzz-friendly copy is
+/// the only option (same constraint as `npm_fuzz`). The *real* functions are enforced
+/// on every CI run by their in-module `#[cfg(test)]` leak tests; these byte-faithful
+/// copies let `cargo fuzz` explore the encoding-space for new dodge forms. A finding
+/// here must be reproduced against the real function before it counts.
+pub mod rewrite_fuzz {
+    /// Mirror of `registry::replace_url_escape_aware`.
+    fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
+        let plain = text.replace(from, to);
+        let esc_from = from.replace('/', "\\/");
+        if !plain.contains(&esc_from) {
+            return plain;
+        }
+        let esc_to = to.replace('/', "\\/");
+        plain.replace(&esc_from, &esc_to)
+    }
+
+    /// Mirror of `registry::ansible::rewrite_ansible_urls`.
+    pub fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
+        const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
+        let upstream = upstream_url.trim_end_matches('/');
+        let base = base_url.trim_end_matches('/');
+        let nora_ansible = format!("{}/ansible", base);
+        let s = replace_url_escape_aware(
+            json_text,
+            &format!("{}/download/", upstream),
+            &format!("{}/download/", nora_ansible),
+        );
+        let s = replace_url_escape_aware(
+            &s,
+            &format!(
+                "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
+                upstream
+            ),
+            &format!("{}/download/", nora_ansible),
+        );
+        let s = replace_url_escape_aware(
+            &s,
+            &format!("{}{}/", upstream, API_PREFIX),
+            &format!("{}/v3/collections/", nora_ansible),
+        );
+        replace_url_escape_aware(&s, upstream, &nora_ansible)
+    }
+
+    /// Mirror of `registry::nuget::rewrite_registration_urls`.
+    pub fn rewrite_registration_urls(
+        json_text: &str,
+        upstream_url: &str,
+        base_url: &str,
+    ) -> String {
+        let upstream = upstream_url.trim_end_matches('/');
+        let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
+        let nora_reg = format!("{}/v3/registration/", nora_nuget);
+        let s = replace_url_escape_aware(
+            json_text,
+            &format!("{}/v3/registration5-semver1/", upstream),
+            &nora_reg,
+        );
+        let s = replace_url_escape_aware(
+            &s,
+            &format!("{}/v3/registration5-gz-semver1/", upstream),
+            &nora_reg,
+        );
+        let s = replace_url_escape_aware(
+            &s,
+            &format!("{}/v3/registration5-gz-semver2/", upstream),
+            &nora_reg,
+        );
+        replace_url_escape_aware(
+            &s,
+            &format!("{}/v3-flatcontainer/", upstream),
+            &format!("{}/v3/flatcontainer/", nora_nuget),
+        )
+    }
+
+    #[cfg(test)]
+    mod url_leak_tests {
+        //! Deterministic front-loop cases (no fuzz CI job) — the fuzz targets
+        //! `fuzz_rewrite_ansible` / `fuzz_rewrite_nuget` explore the rest.
+        use super::*;
+        const UP: &str = "https://origin-host.invalid";
+        const NORA: &str = "http://nora.test";
+
+        #[test]
+        fn ansible_escaped_slash_scrubbed() {
+            let out = rewrite_ansible_urls(
+                r#"{"d":"https:\/\/origin-host.invalid\/download\/a.tar.gz"}"#,
+                UP,
+                NORA,
+            );
+            assert!(!out.contains("origin-host.invalid"), "leak: {out}");
+        }
+
+        #[test]
+        fn nuget_escaped_slash_scrubbed() {
+            let out = rewrite_registration_urls(
+                r#"{"@id":"https:\/\/origin-host.invalid\/v3\/registration5-semver1\/p\/i.json"}"#,
+                UP,
+                NORA,
+            );
+            assert!(!out.contains("origin-host.invalid"), "leak: {out}");
+        }
+    }
+}

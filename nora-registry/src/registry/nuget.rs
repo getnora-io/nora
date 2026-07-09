@@ -1532,23 +1532,30 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
     // catalog0 URLs (catalogEntry.@id) are intentionally left as-is: Nora has
     // no catalog handler, and NuGet clients do not fetch these during restore.
     // Rewriting them would produce Nora URLs that 404.
-    json_text
-        .replace(
-            &format!("{}/v3/registration5-semver1/", upstream),
-            &nora_reg,
-        )
-        .replace(
-            &format!("{}/v3/registration5-gz-semver1/", upstream),
-            &nora_reg,
-        )
-        .replace(
-            &format!("{}/v3/registration5-gz-semver2/", upstream),
-            &nora_reg,
-        )
-        .replace(
-            &format!("{}/v3-flatcontainer/", upstream),
-            &format!("{}/v3/flatcontainer/", nora_nuget),
-        )
+    // Each mapping is escape-aware (plain + `\/`-escaped) so a slash-escaped upstream
+    // registration/flatcontainer URL cannot survive and leak the host — sending the
+    // client back to the origin, past Nora — after the client unescapes `\/` (#385).
+    use super::replace_url_escape_aware as rw;
+    let s = rw(
+        json_text,
+        &format!("{}/v3/registration5-semver1/", upstream),
+        &nora_reg,
+    );
+    let s = rw(
+        &s,
+        &format!("{}/v3/registration5-gz-semver1/", upstream),
+        &nora_reg,
+    );
+    let s = rw(
+        &s,
+        &format!("{}/v3/registration5-gz-semver2/", upstream),
+        &nora_reg,
+    );
+    rw(
+        &s,
+        &format!("{}/v3-flatcontainer/", upstream),
+        &format!("{}/v3/flatcontainer/", nora_nuget),
+    )
 }
 
 /// Validate NuGet version string for use in URL path construction.
@@ -1604,6 +1611,36 @@ fn is_safe_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #385: a slash-escaped upstream registration URL must not survive the
+    /// raw-text rewrite — otherwise the client, after unescaping `\/`, is sent
+    /// back to the origin past Nora (host leak + air-gap bypass).
+    #[test]
+    fn rewrite_nuget_registration_drops_upstream_host_plain_and_escaped() {
+        const HOST: &str = "api.nuget.org";
+        let upstream = "https://api.nuget.org";
+        let base = "http://nora.test";
+
+        let plain = rewrite_registration_urls(
+            r#"{"@id":"https://api.nuget.org/v3/registration5-semver1/pkg/index.json"}"#,
+            upstream,
+            base,
+        );
+        assert!(
+            !plain.contains(HOST),
+            "plain registration host leaked: {plain}"
+        );
+
+        let escaped = rewrite_registration_urls(
+            r#"{"@id":"https:\/\/api.nuget.org\/v3\/registration5-semver1\/pkg\/index.json"}"#,
+            upstream,
+            base,
+        );
+        assert!(
+            !escaped.contains(HOST),
+            "slash-escaped registration host leaked (#385): {escaped}"
+        );
+    }
 
     #[test]
     fn test_valid_package_ids() {

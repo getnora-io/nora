@@ -50,6 +50,27 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, allow)]).into_response()
 }
 
+/// Replace `from`→`to` in raw JSON text, matching BOTH the plain form and the
+/// JSON slash-escaped form (`\/`) of `from`.
+///
+/// Raw-text registry rewrites (ansible, nuget) `.replace()` on the unparsed
+/// upstream response. A valid JSON escaping that many origins emit —
+/// `"https:\/\/host\/path"` — dodges a plain `https://host/path` needle, so the
+/// upstream URL survives the rewrite and leaks the host once the client's JSON
+/// parser unescapes `\/`→`/` (#385, class of #377/#379/#380/#381). Handling the
+/// `\/` form here closes that. NB: `\uXXXX`-escaped separators are a documented
+/// residual — see `rewrite-drops-upstream-host` — caught by the runtime
+/// `UPSTREAM_URL_LEAK_TOTAL` detector, not by this string pass.
+pub(crate) fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
+    let plain = text.replace(from, to);
+    let esc_from = from.replace('/', "\\/");
+    if !plain.contains(&esc_from) {
+        return plain;
+    }
+    let esc_to = to.replace('/', "\\/");
+    plain.replace(&esc_from, &esc_to)
+}
+
 /// Build NORA base URL from config (for URL rewriting).
 ///
 /// Thin wrapper over [`ServerConfig::public_base_url`] — the single source of

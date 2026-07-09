@@ -695,28 +695,33 @@ fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> 
     let upstream = upstream_url.trim_end_matches('/');
     let base = base_url.trim_end_matches('/');
     let nora_ansible = format!("{}/ansible", base);
+    // Each mapping is escape-aware (plain + `\/`-escaped) so a slash-escaped upstream
+    // URL cannot survive and leak the host to the client (#385).
+    use super::replace_url_escape_aware as rw;
 
-    json_text
-        // Most specific first: download URLs
-        .replace(
-            &format!("{}/download/", upstream),
-            &format!("{}/download/", nora_ansible),
-        )
-        // Artifact URLs → download path (#438)
-        .replace(
-            &format!(
-                "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
-                upstream
-            ),
-            &format!("{}/download/", nora_ansible),
-        )
-        // Pulp-style API paths → short v3 paths
-        .replace(
-            &format!("{}{}/", upstream, API_PREFIX),
-            &format!("{}/v3/collections/", nora_ansible),
-        )
-        // Catch-all: any remaining upstream references
-        .replace(upstream, &nora_ansible)
+    // Most specific first: download URLs
+    let s = rw(
+        json_text,
+        &format!("{}/download/", upstream),
+        &format!("{}/download/", nora_ansible),
+    );
+    // Artifact URLs → download path (#438)
+    let s = rw(
+        &s,
+        &format!(
+            "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
+            upstream
+        ),
+        &format!("{}/download/", nora_ansible),
+    );
+    // Pulp-style API paths → short v3 paths
+    let s = rw(
+        &s,
+        &format!("{}{}/", upstream, API_PREFIX),
+        &format!("{}/v3/collections/", nora_ansible),
+    );
+    // Catch-all: any remaining upstream references
+    rw(&s, upstream, &nora_ansible)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -823,6 +828,36 @@ fn is_safe_filename(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #385: a slash-escaped upstream URL (`https:\/\/host` — valid JSON many
+    /// origins emit) must not survive the raw-text rewrite and leak the host.
+    #[test]
+    fn rewrite_ansible_drops_upstream_host_plain_and_escaped() {
+        const HOST: &str = "galaxy.ansible.com";
+        let upstream = "https://galaxy.ansible.com";
+        let base = "http://nora.test";
+
+        let plain = rewrite_ansible_urls(
+            r#"{"download_url":"https://galaxy.ansible.com/download/x/a.tar.gz"}"#,
+            upstream,
+            base,
+        );
+        assert!(!plain.contains(HOST), "plain upstream host leaked: {plain}");
+
+        let escaped = rewrite_ansible_urls(
+            r#"{"download_url":"https:\/\/galaxy.ansible.com\/download\/x\/a.tar.gz"}"#,
+            upstream,
+            base,
+        );
+        assert!(
+            !escaped.contains(HOST),
+            "slash-escaped upstream host leaked (#385): {escaped}"
+        );
+        assert!(
+            escaped.contains("nora.test"),
+            "escaped url not rewritten to nora base: {escaped}"
+        );
+    }
 
     #[test]
     fn test_valid_names() {
