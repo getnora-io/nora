@@ -356,6 +356,7 @@ pub fn check_namespace_isolation(
         let decision = ns_filter.evaluate(&request);
         if let Decision::Block { rule, reason } = &decision {
             engine.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::record_namespace_isolation_refused(registry.as_str());
             return Some(
                 BlockedResponse {
                     rule: rule.clone(),

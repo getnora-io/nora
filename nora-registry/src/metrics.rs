@@ -45,6 +45,28 @@ pub static CURATION_DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create CURATION_DECISIONS_TOTAL metric at startup")
 });
 
+/// Internal-namespace requests refused by namespace isolation — the
+/// dependency-confusion defense firing: an internal name that was neither served
+/// from local storage nor proxied upstream (blocked / 404'd). Previously the guard
+/// was invisible in Prometheus (only a client 403/404 and a test-internal counter
+/// existed), so an operator could neither alert on nor graph it. By registry.
+pub static NAMESPACE_ISOLATION_REFUSED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_namespace_isolation_refused_total",
+        "Internal-namespace requests refused by namespace isolation (never served locally, never proxied upstream), by registry",
+        &["registry"]
+    )
+    .expect("failed to create NAMESPACE_ISOLATION_REFUSED_TOTAL metric at startup")
+});
+
+/// Record one namespace-isolation refusal for `registry` (dependency-confusion
+/// defense). `registry` must be a [`crate::registry_type::RegistryType::as_str`] value.
+pub fn record_namespace_isolation_refused(registry: &str) {
+    NAMESPACE_ISOLATION_REFUSED_TOTAL
+        .with_label_values(&[registry])
+        .inc();
+}
+
 /// Proxy artifacts held by the digest quarantine, by registry and outcome
 /// (`blocked` = enforce returned 403; `observed` = observe served but recorded).
 /// Gives the operator an alertable/graphable signal — the quarantine was

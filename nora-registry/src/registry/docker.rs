@@ -1409,6 +1409,7 @@ async fn download_blob(
     // BLOB_UNKNOWN so GET agrees with the HEAD probe (check_blob, which already 404s)
     // instead of the fatal-to-clients 403.
     if internal {
+        crate::metrics::record_namespace_isolation_refused("docker");
         return blob_unknown_response(&digest);
     }
 
@@ -2303,6 +2304,7 @@ async fn get_manifest(
         if let Some(ref data) = cached {
             return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
         }
+        crate::metrics::record_namespace_isolation_refused("docker");
         return manifest_unknown_response(&name, &reference);
     }
 

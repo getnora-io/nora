@@ -676,3 +676,56 @@ async fn docker_internal_manifest_served_local_still_ok() {
         "locally-hosted internal manifest must still be served, not blocked (#733 serve-local)"
     );
 }
+
+// ── observability: namespace-isolation refusals are counted in Prometheus ──
+// The dependency-confusion defense firing was previously invisible in telemetry (only
+// the client 403/404 and a test-internal counter existed). nora_namespace_isolation_refused_total
+// makes it alertable/graphable. Delta assertion (after > before) is robust to parallel tests
+// incrementing the same label, and still catches a removed increment (nothing bumps the label
+// anywhere -> after == before -> fail).
+
+#[tokio::test]
+async fn docker_internal_miss_increments_isolation_refused_metric() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+    });
+    let before = crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+        .with_label_values(&["docker"])
+        .get();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/v2/internal/backend/manifests/9.9.9",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let after = crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+        .with_label_values(&["docker"])
+        .get();
+    assert!(
+        after > before,
+        "a docker internal-namespace refusal must increment nora_namespace_isolation_refused_total{{registry=docker}}"
+    );
+}
+
+#[tokio::test]
+async fn pypi_internal_refusal_increments_isolation_refused_metric() {
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.pypi.proxy = Some(BLACKHOLE.to_string());
+    });
+    let before = crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+        .with_label_values(&["pypi"])
+        .get();
+    // Internal name, no local copy → check_namespace_isolation refusal (403).
+    let resp = send(&ctx.app, Method::GET, "/simple/internalpkg-metric/", "").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let after = crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+        .with_label_values(&["pypi"])
+        .get();
+    assert!(
+        after > before,
+        "a non-docker internal-namespace refusal (check_namespace_isolation) must increment the isolation-refused metric"
+    );
+}
