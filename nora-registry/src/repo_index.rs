@@ -192,6 +192,10 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Conan => build_conan_index(storage).await,
+                RegistryType::Rpm => {
+                    let (p, s) = crate::registry::rpm::INDEX_PATTERN;
+                    build_generic_index(storage, p, s).await
+                }
             };
             match data {
                 Some(data) => {

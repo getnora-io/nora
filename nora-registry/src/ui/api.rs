@@ -33,6 +33,7 @@ pub struct RegistryStats {
     #[serde(rename = "pub")]
     pub pub_dart: usize,
     pub conan: usize,
+    pub rpm: usize,
 }
 
 #[derive(Serialize)]
@@ -172,6 +173,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         ansible: get(RegistryType::Ansible),
         pub_dart: get(RegistryType::PubDart),
         conan: get(RegistryType::Conan),
+        rpm: get(RegistryType::Rpm),
     })
 }
 
@@ -234,6 +236,7 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
             RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
             RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+            RegistryType::Rpm => vec![],
         };
 
         mount_points.push(MountPoint {
@@ -1066,6 +1069,7 @@ pub async fn get_generic_detail(
     match registry {
         "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await,
         "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
+        "rpm" => get_rpm_detail(storage, name, show_all).await,
         "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
         "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
         "ansible" => get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await,
@@ -1315,6 +1319,58 @@ async fn get_conan_detail(
         versions,
         prerelease_count,
         total_stable,
+        metadata: PackageMetadata::default(),
+    }
+}
+
+/// RPM: the UI "package" is a repository; each row is one stored package
+/// (NEVRA). Reads the per-package metadata sidecars written at upload —
+/// never the .rpm payloads. No prerelease filter: NEVRA strings always
+/// contain '-' and would all be misclassified as prerelease.
+async fn get_rpm_detail(storage: &Storage, repo: &str, show_all: bool) -> PackageDetail {
+    let prefix = format!("rpm/{}/.nora-meta/", repo);
+    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let mut versions = Vec::new();
+
+    for key in &keys {
+        let Ok(data) = storage.get(key).await else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let s = |f: &str| {
+            rec.get(f)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        versions.push(VersionInfo {
+            version: format!(
+                "{}-{}-{}.{}",
+                s("name"),
+                s("version"),
+                s("release"),
+                s("arch")
+            ),
+            size: rec
+                .get("size_package")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            published: format_timestamp(rec.get("file_time").and_then(|v| v.as_u64()).unwrap_or(0)),
+            cached: true,
+        });
+    }
+
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let total = versions.len();
+    if !show_all && versions.len() > 20 {
+        versions.truncate(20);
+    }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+        total_stable: total,
         metadata: PackageMetadata::default(),
     }
 }

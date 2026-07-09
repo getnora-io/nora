@@ -22,7 +22,7 @@ use crate::AppState;
     info(
         title = "Nora",
         version = "0.9.7",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, and Conan",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, and RPM",
         license(name = "MIT"),
         contact(name = "The NORA Authors", url = "https://getnora.dev")
     ),
@@ -46,6 +46,7 @@ use crate::AppState;
         (name = "nuget", description = "NuGet v3 Registry Proxy API"),
         (name = "pub", description = "Dart/Flutter Pub Registry Proxy API"),
         (name = "conan", description = "Conan V2 Registry Proxy API (C/C++)"),
+        (name = "rpm", description = "RPM (yum/dnf) Hosted Repository API"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
@@ -111,6 +112,10 @@ use crate::AppState;
         // Conan (C/C++)
         crate::openapi::conan_ping,
         crate::openapi::conan_recipe_file,
+        // RPM (yum/dnf)
+        crate::openapi::rpm_repomd,
+        crate::openapi::rpm_upload,
+        crate::openapi::rpm_download,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1014,6 +1019,59 @@ pub async fn conan_ping() {}
     )
 )]
 pub async fn conan_recipe_file() {}
+
+// -------------------- RPM (yum/dnf) --------------------
+
+/// Repository metadata index (dnf/yum entry point)
+#[utoipa::path(
+    get,
+    path = "/rpm/{repo}/repodata/repomd.xml",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "repomd.xml referencing primary/filelists/other metadata"),
+        (status = 404, description = "Repository not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_repomd() {}
+
+/// Publish an .rpm package (repodata is regenerated server-side)
+#[utoipa::path(
+    put,
+    path = "/rpm/{repo}/{path}",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package path, must end in .rpm")
+    ),
+    responses(
+        (status = 201, description = "Package stored and repodata regenerated"),
+        (status = 400, description = "Invalid path or not a valid RPM", body = ErrorResponse),
+        (status = 413, description = "File exceeds rpm.max_file_size"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_upload() {}
+
+/// Download a package or repodata file
+#[utoipa::path(
+    get,
+    path = "/rpm/{repo}/{path}",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package or repodata path")
+    ),
+    responses(
+        (status = 200, description = "File content"),
+        (status = 404, description = "File not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_download() {}
 
 // -------------------- Auth / Tokens --------------------
 

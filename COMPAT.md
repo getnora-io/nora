@@ -242,6 +242,42 @@ Caching proxy for ConanCenter (center2.conan.io). Recipe and package files are i
 
 Client: `conan remote add nora http://nora:4000/conan`
 
+## RPM (yum/dnf)
+
+Hosted repositories with server-generated repodata (createrepo-style). Each
+`/rpm/{repo}/` path is an independent repository; publishing or deleting a
+package regenerates `repodata/` (repomd.xml + sha256-named
+primary/filelists/other.xml.gz). Package headers are parsed server-side — no
+`createrepo_c` needed on the client. No upstream proxy (hosted only).
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `repodata/repomd.xml` | Full | Regenerated on publish/delete, `Cache-Control: no-cache` |
+| `primary.xml.gz` | Full | name/evr/arch, provides/requires/conflicts/obsoletes with flags, primary file subset, header-range |
+| `filelists.xml.gz` | Full | All files with dir/ghost types |
+| `other.xml.gz` | Full | Changelogs (last 10 per package, configurable) |
+| Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
+| Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
+| Package download | Full | Byte-identical, sha256 pkgid in repodata |
+| GPG-signed repodata (`repomd.xml.asc`) | — | Unsigned; clients need `gpgcheck=0 repo_gpgcheck=0` (signing: #128) |
+| Upstream proxy | — | Hosted only |
+| sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
+| Delta RPMs (`prestodelta`) | — | Not generated |
+| Module metadata (`modules.yaml`) | — | Not generated |
+
+Publish: `curl -u user:pass -T pkg.rpm http://nora:4000/rpm/myrepo/pkg.rpm`
+
+Client `.repo` file:
+
+```ini
+[nora-myrepo]
+name=NORA myrepo
+baseurl=http://nora:4000/rpm/myrepo
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+```
+
 ## Helm OCI
 
 Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm push` and `helm pull` work through the standard `/v2/` API.
