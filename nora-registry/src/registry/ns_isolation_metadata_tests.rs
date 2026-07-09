@@ -507,3 +507,172 @@ async fn conan_internal_recipe_file_served_local() {
         "locally-cached internal conan recipe file must be served (#733)"
     );
 }
+
+// ── #821: Docker/OCI internal-namespace local MISS is 404, never 403 ──
+// A hosted internal-namespace image's absent manifest/blob is a not-found, not an authz denial.
+// Docker/BuildKit treats 403 on a manifest HEAD/GET as FATAL (breaks `docker push` HEAD-probes and
+// OCI referrers lookups), whereas 404 MANIFEST_UNKNOWN/BLOB_UNKNOWN lets it proceed. The
+// dependency-confusion defense is unchanged: the internal branch precedes the proxy loop, so the
+// live BLACKHOLE upstream is NEVER contacted — proven by the synthetic OCI error body (a leak or a
+// proxy-fallback would yield a bare-body 404, failing the code assertion).
+
+#[tokio::test]
+async fn docker_internal_manifest_miss_get_404_not_403() {
+    use crate::config::DockerUpstream;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+        c.docker.upstreams = vec![DockerUpstream {
+            url: BLACKHOLE.to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+    });
+    // A tag that does not exist yet in a hosted internal namespace (docker push pre-flight).
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/v2/internal/backend/manifests/3.19.2",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "internal-ns manifest miss must be 404, not 403 (#821)"
+    );
+    let body = body_bytes(resp).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["errors"][0]["code"], "MANIFEST_UNKNOWN",
+        "must be OCI MANIFEST_UNKNOWN — proves the internal branch fired, upstream never contacted"
+    );
+}
+
+#[tokio::test]
+async fn docker_internal_manifest_miss_head_404_not_403() {
+    use crate::config::DockerUpstream;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+        c.docker.upstreams = vec![DockerUpstream {
+            url: BLACKHOLE.to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+    });
+    // The HEAD probe docker issues before pushing a new tag — 403 here is fatal to the client.
+    let resp = send(
+        &ctx.app,
+        Method::HEAD,
+        "/v2/internal/backend/manifests/3.19.2",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "internal-ns manifest HEAD miss must be 404, not the fatal-to-docker 403 (#821)"
+    );
+}
+
+#[tokio::test]
+async fn docker_internal_referrers_tag_miss_head_404() {
+    use crate::config::DockerUpstream;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+        c.docker.upstreams = vec![DockerUpstream {
+            url: BLACKHOLE.to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+    });
+    // OCI referrers fallback tag (sha256-<digest>) for a hosted image with no attestations:
+    // this HEAD must 404 so `docker pull` of attestation-carrying internal images proceeds.
+    let resp = send(
+        &ctx.app,
+        Method::HEAD,
+        "/v2/internal/app/manifests/sha256-1111111111111111111111111111111111111111111111111111111111111111",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "internal-ns referrers-tag miss must be 404 (#821)"
+    );
+}
+
+#[tokio::test]
+async fn docker_internal_blob_miss_get_404_and_head_agrees() {
+    use crate::config::DockerUpstream;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+        c.docker.upstreams = vec![DockerUpstream {
+            url: BLACKHOLE.to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+    });
+    let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let uri = format!("/v2/internal/backend/blobs/{digest}");
+    // GET was the 403 half of the HEAD/GET asymmetry (check_blob already 404s) — now 404 BLOB_UNKNOWN.
+    let get = send(&ctx.app, Method::GET, &uri, "").await;
+    assert_eq!(
+        get.status(),
+        StatusCode::NOT_FOUND,
+        "internal-ns blob GET miss must be 404, not 403 (#821)"
+    );
+    let body = body_bytes(get).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
+    // HEAD and GET must now agree (both 404), closing the pre-fix asymmetry.
+    let head = send(&ctx.app, Method::HEAD, &uri, "").await;
+    assert_eq!(
+        head.status(),
+        StatusCode::NOT_FOUND,
+        "internal-ns blob HEAD and GET must agree (both 404)"
+    );
+}
+
+#[tokio::test]
+async fn docker_internal_manifest_served_local_still_ok() {
+    // Regression guard: the #821 fix touches only the MISS branch; a locally-hosted internal
+    // manifest must still be served 200 (serve-local, #733), never namespace-blocked.
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal/**".to_string()];
+    });
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "size": 0,
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "layers": []
+    });
+    // No upstream configured → canonicalize namespace is None → key docker/<name>/manifests/<ref>.json.
+    ctx.state
+        .storage
+        .put(
+            "docker/internal/backend/manifests/1.0.json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/v2/internal/backend/manifests/1.0",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "locally-hosted internal manifest must still be served, not blocked (#733 serve-local)"
+    );
+}

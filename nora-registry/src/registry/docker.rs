@@ -850,6 +850,47 @@ fn quarantine_forbidden(
         .into_response()
 }
 
+/// Build a 404 `MANIFEST_UNKNOWN` response per the OCI Distribution Spec.
+///
+/// Used for a genuine not-found on a manifest we do not hold — including the local
+/// miss on a hosted internal-namespace repo (#821): namespace isolation refuses to
+/// proxy an internal name upstream, but a hosted image's absent tag is a not-found,
+/// not an authorization denial. Docker/BuildKit treats `403` on a manifest
+/// `HEAD`/`GET` as fatal, whereas `404 MANIFEST_UNKNOWN` lets push pre-flight probes
+/// and OCI referrers lookups proceed.
+fn manifest_unknown_response(name: &str, reference: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "errors": [{
+                "code": "MANIFEST_UNKNOWN",
+                "message": "manifest unknown",
+                "detail": { "name": name, "reference": reference }
+            }]
+        })),
+    )
+        .into_response()
+}
+
+/// Build a 404 `BLOB_UNKNOWN` response per the OCI Distribution Spec.
+///
+/// Companion to [`manifest_unknown_response`] for blobs; used for the internal-
+/// namespace local miss (#821) so `GET` agrees with the `HEAD` probe (`check_blob`
+/// already 404s) and never conflates not-found with `403 Forbidden`.
+fn blob_unknown_response(digest: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "errors": [{
+                "code": "BLOB_UNKNOWN",
+                "message": "blob unknown to registry",
+                "detail": { "digest": digest }
+            }]
+        })),
+    )
+        .into_response()
+}
+
 /// Cache-serve quarantine gate for an already-cached artifact with a known digest.
 ///
 /// Blocks (403 in enforce) ONLY when a proxy record for this digest is still
@@ -1362,14 +1403,13 @@ async fn download_blob(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
-    // #733: an internal-namespace image's blob with no local copy is never proxied upstream.
+    // #733/#821: an internal-namespace image's blob with no local copy is never proxied
+    // upstream (dependency-confusion defense — this early return precedes the proxy loop).
+    // A hosted image's absent blob is a not-found, not an authz denial: return 404
+    // BLOB_UNKNOWN so GET agrees with the HEAD probe (check_blob, which already 404s)
+    // instead of the fatal-to-clients 403.
     if internal {
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Docker,
-            &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        return blob_unknown_response(&digest);
     }
 
     let temp_dir = proxy_temp_dir(&state.config.storage.path);
@@ -2253,18 +2293,17 @@ async fn get_manifest(
         }
     }
 
-    // #733: an internal-namespace image's manifest — serve any (stale) local copy, else block;
-    // never proxy upstream (the fresh path already returned above).
+    // #733/#821: an internal-namespace image's manifest — serve any (stale) local copy, else
+    // return a genuine not-found; never proxy upstream (the fresh path already returned above,
+    // and this branch precedes the proxy loop — dependency-confusion defense intact). A hosted
+    // image's absent tag is 404 MANIFEST_UNKNOWN, NOT 403: Docker/BuildKit treats 403 on a
+    // manifest HEAD/GET as fatal, breaking push HEAD-probes and OCI referrers (sha256-<digest>)
+    // lookups on locally-hosted images.
     if internal {
         if let Some(ref data) = cached {
             return serve_cached_manifest(&state, data, &name, &reference, ns.as_deref());
         }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Docker,
-            &name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        return manifest_unknown_response(&name, &reference);
     }
 
     // Try upstream proxies (always if no cache, or if cache is stale)
@@ -2754,30 +2793,10 @@ async fn delete_manifest(
                     tracing::info!(name = %name, reference = %reference, "Docker manifest deleted (legacy key)");
                     StatusCode::ACCEPTED.into_response()
                 }
-                _ => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({
-                        "errors": [{
-                            "code": "MANIFEST_UNKNOWN",
-                            "message": "manifest unknown",
-                            "detail": { "name": name, "reference": reference }
-                        }]
-                    })),
-                )
-                    .into_response(),
+                _ => manifest_unknown_response(&name, &reference),
             }
         }
-        Err(crate::storage::StorageError::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "errors": [{
-                    "code": "MANIFEST_UNKNOWN",
-                    "message": "manifest unknown",
-                    "detail": { "name": name, "reference": reference }
-                }]
-            })),
-        )
-            .into_response(),
+        Err(crate::storage::StorageError::NotFound) => manifest_unknown_response(&name, &reference),
         Err(e) => {
             tracing::error!(error = %e, key = %key, name = %name, reference = %reference, "Failed to delete manifest");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -2821,17 +2840,7 @@ async fn delete_blob(
             tracing::info!(name = %name, digest = %digest, "Docker blob deleted");
             StatusCode::ACCEPTED.into_response()
         }
-        Err(crate::storage::StorageError::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "errors": [{
-                    "code": "BLOB_UNKNOWN",
-                    "message": "blob unknown to registry",
-                    "detail": { "digest": digest }
-                }]
-            })),
-        )
-            .into_response(),
+        Err(crate::storage::StorageError::NotFound) => blob_unknown_response(&digest),
         Err(e) => {
             tracing::error!(error = %e, key = %key, name = %name, digest = %digest, "Failed to delete blob");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
