@@ -84,8 +84,11 @@ jobs:
 
           # Squash the PR into the working tree. `git merge --squash` stages files;
           # it does not execute any code from the PR.
+          # NB: clean up with `git reset --hard`, not `git merge --abort` —
+          # `--squash` never records MERGE_HEAD, so `--abort` always fails
+          # ("no merge to abort") and masks the real error in the log.
           if ! git merge --squash pr-head >/dev/null 2>&1; then
-            git merge --abort || true
+            git reset -q --hard HEAD 2>/dev/null || true
             gh pr comment "$PR" --repo "$REPO" \
               --body "🤖 Auto-reland aborted: this branch conflicts with \`$BASE_REF\`. Rebase onto \`$BASE_REF\` and re-add the \`reland\` label."
             echo "::error::merge conflict with $BASE_REF"; exit 1
@@ -98,14 +101,17 @@ jobs:
           # rejects an empty diff so a reland can't silently land nothing (#798).
           work=$(mktemp -d)
           if ! ./scripts/reland-build-filechanges.sh "$work/file_changes.json"; then
-            git merge --abort 2>/dev/null || true
+            git reset -q --hard HEAD 2>/dev/null || true
             gh pr comment "$PR" --repo "$REPO" \
               --body "🤖 Auto-reland aborted: could not build a non-empty FileChanges payload from the squashed diff (empty diff or unexpected status — guards #798). Rebase onto \`$BASE_REF\` and re-add the \`reland\` label."
             echo "::error::reland FileChanges build failed"; exit 1
           fi
 
-          # Create the reland branch at base HEAD.
+          # Create the reland branch at base HEAD. Delete any leftover ref from a
+          # prior failed run first, so re-adding the `reland` label is an idempotent
+          # retry (otherwise the create fails with "Reference already exists").
           branch="reland/pr-$PR"
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$branch" 2>/dev/null || true
           gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$base_sha" >/dev/null
 
           # createCommitOnBranch → GitHub web-flow signs the commit (verified).
