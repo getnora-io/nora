@@ -116,6 +116,7 @@ use crate::AppState;
         crate::openapi::rpm_repomd,
         crate::openapi::rpm_upload,
         crate::openapi::rpm_download,
+        crate::openapi::rpm_delete,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1072,6 +1073,24 @@ pub async fn rpm_upload() {}
     )
 )]
 pub async fn rpm_download() {}
+
+/// Delete a package (repodata is regenerated server-side)
+#[utoipa::path(
+    delete,
+    path = "/rpm/{repo}/{path}",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package path, must end in .rpm")
+    ),
+    responses(
+        (status = 204, description = "Package deleted and repodata regenerated"),
+        (status = 400, description = "Invalid path", body = ErrorResponse),
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_delete() {}
 
 // -------------------- Auth / Tokens --------------------
 
