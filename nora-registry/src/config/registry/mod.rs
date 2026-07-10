@@ -15,6 +15,7 @@ mod nuget;
 mod pub_dart;
 mod pypi;
 mod raw;
+mod rpm;
 mod terraform;
 
 pub use self::ansible::AnsibleConfig;
@@ -32,4 +33,5 @@ pub use self::nuget::NugetConfig;
 pub use self::pub_dart::PubDartConfig;
 pub use self::pypi::PypiConfig;
 pub use self::raw::RawConfig;
+pub use self::rpm::RpmConfig;
 pub use self::terraform::TerraformConfig;

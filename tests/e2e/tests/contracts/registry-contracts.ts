@@ -382,6 +382,30 @@ export const REGISTRIES: RegistryContract[] = [
       hasClickableVersionRows: false,
     },
   },
+  {
+    slug: 'rpm',
+    displayName: 'RPM (yum/dnf)',
+    sidebarName: 'RPM',
+    list: {
+      slug: 'rpm',
+      title: 'RPM (yum/dnf)',
+      columnHeaders: ['Name', 'Items', 'Size', 'Updated'],
+      countColumnLabel: 'Items',
+      isHierarchical: false,
+      hasSearch: true,
+      searchEndpoint: '/api/ui/rpm/search',
+    },
+    detail: {
+      slug: 'rpm',
+      breadcrumbRootText: 'RPM (yum/dnf)',
+      hasInstallCommand: true,
+      installSectionLabel: 'Install Command',
+      installCommandPattern: /dnf config-manager .+/,
+      tableColumnHeaders: ['Items', 'Size', 'Published'],
+      hasMetadataPanel: false,
+      hasClickableVersionRows: false,
+    },
+  },
 ];
 
 // --- Dashboard Contract ---

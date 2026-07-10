@@ -14,6 +14,7 @@ pub(crate) mod nuget;
 pub(crate) mod pub_dart;
 mod pypi;
 mod raw;
+pub(crate) mod rpm;
 pub(crate) mod terraform;
 
 // Cross-registry regression suite for namespace isolation on metadata paths (contrib-kit#68).
@@ -34,6 +35,7 @@ pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 pub use raw::routes as raw_routes;
+pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
