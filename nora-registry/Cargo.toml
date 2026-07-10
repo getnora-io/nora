@@ -61,8 +61,11 @@ arc-swap = "1"
 memchr = "2"
 # Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
 socket2 = "0.6"
+rpm = { version = "0.25", default-features = false }
 
 [dev-dependencies]
+# Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
+rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
 proptest = "1"
 tempfile = "3"
 wiremock = "0.6"

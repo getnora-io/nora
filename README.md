@@ -15,7 +15,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
-- **13 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++).
+- **14 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), RPM (yum/dnf).
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 1200+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
@@ -23,7 +23,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 [![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
 
-**< 27 MB** binary | **< 50 MB** RAM idle | **3s** startup | **13** registries
+**< 27 MB** binary | **< 50 MB** RAM idle | **3s** startup | **14** registries
 
 ## Supported Registries
 
@@ -42,6 +42,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | NuGet | `/nuget/` | api.nuget.org | ✓ |
 | Pub (Dart/Flutter) | `/pub/` | pub.dev | ✓ |
 | Conan (C/C++) | `/conan/` | ConanCenter | ✓ |
+| RPM (yum/dnf) | `/rpm/` | — (hosted, unsigned) | ✓ |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
 

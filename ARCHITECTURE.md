@@ -54,8 +54,8 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
-   │   Docker    │           │     Maven     │   ...    │    Conan      │
-   │  /v2/*      │           │  /maven2/*    │  (x13)   │   /conan/*    │
+   │   Docker    │           │     Maven     │   ...    │     RPM       │
+   │  /v2/*      │           │  /maven2/*    │  (x14)   │    /rpm/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -144,6 +144,7 @@ nora/
 │   │   ├── nuget.rs         #   NuGet v3 (service index)
 │   │   ├── pub_dart.rs      #   Pub (Dart/Flutter)
 │   │   ├── conan.rs         #   Conan v2 (revisions API)
+│   │   ├── rpm.rs           #   RPM hosted repos (server-generated repodata)
 │   │   └── mod.rs           #   Re-exports: docker_routes(), maven_routes(), ...
 │   │
 │   ├── storage/
@@ -224,7 +225,7 @@ is available to handlers.
 
 ### ADR-1: Single Binary
 
-**Decision:** NORA ships as one statically-linked binary. All 13 registry
+**Decision:** NORA ships as one statically-linked binary. All 14 registry
 handlers, the UI, the curation engine, and the CLI tools are compiled into
 a single executable.
 
@@ -279,7 +280,7 @@ artifacts directly rather than proxying through the old system.
 routes, handlers, config struct, and tests. There is no `RegistryPlugin`
 trait with runtime dispatch.
 
-**Context:** Adding a new registry format requires 24 insertion points
+**Context:** Adding a new registry format requires dozens of insertion points
 across 9 files (see "Adding a New Registry" below). A contributor noted
 this as high coupling.
 
@@ -305,7 +306,7 @@ The explicit approach has practical advantages:
   mentions Conan. No indirection through vtables or trait objects.
 
 New registry formats are added rarely (6 were added in v0.7.0, none
-expected until v0.9+). The cost of 24 mechanical edits once is lower
+expected until v0.9+). The cost of a few dozen mechanical edits once is lower
 than the cost of maintaining a plugin abstraction layer forever.
 
 ### ADR-5: Curation is File-First, GitOps-Native
@@ -350,13 +351,13 @@ consideration for the future.
 registries consume zero resources — no routes are mounted, no background
 tasks run.
 
-**Context:** With 13 formats available, most users need only 2-5.
+**Context:** With 14 formats available, most users need only 2-5.
 Mounting all routes unconditionally wastes memory and widens the attack
 surface.
 
 **Rationale:** The original 7 formats (Docker, Maven, npm, Cargo, PyPI,
-Go, Raw) default to enabled for backward compatibility. The 6 newer
-formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan) default to
+Go, Raw) default to enabled for backward compatibility. The 7 newer
+formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, RPM) default to
 disabled. Any combination is valid — you can run NORA with only Docker
 and PyPI by setting `NORA_MAVEN_ENABLED=false`, `NORA_NPM_ENABLED=false`,
 etc. The `RegistryType::all()` iterator and `enabled_registries()` method
@@ -402,30 +403,41 @@ ADR-4: each handler owns its full request lifecycle.
 
 ## Adding a New Registry
 
-Adding a new registry format requires 24 insertion points across
-9 files. The full list, traced from the Conan handler added in v0.7.0:
+Adding a new registry format touches roughly 20 files. The code half is
+compile-enforced (exhaustive matches with no wildcard arms), the rest is
+CI-enforced (`coherence-check.sh`, e2e contracts). The full list, traced
+from the Conan (v0.7.0) and RPM handlers:
 
-| # | File | Touchpoints | What to add |
-|---|------|:-----------:|-------------|
-| 1 | `registry/<format>.rs` | 1 | **New file.** Routes, handlers, proxy logic, curation calls, tests. 400-1200 lines. |
-| 2 | `registry/mod.rs` | 2 | `mod <format>;` and `pub use <format>::routes as <format>_routes;` |
-| 3 | `registry_type.rs` | 6 | Enum variant + match arms in `as_str()`, `mount_point()`, `display_name()`, `all()`, `from_str_opt()` |
-| 4 | `config/` | 6 | `<Format>Config` struct + Default impl + `NORA_<FORMAT>_ENABLED` env in `config/registry/<format>.rs`; field in top-level `Config`, `enabled_registries()`, and `Config::default()` in `config/mod.rs` |
-| 5 | `main.rs` | 1 | Route merge match arm in `run_server()` |
-| 6 | `metrics.rs` | 1 | Path branch in `detect_registry()` |
-| 7 | `openapi.rs` | 4 | Tag in `tags()`, description string, path entries, stub functions |
-| 8 | `test_helpers.rs` | 2 | Config field + route merge match arm |
-| 9 | `coherence-check.sh` | 1 | Format name in `EXPECTED_REGISTRIES` |
-| | **Total** | **24** | |
+| # | File | What to add |
+|---|------|-------------|
+| 1 | `registry/<format>.rs` | **New file.** Routes, handlers, proxy/publish logic, curation calls, tests. 400-1200 lines. |
+| 2 | `registry/mod.rs` | `mod <format>;` and `pub use <format>::routes as <format>_routes;` |
+| 3 | `registry_type.rs` | Enum variant + match arms in `as_str()`, `mount_point()`, `display_name()`, `all()`, `from_str_opt()` |
+| 4 | `config/registry/<format>.rs` | **New file.** `<Format>Config` struct + Default + `NORA_<FORMAT>_*` env overrides; `mod`/`pub use` in `config/registry/mod.rs` |
+| 5 | `config/mod.rs` | `Config` field, `enabled_registries_legacy()`, `is_enabled_proxy()`, `quarantine_mode_for()`, `apply_env_overrides()`, serde-default test |
+| 6 | `config/curation.rs` + `main.rs` | Curation override field + min-age pairing (proxy formats only; hosted-only formats like Raw/RPM skip this) |
+| 7 | `main.rs` | Route merge match arm in `run_server()` |
+| 8 | `test_helpers.rs` | Config field + route merge match arm |
+| 9 | `repo_index.rs` | Index-builder match arm (`INDEX_PATTERN` + `build_generic_index` usually suffices) |
+| 10 | `metrics.rs` | Path branch in `detect_registry()` + test path |
+| 11 | `ui/components.rs` | Sidebar nav tuple + icon + sidebar tests |
+| 12 | `ui/mod.rs` | `/ui/<format>` routes + page title |
+| 13 | `ui/templates.rs` | Install command, icon dispatch, display name, column labels |
+| 14 | `ui/api.rs` | `RegistryStats` field, dashboard upstreams arm, detail dispatch |
+| 15 | `openapi.rs` | Tag, description string, path entries, stub functions |
+| 16 | `gc.rs` | Coverage-report prefix (formats without an orphan graph) |
+| 17 | `coherence-check.sh` | Format name in `EXPECTED_REGISTRIES` |
+| 18 | `tests/e2e/tests/contracts/registry-contracts.ts` | UI contract entry |
+| 19 | Docs | `README.md`, `COMPAT.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, `llms.txt`, `dist/nora.env.example` |
 
 Several subsystems auto-discover new formats via `RegistryType::all()`
-and require no per-format edits: health checks, curation engine,
-and dashboard statistics.
+and require no per-format edits: health checks, cache TTLs, rate limiting,
+retention, activity log, and dashboard statistics.
 
 ## Known Trade-offs
 
-**24 touchpoints per format.** Adding a registry requires 24 mechanical
-edits across 9 files. A trait-based plugin system would reduce this but
+**~20 files touched per format.** Adding a registry requires dozens of
+mechanical edits. A trait-based plugin system would reduce this but
 add an abstraction layer that must be maintained forever. Registries are
 added rarely — the explicit approach trades one-time boilerplate for
 permanent simplicity, compile-time completeness checks, and full test

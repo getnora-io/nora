@@ -166,6 +166,10 @@ fn build_context(
         nuget: NugetConfig::default(),
         pub_dart: crate::config::PubDartConfig::default(),
         conan: crate::config::ConanConfig::default(),
+        rpm: crate::config::RpmConfig {
+            enabled: true,
+            ..crate::config::RpmConfig::default()
+        },
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
@@ -322,6 +326,9 @@ fn build_context(
             }
             crate::registry_type::RegistryType::Conan => {
                 registry_routes = registry_routes.merge(registry::conan_routes());
+            }
+            crate::registry_type::RegistryType::Rpm => {
+                registry_routes = registry_routes.merge(registry::rpm_routes());
             }
         }
     }

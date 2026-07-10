@@ -145,6 +145,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/pub/{name}", get(generic_registry_detail))
         .route("/ui/conan", get(generic_registry_list))
         .route("/ui/conan/{name}", get(generic_registry_detail))
+        .route("/ui/rpm", get(generic_registry_list))
+        .route("/ui/rpm/{name}", get(generic_registry_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -683,6 +685,7 @@ async fn generic_registry_list(
         "nuget" => "NuGet Gallery",
         "pub" => "Pub (Dart/Flutter)",
         "conan" => "Conan (C/C++)",
+        "rpm" => "RPM (yum/dnf)",
         _ => registry_key,
     };
 

@@ -33,6 +33,8 @@ pub enum RegistryType {
     PubDart,
     #[serde(rename = "conan")]
     Conan,
+    #[serde(rename = "rpm")]
+    Rpm,
 }
 
 impl RegistryType {
@@ -52,6 +54,7 @@ impl RegistryType {
             Self::Nuget => "nuget",
             Self::PubDart => "pub",
             Self::Conan => "conan",
+            Self::Rpm => "rpm",
         }
     }
 
@@ -71,6 +74,7 @@ impl RegistryType {
             Self::Nuget => "/nuget/",
             Self::PubDart => "/pub/",
             Self::Conan => "/conan/",
+            Self::Rpm => "/rpm/",
         }
     }
 
@@ -90,6 +94,7 @@ impl RegistryType {
             Self::Nuget => "NuGet",
             Self::PubDart => "Pub (Dart)",
             Self::Conan => "Conan",
+            Self::Rpm => "RPM",
         }
     }
 
@@ -122,6 +127,7 @@ impl RegistryType {
             Self::Nuget,
             Self::PubDart,
             Self::Conan,
+            Self::Rpm,
         ]
     }
 
@@ -141,6 +147,7 @@ impl RegistryType {
             "nuget" | "chocolatey" | "choco" | "powershellgallery" | "pwsh" => Some(Self::Nuget),
             "pub" | "pub_dart" | "dart" => Some(Self::PubDart),
             "conan" => Some(Self::Conan),
+            "rpm" | "yum" | "dnf" => Some(Self::Rpm),
             _ => None,
         }
     }

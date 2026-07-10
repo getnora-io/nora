@@ -705,6 +705,8 @@ fn detect_registry(path: &str) -> String {
         "pub".to_string()
     } else if path.starts_with("/conan/") {
         "conan".to_string()
+    } else if path.starts_with("/rpm/") {
+        "rpm".to_string()
     } else if path.starts_with("/ui") {
         "ui".to_string()
     } else {
@@ -926,6 +928,7 @@ mod tests {
             "/nuget/v3/index.json",
             "/pub/api/packages/http",
             "/conan/v2/conans/zlib",
+            "/rpm/myrepo/repodata/repomd.xml",
         ] {
             assert!(
                 !is_own_surface(p),
