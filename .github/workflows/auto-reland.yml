@@ -91,27 +91,18 @@ jobs:
             echo "::error::merge conflict with $BASE_REF"; exit 1
           fi
 
-          # Build the FileChanges payload for createCommitOnBranch.
-          # --no-renames → renames appear as delete-old + add-new (simplest correct form).
-          additions='[]'; deletions='[]'
-          while IFS=$'\t' read -r status path; do
-            case "$status" in
-              D)
-                # shellcheck disable=SC2016  # $p is a jq variable, not shell
-                deletions=$(jq -c --arg p "$path" '. + [{path:$p}]' <<<"$deletions")
-                ;;
-              A|M)
-                b64=$(base64 -w0 "$path")
-                # shellcheck disable=SC2016  # $p/$c are jq variables, not shell
-                additions=$(jq -c --arg p "$path" --arg c "$b64" '. + [{path:$p, contents:$c}]' <<<"$additions")
-                ;;
-              *)
-                echo "::error::unexpected status '$status' for '$path'"; exit 1
-                ;;
-            esac
-          done < <(git diff --cached --no-renames --name-status)
-
-          file_changes=$(jq -c -n --argjson a "$additions" --argjson d "$deletions" '{additions:$a, deletions:$d}')
+          # Build the createCommitOnBranch FileChanges from the staged tree.
+          # File contents stream through temp files into jq (see the builder
+          # script), never through argv — a large PR would otherwise exceed
+          # MAX_ARG_STRLEN (128 KiB/arg) and abort (#825). The builder also
+          # rejects an empty diff so a reland can't silently land nothing (#798).
+          work=$(mktemp -d)
+          if ! ./scripts/reland-build-filechanges.sh "$work/file_changes.json"; then
+            git merge --abort 2>/dev/null || true
+            gh pr comment "$PR" --repo "$REPO" \
+              --body "🤖 Auto-reland aborted: could not build a non-empty FileChanges payload from the squashed diff (empty diff or unexpected status — guards #798). Rebase onto \`$BASE_REF\` and re-add the \`reland\` label."
+            echo "::error::reland FileChanges build failed"; exit 1
+          fi
 
           # Create the reland branch at base HEAD.
           branch="reland/pr-$PR"
@@ -120,11 +111,15 @@ jobs:
           # createCommitOnBranch → GitHub web-flow signs the commit (verified).
           headline="$PR_TITLE"
           body=$(printf 'Relands #%s.\n\nCo-authored-by: %s <%s>' "$PR" "$a_name" "$a_email")
-          payload=$(jq -c -n \
+          # Read FileChanges from the file via --slurpfile so the (potentially
+          # large) base64 contents never pass through argv either.
+          jq -c -n \
             --arg repo "$REPO" --arg br "$branch" --arg oid "$base_sha" \
-            --arg hl "$headline" --arg bd "$body" --argjson fc "$file_changes" \
-            '{query:"mutation($repo:String!,$br:String!,$oid:GitObjectID!,$hl:String!,$bd:String!,$fc:FileChanges!){createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$repo,branchName:$br},expectedHeadOid:$oid,message:{headline:$hl,body:$bd},fileChanges:$fc}){commit{oid url}}}",variables:{repo:$repo,br:$br,oid:$oid,hl:$hl,bd:$bd,fc:$fc}}')
-          commit_url=$(echo "$payload" | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.url')
+            --arg hl "$headline" --arg bd "$body" \
+            --slurpfile fc "$work/file_changes.json" \
+            '{query:"mutation($repo:String!,$br:String!,$oid:GitObjectID!,$hl:String!,$bd:String!,$fc:FileChanges!){createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$repo,branchName:$br},expectedHeadOid:$oid,message:{headline:$hl,body:$bd},fileChanges:$fc}){commit{oid url}}}",variables:{repo:$repo,br:$br,oid:$oid,hl:$hl,bd:$bd,fc:$fc[0]}}' \
+            >"$work/payload.json"
+          commit_url=$(gh api graphql --input "$work/payload.json" --jq '.data.createCommitOnBranch.commit.url')
           echo "Signed reland commit: $commit_url"
 
           # Open the reland PR (created with RELAND_TOKEN → required checks run).

@@ -62,6 +62,8 @@ jobs:
         run: ./scripts/coherence-check.sh
       - name: Verify changelog claims
         run: ./scripts/verify-changelog.sh
+      - name: Reland FileChanges builder — large-PR regression
+        run: ./scripts/test-reland-filechanges.sh
 
   test:
     name: Test
