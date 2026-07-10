@@ -271,8 +271,52 @@ impl PkgRecord {
     }
 }
 
+/// Fields the repository computes itself and appends to each paragraph — an
+/// uploaded control carrying its own copy would produce duplicate (and
+/// contradictory) fields in the Packages index.
+const COMPUTED_FIELDS: &[&str] = &["filename", "size", "md5sum", "sha1", "sha256"];
+
+/// Validate an uploaded control paragraph before it is embedded verbatim in
+/// the shared Packages index. dpkg-deb can only build well-formed controls,
+/// but this endpoint accepts anything ar/tar-shaped, and one crafted control
+/// corrupts the whole repo's index: an embedded blank line splits the
+/// paragraph (forging a second stanza), a duplicated Filename/SHA256
+/// contradicts the computed one, and C0 bytes trip apt's parser.
+fn validate_control(control: &str) -> Result<(), String> {
+    for (i, line) in control.trim_end().lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err("control contains a blank line (paragraph injection)".into());
+        }
+        if line.chars().any(|c| c.is_ascii_control() && c != '\t') {
+            return Err("control contains a control character".into());
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if i == 0 {
+                return Err("control starts with a continuation line".into());
+            }
+            continue;
+        }
+        let Some((field, _)) = line.split_once(':') else {
+            return Err(format!(
+                "control line {} is not a field or continuation",
+                i + 1
+            ));
+        };
+        if field.is_empty() || !field.chars().all(|c| c.is_ascii_graphic() && c != ':') {
+            return Err(format!("control line {} has an invalid field name", i + 1));
+        }
+        if COMPUTED_FIELDS.contains(&field.to_ascii_lowercase().as_str()) {
+            return Err(format!(
+                "control must not carry repository-computed field {field}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn extract_record(body: &[u8], path: &str) -> Result<PkgRecord, String> {
     let control = extract_control(body)?;
+    validate_control(&control)?;
     let package = control_field(&control, "Package")
         .filter(|v| !v.is_empty())
         .ok_or("control missing Package field")?;
@@ -665,6 +709,41 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_control() {
+        let ok = "Package: tree\nVersion: 1.0-1\nArchitecture: amd64\nDescription: x\n multi-line continuation\n";
+        assert!(validate_control(ok).is_ok());
+        // Trailing newline alone is not a blank line.
+        assert!(validate_control("Package: a\n").is_ok());
+
+        // Paragraph injection: a blank line would split the Packages stanza.
+        assert!(validate_control("Package: a\n\nPackage: bash\nEvil: 1").is_err());
+        assert!(validate_control("Package: a\n \nX: y").is_err()); // whitespace-only line
+                                                                   // Repository-computed fields must not be uploader-supplied.
+        for f in [
+            "Filename: ../x.deb",
+            "SHA256: 00",
+            "Size: 1",
+            "MD5sum: 0",
+            "sha1: 0",
+        ] {
+            assert!(
+                validate_control(&format!("Package: a\n{f}")).is_err(),
+                "{f}"
+            );
+        }
+        // C0 controls (incl. NUL and CR — valid UTF-8, hostile to apt's parser).
+        assert!(validate_control("Package: a\u{0}b").is_err());
+        assert!(validate_control("Package: a\rb").is_err());
+        assert!(validate_control("Package: a\u{01}b").is_err());
+        // Structure: first-line continuation, non-field line, bad field name.
+        assert!(validate_control(" leading continuation").is_err());
+        assert!(validate_control("Package: a\nnot a field line").is_err());
+        assert!(validate_control("Bad Field: x").is_err());
+        // Tabs in values are fine (legal in deb822).
+        assert!(validate_control("Package: a\nX: a\tb").is_ok());
+    }
+
+    #[test]
     fn test_extract_control_rejects_garbage_and_bombs() {
         assert!(extract_control(b"not an ar archive").is_err());
 
@@ -715,6 +794,10 @@ mod integration_tests {
         let control = format!(
             "Package: {name}\nVersion: {version}\nArchitecture: amd64\nMaintainer: Test <test@example.com>\nInstalled-Size: 10\nDepends: libc6 (>= 2.34)\nSection: utils\nPriority: optional\nDescription: A test package\n built for the NORA deb registry tests\n"
         );
+        build_test_deb_from_control(&control, compression)
+    }
+
+    pub(super) fn build_test_deb_from_control(control: &str, compression: &str) -> Vec<u8> {
         let mut tarb = tar::Builder::new(Vec::new());
         let mut hdr = tar::Header::new_gnu();
         hdr.set_path("./control").unwrap();
@@ -917,6 +1000,28 @@ mod integration_tests {
 
         let keys = ctx.state.storage.list("deb/").await.unwrap();
         assert!(keys.is_empty(), "rejected uploads must not write: {keys:?}");
+    }
+
+    /// A hand-crafted .deb whose control would corrupt the shared Packages
+    /// index (paragraph injection / computed-field forgery) is rejected at
+    /// upload — dpkg-deb can't build these, but this endpoint accepts raw
+    /// ar/tar, so the server must enforce well-formedness itself.
+    #[tokio::test]
+    async fn test_deb_upload_rejects_index_corrupting_control() {
+        let ctx = create_test_context();
+        for control in [
+            // Blank line forges a second stanza claiming to be bash.
+            "Package: a\nVersion: 1\nArchitecture: amd64\n\nPackage: bash\nVersion: 999\n",
+            // Uploader-supplied SHA256 would contradict the computed one.
+            "Package: a\nVersion: 1\nArchitecture: amd64\nSHA256: 0000\n",
+            // Filename hijack.
+            "Package: a\nVersion: 1\nArchitecture: amd64\nFilename: pool/other.deb\n",
+        ] {
+            let deb = build_test_deb_from_control(control, "gz");
+            let resp = send(&ctx.app, Method::PUT, "/deb/myrepo/x.deb", deb).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{control:?}");
+        }
+        assert!(ctx.state.storage.list("deb/").await.unwrap().is_empty());
     }
 
     #[tokio::test]
