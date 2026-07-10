@@ -320,11 +320,29 @@ fn extract_record(
 // Repodata XML generation
 // ============================================================================
 
+/// Escape XML entities and drop characters outside the XML 1.0 `Char`
+/// production (C0 controls except \t \n \r, and U+FFFE/U+FFFF). Those are
+/// forbidden even as character references — libxml2 (what dnf uses) rejects
+/// the whole document if one appears, so an RPM with a stray control byte in
+/// a header string would brick its repo's metadata (#826).
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\t'
+            | '\n'
+            | '\r'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}' => out.push(c),
+            _ => {} // XML-illegal — dropped
+        }
+    }
+    out
 }
 
 fn dep_entry_xml(out: &mut String, tag: &str, deps: &[DepRecord]) {
@@ -953,6 +971,82 @@ mod tests {
     #[test]
     fn test_xml_escape() {
         assert_eq!(xml_escape("a<b>&\"c"), "a&lt;b&gt;&amp;&quot;c");
+    }
+
+    /// XML 1.0 forbids most C0 controls even as character references; a single
+    /// one makes libxml2 (dnf) reject the whole repodata file (#826).
+    #[test]
+    fn test_xml_escape_drops_illegal_chars() {
+        assert_eq!(xml_escape("a\u{01}b"), "ab");
+        assert_eq!(xml_escape("a\u{08}\u{0b}\u{0c}\u{0e}\u{1f}b"), "ab");
+        assert_eq!(xml_escape("a\u{fffe}\u{ffff}b"), "ab");
+        // Legal whitespace controls survive.
+        assert_eq!(xml_escape("a\tb\nc\rd"), "a\tb\nc\rd");
+        // Legal non-ASCII survives.
+        assert_eq!(xml_escape("héllo — 包"), "héllo — 包");
+    }
+
+    /// End-to-end: a package record laced with control bytes must yield XML in
+    /// which every character satisfies the XML 1.0 `Char` production (#826).
+    #[test]
+    fn test_generated_xml_contains_no_illegal_chars() {
+        let hostile = "x\u{01}\u{02}\u{1f}y";
+        let pkg = PkgRecord {
+            name: hostile.into(),
+            epoch: 0,
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "x86_64".into(),
+            summary: hostile.into(),
+            description: format!("desc {hostile}"),
+            packager: hostile.into(),
+            url: hostile.into(),
+            license: hostile.into(),
+            vendor: hostile.into(),
+            group: hostile.into(),
+            buildhost: hostile.into(),
+            sourcerpm: hostile.into(),
+            build_time: 0,
+            file_time: 0,
+            size_package: 1,
+            size_installed: 1,
+            header_start: 0,
+            header_end: 1,
+            href: "Packages/x.rpm".into(),
+            pkgid: "deadbeef".into(),
+            provides: vec![DepRecord {
+                name: hostile.into(),
+                flags: Some("EQ".into()),
+                epoch: Some("0".into()),
+                ver: Some(hostile.into()),
+                rel: None,
+                pre: false,
+            }],
+            requires: vec![],
+            conflicts: vec![],
+            obsoletes: vec![],
+            files: vec![FileRecord {
+                path: format!("/usr/bin/{hostile}"),
+                kind: String::new(),
+            }],
+            changelogs: vec![ChangelogRecord {
+                author: hostile.into(),
+                date: 1,
+                text: hostile.into(),
+            }],
+        };
+        let pkgs = [pkg];
+        for xml in [
+            generate_primary_xml(&pkgs),
+            generate_filelists_xml(&pkgs),
+            generate_other_xml(&pkgs),
+        ] {
+            let bad = xml.chars().find(|&c| {
+                !matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+            });
+            assert_eq!(bad, None, "illegal char {bad:?} in generated XML");
+            assert!(xml.contains("xy"), "escaped fields must keep legal chars");
+        }
     }
 }
 
