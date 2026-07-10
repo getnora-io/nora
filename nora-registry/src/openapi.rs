@@ -22,7 +22,7 @@ use crate::AppState;
     info(
         title = "Nora",
         version = "0.9.7",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, and RPM",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, RPM, and Debian",
         license(name = "MIT"),
         contact(name = "The NORA Authors", url = "https://getnora.dev")
     ),
@@ -47,6 +47,7 @@ use crate::AppState;
         (name = "pub", description = "Dart/Flutter Pub Registry Proxy API"),
         (name = "conan", description = "Conan V2 Registry Proxy API (C/C++)"),
         (name = "rpm", description = "RPM (yum/dnf) Hosted Repository API"),
+        (name = "deb", description = "Debian (APT) Hosted Repository API"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
@@ -117,6 +118,11 @@ use crate::AppState;
         crate::openapi::rpm_upload,
         crate::openapi::rpm_download,
         crate::openapi::rpm_delete,
+        // Debian (APT)
+        crate::openapi::deb_release,
+        crate::openapi::deb_upload,
+        crate::openapi::deb_download,
+        crate::openapi::deb_delete,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1091,6 +1097,77 @@ pub async fn rpm_download() {}
     )
 )]
 pub async fn rpm_delete() {}
+
+// -------------------- Debian (APT) --------------------
+
+/// Repository index metadata (apt entry point for a flat repo)
+#[utoipa::path(
+    get,
+    path = "/deb/{repo}/Release",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Release file with Packages checksums"),
+        (status = 404, description = "Repository not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_release() {}
+
+/// Publish a .deb package (Packages/Release are regenerated server-side)
+#[utoipa::path(
+    put,
+    path = "/deb/{repo}/{path}",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package path, must end in .deb")
+    ),
+    responses(
+        (status = 201, description = "Package stored and indexes regenerated"),
+        (status = 400, description = "Invalid path or not a valid deb", body = ErrorResponse),
+        (status = 413, description = "File exceeds deb.max_file_size"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_upload() {}
+
+/// Download a package or index file
+#[utoipa::path(
+    get,
+    path = "/deb/{repo}/{path}",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package or index path")
+    ),
+    responses(
+        (status = 200, description = "File content"),
+        (status = 404, description = "File not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_download() {}
+
+/// Delete a package (indexes are regenerated server-side)
+#[utoipa::path(
+    delete,
+    path = "/deb/{repo}/{path}",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("path" = String, Path, description = "Package path, must end in .deb")
+    ),
+    responses(
+        (status = 204, description = "Package deleted and indexes regenerated"),
+        (status = 400, description = "Invalid path", body = ErrorResponse),
+        (status = 404, description = "Package not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_delete() {}
 
 // -------------------- Auth / Tokens --------------------
 

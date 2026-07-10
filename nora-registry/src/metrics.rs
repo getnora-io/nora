@@ -707,6 +707,8 @@ fn detect_registry(path: &str) -> String {
         "conan".to_string()
     } else if path.starts_with("/rpm/") {
         "rpm".to_string()
+    } else if path.starts_with("/deb/") {
+        "deb".to_string()
     } else if path.starts_with("/ui") {
         "ui".to_string()
     } else {
@@ -929,6 +931,7 @@ mod tests {
             "/pub/api/packages/http",
             "/conan/v2/conans/zlib",
             "/rpm/myrepo/repodata/repomd.xml",
+            "/deb/myrepo/Packages",
         ] {
             assert!(
                 !is_own_surface(p),

@@ -54,8 +54,8 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
-   │   Docker    │           │     Maven     │   ...    │     RPM       │
-   │  /v2/*      │           │  /maven2/*    │  (x14)   │    /rpm/*     │
+   │   Docker    │           │     Maven     │   ...    │    Debian     │
+   │  /v2/*      │           │  /maven2/*    │  (x15)   │    /deb/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -145,6 +145,7 @@ nora/
 │   │   ├── pub_dart.rs      #   Pub (Dart/Flutter)
 │   │   ├── conan.rs         #   Conan v2 (revisions API)
 │   │   ├── rpm.rs           #   RPM hosted repos (server-generated repodata)
+│   │   ├── deb.rs           #   Debian/APT flat repos (server-generated indexes)
 │   │   └── mod.rs           #   Re-exports: docker_routes(), maven_routes(), ...
 │   │
 │   ├── storage/
@@ -225,7 +226,7 @@ is available to handlers.
 
 ### ADR-1: Single Binary
 
-**Decision:** NORA ships as one statically-linked binary. All 14 registry
+**Decision:** NORA ships as one statically-linked binary. All 15 registry
 handlers, the UI, the curation engine, and the CLI tools are compiled into
 a single executable.
 
@@ -351,14 +352,14 @@ consideration for the future.
 registries consume zero resources — no routes are mounted, no background
 tasks run.
 
-**Context:** With 14 formats available, most users need only 2-5.
+**Context:** With 15 formats available, most users need only 2-5.
 Mounting all routes unconditionally wastes memory and widens the attack
 surface.
 
 **Rationale:** The original 7 formats (Docker, Maven, npm, Cargo, PyPI,
-Go, Raw) default to enabled for backward compatibility. The 7 newer
-formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, RPM) default to
-disabled. Any combination is valid — you can run NORA with only Docker
+Go, Raw) default to enabled for backward compatibility. The 8 newer
+formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, RPM, Debian)
+default to disabled. Any combination is valid — you can run NORA with only Docker
 and PyPI by setting `NORA_MAVEN_ENABLED=false`, `NORA_NPM_ENABLED=false`,
 etc. The `RegistryType::all()` iterator and `enabled_registries()` method
 let subsystems (health, metrics, UI) auto-discover which formats are

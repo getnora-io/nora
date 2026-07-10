@@ -1395,6 +1395,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 registry_routes = registry_routes.merge(registry::conan_routes())
             }
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
+            RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
         }
     }
 

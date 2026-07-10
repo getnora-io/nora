@@ -276,7 +276,7 @@ pub fn render_registry_list_paginated(
 
     let version_label = match registry_type {
         "docker" => t.tags,
-        "raw" | "rpm" => t.items,
+        "raw" | "rpm" | "deb" => t.items,
         _ => t.versions,
     };
 
@@ -1187,6 +1187,10 @@ pub fn render_package_detail(
             "dnf config-manager --add-repo {}/rpm/{}\n# then set gpgcheck=0 repo_gpgcheck=0 in the .repo file",
             base_url, name
         ),
+        "deb" => format!(
+            "echo 'deb [trusted=yes] {}/deb/{} ./' | sudo tee /etc/apt/sources.list.d/nora-{}.list && sudo apt-get update",
+            base_url, name, name
+        ),
         _ => String::new(),
     };
 
@@ -1349,7 +1353,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         metadata_panel = metadata_panel,
         versions_label = if registry_type == "raw" {
             _t.files
-        } else if registry_type == "rpm" {
+        } else if registry_type == "rpm" || registry_type == "deb" {
             _t.items
         } else {
             _t.versions
@@ -1359,7 +1363,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         prerelease = prerelease_toggle,
         col_version = if registry_type == "raw" {
             _t.filename
-        } else if registry_type == "rpm" {
+        } else if registry_type == "rpm" || registry_type == "deb" {
             _t.items
         } else {
             _t.versions
@@ -1743,6 +1747,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         "pub" => icons::PUB,
         "conan" => icons::CONAN,
         "rpm" => icons::RPM,
+        "deb" => icons::DEB,
         _ => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -1765,6 +1770,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         "pub" => "pub.dev",
         "conan" => "Conan (C/C++)",
         "rpm" => "RPM (yum/dnf)",
+        "deb" => "Debian (APT)",
         _ => "Registry",
     }
 }

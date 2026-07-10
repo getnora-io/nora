@@ -266,6 +266,14 @@ pub fn sidebar_dark_with_registries(
             icons::RPM,
             false,
         ),
+        (
+            Some(RegistryType::Deb),
+            "deb",
+            "/ui/deb",
+            "Debian",
+            icons::DEB,
+            false,
+        ),
     ];
 
     // Filter to enabled registries (dashboard always shown)
@@ -749,6 +757,7 @@ pub mod icons {
     pub const NPM: &str = r#"<path fill="currentColor" d="M0 7.334v8h6.666v1.332H12v-1.332h12v-8H0zm6.666 6.664H5.334v-4H3.999v4H1.335V8.667h5.331v5.331zm4 0v1.336H8.001V8.667h5.334v5.332h-2.669v-.001zm12.001 0h-1.33v-4h-1.336v4h-1.335v-4h-1.33v4h-2.671V8.667h8.002v5.331zM10.665 10H12v2.667h-1.335V10z"/>"#;
     pub const CARGO: &str = r#"<path fill="currentColor" d="M6 2h12a1 1 0 011 1v8a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1zm0 2v2h12V4H6zm0 3v2h12V7H6zM2 14h8a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16H2zM14 14h8a1 1 0 011 1v6a1 1 0 01-1 1h-8a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16h-8z"/>"#;
     pub const GO: &str = r#"<path fill="currentColor" d="M2.64 9.56s.24-.14.65-.38c.41-.24.97-.5 1.63-.7A7.85 7.85 0 017.53 8c.86 0 1.67.17 2.37.52.7.35 1.26.87 1.63 1.51.37.64.54 1.41.54 2.27v.2h-2.7v-.16c0-.47-.09-.86-.28-1.15a1.7 1.7 0 00-.77-.67 2.7 2.7 0 00-1.14-.22c-.56 0-1.06.13-1.46.4-.41.27-.72.66-.93 1.16-.21.5-.31 1.1-.31 1.8 0 .69.1 1.28.32 1.78.21.5.53.88.94 1.15.41.27.9.4 1.47.4.38 0 .73-.06 1.04-.17.31-.12.56-.29.74-.52.19-.23.29-.51.29-.84v-.14H7.15v-1.76h5.07v1.3c0 .8-.17 1.48-.52 2.04a3.46 3.46 0 01-1.5 1.3c-.66.3-1.44.45-2.35.45-.99 0-1.87-.18-2.63-.55a4.2 4.2 0 01-1.77-1.59C3.15 14.82 3 13.94 3 12.89v-.28c0-1.04.16-1.93.48-2.65a3.08 3.08 0 01-.84-.4zm12.1-1.34c.92 0 1.74.18 2.44.55a3.96 3.96 0 011.66 1.59c.4.7.6 1.54.6 2.53v.28c0 .99-.2 1.83-.6 2.53a3.96 3.96 0 01-1.66 1.59c-.7.37-1.52.55-2.44.55s-1.74-.18-2.44-.55a3.96 3.96 0 01-1.66-1.59c-.4-.7-.6-1.54-.6-2.53v-.28c0-.99.2-1.83.6-2.53a3.96 3.96 0 011.66-1.59c.7-.37 1.52-.55 2.44-.55zm0 2.12c-.44 0-.82.12-1.14.37-.32.24-.56.6-.73 1.06-.17.46-.26 1.01-.26 1.65v.28c0 .64.09 1.19.26 1.65.17.46.41.82.73 1.06.32.25.7.37 1.14.37.44 0 .82-.12 1.14-.37.32-.24.56-.6.73-1.06.17-.46.26-1.01.26-1.65v-.28c0-.64-.09-1.19-.26-1.65a2.17 2.17 0 00-.73-1.06 1.78 1.78 0 00-1.14-.37z"/>"#;
+    pub const DEB: &str = r#"<path fill="currentColor" d="M12 1 2 6v12l10 5 10-5V6L12 1zm0 2.2 7.5 3.7L12 10.7 4.5 6.9 12 3.2zM4 8.6l7 3.5v8.3l-7-3.5V8.6zm16 8.3-7 3.5v-8.3l7-3.5v8.3z"/>"#;
     pub const RAW: &str = r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#;
     pub const GEMS: &str = r#"<path fill="currentColor" d="M7.81 7.9l-2.97 2.95 7.19 7.18 2.96-2.95 4.22-4.23-2.96-2.96v-.01H7.8zM12 0L1.53 6v12L12 24l10.47-6V6L12 0zm8.47 16.85L12 21.73l-8.47-4.88V7.12L12 2.24l8.47 4.88v9.73z"/>"#;
     pub const TERRAFORM: &str = r#"<path fill="currentColor" d="M1.5 0v7.69l6.56 3.85V3.85L1.5 0zm7.94 4.62v7.69l6.56-3.84V.77L9.44 4.62zm7.94 0v7.69l6.56-3.84V.77l-6.56 3.85zM9.44 13.46v7.69l6.56-3.85v-7.69l-6.56 3.85z"/>"#;
@@ -1065,6 +1074,7 @@ mod tests {
         assert!(!html.contains("/ui/gems"), "disabled gems absent");
         assert!(!html.contains("/ui/conan"), "disabled conan absent");
         assert!(!html.contains("/ui/rpm"), "disabled rpm absent");
+        assert!(!html.contains("/ui/deb"), "disabled deb absent");
         assert!(html.contains("\"/ui/\""), "dashboard nav always present");
     }
 
@@ -1077,6 +1087,7 @@ mod tests {
         assert!(html.contains("/ui/gems"), "fallback shows all formats");
         assert!(html.contains("/ui/conan"));
         assert!(html.contains("/ui/rpm"));
+        assert!(html.contains("/ui/deb"));
         assert!(html.contains("/ui/docker"));
     }
 

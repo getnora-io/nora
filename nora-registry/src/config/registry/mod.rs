@@ -6,6 +6,7 @@
 mod ansible;
 mod cargo;
 mod conan;
+mod deb;
 mod docker;
 mod gems;
 mod go;
@@ -21,6 +22,7 @@ mod terraform;
 pub use self::ansible::AnsibleConfig;
 pub use self::cargo::CargoConfig;
 pub use self::conan::ConanConfig;
+pub use self::deb::DebConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
 #[allow(unused_imports)]
 pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, DockerUpstream};

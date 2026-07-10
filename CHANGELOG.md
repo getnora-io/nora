@@ -3,6 +3,7 @@
 
 ### Added
 - **RPM registry (yum/dnf, hosted)** — 14th format at `/rpm/`. Each `/rpm/{repo}/` is an independent hosted repository: `PUT {repo}/{name}.rpm` parses the package header server-side (pure-Rust `rpm` crate) and regenerates `repodata/` (repomd.xml + sha256-named primary/filelists/other.xml.gz); `DELETE` regenerates. Rebuilds run under the per-repo publish lock, fail closed, and prune unreferenced repodata generations. Repodata is unsigned — clients set `gpgcheck=0 repo_gpgcheck=0`; GPG signing is tracked in #128. Default-disabled (`NORA_RPM_ENABLED=true`), hosted-only. Verified end-to-end against dnf on Fedora 41 (#128).
+- **Debian/APT registry (hosted flat repos)** — 15th format at `/deb/`. Each `/deb/{repo}/` is an independent flat repository (`deb [trusted=yes] {url}/deb/{repo} ./`): `PUT {repo}/{name}.deb` parses the control paragraph server-side (ar → control.tar.{,gz,xz,zst}; pure-Rust `ar`/`lzma-rs`/`ruzstd`, decompression bounded) and regenerates `Packages`, `Packages.gz`, and `Release`; `DELETE` regenerates. Rebuilds read per-package control sidecars under the per-repo publish lock and fail closed. Indexes are unsigned — clients use `[trusted=yes]`; GPG signing is tracked in #128. Default-disabled (`NORA_DEB_ENABLED=true`), hosted-only. Verified end-to-end against apt on Debian (#128).
 
 ## [0.9.7] - 2026-07-05
 
