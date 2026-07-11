@@ -62,6 +62,9 @@ memchr = "2"
 # Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
 socket2 = "0.6"
 rpm = { version = "0.25", default-features = false }
+ar = "0.9"
+lzma-rs = "0.3"
+ruzstd = "0.8"
 
 [dev-dependencies]
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.

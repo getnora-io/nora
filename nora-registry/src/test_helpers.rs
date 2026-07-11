@@ -170,6 +170,10 @@ fn build_context(
             enabled: true,
             ..crate::config::RpmConfig::default()
         },
+        deb: crate::config::DebConfig {
+            enabled: true,
+            ..crate::config::DebConfig::default()
+        },
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
@@ -329,6 +333,9 @@ fn build_context(
             }
             crate::registry_type::RegistryType::Rpm => {
                 registry_routes = registry_routes.merge(registry::rpm_routes());
+            }
+            crate::registry_type::RegistryType::Deb => {
+                registry_routes = registry_routes.merge(registry::deb_routes());
             }
         }
     }

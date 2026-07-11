@@ -276,6 +276,34 @@ baseurl=http://nora:4000/rpm/myrepo
 enabled=1
 gpgcheck=0
 repo_gpgcheck=0
+## Debian (APT)
+
+Hosted *flat* repositories with server-generated indexes. Each
+`/deb/{repo}/` path is an independent repository; publishing or deleting a
+package regenerates `Packages`, `Packages.gz`, and `Release` at the repo
+root. Package control paragraphs are parsed server-side from the .deb
+(ar → control.tar.{,gz,xz,zst}) — no `dpkg-scanpackages` needed. No
+upstream proxy (hosted only).
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `Packages` / `Packages.gz` | Full | Verbatim control paragraphs + Filename/Size/MD5sum/SHA1/SHA256 |
+| `Release` (flat repo) | Full | MD5Sum + SHA256 sections, `Cache-Control: no-cache` |
+| Package publish (`PUT {repo}/{name}.deb`) | Full | Control parsed and validated; invalid debs rejected; decompression bombs bounded |
+| Package delete (`DELETE {repo}/{name}.deb`) | Full | Indexes regenerated |
+| Package download | Full | Byte-identical |
+| `InRelease` / `Release.gpg` (signed) | — | Unsigned; clients use `[trusted=yes]` (signing: #128) |
+| `dists/` pool layout (suites/components) | — | Flat repositories only (`deb <url>/deb/{repo} ./`) |
+| by-hash | — | Not applicable to flat repositories |
+| Translations / Contents indexes | — | Not generated |
+| Upstream proxy | — | Hosted only |
+
+Publish: `curl -u user:pass -T pkg.deb http://nora:4000/deb/myrepo/pkg.deb`
+
+Client sources.list line:
+
+```
+deb [trusted=yes] http://nora:4000/deb/myrepo ./
 ```
 
 ## Helm OCI

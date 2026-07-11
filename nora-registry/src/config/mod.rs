@@ -133,6 +133,8 @@ pub struct Config {
     #[serde(default)]
     pub rpm: RpmConfig,
     #[serde(default)]
+    pub deb: DebConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -254,6 +256,9 @@ impl Config {
         if self.rpm.enabled {
             set.insert(RegistryType::Rpm);
         }
+        if self.deb.enabled {
+            set.insert(RegistryType::Deb);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -285,6 +290,7 @@ impl Config {
             RegistryType::PubDart => self.pub_dart.enabled && self.pub_dart.proxy.is_some(),
             RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
             RegistryType::Rpm => false, // hosted-only, no upstream
+            RegistryType::Deb => false, // hosted-only, no upstream
         }
     }
 
@@ -315,9 +321,11 @@ impl Config {
             RegistryType::Nuget => self.curation.nuget.quarantine.as_ref(),
             RegistryType::PubDart => self.curation.pub_dart.quarantine.as_ref(),
             RegistryType::Conan => self.curation.conan.quarantine.as_ref(),
-            // Raw and RPM are hosted-only: no curation override, no quarantine
-            // gate in their handlers (quarantine gates proxy downloads).
-            RegistryType::Raw | RegistryType::Rpm => return QuarantineMode::Off,
+            // Raw, RPM, and Debian are hosted-only: no curation override, no
+            // quarantine gate in their handlers (quarantine gates proxy downloads).
+            RegistryType::Raw | RegistryType::Rpm | RegistryType::Deb => {
+                return QuarantineMode::Off
+            }
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -957,6 +965,7 @@ impl Config {
         self.pub_dart.apply_env_overrides();
         self.conan.apply_env_overrides();
         self.rpm.apply_env_overrides();
+        self.deb.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -1578,6 +1587,7 @@ mod tests {
         assert_serde_default_eq_default::<PubDartConfig>("pub_dart");
         assert_serde_default_eq_default::<ConanConfig>("conan");
         assert_serde_default_eq_default::<RpmConfig>("rpm");
+        assert_serde_default_eq_default::<DebConfig>("deb");
 
         // Whole-Config fallback agrees with deserializing an empty file.
         let from_empty_cfg: Config = toml::from_str("").unwrap();

@@ -35,6 +35,8 @@ pub enum RegistryType {
     Conan,
     #[serde(rename = "rpm")]
     Rpm,
+    #[serde(rename = "deb")]
+    Deb,
 }
 
 impl RegistryType {
@@ -55,6 +57,7 @@ impl RegistryType {
             Self::PubDart => "pub",
             Self::Conan => "conan",
             Self::Rpm => "rpm",
+            Self::Deb => "deb",
         }
     }
 
@@ -75,6 +78,7 @@ impl RegistryType {
             Self::PubDart => "/pub/",
             Self::Conan => "/conan/",
             Self::Rpm => "/rpm/",
+            Self::Deb => "/deb/",
         }
     }
 
@@ -95,6 +99,7 @@ impl RegistryType {
             Self::PubDart => "Pub (Dart)",
             Self::Conan => "Conan",
             Self::Rpm => "RPM",
+            Self::Deb => "Debian",
         }
     }
 
@@ -128,6 +133,7 @@ impl RegistryType {
             Self::PubDart,
             Self::Conan,
             Self::Rpm,
+            Self::Deb,
         ]
     }
 
@@ -148,6 +154,7 @@ impl RegistryType {
             "pub" | "pub_dart" | "dart" => Some(Self::PubDart),
             "conan" => Some(Self::Conan),
             "rpm" | "yum" | "dnf" => Some(Self::Rpm),
+            "deb" | "apt" | "debian" => Some(Self::Deb),
             _ => None,
         }
     }
