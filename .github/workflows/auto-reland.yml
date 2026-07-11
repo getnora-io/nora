@@ -87,11 +87,24 @@ jobs:
           # NB: clean up with `git reset --hard`, not `git merge --abort` —
           # `--squash` never records MERGE_HEAD, so `--abort` always fails
           # ("no merge to abort") and masks the real error in the log.
-          if ! git merge --squash pr-head >/dev/null 2>&1; then
+          # `-c merge.ff=true`: a runner/global `merge.ff=false` makes
+          # `git merge --squash` fatal ("cannot combine --squash with --no-ff"),
+          # which is NOT a content conflict — force ff so squash always parses.
+          # Capture the output instead of `>/dev/null 2>&1`: masking it made every
+          # failure (fatal invocation, dirty tree, real conflict) read as the same
+          # "merge conflict", sending contributors to rebase a branch that already
+          # merges clean. Surface the git output and name the true cause.
+          if ! merge_out=$(git -c merge.ff=true merge --squash pr-head 2>&1); then
+            if git ls-files -u | grep -q .; then
+              reason="content conflict with \`$BASE_REF\` — rebase onto \`$BASE_REF\`"
+            else
+              reason="merge could not run (not a content conflict); see the git output"
+            fi
+            echo "::group::git merge --squash output"; echo "$merge_out"; echo "::endgroup::"
             git reset -q --hard HEAD 2>/dev/null || true
             gh pr comment "$PR" --repo "$REPO" \
-              --body "🤖 Auto-reland aborted: this branch conflicts with \`$BASE_REF\`. Rebase onto \`$BASE_REF\` and re-add the \`reland\` label."
-            echo "::error::merge conflict with $BASE_REF"; exit 1
+              --body "$(printf '🤖 Auto-reland aborted: %s. Then re-add the `reland` label.\n\n<details><summary>git merge --squash output</summary>\n\n```\n%s\n```\n</details>' "$reason" "$merge_out")"
+            echo "::error::auto-reland merge failed: $reason"; exit 1
           fi
 
           # Build the createCommitOnBranch FileChanges from the staged tree.
