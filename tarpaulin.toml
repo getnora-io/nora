@@ -2,7 +2,7 @@
 packages = ["nora-registry"]
 engine = "Llvm"
 fail-under = 60
-out = ["Json", "Html"]
+out = ["Json", "Html", "Lcov"]
 output-dir = "coverage"
 test-timeout = "5m"
 exclude-files = ["nora-registry/src/ui/*", "nora-registry/src/main.rs", "nora-registry/src/openapi.rs"]

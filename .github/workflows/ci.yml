@@ -64,6 +64,8 @@ jobs:
         run: ./scripts/verify-changelog.sh
       - name: Reland FileChanges builder — large-PR regression
         run: ./scripts/test-reland-filechanges.sh
+      - name: Diff-coverage helper self-test
+        run: ./scripts/test-diff-coverage.sh
 
   test:
     name: Test
@@ -149,6 +151,40 @@ jobs:
           valColorRange: ${{ env.COVERAGE }}
           minColorRange: 0
           maxColorRange: 100
+
+  coverage-diff:
+    name: Coverage (diff)
+    runs-on: ubuntu-latest
+    # Diff-scoped gate: fails the PR when the incremental coverage of changed
+    # .rs lines drops below the threshold, independent of the global fail-under
+    # floor enforced by the `coverage` job above (left untouched).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Run coverage
+        run: cargo tarpaulin --config tarpaulin.toml --fail-under 0
+
+      - name: Diff-scoped coverage gate
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          LCOV=$(find coverage -type f \( -name "*.lcov" -o -name "lcov.info" \) | head -1)
+          if [ -z "$LCOV" ]; then echo "No lcov file found" >&2; exit 1; fi
+          python3 scripts/diff-coverage.py --lcov "$LCOV" --base "${BASE}"
 
   security:
     name: Security
