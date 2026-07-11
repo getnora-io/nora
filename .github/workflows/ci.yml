@@ -65,7 +65,7 @@ jobs:
       - name: Reland FileChanges builder — large-PR regression
         run: ./scripts/test-reland-filechanges.sh
       - name: Diff-coverage helper self-test
-        run: ./scripts/test-diff-coverage.sh
+        run: bash scripts/test-diff-coverage.sh
 
   test:
     name: Test
