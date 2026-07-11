@@ -28,6 +28,13 @@ Only changed lines that carry a ``DA:`` record are counted — non-instrumentabl
 lines (comments, item declarations, ``use`` statements) are ignored, matching
 the behaviour of diff-cover style tools. A changed line with ``DA:<line>,0`` is
 uncovered; ``DA:<line>,<n>`` with ``n > 0`` is covered.
+
+Scope note (ungated by design): the gate can only see lines tarpaulin
+instruments. Changes in the ``exclude-files`` of ``tarpaulin.toml``
+(e.g. ``nora-registry/src/ui/*``, ``main.rs``, ``openapi.rs``) and any
+``#[cfg(...)]``-gated code not built in the coverage profile produce no ``DA:``
+record, so they contribute zero instrumentable lines and are **not** gated by
+this check — the whole-repo ``coverage`` job remains their only floor.
 """
 
 import argparse
