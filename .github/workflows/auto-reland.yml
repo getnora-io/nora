@@ -78,9 +78,14 @@ jobs:
           base_sha=$(git rev-parse HEAD)
           git fetch origin "pull/$PR/head:pr-head"
 
-          # Credit the contributor via a trailer (commit author is the token identity).
-          a_name=$(git log -1 --format='%an' pr-head)
-          a_email=$(git log -1 --format='%ae' pr-head)
+          # Credit EVERY distinct commit author in the PR via a Co-authored-by
+          # trailer — not just the head. A maintainer pushing a fix on top of a
+          # contributor's branch makes their commit the head; crediting only the
+          # head then silently DROPS the original contributor (and a self-co-author
+          # equal to the token identity is de-duped by GitHub, so the trailer can
+          # vanish entirely). Contract: reland-credits-all-pr-authors.
+          coauthors=$(git log "$base_sha..pr-head" --format='%an <%ae>' | sort -u \
+            | sed 's/^/Co-authored-by: /')
 
           # Squash the PR into the working tree. `git merge --squash` stages files;
           # it does not execute any code from the PR.
@@ -133,7 +138,7 @@ jobs:
 
           # createCommitOnBranch → GitHub web-flow signs the commit (verified).
           headline="$PR_TITLE"
-          body=$(printf 'Relands #%s.\n\nCo-authored-by: %s <%s>' "$PR" "$a_name" "$a_email")
+          body=$(printf 'Relands #%s.\n\n%s' "$PR" "$coauthors")
           # Read FileChanges from the file via --slurpfile so the (potentially
           # large) base64 contents never pass through argv either.
           jq -c -n \
