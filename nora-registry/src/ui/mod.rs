@@ -147,6 +147,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/conan/{name}", get(generic_registry_detail))
         .route("/ui/rpm", get(generic_registry_list))
         .route("/ui/rpm/{name}", get(generic_registry_detail))
+        .route("/ui/deb", get(generic_registry_list))
+        .route("/ui/deb/{name}", get(generic_registry_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -686,6 +688,7 @@ async fn generic_registry_list(
         "pub" => "Pub (Dart/Flutter)",
         "conan" => "Conan (C/C++)",
         "rpm" => "RPM (yum/dnf)",
+        "deb" => "Debian (APT)",
         _ => registry_key,
     };
 

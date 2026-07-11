@@ -34,6 +34,7 @@ pub struct RegistryStats {
     pub pub_dart: usize,
     pub conan: usize,
     pub rpm: usize,
+    pub deb: usize,
 }
 
 #[derive(Serialize)]
@@ -174,6 +175,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         pub_dart: get(RegistryType::PubDart),
         conan: get(RegistryType::Conan),
         rpm: get(RegistryType::Rpm),
+        deb: get(RegistryType::Deb),
     })
 }
 
@@ -237,6 +239,7 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
             RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
             RegistryType::Rpm => vec![],
+            RegistryType::Deb => vec![],
         };
 
         mount_points.push(MountPoint {
@@ -1070,6 +1073,7 @@ pub async fn get_generic_detail(
         "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await,
         "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
         "rpm" => get_rpm_detail(storage, name, show_all).await,
+        "deb" => get_deb_detail(storage, name, show_all).await,
         "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
         "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
         "ansible" => get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await,
@@ -1358,6 +1362,54 @@ async fn get_rpm_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             published: format_timestamp(rec.get("file_time").and_then(|v| v.as_u64()).unwrap_or(0)),
+            cached: true,
+        });
+    }
+
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let total = versions.len();
+    if !show_all && versions.len() > 20 {
+        versions.truncate(20);
+    }
+    PackageDetail {
+        versions,
+        prerelease_count: 0,
+        total_stable: total,
+        metadata: PackageMetadata::default(),
+    }
+}
+
+/// Debian: the UI "package" is a repository; each row is one stored package
+/// (package_version_arch). Reads the per-package control sidecars written at
+/// upload — never the .deb payloads. No prerelease filter: Debian versions
+/// routinely contain '-' and would all be misclassified as prerelease.
+async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> PackageDetail {
+    let prefix = format!("deb/{}/.nora-meta/", repo);
+    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let mut versions = Vec::new();
+
+    for key in &keys {
+        let Ok(data) = storage.get(key).await else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let s = |f: &str| {
+            rec.get(f)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let published = storage
+            .stat(key)
+            .await
+            .map(|m| format_timestamp(m.modified))
+            .unwrap_or_else(|| "N/A".to_string());
+        versions.push(VersionInfo {
+            version: format!("{}_{}_{}", s("package"), s("version"), s("arch")),
+            size: rec.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            published,
             cached: true,
         });
     }

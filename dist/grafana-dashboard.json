@@ -34,7 +34,7 @@
         "type": "query",
         "includeAll": true,
         "multi": true,
-        "allValue": "npm|pypi|cargo|go|docker|maven|raw|gems|terraform|ansible|nuget|pub|conan|rpm",
+        "allValue": "npm|pypi|cargo|go|docker|maven|raw|gems|terraform|ansible|nuget|pub|conan|rpm|deb",
         "refresh": 2,
         "sort": 1,
         "regex": "/^(?!other$|ui$).*/"
