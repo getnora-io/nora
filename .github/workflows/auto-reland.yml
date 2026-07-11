@@ -94,7 +94,11 @@ jobs:
           # failure (fatal invocation, dirty tree, real conflict) read as the same
           # "merge conflict", sending contributors to rebase a branch that already
           # merges clean. Surface the git output and name the true cause.
-          if ! merge_out=$(git -c merge.ff=true merge --squash pr-head 2>&1); then
+          # `-c user.*`: `git merge --squash` refuses with "Committer identity
+          # unknown" when the runner has no git identity — even though it never
+          # commits here (the reland commit is made via the API below). Supply a
+          # throwaway identity so the squash can stage the tree.
+          if ! merge_out=$(git -c merge.ff=true -c user.name="auto-reland" -c user.email="auto-reland@users.noreply.github.com" merge --squash pr-head 2>&1); then
             if git ls-files -u | grep -q .; then
               reason="content conflict with \`$BASE_REF\` — rebase onto \`$BASE_REF\`"
             else
