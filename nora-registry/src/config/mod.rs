@@ -624,9 +624,13 @@ impl Config {
             errors.push("storage.path must not be empty when storage mode is local".to_string());
         }
 
-        // 3. S3 bucket must not be empty when mode = S3
-        if self.storage.mode == StorageMode::S3 && self.storage.bucket.trim().is_empty() {
-            errors.push("storage.bucket must not be empty when storage mode is s3".to_string());
+        // 3. Bucket must not be empty when mode = S3 or GCS
+        if matches!(self.storage.mode, StorageMode::S3 | StorageMode::Gcs)
+            && self.storage.bucket.trim().is_empty()
+        {
+            errors.push(
+                "storage.bucket must not be empty when storage mode is s3 or gcs".to_string(),
+            );
         }
 
         // 4. Rate limit values must be > 0 when rate limiting is enabled
@@ -2939,6 +2943,8 @@ mod tests {
             )),
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            gcs_service_account_path: None,
+            gcs_base_url: None,
         };
         let debug_output = format!("{:?}", config);
         assert!(

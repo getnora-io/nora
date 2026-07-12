@@ -617,6 +617,21 @@ async fn main() {
                 config.storage.s3_virtual_hosted,
             )
         }
+        StorageMode::Gcs => {
+            if is_server {
+                info!(
+                    bucket = %config.storage.bucket,
+                    has_service_account = config.storage.gcs_service_account_path.is_some(),
+                    base_url = %config.storage.gcs_base_url.as_deref().unwrap_or("https://storage.googleapis.com"),
+                    "Using Google Cloud Storage"
+                );
+            }
+            Storage::new_gcs(
+                &config.storage.bucket,
+                config.storage.gcs_service_account_path.as_deref(),
+                config.storage.gcs_base_url.as_deref(),
+            )
+        }
     };
 
     // Dispatch to command
@@ -792,8 +807,13 @@ async fn main() {
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
                 ),
+                "gcs" => Storage::new_gcs(
+                    &config.storage.bucket,
+                    config.storage.gcs_service_account_path.as_deref(),
+                    config.storage.gcs_base_url.as_deref(),
+                ),
                 _ => {
-                    error!("Invalid source: '{}'. Use 'local' or 's3'", from);
+                    error!("Invalid source: '{}'. Use 'local', 's3', or 'gcs'", from);
                     std::process::exit(1);
                 }
             };
@@ -808,8 +828,13 @@ async fn main() {
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
                 ),
+                "gcs" => Storage::new_gcs(
+                    &config.storage.bucket,
+                    config.storage.gcs_service_account_path.as_deref(),
+                    config.storage.gcs_base_url.as_deref(),
+                ),
                 _ => {
-                    error!("Invalid destination: '{}'. Use 'local' or 's3'", to);
+                    error!("Invalid destination: '{}'. Use 'local', 's3', or 'gcs'", to);
                     std::process::exit(1);
                 }
             };

@@ -68,7 +68,7 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
                                       │
                            ┌──────────▼──────────┐
                            │      Storage        │
-                           │   local | s3        │
+                           │  local | s3 | gcs   │
                            └─────────────────────┘
 ```
 
@@ -151,7 +151,7 @@ nora/
 │   ├── storage/
 │   │   ├── mod.rs           #   StorageBackend trait + Storage wrapper (validate + pin gate)
 │   │   ├── local.rs         #   Local filesystem implementation
-│   │   └── s3.rs            #   S3-compatible implementation
+│   │   └── object.rs        #   Object-store implementation (S3-compatible + GCS)
 │   │
 │   ├── auth/               # Authentication (middleware + providers)
 │   │   ├── mod.rs           #   auth_middleware, provider dispatch

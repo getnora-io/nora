@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 mod local;
-mod s3;
+mod object;
 
 pub use local::LocalStorage;
-pub use s3::S3Storage;
+pub use object::ObjectStorage;
 
 use crate::hash_pin_store::HashPinStore;
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
@@ -184,13 +184,31 @@ impl Storage {
             "Hash pin store disabled for S3 backend — integrity verification unavailable"
         );
         Self {
-            inner: Arc::new(S3Storage::new(
+            inner: Arc::new(ObjectStorage::new(
                 s3_url,
                 bucket,
                 region,
                 access_key,
                 secret_key,
                 virtual_hosted,
+            )),
+            pin_store: None,
+        }
+    }
+
+    pub fn new_gcs(
+        bucket: &str,
+        service_account_path: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Self {
+        tracing::warn!(
+            "Hash pin store disabled for GCS backend — integrity verification unavailable"
+        );
+        Self {
+            inner: Arc::new(ObjectStorage::new_gcs(
+                bucket,
+                service_account_path,
+                base_url,
             )),
             pin_store: None,
         }

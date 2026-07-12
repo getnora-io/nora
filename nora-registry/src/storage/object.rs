@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 use axum::body::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use std::pin::Pin;
@@ -12,16 +13,20 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
-/// S3-compatible storage backend using the `object_store` crate.
-pub struct S3Storage {
-    store: AmazonS3,
+/// Object-store backend (S3-compatible or Google Cloud Storage) using the
+/// `object_store` crate. Everything past construction goes through the
+/// [`ObjectStore`] trait, so both providers share one implementation.
+pub struct ObjectStorage {
+    store: Box<dyn ObjectStore>,
+    /// "s3" or "gcs" — surfaced in /health.
+    name: &'static str,
     /// Cached total size in bytes, refreshed by background task.
     cached_total_size: std::sync::atomic::AtomicU64,
     /// Whether cached_total_size has been initialized at least once.
     size_cache_initialized: std::sync::atomic::AtomicBool,
 }
 
-impl S3Storage {
+impl ObjectStorage {
     /// Create new S3 storage with optional credentials.
     ///
     /// `virtual_hosted` selects the request addressing style: `false` (default) appends
@@ -59,7 +64,45 @@ impl S3Storage {
         let store = builder.build().expect("Failed to build S3 client");
 
         Self {
-            store,
+            store: Box::new(store),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create new Google Cloud Storage backend.
+    ///
+    /// Credentials resolve in order: explicit `service_account_path` (JSON key
+    /// file), ambient `GOOGLE_*` environment (`GOOGLE_SERVICE_ACCOUNT`,
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, ...), then the instance metadata
+    /// server — so GKE Workload Identity and GCE service accounts work with no
+    /// key material at all. `base_url` overrides the endpoint for emulators
+    /// (fake-gcs-server) or private access endpoints; an `http://` base_url
+    /// also skips request signing (emulators don't verify signatures).
+    pub fn new_gcs(
+        bucket: &str,
+        service_account_path: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Self {
+        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        if let Some(path) = service_account_path {
+            builder = builder.with_service_account_path(path);
+        }
+        if let Some(url) = base_url {
+            let allow_http = url.starts_with("http://");
+            builder = builder.with_base_url(url).with_client_options(
+                object_store::ClientOptions::new().with_allow_http(allow_http),
+            );
+            if allow_http {
+                builder = builder.with_skip_signature(true);
+            }
+        }
+        let store = builder.build().expect("Failed to build GCS client");
+
+        Self {
+            store: Box::new(store),
+            name: "gcs",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
         }
@@ -102,7 +145,7 @@ fn map_err(e: object_store::Error) -> StorageError {
 }
 
 #[async_trait]
-impl StorageBackend for S3Storage {
+impl StorageBackend for ObjectStorage {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let encoded = encode_s3_key(key);
         let path = Path::from(encoded);
@@ -228,7 +271,7 @@ impl StorageBackend for S3Storage {
     }
 
     fn backend_name(&self) -> &'static str {
-        "s3"
+        self.name
     }
 
     async fn refresh_total_size(&self) {
@@ -327,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_backend_name() {
-        let storage = S3Storage::new(
+        let storage = ObjectStorage::new(
             "http://localhost:9000",
             "test-bucket",
             "us-east-1",
@@ -340,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_s3_storage_creation_anonymous() {
-        let storage = S3Storage::new(
+        let storage = ObjectStorage::new(
             "http://localhost:9000",
             "test-bucket",
             "us-east-1",
@@ -365,7 +408,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let storage = S3Storage::new(
+        let storage = ObjectStorage::new(
             &server.uri(),
             "test-bucket",
             "us-east-1",
@@ -395,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_s3_total_size_returns_zero_before_init() {
-        let storage = S3Storage::new(
+        let storage = ObjectStorage::new(
             "http://localhost:9000",
             "test-bucket",
             "us-east-1",

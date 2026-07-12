@@ -108,6 +108,8 @@ fn build_context(
             s3_secret_key: None,
             s3_region: String::new(),
             s3_virtual_hosted: false,
+            gcs_service_account_path: None,
+            gcs_base_url: None,
         },
         maven: MavenConfig {
             enabled: true,

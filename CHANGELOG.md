@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **Native Google Cloud Storage backend (`storage.mode = "gcs"`)** — previously GCS was reachable only through its S3-interoperability layer with static HMAC keys. The S3 backend is generalized into an `ObjectStorage` over the `object_store` trait (the S3 path is unchanged) plus a GCS constructor: bucket from `storage.bucket`, credentials resolved as explicit service-account JSON (`storage.gcs_service_account_path` / `NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH`), then ambient `GOOGLE_*` env, then the instance metadata server — so GKE Workload Identity and GCE service accounts work with no key material. `storage.gcs_base_url` overrides the endpoint for emulators or Private Google Access (an `http://` override also skips request signing). `NORA_STORAGE_MODE=gcs`; `nora migrate` accepts `gcs` as source/destination. Same single-writer caveat as S3 for rpm/deb publishing. Verified end-to-end against real GCS: dnf and apt both install from a GCS-backed instance (#128 follow-on).
+
 ## [1.0.0] - 2026-07-13
 
 ### Added

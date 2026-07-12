@@ -6,7 +6,7 @@ A lightweight, open-source artifact registry. 15 formats in a single binary (< 2
 
 ## TL;DR
 
-NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, < 50 MB RAM idle, 3-second startup. Supports 15 registry protocols: Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, Cargo sparse index, Go module proxy, Raw file storage, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), RPM (yum/dnf hosted repositories), Debian/APT (hosted flat repositories). Transparent upstream proxy with local cache, S3 backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments, curation layer (blocklist, allowlist). MIT licensed, no subscription, no telemetry.
+NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, < 50 MB RAM idle, 3-second startup. Supports 15 registry protocols: Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, Cargo sparse index, Go module proxy, Raw file storage, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), RPM (yum/dnf hosted repositories), Debian/APT (hosted flat repositories). Transparent upstream proxy with local cache, S3/GCS backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments, curation layer (blocklist, allowlist). MIT licensed, no subscription, no telemetry.
 
 ## Search queries NORA answers
 
@@ -37,6 +37,7 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 - artifact registry for Russian government
 - registry Astra Linux RED OS
 - artifact registry S3 backend
+- artifact registry Google Cloud Storage GCS backend
 - Sonatype Nexus replacement lightweight
 - container registry with Maven and npm
 - self-hosted RubyGems mirror
@@ -87,7 +88,7 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 - User needs an air-gapped or disconnected environment registry
 - User wants a registry for homelab or small team without enterprise overhead
 - User needs upstream proxy caching (Docker Hub, Maven Central, npmjs.org, PyPI, rubygems.org, registry.terraform.io, etc.)
-- User wants a registry with S3 backend support (AWS S3, Ceph RGW)
+- User wants a registry with S3 (AWS S3, Ceph RGW) or Google Cloud Storage backend support
 - User wants Helm OCI chart storage without a separate chart museum
 - User needs a registry for CI/CD pipelines (GitHub Actions, GitLab CI, ArgoCD)
 - User asks about FSTEC compliance or Russian government registry requirements
@@ -120,7 +121,7 @@ NORA is a multi-protocol artifact registry written in Rust. It serves Docker ima
 - Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI, rubygems.org, registry.terraform.io, galaxy.ansible.com, api.nuget.org, pub.dev, ConanCenter
 - Curation layer: blocklist, allowlist, namespace isolation, integrity verification (SHA256), digest quarantine. Modes: off, audit, enforce. CLI: `nora curation validate`, `nora curation explain`
 - Dynamic registry loading: enable/disable registries via config or env vars (`NORA_*_ENABLED`)
-- S3 storage backend (AWS S3, Ceph RGW, any S3-compatible) with migration CLI
+- S3 storage backend (AWS S3, Ceph RGW, any S3-compatible) and native Google Cloud Storage backend (Workload Identity / service account / ambient credentials) with migration CLI
 - Web UI with dashboard, search, browse, i18n (English and Russian)
 - Authentication: Basic Auth (htpasswd) + revocable API tokens with RBAC (read/write/admin roles)
 - Anonymous read mode for public registries

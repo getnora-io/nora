@@ -13,6 +13,7 @@ pub enum StorageMode {
     #[default]
     Local,
     S3,
+    Gcs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,15 @@ pub struct StorageConfig {
     /// Cloud OSS answers them with 403 `SecondLevelDomainForbidden`.
     #[serde(default)]
     pub s3_virtual_hosted: bool,
+    /// GCS: path to a service-account JSON key file. Unset = ambient
+    /// credentials (GOOGLE_* env, then the instance metadata server — GKE
+    /// Workload Identity / GCE service accounts need no key material).
+    #[serde(default)]
+    pub gcs_service_account_path: Option<String>,
+    /// GCS: endpoint override for emulators (fake-gcs-server) or Private
+    /// Google Access endpoints. Unset = https://storage.googleapis.com.
+    #[serde(default)]
+    pub gcs_base_url: Option<String>,
 }
 
 pub(super) fn default_s3_region() -> String {
@@ -70,6 +80,8 @@ impl Default for StorageConfig {
             s3_secret_key: None,
             s3_region: default_s3_region(),
             s3_virtual_hosted: false,
+            gcs_service_account_path: None,
+            gcs_base_url: None,
         }
     }
 }
@@ -83,9 +95,10 @@ impl StorageConfig {
             self.mode = match val.to_lowercase().as_str() {
                 "local" | "filesystem" => StorageMode::Local,
                 "s3" => StorageMode::S3,
+                "gcs" => StorageMode::Gcs,
                 other => {
                     return Err(format!(
-                        "NORA_STORAGE_MODE={:?} is invalid — valid values: local, s3",
+                        "NORA_STORAGE_MODE={:?} is invalid — valid values: local, s3, gcs",
                         other
                     ))
                 }
@@ -99,6 +112,12 @@ impl StorageConfig {
         }
         if let Ok(val) = env::var("NORA_STORAGE_BUCKET") {
             self.bucket = val;
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH") {
+            self.gcs_service_account_path = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_GCS_BASE_URL") {
+            self.gcs_base_url = if val.is_empty() { None } else { Some(val) };
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_ACCESS_KEY") {
             self.s3_access_key = if val.is_empty() {
@@ -122,5 +141,44 @@ impl StorageConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gcs_mode_parses_from_toml_and_env() {
+        let cfg: StorageConfig = toml::from_str("mode = \"gcs\"\nbucket = \"artifacts\"").unwrap();
+        assert_eq!(cfg.mode, StorageMode::Gcs);
+        assert_eq!(cfg.bucket, "artifacts");
+        assert_eq!(cfg.gcs_service_account_path, None);
+        assert_eq!(cfg.gcs_base_url, None);
+
+        let mut cfg = StorageConfig::default();
+        // Serialized via a fresh process env in CI would race; set/remove inline.
+        std::env::set_var("NORA_STORAGE_MODE", "gcs");
+        std::env::set_var("NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH", "/sa.json");
+        std::env::set_var("NORA_STORAGE_GCS_BASE_URL", "http://127.0.0.1:4443");
+        let r = cfg.apply_env_overrides();
+        std::env::remove_var("NORA_STORAGE_MODE");
+        std::env::remove_var("NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH");
+        std::env::remove_var("NORA_STORAGE_GCS_BASE_URL");
+        r.unwrap();
+        assert_eq!(cfg.mode, StorageMode::Gcs);
+        assert_eq!(cfg.gcs_service_account_path.as_deref(), Some("/sa.json"));
+        assert_eq!(cfg.gcs_base_url.as_deref(), Some("http://127.0.0.1:4443"));
+    }
+
+    #[test]
+    fn test_unknown_mode_still_fails_closed() {
+        let mut cfg = StorageConfig::default();
+        std::env::set_var("NORA_STORAGE_MODE", "azure");
+        let r = cfg.apply_env_overrides();
+        std::env::remove_var("NORA_STORAGE_MODE");
+        let err = r.unwrap_err();
+        assert!(err.contains("local, s3, gcs"), "{err}");
     }
 }
