@@ -259,7 +259,9 @@ primary/filelists/other.xml.gz). Package headers are parsed server-side — no
 | Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
 | Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
 | Package download | Full | Byte-identical, sha256 pkgid in repodata |
-| GPG-signed repodata (`repomd.xml.asc`) | — | Unsigned; clients need `gpgcheck=0 repo_gpgcheck=0` (signing: #128) |
+| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1` |
+| Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
+| Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Upstream proxy | — | Hosted only |
 | sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
 | Delta RPMs (`prestodelta`) | — | Not generated |
@@ -275,7 +277,14 @@ name=NORA myrepo
 baseurl=http://nora:4000/rpm/myrepo
 enabled=1
 gpgcheck=0
-repo_gpgcheck=0
+repo_gpgcheck=1
+gpgkey=http://nora:4000/rpm/myrepo/repodata/repomd.xml.key
+```
+
+`gpgcheck=0` stays: NORA signs the repository metadata, not the packages
+themselves. With signing disabled (`signing.enabled = false`), also set
+`repo_gpgcheck=0`.
+
 ## Debian (APT)
 
 Hosted *flat* repositories with server-generated indexes. Each
@@ -292,7 +301,8 @@ upstream proxy (hosted only).
 | Package publish (`PUT {repo}/{name}.deb`) | Full | Control parsed and validated; invalid debs rejected; decompression bombs bounded |
 | Package delete (`DELETE {repo}/{name}.deb`) | Full | Indexes regenerated |
 | Package download | Full | Byte-identical |
-| `InRelease` / `Release.gpg` (signed) | — | Unsigned; clients use `[trusted=yes]` (signing: #128) |
+| `InRelease` (clearsigned) / `Release.gpg` (detached) | Full | Signed on every regeneration; verify via `signed-by` |
+| Public key (`pubkey.gpg`) | Full | Armored, for the `signed-by` keyring; key auto-generated at first boot |
 | `dists/` pool layout (suites/components) | — | Flat repositories only (`deb <url>/deb/{repo} ./`) |
 | by-hash | — | Not applicable to flat repositories |
 | Translations / Contents indexes | — | Not generated |
@@ -300,11 +310,16 @@ upstream proxy (hosted only).
 
 Publish: `curl -u user:pass -T pkg.deb http://nora:4000/deb/myrepo/pkg.deb`
 
-Client sources.list line:
+Client setup:
 
 ```
-deb [trusted=yes] http://nora:4000/deb/myrepo ./
+curl -fsSL http://nora:4000/deb/myrepo/pubkey.gpg -o /etc/apt/keyrings/nora.asc
+echo "deb [signed-by=/etc/apt/keyrings/nora.asc] http://nora:4000/deb/myrepo ./" \
+  > /etc/apt/sources.list.d/nora.list
 ```
+
+With signing disabled (`signing.enabled = false`), use
+`deb [trusted=yes] http://nora:4000/deb/myrepo ./` instead.
 
 ## Helm OCI
 

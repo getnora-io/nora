@@ -411,11 +411,38 @@ async fn regenerate_indexes(state: &AppState, repo: &str) -> Result<(), String> 
 
     // Packages before Release — Release carries their hashes, so a reader
     // never sees a Release referencing index bytes that are not there yet.
-    for (name, data) in [
+    // Signatures last, for the same reason. Fail-closed like the rest of
+    // the rebuild: a repo that claims to be signed must never publish an
+    // unsigned or stale-signed index (#128).
+    let mut files: Vec<(&str, Vec<u8>)> = vec![
         ("Packages", packages),
         ("Packages.gz", packages_gz),
-        ("Release", release.into_bytes()),
-    ] {
+        ("Release", release.clone().into_bytes()),
+    ];
+    match &state.signer {
+        Some(signer) => {
+            files.push(("InRelease", signer.clearsign(&release)?.into_bytes()));
+            files.push((
+                "Release.gpg",
+                signer.sign_detached(release.as_bytes())?.into_bytes(),
+            ));
+        }
+        None => {
+            // Signing turned off after having been on: stale signatures that
+            // no longer match Release would hard-fail apt's verification.
+            for name in ["InRelease", "Release.gpg"] {
+                let key = format!("deb/{repo}/{name}");
+                if state.storage.stat(&key).await.is_some() {
+                    state
+                        .storage
+                        .delete(&key)
+                        .await
+                        .map_err(|e| format!("delete stale {name}: {e}"))?;
+                }
+            }
+        }
+    }
+    for (name, data) in files {
         state
             .storage
             .put(&format!("deb/{repo}/{name}"), &data)
@@ -526,6 +553,17 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = strip_flat_prefix(&path).to_string();
+    if path == "pubkey.gpg" {
+        return match &state.signer {
+            Some(signer) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/pgp-keys")],
+                signer.public_key_armored().to_string(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     let key = package_key(&repo, &path);
     if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1165,6 +1203,88 @@ mod integration_tests {
                 "no-cache",
                 "{name}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod signing_tests {
+    use super::integration_tests::build_test_deb_with;
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
+    use axum::http::{Method, StatusCode};
+    use pgp::composed::{
+        CleartextSignedMessage, Deserializable, DetachedSignature, SignedPublicKey,
+    };
+
+    /// InRelease (clearsigned) and Release.gpg (detached) must verify against
+    /// the served public key, and InRelease must embed the Release text (#128).
+    #[tokio::test]
+    async fn test_deb_release_signatures_verify() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/sig.deb",
+            build_test_deb_with("sig", "1.0", "gz"),
+        )
+        .await;
+
+        let release =
+            body_bytes(send(&ctx.app, Method::GET, "/deb/myrepo/Release", "").await).await;
+        let key = body_bytes(send(&ctx.app, Method::GET, "/deb/myrepo/pubkey.gpg", "").await).await;
+        let (public, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/deb/myrepo/InRelease", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let inrelease = body_bytes(resp).await;
+        let (msg, _) =
+            CleartextSignedMessage::from_armor(std::io::Cursor::new(&inrelease[..])).unwrap();
+        msg.verify(&public).unwrap();
+        assert!(
+            msg.signed_text().contains("SHA256:"),
+            "InRelease must embed the Release body"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/deb/myrepo/Release.gpg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let gpg = body_bytes(resp).await;
+        let (sig, _) =
+            DetachedSignature::from_armor_single(std::io::Cursor::new(&gpg[..])).unwrap();
+        sig.verify(&public, &release[..]).unwrap();
+
+        // apt fetches these via the flat-repo dot path too.
+        let resp = send(&ctx.app, Method::GET, "/deb/myrepo/./InRelease", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Unsigned mode: no signature endpoints, and stale InRelease/Release.gpg
+    /// from a previously-signed deployment are removed on regeneration.
+    #[tokio::test]
+    async fn test_deb_unsigned_mode_removes_stale_signatures() {
+        let ctx = create_test_context_with_config(|c| c.signing.enabled = false);
+        for name in ["InRelease", "Release.gpg"] {
+            ctx.state
+                .storage
+                .put(&format!("deb/myrepo/{name}"), b"stale")
+                .await
+                .unwrap();
+        }
+
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/sig.deb",
+            build_test_deb_with("sig", "1.0", "gz"),
+        )
+        .await;
+
+        for name in ["InRelease", "Release.gpg", "pubkey.gpg"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/deb/myrepo/{name}"), "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
         }
     }
 }

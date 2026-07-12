@@ -46,6 +46,7 @@ mod repo_index;
 mod request_id;
 mod retention;
 mod secrets;
+mod signing;
 mod storage;
 mod tokens;
 mod ui;
@@ -251,6 +252,8 @@ pub struct AppState {
     /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
+    /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
+    pub signer: Option<Arc<signing::RepoSigner>>,
     /// Pre-compiled upstream hostname searchers for leak detection (#386)
     pub leak_finders: metrics::LeakFinders,
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
@@ -913,6 +916,50 @@ async fn main() {
     }
 }
 
+/// Build the repository index signer (#128). `None` disables signing:
+/// explicitly via config, when no signing-capable registry (rpm/deb) is
+/// enabled, or on S3 storage without a configured `signing.key_path` (warned
+/// — there is no local data directory to keep a generated key in). A present
+/// but unreadable/corrupt key is fatal: silently serving unsigned (or with a
+/// silently rotated key) would break every client pinning the public key.
+fn build_signer(
+    config: &config::Config,
+    enabled: &std::collections::HashSet<RegistryType>,
+) -> Option<Arc<signing::RepoSigner>> {
+    if !enabled.contains(&RegistryType::Rpm) && !enabled.contains(&RegistryType::Deb) {
+        return None;
+    }
+    if !config.signing.enabled {
+        info!("repository index signing disabled by config");
+        return None;
+    }
+    let path = if !config.signing.key_path.is_empty() {
+        std::path::PathBuf::from(&config.signing.key_path)
+    } else if config.storage.mode == config::StorageMode::Local {
+        std::path::Path::new(&config.storage.path).join(".signing/nora.key")
+    } else {
+        tracing::warn!(
+            "repository index signing disabled: storage is not local and signing.key_path \
+             is not set (NORA_SIGNING_KEY_PATH)"
+        );
+        return None;
+    };
+    match signing::RepoSigner::load_or_generate(&path) {
+        Ok(signer) => {
+            info!(
+                fingerprint = %signer.fingerprint(),
+                path = %path.display(),
+                "repository index signing enabled"
+            );
+            Some(Arc::new(signer))
+        }
+        Err(e) => {
+            eprintln!("Fatal: repository index signing key error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Load per-registry min_release_age overrides from CurationConfig into the filter.
 fn load_registry_overrides(
     filter: &mut curation::MinReleaseAgeFilter,
@@ -1469,6 +1516,8 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Cancellation token for graceful shutdown of background tasks (#306). Created
     // before AppState so on-demand handlers (admin reindex warm-up) can observe it.
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let signer = build_signer(&config, &enabled_registries);
+
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -1491,6 +1540,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
         digest_store,
+        signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
     };
