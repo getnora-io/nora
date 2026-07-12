@@ -141,7 +141,7 @@ impl RegistryType {
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "docker" => Some(Self::Docker),
-            "maven" => Some(Self::Maven),
+            "maven" | "maven2" => Some(Self::Maven),
             "npm" => Some(Self::Npm),
             "cargo" => Some(Self::Cargo),
             "pypi" => Some(Self::PyPI),

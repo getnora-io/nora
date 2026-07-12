@@ -34,6 +34,7 @@ mod docker_key_migration;
 mod gc;
 mod hash_pin_store;
 mod health;
+mod import;
 mod metrics;
 mod migrate;
 mod mirror;
@@ -141,6 +142,11 @@ enum Commands {
         /// Output results as JSON (for CI pipelines)
         #[arg(long, global = true)]
         json: bool,
+    },
+    /// Import artifacts from an external registry (Artifactory / Nexus) into NORA (#599)
+    Import {
+        #[command(subcommand)]
+        action: import::ImportCommand,
     },
     /// Curation tools: validate files, explain decisions
     Curation {
@@ -825,6 +831,12 @@ async fn main() {
                 run_curation_explain(&config, &package);
             }
         },
+        Some(Commands::Import { action }) => {
+            if let Err(e) = import::run(action, &storage, &config).await {
+                error!("Import failed: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::MigrateDockerKeys { dry_run }) => {
             let namespace = config
                 .docker

@@ -16,6 +16,15 @@ use axum::{
     Extension, Router,
 };
 
+/// Build the storage key for a Raw artifact at request-relative `path`.
+///
+/// Single source of truth for the `raw/<path>` layout so the handlers here and
+/// `nora import` (review R7, contract `import-key-format-equals-handler-key-format`)
+/// produce byte-identical keys that GC/retention/UI browse walk as strings.
+pub(crate) fn storage_key(path: &str) -> String {
+    format!("raw/{path}")
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new().route("/raw/-/reindex", post(reindex)).route(
         "/raw/{*path}",
@@ -47,7 +56,7 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let key = format!("raw/{}", path);
+    let key = storage_key(&path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -147,7 +156,7 @@ async fn upload(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let key = format!("raw/{}", path);
+    let key = storage_key(&path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -316,7 +325,7 @@ async fn delete_file(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let key = format!("raw/{}", path);
+    let key = storage_key(&path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -346,7 +355,7 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let key = format!("raw/{}", path);
+    let key = storage_key(&path);
     if validate_storage_key(&key).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
