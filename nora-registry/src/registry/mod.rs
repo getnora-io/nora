@@ -32,11 +32,17 @@ pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
+
+// Storage-key builders reused by `nora import` so imported keys are
+// byte-identical to the keys these handlers serve — GC/retention/UI browse walk
+// keys as strings (review R7, contract `import-key-format-equals-handler-key-format`).
+pub(crate) use maven::storage_key as maven_storage_key;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 pub use raw::routes as raw_routes;
+pub(crate) use raw::storage_key as raw_storage_key;
 pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 

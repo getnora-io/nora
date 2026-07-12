@@ -27,6 +27,16 @@ use sha2::Digest;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+/// Build the storage key for a Maven artifact at repo-relative `path`.
+///
+/// Single source of truth for the `maven/<path>` layout so that anything writing
+/// Maven objects (the handlers here, and `nora import` — review R7, contract
+/// `import-key-format-equals-handler-key-format`) produces byte-identical keys
+/// that GC/retention/UI browse walk as strings.
+pub(crate) fn storage_key(path: &str) -> String {
+    format!("maven/{path}")
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/maven2/{*path}",
@@ -180,7 +190,7 @@ async fn download(
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    let key = format!("maven/{}", path);
+    let key = storage_key(&path);
 
     let artifact_name = path
         .split('/')
@@ -549,7 +559,7 @@ async fn upload(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let key = format!("maven/{}", path);
+    let key = storage_key(&path);
 
     let artifact_name = path
         .split('/')
