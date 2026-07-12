@@ -951,6 +951,15 @@ fn build_signer(
                 path = %path.display(),
                 "repository index signing enabled"
             );
+            if signer.was_generated() && config.storage.mode != config::StorageMode::Local {
+                tracing::warn!(
+                    path = %path.display(),
+                    "signing key was GENERATED on this boot while artifacts live in an \
+                     object store — if this path is per-pod/ephemeral, every replica or \
+                     reschedule mints a new identity and clients fail verification. \
+                     Provision one key and mount it read-only on every replica."
+                );
+            }
             Some(Arc::new(signer))
         }
         Err(e) => {

@@ -7,6 +7,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rsa crate Marvin Attack (timing sidechannel). No upstream fix.
     # jsonwebtoken uses rsa for JWK decoding; NORA only verifies signatures.
+    # Also transitive via pgp (rpgp): index signing is Ed25519-only, so no
+    # rsa private-key operation is ever performed there either.
     "RUSTSEC-2023-0071",
     # quick-xml <0.41 DoS (quadratic-attr + NsReader memory-exhaustion).
     # Transitive via object_store (S3 XML parsing); no upstream fix yet

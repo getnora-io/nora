@@ -638,9 +638,12 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         .map_err(|e| format!("write repomd.xml: {e}"))?;
 
     // Signature written AFTER repomd.xml so a reader never sees a signature
-    // for bytes that are not there yet. Fail-closed like the rest of the
-    // rebuild: a repo that claims to be signed must never publish an
-    // unsigned or stale-signed repomd (#128).
+    // for bytes that are not there yet. The converse window exists — a reader
+    // between the two puts sees new repomd with the previous signature — and
+    // resolves on client retry, same transient class as the hashed-blob
+    // window above. Fail-closed like the rest of the rebuild: a repo that
+    // claims to be signed must never publish an unsigned or stale-signed
+    // repomd (#128).
     let asc_key = format!("{}.asc", repomd_key(repo));
     match &state.signer {
         Some(signer) => {

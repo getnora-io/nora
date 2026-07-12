@@ -12,9 +12,16 @@
 //! the variant every deployed verifier understands (gpgv on apt's side,
 //! gnupg via librepo on dnf's side); the RFC 9580 v6 algorithms are not yet
 //! recognized by either. Generated on first boot and persisted armored at
-//! the configured path, so a restart — or a replica sharing the path —
-//! keeps the same identity. Key material never passes through config or
-//! env; only a filesystem path does.
+//! the configured path, so a restart keeps the same identity. Key material
+//! never passes through config or env; only a filesystem path does.
+//!
+//! The key is SINGLE-WRITER: it lives on the local filesystem even when
+//! artifacts live in an object store. Running multiple replicas requires
+//! the same key bytes at `signing.key_path` on every replica — provision
+//! the key once and mount it read-only everywhere (e.g. a Kubernetes
+//! Secret), or share a ReadWriteMany volume. Replicas that each generate
+//! their own key serve clients a public key that fails to verify indexes
+//! signed by their siblings.
 
 use pgp::composed::{
     ArmorOptions, CleartextSignedMessage, Deserializable, DetachedSignature, KeyType,
@@ -24,6 +31,7 @@ use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::{KeyDetails, Password};
 use std::io::Cursor;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// Signing identity attached to the generated key.
 const USER_ID: &str = "NORA repository signing";
@@ -32,6 +40,9 @@ pub struct RepoSigner {
     key: SignedSecretKey,
     public_armored: String,
     fingerprint: String,
+    /// True when this process generated the key on this boot (first boot or
+    /// race winner) — lets startup warn about generation on ephemeral paths.
+    generated: bool,
 }
 
 impl RepoSigner {
@@ -40,17 +51,37 @@ impl RepoSigner {
     /// returned, never papered over with a fresh key — silently rotating
     /// the key would invalidate every client's pinned public key.
     pub fn load_or_generate(path: &Path) -> Result<Self, String> {
-        let key = match std::fs::read_to_string(path) {
+        let mut generated = false;
+        let key = match std::fs::read_to_string(path).map(Zeroizing::new) {
             Ok(armored) => {
-                let (key, _) = SignedSecretKey::from_armor_single(Cursor::new(armored))
+                let (key, _) = SignedSecretKey::from_armor_single(Cursor::new(armored.as_str()))
                     .map_err(|e| format!("parse signing key {}: {e}", path.display()))?;
                 key
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = generate_key()?;
-                persist_key(&key, path)?;
-                tracing::info!(path = %path.display(), "generated new repository signing key");
-                key
+                match persist_key(&key, path)? {
+                    Persisted::Written => {
+                        tracing::info!(path = %path.display(), "generated new repository signing key");
+                        generated = true;
+                        key
+                    }
+                    // A concurrent first boot won the create — discard the
+                    // fresh key and adopt the winner's, or every replica
+                    // would sign with a different identity for its lifetime.
+                    Persisted::LostRace => {
+                        let armored =
+                            Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+                                format!("re-read signing key {}: {e}", path.display())
+                            })?);
+                        let (key, _) =
+                            SignedSecretKey::from_armor_single(Cursor::new(armored.as_str()))
+                                .map_err(|e| {
+                                    format!("parse signing key {}: {e}", path.display())
+                                })?;
+                        key
+                    }
+                }
             }
             Err(e) => return Err(format!("read signing key {}: {e}", path.display())),
         };
@@ -64,7 +95,13 @@ impl RepoSigner {
             key,
             public_armored: public,
             fingerprint,
+            generated,
         })
+    }
+
+    /// True when the key was generated (not loaded) on this boot.
+    pub fn was_generated(&self) -> bool {
+        self.generated
     }
 
     /// Clearsign `text` (APT `InRelease`).
@@ -110,25 +147,53 @@ fn generate_key() -> Result<SignedSecretKey, String> {
 }
 
 /// Write the armored secret key with owner-only permissions, creating the
-/// parent directory. Written to a temp file then renamed, so a crash never
-/// leaves a half-written key that would fail to parse on the next boot.
-fn persist_key(key: &SignedSecretKey, path: &Path) -> Result<(), String> {
-    let armored = key
-        .to_armored_string(ArmorOptions::default())
-        .map_err(|e| format!("armor signing key: {e}"))?;
+/// parent directory. Staged to a per-process temp file, then claimed with a
+/// create-exclusive link: exactly one of N concurrent first boots wins;
+/// losers get [`Persisted::LostRace`] and must adopt the winner's key. A
+/// crash never leaves a half-written key at the final path.
+enum Persisted {
+    Written,
+    /// Another process created the key between our read and our write.
+    LostRace,
+}
+
+fn persist_key(key: &SignedSecretKey, path: &Path) -> Result<Persisted, String> {
+    let armored = Zeroizing::new(
+        key.to_armored_string(ArmorOptions::default())
+            .map_err(|e| format!("armor signing key: {e}"))?,
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension("key.tmp");
-    std::fs::write(&tmp, &armored).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    // Unique per CALL, not per process — concurrent threads in one process
+    // (or pid reuse across containers) must never share a staging file, or
+    // the link winner can publish bytes some other caller staged.
+    static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "key.tmp.{}.{}",
+        std::process::id(),
+        STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, armored.as_bytes())
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    Ok(())
+    // hard_link is create-exclusive (EEXIST if a concurrent boot already won),
+    // unlike rename which silently replaces.
+    let outcome = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => Persisted::Written,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Persisted::LostRace,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("link to {}: {e}", path.display()));
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -157,6 +222,42 @@ mod tests {
             "reload must keep the same key, not rotate"
         );
         assert_eq!(first.public_key_armored(), second.public_key_armored());
+    }
+
+    /// N concurrent first boots must all end up with the SAME identity —
+    /// the create-exclusive claim means one generator wins and every loser
+    /// adopts the winner's key instead of serving its own for its lifetime.
+    #[test]
+    fn concurrent_first_boot_converges_on_one_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nora.key");
+        let fingerprints: Vec<String> = std::thread::scope(|s| {
+            (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        RepoSigner::load_or_generate(&path)
+                            .unwrap()
+                            .fingerprint()
+                            .to_string()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert!(
+            fingerprints.windows(2).all(|w| w[0] == w[1]),
+            "replicas diverged: {fingerprints:?}"
+        );
+        // No stray temp files left behind by the losers.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(strays.is_empty(), "stray temp files: {strays:?}");
     }
 
     #[test]
@@ -191,5 +292,105 @@ mod tests {
 
         let public = signer.public_key_armored();
         assert!(public.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod real_verifier_tests {
+    //! Closes the round-trip-vs-acceptance gap: rPGP verifying its own output
+    //! proves consistency, not that gpgv/gnupg (what apt and librepo actually
+    //! run) accept it. Ignored by default — requires `gpg` and `gpgv` on PATH;
+    //! run with `cargo test -- --ignored real_verifier`.
+    use super::*;
+    use std::process::Command;
+
+    fn run(cmd: &mut Command) -> (bool, String) {
+        match cmd.output() {
+            Ok(o) => (
+                o.status.success(),
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires gpg + gpgv on PATH"]
+    fn real_verifier_accepts_all_signature_shapes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("gnupghome");
+        std::fs::create_dir(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let signer = RepoSigner::load_or_generate(&dir.path().join("nora.key")).unwrap();
+
+        // The exact bytes NORA serves: pubkey, detached sigs, clearsigned doc.
+        let release = "Origin: NORA\nLabel: test\nDate: Sat, 12 Jul 2026 12:00:00 UTC\nSHA256:\n abc123 1 Packages\n";
+        let repomd = b"<?xml version=\"1.0\"?><repomd></repomd>";
+        let w = |name: &str, data: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, data).unwrap();
+            p
+        };
+        let pubkey = w("pubkey.gpg", signer.public_key_armored().as_bytes());
+        let release_f = w("Release", release.as_bytes());
+        let release_gpg = w(
+            "Release.gpg",
+            signer.sign_detached(release.as_bytes()).unwrap().as_bytes(),
+        );
+        let inrelease = w("InRelease", signer.clearsign(release).unwrap().as_bytes());
+        let repomd_f = w("repomd.xml", repomd);
+        let repomd_asc = w(
+            "repomd.xml.asc",
+            signer.sign_detached(repomd).unwrap().as_bytes(),
+        );
+
+        // gpg --import the served public key (librepo's flow for repo_gpgcheck).
+        let (ok, out) = run(Command::new("gpg")
+            .env("GNUPGHOME", &home)
+            .args(["--batch", "--import"])
+            .arg(&pubkey));
+        assert!(ok, "gpg --import rejected the served public key:\n{out}");
+
+        // Dearmored keyring for gpgv (it reads keyring files, not armored keys).
+        let keyring = dir.path().join("keyring.gpg");
+        let (ok, out) = run(Command::new("gpg")
+            .env("GNUPGHOME", &home)
+            .args(["--batch", "--yes", "-o"])
+            .arg(&keyring)
+            .args(["--dearmor"])
+            .arg(&pubkey));
+        assert!(ok, "gpg --dearmor failed:\n{out}");
+
+        // apt flow 1: detached Release.gpg over Release.
+        let (ok, out) = run(Command::new("gpgv")
+            .arg("--keyring")
+            .arg(&keyring)
+            .arg(&release_gpg)
+            .arg(&release_f));
+        assert!(ok, "gpgv rejected Release.gpg/Release:\n{out}");
+
+        // apt flow 2: clearsigned InRelease.
+        let (ok, out) = run(Command::new("gpgv")
+            .arg("--keyring")
+            .arg(&keyring)
+            .arg(&inrelease));
+        assert!(ok, "gpgv rejected InRelease:\n{out}");
+
+        // dnf/librepo flow: detached armored sig over repomd.xml.
+        let (ok, out) = run(Command::new("gpg")
+            .env("GNUPGHOME", &home)
+            .args(["--batch", "--verify"])
+            .arg(&repomd_asc)
+            .arg(&repomd_f));
+        assert!(ok, "gpg --verify rejected repomd.xml.asc:\n{out}");
     }
 }

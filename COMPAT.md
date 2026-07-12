@@ -259,7 +259,7 @@ primary/filelists/other.xml.gz). Package headers are parsed server-side — no
 | Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
 | Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
 | Package download | Full | Byte-identical, sha256 pkgid in repodata |
-| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1` |
+| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Upstream proxy | — | Hosted only |
