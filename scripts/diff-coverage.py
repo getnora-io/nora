@@ -194,14 +194,26 @@ def git_root():
 
 
 def get_changed_rs_ranges(base):
-    """Return ``{filepath: [(start, end)]}`` for new/changed ``.rs`` lines."""
+    """Return ``{filepath: [(start, end)]}`` for new/changed ``.rs`` lines.
+
+    Rename-aware: ``--find-renames`` makes git emit a renamed file as a rename
+    (its ``rename to`` path on the ``+++ b/`` side) carrying only the lines that
+    genuinely changed, instead of ``--no-renames`` scoring the whole moved file
+    as new. Without this, moving ``foo.rs`` to ``bar.rs`` re-exposes every
+    already-merged (and possibly grandfathered-uncovered) line as a "changed"
+    line, so a near-pure rename fails the gate on code that was never touched.
+    ``--diff-filter=AMR`` must include ``R`` for the same reason: a detected
+    rename has status ``R``, and an ``AM``-only filter would otherwise drop it
+    entirely — under-counting the lines the rename genuinely added. Deletions
+    (``D``) stay excluded; only the new side is ever scored.
+    """
     merge_base = run_git(["merge-base", base, "HEAD"]).strip()
     diff = run_git(
         [
             "diff",
             "--unified=0",
-            "--no-renames",
-            "--diff-filter=AM",
+            "--find-renames",
+            "--diff-filter=AMR",
             "--src-prefix=a/",
             "--dst-prefix=b/",
             merge_base,
@@ -323,6 +335,33 @@ def run_self_test():
         "-old\n"
     )
     check("deletion (new side /dev/null) ignored", not parse_diff_hunks(diff_del))
+
+    # --- a rename (--find-renames) scores only the genuinely-changed lines -----
+    # git emits a rename+modify with `rename from/to` headers and a hunk that
+    # covers ONLY the changed lines, keyed by the new path on `+++ b/`. The
+    # grandfathered, unchanged body of the moved file must NOT reappear as
+    # "changed" (the bug that failed the gate on near-pure renames).
+    diff_rename = (
+        "diff --git a/src/storage/s3.rs b/src/storage/object.rs\n"
+        "similarity index 88%\n"
+        "rename from src/storage/s3.rs\n"
+        "rename to src/storage/object.rs\n"
+        "--- a/src/storage/s3.rs\n"
+        "+++ b/src/storage/object.rs\n"
+        "@@ -82,0 +83,3 @@ impl ObjectStorage {\n"
+        "+    pub fn new_gcs() {}\n"
+        "+    // added\n"
+        "+    // added\n"
+    )
+    ranges_rename = parse_diff_hunks(diff_rename)
+    check(
+        "rename scores only changed lines under the new path",
+        ranges_rename == {"src/storage/object.rs": [(83, 85)]},
+    )
+    check(
+        "rename does not re-expose the old path",
+        "src/storage/s3.rs" not in ranges_rename,
+    )
 
     # --- malformed DA: lines are skipped --------------------------------------
     lcov_bad = (
