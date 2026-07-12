@@ -51,9 +51,16 @@ done | while IFS= read -r finding; do
     info "$finding"
 done
 
-# ── Check 2: lock guard must not be scoped inside if-block ──
-# Pattern: publish_lock + _guard inside `if condition {` block,
-# then storage.put AFTER the closing brace = unprotected write
+# ── Check 2: lock guard must not be scoped inside a conditional/loop block ──
+# Bad pattern: publish_lock + _guard inside `if cond { … }` (or for/while/loop),
+# whose closing brace drops the guard BEFORE a later storage.put = unprotected write.
+#
+# The guard's *enclosing* block is found by a backward brace-walk from the guard
+# line (the first unmatched `{` going up). We flag ONLY when that opener is an
+# if/else/for/while/loop. A guard at function-body scope after early-return guard
+# clauses (`if validate(..).is_err() { return }`) has the fn body as its encloser
+# and is correctly NOT flagged — the previous line-window heuristic false-positived
+# on exactly that idiom (deb/rpm delete_package).
 echo ""
 echo "--- Check 2: lock guard scope ---"
 
@@ -61,19 +68,51 @@ for file in "$REGISTRY_DIR"/*.rs; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
 
-    # Find publish_lock calls and check if they're inside a conditional
     awk -v base="$base" '
     /publish_lock/ { lock_line=NR }
     /let _guard/ && lock_line && (NR - lock_line < 3) {
-        guard_line=NR
-        # Check if we are inside an if-block by looking at context
-        for (i=NR-5; i<=NR; i++) {
-            if (lines[i] ~ /if .* \{/ && lines[i] !~ /let|match/) {
-                printf "%s:%d _guard created inside if-block (may drop before storage.put)\n", base, guard_line
+        # Backward brace-walk: the first unmatched `{` above the guard opened the
+        # block that lexically encloses it.
+        depth=0; encloser=""; enc_line=0
+        for (i=NR-1; i>=1; i--) {
+            t=lines[i]; nopen=gsub(/[{]/,"",t)
+            t=lines[i]; nclose=gsub(/[}]/,"",t)
+            depth += nclose - nopen
+            if (depth < 0) { encloser=lines[i]; enc_line=i; break }
+        }
+        is_cond = (encloser ~ /(^|[^A-Za-z0-9_])(if|for|while|loop|else)([^A-Za-z0-9_]|$)/)
+        is_excluded = (encloser ~ /=>/) || (encloser ~ /(^|[^A-Za-z0-9_])fn[^A-Za-z0-9_]/) ||
+                      (encloser ~ /\|[^|]*\|[[:space:]]*\{/)
+        # A guard at fn-body / match-arm / closure scope is held across the rest
+        # of that scope — safe. Only a guard inside a conditional/loop CAN drop
+        # early; record it for the write-after-close check in END.
+        if (is_cond && !is_excluded) { gi++; g_guard[gi]=NR; g_enc[gi]=enc_line }
+    }
+    { lines[NR]=$0 }
+    END {
+        for (k=1; k<=gi; k++) {
+            # Find where the enclosing conditional/loop block closes.
+            d=0; close_line=0
+            for (j=g_enc[k]; j<=NR; j++) {
+                t=lines[j]; nopen=gsub(/[{]/,"",t)
+                t=lines[j]; nclose=gsub(/[}]/,"",t)
+                d += nopen - nclose
+                if (j > g_enc[k] && d <= 0) { close_line=j; break }
+            }
+            if (close_line == 0) continue
+            # BUG only if a storage write follows the block close, still inside the
+            # function (up to the next column-0 `}`): the guard has already dropped,
+            # so that write is unserialized. A guard whose block contains ALL its
+            # writes (e.g. a per-key lock inside a `for` loop) is correctly ignored.
+            for (j=close_line+1; j<=NR; j++) {
+                if (lines[j] ~ /^}/) break
+                if (lines[j] ~ /storage\.(put|delete|write|put_from_path|put_multipart)/) {
+                    printf "%s:%d _guard drops (conditional/loop scope) before storage write at line %d\n", base, g_guard[k], j
+                    break
+                }
             }
         }
     }
-    { lines[NR]=$0 }
     ' "$file"
 done | while IFS= read -r finding; do
     red "$finding"
