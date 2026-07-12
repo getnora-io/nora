@@ -49,6 +49,8 @@ pub struct StorageConfig {
     pub gcs_service_account_path: Option<String>,
     /// GCS: endpoint override for emulators (fake-gcs-server) or Private
     /// Google Access endpoints. Unset = https://storage.googleapis.com.
+    /// Emulator-only caveat: an `http://` override also disables request
+    /// signing — do not point this at a plaintext non-emulator endpoint.
     #[serde(default)]
     pub gcs_base_url: Option<String>,
 }

@@ -109,20 +109,21 @@ impl ObjectStorage {
     }
 }
 
-/// Encode `@` in S3 keys to `%40` for SeaweedFS compatibility.
+/// Encode `@` in object keys to `%40` for SeaweedFS compatibility (shared by
+/// every object-store backend so all providers use one key scheme).
 ///
 /// SeaweedFS returns 500 on GET/PUT for keys containing `@`
 /// (e.g. npm scoped packages like `npm/@babel/core/...`).
 ///
 /// Uses `%40` (URL-encoding style) instead of `_at_` to avoid roundtrip
 /// collisions with keys containing literal `_at_` (e.g. `look_at_this`) (#534).
-fn encode_s3_key(key: &str) -> String {
+fn encode_object_key(key: &str) -> String {
     key.replace('@', "%40")
 }
 
 /// Legacy encoding: `@` → `_at_` (used before #534).
 /// Only needed for fallback reads of pre-migration data.
-fn encode_s3_key_legacy(key: &str) -> String {
+fn encode_object_key_legacy(key: &str) -> String {
     key.replace('@', "_at_")
 }
 
@@ -132,7 +133,7 @@ fn encode_s3_key_legacy(key: &str) -> String {
 /// data are NOT decoded here — they are handled by fallback reads in `get()`
 /// and `stat()`. This avoids the roundtrip collision where literal `_at_` in
 /// keys (e.g. `cargo/look_at_this/`) would be wrongly decoded as `@`.
-fn decode_s3_key(key: &str) -> String {
+fn decode_object_key(key: &str) -> String {
     key.replace("%40", "@")
 }
 
@@ -147,7 +148,7 @@ fn map_err(e: object_store::Error) -> StorageError {
 #[async_trait]
 impl StorageBackend for ObjectStorage {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
         self.store.put(&path, payload).await.map_err(map_err)?;
@@ -155,7 +156,7 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         match self.store.get(&path).await {
             Ok(result) => {
@@ -165,7 +166,7 @@ impl StorageBackend for ObjectStorage {
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 // Only needed when key contains @, since otherwise both schemes produce the same output.
-                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                let legacy_path = Path::from(encode_object_key_legacy(key));
                 let result = self.store.get(&legacy_path).await.map_err(map_err)?;
                 let bytes = result.bytes().await.map_err(map_err)?;
                 Ok(bytes)
@@ -175,14 +176,14 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         self.store.delete(&path).await.map_err(map_err)?;
         Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let encoded = encode_s3_key(prefix);
+        let encoded = encode_object_key(prefix);
         let prefix_path = Path::from(encoded);
         let list_prefix = if prefix.is_empty() {
             None
@@ -200,12 +201,12 @@ impl StorageBackend for ObjectStorage {
 
         Ok(objects
             .into_iter()
-            .map(|meta| decode_s3_key(meta.location.as_ref()))
+            .map(|meta| decode_object_key(meta.location.as_ref()))
             .collect())
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
-        let encoded = encode_s3_key(prefix);
+        let encoded = encode_object_key(prefix);
         let prefix_path = Path::from(encoded);
         let list_prefix = if prefix.is_empty() {
             None
@@ -227,7 +228,7 @@ impl StorageBackend for ObjectStorage {
             .map(|meta| {
                 let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
                 (
-                    decode_s3_key(meta.location.as_ref()),
+                    decode_object_key(meta.location.as_ref()),
                     FileMeta {
                         size: meta.size,
                         modified,
@@ -238,13 +239,13 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let meta = match self.store.head(&path).await {
             Ok(m) => m,
             Err(_) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data
-                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                let legacy_path = Path::from(encode_object_key_legacy(key));
                 self.store.head(&legacy_path).await.ok()?
             }
             Err(_) => return None,
@@ -287,7 +288,7 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn put_from_path(&self, key: &str, src: &std::path::Path) -> Result<()> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let s3_path = Path::from(encoded);
 
         // Streaming multipart upload: read file in 8 MiB chunks, feed to
@@ -319,12 +320,12 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let result = match self.store.get(&path).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                let legacy_path = Path::from(encode_object_key_legacy(key));
                 self.store.get(&legacy_path).await.map_err(map_err)?
             }
             Err(e) => return Err(map_err(e)),
@@ -345,11 +346,11 @@ impl StorageBackend for ObjectStorage {
             range: Some(object_store::GetRange::Bounded(start..(end + 1))),
             ..Default::default()
         };
-        let path = Path::from(encode_s3_key(key));
+        let path = Path::from(encode_object_key(key));
         let result = match self.store.get_opts(&path, make_opts()).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
-                let legacy_path = Path::from(encode_s3_key_legacy(key));
+                let legacy_path = Path::from(encode_object_key_legacy(key));
                 self.store
                     .get_opts(&legacy_path, make_opts())
                     .await
@@ -392,6 +393,23 @@ mod tests {
             false,
         );
         assert_eq!(storage.backend_name(), "s3");
+    }
+
+    /// GCS construction with no credentials and an emulator base_url — the
+    /// builder resolves credentials lazily (no build-time I/O), same contract
+    /// as the anonymous S3 construction test above.
+    #[test]
+    fn test_gcs_storage_creation_emulator() {
+        let storage = ObjectStorage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
+        assert_eq!(storage.backend_name(), "gcs");
+    }
+
+    /// GCS construction against the real endpoint (no base_url, no explicit
+    /// service account) — the ambient-credential ladder must also be lazy.
+    #[test]
+    fn test_gcs_storage_creation_default_endpoint() {
+        let storage = ObjectStorage::new_gcs("test-bucket", None, None);
+        assert_eq!(storage.backend_name(), "gcs");
     }
 
     /// Empty ListObjectsV2 body so `health_check`'s `list(None)` succeeds against the mock.
@@ -478,30 +496,30 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_s3_key() {
-        assert_eq!(encode_s3_key("npm/@scope/pkg"), "npm/%40scope/pkg");
+    fn test_encode_object_key() {
+        assert_eq!(encode_object_key("npm/@scope/pkg"), "npm/%40scope/pkg");
         assert_eq!(
-            encode_s3_key("npm/@babel/core/metadata.json"),
+            encode_object_key("npm/@babel/core/metadata.json"),
             "npm/%40babel/core/metadata.json"
         );
     }
 
     #[test]
-    fn test_decode_s3_key_new_encoding() {
-        assert_eq!(decode_s3_key("npm/%40scope/pkg"), "npm/@scope/pkg");
+    fn test_decode_object_key_new_encoding() {
+        assert_eq!(decode_object_key("npm/%40scope/pkg"), "npm/@scope/pkg");
         assert_eq!(
-            decode_s3_key("npm/%40babel/core/metadata.json"),
+            decode_object_key("npm/%40babel/core/metadata.json"),
             "npm/@babel/core/metadata.json"
         );
     }
 
     #[test]
-    fn test_decode_s3_key_legacy_not_decoded() {
-        // Legacy _at_ keys are NOT decoded by decode_s3_key (avoids #534 collision).
+    fn test_decode_object_key_legacy_not_decoded() {
+        // Legacy _at_ keys are NOT decoded by decode_object_key (avoids #534 collision).
         // They are handled by fallback reads in get()/stat() instead.
-        assert_eq!(decode_s3_key("npm/_at_scope/pkg"), "npm/_at_scope/pkg");
+        assert_eq!(decode_object_key("npm/_at_scope/pkg"), "npm/_at_scope/pkg");
         assert_eq!(
-            decode_s3_key("npm/_at_babel/core/metadata.json"),
+            decode_object_key("npm/_at_babel/core/metadata.json"),
             "npm/_at_babel/core/metadata.json"
         );
     }
@@ -518,7 +536,7 @@ mod tests {
         ];
         for key in keys {
             assert_eq!(
-                decode_s3_key(&encode_s3_key(key)),
+                decode_object_key(&encode_object_key(key)),
                 key,
                 "roundtrip failed for: {key}"
             );
@@ -529,24 +547,27 @@ mod tests {
     #[test]
     fn test_no_roundtrip_collision_with_literal_at() {
         let key = "cargo/look_at_this/1.0.crate";
-        let encoded = encode_s3_key(key);
+        let encoded = encode_object_key(key);
         // Must NOT contain _at_ substitution — key has no @
         assert_eq!(encoded, key);
-        assert_eq!(decode_s3_key(&encoded), key);
+        assert_eq!(decode_object_key(&encoded), key);
     }
 
     #[test]
     fn test_encode_no_at() {
         let key = "npm/chalk/metadata.json";
-        assert_eq!(encode_s3_key(key), key);
+        assert_eq!(encode_object_key(key), key);
     }
 
     #[test]
     fn test_legacy_encode_for_fallback() {
-        assert_eq!(encode_s3_key_legacy("npm/@scope/pkg"), "npm/_at_scope/pkg");
+        assert_eq!(
+            encode_object_key_legacy("npm/@scope/pkg"),
+            "npm/_at_scope/pkg"
+        );
         // Key without @ is unchanged in both schemes
         assert_eq!(
-            encode_s3_key_legacy("npm/chalk/metadata.json"),
+            encode_object_key_legacy("npm/chalk/metadata.json"),
             "npm/chalk/metadata.json"
         );
     }
@@ -560,8 +581,8 @@ mod proptests {
     proptest! {
         /// For any key containing @, _, or other ASCII chars, roundtrip must hold (#534).
         #[test]
-        fn s3_key_roundtrip(key in "[a-z0-9@_./-]{1,100}") {
-            prop_assert_eq!(decode_s3_key(&encode_s3_key(&key)), key);
+        fn object_key_roundtrip(key in "[a-z0-9@_./-]{1,100}") {
+            prop_assert_eq!(decode_object_key(&encode_object_key(&key)), key);
         }
     }
 }

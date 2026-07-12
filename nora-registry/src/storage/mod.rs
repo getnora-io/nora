@@ -689,6 +689,15 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    /// The GCS wrapper constructs without credentials or network and disables
+    /// the pin store, matching the S3 wrapper's at-rest posture.
+    #[test]
+    fn test_new_gcs_wrapper() {
+        let storage = Storage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
+        assert_eq!(storage.backend_name(), "gcs");
+        assert!(storage.get_pin_hash("any/key").is_none());
+    }
+
     /// Wait until the pin record from `put()` is visible. Since #604 `put()`
     /// awaits the pin, so this returns on the first poll; kept for robustness.
     async fn await_pin(storage: &Storage, key: &str) {
