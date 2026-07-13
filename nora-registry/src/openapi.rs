@@ -122,6 +122,7 @@ use crate::AppState;
         crate::openapi::rpm_reindex,
         // Debian (APT)
         crate::openapi::deb_release,
+        crate::openapi::deb_dist_release,
         crate::openapi::deb_upload,
         crate::openapi::deb_download,
         crate::openapi::deb_delete,
@@ -1153,18 +1154,37 @@ pub async fn rpm_reindex() {}
 )]
 pub async fn deb_release() {}
 
-/// Publish a .deb package (Packages/Release are regenerated server-side)
+/// Distribution index metadata (apt entry point for a structured repo)
+#[utoipa::path(
+    get,
+    path = "/deb/{repo}/dists/{distribution}/Release",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("distribution" = String, Path, description = "Distribution (suite) name")
+    ),
+    responses(
+        (status = 200, description = "Release file listing per-component/arch Packages checksums"),
+        (status = 404, description = "Distribution not found"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_dist_release() {}
+
+/// Publish a .deb package (indexes are regenerated server-side)
 #[utoipa::path(
     put,
     path = "/deb/{repo}/{path}",
     tag = "deb",
     params(
         ("repo" = String, Path, description = "Repository name"),
-        ("path" = String, Path, description = "Package path, must end in .deb")
+        ("path" = String, Path, description = "Package path, must end in .deb"),
+        ("distribution" = Option<String>, Query, description = "Publish into the structured layout under dists/{distribution}/ (omit for a flat repository)"),
+        ("component" = Option<String>, Query, description = "Component within the distribution (default: main; requires distribution)")
     ),
     responses(
         (status = 201, description = "Package stored and indexes regenerated"),
-        (status = 400, description = "Invalid path or not a valid deb", body = ErrorResponse),
+        (status = 400, description = "Invalid path, placement, or not a valid deb", body = ErrorResponse),
         (status = 413, description = "File exceeds deb.max_file_size"),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
