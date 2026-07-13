@@ -189,6 +189,8 @@ fn build_context(
             trusted_proxies: crate::config::TrustedProxies::default_loopback(),
             oidc: crate::config::OidcConfig::default(),
             admin_users: Vec::new(),
+            public_web_ui: false,
+            public_metrics: true,
         },
         rate_limit: RateLimitConfig {
             enabled: false,
@@ -356,7 +358,9 @@ fn build_context(
         }
     }
 
-    let public_routes = Router::new().merge(crate::health::routes());
+    let public_routes = Router::new()
+        .merge(crate::health::routes())
+        .merge(crate::metrics::routes());
 
     let app_routes = Router::new()
         .merge(crate::auth::token_routes())

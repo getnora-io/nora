@@ -103,23 +103,25 @@ impl AuthFailureTracker {
 }
 
 /// Check if path is public (no auth required)
+/// Paths that are public UNCONDITIONALLY: probes (a gated /health takes the
+/// whole deployment down behind an LB) and the token endpoints, which do
+/// their own credential handling.
 fn is_public_path(path: &str) -> bool {
-    // Token UI pages require auth — exclude before wildcard match
+    matches!(
+        path,
+        "/" | "/health" | "/ready" | "/api/tokens" | "/api/tokens/list" | "/api/tokens/revoke"
+    )
+}
+
+/// The browse web surface: UI pages, their JSON API, and the API docs. All
+/// of it enumerates repositories and packages, so under an auth-enabled
+/// deployment it is gated unless `anonymous_read` or `public_web_ui` opens
+/// it (token-management pages stay ALWAYS gated — they were before, too).
+fn is_web_surface(path: &str) -> bool {
     if path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens") {
         return false;
     }
-
-    matches!(
-        path,
-        "/" | "/health"
-            | "/ready"
-            | "/metrics"
-            | "/api/tokens"
-            | "/api/tokens/list"
-            | "/api/tokens/revoke"
-    ) || path.starts_with("/ui")
-        || path.starts_with("/api-docs")
-        || path.starts_with("/api/ui")
+    path.starts_with("/ui") || path.starts_with("/api/ui") || path.starts_with("/api-docs")
 }
 
 /// Check if a path belongs to the Docker/OCI registry (`/v2`, `/v2/…`).
@@ -227,14 +229,42 @@ pub async fn auth_middleware(
     }
 
     // Skip auth for public endpoints
-    if is_public_path(request.uri().path()) {
-        request
-            .extensions_mut()
-            .insert(NamespaceAuthority::Unrestricted);
-        request
-            .extensions_mut()
-            .insert(AuthenticatedUser("anonymous".to_string()));
-        return next.run(request).await;
+    {
+        let path = request.uri().path();
+        // Unconditional publics (probes, token endpoints), plus the web
+        // surface and /metrics when the config opens them. The web surface
+        // enumerates every repository, so it follows `anonymous_read` (the
+        // registry read APIs would expose the same names) or the explicit
+        // `public_web_ui` escape; /metrics has its own default-open switch —
+        // labels carry registry formats, not repository names.
+        let config = &state.config.auth;
+        let open = is_public_path(path)
+            || (is_web_surface(path) && (config.anonymous_read || config.public_web_ui))
+            || (path == "/metrics" && config.public_metrics);
+        if open {
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(NamespaceAuthority::Unrestricted);
+            request
+                .extensions_mut()
+                .insert(AuthenticatedUser("anonymous".to_string()));
+            return next.run(request).await;
+        }
+        // A gated web-surface request without credentials gets a Basic
+        // challenge so browsers prompt instead of rendering a bare 401.
+        if (is_web_surface(path) || path == "/metrics")
+            && request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .is_none()
+        {
+            return axum::http::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .header("WWW-Authenticate", "Basic realm=\"nora\"")
+                .body(axum::body::Body::from("Authentication required"))
+                .expect("valid response");
+        }
     }
 
     let path = request.uri().path();
@@ -545,49 +575,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_public_path() {
-        // Public paths
-        assert!(is_public_path("/"));
-        assert!(is_public_path("/health"));
-        assert!(is_public_path("/ready"));
-        assert!(is_public_path("/metrics"));
-        assert!(is_public_path("/ui"));
-        assert!(is_public_path("/ui/dashboard"));
-        assert!(is_public_path("/api-docs"));
-        assert!(is_public_path("/api-docs/openapi.json"));
-        assert!(is_public_path("/api/ui/stats"));
-        assert!(is_public_path("/api/tokens"));
-        assert!(is_public_path("/api/tokens/list"));
-        assert!(is_public_path("/api/tokens/revoke"));
-
-        // Docker /v2/ is NOT public — requires auth challenge per V2 spec
+    fn test_public_path_classification() {
+        // Unconditional publics: probes + token endpoints only.
+        for p in [
+            "/",
+            "/health",
+            "/ready",
+            "/api/tokens",
+            "/api/tokens/list",
+            "/api/tokens/revoke",
+        ] {
+            assert!(is_public_path(p), "{p}");
+        }
+        // The web surface is NOT unconditionally public any more — it is
+        // config-gated in the middleware (repository enumeration).
+        for p in [
+            "/ui",
+            "/ui/dashboard",
+            "/api-docs",
+            "/api-docs/openapi.json",
+            "/api/ui/stats",
+            "/metrics",
+        ] {
+            assert!(!is_public_path(p), "{p}");
+        }
+        for p in ["/ui", "/ui/rpm", "/api/ui/stats", "/api-docs"] {
+            assert!(is_web_surface(p), "{p}");
+        }
+        // Token pages are part of the always-gated set, not the web surface.
+        assert!(!is_web_surface("/ui/tokens"));
+        assert!(!is_web_surface("/api/ui/tokens"));
+        // Docker /v2/ is neither.
         assert!(!is_public_path("/v2/"));
-        assert!(!is_public_path("/v2"));
-
-        // Token UI pages are NOT public (require auth)
-        assert!(!is_public_path("/ui/tokens"));
-        assert!(!is_public_path("/ui/tokens/"));
-        assert!(!is_public_path("/api/ui/tokens/create"));
-        assert!(!is_public_path("/api/ui/tokens/list"));
-        assert!(!is_public_path("/api/ui/tokens/abc123/revoke"));
-
-        // Protected paths
-        assert!(!is_public_path("/api/tokens/unknown"));
-        assert!(!is_public_path("/api/tokens/admin"));
-        assert!(!is_public_path("/api/tokens/extra/path"));
-        assert!(!is_public_path("/v2/myimage/blobs/sha256:abc"));
-        assert!(!is_public_path("/v2/library/nginx/manifests/latest"));
-        assert!(!is_public_path(
-            "/maven2/com/example/artifact/1.0/artifact.jar"
-        ));
-        assert!(!is_public_path("/npm/lodash"));
+        assert!(!is_web_surface("/v2/"));
     }
 
     #[test]
     fn test_is_public_path_health() {
         assert!(is_public_path("/health"));
         assert!(is_public_path("/ready"));
-        assert!(is_public_path("/metrics"));
+        // /metrics is config-gated now (auth.public_metrics), not unconditional.
+        assert!(!is_public_path("/metrics"));
     }
 
     #[test]
@@ -607,16 +635,19 @@ mod tests {
 
     #[test]
     fn test_is_public_path_ui() {
-        assert!(is_public_path("/ui"));
-        assert!(is_public_path("/ui/dashboard"));
-        assert!(is_public_path("/ui/repos"));
+        // The UI is the config-gated web surface, not unconditionally public.
+        for p in ["/ui", "/ui/dashboard", "/ui/repos"] {
+            assert!(!is_public_path(p), "{p}");
+            assert!(is_web_surface(p), "{p}");
+        }
     }
 
     #[test]
     fn test_is_public_path_api_docs() {
-        assert!(is_public_path("/api-docs"));
-        assert!(is_public_path("/api-docs/openapi.json"));
-        assert!(is_public_path("/api/ui"));
+        for p in ["/api-docs", "/api-docs/openapi.json", "/api/ui"] {
+            assert!(!is_public_path(p), "{p}");
+            assert!(is_web_surface(p), "{p}");
+        }
     }
 
     #[test]
@@ -1966,5 +1997,104 @@ Jd74nq6dNCjpWG4drIsyhqX+
             StatusCode::UNAUTHORIZED,
             "HS256 tokens must be rejected for OIDC"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod web_surface_gating_tests {
+    use crate::test_helpers::{create_test_context_with_auth, send, send_with_headers};
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+
+    fn basic(user: &str, pass: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        )
+    }
+
+    /// With auth on and no anonymous read, the whole web surface requires
+    /// credentials — it enumerates every repository — while probes stay open.
+    #[tokio::test]
+    async fn test_web_surface_gated_when_private() {
+        let ctx = create_test_context_with_auth(&[("alice", "pw")]);
+
+        for p in [
+            "/ui/",
+            "/ui/rpm",
+            "/api/ui/stats",
+            "/api/ui/dashboard",
+            "/api-docs/openapi.json",
+        ] {
+            let resp = send(&ctx.app, Method::GET, p, "").await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{p}");
+            assert!(
+                resp.headers().get("www-authenticate").is_some(),
+                "{p} must challenge so browsers prompt"
+            );
+        }
+        // Probes stay unconditionally open (LB/liveness would break).
+        for p in ["/health", "/ready"] {
+            let resp = send(&ctx.app, Method::GET, p, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{p}");
+        }
+        // /metrics defaults to open for scrapers.
+        let resp = send(&ctx.app, Method::GET, "/metrics", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Valid credentials open the web surface.
+        let cred = basic("alice", "pw");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/api/ui/stats",
+            vec![("authorization", cred.as_str())],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// anonymous_read (which already exposes repo names through the registry
+    /// read APIs) or the explicit public_web_ui switch reopen the surface;
+    /// public_metrics=false closes /metrics.
+    #[tokio::test]
+    async fn test_gating_switches() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.auth.enabled = true;
+            c.auth.anonymous_read = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/ui/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "anonymous_read opens the UI");
+
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.auth.enabled = true;
+            c.auth.public_web_ui = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/api/ui/stats", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "public_web_ui opens the UI");
+
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.auth.enabled = true;
+            c.auth.public_metrics = false;
+        });
+        let resp = send(&ctx.app, Method::GET, "/metrics", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "public_metrics=false gates metrics"
+        );
+    }
+
+    /// Token management pages stay gated even when the web surface is open.
+    #[tokio::test]
+    async fn test_token_pages_stay_gated() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.auth.enabled = true;
+            c.auth.public_web_ui = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/api/ui/tokens", "").await;
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 }
