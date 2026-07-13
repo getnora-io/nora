@@ -40,14 +40,16 @@ use std::io::{Read, Write};
 pub const INDEX_PATTERN: (&str, &str) = ("deb/", ".deb");
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/deb/{repo}/{*path}",
-        get(download)
-            .head(check_exists)
-            .put(upload)
-            .delete(delete_package)
-            .fallback(|| async { method_not_allowed("GET, HEAD, PUT, DELETE") }),
-    )
+    Router::new()
+        .route("/deb/{repo}/-/reindex", axum::routing::post(reindex))
+        .route(
+            "/deb/{repo}/{*path}",
+            get(download)
+                .head(check_exists)
+                .put(upload)
+                .delete(delete_package)
+                .fallback(|| async { method_not_allowed("GET, HEAD, PUT, DELETE") }),
+        )
 }
 
 /// Sidecar prefix inside a repo. Rejected as an upload path component, so it
@@ -370,18 +372,23 @@ fn generate_release(packages: &[u8], packages_gz: &[u8], repo: &str) -> String {
 /// Indexes have fixed names (flat apt repos have no by-hash), so a client that
 /// fetched Release mid-regeneration can see a hash mismatch on Packages; apt
 /// reports it and succeeds on retry — same window as reprepro/aptly.
-async fn regenerate_indexes(state: &AppState, repo: &str) -> Result<(), String> {
+/// AppState-free so callers outside the request path (reindex, and later
+/// retention / key-rotation sweeps) can rebuild a repo with just storage and
+/// the signer.
+pub(crate) async fn regenerate_indexes(
+    storage: &crate::Storage,
+    signer: Option<&crate::signing::RepoSigner>,
+    repo: &str,
+) -> Result<(), String> {
     let meta_prefix = format!("deb/{repo}/{META_DIR}/");
-    let keys = state
-        .storage
+    let keys = storage
         .list(&meta_prefix)
         .await
         .map_err(|e| format!("list sidecars: {e}"))?;
 
     let mut pkgs = Vec::with_capacity(keys.len());
     for key in &keys {
-        let data = state
-            .storage
+        let data = storage
             .get(key)
             .await
             .map_err(|e| format!("read sidecar {key}: {e}"))?;
@@ -419,7 +426,7 @@ async fn regenerate_indexes(state: &AppState, repo: &str) -> Result<(), String> 
         ("Packages.gz", packages_gz),
         ("Release", release.clone().into_bytes()),
     ];
-    match &state.signer {
+    match signer {
         Some(signer) => {
             files.push(("InRelease", signer.clearsign(&release)?.into_bytes()));
             files.push((
@@ -432,9 +439,8 @@ async fn regenerate_indexes(state: &AppState, repo: &str) -> Result<(), String> 
             // no longer match Release would hard-fail apt's verification.
             for name in ["InRelease", "Release.gpg"] {
                 let key = format!("deb/{repo}/{name}");
-                if state.storage.stat(&key).await.is_some() {
-                    state
-                        .storage
+                if storage.stat(&key).await.is_some() {
+                    storage
                         .delete(&key)
                         .await
                         .map_err(|e| format!("delete stale {name}: {e}"))?;
@@ -443,8 +449,7 @@ async fn regenerate_indexes(state: &AppState, repo: &str) -> Result<(), String> 
         }
     }
     for (name, data) in files {
-        state
-            .storage
+        storage
             .put(&format!("deb/{repo}/{name}"), &data)
             .await
             .map_err(|e| format!("write {name}: {e}"))?;
@@ -520,7 +525,7 @@ async fn upload(
         tracing::error!(error = %e, key = %key, "deb: failed to store metadata sidecar");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if let Err(e) = regenerate_indexes(&state, &repo).await {
+    if let Err(e) = regenerate_indexes(&state.storage, state.signer.as_deref(), &repo).await {
         tracing::error!(repo = %repo, error = %e, "deb: index regeneration failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -664,7 +669,7 @@ async fn delete_package(
     if let Err(e) = state.storage.delete(&sidecar_key(&repo, &path)).await {
         tracing::warn!(error = %e, key = %key, "deb: failed to delete metadata sidecar");
     }
-    if let Err(e) = regenerate_indexes(&state, &repo).await {
+    if let Err(e) = regenerate_indexes(&state.storage, state.signer.as_deref(), &repo).await {
         tracing::error!(repo = %repo, error = %e, "deb: index regeneration failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -678,6 +683,121 @@ async fn delete_package(
         .log(AuditEntry::new("delete", "api", &path, "deb", ""));
     state.repo_index.invalidate("deb");
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Reconcile a repository with what is actually in storage, then rebuild
+/// (and re-sign) its indexes — the deb counterpart of the rpm reindex; see
+/// that handler for the contract. Runs under the repo publish lock.
+async fn reindex(
+    State(state): State<AppState>,
+    Path(repo): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+) -> Response {
+    if !state.config.deb.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
+        return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    }
+    if enforce_namespace_scope(&authority, &repo).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let lock = state.publish_lock(&release_key(&repo));
+    let _guard = lock.lock().await;
+
+    let prefix = format!("deb/{repo}/");
+    let keys = match state.storage.list(&prefix).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, repo = %repo, "deb reindex: list failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if keys.is_empty() {
+        return (StatusCode::NOT_FOUND, "No such repository").into_response();
+    }
+
+    let meta_prefix = format!("deb/{repo}/{META_DIR}/");
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&meta_prefix) {
+            if let Some(pkg) = rest.strip_suffix(".json") {
+                sidecars.insert(pkg.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.to_ascii_lowercase().ends_with(".deb") {
+                packages.insert(rest.to_string());
+            }
+        }
+    }
+
+    let mut orphans_removed = 0usize;
+    for stale in sidecars.difference(&packages) {
+        match state.storage.delete(&sidecar_key(&repo, stale)).await {
+            Ok(()) => orphans_removed += 1,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %stale, "deb reindex: orphan sidecar delete failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+
+    let mut sidecars_created = 0usize;
+    for missing in packages.difference(&sidecars) {
+        let body = match state.storage.get(&package_key(&repo, missing)).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: package read failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let record = match extract_record(&body, missing) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: not a valid deb — refusing to index");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{missing} is not a valid deb: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        let json = match serde_json::to_vec(&record) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "deb reindex: sidecar serialize failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if let Err(e) = state.storage.put(&sidecar_key(&repo, missing), &json).await {
+            tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: sidecar write failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        sidecars_created += 1;
+    }
+
+    if let Err(e) = regenerate_indexes(&state.storage, state.signer.as_deref(), &repo).await {
+        tracing::error!(repo = %repo, error = %e, "deb reindex: index regeneration failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    state
+        .audit
+        .log(AuditEntry::new("reindex", "api", &repo, "deb", ""));
+    state.repo_index.invalidate("deb");
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "packages": packages.len(),
+            "sidecars_created": sidecars_created,
+            "orphans_removed": orphans_removed,
+            "signed": state.signer.is_some(),
+        })),
+    )
+        .into_response()
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -1286,5 +1406,104 @@ mod signing_tests {
             let resp = send(&ctx.app, Method::GET, &format!("/deb/myrepo/{name}"), "").await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reindex_tests {
+    use super::integration_tests::build_test_deb_with;
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn packages_index(ctx: &crate::test_helpers::TestContext) -> String {
+        String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, "/deb/myrepo/Packages", "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// Out-of-band delete → orphan sidecar dropped, indexes re-signed and no
+    /// longer advertising the ghost; out-of-band add → adopted and served.
+    #[tokio::test]
+    async fn test_deb_reindex_heals_both_directions() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/aaa.deb",
+            build_test_deb_with("aaa", "1.0", "gz"),
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/bbb.deb",
+            build_test_deb_with("bbb", "1.0", "gz"),
+        )
+        .await;
+
+        ctx.state
+            .storage
+            .delete("deb/myrepo/pool/aaa.deb")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "deb/myrepo/pool/ccc.deb",
+                &build_test_deb_with("ccc", "2.0", "zst"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            packages_index(&ctx).await.contains("Package: aaa"),
+            "stale before reindex"
+        );
+
+        let resp = send(&ctx.app, Method::POST, "/deb/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["packages"], 2);
+        assert_eq!(body["orphans_removed"], 1);
+        assert_eq!(body["sidecars_created"], 1);
+
+        let p = packages_index(&ctx).await;
+        assert!(!p.contains("Package: aaa"), "deleted package must vanish");
+        assert!(p.contains("Package: bbb"));
+        assert!(p.contains("Package: ccc"), "adopted package must be served");
+
+        let inrelease = send(&ctx.app, Method::GET, "/deb/myrepo/InRelease", "").await;
+        assert_eq!(inrelease.status(), StatusCode::OK, "signature regenerated");
+    }
+
+    /// A crafted control that would corrupt the index fails the reindex
+    /// loudly — same validation as the upload path.
+    #[tokio::test]
+    async fn test_deb_reindex_rejects_invalid_package() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/aaa.deb",
+            build_test_deb_with("aaa", "1.0", "gz"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put("deb/myrepo/pool/junk.deb", b"not a deb")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/deb/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_deb_reindex_unknown_repo_404s() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::POST, "/deb/nosuch/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
