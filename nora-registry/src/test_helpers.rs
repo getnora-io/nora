@@ -40,6 +40,9 @@ pub struct TestContext {
     pub state: AppState,
     pub app: Router,
     pub _tempdir: TempDir,
+    /// Holds the signing key outside the storage root, so storage-size
+    /// assertions see only artifact bytes.
+    pub _signing_dir: TempDir,
 }
 
 /// Build a test context with auth **disabled** and all proxies off.
@@ -197,6 +200,7 @@ fn build_context(
         tls: crate::config::TlsConfig::default(),
         audit: crate::config::AuditConfig::default(),
         registries: None,
+        signing: crate::config::SigningConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -259,6 +263,15 @@ fn build_context(
     let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
 
     let enabled_registries = Arc::new(enabled_registries);
+    let signing_dir = TempDir::new().expect("signing tempdir");
+    let signer = if config.signing.enabled {
+        Some(Arc::new(
+            crate::signing::RepoSigner::load_or_generate(&signing_dir.path().join("signing.key"))
+                .expect("test signing key"),
+        ))
+    } else {
+        None
+    };
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -283,6 +296,7 @@ fn build_context(
         )),
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
+        signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -367,6 +381,7 @@ fn build_context(
         state,
         app,
         _tempdir: tempdir,
+        _signing_dir: signing_dir,
     }
 }
 

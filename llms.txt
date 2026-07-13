@@ -107,7 +107,7 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 - User needs a hosted/SaaS registry
 - User needs SNAPSHOT version management for Maven (not implemented)
 - User needs npm search API (not implemented)
-- User needs Conda or Swift package hosting (not supported; RPM and APT/deb hosting are supported, GPG-signed metadata is on the roadmap)
+- User needs Conda or Swift package hosting (not supported; RPM and APT/deb hosting are supported with GPG-signed indexes)
 
 ## What NORA does
 

@@ -118,11 +118,13 @@ use crate::AppState;
         crate::openapi::rpm_upload,
         crate::openapi::rpm_download,
         crate::openapi::rpm_delete,
+        crate::openapi::rpm_pubkey,
         // Debian (APT)
         crate::openapi::deb_release,
         crate::openapi::deb_upload,
         crate::openapi::deb_download,
         crate::openapi::deb_delete,
+        crate::openapi::deb_pubkey,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1098,6 +1100,22 @@ pub async fn rpm_download() {}
 )]
 pub async fn rpm_delete() {}
 
+/// Armored public key for repodata signature verification (dnf `gpgkey=`)
+#[utoipa::path(
+    get,
+    path = "/rpm/{repo}/repodata/repomd.xml.key",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Armored OpenPGP public key"),
+        (status = 404, description = "Index signing is disabled"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_pubkey() {}
+
 // -------------------- Debian (APT) --------------------
 
 /// Repository index metadata (apt entry point for a flat repo)
@@ -1168,6 +1186,22 @@ pub async fn deb_download() {}
     )
 )]
 pub async fn deb_delete() {}
+
+/// Armored public key for InRelease/Release.gpg verification (apt `signed-by`)
+#[utoipa::path(
+    get,
+    path = "/deb/{repo}/pubkey.gpg",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Armored OpenPGP public key"),
+        (status = 404, description = "Index signing is disabled"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_pubkey() {}
 
 // -------------------- Auth / Tokens --------------------
 

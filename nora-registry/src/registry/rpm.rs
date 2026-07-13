@@ -637,6 +637,36 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         .await
         .map_err(|e| format!("write repomd.xml: {e}"))?;
 
+    // Signature written AFTER repomd.xml so a reader never sees a signature
+    // for bytes that are not there yet. The converse window exists — a reader
+    // between the two puts sees new repomd with the previous signature — and
+    // resolves on client retry, same transient class as the hashed-blob
+    // window above. Fail-closed like the rest of the rebuild: a repo that
+    // claims to be signed must never publish an unsigned or stale-signed
+    // repomd (#128).
+    let asc_key = format!("{}.asc", repomd_key(repo));
+    match &state.signer {
+        Some(signer) => {
+            let asc = signer.sign_detached(repomd.as_bytes())?;
+            state
+                .storage
+                .put(&asc_key, asc.as_bytes())
+                .await
+                .map_err(|e| format!("write repomd.xml.asc: {e}"))?;
+        }
+        None => {
+            // Signing turned off after having been on: a stale signature that
+            // no longer matches repomd.xml would hard-fail repo_gpgcheck.
+            if state.storage.stat(&asc_key).await.is_some() {
+                state
+                    .storage
+                    .delete(&asc_key)
+                    .await
+                    .map_err(|e| format!("delete stale repomd.xml.asc: {e}"))?;
+            }
+        }
+    }
+
     // Drop repodata generations no longer referenced by repomd.xml. A client
     // that fetched the old repomd in the regeneration window gets a 404 on the
     // old blobs and re-fetches repomd — dnf handles this (same behaviour as
@@ -647,7 +677,10 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         .collect();
     if let Ok(existing) = state.storage.list(&format!("rpm/{repo}/{REPODATA}/")).await {
         for key in existing {
-            if key.ends_with("repomd.xml") || current.contains(&key) {
+            if key.ends_with("repomd.xml")
+                || key.ends_with("repomd.xml.asc")
+                || current.contains(&key)
+            {
                 continue;
             }
             if let Err(e) = state.storage.delete(&key).await {
@@ -780,6 +813,17 @@ async fn download(
 ) -> Response {
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if path == format!("{REPODATA}/repomd.xml.key") {
+        return match &state.signer {
+            Some(signer) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/pgp-keys")],
+                signer.public_key_armored().to_string(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
     }
     let key = package_key(&repo, &path);
     if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
@@ -1275,7 +1319,8 @@ mod integration_tests {
             .list(&format!("rpm/myrepo/{REPODATA}/"))
             .await
             .unwrap();
-        assert_eq!(keys.len(), 4, "stale repodata not pruned: {keys:?}");
+        // repomd.xml + .asc + 3 current hashed files.
+        assert_eq!(keys.len(), 5, "stale repodata not pruned: {keys:?}");
 
         // New primary covers both packages, sorted by name.
         let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await;
@@ -1417,6 +1462,157 @@ mod integration_tests {
         let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = send(&ctx.app, Method::PUT, "/rpm/myrepo/x.rpm", b"x".to_vec()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod signing_tests {
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
+    use axum::http::{Method, StatusCode};
+    use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
+
+    fn build_rpm() -> Vec<u8> {
+        let pkg = rpm::PackageBuilder::new("sig", "1.0", "MIT", "x86_64", "sig test")
+            .release("1")
+            .build()
+            .unwrap();
+        let mut buf = Vec::new();
+        pkg.write(&mut buf).unwrap();
+        buf
+    }
+
+    /// repomd.xml.asc must cryptographically verify against the served
+    /// public key over the served repomd.xml bytes (#128).
+    #[tokio::test]
+    async fn test_rpm_repomd_signature_verifies() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/rpm/myrepo/sig.rpm", build_rpm()).await;
+
+        let repomd =
+            body_bytes(send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await)
+                .await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/repodata/repomd.xml.asc",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let asc = body_bytes(resp).await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/repodata/repomd.xml.key",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/pgp-keys"
+        );
+        let key = body_bytes(resp).await;
+
+        let (public, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
+        let (sig, _) =
+            DetachedSignature::from_armor_single(std::io::Cursor::new(&asc[..])).unwrap();
+        sig.verify(&public, &repomd[..]).unwrap();
+    }
+
+    /// Signature stays consistent across regenerations: after a second
+    /// publish the new .asc verifies the new repomd (never the old one).
+    #[tokio::test]
+    async fn test_rpm_signature_tracks_regeneration() {
+        let ctx = create_test_context();
+        send(&ctx.app, Method::PUT, "/rpm/myrepo/a.rpm", build_rpm()).await;
+        let asc_v1 = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/rpm/myrepo/repodata/repomd.xml.asc",
+                "",
+            )
+            .await,
+        )
+        .await;
+
+        send(&ctx.app, Method::PUT, "/rpm/myrepo/b.rpm", build_rpm()).await;
+        let repomd =
+            body_bytes(send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await)
+                .await;
+        let asc_v2 = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/rpm/myrepo/repodata/repomd.xml.asc",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(asc_v1, asc_v2);
+
+        let key = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/rpm/myrepo/repodata/repomd.xml.key",
+                "",
+            )
+            .await,
+        )
+        .await;
+        let (public, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
+        let (sig, _) =
+            DetachedSignature::from_armor_single(std::io::Cursor::new(&asc_v2[..])).unwrap();
+        sig.verify(&public, &repomd[..]).unwrap();
+    }
+
+    /// Unsigned mode: no signature or key endpoints, and a stale .asc left
+    /// over from a previously-signed deployment is removed on regeneration.
+    #[tokio::test]
+    async fn test_rpm_unsigned_mode_removes_stale_signature() {
+        let ctx = create_test_context_with_config(|c| c.signing.enabled = false);
+        ctx.state
+            .storage
+            .put("rpm/myrepo/repodata/repomd.xml.asc", b"stale signature")
+            .await
+            .unwrap();
+
+        send(&ctx.app, Method::PUT, "/rpm/myrepo/sig.rpm", build_rpm()).await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/repodata/repomd.xml.asc",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "stale .asc must be pruned"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/repodata/repomd.xml.key",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

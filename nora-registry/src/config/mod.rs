@@ -17,10 +17,12 @@ mod registries;
 pub mod registry;
 mod retention;
 mod server;
+mod signing_cfg;
 mod storage;
 
 // Infrastructure configs
 pub use self::audit_cfg::AuditConfig;
+pub use self::signing_cfg::SigningConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
 #[allow(unused_imports)]
 pub use self::auth::{
@@ -152,6 +154,8 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub signing: SigningConfig,
     /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
     #[serde(default)]
     pub registries: Option<RegistriesSection>,
@@ -969,6 +973,7 @@ impl Config {
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
+        self.signing.apply_env_overrides();
         self.gc.apply_env_overrides();
         self.retention.apply_env_overrides();
 
@@ -1588,6 +1593,7 @@ mod tests {
         assert_serde_default_eq_default::<ConanConfig>("conan");
         assert_serde_default_eq_default::<RpmConfig>("rpm");
         assert_serde_default_eq_default::<DebConfig>("deb");
+        assert_serde_default_eq_default::<SigningConfig>("signing");
 
         // Whole-Config fallback agrees with deserializing an empty file.
         let from_empty_cfg: Config = toml::from_str("").unwrap();

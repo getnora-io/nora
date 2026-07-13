@@ -42,8 +42,8 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 | NuGet | `/nuget/` | api.nuget.org | ✓ |
 | Pub (Dart/Flutter) | `/pub/` | pub.dev | ✓ |
 | Conan (C/C++) | `/conan/` | ConanCenter | ✓ |
-| RPM (yum/dnf) | `/rpm/` | — (hosted, unsigned) | ✓ |
-| Debian/APT | `/deb/` | — (hosted, unsigned) | ✓ |
+| RPM (yum/dnf) | `/rpm/` | — (hosted, GPG-signed) | ✓ |
+| Debian/APT | `/deb/` | — (hosted, GPG-signed) | ✓ |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
 

@@ -196,6 +196,7 @@ nora/
 │   │   └── logo.jpg         #   UI logo asset
 │   │
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
+│   ├── signing.rs           # rpm/deb index signing (OpenPGP key + InRelease/repomd.xml.asc)
 │   ├── secrets/             # Secret value handling (env vars, redaction)
 │   ├── request_id.rs        # X-Request-Id middleware
 │   ├── repo_index.rs        # In-memory repository index
