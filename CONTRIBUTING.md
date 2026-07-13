@@ -79,7 +79,7 @@ curl http://localhost:4000/health
 # Build release binary first
 cargo build --release
 
-# Run full smoke suite (starts NORA, tests all 7 protocols, stops)
+# Run full smoke suite (starts NORA, tests all 15 protocols, stops)
 bash tests/smoke.sh
 ```
 
@@ -102,6 +102,14 @@ cargo test --lib --bin nora
 ```
 
 All three must pass. CI will enforce this.
+
+**Sign your commits.** `main` requires **verified GPG-signed commits** — an unsigned commit cannot be merged and a maintainer has to re-sign (reland) it by hand, which delays your PR. Configure signing once:
+
+```bash
+git config commit.gpgsign true   # or per-commit: git commit -S
+```
+
+See [GitHub's guide to signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). The commit email must match a verified key on your GitHub account, or the commit shows as *Unverified*.
 
 ## Code Style
 

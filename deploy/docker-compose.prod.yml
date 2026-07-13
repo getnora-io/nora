@@ -1,14 +1,14 @@
 # Production Docker Compose for NORA Registry
-# Usage: NORA_VERSION=0.9.0 docker compose -f deploy/docker-compose.prod.yml up -d
+# Usage: NORA_VERSION=1.0.0 docker compose -f deploy/docker-compose.prod.yml up -d
 #
 # Required env vars (set in .env or shell):
-#   NORA_VERSION        — image tag (default: 0.9.0)
+#   NORA_VERSION        — image tag (default: 1.0.0)
 #   NORA_PUBLIC_URL     — external URL for download links
 #   NORA_AUTH_ENABLED   — enable authentication (default: true)
 
 services:
   nora:
-    image: ghcr.io/getnora-io/nora:${NORA_VERSION:-0.9.0}
+    image: ghcr.io/getnora-io/nora:${NORA_VERSION:-1.0.0}
     restart: unless-stopped
     read_only: true
     tmpfs:

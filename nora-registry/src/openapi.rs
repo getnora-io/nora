@@ -21,7 +21,7 @@ use crate::AppState;
 #[openapi(
     info(
         title = "Nora",
-        version = "0.9.7",
+        version = "1.0.0",
         description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, RPM, and Debian",
         license(name = "MIT"),
         contact(name = "The NORA Authors", url = "https://getnora.dev")
