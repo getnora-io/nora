@@ -1,6 +1,8 @@
 # Changelog
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-13
+
 ### Security
 - **The browse web UI is now gated on a private deployment.** With auth enabled and `anonymous_read` off, the UI, its JSON API (`/ui`, `/api/ui`), and the API docs (`/api-docs`) were served without authentication — enumerating every repository and package a private registry exists to hide. They now require credentials unless `anonymous_read` (which already exposes the same names through the registry read APIs) or the new `auth.public_web_ui` (`NORA_AUTH_PUBLIC_WEB_UI`, default false) opens them; an unauthenticated request gets a Basic challenge so browsers prompt. Health/readiness probes stay unconditionally public. `/metrics` gets its own `auth.public_metrics` (`NORA_AUTH_PUBLIC_METRICS`, default **true** — scrapers rarely carry credentials and labels name registry formats, not repositories); set it false to gate metrics too. **Behavior change:** operators who relied on an anonymous web UI while keeping the registry APIs authenticated must set `public_web_ui = true` (or enable `anonymous_read`).
 
