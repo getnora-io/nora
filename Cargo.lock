@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "0.9.7"
+version = "1.0.0-rc1"
 dependencies = [
  "ar",
  "arc-swap",
