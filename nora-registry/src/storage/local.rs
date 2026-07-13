@@ -242,7 +242,7 @@ impl StorageBackend for LocalStorage {
     async fn total_size(&self) -> u64 {
         let base = self.base_path.clone();
         tokio::task::spawn_blocking(move || {
-            fn dir_size(path: &std::path::Path) -> u64 {
+            fn dir_size(path: &std::path::Path, is_root: bool) -> u64 {
                 let mut total = 0u64;
                 if let Ok(entries) = std::fs::read_dir(path) {
                     for entry in entries.flatten() {
@@ -250,13 +250,19 @@ impl StorageBackend for LocalStorage {
                         if path.is_file() {
                             total += entry.metadata().map(|m| m.len()).unwrap_or(0);
                         } else if path.is_dir() {
-                            total += dir_size(&path);
+                            // `<root>/tmp/` holds in-flight streamed uploads —
+                            // transient staging, not stored artifacts; counting
+                            // it makes the storage gauge sawtooth during pushes.
+                            if is_root && path.file_name().is_some_and(|n| n == "tmp") {
+                                continue;
+                            }
+                            total += dir_size(&path, false);
                         }
                     }
                 }
                 total
             }
-            dir_size(&base)
+            dir_size(&base, true)
         })
         .await
         .unwrap_or(0)

@@ -404,6 +404,13 @@ pub(crate) async fn stream_body_to_file(
     if let Err(e) = file.flush().await {
         return StreamOutcome::Io(e);
     }
+    // Durability: put_from_path's direct-rename commit relies on the caller
+    // having fsync'd the source — without this, a power loss just after the
+    // rename can leave the key's directory entry pointing at data that never
+    // reached disk (latent for docker since the switch to streaming; #846).
+    if let Err(e) = file.sync_all().await {
+        return StreamOutcome::Io(e);
+    }
     // Postcondition: a successful stream never exceeds the budget — the loop
     // returns TooLarge before writing any frame that would cross it.
     debug_assert!(
