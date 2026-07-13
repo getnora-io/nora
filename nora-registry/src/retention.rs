@@ -245,6 +245,163 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     result
 }
 
+/// Collect rpm package versions per repository from the metadata sidecars
+/// (never the .rpm payloads). Group = `rpm:{repo}/{package-name}`; each
+/// version's keys are the package file and its sidecar. Deleting a version
+/// therefore requires the post-delete index regeneration in `run_retention`.
+async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    collect_sidecar_versions(storage, "rpm", |v| {
+        let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        SidecarVersion {
+            package: s("name"),
+            version: format!("{}-{}.{}", s("version"), s("release"), s("arch")),
+            href: s("href"),
+            size: v.get("size_package").and_then(|x| x.as_u64()).unwrap_or(0),
+            modified: v.get("file_time").and_then(|x| x.as_u64()),
+        }
+    })
+    .await
+}
+
+/// Collect deb package versions per repository — deb counterpart of
+/// [`collect_rpm_versions`], same group/keys/regeneration contract.
+async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    collect_sidecar_versions(storage, "deb", |v| {
+        let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        SidecarVersion {
+            package: s("package"),
+            version: format!("{}_{}", s("version"), s("arch")),
+            href: s("filename"),
+            size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+            modified: None, // deb sidecars carry no upload time; use sidecar mtime
+        }
+    })
+    .await
+}
+
+struct SidecarVersion {
+    package: String,
+    version: String,
+    href: String,
+    size: u64,
+    modified: Option<u64>,
+}
+
+async fn collect_sidecar_versions(
+    storage: &Storage,
+    registry: &str,
+    parse: impl Fn(&serde_json::Value) -> SidecarVersion,
+) -> Vec<(String, Vec<VersionEntry>)> {
+    let all_keys = storage
+        .list(&format!("{registry}/"))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to list {registry}/ keys: {}", e);
+            Vec::new()
+        });
+
+    let mut groups: std::collections::HashMap<String, Vec<VersionEntry>> =
+        std::collections::HashMap::new();
+    for key in &all_keys {
+        // {registry}/{repo}/.nora-meta/{path}.json
+        let Some(rest) = key.strip_prefix(&format!("{registry}/")) else {
+            continue;
+        };
+        let Some((repo, meta_rest)) = rest.split_once("/.nora-meta/") else {
+            continue;
+        };
+        let Some(pkg_path) = meta_rest.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(data) = storage.get(key).await else {
+            tracing::warn!(key = %key, "retention: sidecar unreadable — version skipped (kept)");
+            continue;
+        };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            tracing::warn!(key = %key, "retention: sidecar unparsable — version skipped (kept)");
+            continue;
+        };
+        let sv = parse(&json);
+        if sv.package.is_empty() || sv.href != pkg_path {
+            // href/path divergence means the sidecar does not describe this
+            // package file — leave it for `-/reindex` to reconcile.
+            tracing::warn!(key = %key, "retention: sidecar/package mismatch — version skipped (kept)");
+            continue;
+        }
+        let package_key = format!("{registry}/{repo}/{pkg_path}");
+        let modified = match sv.modified {
+            Some(m) => m,
+            None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
+        };
+        groups
+            .entry(format!("{registry}:{repo}/{}", sv.package))
+            .or_default()
+            .push(VersionEntry {
+                name: sv.version,
+                keys: vec![package_key, key.clone()],
+                modified,
+                size: sv.size,
+            });
+    }
+    groups.into_iter().collect()
+}
+
+/// Collect raw "versions" as depth-2 path prefixes: `raw/{top}/{version}/…`
+/// groups under `raw:{top}` with every key below the prefix belonging to the
+/// version — a directory of related files ages out as one unit. A file
+/// directly under `raw/{top}/` is its own single-key version. Keys at the
+/// root of `raw/` have no grouping and are never collected (never deleted).
+async fn collect_raw_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    let keys = match storage.list_with_meta("raw/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("Failed to list raw/ keys: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // group -> version -> (keys, max_mtime, total_size)
+    let mut groups: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, (Vec<String>, u64, u64)>,
+    > = std::collections::HashMap::new();
+    for (key, meta) in &keys {
+        let Some(rest) = key.strip_prefix("raw/") else {
+            continue;
+        };
+        let mut segs = rest.splitn(3, '/');
+        let (Some(top), Some(second)) = (segs.next(), segs.next()) else {
+            continue; // file at raw/ root: ungrouped, never collected
+        };
+        let entry = groups
+            .entry(format!("raw:{top}"))
+            .or_default()
+            .entry(second.to_string())
+            .or_insert((Vec::new(), 0, 0));
+        entry.0.push(key.clone());
+        entry.1 = entry.1.max(meta.modified);
+        entry.2 += meta.size;
+    }
+
+    groups
+        .into_iter()
+        .map(|(group, versions)| {
+            (
+                group,
+                versions
+                    .into_iter()
+                    .map(|(name, (keys, modified, size))| VersionEntry {
+                        name,
+                        keys,
+                        modified,
+                        size,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// Collect Docker tags for each repository.
 async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     let all_keys = storage.list("docker/").await.unwrap_or_else(|e| {
@@ -530,6 +687,7 @@ pub struct RetentionResult {
 pub async fn run_retention(
     storage: &Storage,
     publish_locks: &PublishLocks,
+    signer: Option<&crate::signing::RepoSigner>,
     rules: &[RetentionRule],
     dry_run: bool,
 ) -> RetentionResult {
@@ -547,11 +705,18 @@ pub async fn run_retention(
     all_groups.extend(collect_pypi_versions(storage).await);
     all_groups.extend(collect_cargo_versions(storage).await);
     all_groups.extend(collect_go_versions(storage).await);
+    all_groups.extend(collect_rpm_versions(storage).await);
+    all_groups.extend(collect_deb_versions(storage).await);
+    all_groups.extend(collect_raw_versions(storage).await);
 
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
     let mut total_deleted_keys = 0usize;
     let mut total_bytes = 0u64;
+    // rpm/deb repos whose packages were deleted — their indexes must be
+    // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
+    let mut regen: std::collections::BTreeSet<(&'static str, String)> =
+        std::collections::BTreeSet::new();
 
     for (group_name, versions) in all_groups {
         // Find matching rule for this group
@@ -569,6 +734,21 @@ pub async fn run_retention(
         total_planned += plans.len();
 
         if !dry_run {
+            if let Some(repo) = group_name
+                .strip_prefix("rpm:")
+                .map(|n| ("rpm", n))
+                .or_else(|| group_name.strip_prefix("deb:").map(|n| ("deb", n)))
+                .and_then(|(fmt, n)| n.split('/').next().map(|r| (fmt, r.to_string())))
+            {
+                regen.insert((
+                    if group_name.starts_with("rpm:") {
+                        "rpm"
+                    } else {
+                        "deb"
+                    },
+                    repo.1,
+                ));
+            }
             for plan in &plans {
                 for key in &plan.keys {
                     // Serialize with concurrent publish to prevent deleting
@@ -601,6 +781,28 @@ pub async fn run_retention(
         }
 
         all_plans.push((group_name, plans));
+    }
+
+    // Rebuild + re-sign the indexes of every rpm/deb repo retention touched,
+    // under the same per-repo publish lock the handlers use. Fail-open per
+    // repo: a failed rebuild logs loudly and the next publish/reindex heals
+    // it; the deletions themselves are already durable.
+    for (fmt, repo) in &regen {
+        let lock_key = match *fmt {
+            "rpm" => format!("rpm/{repo}/repodata/repomd.xml"),
+            _ => format!("deb/{repo}/Release"),
+        };
+        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+        let _guard = lock.lock().await;
+        let result = match *fmt {
+            "rpm" => crate::registry::rpm::regenerate_repodata(storage, signer, repo).await,
+            _ => crate::registry::deb::regenerate_indexes(storage, signer, repo).await,
+        };
+        if let Err(e) = result {
+            tracing::error!(registry = %fmt, repo = %repo, error = %e, "retention: index regeneration failed — run -/reindex to heal");
+        } else {
+            info!(registry = %fmt, repo = %repo, "retention: indexes regenerated");
+        }
     }
 
     let duration = start.elapsed().as_secs_f64();
@@ -638,12 +840,18 @@ pub async fn run_retention(
 fn find_matching_rule<'a>(
     rules: &'a [RetentionRule],
     registry: &str,
-    _group_name: &str,
+    group_name: &str,
 ) -> Option<&'a RetentionRule> {
-    // Simple matching: rule.registry must match (or be "*")
-    rules
-        .iter()
-        .find(|r| r.registry == registry || r.registry == "*")
+    // First rule whose registry matches (or "*") AND whose name_glob (if any)
+    // matches the group's name within the registry.
+    let name = group_name
+        .split_once(':')
+        .map(|(_, n)| n)
+        .unwrap_or(group_name);
+    rules.iter().find(|r| {
+        (r.registry == registry || r.registry == "*")
+            && r.name_glob.as_deref().is_none_or(|g| glob_match(g, name))
+    })
 }
 
 // ============================================================================
@@ -657,6 +865,7 @@ fn find_matching_rule<'a>(
 pub fn spawn_retention_scheduler(
     storage: Storage,
     publish_locks: PublishLocks,
+    signer: Option<Arc<crate::signing::RepoSigner>>,
     rules: Vec<RetentionRule>,
     interval_secs: u64,
     dry_run: bool,
@@ -696,7 +905,8 @@ pub fn spawn_retention_scheduler(
                 dry_run = dry_run,
                 "Retention scheduler: starting periodic run"
             );
-            let result = run_retention(&storage, &publish_locks, &rules, dry_run).await;
+            let result =
+                run_retention(&storage, &publish_locks, signer.as_deref(), &rules, dry_run).await;
             info!(
                 "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                 result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
@@ -742,6 +952,7 @@ mod tests {
     ) -> RetentionRule {
         RetentionRule {
             registry: "*".to_string(),
+            name_glob: None,
             keep_last,
             older_than_days,
             exclude_tags: exclude_tags.into_iter().map(String::from).collect(),
@@ -915,12 +1126,13 @@ mod tests {
 
         let rules = vec![RetentionRule {
             registry: "maven".to_string(),
+            name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
         assert_eq!(result.planned, 2); // 1.0 and 2.0 deleted, 3.0 kept
         assert!(storage
             .get("maven/com/example/lib/3.0/lib-3.0.jar")
@@ -944,12 +1156,13 @@ mod tests {
 
         let rules = vec![RetentionRule {
             registry: "maven".to_string(),
+            name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &test_publish_locks(), &rules, true).await;
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
         assert_eq!(result.planned, 1);
         assert_eq!(result.deleted_keys, 0); // dry run
                                             // Both still exist
@@ -970,12 +1183,13 @@ mod tests {
         // Rule for docker, not maven
         let rules = vec![RetentionRule {
             registry: "docker".to_string(),
+            name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
         assert_eq!(result.planned, 0);
     }
 
@@ -995,12 +1209,13 @@ mod tests {
 
         let rules = vec![RetentionRule {
             registry: "*".to_string(),
+            name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
         assert!(result.planned >= 1); // at least 1.0 deleted
     }
 
@@ -1033,12 +1248,13 @@ mod tests {
 
         let rules = vec![RetentionRule {
             registry: "go".to_string(),
+            name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
             exclude_tags: vec![],
         }];
 
-        let result = run_retention(&storage, &test_publish_locks(), &rules, false).await;
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
         assert_eq!(result.planned, 2); // v1.0.0 and v2.0.0 deleted
         assert_eq!(result.deleted_keys, 6); // 3 files per version * 2
                                             // v3.0.0 kept (newest by name tiebreaker)
@@ -1051,5 +1267,263 @@ mod tests {
             .get("go/github.com/user/repo/@v/v1.0.0.zip")
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod format_retention_tests {
+    use super::*;
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    fn rule(
+        registry: &str,
+        glob: Option<&str>,
+        keep: Option<u32>,
+        days: Option<u32>,
+    ) -> RetentionRule {
+        RetentionRule {
+            registry: registry.into(),
+            name_glob: glob.map(String::from),
+            keep_last: keep,
+            older_than_days: days,
+            exclude_tags: vec![],
+        }
+    }
+
+    #[test]
+    fn test_name_glob_targets_specific_repos() {
+        // Specific-first: dev repos age out, stream repos keep a window,
+        // anything unmatched (release repos) is untouched.
+        let rules = vec![
+            rule("rpm", Some("*-dev-*/*"), None, Some(7)),
+            rule("rpm", Some("*-stream-*/*"), Some(25), None),
+        ];
+        assert_eq!(
+            find_matching_rule(&rules, "rpm", "rpm:app-dev-x1/pkg").map(|r| r.older_than_days),
+            Some(Some(7))
+        );
+        assert_eq!(
+            find_matching_rule(&rules, "rpm", "rpm:app-stream-x/pkg").map(|r| r.keep_last),
+            Some(Some(25))
+        );
+        assert!(
+            find_matching_rule(&rules, "rpm", "rpm:app-release/pkg").is_none(),
+            "no rule = keep forever"
+        );
+    }
+
+    fn build_rpm(name: &str, version: &str) -> Vec<u8> {
+        let pkg = rpm::PackageBuilder::new(name, version, "MIT", "x86_64", "t")
+            .release("1")
+            .build()
+            .unwrap();
+        let mut buf = Vec::new();
+        pkg.write(&mut buf).unwrap();
+        buf
+    }
+
+    /// keep_last over an rpm repo: old versions' packages AND sidecars are
+    /// deleted, and the repo's indexes are rebuilt + re-signed afterwards —
+    /// no ghosts advertised.
+    #[tokio::test]
+    async fn test_rpm_retention_deletes_and_regenerates() {
+        let ctx = create_test_context();
+        for v in ["1.0", "2.0", "3.0"] {
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/rpm/prod/pkg-{v}.rpm"),
+                build_rpm("pkg", v),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        let rules = vec![rule("rpm", None, Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "two of three versions dominated");
+
+        // Packages + sidecars of evicted versions are gone.
+        let keys = ctx.state.storage.list("rpm/prod/").await.unwrap();
+        let rpms: Vec<_> = keys.iter().filter(|k| k.ends_with(".rpm")).collect();
+        assert_eq!(rpms.len(), 1, "{rpms:?}");
+        let sidecars: Vec<_> = keys.iter().filter(|k| k.ends_with(".json")).collect();
+        assert_eq!(sidecars.len(), 1, "{sidecars:?}");
+
+        // Index regenerated: exactly one package advertised, signature fresh.
+        let repomd = String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, "/rpm/prod/repodata/repomd.xml", "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        let start = repomd.find("href=\"").unwrap() + 6;
+        let end = repomd[start..].find('"').unwrap() + start;
+        let href = repomd[start..end].to_string();
+        let gz =
+            body_bytes(send(&ctx.app, Method::GET, &format!("/rpm/prod/{href}"), "").await).await;
+        let mut primary = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&gz[..]), &mut primary)
+            .unwrap();
+        assert!(primary.contains("packages=\"1\""), "{primary}");
+        let asc = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/prod/repodata/repomd.xml.asc",
+            "",
+        )
+        .await;
+        assert_eq!(asc.status(), StatusCode::OK);
+    }
+
+    /// Age-only rule (the dev-repo shape): everything older than the window
+    /// goes regardless of count; dry-run touches nothing.
+    #[tokio::test]
+    async fn test_rpm_age_only_rule_and_dry_run() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/dev1/pkg-1.0.rpm",
+            build_rpm("pkg", "1.0"),
+        )
+        .await;
+
+        // Backdate the version 8 days via its sidecar (also proves the
+        // collector takes `modified` from the sidecar's file_time).
+        let sc_key = "rpm/dev1/.nora-meta/pkg-1.0.rpm.json";
+        let mut sc: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(sc_key).await.unwrap()).unwrap();
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 8 * 86400;
+        sc["file_time"] = serde_json::json!(old_ts);
+        ctx.state
+            .storage
+            .put(sc_key, &serde_json::to_vec(&sc).unwrap())
+            .await
+            .unwrap();
+
+        // Dry run with the dev-repo shape (age-only, 7 days): plans but never
+        // deletes and never regenerates.
+        let rules = vec![rule("rpm", None, None, Some(7))];
+        let before = ctx.state.storage.list("rpm/dev1/").await.unwrap().len();
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            true,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert_eq!(result.deleted_keys, 0);
+        assert_eq!(
+            ctx.state.storage.list("rpm/dev1/").await.unwrap().len(),
+            before
+        );
+
+        // Real run deletes the 8-day-old version.
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        let keys = ctx.state.storage.list("rpm/dev1/").await.unwrap();
+        assert!(!keys.iter().any(|k| k.ends_with(".rpm")), "{keys:?}");
+    }
+
+    /// Deb mirror of the keep_last flow, asserting the Packages index and
+    /// signatures follow the deletion.
+    #[tokio::test]
+    async fn test_deb_retention_deletes_and_regenerates() {
+        let ctx = create_test_context();
+        for v in ["1.0", "2.0"] {
+            let deb = crate::registry::deb::test_fixtures::build_deb("pkg", v);
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/deb/prod/pool/pkg_{v}.deb"),
+                deb,
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        let rules = vec![rule("deb", None, Some(1), None)];
+        run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+
+        let packages = String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, "/deb/prod/Packages", "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(packages.matches("Package: pkg").count(), 1, "{packages}");
+        let inrelease = send(&ctx.app, Method::GET, "/deb/prod/InRelease", "").await;
+        assert_eq!(inrelease.status(), StatusCode::OK);
+    }
+
+    /// Raw: a depth-2 prefix is the version unit — the whole CALVER-style
+    /// directory ages out together; root-level files are never collected.
+    #[tokio::test]
+    async fn test_raw_prefix_grouping_and_deletion() {
+        let ctx = create_test_context();
+        for k in [
+            "raw/stream/v1/image.bin",
+            "raw/stream/v1/image.bin.sha256",
+            "raw/stream/v2/image.bin",
+            "raw/rootfile.bin",
+        ] {
+            ctx.state.storage.put(k, b"data").await.unwrap();
+        }
+
+        let groups = collect_raw_versions(&ctx.state.storage).await;
+        let stream = groups.iter().find(|(g, _)| g == "raw:stream").unwrap();
+        assert_eq!(stream.1.len(), 2, "two prefix versions");
+        assert!(
+            !groups.iter().any(|(g, _)| g.contains("rootfile")),
+            "root-level files are never a version"
+        );
+
+        let rules = vec![rule("raw", Some("stream"), Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        let keys = ctx.state.storage.list("raw/").await.unwrap();
+        assert!(keys.contains(&"raw/rootfile.bin".to_string()));
+        assert_eq!(
+            keys.iter().filter(|k| k.starts_with("raw/stream/")).count(),
+            1,
+            "one prefix version survives: {keys:?}"
+        );
     }
 }

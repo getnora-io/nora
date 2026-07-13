@@ -694,9 +694,12 @@ async fn main() {
         }
         Some(Commands::RetentionPlan) => {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            // Dry-run: plans only, no deletions and no index regeneration —
+            // no signer needed.
             let result = retention::run_retention(
                 &storage,
                 &cli_publish_locks,
+                None,
                 &config.retention.rules,
                 true,
             )
@@ -726,6 +729,7 @@ async fn main() {
                 let result = retention::run_retention(
                     &storage,
                     &cli_publish_locks,
+                    None,
                     &config.retention.rules,
                     true,
                 )
@@ -751,9 +755,14 @@ async fn main() {
                 }
                 print_retention_coverage(&storage, &config.retention.rules).await;
             } else {
+                // Real deletions rebuild rpm/deb indexes — sign them with the
+                // same key the server would, or clients start failing
+                // verification after a CLI retention pass.
+                let signer = build_signer(&config, &config.enabled_registries());
                 let result = retention::run_retention(
                     &storage,
                     &cli_publish_locks,
+                    signer.as_deref(),
                     &config.retention.rules,
                     false,
                 )
@@ -1624,6 +1633,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let handle = retention::spawn_retention_scheduler(
             state.storage.clone(),
             state.publish_locks.clone(),
+            state.signer.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,

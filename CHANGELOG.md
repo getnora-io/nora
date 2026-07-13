@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **Retention over rpm, deb, and raw** — the three formats retention previously skipped silently. rpm/deb versions are collected from the metadata sidecars (payloads never read) and grouped per `{repo}/{package}`; deleting a version removes the package and its sidecar, and every touched repo's indexes are rebuilt **and re-signed** under the publish lock afterwards — retention can no longer leave a signed index advertising deleted packages. Raw groups depth-2 path prefixes (`raw/{name}/{version}/…`) as the aging unit, so a directory of related files ages out together; root-level files are never collected. New optional `name_glob` on retention rules targets groups within a registry (e.g. `*-dev-*/*` for an age-only policy on dev repositories, `*-stream-*/*` for a keep-last window) — first matching rule wins, and no matching rule still means keep forever. `nora retention-apply --yes` signs regenerated indexes with the same key as the server.
+
 ## [1.0.1] - 2026-07-13
 
 ### Security
