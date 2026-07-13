@@ -40,14 +40,16 @@ use std::io::Write;
 pub const INDEX_PATTERN: (&str, &str) = ("rpm/", ".rpm");
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/rpm/{repo}/{*path}",
-        get(download)
-            .head(check_exists)
-            .put(upload)
-            .delete(delete_package)
-            .fallback(|| async { method_not_allowed("GET, HEAD, PUT, DELETE") }),
-    )
+    Router::new()
+        .route("/rpm/{repo}/-/reindex", axum::routing::post(reindex))
+        .route(
+            "/rpm/{repo}/{*path}",
+            get(download)
+                .head(check_exists)
+                .put(upload)
+                .delete(delete_package)
+                .fallback(|| async { method_not_allowed("GET, HEAD, PUT, DELETE") }),
+        )
 }
 
 /// Sidecar prefix inside a repo. Not a valid RPM path component for clients
@@ -581,18 +583,23 @@ fn generate_repomd_xml(files: &[RepodataFile], revision: u64) -> String {
 /// hold the repo's publish lock. Fail-closed: any error aborts the rebuild
 /// (and the surrounding publish) rather than writing a truncated repo —
 /// same contract as the cargo index (`regenerate_cargo_index`).
-async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String> {
+/// AppState-free so callers outside the request path (reindex, and later
+/// retention / key-rotation sweeps) can rebuild a repo with just storage and
+/// the signer.
+pub(crate) async fn regenerate_repodata(
+    storage: &crate::Storage,
+    signer: Option<&crate::signing::RepoSigner>,
+    repo: &str,
+) -> Result<(), String> {
     let meta_prefix = format!("rpm/{repo}/{META_DIR}/");
-    let keys = state
-        .storage
+    let keys = storage
         .list(&meta_prefix)
         .await
         .map_err(|e| format!("list sidecars: {e}"))?;
 
     let mut pkgs = Vec::with_capacity(keys.len());
     for key in &keys {
-        let data = state
-            .storage
+        let data = storage
             .get(key)
             .await
             .map_err(|e| format!("read sidecar {key}: {e}"))?;
@@ -622,8 +629,7 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         .unwrap_or(0);
 
     for f in &built {
-        state
-            .storage
+        storage
             .put(&format!("rpm/{repo}/{}", f.href), &f.gz)
             .await
             .map_err(|e| format!("write {}: {e}", f.href))?;
@@ -631,8 +637,7 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
     // repomd.xml last — it references the files above, so a reader never sees
     // a repomd pointing at data that has not been written yet.
     let repomd = generate_repomd_xml(&built, revision);
-    state
-        .storage
+    storage
         .put(&repomd_key(repo), repomd.as_bytes())
         .await
         .map_err(|e| format!("write repomd.xml: {e}"))?;
@@ -645,11 +650,10 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
     // claims to be signed must never publish an unsigned or stale-signed
     // repomd (#128).
     let asc_key = format!("{}.asc", repomd_key(repo));
-    match &state.signer {
+    match signer {
         Some(signer) => {
             let asc = signer.sign_detached(repomd.as_bytes())?;
-            state
-                .storage
+            storage
                 .put(&asc_key, asc.as_bytes())
                 .await
                 .map_err(|e| format!("write repomd.xml.asc: {e}"))?;
@@ -657,9 +661,8 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         None => {
             // Signing turned off after having been on: a stale signature that
             // no longer matches repomd.xml would hard-fail repo_gpgcheck.
-            if state.storage.stat(&asc_key).await.is_some() {
-                state
-                    .storage
+            if storage.stat(&asc_key).await.is_some() {
+                storage
                     .delete(&asc_key)
                     .await
                     .map_err(|e| format!("delete stale repomd.xml.asc: {e}"))?;
@@ -675,7 +678,7 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
         .iter()
         .map(|f| format!("rpm/{repo}/{}", f.href))
         .collect();
-    if let Ok(existing) = state.storage.list(&format!("rpm/{repo}/{REPODATA}/")).await {
+    if let Ok(existing) = storage.list(&format!("rpm/{repo}/{REPODATA}/")).await {
         for key in existing {
             if key.ends_with("repomd.xml")
                 || key.ends_with("repomd.xml.asc")
@@ -683,7 +686,7 @@ async fn regenerate_repodata(state: &AppState, repo: &str) -> Result<(), String>
             {
                 continue;
             }
-            if let Err(e) = state.storage.delete(&key).await {
+            if let Err(e) = storage.delete(&key).await {
                 tracing::warn!(key = %key, error = %e, "rpm: failed to prune stale repodata");
             }
         }
@@ -779,7 +782,7 @@ async fn upload(
         tracing::error!(error = %e, key = %key, "rpm: failed to store metadata sidecar");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if let Err(e) = regenerate_repodata(&state, &repo).await {
+    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
         tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -924,7 +927,7 @@ async fn delete_package(
     if let Err(e) = state.storage.delete(&sidecar_key(&repo, &path)).await {
         tracing::warn!(error = %e, key = %key, "rpm: failed to delete metadata sidecar");
     }
-    if let Err(e) = regenerate_repodata(&state, &repo).await {
+    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
         tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -938,6 +941,147 @@ async fn delete_package(
         .log(AuditEntry::new("delete", "api", &path, "rpm", ""));
     state.repo_index.invalidate("rpm");
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Reconcile a repository with what is actually in storage, then rebuild
+/// (and re-sign) its repodata. Heals out-of-band changes the publish path
+/// never saw: packages deleted directly from storage (their stale sidecars
+/// are dropped) and packages added directly to storage (parsed, sidecar
+/// created). Also the re-sign hook after a signing-key change. Runs under
+/// the repo publish lock, like every rebuild.
+async fn reindex(
+    State(state): State<AppState>,
+    Path(repo): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+) -> Response {
+    if !state.config.rpm.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
+        return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    }
+    if enforce_namespace_scope(&authority, &repo).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let lock = state.publish_lock(&repomd_key(&repo));
+    let _guard = lock.lock().await;
+
+    let prefix = format!("rpm/{repo}/");
+    let keys = match state.storage.list(&prefix).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, repo = %repo, "rpm reindex: list failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if keys.is_empty() {
+        return (StatusCode::NOT_FOUND, "No such repository").into_response();
+    }
+
+    let meta_prefix = format!("rpm/{repo}/{META_DIR}/");
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&meta_prefix) {
+            if let Some(pkg) = rest.strip_suffix(".json") {
+                sidecars.insert(pkg.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.to_ascii_lowercase().ends_with(".rpm") && !rest.starts_with(REPODATA) {
+                packages.insert(rest.to_string());
+            }
+        }
+    }
+
+    // Drop sidecars whose package is gone (deleted out-of-band).
+    let mut orphans_removed = 0usize;
+    for stale in sidecars.difference(&packages) {
+        match state.storage.delete(&sidecar_key(&repo, stale)).await {
+            Ok(()) => orphans_removed += 1,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %stale, "rpm reindex: orphan sidecar delete failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+
+    // Parse packages that have no sidecar (added out-of-band). The package is
+    // read fully once — header for the fields, whole body for the pkgid.
+    let mut sidecars_created = 0usize;
+    for missing in packages.difference(&sidecars) {
+        let body = match state.storage.get(&package_key(&repo, missing)).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: package read failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let md = match PackageMetadata::parse(&mut &body[..]) {
+            Ok(md) => md,
+            Err(e) => {
+                tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: not a valid RPM — refusing to index");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{missing} is not a valid RPM: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        let file_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = match extract_record(
+            &md,
+            &body,
+            missing,
+            file_time,
+            state.config.rpm.changelog_limit,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{missing}: RPM header missing required tags: {e}"),
+                )
+                    .into_response()
+            }
+        };
+        let json = match serde_json::to_vec(&record) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "rpm reindex: sidecar serialize failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if let Err(e) = state.storage.put(&sidecar_key(&repo, missing), &json).await {
+            tracing::error!(error = %e, repo = %repo, pkg = %missing, "rpm reindex: sidecar write failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        sidecars_created += 1;
+    }
+
+    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
+        tracing::error!(repo = %repo, error = %e, "rpm reindex: repodata regeneration failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    state
+        .audit
+        .log(AuditEntry::new("reindex", "api", &repo, "rpm", ""));
+    state.repo_index.invalidate("rpm");
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "packages": packages.len(),
+            "sidecars_created": sidecars_created,
+            "orphans_removed": orphans_removed,
+            "signed": state.signer.is_some(),
+        })),
+    )
+        .into_response()
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -1614,5 +1758,169 @@ mod signing_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reindex_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+
+    fn build_rpm(name: &str) -> Vec<u8> {
+        let pkg = rpm::PackageBuilder::new(name, "1.0", "MIT", "x86_64", "t")
+            .release("1")
+            .build()
+            .unwrap();
+        let mut buf = Vec::new();
+        pkg.write(&mut buf).unwrap();
+        buf
+    }
+
+    async fn primary(ctx: &crate::test_helpers::TestContext) -> String {
+        let repomd = String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        let start = repomd.find("href=\"").unwrap() + 6;
+        let end = repomd[start..].find('"').unwrap() + start;
+        let href = &repomd[start..end];
+        let resp = send(&ctx.app, Method::GET, &format!("/rpm/myrepo/{href}"), "").await;
+        let gz = body_bytes(resp).await;
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&gz[..]), &mut out)
+            .unwrap();
+        out
+    }
+
+    /// Out-of-band deletion: the package vanishes from storage behind the
+    /// API's back; reindex drops the orphan sidecar and the rebuilt (and
+    /// re-signed) repodata stops advertising it.
+    #[tokio::test]
+    async fn test_reindex_heals_out_of_band_delete() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/aaa.rpm",
+            build_rpm("aaa"),
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/bbb.rpm",
+            build_rpm("bbb"),
+        )
+        .await;
+
+        // Delete one package directly in storage — the manual-deletion gap.
+        ctx.state
+            .storage
+            .delete("rpm/myrepo/aaa.rpm")
+            .await
+            .unwrap();
+        assert!(
+            primary(&ctx).await.contains("<name>aaa</name>"),
+            "stale before reindex"
+        );
+
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["packages"], 1);
+        assert_eq!(body["orphans_removed"], 1);
+        assert_eq!(body["signed"], true);
+
+        let p = primary(&ctx).await;
+        assert!(
+            !p.contains("<name>aaa</name>"),
+            "reindex must drop the deleted package"
+        );
+        assert!(p.contains("<name>bbb</name>"));
+        // Signature regenerated alongside.
+        let asc = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/myrepo/repodata/repomd.xml.asc",
+            "",
+        )
+        .await;
+        assert_eq!(asc.status(), StatusCode::OK);
+    }
+
+    /// Out-of-band addition: a package dropped straight into storage gets
+    /// parsed, sidecar'd, and served after reindex.
+    #[tokio::test]
+    async fn test_reindex_adopts_out_of_band_add() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/aaa.rpm",
+            build_rpm("aaa"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put("rpm/myrepo/ccc.rpm", &build_rpm("ccc"))
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["packages"], 2);
+        assert_eq!(body["sidecars_created"], 1);
+
+        let p = primary(&ctx).await;
+        assert!(
+            p.contains("<name>ccc</name>"),
+            "adopted package must be served"
+        );
+    }
+
+    /// Garbage dropped into storage must fail the reindex loudly, not get
+    /// silently skipped into a repo that lies about its contents.
+    #[tokio::test]
+    async fn test_reindex_rejects_invalid_out_of_band_package() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/aaa.rpm",
+            build_rpm("aaa"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put("rpm/myrepo/junk.rpm", b"not an rpm")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_unknown_repo_404s_and_scope_enforced() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::POST, "/rpm/nosuch/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        use crate::config::ScopeEnforcement;
+        let scoped = crate::auth::NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["otherrepo".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+        let resp = super::reindex(
+            axum::extract::State(ctx.state.clone()),
+            axum::extract::Path("myrepo".to_string()),
+            axum::Extension(scoped),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

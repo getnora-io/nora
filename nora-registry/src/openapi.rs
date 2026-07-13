@@ -119,12 +119,14 @@ use crate::AppState;
         crate::openapi::rpm_download,
         crate::openapi::rpm_delete,
         crate::openapi::rpm_pubkey,
+        crate::openapi::rpm_reindex,
         // Debian (APT)
         crate::openapi::deb_release,
         crate::openapi::deb_upload,
         crate::openapi::deb_download,
         crate::openapi::deb_delete,
         crate::openapi::deb_pubkey,
+        crate::openapi::deb_reindex,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1116,6 +1118,23 @@ pub async fn rpm_delete() {}
 )]
 pub async fn rpm_pubkey() {}
 
+/// Reconcile the repository with storage and rebuild (re-sign) its repodata
+#[utoipa::path(
+    post,
+    path = "/rpm/{repo}/-/reindex",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Reconciled; JSON counts of packages, adopted sidecars, removed orphans"),
+        (status = 404, description = "No such repository"),
+        (status = 422, description = "A stored file is not a valid package"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_reindex() {}
+
 // -------------------- Debian (APT) --------------------
 
 /// Repository index metadata (apt entry point for a flat repo)
@@ -1202,6 +1221,23 @@ pub async fn deb_delete() {}
     )
 )]
 pub async fn deb_pubkey() {}
+
+/// Reconcile the repository with storage and rebuild (re-sign) its indexes
+#[utoipa::path(
+    post,
+    path = "/deb/{repo}/-/reindex",
+    tag = "deb",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Reconciled; JSON counts of packages, adopted sidecars, removed orphans"),
+        (status = 404, description = "No such repository"),
+        (status = 422, description = "A stored file is not a valid package"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn deb_reindex() {}
 
 // -------------------- Auth / Tokens --------------------
 

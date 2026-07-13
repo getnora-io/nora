@@ -262,6 +262,7 @@ primary/filelists/other.xml.gz). Package headers are parsed server-side — no
 | GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
+| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |
 | Upstream proxy | — | Hosted only |
 | sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
 | Delta RPMs (`prestodelta`) | — | Not generated |
@@ -303,6 +304,7 @@ upstream proxy (hosted only).
 | Package download | Full | Byte-identical |
 | `InRelease` (clearsigned) / `Release.gpg` (detached) | Full | Signed on every regeneration; verify via `signed-by` |
 | Public key (`pubkey.gpg`) | Full | Armored, for the `signed-by` keyring; key auto-generated at first boot |
+| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs indexes |
 | `dists/` pool layout (suites/components) | — | Flat repositories only (`deb <url>/deb/{repo} ./`) |
 | by-hash | — | Not applicable to flat repositories |
 | Translations / Contents indexes | — | Not generated |
