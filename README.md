@@ -23,7 +23,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 [![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
 
-**< 27 MB** binary | **< 50 MB** RAM idle | **3s** startup | **15** registries
+**< 30 MB** binary | **< 50 MB** RAM idle | **3s** startup | **15** registries
 
 ## Supported Registries
 
@@ -146,7 +146,7 @@ docker run -d -p 4000:4000 \
 |--------|------|-------|-------|
 | Startup | < 3s | 30-60s | 30-60s |
 | Memory | < 50 MB idle | 2-4 GB | 2-4 GB |
-| Binary | < 27 MB | 600+ MB | 1+ GB |
+| Binary | < 30 MB | 600+ MB | 1+ GB |
 
 ## Roadmap
 
