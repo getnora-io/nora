@@ -288,10 +288,13 @@ themselves. With signing disabled (`signing.enabled = false`), also set
 
 ## Debian (APT)
 
-Hosted *flat* repositories with server-generated indexes. Each
-`/deb/{repo}/` path is an independent repository; publishing or deleting a
-package regenerates `Packages`, `Packages.gz`, and `Release` at the repo
-root. Package control paragraphs are parsed server-side from the .deb
+Hosted repositories with server-generated indexes, in either apt layout
+(chosen per package at publish): *flat* (indexes at the repo root, sources
+line `deb <url>/deb/{repo} ./`) or *structured* (`dists/{distribution}/`
+suites with components, sources line `deb <url>/deb/{repo} jammy main`).
+Each `/deb/{repo}/` path is an independent repository; publishing or
+deleting a package regenerates every affected index. Package control
+paragraphs are parsed server-side from the .deb
 (ar → control.tar.{,gz,xz,zst}) — no `dpkg-scanpackages` needed. No
 upstream proxy (hosted only).
 
@@ -299,29 +302,36 @@ upstream proxy (hosted only).
 |---------|--------|-------|
 | `Packages` / `Packages.gz` | Full | Verbatim control paragraphs + Filename/Size/MD5sum/SHA1/SHA256 |
 | `Release` (flat repo) | Full | MD5Sum + SHA256 sections, `Cache-Control: no-cache` |
+| `dists/` layout (suites/components) | Full | `PUT ...?distribution=<dist>[&component=<comp>]`; per-dist Release + `{component}/binary-{arch}/Packages{,.gz}`; arch-`all` packages folded into every concrete arch index; upload path is free-form (`Filename` is repo-root-relative, `pool/` not required) |
 | Package publish (`PUT {repo}/{name}.deb`) | Full | Control parsed and validated; invalid debs rejected; decompression bombs bounded |
-| Package delete (`DELETE {repo}/{name}.deb`) | Full | Indexes regenerated |
+| Package delete (`DELETE {repo}/{name}.deb`) | Full | Indexes regenerated; emptied distributions are removed |
 | Package download | Full | Byte-identical |
-| `InRelease` (clearsigned) / `Release.gpg` (detached) | Full | Signed on every regeneration; verify via `signed-by` |
+| `InRelease` (clearsigned) / `Release.gpg` (detached) | Full | Signed on every regeneration (per distribution in the structured layout); verify via `signed-by` |
 | Public key (`pubkey.gpg`) | Full | Armored, for the `signed-by` keyring; key auto-generated at first boot |
-| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs indexes |
-| `dists/` pool layout (suites/components) | — | Flat repositories only (`deb <url>/deb/{repo} ./`) |
-| by-hash | — | Not applicable to flat repositories |
+| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages (into the flat layout — placement is upload-time intent), rebuilds + re-signs indexes |
+| by-hash | — | Not generated; index files are served `Cache-Control: no-cache` |
 | Translations / Contents indexes | — | Not generated |
 | Upstream proxy | — | Hosted only |
 
-Publish: `curl -u user:pass -T pkg.deb http://nora:4000/deb/myrepo/pkg.deb`
+Publish (flat): `curl -u user:pass -T pkg.deb http://nora:4000/deb/myrepo/pkg.deb`
+
+Publish (structured):
+`curl -u user:pass -T pkg.deb "http://nora:4000/deb/myrepo/pool/pkg.deb?distribution=jammy&component=main"`
 
 Client setup:
 
 ```
 curl -fsSL http://nora:4000/deb/myrepo/pubkey.gpg -o /etc/apt/keyrings/nora.asc
+# flat
 echo "deb [signed-by=/etc/apt/keyrings/nora.asc] http://nora:4000/deb/myrepo ./" \
+  > /etc/apt/sources.list.d/nora.list
+# structured
+echo "deb [signed-by=/etc/apt/keyrings/nora.asc] http://nora:4000/deb/myrepo jammy main" \
   > /etc/apt/sources.list.d/nora.list
 ```
 
-With signing disabled (`signing.enabled = false`), use
-`deb [trusted=yes] http://nora:4000/deb/myrepo ./` instead.
+With signing disabled (`signing.enabled = false`), use `[trusted=yes]`
+instead of `[signed-by=...]`.
 
 ## Helm OCI
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! Debian registry — hosted flat APT repositories with server-generated indexes.
+//! Debian registry — hosted APT repositories with server-generated indexes.
 //!
 //! Implements:
 //!   PUT    /deb/{repo}/{*path}  — upload a .deb (parses control, regenerates indexes)
@@ -9,13 +9,20 @@
 //!   HEAD   /deb/{repo}/{*path}  — existence/size check
 //!   DELETE /deb/{repo}/{*path}  — remove a package (regenerates indexes)
 //!
-//! Each `{repo}` is an independent *flat* repository (`deb [trusted=yes]
-//! {base}/deb/{repo} ./`): `Packages`, `Packages.gz`, and `Release` at the repo
-//! root are regenerated on every publish/delete from per-package control
-//! sidecars (parsed once at upload, same shape as the rpm handler), so a
-//! rebuild never re-reads .deb payloads. Indexes are unsigned — clients use
-//! `[trusted=yes]` (no InRelease/Release.gpg; GPG signing is a separate
-//! roadmap item, #128).
+//! Each `{repo}` is an independent repository serving either (or both) apt
+//! layouts, decided per package at upload:
+//!
+//! * **flat** (default): `Packages`, `Packages.gz`, and `Release` at the repo
+//!   root; sources line `deb {base}/deb/{repo} ./`.
+//! * **structured** (`?distribution=jammy[&component=main]`): indexes under
+//!   `dists/{distribution}/{component}/binary-{arch}/`, one signed Release per
+//!   distribution; sources line `deb {base}/deb/{repo} jammy main`. The
+//!   upload path is still free-form — `Filename:` entries are relative to the
+//!   repo root, so packages need not live under `pool/`.
+//!
+//! All indexes are regenerated on every publish/delete from per-package
+//! control sidecars (parsed once at upload, same shape as the rpm handler),
+//! so a rebuild never re-reads .deb payloads.
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -25,7 +32,7 @@ use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -34,6 +41,7 @@ use axum::{
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 
 /// Dashboard index: group stored .deb files by repository name.
@@ -105,10 +113,54 @@ fn validate_package_path(repo: &str, path: &str) -> Result<(), &'static str> {
     {
         return Err("Invalid path");
     }
-    if RESERVED.contains(&path) {
+    if RESERVED.contains(&path) || path.starts_with("dists/") {
         return Err("Reserved index path");
     }
     Ok(())
+}
+
+/// Structured-layout placement: the package is indexed under
+/// `dists/{distribution}/{component}/binary-{arch}/`. Absent from a sidecar →
+/// the package belongs to the flat root layout (pre-structured sidecars
+/// deserialize as flat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Placement {
+    distribution: String,
+    component: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PublishQuery {
+    distribution: Option<String>,
+    component: Option<String>,
+}
+
+/// A distribution/component/architecture name becomes one path segment under
+/// `dists/` and one space-separated token in the Release `Components` /
+/// `Architectures` lists — restrict to characters safe in both.
+fn valid_release_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+fn resolve_placement(q: PublishQuery) -> Result<Option<Placement>, &'static str> {
+    let Some(distribution) = q.distribution else {
+        return match q.component {
+            None => Ok(None),
+            Some(_) => Err("component requires distribution"),
+        };
+    };
+    let component = q.component.unwrap_or_else(|| "main".to_string());
+    if !valid_release_token(&distribution) || !valid_release_token(&component) {
+        return Err("Invalid distribution/component name");
+    }
+    Ok(Some(Placement {
+        distribution,
+        component,
+    }))
 }
 
 // ============================================================================
@@ -255,6 +307,8 @@ struct PkgRecord {
     md5: String,
     sha1: String,
     sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement: Option<Placement>,
 }
 
 impl PkgRecord {
@@ -316,7 +370,11 @@ fn validate_control(control: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_record(body: &[u8], path: &str) -> Result<PkgRecord, String> {
+fn extract_record(
+    body: &[u8],
+    path: &str,
+    placement: Option<Placement>,
+) -> Result<PkgRecord, String> {
     let control = extract_control(body)?;
     validate_control(&control)?;
     let package = control_field(&control, "Package")
@@ -328,6 +386,11 @@ fn extract_record(body: &[u8], path: &str) -> Result<PkgRecord, String> {
     let arch = control_field(&control, "Architecture")
         .filter(|v| !v.is_empty())
         .ok_or("control missing Architecture field")?;
+    // In the structured layout the architecture becomes a `binary-{arch}`
+    // path segment and a Release `Architectures` token.
+    if placement.is_some() && !valid_release_token(arch) {
+        return Err(format!("Architecture {arch:?} not usable under dists/"));
+    }
     Ok(PkgRecord {
         package: package.to_string(),
         version: version.to_string(),
@@ -338,6 +401,7 @@ fn extract_record(body: &[u8], path: &str) -> Result<PkgRecord, String> {
         md5: hex::encode(md5::Md5::digest(body)),
         sha1: hex::encode(sha1::Sha1::digest(body)),
         sha256: hex::encode(sha2::Sha256::digest(body)),
+        placement,
     })
 }
 
@@ -348,30 +412,98 @@ fn release_date() -> String {
         .to_string()
 }
 
+fn hash_entry(data: &[u8], name: &str, hasher: fn(&[u8]) -> String) -> String {
+    format!(" {} {} {}\n", hasher(data), data.len(), name)
+}
+
+fn md5_hex(d: &[u8]) -> String {
+    hex::encode(md5::Md5::digest(d))
+}
+
+fn sha256_hex(d: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(d))
+}
+
 fn generate_release(packages: &[u8], packages_gz: &[u8], repo: &str) -> String {
-    let entry = |data: &[u8], name: &str, hasher: fn(&[u8]) -> String| {
-        format!(" {} {} {}\n", hasher(data), data.len(), name)
-    };
-    let md5 = |d: &[u8]| hex::encode(md5::Md5::digest(d));
-    let sha256 = |d: &[u8]| hex::encode(sha2::Sha256::digest(d));
     format!(
         "Origin: NORA\nLabel: {repo}\nDate: {}\nMD5Sum:\n{}{}SHA256:\n{}{}",
         release_date(),
-        entry(packages, "Packages", md5),
-        entry(packages_gz, "Packages.gz", md5),
-        entry(packages, "Packages", sha256),
-        entry(packages_gz, "Packages.gz", sha256),
+        hash_entry(packages, "Packages", md5_hex),
+        hash_entry(packages_gz, "Packages.gz", md5_hex),
+        hash_entry(packages, "Packages", sha256_hex),
+        hash_entry(packages_gz, "Packages.gz", sha256_hex),
     )
 }
 
-/// Rebuild Packages/Packages.gz/Release for `repo` from control sidecars.
-/// Caller must hold the repo's publish lock. Fail-closed: any error aborts the
-/// rebuild (and the surrounding publish) rather than writing a truncated
-/// index — same contract as the cargo index and the rpm handler.
+/// Release for one `dists/{dist}/` tree. `files` paths are relative to the
+/// dist root, as apt expects.
+fn generate_dist_release(
+    repo: &str,
+    dist: &str,
+    components: &[&str],
+    arches: &BTreeSet<&str>,
+    files: &[(String, Vec<u8>)],
+) -> String {
+    let mut md5_lines = String::new();
+    let mut sha_lines = String::new();
+    for (name, data) in files {
+        md5_lines.push_str(&hash_entry(data, name, md5_hex));
+        sha_lines.push_str(&hash_entry(data, name, sha256_hex));
+    }
+    format!(
+        "Origin: NORA\nLabel: {repo}\nSuite: {dist}\nCodename: {dist}\nDate: {}\nArchitectures: {}\nComponents: {}\nMD5Sum:\n{md5_lines}SHA256:\n{sha_lines}",
+        release_date(),
+        arches.iter().copied().collect::<Vec<_>>().join(" "),
+        components.join(" "),
+    )
+}
+
+fn packages_index<'a>(pkgs: impl IntoIterator<Item = &'a PkgRecord>) -> Vec<u8> {
+    pkgs.into_iter()
+        .map(|p| p.paragraph())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
+
+fn gzip(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data)
+        .and_then(|_| enc.finish())
+        .map_err(|e| format!("gzip: {e}"))
+}
+
+/// Release + signatures for one layout root, in write order (Release before
+/// InRelease/Release.gpg). `prefix` is `""` (flat root) or `dists/{dist}/`.
+fn signed_release(
+    signer: Option<&crate::signing::RepoSigner>,
+    prefix: &str,
+    release: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = vec![(format!("{prefix}Release"), release.as_bytes().to_vec())];
+    if let Some(signer) = signer {
+        out.push((
+            format!("{prefix}InRelease"),
+            signer.clearsign(release)?.into_bytes(),
+        ));
+        out.push((
+            format!("{prefix}Release.gpg"),
+            signer.sign_detached(release.as_bytes())?.into_bytes(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Rebuild all indexes for `repo` from control sidecars: the flat root layout
+/// for packages without a placement, and one `dists/{dist}/` tree per
+/// distribution for packages with one. Caller must hold the repo's publish
+/// lock. Fail-closed: any error aborts the rebuild (and the surrounding
+/// publish) rather than writing a truncated index — same contract as the
+/// cargo index and the rpm handler.
 ///
-/// Indexes have fixed names (flat apt repos have no by-hash), so a client that
-/// fetched Release mid-regeneration can see a hash mismatch on Packages; apt
-/// reports it and succeeds on retry — same window as reprepro/aptly.
+/// Indexes have fixed names (no by-hash), so a client that fetched Release
+/// mid-regeneration can see a hash mismatch on Packages; apt reports it and
+/// succeeds on retry — same window as reprepro/aptly.
 /// AppState-free so callers outside the request path (reindex, and later
 /// retention / key-rotation sweeps) can rebuild a repo with just storage and
 /// the signer.
@@ -402,57 +534,116 @@ pub(crate) async fn regenerate_indexes(
         (&a.package, &a.version, &a.filename).cmp(&(&b.package, &b.version, &b.filename))
     });
 
-    let packages: Vec<u8> = pkgs
-        .iter()
-        .map(|p| p.paragraph())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_bytes();
-
-    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let packages_gz = enc
-        .write_all(&packages)
-        .and_then(|_| enc.finish())
-        .map_err(|e| format!("gzip Packages: {e}"))?;
-    let release = generate_release(&packages, &packages_gz, repo);
-
-    // Packages before Release — Release carries their hashes, so a reader
-    // never sees a Release referencing index bytes that are not there yet.
-    // Signatures last, for the same reason. Fail-closed like the rest of
-    // the rebuild: a repo that claims to be signed must never publish an
-    // unsigned or stale-signed index (#128).
-    let mut files: Vec<(&str, Vec<u8>)> = vec![
-        ("Packages", packages),
-        ("Packages.gz", packages_gz),
-        ("Release", release.clone().into_bytes()),
-    ];
-    match signer {
-        Some(signer) => {
-            files.push(("InRelease", signer.clearsign(&release)?.into_bytes()));
-            files.push((
-                "Release.gpg",
-                signer.sign_detached(release.as_bytes())?.into_bytes(),
-            ));
-        }
-        None => {
-            // Signing turned off after having been on: stale signatures that
-            // no longer match Release would hard-fail apt's verification.
-            for name in ["InRelease", "Release.gpg"] {
-                let key = format!("deb/{repo}/{name}");
-                if storage.stat(&key).await.is_some() {
-                    storage
-                        .delete(&key)
-                        .await
-                        .map_err(|e| format!("delete stale {name}: {e}"))?;
-                }
-            }
+    let mut flat: Vec<&PkgRecord> = Vec::new();
+    let mut dists: BTreeMap<&str, BTreeMap<&str, Vec<&PkgRecord>>> = BTreeMap::new();
+    for p in &pkgs {
+        match &p.placement {
+            None => flat.push(p),
+            Some(pl) => dists
+                .entry(&pl.distribution)
+                .or_default()
+                .entry(&pl.component)
+                .or_default()
+                .push(p),
         }
     }
-    for (name, data) in files {
+
+    // Everything the rebuild produces, keyed relative to `deb/{repo}/`, in
+    // write order: index files before the Release that carries their hashes,
+    // signatures last — a reader never sees a Release (or signature)
+    // referencing bytes that are not there yet.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // The flat root layout is kept for a purely-flat repo (even when empty —
+    // an emptied repo keeps serving empty indexes) and dropped once every
+    // package has moved under dists/.
+    if dists.is_empty() || !flat.is_empty() {
+        let packages = packages_index(flat.iter().copied());
+        let packages_gz = gzip(&packages)?;
+        let release = generate_release(&packages, &packages_gz, repo);
+        files.push(("Packages".into(), packages));
+        files.push(("Packages.gz".into(), packages_gz));
+        files.extend(signed_release(signer, "", &release)?);
+    }
+
+    for (dist, comps) in &dists {
+        // Target architectures: every concrete arch in the dist; `all`
+        // packages fold into each. A dist holding only arch-all packages
+        // publishes binary-all.
+        let mut arches: BTreeSet<&str> = comps
+            .values()
+            .flatten()
+            .map(|p| p.arch.as_str())
+            .filter(|a| *a != "all")
+            .collect();
+        if arches.is_empty() {
+            arches.insert("all");
+        }
+
+        // Every component×arch combination is emitted (empty ones included)
+        // so the Release file never references an index that is not there.
+        let mut indexes: Vec<(String, Vec<u8>)> = Vec::new();
+        for (comp, cpkgs) in comps {
+            for arch in &arches {
+                let packages = packages_index(
+                    cpkgs
+                        .iter()
+                        .copied()
+                        .filter(|p| p.arch == *arch || p.arch == "all"),
+                );
+                let packages_gz = gzip(&packages)?;
+                indexes.push((format!("{comp}/binary-{arch}/Packages"), packages));
+                indexes.push((format!("{comp}/binary-{arch}/Packages.gz"), packages_gz));
+            }
+        }
+        let components: Vec<&str> = comps.keys().copied().collect();
+        let release = generate_dist_release(repo, dist, &components, &arches, &indexes);
+        let prefix = format!("dists/{dist}/");
+        files.extend(
+            indexes
+                .into_iter()
+                .map(|(name, data)| (format!("{prefix}{name}"), data)),
+        );
+        files.extend(signed_release(signer, &prefix, &release)?);
+    }
+
+    let desired: BTreeSet<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    for (name, data) in &files {
         storage
-            .put(&format!("deb/{repo}/{name}"), &data)
+            .put(&format!("deb/{repo}/{name}"), data)
             .await
             .map_err(|e| format!("write {name}: {e}"))?;
+    }
+
+    // Drop what this rebuild no longer produces: root indexes once the repo
+    // is fully structured, signatures after signing was turned off (stale
+    // ones would hard-fail apt's verification), and any dists/ key from a
+    // removed distribution/component/arch.
+    let repo_prefix = format!("deb/{repo}/");
+    for name in RESERVED {
+        let key = format!("{repo_prefix}{name}");
+        if !desired.contains(name) && storage.stat(&key).await.is_some() {
+            storage
+                .delete(&key)
+                .await
+                .map_err(|e| format!("delete stale {name}: {e}"))?;
+        }
+    }
+    let existing = storage
+        .list(&format!("{repo_prefix}dists/"))
+        .await
+        .map_err(|e| format!("list dists: {e}"))?;
+    for key in existing {
+        let stale = match key.strip_prefix(&repo_prefix) {
+            Some(rel) => !desired.contains(rel),
+            None => false,
+        };
+        if stale {
+            storage
+                .delete(&key)
+                .await
+                .map_err(|e| format!("delete stale {key}: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -464,6 +655,7 @@ pub(crate) async fn regenerate_indexes(
 async fn upload(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
+    Query(query): Query<PublishQuery>,
     Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
 ) -> Response {
@@ -473,6 +665,10 @@ async fn upload(
     if let Err(msg) = validate_package_path(&repo, &path) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
+    let placement = match resolve_placement(query) {
+        Ok(p) => p,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     // Enforce OIDC namespace_scope on the repository name (#583).
     if enforce_namespace_scope(&authority, &repo).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -488,7 +684,7 @@ async fn upload(
             .into_response();
     }
 
-    let record = match extract_record(&body, &path) {
+    let record = match extract_record(&body, &path, placement) {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("Not a valid deb: {e}")).into_response()
@@ -592,8 +788,8 @@ async fn download(
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type(&path));
             // Index files are rewritten in place on every publish (fixed
-            // names, no by-hash in flat repos) — clients must revalidate.
-            if RESERVED.contains(&path.as_str()) {
+            // names, no by-hash) — clients must revalidate.
+            if RESERVED.contains(&path.as_str()) || path.starts_with("dists/") {
                 builder = builder.header(header::CACHE_CONTROL, "no-cache");
             }
             builder
@@ -688,6 +884,11 @@ async fn delete_package(
 /// Reconcile a repository with what is actually in storage, then rebuild
 /// (and re-sign) its indexes — the deb counterpart of the rpm reindex; see
 /// that handler for the contract. Runs under the repo publish lock.
+///
+/// Packages found without a sidecar are adopted into the *flat* layout: a
+/// structured placement exists only as upload-time intent, so it cannot be
+/// reconstructed from storage. Re-upload with `?distribution=` to place an
+/// adopted package under dists/.
 async fn reindex(
     State(state): State<AppState>,
     Path(repo): Path<String>,
@@ -753,7 +954,7 @@ async fn reindex(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let record = match extract_record(&body, missing) {
+        let record = match extract_record(&body, missing, None) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: not a valid deb — refusing to index");
@@ -826,6 +1027,34 @@ mod tests {
         assert!(validate_package_path("myrepo", ".nora-meta/x.deb").is_err()); // dot segment
         assert!(validate_package_path("myrepo", "a/../b.deb").is_err()); // traversal
         assert!(validate_package_path("myrepo", "/abs.deb").is_err());
+        assert!(validate_package_path("myrepo", "dists/jammy/x.deb").is_err()); // server-owned tree
+    }
+
+    #[test]
+    fn test_resolve_placement() {
+        let q = |d: Option<&str>, c: Option<&str>| PublishQuery {
+            distribution: d.map(String::from),
+            component: c.map(String::from),
+        };
+        assert!(resolve_placement(q(None, None)).unwrap().is_none());
+        let p = resolve_placement(q(Some("jammy"), None)).unwrap().unwrap();
+        assert_eq!(
+            (p.distribution.as_str(), p.component.as_str()),
+            ("jammy", "main")
+        );
+        let p = resolve_placement(q(Some("bookworm-updates"), Some("contrib")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.component, "contrib");
+
+        assert!(resolve_placement(q(None, Some("main"))).is_err()); // component alone
+        for bad in ["", "a/b", ".hidden", "ja mmy", "x\u{0}y", &"a".repeat(65)] {
+            assert!(resolve_placement(q(Some(bad), None)).is_err(), "{bad:?}");
+            assert!(
+                resolve_placement(q(Some("jammy"), Some(bad))).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -848,6 +1077,7 @@ mod tests {
             md5: "m".into(),
             sha1: "s1".into(),
             sha256: "s256".into(),
+            placement: None,
         };
         let p = rec.paragraph();
         assert!(p.contains("Package: tree\n"));
@@ -949,8 +1179,17 @@ mod integration_tests {
     /// Build a real .deb in memory: ar(debian-binary, control.tar.<comp>,
     /// data.tar.gz) — exercises the same parse path dpkg-built packages hit.
     pub(super) fn build_test_deb_with(name: &str, version: &str, compression: &str) -> Vec<u8> {
+        build_test_deb_arch(name, version, "amd64", compression)
+    }
+
+    pub(super) fn build_test_deb_arch(
+        name: &str,
+        version: &str,
+        arch: &str,
+        compression: &str,
+    ) -> Vec<u8> {
         let control = format!(
-            "Package: {name}\nVersion: {version}\nArchitecture: amd64\nMaintainer: Test <test@example.com>\nInstalled-Size: 10\nDepends: libc6 (>= 2.34)\nSection: utils\nPriority: optional\nDescription: A test package\n built for the NORA deb registry tests\n"
+            "Package: {name}\nVersion: {version}\nArchitecture: {arch}\nMaintainer: Test <test@example.com>\nInstalled-Size: 10\nDepends: libc6 (>= 2.34)\nSection: utils\nPriority: optional\nDescription: A test package\n built for the NORA deb registry tests\n"
         );
         build_test_deb_from_control(&control, compression)
     }
@@ -1208,6 +1447,7 @@ mod integration_tests {
         let resp = super::upload(
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("otherrepo".to_string(), "x.deb".to_string())),
+            axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             axum::body::Bytes::from(build_test_deb("x", "1.0")),
         )
@@ -1218,6 +1458,7 @@ mod integration_tests {
         let resp = super::upload(
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("myrepo".to_string(), "x.deb".to_string())),
+            axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
             axum::body::Bytes::from(build_test_deb("x", "1.0")),
         )
@@ -1505,5 +1746,317 @@ mod reindex_tests {
         let ctx = create_test_context();
         let resp = send(&ctx.app, Method::POST, "/deb/nosuch/-/reindex", "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod structured_tests {
+    use super::integration_tests::{build_test_deb_arch, build_test_deb_with};
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+    use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};
+    use sha2::Digest;
+
+    async fn get_text(ctx: &crate::test_helpers::TestContext, path: &str) -> String {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_deb_structured_upload_generates_dists_tree() {
+        let ctx = create_test_context();
+        let body = build_test_deb_with("tree", "2.1.0-1", "gz");
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/main/t/tree_2.1.0-1_amd64.deb?distribution=jammy",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Component defaults to main; Packages carries the repo-root-relative
+        // Filename and computed hashes.
+        let packages = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-amd64/Packages").await;
+        assert!(packages.contains("Package: tree\n"), "{packages}");
+        assert!(packages.contains("Filename: pool/main/t/tree_2.1.0-1_amd64.deb\n"));
+        let sha256 = hex::encode(sha2::Sha256::digest(&body));
+        assert!(packages.contains(&format!("SHA256: {sha256}\n")));
+
+        // Packages.gz round-trips.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/myrepo/dists/jammy/main/binary-amd64/Packages.gz",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-cache"
+        );
+        let gz = body_bytes(resp).await;
+        let mut plain = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&gz[..]), &mut plain)
+            .unwrap();
+        assert_eq!(plain, packages);
+
+        // Dist Release: identity fields + correct hash entries, dist-relative
+        // paths.
+        let release = get_text(&ctx, "/deb/myrepo/dists/jammy/Release").await;
+        assert!(release.contains("Suite: jammy\n"), "{release}");
+        assert!(release.contains("Codename: jammy\n"));
+        assert!(release.contains("Architectures: amd64\n"));
+        assert!(release.contains("Components: main\n"));
+        let pkg_sha = hex::encode(sha2::Sha256::digest(packages.as_bytes()));
+        let gz_sha = hex::encode(sha2::Sha256::digest(&gz));
+        assert!(release.contains(&format!(
+            " {pkg_sha} {} main/binary-amd64/Packages\n",
+            packages.len()
+        )));
+        assert!(release.contains(&format!(
+            " {gz_sha} {} main/binary-amd64/Packages.gz\n",
+            gz.len()
+        )));
+
+        // Fully-structured repo: no flat root indexes.
+        for name in ["Packages", "Release", "InRelease"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/deb/myrepo/{name}"), "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+        }
+
+        // InRelease verifies against the served key and embeds the Release.
+        let key = body_bytes(send(&ctx.app, Method::GET, "/deb/myrepo/pubkey.gpg", "").await).await;
+        let (public, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(&key[..])).unwrap();
+        let inrelease = get_text(&ctx, "/deb/myrepo/dists/jammy/InRelease").await;
+        let (msg, _) =
+            CleartextSignedMessage::from_armor(std::io::Cursor::new(inrelease.as_bytes())).unwrap();
+        msg.verify(&public).unwrap();
+        assert!(msg.signed_text().contains("Suite: jammy"));
+    }
+
+    /// arch-all packages fold into every concrete arch index; binary-all is
+    /// only published when a dist has nothing but arch-all packages.
+    #[tokio::test]
+    async fn test_deb_structured_arch_all_folding() {
+        let ctx = create_test_context();
+        for (path, body) in [
+            (
+                "a_1_amd64.deb",
+                build_test_deb_arch("a", "1", "amd64", "gz"),
+            ),
+            (
+                "b_1_arm64.deb",
+                build_test_deb_arch("b", "1", "arm64", "gz"),
+            ),
+            ("c_1_all.deb", build_test_deb_arch("c", "1", "all", "gz")),
+        ] {
+            let resp = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/deb/myrepo/pool/{path}?distribution=jammy"),
+                body,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{path}");
+        }
+
+        let amd = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-amd64/Packages").await;
+        assert!(
+            amd.contains("Package: a\n") && amd.contains("Package: c\n"),
+            "{amd}"
+        );
+        assert!(!amd.contains("Package: b\n"));
+        let arm = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-arm64/Packages").await;
+        assert!(
+            arm.contains("Package: b\n") && arm.contains("Package: c\n"),
+            "{arm}"
+        );
+
+        let release = get_text(&ctx, "/deb/myrepo/dists/jammy/Release").await;
+        assert!(
+            release.contains("Architectures: amd64 arm64\n"),
+            "{release}"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/myrepo/dists/jammy/main/binary-all/Packages",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_deb_structured_all_only_dist_publishes_binary_all() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/c_1_all.deb?distribution=jammy",
+            build_test_deb_arch("c", "1", "all", "gz"),
+        )
+        .await;
+        let all = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-all/Packages").await;
+        assert!(all.contains("Package: c\n"));
+        let release = get_text(&ctx, "/deb/myrepo/dists/jammy/Release").await;
+        assert!(release.contains("Architectures: all\n"), "{release}");
+    }
+
+    /// Every component×arch combination is emitted — including empty ones —
+    /// so the Release never references a missing index.
+    #[tokio::test]
+    async fn test_deb_structured_component_arch_matrix() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/a_1_amd64.deb?distribution=jammy&component=main",
+            build_test_deb_arch("a", "1", "amd64", "gz"),
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/b_1_arm64.deb?distribution=jammy&component=contrib",
+            build_test_deb_arch("b", "1", "arm64", "gz"),
+        )
+        .await;
+
+        let release = get_text(&ctx, "/deb/myrepo/dists/jammy/Release").await;
+        assert!(release.contains("Components: contrib main\n"), "{release}");
+        for combo in [
+            "main/binary-amd64",
+            "main/binary-arm64",
+            "contrib/binary-amd64",
+            "contrib/binary-arm64",
+        ] {
+            assert!(release.contains(&format!(" {combo}/Packages\n")), "{combo}");
+            let idx = get_text(&ctx, &format!("/deb/myrepo/dists/jammy/{combo}/Packages")).await;
+            match combo {
+                "main/binary-amd64" => assert!(idx.contains("Package: a\n")),
+                "contrib/binary-arm64" => assert!(idx.contains("Package: b\n")),
+                _ => assert!(!idx.contains("Package:"), "{combo} must be empty: {idx}"),
+            }
+        }
+    }
+
+    /// A repo can serve both layouts at once: flat uploads stay in the root
+    /// indexes, structured uploads live under dists/ only.
+    #[tokio::test]
+    async fn test_deb_mixed_flat_and_structured() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/flat.deb",
+            build_test_deb_with("flatpkg", "1.0", "gz"),
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/s_1_amd64.deb?distribution=jammy",
+            build_test_deb_arch("structpkg", "1", "amd64", "gz"),
+        )
+        .await;
+
+        let flat = get_text(&ctx, "/deb/myrepo/Packages").await;
+        assert!(flat.contains("Package: flatpkg\n") && !flat.contains("Package: structpkg"));
+        let dist = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-amd64/Packages").await;
+        assert!(dist.contains("Package: structpkg\n") && !dist.contains("Package: flatpkg"));
+    }
+
+    /// Deleting the last structured package removes its dists/ tree (stale
+    /// Release/signatures would otherwise keep advertising it) and the repo
+    /// reverts to empty flat indexes.
+    #[tokio::test]
+    async fn test_deb_structured_delete_cleans_dists_tree() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/a_1_amd64.deb?distribution=jammy",
+            build_test_deb_arch("a", "1", "amd64", "gz"),
+        )
+        .await;
+
+        let resp = send(
+            &ctx.app,
+            Method::DELETE,
+            "/deb/myrepo/pool/a_1_amd64.deb",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        for path in [
+            "dists/jammy/Release",
+            "dists/jammy/InRelease",
+            "dists/jammy/main/binary-amd64/Packages",
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/deb/myrepo/{path}"), "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let flat = get_text(&ctx, "/deb/myrepo/Packages").await;
+        assert!(!flat.contains("Package:"), "{flat}");
+    }
+
+    #[tokio::test]
+    async fn test_deb_structured_upload_rejections() {
+        let ctx = create_test_context();
+        let deb = build_test_deb_with("x", "1.0", "gz");
+        for (path, expect) in [
+            ("/deb/myrepo/x.deb?component=main", "component alone"),
+            ("/deb/myrepo/x.deb?distribution=ja%20mmy", "space in dist"),
+            (
+                "/deb/myrepo/x.deb?distribution=jammy&component=..",
+                "dot component",
+            ),
+            ("/deb/myrepo/dists/jammy/x.deb", "upload into dists/"),
+        ] {
+            let resp = send(&ctx.app, Method::PUT, path, deb.clone()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{expect}");
+        }
+        assert!(ctx.state.storage.list("deb/").await.unwrap().is_empty());
+    }
+
+    /// Reindex preserves structured placement recorded in surviving sidecars
+    /// and adopts sidecar-less packages into the flat layout.
+    #[tokio::test]
+    async fn test_deb_structured_reindex() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/myrepo/pool/a_1_amd64.deb?distribution=jammy",
+            build_test_deb_arch("a", "1", "amd64", "gz"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put(
+                "deb/myrepo/pool/adopted.deb",
+                &build_test_deb_with("adopted", "2.0", "gz"),
+            )
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::POST, "/deb/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let dist = get_text(&ctx, "/deb/myrepo/dists/jammy/main/binary-amd64/Packages").await;
+        assert!(dist.contains("Package: a\n"), "placement survives reindex");
+        let flat = get_text(&ctx, "/deb/myrepo/Packages").await;
+        assert!(flat.contains("Package: adopted\n"), "adopted into flat");
+        assert!(!flat.contains("Package: a\n"));
     }
 }
