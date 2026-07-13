@@ -51,8 +51,10 @@ use crate::config::basic_auth_header;
 use crate::metrics::UPSTREAM_REQUEST_DURATION;
 use crate::registry_type::RegistryType;
 use crate::AppState;
+use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use std::time::{Duration, Instant};
 
 /// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
@@ -351,6 +353,125 @@ pub(crate) async fn proxy_forward_post(
     }
     cb.record_failure(registry_str, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
+}
+
+// ============================================================================
+// Streaming upload helpers (shared by docker blob uploads and raw uploads)
+// ============================================================================
+
+/// Outcome of streaming a request body to a temp file with a byte budget.
+pub(crate) enum StreamOutcome {
+    /// Wrote N bytes successfully.
+    Ok(u64),
+    /// Budget exceeded — aborted before writing the offending frame (413).
+    TooLarge,
+    /// Request-body stream errored mid-flight (client disconnect).
+    ClientGone,
+    /// Local write/flush failure (500).
+    Io(std::io::Error),
+}
+
+/// Stream `body` into `file`, bounded to `budget` bytes, never holding more than
+/// one frame in RAM (#817). The running total is checked BEFORE each write, so at
+/// most `budget` bytes ever reach disk — a request over budget aborts without
+/// writing the offending frame.
+///
+/// CANCEL-SAFETY: a pure per-frame read→write loop with no lock held and no
+/// shared state mutated. If the future is dropped mid-stream, the partially
+/// written file is reclaimed by the caller's `TempFileGuard`; nothing is left
+/// half-set.
+pub(crate) async fn stream_body_to_file(
+    body: Body,
+    file: &mut tokio::fs::File,
+    budget: u64,
+) -> StreamOutcome {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = body.into_data_stream();
+    let mut written: u64 = 0;
+    while let Some(frame) = stream.next().await {
+        let chunk = match frame {
+            Ok(c) => c,
+            Err(_) => return StreamOutcome::ClientGone,
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > budget {
+            return StreamOutcome::TooLarge;
+        }
+        if let Err(e) = file.write_all(&chunk).await {
+            return StreamOutcome::Io(e);
+        }
+    }
+    if let Err(e) = file.flush().await {
+        return StreamOutcome::Io(e);
+    }
+    // Durability: put_from_path's direct-rename commit relies on the caller
+    // having fsync'd the source — without this, a power loss just after the
+    // rename can leave the key's directory entry pointing at data that never
+    // reached disk (latent for docker since the switch to streaming; #846).
+    if let Err(e) = file.sync_all().await {
+        return StreamOutcome::Io(e);
+    }
+    // Postcondition: a successful stream never exceeds the budget — the loop
+    // returns TooLarge before writing any frame that would cross it.
+    debug_assert!(
+        written <= budget,
+        "stream_body_to_file wrote {written} bytes > budget {budget}"
+    );
+    StreamOutcome::Ok(written)
+}
+
+/// Parse the `Content-Length` header, if present and well-formed.
+pub(crate) fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// RAII: delete a temp file on drop unless disarmed.
+///
+/// Ensures temp files are cleaned up on ALL error paths (network errors,
+/// hash mismatch, panics, early returns via `?` operator) — #580.
+pub(crate) struct TempFileGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TempFileGuard {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Disarm the guard — caller takes ownership of cleanup.
+    /// Call this after successful `put_from_path` (which moves/deletes the file).
+    pub(crate) fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// sha256 of a file's contents, read in 256 KiB chunks — used to hash a
+/// streamed upload without ever holding the body in memory.
+pub(crate) async fn sha256_of_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        match reader.read(&mut buf).await? {
+            0 => break,
+            n => hasher.update(&buf[..n]),
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // ============================================================================

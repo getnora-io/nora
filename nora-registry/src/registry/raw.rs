@@ -4,11 +4,14 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::registry::method_not_allowed;
+use crate::registry::{
+    content_length, method_not_allowed, sha256_of_file, stream_body_to_file, StreamOutcome,
+    TempFileGuard,
+};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -98,8 +101,18 @@ async fn download(
         }
     }
 
-    match state.storage.get_verified(&key).await {
-        Ok(outcome) => {
+    // Streamed serve with STREAMING integrity verification. The buffered
+    // `get_verified` gate would hold the whole object in memory — unusable for
+    // multi-GB artifacts — so raw hashes the stream as it is served and
+    // compares against the recorded pin at EOF. On a mismatch the body is
+    // aborted BEFORE its final frame: the client observes a connection error /
+    // Content-Length shortfall instead of a completed corrupt download —
+    // fail-closed, in streaming form. A key with no pin (object-store backend)
+    // is served without a cryptographic check, exactly like the buffered
+    // gate's `Unpinned` arm.
+    let pin = state.storage.get_pin_hash(&key);
+    match state.storage.get_reader(&key).await {
+        Ok((len, reader)) => {
             state.metrics.record_download("raw");
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
@@ -111,29 +124,21 @@ async fn download(
                 .audit
                 .log(AuditEntry::new("pull", "api", "", "raw", ""));
 
-            // Discharge the integrity witness once, here at the serve site. A
-            // cryptographically Verified read flows through `verified_body`,
-            // which accepts *only* a `Blob<Verified>` — serving raw or merely
-            // tamper-evident bytes on this path is a compile error. An
-            // open-world read (unpinned key / S3 backend) is served knowingly,
-            // never silently. (Typestate pilot — see `crate::verified`.)
-            use nora_registry::verified::{verified_body, GateOutcome};
-            let data = match outcome {
-                GateOutcome::Verified(blob) => verified_body(blob),
-                GateOutcome::Unpinned(blob) => blob.into_inner(),
-            };
-
-            // Guess content type from extension
             let content_type = guess_content_type(&key);
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, len.to_string())
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
-            if let Some(hash) = state.storage.get_pin_hash(&key) {
+            if let Some(ref hash) = pin {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
             builder
-                .body(axum::body::Body::from(data))
+                .body(axum::body::Body::from_stream(verify_while_streaming(
+                    reader,
+                    pin,
+                    key.clone(),
+                )))
                 .expect("valid response")
                 .into_response()
         }
@@ -145,12 +150,101 @@ async fn download(
     }
 }
 
+/// Frame stream that hashes every frame and, when an integrity pin is
+/// present, withholds the FINAL frame until the digest has been checked at
+/// EOF — a mismatch aborts the body one frame short of completion, so a
+/// tampered object can never arrive at the client as a complete download.
+/// (The streaming counterpart of the buffered `get_verified` gate; see the
+/// serve site above.)
+struct VerifyingStream {
+    frames:
+        tokio_util::io::ReaderStream<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>,
+    /// Expected pin + running hash; `None` = unpinned key, no check.
+    hashing: Option<(String, sha2::Sha256)>,
+    key: String,
+    /// One-frame holdback buffer (only used while `hashing` is active).
+    held: Option<axum::body::Bytes>,
+    done: bool,
+}
+
+impl futures::Stream for VerifyingStream {
+    type Item = Result<axum::body::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use sha2::Digest;
+        use std::task::Poll;
+
+        loop {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            match std::pin::Pin::new(&mut self.frames).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if let Some((_, hasher)) = self.hashing.as_mut() {
+                        hasher.update(&chunk);
+                        // Holdback applies only when a pin will be checked.
+                        match self.held.replace(chunk) {
+                            Some(prev) => return Poll::Ready(Some(Ok(prev))),
+                            None => continue, // primed the holdback, read on
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    if let Some((expected, hasher)) = self.hashing.take() {
+                        let computed = hex::encode(hasher.finalize());
+                        if computed != expected {
+                            tracing::error!(
+                                key = %self.key,
+                                expected = %expected,
+                                computed = %computed,
+                                "SECURITY: integrity pin mismatch on streamed read — aborting body"
+                            );
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                "integrity pin mismatch",
+                            ))));
+                        }
+                    }
+                    return match self.held.take() {
+                        Some(last) => Poll::Ready(Some(Ok(last))),
+                        None => Poll::Ready(None),
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn verify_while_streaming(
+    reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    pin: Option<String>,
+    key: String,
+) -> VerifyingStream {
+    use sha2::Digest;
+    VerifyingStream {
+        frames: tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024),
+        hashing: pin.map(|p| (p, sha2::Sha256::new())),
+        key,
+        held: None,
+        done: false,
+    }
+}
+
 async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -174,17 +268,57 @@ async fn upload(
             .into_response();
     }
 
-    // Check file size limit
-    if body.len() as u64 > state.config.raw.max_file_size {
-        return (
+    let too_large = || {
+        (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "File too large. Max size: {} bytes",
                 state.config.raw.max_file_size
             ),
         )
-            .into_response();
+            .into_response()
+    };
+    // Fast-reject an oversized declared length before reading any body bytes.
+    if content_length(&headers).is_some_and(|len| len > state.config.raw.max_file_size) {
+        return too_large();
     }
+
+    // Stream the body to a temp file on the storage filesystem — the body is
+    // never held in memory, so uploads are bounded by disk, not RAM, and the
+    // local backend's put_from_path commits by rename (no copy). The size cap
+    // is enforced incrementally as frames arrive. Streamed BEFORE taking the
+    // publish lock so a slow client cannot hold the key's lock for the
+    // duration of a multi-GB transfer.
+    let temp_dir = raw_upload_temp_dir(&state.config.storage.path);
+    let temp_path = temp_dir.join(uuid::Uuid::new_v4().to_string());
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    let mut file = match tokio::fs::File::create(&temp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create raw upload temp file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match stream_body_to_file(body, &mut file, state.config.raw.max_file_size).await {
+        StreamOutcome::Ok(_) => {}
+        StreamOutcome::TooLarge => return too_large(),
+        StreamOutcome::ClientGone => {
+            return (StatusCode::BAD_REQUEST, "Request body stream ended early").into_response()
+        }
+        StreamOutcome::Io(e) => {
+            tracing::error!(error = %e, "Failed to write raw upload temp file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    drop(file);
+    // Hash the streamed file for the integrity pin (drives the ETag flows).
+    let sha256 = match sha256_of_file(&temp_path).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to hash raw upload temp file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
@@ -235,7 +369,7 @@ async fn upload(
 
         // If-Match: * → update only if resource exists
         (true, _, Some("*")) => {
-            return do_overwrite(&state, &key, &path, &body).await;
+            return do_overwrite(&state, &key, &path, &temp_path, &sha256, &mut temp_guard).await;
         }
         (false, _, Some("*")) => {
             return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
@@ -248,7 +382,15 @@ async fn upload(
                 Some(hash) => {
                     let expected = format!("\"{}\"", hash);
                     if etag == expected {
-                        return do_overwrite(&state, &key, &path, &body).await;
+                        return do_overwrite(
+                            &state,
+                            &key,
+                            &path,
+                            &temp_path,
+                            &sha256,
+                            &mut temp_guard,
+                        )
+                        .await;
                     }
                     return (StatusCode::PRECONDITION_FAILED, "ETag mismatch").into_response();
                 }
@@ -267,9 +409,14 @@ async fn upload(
         }
     }
 
-    // Create new file
-    match state.storage.put(&key, &body).await {
+    // Create new file — commit the streamed temp (rename on the local backend).
+    match state
+        .storage
+        .put_from_path(&key, &temp_path, Some(&sha256))
+        .await
+    {
         Ok(()) => {
+            temp_guard.disarm();
             state.metrics.record_upload("raw");
             state
                 .audit
@@ -291,11 +438,23 @@ async fn upload(
 }
 
 /// Overwrite an existing file (conditional PUT with `If-Match`).
-async fn do_overwrite(state: &AppState, key: &str, path: &str, body: &[u8]) -> Response {
-    // Direct put() — both filesystem and S3 backends overwrite in-place,
-    // avoiding the 404 window that delete-then-put created for concurrent readers.
-    match state.storage.put(key, body).await {
+async fn do_overwrite(
+    state: &AppState,
+    key: &str,
+    path: &str,
+    temp_path: &std::path::Path,
+    sha256: &str,
+    temp_guard: &mut TempFileGuard,
+) -> Response {
+    // put_from_path overwrites in place on both backends, avoiding the 404
+    // window that delete-then-put created for concurrent readers.
+    match state
+        .storage
+        .put_from_path(key, temp_path, Some(sha256))
+        .await
+    {
         Ok(()) => {
+            temp_guard.disarm();
             state.metrics.record_upload("raw");
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
@@ -379,6 +538,16 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Temp directory for streamed raw uploads, created on demand. Lives inside
+/// the storage path so the local backend's commit is a same-filesystem rename.
+fn raw_upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/raw-uploads");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(path = %dir.display(), error = %e, "failed to create raw upload temp directory");
+    }
+    dir
 }
 
 /// Format a Unix timestamp as an HTTP-date (RFC 7231 §7.1.1.1).
@@ -520,7 +689,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_raw_namespace_scope_enforced() {
         use crate::config::ScopeEnforcement;
-        use axum::body::Bytes;
+        use axum::body::Body;
         use axum::extract::{Path, State};
         use axum::Extension;
 
@@ -532,7 +701,7 @@ mod integration_tests {
             Path("other/secret.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Enforce)),
             axum::http::HeaderMap::new(),
-            Bytes::from_static(b"x"),
+            Body::from(&b"x"[..]),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -544,7 +713,7 @@ mod integration_tests {
             Path("myorg/app/file.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Enforce)),
             axum::http::HeaderMap::new(),
-            Bytes::from_static(b"x"),
+            Body::from(&b"x"[..]),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -564,7 +733,7 @@ mod integration_tests {
             Path("elsewhere/a.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Audit)),
             axum::http::HeaderMap::new(),
-            Bytes::from_static(b"x"),
+            Body::from(&b"x"[..]),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -609,6 +778,98 @@ mod integration_tests {
 
         let get = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Uploads stream to disk: a multi-megabyte body (many frames) round-trips,
+    /// records an integrity pin (ETag present), and leaves no temp file behind.
+    #[tokio::test]
+    async fn test_raw_streamed_upload_roundtrip_and_temp_hygiene() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.raw.max_file_size = 16 * 1024 * 1024
+        });
+        // ~3.2MB of non-repeating bytes — crosses many body frames.
+        let body: Vec<u8> = (0..800_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let put = send(&ctx.app, Method::PUT, "/raw/big.bin", body.clone()).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let get = send(&ctx.app, Method::GET, "/raw/big.bin", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert!(
+            get.headers().get("etag").is_some(),
+            "pin must survive streaming"
+        );
+        let got = body_bytes(get).await;
+        assert_eq!(got.len(), body.len());
+        assert_eq!(&got[..], &body[..]);
+
+        let tmp = std::path::Path::new(&ctx.state.config.storage.path).join("tmp/raw-uploads");
+        let leftovers = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(
+            leftovers, 0,
+            "temp file must be consumed by the commit rename"
+        );
+    }
+
+    /// The size cap rejects mid-stream (413), stores nothing, leaks no temp.
+    #[tokio::test]
+    async fn test_raw_streamed_upload_too_large_rejected_midstream() {
+        let ctx = create_test_context(); // 1 MB cap
+        let body = vec![0u8; 2 * 1024 * 1024];
+        let put = send(&ctx.app, Method::PUT, "/raw/big.bin", body).await;
+        assert_eq!(put.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(ctx.state.storage.stat("raw/big.bin").await.is_none());
+        let tmp = std::path::Path::new(&ctx.state.config.storage.path).join("tmp/raw-uploads");
+        let leftovers = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "aborted stream must not leak its temp file");
+    }
+
+    /// A tampered object must never arrive complete: the streamed read hashes
+    /// while serving and aborts the body before its final frame on a pin
+    /// mismatch — the client sees a broken transfer, not a corrupt file.
+    #[tokio::test]
+    async fn test_raw_streamed_read_aborts_on_tamper() {
+        let ctx = create_test_context();
+        let body = vec![7u8; 300_000];
+        let put = send(&ctx.app, Method::PUT, "/raw/pinned.bin", body.clone()).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        // Corrupt the object behind the pin store's back.
+        let on_disk = std::path::Path::new(&ctx.state.config.storage.path).join("raw/pinned.bin");
+        let mut tampered = std::fs::read(&on_disk).unwrap();
+        tampered[150_000] ^= 0xFF;
+        std::fs::write(&on_disk, &tampered).unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/raw/pinned.bin", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "status is already committed when streaming"
+        );
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        match collected {
+            Err(_) => {} // body errored mid-stream — the fail-closed signal
+            Ok(bytes) => assert!(
+                bytes.len() < body.len(),
+                "tampered object must not arrive complete ({} of {} bytes)",
+                bytes.len(),
+                body.len()
+            ),
+        }
+    }
+
+    /// An oversized declared Content-Length is rejected before the body is read.
+    #[tokio::test]
+    async fn test_raw_content_length_fast_reject() {
+        let ctx = create_test_context();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/big.bin",
+            vec![("content-length", "99999999")],
+            vec![0u8; 8],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

@@ -8,6 +8,9 @@ use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
+use crate::registry::{
+    content_length, sha256_of_file, stream_body_to_file, StreamOutcome, TempFileGuard,
+};
 use crate::secrets::expose_opt;
 use crate::storage::Storage;
 use crate::validation::{
@@ -533,62 +536,57 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Outcome of streaming a request body to a temp file with a byte budget.
-enum StreamOutcome {
-    /// Wrote N bytes successfully.
-    Ok(u64),
-    /// Budget exceeded — aborted before writing the offending frame (413).
-    TooLarge,
-    /// Request-body stream errored mid-flight (client disconnect).
-    ClientGone,
-    /// Local write/flush failure (500).
-    Io(std::io::Error),
-}
-
-/// Stream `body` into `file`, bounded to `budget` bytes, never holding more than
-/// one frame in RAM (#817). The running total is checked BEFORE each write, so at
-/// most `budget` bytes ever reach disk — a request over budget aborts without
-/// writing the offending frame.
+/// RAII guard for `PROXY_ACTIVE_DOWNLOADS` gauge — decrements on drop (#580).
 ///
-/// CANCEL-SAFETY: a pure per-frame read→write loop with no lock held and no
-/// shared state mutated. If the future is dropped mid-stream, the partially
-/// written file is reclaimed by the caller's `TempFileGuard`; nothing is left
-/// half-set.
-async fn stream_body_to_file(body: Body, file: &mut tokio::fs::File, budget: u64) -> StreamOutcome {
-    use tokio::io::AsyncWriteExt;
-    let mut stream = body.into_data_stream();
-    let mut written: u64 = 0;
-    while let Some(frame) = stream.next().await {
-        let chunk = match frame {
-            Ok(c) => c,
-            Err(_) => return StreamOutcome::ClientGone,
-        };
-        written = written.saturating_add(chunk.len() as u64);
-        if written > budget {
-            return StreamOutcome::TooLarge;
-        }
-        if let Err(e) = file.write_all(&chunk).await {
-            return StreamOutcome::Io(e);
-        }
+/// Guarantees the gauge stays accurate on all exit paths including panics,
+/// early `?` returns, and tokio task cancellation.
+struct ProxyDownloadGuard;
+
+impl Drop for ProxyDownloadGuard {
+    fn drop(&mut self) {
+        crate::metrics::PROXY_ACTIVE_DOWNLOADS.dec();
     }
-    if let Err(e) = file.flush().await {
-        return StreamOutcome::Io(e);
-    }
-    // Postcondition: a successful stream never exceeds the budget — the loop
-    // returns TooLarge before writing any frame that would cross it.
-    debug_assert!(
-        written <= budget,
-        "stream_body_to_file wrote {written} bytes > budget {budget}"
-    );
-    StreamOutcome::Ok(written)
 }
 
-/// Parse the `Content-Length` header, if present and well-formed.
-fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
-    headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+/// Validate that an upload UUID from URL path is safe (no path traversal).
+///
+/// Accepts only lowercase hex + hyphens (UUID-4 format) up to 36 chars.
+/// Rejects `/`, `..`, null bytes, and anything that could escape the temp directory.
+fn validate_upload_uuid(uuid: &str) -> Result<(), &'static str> {
+    if uuid.is_empty() || uuid.len() > 36 {
+        return Err("invalid upload UUID length");
+    }
+    if uuid
+        .bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+    {
+        return Err("invalid upload UUID characters");
+    }
+    Ok(())
+}
+
+/// Remove stale temp files from the Docker upload directory.
+///
+/// Files older than `SESSION_TTL` are removed regardless of name format.
+/// Called at startup and periodically from the background task (mirrors
+/// [`cleanup_proxy_temp_dir`]), so an upload temp orphaned by a storage-write
+/// failure — whose session entry is already gone, so `cleanup_expired_sessions`
+/// will never free it — is reclaimed without waiting for a restart. The
+/// Get the temp directory for Docker uploads, creating it if needed.
+fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(path = %dir.display(), error = %e, "failed to create upload temp directory");
+    }
+    dir
+}
+
+fn proxy_temp_dir(data_dir: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(path = %dir.display(), error = %e, "failed to create proxy temp directory");
+    }
+    dir
 }
 
 /// Remove expired upload sessions and their temp files (called by background task)
@@ -627,87 +625,6 @@ pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>
     }
 }
 
-/// Get the temp directory for Docker uploads, creating it if needed.
-fn upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::error!(path = %dir.display(), error = %e, "failed to create upload temp directory");
-    }
-    dir
-}
-
-fn proxy_temp_dir(data_dir: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::error!(path = %dir.display(), error = %e, "failed to create proxy temp directory");
-    }
-    dir
-}
-
-/// RAII guard that deletes a temp file on drop unless disarmed.
-///
-/// Ensures temp files are cleaned up on ALL error paths (network errors,
-/// hash mismatch, panics, early returns via `?` operator) — #580.
-pub(crate) struct TempFileGuard {
-    path: Option<std::path::PathBuf>,
-}
-
-impl TempFileGuard {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    /// Disarm the guard — caller takes ownership of cleanup.
-    /// Call this after successful `put_from_path` (which moves/deletes the file).
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// RAII guard for `PROXY_ACTIVE_DOWNLOADS` gauge — decrements on drop (#580).
-///
-/// Guarantees the gauge stays accurate on all exit paths including panics,
-/// early `?` returns, and tokio task cancellation.
-struct ProxyDownloadGuard;
-
-impl Drop for ProxyDownloadGuard {
-    fn drop(&mut self) {
-        crate::metrics::PROXY_ACTIVE_DOWNLOADS.dec();
-    }
-}
-
-/// Validate that an upload UUID from URL path is safe (no path traversal).
-///
-/// Accepts only lowercase hex + hyphens (UUID-4 format) up to 36 chars.
-/// Rejects `/`, `..`, null bytes, and anything that could escape the temp directory.
-fn validate_upload_uuid(uuid: &str) -> Result<(), &'static str> {
-    if uuid.is_empty() || uuid.len() > 36 {
-        return Err("invalid upload UUID length");
-    }
-    if uuid
-        .bytes()
-        .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'-'))
-    {
-        return Err("invalid upload UUID characters");
-    }
-    Ok(())
-}
-
-/// Remove stale temp files from the Docker upload directory.
-///
-/// Files older than `SESSION_TTL` are removed regardless of name format.
-/// Called at startup and periodically from the background task (mirrors
-/// [`cleanup_proxy_temp_dir`]), so an upload temp orphaned by a storage-write
-/// failure — whose session entry is already gone, so `cleanup_expired_sessions`
-/// will never free it — is reclaimed without waiting for a restart. The
 /// `SESSION_TTL` age guard keeps in-progress uploads safe under the periodic call.
 pub fn cleanup_upload_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
@@ -1935,32 +1852,14 @@ async fn upload_blob(
 
     // Verify digest by streaming SHA-256 — O(chunk_size) memory, not O(blob_size)
     {
-        use sha2::Digest as _;
-        use tokio::io::AsyncReadExt;
-        let file = match tokio::fs::File::open(&temp_path).await {
-            Ok(f) => f,
+        let computed = match sha256_of_file(&temp_path).await {
+            Ok(h) => format!("sha256:{h}"),
             Err(e) => {
-                tracing::error!(error = %e, "Failed to open temp file for digest verification");
+                tracing::error!(error = %e, "Failed to hash temp file for digest verification");
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let mut reader = tokio::io::BufReader::new(file);
-        let mut hasher = sha2::Sha256::new();
-        let mut buf = vec![0u8; 256 * 1024]; // 256 KiB read chunks
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to read temp file for digest");
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            hasher.update(&buf[..n]);
-        }
-        let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
         if computed != *digest {
             tracing::warn!(
                 expected = %digest,

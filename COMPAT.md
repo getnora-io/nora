@@ -115,11 +115,11 @@ This document describes which parts of each registry protocol are implemented in
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Upload (PUT) | Full | Any file type |
+| Upload (PUT) | Full | Any file type; body streams to disk (O(frame) memory), so upload size is bounded by `raw.max_file_size` alone — `server.body_limit_mb` does not apply |
 | Download (GET) | Full | Content-Type by extension |
 | Delete (DELETE) | Full | |
 | Exists check (HEAD) | Full | Returns size + Content-Type |
-| Max file size | Full | Configurable (default 1MB) |
+| Max file size | Full | Configurable `raw.max_file_size` (default 100MB), enforced incrementally mid-stream |
 | Conditional overwrite (`If-Match`) | Full | ETag-based, returns 200 on success |
 | Create-only (`If-None-Match: *`) | Full | Returns 412 if resource exists |
 | Directory listing | — | Not implemented |
