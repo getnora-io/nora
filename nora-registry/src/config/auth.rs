@@ -180,6 +180,22 @@ pub struct AuthConfig {
     /// endpoint. ENV: NORA_AUTH_DOCKER_ANON_PULL.
     #[serde(default)]
     pub docker_anon_pull: bool,
+    /// Serve the browse UI and its JSON API (`/ui`, `/api/ui`) and the API
+    /// docs (`/api-docs`) without authentication. Default `false`
+    /// (fail-closed): the web surface enumerates every repository and
+    /// package — exactly what a private deployment is hiding — so with auth
+    /// enabled it requires credentials unless `anonymous_read` (which
+    /// already exposes the same names through the registry read APIs) or
+    /// this switch opens it. Health probes (`/health`, `/ready`) are always
+    /// public. ENV: NORA_AUTH_PUBLIC_WEB_UI.
+    #[serde(default)]
+    pub public_web_ui: bool,
+    /// Serve `/metrics` without authentication. Default `true`: Prometheus
+    /// scrapers rarely carry credentials, and metric labels name registry
+    /// FORMATS, not repositories. Set `false` to require auth there too
+    /// (Prometheus `basic_auth` supports it). ENV: NORA_AUTH_PUBLIC_METRICS.
+    #[serde(default = "default_public_metrics")]
+    pub public_metrics: bool,
     #[serde(default = "default_htpasswd_file")]
     pub htpasswd_file: String,
     #[serde(default = "default_token_storage")]
@@ -343,6 +359,10 @@ pub(super) fn default_namespace_scope() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_public_metrics() -> bool {
+    true
+}
+
 pub(super) fn default_htpasswd_file() -> String {
     "users.htpasswd".to_string()
 }
@@ -361,6 +381,8 @@ impl Default for AuthConfig {
             enabled: false,
             anonymous_read: false,
             docker_anon_pull: false,
+            public_web_ui: false,
+            public_metrics: true,
             htpasswd_file: "users.htpasswd".to_string(),
             token_storage: "data/tokens".to_string(),
             token_cache_ttl: 300,
@@ -374,6 +396,12 @@ impl Default for AuthConfig {
 impl AuthConfig {
     /// Apply environment variable overrides for auth config.
     pub(super) fn apply_env_overrides(&mut self) {
+        if let Ok(val) = env::var("NORA_AUTH_PUBLIC_WEB_UI") {
+            self.public_web_ui = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_AUTH_PUBLIC_METRICS") {
+            self.public_metrics = val.to_lowercase() == "true" || val == "1";
+        }
         if let Ok(val) = env::var("NORA_AUTH_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";
         }
