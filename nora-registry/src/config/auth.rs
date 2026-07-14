@@ -248,9 +248,20 @@ pub struct AuthConfig {
 /// # but logs+counts them (nora_auth_namespace_scope_total) for staged rollout.
 /// namespace_scope_enforcement = "enforce"
 ///
-/// [auth.oidc.providers.role_rules]
-/// "repo:myorg/*:ref:refs/heads/main" = "write"
-/// "repo:myorg/*" = "read"
+/// [[auth.oidc.providers.role_rules]]
+/// pattern = "repo:myorg/*:ref:refs/heads/main"
+/// role = "write"
+///
+/// # A rule may narrow the provider's namespace_scope: these identities can
+/// # write, but only under ci-transport/.
+/// [[auth.oidc.providers.role_rules]]
+/// pattern = "repo:myorg/*:pull_request"
+/// role = "write"
+/// namespace_scope = ["ci-transport/**"]
+///
+/// [[auth.oidc.providers.role_rules]]
+/// pattern = "repo:myorg/*"
+/// role = "read"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcConfig {
@@ -325,6 +336,12 @@ pub struct OidcRoleRule {
     pub pattern: String,
     /// Role to assign: "read", "write", or "admin"
     pub role: String,
+    /// Narrow the provider's `namespace_scope` for identities matched by this
+    /// rule (e.g. grant CI pull-request builds write access to a transport
+    /// prefix only). Absent = inherit the provider's scope. A rule scope is
+    /// applied with the provider's `namespace_scope_enforcement`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_scope: Option<Vec<String>>,
 }
 
 /// How an OIDC provider's `namespace_scope` is applied on writes.

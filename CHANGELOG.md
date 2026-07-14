@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **Per-rule namespace scope for OIDC role rules** — an `[[auth.oidc.providers.role_rules]]` entry may set `namespace_scope = ["ci-transport/**"]` to narrow the provider's scope for identities matched by that rule. Lets one issuer grant, e.g., pull-request CI builds write access confined to a transport prefix while main/tag builds keep the provider-wide scope. Absent = inherit the provider's `namespace_scope`; enforcement mode stays provider-level. Also corrects the config doc example for `role_rules`, which showed a map form that fails to parse (the real shape is an array of tables with `pattern`/`role`).
+
 ## [1.0.1] - 2026-07-13
 
 ### Security

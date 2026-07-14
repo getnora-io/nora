@@ -209,7 +209,7 @@ impl OidcValidator {
 
         // Map claims to role via role_rules
         let subject = claims.sub.unwrap_or_default();
-        let role = self.match_role(provider, &subject).ok_or_else(|| {
+        let (role, rule_scope) = self.match_role(provider, &subject).ok_or_else(|| {
             format!(
                 "No role rule matches sub='{}' for provider {}",
                 subject, provider.name
@@ -221,7 +221,8 @@ impl OidcValidator {
             subject,
             issuer: provider.issuer.clone(),
             role,
-            namespace_scope: provider.namespace_scope.clone(),
+            // A rule-level scope narrows the provider scope for this identity.
+            namespace_scope: rule_scope.unwrap_or_else(|| provider.namespace_scope.clone()),
             namespace_scope_enforcement: provider.namespace_scope_enforcement,
         })
     }
@@ -336,15 +337,21 @@ impl OidcValidator {
     }
 
     /// Match subject against provider's role_rules. First match wins.
-    fn match_role(&self, provider: &OidcProvider, subject: &str) -> Option<Role> {
+    /// Returns the role plus the rule's namespace-scope override, if any.
+    fn match_role(
+        &self,
+        provider: &OidcProvider,
+        subject: &str,
+    ) -> Option<(Role, Option<Vec<String>>)> {
         for rule in &provider.role_rules {
             if glob_match(&rule.pattern, subject) {
-                return match rule.role.as_str() {
-                    "admin" => Some(Role::Admin),
-                    "write" => Some(Role::Write),
-                    "read" => Some(Role::Read),
-                    _ => None,
+                let role = match rule.role.as_str() {
+                    "admin" => Role::Admin,
+                    "write" => Role::Write,
+                    "read" => Role::Read,
+                    _ => return None,
                 };
+                return Some((role, rule.namespace_scope.clone()));
             }
         }
         None
@@ -455,25 +462,38 @@ mod tests {
                 OidcRoleRule {
                     pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
                     role: "write".to_string(),
+                    namespace_scope: None,
+                },
+                OidcRoleRule {
+                    pattern: "repo:myorg/*:pull_request".to_string(),
+                    role: "write".to_string(),
+                    namespace_scope: Some(vec!["ci-transport/**".to_string()]),
                 },
                 OidcRoleRule {
                     pattern: "repo:myorg/*".to_string(),
                     role: "read".to_string(),
+                    namespace_scope: None,
                 },
             ],
         };
 
-        // main branch → write (first rule)
-        let role = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/main");
-        assert!(matches!(role, Some(Role::Write)));
+        // main branch → write (first rule), inherits provider scope
+        let m = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/main");
+        assert!(matches!(m, Some((Role::Write, None))));
 
-        // other branch → read (second rule)
-        let role = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/dev");
-        assert!(matches!(role, Some(Role::Read)));
+        // pull_request → write narrowed to the rule's scope
+        let m = validator.match_role(&provider, "repo:myorg/app:pull_request");
+        let (role, scope) = m.unwrap();
+        assert_eq!(role, Role::Write);
+        assert_eq!(scope.as_deref(), Some(&["ci-transport/**".to_string()][..]));
+
+        // other branch → read (last rule)
+        let m = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/dev");
+        assert!(matches!(m, Some((Role::Read, None))));
 
         // different org → no match
-        let role = validator.match_role(&provider, "repo:other/app:ref:refs/heads/main");
-        assert!(role.is_none());
+        let m = validator.match_role(&provider, "repo:other/app:ref:refs/heads/main");
+        assert!(m.is_none());
     }
 
     #[test]

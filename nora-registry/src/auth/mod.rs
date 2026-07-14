@@ -1522,10 +1522,17 @@ Jd74nq6dNCjpWG4drIsyhqX+
                         OidcRoleRule {
                             pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
                             role: "write".to_string(),
+                            namespace_scope: None,
+                        },
+                        OidcRoleRule {
+                            pattern: "repo:myorg/*:pull_request".to_string(),
+                            role: "write".to_string(),
+                            namespace_scope: Some(vec!["ci-transport/**".to_string()]),
                         },
                         OidcRoleRule {
                             pattern: "repo:myorg/*".to_string(),
                             role: "read".to_string(),
+                            namespace_scope: None,
                         },
                     ],
                 }],
@@ -1642,6 +1649,62 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::CREATED,
             "Write with main-branch OIDC token should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_rule_scope_narrows_writes() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // pull_request rule: role=write, namespace_scope=["ci-transport/**"]
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:pull_request",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", token);
+
+        // In-scope write is allowed…
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/ci-transport/run-1/artifact.txt",
+            vec![("authorization", &bearer)],
+            b"transport".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "PR token should write inside its rule scope"
+        );
+
+        // …but the same identity cannot write outside the rule's scope, even
+        // though the provider scope is ["*"].
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/prod/artifact.txt",
+            vec![("authorization", &bearer)],
+            b"escape".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "PR token must not write outside its rule scope"
         );
     }
 
