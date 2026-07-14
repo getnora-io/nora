@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **Cargo sparse index now advertises `auth-required` on private deployments** — with auth enabled and `anonymous_read` off, `/cargo/index/config.json` sets `"auth-required": true` (RFC 3139) so cargo sends credentials on index and download requests. Previously cargo only authenticated the publish API, and every sparse-index fetch against a private instance failed with 401 before publish even started.
+
 ## [1.0.1] - 2026-07-13
 
 ### Security
