@@ -405,15 +405,12 @@ async fn collect_sidecar_versions(
             Some(placement) => format!("{registry}:{repo}/{placement}/{}", sv.package),
             None => format!("{registry}:{repo}/{}", sv.package),
         };
-        groups
-            .entry(group)
-            .or_default()
-            .push(VersionEntry {
-                name: sv.version,
-                keys: vec![package_key, key.clone()],
-                modified,
-                size: sv.size,
-            });
+        groups.entry(group).or_default().push(VersionEntry {
+            name: sv.version,
+            keys: vec![package_key, key.clone()],
+            modified,
+            size: sv.size,
+        });
     }
     groups.into_iter().collect()
 }
