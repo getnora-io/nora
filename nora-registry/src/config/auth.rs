@@ -338,8 +338,11 @@ pub struct OidcRoleRule {
     pub role: String,
     /// Narrow the provider's `namespace_scope` for identities matched by this
     /// rule (e.g. grant CI pull-request builds write access to a transport
-    /// prefix only). Absent = inherit the provider's scope. A rule scope is
-    /// applied with the provider's `namespace_scope_enforcement`.
+    /// prefix only). Enforced **in addition to** the provider scope — a write
+    /// must satisfy both, so the provider scope stays a hard ceiling and a
+    /// rule cannot widen past it (`["*"]` here is a no-op, not a promotion).
+    /// Absent = inherit the provider's scope. A rule scope is applied with
+    /// the provider's `namespace_scope_enforcement`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_scope: Option<Vec<String>>,
 }

@@ -431,11 +431,14 @@ pub async fn auth_middleware(
                         if is_admin && !identity.role.can_admin() {
                             return (StatusCode::FORBIDDEN, "Admin role required").into_response();
                         }
-                        // Carry the provider's namespace_scope into the request so
-                        // write handlers can enforce it on the artifact coordinate (#583).
-                        let authority = NamespaceAuthority::from_oidc_scope(
+                        // Carry the namespace scopes into the request so write
+                        // handlers can enforce them on the artifact coordinate
+                        // (#583). Provider scope and rule scope are a conjunction:
+                        // the provider scope is a ceiling a rule cannot widen.
+                        let authority = NamespaceAuthority::from_oidc_scopes(
                             &identity.provider,
-                            &identity.namespace_scope,
+                            std::iter::once(identity.namespace_scope.as_slice())
+                                .chain(identity.rule_namespace_scope.as_deref()),
                             identity.namespace_scope_enforcement,
                         );
                         request.extensions_mut().insert(authority);
@@ -1500,7 +1503,18 @@ Jd74nq6dNCjpWG4drIsyhqX+
 
     /// Build a TestContext with OIDC enabled, pointing at the given mock JWKS URL.
     fn create_oidc_test_context(mock_issuer_url: &str) -> TestContext {
+        create_oidc_test_context_scoped(mock_issuer_url, &["*"], None)
+    }
+
+    /// Like [`create_oidc_test_context`], with the provider `namespace_scope`
+    /// and the main-branch rule's `namespace_scope` injectable.
+    fn create_oidc_test_context_scoped(
+        mock_issuer_url: &str,
+        provider_scope: &[&str],
+        main_rule_scope: Option<Vec<String>>,
+    ) -> TestContext {
         let issuer = mock_issuer_url.to_string();
+        let provider_scope: Vec<String> = provider_scope.iter().map(|s| s.to_string()).collect();
         let mut ctx = create_test_context_with_config(move |cfg| {
             cfg.auth.enabled = true;
             cfg.auth.anonymous_read = false;
@@ -1515,14 +1529,14 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     audience: "nora".to_string(),
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,
-                    namespace_scope: vec!["*".to_string()],
+                    namespace_scope: provider_scope.clone(),
                     namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                     enabled: true,
                     role_rules: vec![
                         OidcRoleRule {
                             pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
                             role: "write".to_string(),
-                            namespace_scope: None,
+                            namespace_scope: main_rule_scope.clone(),
                         },
                         OidcRoleRule {
                             pattern: "repo:myorg/*:pull_request".to_string(),
@@ -1705,6 +1719,61 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::FORBIDDEN,
             "PR token must not write outside its rule scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oidc_rule_scope_cannot_widen_provider_ceiling() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Narrow provider ceiling, rule that tries to widen to ["*"].
+        let ctx = create_oidc_test_context_scoped(
+            &mock_server.uri(),
+            &["myorg/**"],
+            Some(vec!["*".to_string()]),
+        );
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", token);
+
+        // Inside the provider ceiling: allowed.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/myorg/repo/artifact.txt",
+            vec![("authorization", &bearer)],
+            b"inside".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // The rule's ["*"] must not lift the provider ceiling.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/other/artifact.txt",
+            vec![("authorization", &bearer)],
+            b"escape".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a rule namespace_scope of [\"*\"] must not widen past the provider scope"
         );
     }
 

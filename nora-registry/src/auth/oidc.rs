@@ -39,7 +39,12 @@ pub struct OidcIdentity {
     pub role: Role,
     /// Provider's `namespace_scope` patterns (segment-aware globs). `["*"]` = all
     /// namespaces. Enforced on writes via `auth::enforce_namespace_scope`.
+    /// Always the provider's hard ceiling, whatever the matched rule says.
     pub namespace_scope: Vec<String>,
+    /// The matched role rule's `namespace_scope`, if it set one. Enforced in
+    /// addition to the provider scope — a write must satisfy both, so a rule
+    /// can only narrow the provider ceiling, never widen past it.
+    pub rule_namespace_scope: Option<Vec<String>>,
     /// Whether `namespace_scope` is enforced (403 on mismatch) or only audited
     /// for this provider.
     pub namespace_scope_enforcement: ScopeEnforcement,
@@ -221,8 +226,8 @@ impl OidcValidator {
             subject,
             issuer: provider.issuer.clone(),
             role,
-            // A rule-level scope narrows the provider scope for this identity.
-            namespace_scope: rule_scope.unwrap_or_else(|| provider.namespace_scope.clone()),
+            namespace_scope: provider.namespace_scope.clone(),
+            rule_namespace_scope: rule_scope,
             namespace_scope_enforcement: provider.namespace_scope_enforcement,
         })
     }
