@@ -105,7 +105,7 @@ pub fn plan_deletions(
     versions.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
-            .then_with(|| b.name.cmp(&a.name))
+            .then_with(|| cmp_version_names(&b.name, &a.name))
     });
 
     let mut deletions = Vec::new();
@@ -155,6 +155,59 @@ pub fn plan_deletions(
     }
 
     deletions
+}
+
+/// Compare version-ish names the way version schemes expect: digit runs
+/// compare numerically (`"1.10" > "1.9"`) and `~` sorts before anything,
+/// including end-of-string (`"1.0~rc1" < "1.0"`, as in Debian versions).
+/// Only the mtime tiebreaker in [`plan_deletions`] — bulk-imported sidecars
+/// often share one mtime, and a lexical tiebreak would evict `1.10` in
+/// favour of `1.9`.
+fn cmp_version_names(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn take_digits<'s>(s: &'s [u8], i: &mut usize) -> &'s [u8] {
+        let start = *i;
+        while *i < s.len() && s[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        // Numeric comparison: strip leading zeros.
+        let run = &s[start..*i];
+        let nz = run.iter().position(|c| *c != b'0').unwrap_or(run.len());
+        &run[nz..]
+    }
+    // '~' < end-of-string/digit-run < everything else.
+    fn rank(c: Option<&u8>) -> u16 {
+        match c {
+            Some(b'~') => 0,
+            None => 1,
+            Some(&c) => 2 + c as u16,
+        }
+    }
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        // Non-digit run, byte by byte.
+        loop {
+            let ca = a.get(i).filter(|c| !c.is_ascii_digit());
+            let cb = b.get(j).filter(|c| !c.is_ascii_digit());
+            match rank(ca).cmp(&rank(cb)) {
+                Ordering::Equal if ca.is_none() => break,
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                other => return other,
+            }
+        }
+        if i >= a.len() && j >= b.len() {
+            return Ordering::Equal;
+        }
+        let (da, db) = (take_digits(a, &mut i), take_digits(b, &mut j));
+        match da.len().cmp(&db.len()).then_with(|| da.cmp(db)) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+    }
 }
 
 /// Check if a version name matches any exclusion glob pattern.
@@ -258,13 +311,17 @@ async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             href: s("href"),
             size: v.get("size_package").and_then(|x| x.as_u64()).unwrap_or(0),
             modified: v.get("file_time").and_then(|x| x.as_u64()),
+            placement: None,
         }
     })
     .await
 }
 
 /// Collect deb package versions per repository — deb counterpart of
-/// [`collect_rpm_versions`], same group/keys/regeneration contract.
+/// [`collect_rpm_versions`], same keys/regeneration contract. Structured
+/// packages group per placement (`deb:{repo}/{dist}/{component}/{package}`),
+/// matching how `regenerate_indexes` rebuilds one index per distribution;
+/// flat-root packages group as `deb:{repo}/{package}`.
 async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     collect_sidecar_versions(storage, "deb", |v| {
         let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -274,6 +331,11 @@ async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             href: s("filename"),
             size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
             modified: None, // deb sidecars carry no upload time; use sidecar mtime
+            placement: v.get("placement").and_then(|p| {
+                let d = p.get("distribution")?.as_str()?;
+                let c = p.get("component")?.as_str()?;
+                Some(format!("{d}/{c}"))
+            }),
         }
     })
     .await
@@ -285,6 +347,12 @@ struct SidecarVersion {
     href: String,
     size: u64,
     modified: Option<u64>,
+    /// `{distribution}/{component}` for structured-layout deb sidecars.
+    /// Each distribution is an independent APT index, so retention must
+    /// scope `keep_last` per distribution — pooling them would evict a
+    /// distribution's only version whenever a sibling distribution holds a
+    /// newer one. None = the repo's flat root scope.
+    placement: Option<String>,
 }
 
 async fn collect_sidecar_versions(
@@ -333,8 +401,12 @@ async fn collect_sidecar_versions(
             Some(m) => m,
             None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
         };
+        let group = match &sv.placement {
+            Some(placement) => format!("{registry}:{repo}/{placement}/{}", sv.package),
+            None => format!("{registry}:{repo}/{}", sv.package),
+        };
         groups
-            .entry(format!("{registry}:{repo}/{}", sv.package))
+            .entry(group)
             .or_default()
             .push(VersionEntry {
                 name: sv.version,
@@ -1084,6 +1156,33 @@ mod tests {
     }
 
     #[test]
+    fn test_version_name_tiebreak_is_numeric_aware() {
+        assert_eq!(
+            cmp_version_names("1.10_amd64", "1.9_amd64"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_version_names("1.0~rc1", "1.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(cmp_version_names("2.0", "2.0"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            cmp_version_names("1.2.3-4", "1.2.3-10"),
+            std::cmp::Ordering::Less
+        );
+
+        // Tied mtimes (bulk-imported sidecars): the newer version survives.
+        let versions = vec![
+            make_version("1.9_amd64", NOW, 100),
+            make_version("1.10_amd64", NOW, 100),
+        ];
+        let rule = make_rule(Some(1), None, vec![]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "1.9_amd64");
+    }
+
+    #[test]
     fn test_empty_versions() {
         let rule = make_rule(Some(1), None, vec![]);
         let plans = plan_deletions(vec![], &rule, NOW);
@@ -1484,6 +1583,72 @@ mod format_retention_tests {
         assert_eq!(packages.matches("Package: pkg").count(), 1, "{packages}");
         let inrelease = send(&ctx.app, Method::GET, "/deb/prod/InRelease", "").await;
         assert_eq!(inrelease.status(), StatusCode::OK);
+    }
+
+    /// `keep_last` counts per distribution, not per repo: a distribution's
+    /// sole version must survive even when a sibling distribution holds a
+    /// newer version of the same package (each distribution is an
+    /// independent APT index, and `regenerate_indexes` would silently drop
+    /// the evicted one).
+    #[tokio::test]
+    async fn test_deb_keep_last_counts_per_distribution() {
+        let ctx = create_test_context();
+        for (v, dist) in [("1.5", "jammy"), ("1.8", "jammy"), ("2.0", "focal")] {
+            let deb = crate::registry::deb::test_fixtures::build_deb("tree", v);
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/deb/myrepo/pool/tree_{v}_amd64.deb?distribution={dist}"),
+                deb,
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        let rules = vec![rule("deb", Some("myrepo/*"), Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1, "only jammy exceeds keep_last");
+
+        // jammy keeps its newest (name tiebreak on tied mtimes), focal keeps
+        // its only version.
+        let jammy = String::from_utf8(
+            body_bytes(
+                send(
+                    &ctx.app,
+                    Method::GET,
+                    "/deb/myrepo/dists/jammy/main/binary-amd64/Packages",
+                    "",
+                )
+                .await,
+            )
+            .await
+            .to_vec(),
+        )
+        .unwrap();
+        assert!(jammy.contains("Version: 1.8\n"), "{jammy}");
+        assert!(!jammy.contains("Version: 1.5\n"), "{jammy}");
+        let focal = String::from_utf8(
+            body_bytes(
+                send(
+                    &ctx.app,
+                    Method::GET,
+                    "/deb/myrepo/dists/focal/main/binary-amd64/Packages",
+                    "",
+                )
+                .await,
+            )
+            .await
+            .to_vec(),
+        )
+        .unwrap();
+        assert!(focal.contains("Version: 2.0\n"), "{focal}");
     }
 
     /// Raw: a depth-2 prefix is the version unit — the whole CALVER-style
