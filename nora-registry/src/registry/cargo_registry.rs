@@ -76,11 +76,16 @@ pub fn routes() -> Router<AppState> {
 /// GET /cargo/index/config.json — tells cargo where to download crates.
 async fn index_config(State(state): State<AppState>) -> Response {
     let base = nora_base_url(&state);
+    // Cargo only sends credentials to the sparse index and dl endpoints when
+    // the registry advertises `auth-required` (RFC 3139). Without it, a
+    // private deployment 401s every index fetch before publish even starts.
+    let auth_required = state.config.auth.enabled && !state.config.auth.anonymous_read;
     let config = serde_json::json!({
         "dl": format!("{}/cargo/api/v1/crates", base),
         // Cargo appends `/api/v1/...` to this base for write and metadata requests,
         // so the advertised API root must be the registry mount, not `/cargo/api`.
-        "api": format!("{}/cargo", base)
+        "api": format!("{}/cargo", base),
+        "auth-required": auth_required
     });
     (
         StatusCode::OK,
@@ -1161,6 +1166,46 @@ mod integration_tests {
             api.ends_with("/cargo"),
             "api must end with /cargo so Cargo can build {{api}}/api/v1/crates/... routes, got: {}",
             api
+        );
+        // Open test context (no auth): cargo must not be told to send creds.
+        assert_eq!(json["auth-required"], serde_json::Value::Bool(false));
+    }
+
+    /// A private deployment (auth on, no anonymous read) must advertise
+    /// `auth-required` or cargo never sends credentials to the sparse index
+    /// and every fetch 401s (RFC 3139).
+    #[tokio::test]
+    async fn test_cargo_index_config_auth_required() {
+        use crate::test_helpers::{
+            create_test_context_with_anonymous_read, create_test_context_with_auth,
+            send_with_headers,
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let basic = format!("Basic {}", STANDARD.encode("alice:hunter2"));
+        let ctx = create_test_context_with_auth(&[("alice", "hunter2")]);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/cargo/index/config.json",
+            vec![("authorization", &basic)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["auth-required"], serde_json::Value::Bool(true));
+
+        let ctx = create_test_context_with_anonymous_read(&[("alice", "hunter2")]);
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/config.json", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["auth-required"],
+            serde_json::Value::Bool(false),
+            "anonymous_read serves index reads without creds"
         );
     }
 
