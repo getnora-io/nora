@@ -299,15 +299,17 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 }
 
 /// Collect rpm package versions per repository from the metadata sidecars
-/// (never the .rpm payloads). Group = `rpm:{repo}/{package-name}`; each
-/// version's keys are the package file and its sidecar. Deleting a version
-/// therefore requires the post-delete index regeneration in `run_retention`.
+/// (never the .rpm payloads). Group = `rpm:{repo}/{arch}/{package-name}`;
+/// each version's keys are the package file and its sidecar. Deleting a
+/// version therefore requires the post-delete index regeneration in
+/// `run_retention`.
 async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     collect_sidecar_versions(storage, "rpm", |v| {
         let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
         SidecarVersion {
             package: s("name"),
             version: format!("{}-{}.{}", s("version"), s("release"), s("arch")),
+            arch: s("arch"),
             href: s("href"),
             size: v.get("size_package").and_then(|x| x.as_u64()).unwrap_or(0),
             modified: v.get("file_time").and_then(|x| x.as_u64()),
@@ -319,15 +321,17 @@ async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 
 /// Collect deb package versions per repository — deb counterpart of
 /// [`collect_rpm_versions`], same keys/regeneration contract. Structured
-/// packages group per placement (`deb:{repo}/{dist}/{component}/{package}`),
-/// matching how `regenerate_indexes` rebuilds one index per distribution;
-/// flat-root packages group as `deb:{repo}/{package}`.
+/// packages group per placement and architecture
+/// (`deb:{repo}/{dist}/{component}/{arch}/{package}`), matching how
+/// `regenerate_indexes` rebuilds one index per distribution × architecture;
+/// flat-root packages group as `deb:{repo}/{arch}/{package}`.
 async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     collect_sidecar_versions(storage, "deb", |v| {
         let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
         SidecarVersion {
             package: s("package"),
             version: format!("{}_{}", s("version"), s("arch")),
+            arch: s("arch"),
             href: s("filename"),
             size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
             modified: None, // deb sidecars carry no upload time; use sidecar mtime
@@ -344,6 +348,11 @@ async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 struct SidecarVersion {
     package: String,
     version: String,
+    /// Architecture, its own group axis: each `binary-{arch}` index (deb) is
+    /// independent, and rpm `keep_last` should not collapse architectures
+    /// either. `all`/`noarch` packages serve every architecture and form
+    /// their own group rather than pooling under a concrete one.
+    arch: String,
     href: String,
     size: u64,
     modified: Option<u64>,
@@ -402,8 +411,10 @@ async fn collect_sidecar_versions(
             None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
         };
         let group = match &sv.placement {
-            Some(placement) => format!("{registry}:{repo}/{placement}/{}", sv.package),
-            None => format!("{registry}:{repo}/{}", sv.package),
+            Some(placement) => {
+                format!("{registry}:{repo}/{placement}/{}/{}", sv.arch, sv.package)
+            }
+            None => format!("{registry}:{repo}/{}/{}", sv.arch, sv.package),
         };
         groups.entry(group).or_default().push(VersionEntry {
             name: sv.version,
@@ -1397,21 +1408,26 @@ mod format_retention_tests {
             rule("rpm", Some("*-stream-*/*"), Some(25), None),
         ];
         assert_eq!(
-            find_matching_rule(&rules, "rpm", "rpm:app-dev-x1/pkg").map(|r| r.older_than_days),
+            find_matching_rule(&rules, "rpm", "rpm:app-dev-x1/x86_64/pkg")
+                .map(|r| r.older_than_days),
             Some(Some(7))
         );
         assert_eq!(
-            find_matching_rule(&rules, "rpm", "rpm:app-stream-x/pkg").map(|r| r.keep_last),
+            find_matching_rule(&rules, "rpm", "rpm:app-stream-x/x86_64/pkg").map(|r| r.keep_last),
             Some(Some(25))
         );
         assert!(
-            find_matching_rule(&rules, "rpm", "rpm:app-release/pkg").is_none(),
+            find_matching_rule(&rules, "rpm", "rpm:app-release/x86_64/pkg").is_none(),
             "no rule = keep forever"
         );
     }
 
     fn build_rpm(name: &str, version: &str) -> Vec<u8> {
-        let pkg = rpm::PackageBuilder::new(name, version, "MIT", "x86_64", "t")
+        build_rpm_arch(name, version, "x86_64")
+    }
+
+    fn build_rpm_arch(name: &str, version: &str, arch: &str) -> Vec<u8> {
+        let pkg = rpm::PackageBuilder::new(name, version, "MIT", arch, "t")
             .release("1")
             .build()
             .unwrap();
@@ -1580,6 +1596,91 @@ mod format_retention_tests {
         assert_eq!(packages.matches("Package: pkg").count(), 1, "{packages}");
         let inrelease = send(&ctx.app, Method::GET, "/deb/prod/InRelease", "").await;
         assert_eq!(inrelease.status(), StatusCode::OK);
+    }
+
+    /// `keep_last` counts per architecture: each `binary-{arch}/Packages` is
+    /// an independent APT index, so two architectures of the same
+    /// package/version/distribution must not share one `keep_last` budget —
+    /// pooling them always evicts an arch once `keep_last < arch count`.
+    #[tokio::test]
+    async fn test_deb_keep_last_counts_per_architecture() {
+        let ctx = create_test_context();
+        for arch in ["amd64", "arm64"] {
+            let deb = crate::registry::deb::test_fixtures::build_deb_arch("tree", "1.8", arch);
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/deb/myrepo/pool/tree_1.8_{arch}.deb?distribution=jammy"),
+                deb,
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        let rules = vec![rule("deb", None, Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.planned, 0,
+            "one version per arch — nothing exceeds keep_last"
+        );
+
+        for arch in ["amd64", "arm64"] {
+            let packages = String::from_utf8(
+                body_bytes(
+                    send(
+                        &ctx.app,
+                        Method::GET,
+                        &format!("/deb/myrepo/dists/jammy/main/binary-{arch}/Packages"),
+                        "",
+                    )
+                    .await,
+                )
+                .await
+                .to_vec(),
+            )
+            .unwrap();
+            assert!(packages.contains("Package: tree\n"), "{arch}: {packages}");
+        }
+    }
+
+    /// rpm mirror of the per-architecture scope: one repodata, but `keep_last`
+    /// must still not collapse architectures into one budget.
+    #[tokio::test]
+    async fn test_rpm_keep_last_counts_per_architecture() {
+        let ctx = create_test_context();
+        for arch in ["x86_64", "aarch64"] {
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/rpm/prod/pkg-1.0.{arch}.rpm"),
+                build_rpm_arch("pkg", "1.0", arch),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        let rules = vec![rule("rpm", None, Some(1), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.planned, 0,
+            "one version per arch — nothing exceeds keep_last"
+        );
+        let keys = ctx.state.storage.list("rpm/prod/").await.unwrap();
+        assert_eq!(keys.iter().filter(|k| k.ends_with(".rpm")).count(), 2);
     }
 
     /// `keep_last` counts per distribution, not per repo: a distribution's
