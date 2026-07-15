@@ -4,6 +4,9 @@
 ### Fixed
 - **Cargo sparse index now advertises `auth-required` on private deployments** — with auth enabled and `anonymous_read` off, `/cargo/index/config.json` sets `"auth-required": true` (RFC 3139) so cargo sends credentials on index and download requests. Previously cargo only authenticated the publish API, and every sparse-index fetch against a private instance failed with 401 before publish even started.
 
+### Added
+- **Per-rule namespace scope for OIDC role rules** — an `[[auth.oidc.providers.role_rules]]` entry may set `namespace_scope = ["ci-transport/**"]` to narrow the provider's scope for identities matched by that rule. A write must satisfy **both** the provider scope and the rule scope — the provider scope stays a hard ceiling, and a rule cannot widen past it. Lets one issuer grant, e.g., pull-request CI builds write access confined to a transport prefix while main/tag builds keep the provider-wide scope. Absent = inherit the provider's `namespace_scope`; enforcement mode stays provider-level. Also corrects the config doc example for `role_rules`, which showed a map form that fails to parse (the real shape is an array of tables with `pattern`/`role`).
+
 ## [1.0.1] - 2026-07-13
 
 ### Security
