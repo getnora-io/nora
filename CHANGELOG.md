@@ -2,6 +2,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **Retention and GC schedulers run once at boot** — both schedulers used to wait a full interval before their first pass, so a process restarting more often than the interval (rolling deployments, crash loops) never ran either of them, accumulating unbounded garbage while the schedule looked configured. The interval's first tick now fires immediately, and the boot pass waits on the shared cleanup lock (instead of skip-if-held) so retention and GC don't race each other out of their first run.
 - **Cargo sparse index now advertises `auth-required` on private deployments** — with auth enabled and `anonymous_read` off, `/cargo/index/config.json` sets `"auth-required": true` (RFC 3139) so cargo sends credentials on index and download requests. Previously cargo only authenticated the publish API, and every sparse-index fetch against a private instance failed with 401 before publish even started.
 
 ### Added
