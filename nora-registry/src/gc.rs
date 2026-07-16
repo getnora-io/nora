@@ -835,8 +835,11 @@ pub fn spawn_gc_scheduler(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        // First tick fires immediately — skip it so GC doesn't run on startup
-        interval.tick().await;
+        // The interval's first tick fires immediately: GC runs once at boot,
+        // then every `interval_secs` — a process restarting more often than
+        // the interval otherwise never collects anything (see the matching
+        // note in `spawn_retention_scheduler`).
+        let mut boot_run = true;
 
         loop {
             // CANCEL-SAFETY: interval.tick() holds no state between polls.
@@ -854,12 +857,20 @@ pub fn spawn_gc_scheduler(
                 break;
             }
 
-            // Cross-scheduler lock: skip if GC or retention is already running
-            let guard = cleanup_lock.try_lock();
-            if guard.is_err() {
+            // Cross-scheduler lock: skip if GC or retention is already running.
+            // The boot run waits for the lock instead — retention's boot pass
+            // fires at the same instant, and skipping would postpone the first
+            // GC by a whole interval again.
+            let guard = if boot_run {
+                boot_run = false;
+                Ok(cleanup_lock.lock().await)
+            } else {
+                cleanup_lock.try_lock()
+            };
+            let Ok(guard) = guard else {
                 info!("GC: cleanup lock held (GC or retention running), skipping");
                 continue;
-            }
+            };
 
             info!("GC scheduler: starting periodic run");
             let result = run_gc(&storage, &publish_locks, dry_run, grace_secs).await;

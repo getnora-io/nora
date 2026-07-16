@@ -955,8 +955,12 @@ pub fn spawn_retention_scheduler(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        // First tick fires immediately — skip it so retention doesn't run on startup
-        interval.tick().await;
+        // The interval's first tick fires immediately: retention runs once at
+        // boot, then every `interval_secs`. Waiting a full interval instead
+        // means a process that restarts more often than the interval NEVER
+        // runs retention — deploy-happy environments accumulated unbounded
+        // garbage exactly when the schedule looked configured.
+        let mut boot_run = true;
 
         loop {
             // CANCEL-SAFETY: Same as GC — interval.tick() is stateless between polls,
@@ -974,12 +978,20 @@ pub fn spawn_retention_scheduler(
                 break;
             }
 
-            // Cross-scheduler lock: skip if GC or retention is already running
-            let guard = cleanup_lock.try_lock();
-            if guard.is_err() {
+            // Cross-scheduler lock: skip if GC or retention is already running.
+            // The boot run waits for the lock instead — GC's boot pass fires at
+            // the same instant, and skipping here would silently postpone the
+            // first retention by a whole interval again.
+            let guard = if boot_run {
+                boot_run = false;
+                Ok(cleanup_lock.lock().await)
+            } else {
+                cleanup_lock.try_lock()
+            };
+            let Ok(guard) = guard else {
                 info!("Retention: cleanup lock held (GC or retention running), skipping");
                 continue;
-            }
+            };
 
             info!(
                 dry_run = dry_run,
@@ -1245,6 +1257,52 @@ mod tests {
             .get("maven/com/example/lib/3.0/lib-3.0.jar")
             .await
             .is_ok());
+    }
+
+    /// The scheduler must run once at boot, not a full interval later — a
+    /// process that restarts more often than the interval otherwise never
+    /// runs retention at all.
+    #[tokio::test]
+    async fn test_scheduler_runs_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("maven/com/test/a/1.0/a.jar", b"data")
+            .await
+            .unwrap();
+        storage
+            .put("maven/com/test/a/2.0/a.jar", b"data")
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_retention_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            None,
+            rules,
+            86400, // the boot run must not wait for this
+            false,
+            None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage.get("maven/com/test/a/1.0/a.jar").await.is_ok() {
+            assert!(Instant::now() < deadline, "boot run never fired");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(storage.get("maven/com/test/a/2.0/a.jar").await.is_ok());
+        cancel.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
