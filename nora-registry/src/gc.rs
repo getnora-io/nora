@@ -863,7 +863,15 @@ pub fn spawn_gc_scheduler(
             // GC by a whole interval again.
             let guard = if boot_run {
                 boot_run = false;
-                Ok(cleanup_lock.lock().await)
+                // CANCEL-SAFETY: the boot pass waits on the lock (vs skip-if-held) so it
+                // can't forfeit its first run to retention's simultaneous boot pass — but
+                // race the wait against cancellation, so a SIGTERM during boot contention
+                // breaks promptly instead of blocking behind the sibling's whole pass.
+                // Dropping the not-yet-acquired lock() future only removes this waiter.
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    g = cleanup_lock.lock() => Ok(g),
+                }
             } else {
                 cleanup_lock.try_lock()
             };
@@ -1967,5 +1975,51 @@ mod tests {
         }
         cancel.cancel();
         handle.await.unwrap();
+    }
+
+    /// A shutdown requested while the boot pass is parked on the cleanup lock
+    /// must break promptly — not wait out the lock holder and then run a full
+    /// pass after cancellation was already requested.
+    #[tokio::test]
+    async fn test_gc_boot_run_cancels_while_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        // Orphan checksum sidecar the boot GC would collect if it ever ran.
+        storage
+            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
+            .await
+            .unwrap();
+
+        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = cleanup_lock.clone().lock_owned().await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_gc_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            86400,
+            false,
+            0,
+            cleanup_lock,
+            cancel.clone(),
+        );
+
+        // Let the boot pass reach the parked lock().await, then ask to stop.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        // The scheduler must stop even though the lock is still held — the boot
+        // acquire races cancellation, so it can't block behind the holder.
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("scheduler did not stop when cancelled while parked on the boot lock")
+            .unwrap();
+
+        // It never acquired the lock, so it never collected the orphan.
+        assert!(storage
+            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
+            .await
+            .is_ok());
+        drop(held);
     }
 }

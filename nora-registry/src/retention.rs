@@ -984,7 +984,15 @@ pub fn spawn_retention_scheduler(
             // first retention by a whole interval again.
             let guard = if boot_run {
                 boot_run = false;
-                Ok(cleanup_lock.lock().await)
+                // CANCEL-SAFETY: the boot pass waits on the lock (vs skip-if-held) so it
+                // can't forfeit its first run to GC's simultaneous boot pass — but race
+                // the wait against cancellation, so a SIGTERM during boot contention
+                // breaks promptly instead of blocking behind the sibling's whole pass.
+                // Dropping the not-yet-acquired lock() future only removes this waiter.
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    g = cleanup_lock.lock() => Ok(g),
+                }
             } else {
                 cleanup_lock.try_lock()
             };
@@ -1359,6 +1367,61 @@ mod tests {
         }
         cancel.cancel();
         handle.await.unwrap();
+    }
+
+    /// A shutdown requested while the boot pass is parked on the cleanup lock
+    /// must break promptly — not wait out the lock holder and then run a full
+    /// pass after cancellation was already requested.
+    #[tokio::test]
+    async fn test_retention_boot_run_cancels_while_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("maven/com/test/a/1.0/a.jar", b"data")
+            .await
+            .unwrap();
+        storage
+            .put("maven/com/test/a/2.0/a.jar", b"data")
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = cleanup_lock.clone().lock_owned().await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_retention_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            None,
+            rules,
+            86400,
+            false,
+            None,
+            cleanup_lock,
+            cancel.clone(),
+        );
+
+        // Let the boot pass reach the parked lock().await, then ask to stop.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        // The scheduler must stop even though the lock is still held — the boot
+        // acquire races cancellation, so it can't block behind the holder.
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("scheduler did not stop when cancelled while parked on the boot lock")
+            .unwrap();
+
+        // It never acquired the lock, so it never pruned the dominated version.
+        assert!(storage.get("maven/com/test/a/1.0/a.jar").await.is_ok());
+        drop(held);
     }
 
     #[tokio::test]
