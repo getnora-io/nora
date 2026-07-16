@@ -1305,6 +1305,62 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// The boot pass waits on the shared cleanup lock instead of the
+    /// periodic skip-if-held — losing the boot race to GC must delay the
+    /// first run, not forfeit it for a whole interval.
+    #[tokio::test]
+    async fn test_boot_run_waits_for_cleanup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("maven/com/test/a/1.0/a.jar", b"data")
+            .await
+            .unwrap();
+        storage
+            .put("maven/com/test/a/2.0/a.jar", b"data")
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = cleanup_lock.clone().lock_owned().await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_retention_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            None,
+            rules,
+            86400,
+            false,
+            None,
+            cleanup_lock,
+            cancel.clone(),
+        );
+
+        // While the lock is held the boot pass must be parked, not skipped.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(storage.get("maven/com/test/a/1.0/a.jar").await.is_ok());
+
+        drop(held);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage.get("maven/com/test/a/1.0/a.jar").await.is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "boot run skipped instead of waiting for the lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_retention_dry_run_preserves() {
         let dir = tempfile::tempdir().unwrap();

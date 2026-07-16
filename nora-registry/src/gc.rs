@@ -1881,4 +1881,91 @@ mod tests {
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
     }
+
+    /// The scheduler must run once at boot, not a full interval later — a
+    /// process that restarts more often than the interval otherwise never
+    /// collects anything.
+    #[tokio::test]
+    async fn test_gc_scheduler_runs_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        // Orphan checksum sidecar: no primary artifact next to it.
+        storage
+            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
+            .await
+            .unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_gc_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            86400, // the boot run must not wait for this
+            false,
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage
+            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
+            .await
+            .is_ok()
+        {
+            assert!(Instant::now() < deadline, "boot run never fired");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
+    /// The boot pass waits on the shared cleanup lock instead of the
+    /// periodic skip-if-held — losing the boot race to the sibling scheduler
+    /// must delay the first run, not forfeit it for a whole interval.
+    #[tokio::test]
+    async fn test_gc_boot_run_waits_for_cleanup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
+            .await
+            .unwrap();
+
+        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = cleanup_lock.clone().lock_owned().await;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_gc_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            86400,
+            false,
+            0,
+            cleanup_lock,
+            cancel.clone(),
+        );
+
+        // While the lock is held the boot pass must be parked, not skipped.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(storage
+            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
+            .await
+            .is_ok());
+
+        drop(held);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage
+            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
+            .await
+            .is_ok()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "boot run skipped instead of waiting for the lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+    }
 }
