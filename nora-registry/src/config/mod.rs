@@ -1871,6 +1871,7 @@ mod tests {
         config.retention.enabled = true;
         config.retention.rules = vec![RetentionRule {
             registry: "docker".to_string(),
+            name_glob: None,
             keep_last: Some(5),
             older_than_days: None,
             exclude_tags: Vec::new(),

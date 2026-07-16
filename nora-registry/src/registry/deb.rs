@@ -1167,6 +1167,18 @@ mod tests {
     }
 }
 
+/// Cross-module test fixture (used by retention tests).
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    pub(crate) fn build_deb(name: &str, version: &str) -> Vec<u8> {
+        super::integration_tests::build_test_deb_with(name, version, "gz")
+    }
+
+    pub(crate) fn build_deb_arch(name: &str, version: &str, arch: &str) -> Vec<u8> {
+        super::integration_tests::build_test_deb_arch(name, version, arch, "gz")
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
