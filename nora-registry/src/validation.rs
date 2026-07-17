@@ -366,20 +366,20 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
 /// would match `org-evil`). This matcher is anchored at both ends and treats
 /// `/` as a hard segment boundary.
 ///
-/// Semantics (wildcards are whole-segment only — they never match across `/`
-/// implicitly):
+/// Semantics (`*` never matches across `/` — a segment boundary is hard):
 /// - the whole pattern `"*"` matches anything — the universal, backward-compatible
 ///   no-op used by the default `namespace_scope = ["*"]`.
-/// - a `*` segment matches exactly one segment (`github/*` matches `github/repo`
-///   but not `github/a/b`).
 /// - a `**` segment matches zero or more segments (`github/**` matches `github`,
-///   `github/a`, and `github/a/b`).
-/// - any other segment must match an identical literal segment.
+///   `github/a`, and `github/a/b`). `**` is only a wildcard as a whole segment.
+/// - within a segment, `*` matches any run of non-`/` characters: a bare `*`
+///   segment matches exactly one segment (`github/*` matches `github/repo` but
+///   not `github/a/b`), and `team-*-dev` matches `team-alpha-dev` but never
+///   `team-alpha/dev`.
+/// - segments without `*` must match literally.
 ///
-/// A segment that merely *contains* `*` (e.g. `my*org`) is treated literally and
-/// therefore will not match a real namespace — fail-closed by construction. Only
-/// a segment that is exactly `*` or `**` is a wildcard. Operators should always
-/// include the `/` boundary in scopes (`myorg/**`, not `myorg*`).
+/// Note `github*/x` matches `github-evil/x` — an intra-segment trailing `*`
+/// behaves like any glob. Scopes that must not capture sibling namespaces
+/// should end the literal part at a `/` boundary (`github/**`, not `github*`).
 ///
 /// # Examples
 /// ```ignore
@@ -388,6 +388,8 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
 /// assert!(!namespace_match("github/*", "github-evil/x"));
 /// assert!(!namespace_match("github/*", "github/a/b"));
 /// assert!(namespace_match("github/**", "github/a/b"));
+/// assert!(namespace_match("team-*-dev", "team-alpha-dev"));
+/// assert!(!namespace_match("team-*-dev", "team-alpha/dev"));
 /// ```
 pub fn namespace_match(pattern: &str, value: &str) -> bool {
     // Universal no-op: the default scope, and any explicit `*`, matches everything.
@@ -415,11 +417,44 @@ fn segments_match(pat: &[&str], val: &[&str]) -> bool {
             // One or more consumed (suffixes val[1..], val[2..], …, []):
             (0..val.len()).any(|i| segments_match(rest, &val[i + 1..]))
         }
-        // `*` consumes exactly one value segment.
-        Some((&"*", rest)) => !val.is_empty() && segments_match(rest, &val[1..]),
-        // Literal segment must match exactly (anchored start).
-        Some((&lit, rest)) => !val.is_empty() && val[0] == lit && segments_match(rest, &val[1..]),
+        // Any other segment consumes exactly one value segment; `*` inside it
+        // matches within that segment only (never across `/`).
+        Some((&seg, rest)) => {
+            !val.is_empty() && segment_glob(seg, val[0]) && segments_match(rest, &val[1..])
+        }
     }
+}
+
+/// Char-level glob for one path segment: `*` matches any run of characters
+/// (the segment split has already removed every `/`). Iterative single-star
+/// backtracking — O(len(pattern) · len(value)) worst case, no recursion, so
+/// adversarial fuzz inputs can't blow the stack or go exponential.
+fn segment_glob(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    // Byte-wise is UTF-8-safe here: `*` is ASCII and never a continuation byte,
+    // and non-wildcard bytes must be equal anyway.
+    let (p, v) = (pattern.as_bytes(), value.as_bytes());
+    let (mut pi, mut vi) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while vi < v.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            backtrack = Some((pi, vi));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == v[vi] {
+            pi += 1;
+            vi += 1;
+        } else if let Some((star_pi, star_vi)) = backtrack {
+            // Let the last `*` absorb one more byte and retry after it.
+            backtrack = Some((star_pi, star_vi + 1));
+            pi = star_pi + 1;
+            vi = star_vi + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&b| b == b'*')
 }
 
 #[cfg(test)]
@@ -830,10 +865,26 @@ mod namespace_match_tests {
     }
 
     #[test]
-    fn intra_segment_star_is_literal_not_wildcard() {
-        // Only a whole-segment `*`/`**` is a wildcard; `my*org` is fail-closed.
-        assert!(!namespace_match("my*org/*", "myXXXorg/repo"));
-        assert!(namespace_match("my*org", "my*org")); // matches only itself, literally
+    fn intra_segment_star_matches_within_segment() {
+        assert!(namespace_match("my*org/*", "myXXXorg/repo"));
+        assert!(namespace_match("team-*-dev-*", "team-alpha-dev-client"));
+        assert!(namespace_match("*-dev", "team-dev")); // leading
+        assert!(namespace_match("team-*", "team-")); // zero-width
+        assert!(!namespace_match("team-*-dev", "team-alpha-prod"));
+        // Multiple stars backtrack correctly.
+        assert!(namespace_match("*ab*ab", "abxab"));
+        assert!(!namespace_match("*ab*ab", "abab-x"));
+    }
+
+    #[test]
+    fn intra_segment_star_never_crosses_segment_boundary() {
+        // The security property inherited from whole-segment matching: `*`
+        // absorbs characters only inside its own segment.
+        assert!(!namespace_match("team-*-dev", "team-alpha/dev"));
+        assert!(!namespace_match("a*b", "a/b"));
+        assert!(!namespace_match("github/x*y", "github/x/y"));
+        // Segment count still has to line up.
+        assert!(!namespace_match("my*org", "myXXXorg/repo"));
     }
 
     proptest! {
@@ -877,6 +928,40 @@ mod namespace_match_tests {
             let pattern = format!("{}/**", prefix);
             let value = format!("{}/{}", prefix, descendant);
             prop_assert!(namespace_match(&pattern, &value));
+        }
+
+        // An intra-segment `*` absorbs any run of characters inside one segment…
+        #[test]
+        fn prop_intra_segment_star_matches_within_segment(
+            pre in "[a-z]{0,6}",
+            mid in "[a-z0-9._-]{0,12}",
+            post in "[a-z]{0,6}",
+        ) {
+            let pattern = format!("{}*{}", pre, post);
+            let value = format!("{}{}{}", pre, mid, post);
+            prop_assert!(namespace_match(&pattern, &value));
+        }
+
+        // …but never across a `/`: the value's extra segment can't be eaten.
+        #[test]
+        fn prop_intra_segment_star_never_crosses_slash(
+            pre in "[a-z]{1,6}",
+            left in "[a-z]{0,8}",
+            right in "[a-z]{1,8}",
+            post in "[a-z]{1,6}",
+        ) {
+            let pattern = format!("{}*{}", pre, post);
+            let value = format!("{}{}/{}{}", pre, left, right, post);
+            prop_assert!(!namespace_match(&pattern, &value));
+        }
+
+        // Patterns without `*` are exact equality — unchanged by glob support.
+        #[test]
+        fn prop_starless_pattern_is_exact_match(
+            a in "[a-z]{1,8}(/[a-z]{1,8}){0,3}",
+            b in "[a-z]{1,8}(/[a-z]{1,8}){0,3}",
+        ) {
+            prop_assert_eq!(namespace_match(&a, &b), a == b);
         }
     }
 }
