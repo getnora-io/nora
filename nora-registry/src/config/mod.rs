@@ -215,6 +215,40 @@ impl Config {
         self.enabled_registries_legacy()
     }
 
+    /// Materialize the resolved enable-set into the per-registry `enabled` flags.
+    ///
+    /// Route mounting is driven by [`Self::enabled_registries`], but the hosted
+    /// handlers (rpm/deb/raw) additionally re-check `config.<reg>.enabled`. When
+    /// the enable-set is resolved from `NORA_REGISTRIES_ENABLE` or
+    /// `[registries].enable`, those per-registry flags stay at their struct
+    /// defaults, so a mounted rpm/deb route still 404s on every request. Writing
+    /// the resolved set back keeps the two in sync. Call once at startup, right
+    /// after [`Self::enabled_registries`]. The `match` is exhaustive over
+    /// [`RegistryType`], so a new variant is a compile error until its flag is
+    /// wired here. (#856)
+    pub fn apply_enabled_registries(&mut self, set: &HashSet<RegistryType>) {
+        for rt in RegistryType::all() {
+            let on = set.contains(rt);
+            match rt {
+                RegistryType::Docker => self.docker.enabled = on,
+                RegistryType::Maven => self.maven.enabled = on,
+                RegistryType::Npm => self.npm.enabled = on,
+                RegistryType::Cargo => self.cargo.enabled = on,
+                RegistryType::PyPI => self.pypi.enabled = on,
+                RegistryType::Go => self.go.enabled = on,
+                RegistryType::Raw => self.raw.enabled = on,
+                RegistryType::Gems => self.gems.enabled = on,
+                RegistryType::Terraform => self.terraform.enabled = on,
+                RegistryType::Ansible => self.ansible.enabled = on,
+                RegistryType::Nuget => self.nuget.enabled = on,
+                RegistryType::PubDart => self.pub_dart.enabled = on,
+                RegistryType::Conan => self.conan.enabled = on,
+                RegistryType::Rpm => self.rpm.enabled = on,
+                RegistryType::Deb => self.deb.enabled = on,
+            }
+        }
+    }
+
     /// Legacy registry resolution from individual `*.enabled` flags.
     fn enabled_registries_legacy(&self) -> HashSet<RegistryType> {
         let mut set = HashSet::new();
@@ -2666,6 +2700,65 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains(&RegistryType::Docker));
         assert!(set.contains(&RegistryType::Npm));
+    }
+
+    #[test]
+    fn apply_enabled_registries_materializes_flags() {
+        // #856: the resolved enable-set must land in the per-registry `enabled`
+        // flags — hosted handlers (rpm/deb/raw) gate on those, not on the set.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        // rpm/deb default `enabled = false`; docker defaults `true`.
+        assert!(!config.rpm.enabled);
+        assert!(config.docker.enabled);
+
+        config.apply_enabled_registries(&std::collections::HashSet::from([RegistryType::Rpm]));
+
+        assert!(
+            config.rpm.enabled,
+            "rpm must be flagged enabled after apply (#856)"
+        );
+        assert!(!config.deb.enabled, "deb was not in the set");
+        assert!(
+            !config.docker.enabled,
+            "docker was not in the set — must be cleared"
+        );
+    }
+
+    #[test]
+    fn registries_toml_enable_backpropagates_to_flags() {
+        // #856 at the config layer: `[registries].enable = ["rpm"]` resolves rpm
+        // into the set AND (after apply) into `config.rpm.enabled`, so the mounted
+        // rpm route no longer 404s in the handler gate.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["rpm"]
+        "#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.rpm.enabled, "precondition: rpm flag defaults off");
+
+        let set = config.enabled_registries();
+        config.apply_enabled_registries(&set);
+
+        assert!(set.contains(&RegistryType::Rpm));
+        assert!(
+            config.rpm.enabled,
+            "rpm flag must be set from [registries].enable (#856)"
+        );
     }
 
     #[test]
