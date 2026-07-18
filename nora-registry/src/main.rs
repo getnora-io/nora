@@ -1457,6 +1457,13 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Determine enabled registries from config
     let enabled_registries = config.enabled_registries();
 
+    // Back-propagate the resolved set into the per-registry `enabled` flags so
+    // hosted handlers (rpm/deb/raw) that re-check `config.<reg>.enabled` agree
+    // with route mounting. Without this, an enable-set from
+    // NORA_REGISTRIES_ENABLE / [registries].enable mounts the routes but leaves
+    // the flags at their defaults, so rpm/deb 404. (#856)
+    config.apply_enabled_registries(&enabled_registries);
+
     // Make the enabled set available to the UI sidebar so its nav lists exactly
     // the enabled registries (matching the dashboard body). Set once, immutable.
     ui::components::set_enabled_registries(enabled_registries.clone());
