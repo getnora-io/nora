@@ -3,8 +3,10 @@
 
 //! `nora mirror` — pre-fetch dependencies through NORA proxy cache.
 
+mod deb;
 mod docker;
 mod npm;
+mod rpm;
 
 use clap::Subcommand;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -48,6 +50,30 @@ pub enum MirrorFormat {
         /// Path to dependency list (mvn dependency:list output)
         #[arg(long)]
         lockfile: PathBuf,
+    },
+    /// Warm a pull-through RPM repo for offline use (fetch every package through NORA)
+    Rpm {
+        /// Proxied repo name (an entry in `[rpm.proxies]`)
+        #[arg(long)]
+        repo: String,
+        /// Only these arches (e.g. x86_64,noarch); default: all
+        #[arg(long, value_delimiter = ',')]
+        arch: Option<Vec<String>>,
+    },
+    /// Warm a pull-through DEB repo for offline use (fetch every package through NORA)
+    Deb {
+        /// Proxied repo name (an entry in `[deb.proxies]`)
+        #[arg(long)]
+        repo: String,
+        /// Distribution under dists/ (omit for a flat repo)
+        #[arg(long)]
+        dist: Option<String>,
+        /// Components to mirror (default: all listed in the Release file)
+        #[arg(long, value_delimiter = ',')]
+        component: Option<Vec<String>>,
+        /// Architectures to mirror (default: all listed in the Release file)
+        #[arg(long, value_delimiter = ',')]
+        arch: Option<Vec<String>>,
     },
     /// Mirror Docker images from upstream registries
     Docker {
@@ -162,6 +188,26 @@ pub async fn run_mirror(
         }
         MirrorFormat::Maven { lockfile } => {
             mirror_lockfile(client, registry, "maven", &lockfile).await?
+        }
+        MirrorFormat::Rpm { repo, arch } => {
+            rpm::run_rpm_mirror(client, registry, &repo, arch.as_deref(), concurrency).await?
+        }
+        MirrorFormat::Deb {
+            repo,
+            dist,
+            component,
+            arch,
+        } => {
+            deb::run_deb_mirror(
+                client,
+                registry,
+                &repo,
+                dist.as_deref(),
+                component.as_deref(),
+                arch.as_deref(),
+                concurrency,
+            )
+            .await?
         }
         MirrorFormat::Docker {
             images,
@@ -305,6 +351,129 @@ async fn mirror_lockfile(
         failed,
         bytes,
     })
+}
+
+/// GET each repo-relative path through the NORA pull-through repo so the
+/// proxy cache is warmed for offline use. A path NORA already has (HEAD 200,
+/// local-only check) is skipped and counted as fetched with 0 new bytes.
+async fn warm_repo_paths(
+    client: &reqwest::Client,
+    base: &str,
+    format: &str,
+    repo: &str,
+    paths: &[String],
+    concurrency: usize,
+) -> MirrorResult {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let pb = create_progress_bar(paths.len() as u64);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let fetched = std::sync::Arc::new(AtomicUsize::new(0));
+    let failed = std::sync::Arc::new(AtomicUsize::new(0));
+    let bytes = std::sync::Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for path in paths {
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let client = client.clone();
+        let pb = pb.clone();
+        let fetched = fetched.clone();
+        let failed = failed.clone();
+        let bytes = bytes.clone();
+        let url = format!("{base}/{format}/{repo}/{path}");
+        let label = path.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let cached = matches!(client.head(&url).send().await, Ok(r) if r.status().is_success());
+            if cached {
+                fetched.fetch_add(1, Ordering::Relaxed);
+            } else {
+                match client.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(body) = r.bytes().await {
+                            bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                        }
+                        fetched.fetch_add(1, Ordering::Relaxed);
+                    }
+                    r => {
+                        let status = match r {
+                            Ok(resp) => format!("HTTP {}", resp.status()),
+                            Err(e) => e.to_string(),
+                        };
+                        eprintln!("  WARN: {label} -> {status}");
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            pb.set_message(label);
+            pb.inc(1);
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    pb.finish_with_message("done");
+
+    MirrorResult {
+        total: paths.len(),
+        fetched: fetched.load(std::sync::atomic::Ordering::Relaxed),
+        failed: failed.load(std::sync::atomic::Ordering::Relaxed),
+        bytes: bytes.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Fetch a repo-relative path through the NORA proxy, returning the body.
+async fn fetch_repo_file(
+    client: &reqwest::Client,
+    base: &str,
+    format: &str,
+    repo: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let url = format!("{base}/{format}/{repo}/{path}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("{url}: HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("{url}: {e}"))
+}
+
+/// Decompress an index file by its extension (`.gz`/`.xz`/plain) to text.
+/// Repo indexes are operator-chosen upstream data read on the client side —
+/// no decompression cap needed (unlike the server's control.tar bomb cap).
+fn decompress_index(path: &str, raw: Vec<u8>) -> Result<String, String> {
+    use std::io::Read;
+    if path.ends_with(".gz") {
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_string(&mut s)
+            .map_err(|e| format!("{path}: {e}"))?;
+        Ok(s)
+    } else if path.ends_with(".xz") {
+        let mut out = Vec::new();
+        lzma_rs::xz_decompress(&mut &raw[..], &mut out).map_err(|e| format!("{path}: {e:?}"))?;
+        String::from_utf8(out).map_err(|e| format!("{path}: {e}"))
+    } else if path.ends_with(".zst") {
+        let mut s = String::new();
+        ruzstd::decoding::StreamingDecoder::new(&raw[..])
+            .map_err(|e| format!("{path}: {e}"))?
+            .read_to_string(&mut s)
+            .map_err(|e| format!("{path}: {e}"))?;
+        Ok(s)
+    } else {
+        String::from_utf8(raw).map_err(|e| format!("{path}: {e}"))
+    }
 }
 
 fn parse_requirements_txt(content: &str) -> Vec<MirrorTarget> {

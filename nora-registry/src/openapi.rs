@@ -46,8 +46,8 @@ use crate::AppState;
         (name = "nuget", description = "NuGet v3 Registry Proxy API"),
         (name = "pub", description = "Dart/Flutter Pub Registry Proxy API"),
         (name = "conan", description = "Conan V2 Registry Proxy API (C/C++)"),
-        (name = "rpm", description = "RPM (yum/dnf) Hosted Repository API"),
-        (name = "deb", description = "Debian (APT) Hosted Repository API"),
+        (name = "rpm", description = "RPM (yum/dnf) Hosted & Pull-Through Repository API"),
+        (name = "deb", description = "Debian (APT) Hosted & Pull-Through Repository API"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(

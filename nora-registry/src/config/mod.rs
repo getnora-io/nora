@@ -327,8 +327,8 @@ impl Config {
             RegistryType::Nuget => self.nuget.enabled && self.nuget.proxy.is_some(),
             RegistryType::PubDart => self.pub_dart.enabled && self.pub_dart.proxy.is_some(),
             RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
-            RegistryType::Rpm => false, // hosted-only, no upstream
-            RegistryType::Deb => false, // hosted-only, no upstream
+            RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
+            RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
         }
     }
 
@@ -359,11 +359,11 @@ impl Config {
             RegistryType::Nuget => self.curation.nuget.quarantine.as_ref(),
             RegistryType::PubDart => self.curation.pub_dart.quarantine.as_ref(),
             RegistryType::Conan => self.curation.conan.quarantine.as_ref(),
-            // Raw, RPM, and Debian are hosted-only: no curation override, no
-            // quarantine gate in their handlers (quarantine gates proxy downloads).
-            RegistryType::Raw | RegistryType::Rpm | RegistryType::Deb => {
-                return QuarantineMode::Off
-            }
+            RegistryType::Rpm => self.curation.rpm.quarantine.as_ref(),
+            RegistryType::Deb => self.curation.deb.quarantine.as_ref(),
+            // Raw is hosted-only: no curation override, no quarantine gate in
+            // its handlers (quarantine gates proxy downloads).
+            RegistryType::Raw => return QuarantineMode::Off,
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -549,6 +549,15 @@ impl Config {
         for proxy in &self.maven.proxies {
             if let Some(host) = extract_host(proxy.url()) {
                 result.push(("maven".to_string(), host));
+            }
+        }
+
+        // RPM/DEB per-repo proxies: BTreeMap<repo, RepoProxyEntry>
+        for (name, proxies) in [("rpm", &self.rpm.proxies), ("deb", &self.deb.proxies)] {
+            for entry in proxies.values() {
+                if let Some(host) = extract_host(entry.url()) {
+                    result.push((name.to_string(), host));
+                }
             }
         }
 
@@ -2504,6 +2513,8 @@ mod tests {
             &mut config.curation.nuget,
             &mut config.curation.pub_dart,
             &mut config.curation.conan,
+            &mut config.curation.rpm,
+            &mut config.curation.deb,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }

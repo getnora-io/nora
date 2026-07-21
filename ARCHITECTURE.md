@@ -417,7 +417,7 @@ from the Conan (v0.7.0) and RPM handlers:
 | 3 | `registry_type.rs` | Enum variant + match arms in `as_str()`, `mount_point()`, `display_name()`, `all()`, `from_str_opt()` |
 | 4 | `config/registry/<format>.rs` | **New file.** `<Format>Config` struct + Default + `NORA_<FORMAT>_*` env overrides; `mod`/`pub use` in `config/registry/mod.rs` |
 | 5 | `config/mod.rs` | `Config` field, `enabled_registries_legacy()`, `is_enabled_proxy()`, `quarantine_mode_for()`, `apply_env_overrides()`, serde-default test |
-| 6 | `config/curation.rs` + `main.rs` | Curation override field + min-age pairing (proxy formats only; hosted-only formats like Raw/RPM skip this) |
+| 6 | `config/curation.rs` + `main.rs` | Curation override field + min-age pairing (proxy formats only; hosted-only formats like Raw skip this) |
 | 7 | `main.rs` | Route merge match arm in `run_server()` |
 | 8 | `test_helpers.rs` | Config field + route merge match arm |
 | 9 | `repo_index.rs` | Index-builder match arm (`INDEX_PATTERN` + `build_generic_index` usually suffices) |

@@ -129,6 +129,10 @@ pub struct CurationConfig {
     pub pub_dart: RegistryCurationOverride,
     #[serde(default)]
     pub conan: RegistryCurationOverride,
+    #[serde(default)]
+    pub rpm: RegistryCurationOverride,
+    #[serde(default)]
+    pub deb: RegistryCurationOverride,
 }
 
 /// Per-registry curation override (used within `[curation.{registry}]`).
@@ -170,6 +174,8 @@ impl Default for CurationConfig {
             nuget: RegistryCurationOverride::default(),
             pub_dart: RegistryCurationOverride::default(),
             conan: RegistryCurationOverride::default(),
+            rpm: RegistryCurationOverride::default(),
+            deb: RegistryCurationOverride::default(),
         }
     }
 }
@@ -242,6 +248,8 @@ impl CurationConfig {
             ("NUGET", &mut self.nuget),
             ("PUB", &mut self.pub_dart),
             ("CONAN", &mut self.conan),
+            ("RPM", &mut self.rpm),
+            ("DEB", &mut self.deb),
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };
