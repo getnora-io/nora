@@ -140,11 +140,11 @@ impl ServerConfig {
         let Some(url) = self.public_url.as_deref() else {
             return String::new();
         };
-        // Path component without a URL crate: drop the scheme, then the authority
-        // (up to the first '/'), keep the rest.
-        let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let path = after_scheme.find('/').map_or("", |i| &after_scheme[i..]);
-        path.trim_end_matches('/').to_string()
+        // Delegate to the shared "drop scheme + authority, keep path" helper so
+        // this and the ansible metadata rewriter cannot drift; trim trailing slash.
+        super::url_path_component(url)
+            .trim_end_matches('/')
+            .to_string()
     }
 
     /// Apply environment variable overrides for server config.

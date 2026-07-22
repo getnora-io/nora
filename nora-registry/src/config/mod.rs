@@ -76,6 +76,17 @@ pub fn basic_auth_header(credentials: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
 
+/// Path component of a URL (`https://host/prefix/` → `/prefix/`), or `""` when
+/// there is no path. The scheme is optional — a bare path is returned unchanged.
+/// Does not trim a trailing slash (callers that want it trimmed do so). Single
+/// source of truth for "drop scheme + authority, keep path"; used by
+/// [`ServerConfig::base_path`](server::ServerConfig::base_path) and the ansible
+/// metadata rewriter so the two cannot drift.
+pub(crate) fn url_path_component(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after_scheme.find('/').map_or("", |i| &after_scheme[i..])
+}
+
 /// Parse an env var value into `target`, warning on failure (#537).
 ///
 /// If `val` parses successfully, `*target` is updated. If parsing fails,
