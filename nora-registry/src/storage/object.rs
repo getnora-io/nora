@@ -30,7 +30,18 @@ pub struct ObjectStorage {
     /// and LB health check, and slow listings under load mark the backend
     /// unhealthy exactly when it is busiest (#869).
     cached_reachable: std::sync::atomic::AtomicBool,
+    /// Unix seconds of the last background refresh (`0` = never refreshed). Paired with
+    /// `cached_reachable`, which is only ever written by the 60s maintenance loop: if that
+    /// task stalls or dies, the stale flag would otherwise pin readiness forever. A refresh
+    /// older than `HEALTH_MAX_STALE_SECS` is treated as unreachable (#872).
+    last_refresh_unix: std::sync::atomic::AtomicU64,
 }
+
+/// Reachability older than this is treated as unknown → unreachable. 2.5× the 60s background
+/// refresh cadence: tolerates one missed refresh + jitter without flapping, but a stalled or
+/// dead maintenance loop un-readies the pod within the window instead of pinning a stale
+/// `true` (#872).
+const HEALTH_MAX_STALE_SECS: i64 = 150;
 
 impl ObjectStorage {
     /// Create new S3 storage with optional credentials.
@@ -75,6 +86,7 @@ impl ObjectStorage {
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -113,6 +125,7 @@ impl ObjectStorage {
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -268,11 +281,18 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // Cached outcome of the last background refresh (#869) — probes must
-        // never hit the store. False until the boot refresh succeeds, so
-        // readiness still gates a misconfigured store at rollout.
+        // Cached outcome of the last background refresh (#869) — probes must never hit the
+        // store. False until the boot refresh succeeds, so readiness still gates a
+        // misconfigured store at rollout. Self-expiring (#872): the flag is only written by
+        // the 60s maintenance loop, so a stalled or dead loop lets the staleness window lapse
+        // and un-readies the pod rather than pinning a stale `true` forever.
         self.cached_reachable
             .load(std::sync::atomic::Ordering::Relaxed)
+            && crate::cache_ttl::is_within_ttl(
+                self.last_refresh_unix
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                HEALTH_MAX_STALE_SECS,
+            )
     }
 
     async fn total_size(&self) -> u64 {
@@ -289,6 +309,12 @@ impl StorageBackend for ObjectStorage {
 
         self.cached_reachable
             .store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+        // Stamp every run (success or failure): this marks the maintenance loop as alive so
+        // `health_check` can expire the cached verdict if the loop stops (#872).
+        self.last_refresh_unix.store(
+            crate::cache_ttl::now_unix(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Ok(objects) = result {
             let total: u64 = objects.iter().map(|m| m.size).sum();
             self.cached_total_size
@@ -402,6 +428,30 @@ mod tests {
         assert!(!storage.health_check().await);
         storage.refresh_total_size().await;
         assert!(!storage.health_check().await);
+    }
+
+    /// Cached reachability self-expires (#872): a `true` verdict whose last refresh is older
+    /// than `HEALTH_MAX_STALE_SECS` (a stalled or dead maintenance loop) must NOT keep the pod
+    /// ready. Only a recent refresh keeps `health_check` true.
+    #[tokio::test]
+    async fn test_health_check_expires_when_refresh_stalls() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let now = crate::cache_ttl::now_unix();
+
+        // A since-dead refresh loop: reachable was true, but the last refresh is ancient.
+        storage.cached_reachable.store(true, Relaxed);
+        storage
+            .last_refresh_unix
+            .store(now.saturating_sub(10_000), Relaxed);
+        assert!(
+            !storage.health_check().await,
+            "stale reachability must not keep readiness up"
+        );
+
+        // A fresh refresh timestamp → reachable again.
+        storage.last_refresh_unix.store(now, Relaxed);
+        assert!(storage.health_check().await);
     }
 
     #[test]
