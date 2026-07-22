@@ -8,6 +8,14 @@
 //! - `0`  — always refetch (disable cache for metadata)
 //! - `>0` — TTL in seconds; refetch after this many seconds
 
+/// Current wall-clock time in Unix epoch seconds (saturating to 0 before the epoch).
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Check if a cached entry is still fresh.
 ///
 /// # Arguments
@@ -23,13 +31,7 @@ pub fn is_within_ttl(modified_unix: u64, ttl_secs: i64) -> bool {
         // 0: always refetch — always stale
         0 => false,
         // >0: check age
-        ttl => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            now.saturating_sub(modified_unix) < ttl as u64
-        }
+        ttl => now_unix().saturating_sub(modified_unix) < ttl as u64,
     }
 }
 
