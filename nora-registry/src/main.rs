@@ -1772,8 +1772,10 @@ async fn run_server(mut config: Config, storage: Storage) {
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
             metrics_state.auth_failures.cleanup();
 
-            // Every 60s (every other tick): refresh S3 total_size cache + storage gauge
-            if tick_count.is_multiple_of(2) {
+            // Every 60s (odd ticks — the interval's first tick fires immediately, so the
+            // boot pass runs right away: object-store reachability (#869) and the storage
+            // gauge are populated before the first readiness probe, not 30s in).
+            if !tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_total_size_cache().await;
                 metrics::STORAGE_BYTES
                     .with_label_values(&["total"])
