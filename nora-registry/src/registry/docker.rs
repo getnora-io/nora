@@ -3860,6 +3860,48 @@ mod integration_tests {
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
     }
 
+    /// Provenance invariant that #868's hosted/proxied inference depends on: a local push
+    /// writes the BARE manifest key (`docker/{name}/manifests/{ref}.json`, no namespace
+    /// segment). `get_manifest` reads a bare-key hit as a hosted (locally pushed) manifest —
+    /// served authoritatively, no upstream revalidation. If `put_manifest` ever wrote a
+    /// namespaced key, hosted and proxied manifests would become indistinguishable and a
+    /// proxied tag could be served stale forever — so this must fail loudly.
+    #[tokio::test]
+    async fn test_local_push_writes_bare_manifest_key() {
+        let ctx = create_test_context();
+        seed_zero_config(&ctx.state, "prov-img").await;
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let put_resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/prov-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
+
+        // The bare tag key — what get_manifest treats as the hosted/legacy key — is populated.
+        assert!(
+            ctx.state
+                .storage
+                .get("docker/prov-img/manifests/v1.json")
+                .await
+                .is_ok(),
+            "local push must write the bare manifest key (hosted provenance)"
+        );
+    }
+
     #[tokio::test]
     async fn test_manifest_push_rejects_absent_blob() {
         let ctx = create_test_context();
