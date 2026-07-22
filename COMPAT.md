@@ -248,7 +248,15 @@ Hosted repositories with server-generated repodata (createrepo-style). Each
 `/rpm/{repo}/` path is an independent repository; publishing or deleting a
 package regenerates `repodata/` (repomd.xml + sha256-named
 primary/filelists/other.xml.gz). Package headers are parsed server-side — no
-`createrepo_c` needed on the client. No upstream proxy (hosted only).
+`createrepo_c` needed on the client.
+
+Pull-through proxy repositories: map a repo name to one upstream yum repo
+(`[rpm.proxies] fedora = "https://…/Everything/x86_64/os"`). A proxied repo is
+read-only (writes → 409); upstream metadata (repodata/, including the
+upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
+(default 300), packages are cached forever, and a stale cache is served with
+`x-nora-stale: true` when the upstream is down. `nora mirror rpm --repo
+<name>` pre-fetches every package for fully offline (air-gapped) clients.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -263,7 +271,8 @@ primary/filelists/other.xml.gz). Package headers are parsed server-side — no
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |
-| Upstream proxy | — | Hosted only |
+| Upstream proxy | Full | Per-repo pull-through via `[rpm.proxies]`; digest quarantine via `[curation.rpm]` |
+| Offline mirror | Full | `nora mirror rpm --repo <name> [--arch x86_64,noarch]` warms the full package set |
 | sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
 | Delta RPMs (`prestodelta`) | — | Not generated |
 | Module metadata (`modules.yaml`) | — | Not generated |
@@ -295,8 +304,16 @@ suites with components, sources line `deb <url>/deb/{repo} jammy main`).
 Each `/deb/{repo}/` path is an independent repository; publishing or
 deleting a package regenerates every affected index. Package control
 paragraphs are parsed server-side from the .deb
-(ar → control.tar.{,gz,xz,zst}) — no `dpkg-scanpackages` needed. No
-upstream proxy (hosted only).
+(ar → control.tar.{,gz,xz,zst}) — no `dpkg-scanpackages` needed.
+
+Pull-through proxy repositories: map a repo name to one upstream apt repo
+(`[deb.proxies] debian = "https://deb.debian.org/debian"`). A proxied repo is
+read-only (writes → 409); upstream indexes (dists/, including the upstream's
+InRelease/Release.gpg) are served verbatim within `deb.metadata_ttl` seconds
+(default 300), packages are cached forever, and a stale cache is served with
+`x-nora-stale: true` when the upstream is down. `nora mirror deb --repo
+<name> --dist <dist>` pre-fetches every package for fully offline
+(air-gapped) clients.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -310,8 +327,9 @@ upstream proxy (hosted only).
 | Public key (`pubkey.gpg`) | Full | Armored, for the `signed-by` keyring; key auto-generated at first boot |
 | Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages (into the flat layout — placement is upload-time intent), rebuilds + re-signs indexes |
 | by-hash | — | Not generated; index files are served `Cache-Control: no-cache` |
-| Translations / Contents indexes | — | Not generated |
-| Upstream proxy | — | Hosted only |
+| Translations / Contents indexes | — | Not generated (proxied repos pass them through) |
+| Upstream proxy | Full | Per-repo pull-through via `[deb.proxies]`; digest quarantine via `[curation.deb]` |
+| Offline mirror | Full | `nora mirror deb --repo <name> [--dist <dist>] [--component main] [--arch amd64]` warms the full package set |
 
 Publish (flat): `curl -u user:pass -T pkg.deb http://nora:4000/deb/myrepo/pkg.deb`
 
@@ -359,7 +377,7 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
 | Backup/restore | Full | CLI commands |
-| Mirror CLI | Full | `nora mirror` for npm/pip/cargo/maven/docker |
+| Mirror CLI | Full | `nora mirror` for npm/pip/cargo/maven/docker/rpm/deb |
 
 ### Storage backend notes
 

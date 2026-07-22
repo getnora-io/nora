@@ -51,7 +51,7 @@ use crate::config::basic_auth_header;
 use crate::metrics::UPSTREAM_REQUEST_DURATION;
 use crate::registry_type::RegistryType;
 use crate::AppState;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -60,6 +60,17 @@ use std::time::{Duration, Instant};
 /// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
 pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, allow)]).into_response()
+}
+
+/// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
+/// its content mirrors the upstream; local publish/delete/reindex would
+/// diverge from (and be clobbered by) the next upstream metadata refresh.
+pub(crate) fn proxied_repo_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "Repository is a pull-through proxy (read-only)",
+    )
+        .into_response()
 }
 
 /// Replace `from`→`to` in raw JSON text, matching BOTH the plain form and the
@@ -248,6 +259,169 @@ pub(crate) async fn proxy_fetch_text(
         registry,
     )
     .await
+}
+
+/// One pull-through download for a per-repo proxied rpm/deb repository.
+///
+/// Shared by `rpm::download` and `deb::download` — the flow is the Maven proxy
+/// flow minus name-based curation (a proxied repo is declared in config and
+/// disjoint from hosted repos, so dependency-confusion gating does not apply;
+/// the digest quarantine still gates immutable packages):
+/// fresh-cache serve → upstream fetch → background cache → stale fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn repo_proxy_download(
+    state: &AppState,
+    registry: &'static str,
+    rt: crate::registry_type::RegistryType,
+    display: String,
+    key: String,
+    url: String,
+    auth: Option<&str>,
+    timeout_secs: u64,
+    metadata_ttl: i64,
+    immutable: bool,
+    content_type: &'static str,
+) -> Response {
+    use crate::activity_log::{ActionType, ActivityEntry};
+    use crate::audit::AuditEntry;
+
+    let q_override = match registry {
+        "rpm" => &state.config.curation.rpm,
+        _ => &state.config.curation.deb,
+    };
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        q_override
+            .quarantine
+            .as_ref()
+            .or(state.config.curation.quarantine.as_ref()),
+        q_override
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    let serve = |data: Bytes| {
+        let mut builder = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type);
+        if !immutable {
+            builder = builder.header(header::CACHE_CONTROL, "no-cache");
+        }
+        builder.body(Body::from(data)).expect("valid response")
+    };
+
+    let cached = state.storage.get(&key).await.ok();
+    let cache_fresh = match &cached {
+        None => false,
+        Some(_) if immutable => true,
+        Some(_) => {
+            let modified = state.storage.stat(&key).await.map(|m| m.modified);
+            crate::cache_ttl::mutable_ref_fresh(true, metadata_ttl, modified)
+        }
+    };
+
+    if let Some(ref data) = cached {
+        if cache_fresh {
+            state.metrics.record_download(registry);
+            state.metrics.record_cache_hit(registry);
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                display,
+                rt,
+                "CACHE",
+            ));
+            state
+                .audit
+                .log(AuditEntry::new("cache_hit", "api", "", registry, ""));
+            // Quarantine only immutable packages — metadata is rewritten
+            // upstream on every sync and its digest would change forever.
+            if immutable {
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                    &state.digest_store,
+                    registry,
+                    data,
+                    &q_mode,
+                    q_secs,
+                    "cache",
+                    None,
+                ) {
+                    return resp;
+                }
+            }
+            return serve(data.clone()).into_response();
+        }
+    }
+
+    match proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(timeout_secs),
+        auth,
+        &state.circuit_breaker,
+        rt,
+    )
+    .await
+    {
+        Ok(data) => {
+            let data = Bytes::from(data);
+            state.metrics.record_download(registry);
+            state.metrics.record_cache_miss(registry);
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                display,
+                rt,
+                "PROXY",
+            ));
+            state
+                .audit
+                .log(AuditEntry::new("proxy_fetch", "api", "", registry, ""));
+            if immutable {
+                state.spawn_cache_immutable(registry, key, data.clone());
+                if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                    &state.digest_store,
+                    registry,
+                    &data,
+                    &q_mode,
+                    q_secs,
+                    &url,
+                    None,
+                ) {
+                    return resp;
+                }
+            } else {
+                state.spawn_cache(registry, key, data.clone());
+            }
+            serve(data).into_response()
+        }
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        Err(e) => {
+            // Upstream failed — serve the stale cached copy if we have one.
+            if let Some(data) = cached {
+                tracing::warn!(registry, url = %url, error = ?e, "upstream failed, serving stale cached copy");
+                if immutable {
+                    if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
+                        &state.digest_store,
+                        registry,
+                        &data,
+                        &q_mode,
+                        q_secs,
+                        "cache-stale",
+                        None,
+                    ) {
+                        return resp;
+                    }
+                }
+                let mut response = serve(data).into_response();
+                response.headers_mut().insert(
+                    header::HeaderName::from_static("x-nora-stale"),
+                    header::HeaderValue::from_static("true"),
+                );
+                return response;
+            }
+            tracing::debug!(registry, url = %url, error = ?e, "proxy fetch failed with no cached copy");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 /// Forward a POST (request body + an allowlist of headers) to an upstream and

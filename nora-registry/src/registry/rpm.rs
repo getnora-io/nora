@@ -19,7 +19,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::registry::method_not_allowed;
+use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -707,6 +707,9 @@ async fn upload(
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if state.config.rpm.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
+    }
     if let Err(msg) = validate_package_path(&repo, &path) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -817,6 +820,32 @@ async fn download(
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // Pull-through repo: every path (including repodata/ and repomd.xml.key,
+    // which are server-generated only for hosted repos) proxies to the
+    // configured upstream. Packages are immutable; metadata is TTL-bounded.
+    if let Some(entry) = state.config.rpm.proxies.get(&repo) {
+        let key = package_key(&repo, &path);
+        if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let lower = path.to_ascii_lowercase();
+        let immutable = lower.ends_with(".rpm") || lower.ends_with(".drpm");
+        let url = format!("{}/{}", entry.url().trim_end_matches('/'), path);
+        return crate::registry::repo_proxy_download(
+            &state,
+            "rpm",
+            crate::registry_type::RegistryType::Rpm,
+            format!("{repo}/{path}"),
+            key,
+            url,
+            entry.auth(),
+            state.config.rpm.proxy_timeout,
+            state.config.rpm.metadata_ttl,
+            immutable,
+            content_type(&path),
+        )
+        .await;
+    }
     if path == format!("{REPODATA}/repomd.xml.key") {
         return match &state.signer {
             Some(signer) => (
@@ -900,6 +929,9 @@ async fn delete_package(
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if state.config.rpm.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
+    }
     if let Err(msg) = validate_package_path(&repo, &path) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -959,6 +991,9 @@ async fn reindex(
     }
     if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
         return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    }
+    if state.config.rpm.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
     }
     if enforce_namespace_scope(&authority, &repo).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -1922,5 +1957,196 @@ mod reindex_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod proxy_tests {
+    use crate::config::registry::RepoProxyEntry;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Wait for the background `spawn_cache` write to land.
+    async fn await_cached(state: &crate::AppState, key: &str) {
+        for _ in 0..100 {
+            if state.storage.stat(key).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("cache write for {key} never landed");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_proxy_fetches_caches_then_serves_from_cache() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/Packages/foo-1.0-1.x86_64.rpm"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"rpmbytes".to_vec()))
+            .expect(1) // second GET must come from the cache
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/fedora/Packages/foo-1.0-1.x86_64.rpm",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"rpmbytes");
+
+        await_cached(&ctx.state, "rpm/fedora/Packages/foo-1.0-1.x86_64.rpm").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/fedora/Packages/foo-1.0-1.x86_64.rpm",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"rpmbytes");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_proxy_metadata_revalidates_when_ttl_zero() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repodata/repomd.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<repomd/>"))
+            .expect(2) // ttl=0 → every GET revalidates upstream
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm.metadata_ttl = 0;
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+        });
+
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, "/rpm/fedora/repodata/repomd.xml", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "mutable metadata must not be client-cached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rpm_proxy_serves_stale_metadata_when_upstream_down() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm.metadata_ttl = 0; // force revalidation so the fetch fails
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+        });
+        ctx.state
+            .storage
+            .put("rpm/fedora/repodata/repomd.xml", b"<repomd-cached/>")
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/rpm/fedora/repodata/repomd.xml", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-nora-stale")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"<repomd-cached/>");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_proxy_quarantine_enforce_holds_new_package() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"heldrpm".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm
+                .proxies
+                .insert("fedora".to_string(), RepoProxyEntry::Simple(uri));
+            cfg.curation.rpm.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/rpm/fedora/Packages/held-1.0-1.x86_64.rpm",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Metadata is never quarantined — repodata must still flow.
+        let resp = send(&ctx.app, Method::GET, "/rpm/fedora/repodata/repomd.xml", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_rpm_proxied_repo_rejects_writes() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.rpm.enabled = true;
+            cfg.rpm.proxies.insert(
+                "fedora".to_string(),
+                RepoProxyEntry::Simple("http://upstream.invalid".to_string()),
+            );
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/fedora/foo-1.0-1.x86_64.rpm",
+            "x",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = send(
+            &ctx.app,
+            Method::DELETE,
+            "/rpm/fedora/foo-1.0-1.x86_64.rpm",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = send(&ctx.app, Method::POST, "/rpm/fedora/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // A hosted repo (not in the proxies map) is untouched by the guard.
+        let resp = send(&ctx.app, Method::PUT, "/rpm/hosted/not-an-rpm.txt", "x").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

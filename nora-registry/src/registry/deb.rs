@@ -27,7 +27,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::registry::method_not_allowed;
+use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
@@ -662,6 +662,9 @@ async fn upload(
     if !state.config.deb.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if state.config.deb.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
+    }
     if let Err(msg) = validate_package_path(&repo, &path) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -754,6 +757,32 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = strip_flat_prefix(&path).to_string();
+    // Pull-through repo: every path (including dists/ indexes and pubkey.gpg,
+    // which are server-generated only for hosted repos) proxies to the
+    // configured upstream. Packages are immutable; metadata is TTL-bounded.
+    if let Some(entry) = state.config.deb.proxies.get(&repo) {
+        let key = package_key(&repo, &path);
+        if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let lower = path.to_ascii_lowercase();
+        let immutable = lower.ends_with(".deb") || lower.ends_with(".udeb");
+        let url = format!("{}/{}", entry.url().trim_end_matches('/'), path);
+        return crate::registry::repo_proxy_download(
+            &state,
+            "deb",
+            crate::registry_type::RegistryType::Deb,
+            format!("{repo}/{path}"),
+            key,
+            url,
+            entry.auth(),
+            state.config.deb.proxy_timeout,
+            state.config.deb.metadata_ttl,
+            immutable,
+            content_type(&path),
+        )
+        .await;
+    }
     if path == "pubkey.gpg" {
         return match &state.signer {
             Some(signer) => (
@@ -838,6 +867,9 @@ async fn delete_package(
     if !state.config.deb.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if state.config.deb.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
+    }
     if let Err(msg) = validate_package_path(&repo, &path) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -899,6 +931,9 @@ async fn reindex(
     }
     if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
         return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    }
+    if state.config.deb.proxies.contains_key(&repo) {
+        return proxied_repo_conflict();
     }
     if enforce_namespace_scope(&authority, &repo).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -2070,5 +2105,101 @@ mod structured_tests {
         let flat = get_text(&ctx, "/deb/myrepo/Packages").await;
         assert!(flat.contains("Package: adopted\n"), "adopted into flat");
         assert!(!flat.contains("Package: a\n"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod proxy_tests {
+    use crate::config::registry::RepoProxyEntry;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_deb_proxy_fetches_structured_layout() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/InRelease"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Origin: Debian"))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pool/main/a/a_1.0_amd64.deb"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"debbytes".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb
+                .proxies
+                .insert("debian".to_string(), RepoProxyEntry::Simple(uri));
+        });
+
+        // Index path (mutable, upstream-signed) proxies verbatim.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/dists/bookworm/InRelease",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"Origin: Debian");
+
+        // Package path (immutable) proxies and caches.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/pool/main/a/a_1.0_amd64.deb",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"debbytes");
+    }
+
+    #[tokio::test]
+    async fn test_deb_proxy_strips_flat_prefix() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/InRelease"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("flat"))
+            .mount(&upstream)
+            .await;
+
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb
+                .proxies
+                .insert("debian".to_string(), RepoProxyEntry::Simple(uri));
+        });
+
+        // apt requests `./InRelease` for flat sources lines.
+        let resp = send(&ctx.app, Method::GET, "/deb/debian/./InRelease", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"flat");
+    }
+
+    #[tokio::test]
+    async fn test_deb_proxied_repo_rejects_writes() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb.proxies.insert(
+                "debian".to_string(),
+                RepoProxyEntry::Simple("http://upstream.invalid".to_string()),
+            );
+        });
+
+        let resp = send(&ctx.app, Method::PUT, "/deb/debian/a_1.0_amd64.deb", "x").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = send(&ctx.app, Method::DELETE, "/deb/debian/a_1.0_amd64.deb", "").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let resp = send(&ctx.app, Method::POST, "/deb/debian/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 }
