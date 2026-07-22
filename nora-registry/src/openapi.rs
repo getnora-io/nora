@@ -268,8 +268,7 @@ pub struct ErrorResponse {
     path = "/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service is healthy", body = HealthResponse),
-        (status = 503, description = "Service is unhealthy", body = HealthResponse)
+        (status = 200, description = "Process is up; `status` field reports `healthy` or `degraded` (storage unreachable)", body = HealthResponse)
     )
 )]
 pub async fn health_check() {}

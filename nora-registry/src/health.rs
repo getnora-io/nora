@@ -43,7 +43,7 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
     let status = if storage_reachable {
         "healthy"
     } else {
-        "unhealthy"
+        "degraded"
     };
 
     let uptime = state.start_time.elapsed().as_secs();
@@ -69,13 +69,12 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         upstreams,
     };
 
-    let status_code = if storage_reachable {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (status_code, Json(health))
+    // Always 200: /health is a liveness signal — the process is up and serving.
+    // Storage reachability is informational (`status: degraded`); gating liveness
+    // or the LB on it turns a storage blip into a restart loop / full 502 outage
+    // for every route, storage-backed or not (#869). Readiness (`/ready`) is the
+    // storage gate.
+    (StatusCode::OK, Json(health))
 }
 
 async fn readiness_check(State(state): State<AppState>) -> StatusCode {
@@ -187,6 +186,32 @@ mod tests {
 
         let size = json["storage"]["total_size_bytes"].as_u64().unwrap();
         assert_eq!(size, 0, "empty storage should report 0 bytes");
+    }
+
+    /// Storage unreachable → `/health` stays 200 (liveness = process up) and reports
+    /// `degraded`; `/ready` is the storage gate and goes 503 (#869).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_health_200_degraded_when_storage_unreachable() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = create_test_context();
+        let dir = ctx._tempdir.path();
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir, perms).unwrap();
+
+        let health = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = body_bytes(health).await;
+        assert!(std::str::from_utf8(&body).unwrap().contains("degraded"));
+
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Restore write permission so TempDir::drop can clean up.
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms).unwrap();
     }
 
     #[tokio::test]

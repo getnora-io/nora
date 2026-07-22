@@ -24,6 +24,12 @@ pub struct ObjectStorage {
     cached_total_size: std::sync::atomic::AtomicU64,
     /// Whether cached_total_size has been initialized at least once.
     size_cache_initialized: std::sync::atomic::AtomicBool,
+    /// Outcome of the last background refresh, served by `health_check()`.
+    /// Starts `false` so readiness gates until the boot refresh confirms the
+    /// store — a live probe here would list the whole bucket on every kubelet
+    /// and LB health check, and slow listings under load mark the backend
+    /// unhealthy exactly when it is busiest (#869).
+    cached_reachable: std::sync::atomic::AtomicBool,
 }
 
 impl ObjectStorage {
@@ -68,6 +74,7 @@ impl ObjectStorage {
             name: "s3",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -105,6 +112,7 @@ impl ObjectStorage {
             name: "gcs",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -260,10 +268,11 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // Try listing with no prefix — if the store responds, it's healthy.
-        // Even an empty bucket or a 404 on prefix is fine.
-        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
-        result.is_ok()
+        // Cached outcome of the last background refresh (#869) — probes must
+        // never hit the store. False until the boot refresh succeeds, so
+        // readiness still gates a misconfigured store at rollout.
+        self.cached_reachable
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn total_size(&self) -> u64 {
@@ -278,6 +287,8 @@ impl StorageBackend for ObjectStorage {
     async fn refresh_total_size(&self) {
         let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
 
+        self.cached_reachable
+            .store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
         if let Ok(objects) = result {
             let total: u64 = objects.iter().map(|m| m.size).sum();
             self.cached_total_size
@@ -382,6 +393,17 @@ mod tests {
         assert_eq!(storage.backend_name(), "s3");
     }
 
+    /// `health_check` is a cached signal (#869): false at construction (probes do no
+    /// store I/O), and still false after a refresh against an unreachable endpoint.
+    /// The true-path is the background refresh loop against a live store.
+    #[tokio::test]
+    async fn test_health_check_cached_not_live() {
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        assert!(!storage.health_check().await);
+        storage.refresh_total_size().await;
+        assert!(!storage.health_check().await);
+    }
+
     #[test]
     fn test_s3_storage_creation_anonymous() {
         let storage = ObjectStorage::new(
@@ -412,11 +434,12 @@ mod tests {
         assert_eq!(storage.backend_name(), "gcs");
     }
 
-    /// Empty ListObjectsV2 body so `health_check`'s `list(None)` succeeds against the mock.
+    /// Empty ListObjectsV2 body so `refresh_total_size`'s `list(None)` succeeds against the mock.
     const EMPTY_LIST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
 
-    /// Run one `health_check` (a ListObjectsV2) against a mock server and return the
-    /// request path the client actually used.
+    /// Run one `refresh_total_size` (a ListObjectsV2) against a mock server and return the
+    /// request path the client actually used. Also covers the cached-reachability true
+    /// path (#869): a successful refresh flips `health_check()` to true.
     async fn observed_list_path(virtual_hosted: bool) -> String {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -434,6 +457,8 @@ mod tests {
             Some("secret"),
             virtual_hosted,
         );
+        assert!(!storage.health_check().await);
+        storage.refresh_total_size().await;
         assert!(storage.health_check().await);
         let requests = server.received_requests().await.unwrap();
         requests[0].url.path().to_string()
