@@ -2159,26 +2159,39 @@ async fn get_manifest(
     let key = manifest_key(ns.as_deref(), &name, &reference);
     let legacy_key = manifest_key(None, &name, &reference);
 
-    // Try local storage first (namespaced key, then legacy fallback).
-    let cached = storage_get_with_fallback(&state.storage, &key, &legacy_key)
-        .await
-        .ok();
+    // Try local storage first (namespaced key, then bare-key fallback). Provenance lives in
+    // the key layout: the namespaced key only ever holds an upstream-proxied copy, while the
+    // bare key is what `put_manifest` writes — a bare-key hit is a locally pushed (hosted)
+    // manifest. (Pre-#349 flat-keyed proxy caches are consequently read as hosted; the cost
+    // is skipped tag revalidation on those legacy entries.)
+    let (cached, hosted) = match state.storage.get(&key).await {
+        Ok(data) => (Some(data), key == legacy_key),
+        Err(_) if key != legacy_key => (state.storage.get(&legacy_key).await.ok(), true),
+        Err(_) => (None, true),
+    };
     // Digest references are immutable (content-addressed) → the cache is authoritative forever.
-    // Tag references are MUTABLE: a tag can be re-pushed to point at a different manifest, so a
-    // proxied tag must be revalidated against upstream before it is served — otherwise a
-    // re-pushed upstream tag is never reflected (#638). `metadata_ttl` is an optional staleness
-    // window for tags: only a POSITIVE value serves a tag from cache without revalidating (within
-    // the window); otherwise the latest is fetched. A tag with no upstream (hosted) is
-    // authoritative and served from cache; when upstream is unreachable the stale-while-error
-    // path below still serves the cached manifest.
+    // Tag references on PROXIED copies are MUTABLE: a tag can be re-pushed to point at a
+    // different manifest, so a proxied tag must be revalidated against upstream before it is
+    // served — otherwise a re-pushed upstream tag is never reflected (#638). `metadata_ttl` is
+    // an optional staleness window for tags: only a POSITIVE value serves a tag from cache
+    // without revalidating (within the window); otherwise the latest is fetched. A HOSTED
+    // manifest (bare-key hit, or no upstreams configured) is authoritative and served without
+    // any upstream round trip — before this distinction a hosted tag was revalidated against
+    // an upstream that never had it, 404ing local images when upstream was down and
+    // serve_stale off, and stale-marking every pull otherwise.
     let is_digest = reference.starts_with("sha256:");
+    let revalidate = !hosted && !upstreams_to_try.is_empty();
     let cache_fresh = if cached.is_some() {
-        let modified = storage_stat_with_fallback(&state.storage, &key, &legacy_key)
-            .await
-            .map(|m| m.modified);
+        let modified = if revalidate && !is_digest {
+            storage_stat_with_fallback(&state.storage, &key, &legacy_key)
+                .await
+                .map(|m| m.modified)
+        } else {
+            None
+        };
         manifest_cache_fresh(
             is_digest,
-            !upstreams_to_try.is_empty(),
+            revalidate,
             state.config.docker.metadata_ttl,
             modified,
         )
@@ -3788,6 +3801,62 @@ mod integration_tests {
             .to_string();
         assert_eq!(get_digest, digest_header);
         let body = body_bytes(get_resp).await;
+        assert_eq!(body.as_ref(), manifest_bytes.as_slice());
+    }
+
+    /// A locally pushed manifest is authoritative: with global pull-through upstreams
+    /// configured, GET must serve it without revalidating against upstream — an unreachable
+    /// upstream must neither 404 the tag (serve_stale = false) nor stale-mark it.
+    #[tokio::test]
+    async fn test_hosted_manifest_skips_upstream_revalidation() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.serve_stale = false;
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: "http://127.0.0.1:1".into(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        seed_zero_config(&ctx.state, "hosted-img").await;
+        let put_resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/hosted-img/manifests/v1",
+            Body::from(manifest_bytes.clone()),
+        )
+        .await;
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/hosted-img/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-nora-stale").is_none(),
+            "hosted manifest must not be served via the stale-while-error path"
+        );
+        let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
     }
 
