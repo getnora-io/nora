@@ -721,7 +721,34 @@ fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> 
         &format!("{}/v3/collections/", nora_ansible),
     );
     // Catch-all: any remaining upstream references
-    rw(&s, upstream, &nora_ansible)
+    let s = rw(&s, upstream, &nora_ansible);
+
+    // Root-relative pagination links (#851-followup): galaxy_ng emits
+    // `links.next`/`first`/`last` as host-relative paths (no scheme/host), e.g.
+    // `/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=100`.
+    // The absolute rewrites above never match these, so without this the client
+    // resolves them against NORA's host root — dropping the `/ansible` mount —
+    // and every collection with >100 versions (e.g. community.docker) 404s on page 2.
+    // Rewrite to root-relative NORA paths so the client's relative-link
+    // resolution keeps them under `/ansible`.
+    //
+    // These needles are anchored on the opening `"` of the JSON string value
+    // (the escape-aware `rw` also matches the `\"`…`\/`-escaped form). Unlike the
+    // absolute rules above — pinned by a full `scheme://host` — a bare path is a
+    // weak anchor, so without the quote it would also rewrite the middle of a
+    // *different* host's URL or a literal path in free text (`docs_blob`). The
+    // pagination links are whole string values, so the quote is always adjacent.
+    let nora_ansible_path = format!("{}/ansible", crate::config::url_path_component(base));
+    let s = rw(
+        &s,
+        "\"/api/v3/plugin/ansible/content/published/collections/artifacts/",
+        &format!("\"{}/download/", nora_ansible_path),
+    );
+    rw(
+        &s,
+        &format!("\"{}/", API_PREFIX),
+        &format!("\"{}/v3/collections/", nora_ansible_path),
+    )
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -990,6 +1017,106 @@ mod tests {
             result
         );
         assert!(!result.contains("galaxy.ansible.com"));
+    }
+
+    #[test]
+    fn test_rewrite_relative_pagination_next_link() {
+        // galaxy_ng emits root-relative pagination links (no scheme/host). The
+        // absolute rewrites don't touch them; they must still land under /ansible
+        // so the client's relative-link resolution stays on the mount. Regression
+        // for community.docker (148 versions) 404ing on page 2.
+        let input = r#"{"links":{"next":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=100","first":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=0"}}"#;
+        let result = rewrite_ansible_urls(
+            input,
+            "https://galaxy.ansible.com",
+            "https://nora.nuc.m8g.dev",
+        );
+        assert!(
+            result.contains(
+                "\"next\":\"/ansible/v3/collections/community/docker/versions/?limit=100&offset=100\""
+            ),
+            "relative next link not rewritten to /ansible path: {result}"
+        );
+        assert!(
+            result.contains(
+                "\"first\":\"/ansible/v3/collections/community/docker/versions/?limit=100&offset=0\""
+            ),
+            "relative first link not rewritten: {result}"
+        );
+        // No bare /api/v3/plugin path may survive (would drop the /ansible mount).
+        assert!(
+            !result.contains("\"/api/v3/plugin/"),
+            "a root-relative pulp path leaked: {result}"
+        );
+
+        // Same link in the `\/`-escaped JSON form many origins emit (#385 class):
+        // must be rewritten too, or the pulp path survives once the client
+        // unescapes it.
+        let escaped = r#"{"links":{"next":"\/api\/v3\/plugin\/ansible\/content\/published\/collections\/index\/community\/docker\/versions\/?limit=100&offset=100"}}"#;
+        let result = rewrite_ansible_urls(
+            escaped,
+            "https://galaxy.ansible.com",
+            "https://nora.nuc.m8g.dev",
+        );
+        assert!(
+            result.contains(
+                "\"next\":\"\\/ansible\\/v3\\/collections\\/community\\/docker\\/versions\\/?limit=100&offset=100\""
+            ),
+            "escaped relative next link not rewritten: {result}"
+        );
+        assert!(
+            !result.contains("plugin"),
+            "an escaped pulp path leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_relative_pagination_subpath_mount() {
+        // NORA mounted under a sub-path (reverse proxy): the relative link must
+        // carry the prefix so the client resolves it under `/prefix/ansible`, not
+        // the host root. Exercises `url_path_component` inside the rewriter — the
+        // reason it exists — which `test_url_path_component` only covers in isolation.
+        let input = r#"{"links":{"next":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=100"}}"#;
+        let result = rewrite_ansible_urls(
+            input,
+            "https://galaxy.ansible.com",
+            "https://nora.test/prefix",
+        );
+        assert!(
+            result.contains(
+                "\"next\":\"/prefix/ansible/v3/collections/community/docker/versions/?limit=100&offset=100\""
+            ),
+            "relative link did not carry the sub-path mount prefix: {result}"
+        );
+    }
+
+    #[test]
+    fn test_relative_rewrite_is_quote_anchored() {
+        // The relative rules match a bare path only at the start of a JSON string
+        // value (anchored on the opening quote). A pulp-looking path in the middle
+        // of a *different* host's absolute URL, or in free text, must be left
+        // untouched — otherwise the weakly-anchored rule mangles unrelated content.
+        let foreign = r#"{"x":"https://mirror.example/api/v3/plugin/ansible/content/published/collections/index/foo/bar/"}"#;
+        assert_eq!(
+            rewrite_ansible_urls(foreign, "https://galaxy.ansible.com", "https://nora.test"),
+            foreign,
+            "a non-upstream absolute URL was mangled mid-path"
+        );
+        let prose = r#"{"description":"see /api/v3/plugin/ansible/content/published/collections/index/ here"}"#;
+        assert_eq!(
+            rewrite_ansible_urls(prose, "https://galaxy.ansible.com", "https://nora.test"),
+            prose,
+            "a literal path in free text was mangled"
+        );
+    }
+
+    #[test]
+    fn test_url_path_component() {
+        use crate::config::url_path_component;
+        assert_eq!(url_path_component("https://nora.nuc.m8g.dev"), "");
+        assert_eq!(url_path_component("https://nora.test/prefix"), "/prefix");
+        assert_eq!(url_path_component("http://nora:4000"), "");
+        assert_eq!(url_path_component("/already/a/path"), "/already/a/path");
     }
 
     #[test]
@@ -1338,5 +1465,67 @@ mod integration_tests {
             .with_label_values(&["ansible"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// Regression: galaxy_ng emits `links.next` as a *host-relative* path
+    /// (no scheme/host). Driven through the real `version_list` handler, the
+    /// rewritten body must land the pagination link under `/ansible` so the
+    /// client stays on the mount — otherwise a >100-version collection (e.g.
+    /// community.docker, 148 versions) 404s on page 2 with `cmd_arg` HTTP 404.
+    #[tokio::test]
+    async fn test_version_list_rewrites_relative_next_link() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Page 1 body carries galaxy_ng's root-relative pagination pointers.
+        let page1 = r#"{"meta":{"count":148},"links":{"first":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=0","previous":null,"next":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=100","last":"/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=48"},"data":[{"version":"4.4.0"}]}"#;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page1, "application/json"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+            cfg.ansible.proxy = Some(upstream.uri());
+            cfg.ansible.metadata_ttl = 0; // force an upstream fetch (no fresh cache)
+            cfg.ansible.revalidate = false; // no validators → plain 200 full fetch
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/ansible/v3/collections/community/docker/versions/?limit=100",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let text = String::from_utf8_lossy(&body);
+
+        // Relative pagination links now point under /ansible (path-only, so the
+        // client's relative-link resolution keeps the mount prefix).
+        assert!(
+            text.contains(
+                "\"next\":\"/ansible/v3/collections/community/docker/versions/?limit=100&offset=100\""
+            ),
+            "next link not rewritten under /ansible: {text}"
+        );
+        assert!(
+            text.contains(
+                "\"first\":\"/ansible/v3/collections/community/docker/versions/?limit=100&offset=0\""
+            ),
+            "first link not rewritten under /ansible: {text}"
+        );
+        // No bare pulp path may survive — that is exactly what dropped the mount.
+        assert!(
+            !text.contains("/api/v3/plugin/"),
+            "a root-relative pulp path leaked to the client: {text}"
+        );
+        // Payload is otherwise passed through untouched.
+        assert!(text.contains("\"version\":\"4.4.0\""), "data lost: {text}");
     }
 }
