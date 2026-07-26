@@ -150,12 +150,23 @@ fn encode_object_key_legacy(key: &str) -> String {
 
 /// Decode S3 keys back to original form.
 ///
-/// Only decodes the current `%40` encoding. Legacy `_at_` keys from pre-#534
-/// data are NOT decoded here — they are handled by fallback reads in `get()`
-/// and `stat()`. This avoids the roundtrip collision where literal `_at_` in
-/// keys (e.g. `cargo/look_at_this/`) would be wrongly decoded as `@`.
+/// `encode_object_key` maps `@` -> `%40`, but `object_store::path::Path` percent-
+/// encodes the `%` we introduced (its INVALID set includes `%`, not `@`), so the
+/// byte actually written — and returned by `list()`/`list_with_meta()` in
+/// `meta.location` — is DOUBLE-encoded `%2540`, not `%40`. Reversing only `%40`
+/// left the double form intact, so a follow-up `get()` on the listed key encoded a
+/// third time (`%252540`) and 404'd. Net effect: scoped npm packages (`@scope/name`)
+/// listed as if they had no versions, so scan-regenerate wrote an EMPTY packument on
+/// every publish and `npm install` failed `ENOVERSIONS` (#878, S3/object_store only —
+/// local FS has no `%` re-encoding). Reverse the double form FIRST, then the single
+/// form (a backend that does not re-encode, e.g. an in-memory mock). Non-scoped keys
+/// carry no `%` and are untouched by either replace.
+///
+/// Legacy `_at_` keys from pre-#534 data are still NOT decoded here — they are
+/// handled by fallback reads in `get()`/`stat()`, avoiding the roundtrip collision
+/// where a literal `_at_` (e.g. `cargo/look_at_this/`) would be wrongly decoded.
 fn decode_object_key(key: &str) -> String {
-    key.replace("%40", "@")
+    key.replace("%2540", "@").replace("%40", "@")
 }
 
 /// Map object_store errors to StorageError.
@@ -452,6 +463,67 @@ mod tests {
         // A fresh refresh timestamp → reachable again.
         storage.last_refresh_unix.store(now, Relaxed);
         assert!(storage.health_check().await);
+    }
+
+    /// #878 unit guard: `decode_object_key` must reverse the DOUBLE-encoded `%2540`
+    /// that `object_store::path::Path` produces from our `%40`, the single `%40`
+    /// (a non-re-encoding backend), and must NOT touch a literal `_at_`.
+    #[test]
+    fn decode_reverses_double_encoded_at() {
+        assert_eq!(
+            decode_object_key("npm/%2540scope/pkg/metadata.json"),
+            "npm/@scope/pkg/metadata.json"
+        );
+        assert_eq!(decode_object_key("npm/%40scope/x"), "npm/@scope/x");
+        assert_eq!(
+            decode_object_key("cargo/look_at_this/x"),
+            "cargo/look_at_this/x"
+        );
+    }
+
+    /// #878 regression through the REAL scan-regenerate call path (list -> get) against a
+    /// live object_store. The `%`-re-encoding lives in `Path`, not the S3 backend, so the
+    /// in-memory store reproduces the double-encoding faithfully — no MinIO needed. Before
+    /// the `decode_object_key` fix, `list()` returned the `%2540` key, the follow-up `get()`
+    /// re-encoded a third time and 404'd, and every scoped npm publish regenerated an empty
+    /// packument (`npm install` -> ENOVERSIONS).
+    #[tokio::test]
+    async fn scoped_key_lists_and_gets_through_path_encoding() {
+        let storage = ObjectStorage {
+            store: Box::new(object_store::memory::InMemory::new()),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let key = "npm/@scope/pkg/versions/1.0.0.json";
+        storage.put(key, br#"{"version":"1.0.0"}"#).await.unwrap();
+
+        // Control: a non-scoped key (no `@`, no `%`) is unaffected.
+        let plain = "npm/plainpkg/versions/1.0.0.json";
+        storage.put(plain, br#"{"version":"1.0.0"}"#).await.unwrap();
+
+        // list() must return the ORIGINAL logical key (with `@`), not the `%2540` form.
+        let listed = storage.list("npm/@scope/pkg/versions/").await.unwrap();
+        assert_eq!(
+            listed,
+            vec![key.to_string()],
+            "list must decode %2540 back to @ so scan-regenerate can read it"
+        );
+
+        // The listed key must be directly get-able — the exact scan-regenerate step that
+        // silently dropped scoped versions before the fix.
+        let got = storage
+            .get(&listed[0])
+            .await
+            .expect("get on the listed key must succeed");
+        assert_eq!(&got[..], br#"{"version":"1.0.0"}"#);
+
+        let listed_plain = storage.list("npm/plainpkg/versions/").await.unwrap();
+        assert_eq!(listed_plain, vec![plain.to_string()]);
+        assert!(storage.get(&listed_plain[0]).await.is_ok());
     }
 
     #[test]

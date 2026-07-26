@@ -952,6 +952,33 @@ async fn handle_publish(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    // Fail-closed (#878): a 201 MUST mean the published version is actually visible in
+    // the packument. scan-regenerate derives `versions` by LISTING the per-version keys
+    // and reading each back; a storage key-encoding round-trip bug (the object_store
+    // `%40`->`%2540` double-encoding for `@scope/...` keys) silently produced an empty
+    // `versions` map, yet publish still returned 201 and `npm install` then failed
+    // ENOVERSIONS. Read the regenerated packument back and refuse (500) unless every
+    // just-published version is present, so a regen round-trip defect can never again
+    // hide behind a 201.
+    let published_visible = match state.storage.get(&metadata_key).await {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|m| {
+                m.get("versions")
+                    .and_then(|v| v.as_object())
+                    .map(|vs| new_versions.keys().all(|v| vs.contains_key(v)))
+            })
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if !published_visible {
+        tracing::error!(
+            package = %package_name,
+            "npm publish: regenerated packument does not list the just-published version(s) — refusing 201 (scan-regenerate round-trip broke, see #878)"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     state.metrics.record_upload("npm");
     state
         .audit
