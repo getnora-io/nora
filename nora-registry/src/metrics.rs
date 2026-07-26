@@ -91,6 +91,20 @@ pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("failed to create PROXY_UPSTREAM_304_TOTAL metric at startup")
 });
 
+/// Upstream 4xx responses that carried a policy/geo block signature (e.g. an AWS
+/// WAF geo rule via `x-amzn-waf-reason`) and were relayed as a bare 404. Lets an
+/// operator tell an effective region/policy outage apart from a genuine not-found
+/// — which is otherwise invisible (a 4xx logs nothing and never trips the breaker).
+/// Labels: `registry`, `reason` (bounded: `geo` | `waf`) (#881).
+pub static UPSTREAM_POLICY_BLOCKED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_upstream_policy_blocked_total",
+        "Upstream 4xx responses bearing a policy/geo block signature, relayed as 404",
+        &["registry", "reason"]
+    )
+    .expect("failed to create UPSTREAM_POLICY_BLOCKED_TOTAL metric at startup")
+});
+
 /// Body bytes saved by revalidation (size of the cached body that did NOT have
 /// to be re-downloaded because upstream returned 304) (#596).
 pub static PROXY_REVALIDATION_BYTES_SAVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
