@@ -48,7 +48,7 @@ pub use terraform::routes as terraform_routes;
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::basic_auth_header;
-use crate::metrics::UPSTREAM_REQUEST_DURATION;
+use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
 use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::body::{Body, Bytes};
@@ -121,6 +121,22 @@ pub(crate) fn circuit_open_response(registry: &str) -> Response {
         .into_response()
 }
 
+/// Detect a policy/geo block signature on an upstream 4xx response, returning a
+/// bounded reason label (low metric cardinality) or `None` for a genuine 4xx.
+///
+/// Currently keys off `x-amzn-waf-reason`, which AWS CloudFront + WAF sets when a
+/// rule blocks a request — a trade-control/geo rule returns it as a 404 that is
+/// otherwise indistinguishable from a not-found (#881). More signatures can be
+/// added here without touching the call site.
+fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static str> {
+    let reason = headers.get("x-amzn-waf-reason")?;
+    let is_geo = reason
+        .to_str()
+        .map(|v| v.eq_ignore_ascii_case("geo"))
+        .unwrap_or(false);
+    Some(if is_geo { "geo" } else { "waf" })
+}
+
 /// Core fetch logic with retry. Callers provide a response extractor.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
@@ -174,6 +190,24 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "4xx"])
                         .observe(elapsed);
+                    // A policy/geo block (e.g. an AWS WAF geo rule) is a 4xx that is
+                    // effectively an outage dressed up as a not-found: it logs nothing,
+                    // never moves the breaker, and only bumps the 4xx metric — so an
+                    // operator cannot tell it apart from a genuine 404. Surface it
+                    // distinctly when the response carries a block signature (#881).
+                    // A plain 4xx (no signature) stays silent, exactly as before.
+                    if let Some(reason) = policy_block_reason(response.headers()) {
+                        UPSTREAM_POLICY_BLOCKED_TOTAL
+                            .with_label_values(&[registry_str, reason])
+                            .inc();
+                        tracing::warn!(
+                            registry = registry_str,
+                            url,
+                            status,
+                            reason,
+                            "upstream returned a policy/geo block, relayed as 404 (not a genuine not-found) — check egress/region"
+                        );
+                    }
                     // A 4xx means the upstream is alive and answered — not an
                     // availability failure. `record_alive` closes the breaker
                     // from HalfOpen (so it recovers instead of slow-probing) but
@@ -805,6 +839,89 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProxyError::Network(_))));
+    }
+
+    // --- Policy/geo upstream block observability (#881) ---
+
+    #[test]
+    fn policy_block_reason_detects_waf_geo() {
+        use reqwest::header::HeaderMap;
+        let mut geo = HeaderMap::new();
+        geo.insert("x-amzn-waf-reason", "geo".parse().unwrap());
+        assert_eq!(policy_block_reason(&geo), Some("geo"));
+
+        let mut other = HeaderMap::new();
+        other.insert("x-amzn-waf-reason", "rate-based".parse().unwrap());
+        assert_eq!(policy_block_reason(&other), Some("waf"));
+
+        // A genuine 4xx (no WAF signature) is not a policy block.
+        assert_eq!(policy_block_reason(&HeaderMap::new()), None);
+    }
+
+    /// A geo-blocked upstream 4xx (WAF `x-amzn-waf-reason: geo`) bumps the policy-block
+    /// metric and is still relayed as `NotFound`; a plain 4xx does neither (#881).
+    #[tokio::test]
+    async fn upstream_waf_geo_block_surfaced_but_plain_4xx_silent() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Geo-blocked upstream: 404 + x-amzn-waf-reason: geo.
+        let blocked = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404).insert_header("x-amzn-waf-reason", "geo"))
+            .mount(&blocked)
+            .await;
+        let reg = RegistryType::Terraform;
+        let before = UPSTREAM_POLICY_BLOCKED_TOTAL
+            .with_label_values(&[reg.as_str(), "geo"])
+            .get();
+        let r = proxy_fetch_text(
+            &reqwest::Client::new(),
+            &blocked.uri(),
+            Duration::from_secs(5),
+            None,
+            None,
+            &noop_cb(),
+            reg,
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::NotFound)));
+        assert_eq!(
+            UPSTREAM_POLICY_BLOCKED_TOTAL
+                .with_label_values(&[reg.as_str(), "geo"])
+                .get(),
+            before + 1,
+            "a WAF geo 4xx must bump the policy-block metric"
+        );
+
+        // Control: a plain 404 (no WAF signature) must NOT bump the metric.
+        let plain = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&plain)
+            .await;
+        let reg2 = RegistryType::Cargo;
+        let before2 = UPSTREAM_POLICY_BLOCKED_TOTAL
+            .with_label_values(&[reg2.as_str(), "geo"])
+            .get();
+        let r2 = proxy_fetch_text(
+            &reqwest::Client::new(),
+            &plain.uri(),
+            Duration::from_secs(5),
+            None,
+            None,
+            &noop_cb(),
+            reg2,
+        )
+        .await;
+        assert!(matches!(r2, Err(ProxyError::NotFound)));
+        assert_eq!(
+            UPSTREAM_POLICY_BLOCKED_TOTAL
+                .with_label_values(&[reg2.as_str(), "geo"])
+                .get(),
+            before2,
+            "a plain 4xx must NOT bump the policy-block metric"
+        );
     }
 
     // --- Conditional revalidation (#596) ---
