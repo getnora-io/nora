@@ -1038,6 +1038,18 @@ async fn merge_and_cache_proxy_metadata(
     upstream: &[u8],
 ) -> Bytes {
     let key = storage_key(document_path);
+
+    // Serialize the read -> merge -> write -> checksums cycle with the upload-side
+    // regeneration (`update_artifact_metadata`) and any concurrent proxy merge: all of them
+    // write the same `maven-metadata.xml` key and its four checksum sidecars. Without a shared
+    // lock those five independent `put`s interleave, leaving a stored `.sha1`/`.md5`/… that
+    // corresponds to different bytes than the stored `.xml` (checksum-mismatch window). The
+    // upload path locks the artifact's `maven-metadata.xml` key; locking the document key here
+    // — identical for artifact-level metadata — keeps `publish_lock serializes all writes to the
+    // same artifact path` intact on the proxy path too (#886). Held across the writes below.
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+
     let cached = state.storage.get(&key).await.ok();
     let last_updated = [Some(upstream), cached.as_deref()]
         .into_iter()

@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **Maven keeps server-generated artifact metadata authoritative** — a Maven client that re-uploads a stale artifact-level `maven-metadata.xml` after a concurrent deploy no longer overwrites the version list NORA generates: an uploaded artifact-level metadata document (and its checksums) is recognized by its shape and dropped, while version-level (SNAPSHOT) and group-level (plugin) metadata are still stored verbatim. On a proxy refresh, locally hosted versions are merged into the refreshed upstream document instead of being replaced by it, and the `.md5`/`.sha1`/`.sha256`/`.sha512` sidecars are recomputed from the merged document. The proxy-side merge runs under the same `publish_lock` as the upload-side regeneration, so the document and its checksums are written as one critical section and stay mutually consistent under concurrent fetch and publish (#886).
+
 ## [1.1.0] - 2026-07-26
 
 ### Fixed
