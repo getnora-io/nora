@@ -13,6 +13,7 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
+use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
@@ -23,6 +24,7 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use quick_xml::{events::Event, Reader};
 use sha2::Digest;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -66,6 +68,95 @@ enum MavenPathKind {
         filename: String,
     },
     Opaque,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MavenMetadataLevel {
+    Group,
+    Artifact,
+    Version,
+}
+
+fn classify_metadata_level(data: &[u8]) -> Option<MavenMetadataLevel> {
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut depth = 0;
+    let mut root_seen = false;
+    let mut root_closed = false;
+    let mut has_artifact_id = false;
+    let mut has_version = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = element.local_name();
+                if depth == 0 {
+                    if root_seen || name.as_ref() != b"metadata" {
+                        return None;
+                    }
+                    root_seen = true;
+                } else if depth == 1 {
+                    has_artifact_id |= name.as_ref() == b"artifactId";
+                    has_version |= name.as_ref() == b"version";
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(element)) => {
+                let name = element.local_name();
+                if depth == 0 {
+                    if root_seen || name.as_ref() != b"metadata" {
+                        return None;
+                    }
+                    root_seen = true;
+                    root_closed = true;
+                } else if depth == 1 {
+                    has_artifact_id |= name.as_ref() == b"artifactId";
+                    has_version |= name.as_ref() == b"version";
+                }
+            }
+            Ok(Event::End(element)) => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if element.local_name().as_ref() != b"metadata" {
+                        return None;
+                    }
+                    root_closed = true;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    if !root_seen || !root_closed || depth != 0 {
+        return None;
+    }
+
+    if has_version {
+        Some(MavenMetadataLevel::Version)
+    } else if has_artifact_id {
+        Some(MavenMetadataLevel::Artifact)
+    } else {
+        Some(MavenMetadataLevel::Group)
+    }
+}
+
+fn metadata_document_key(checksum_key: &str) -> Option<&str> {
+    [".md5", ".sha1", ".sha256", ".sha512"]
+        .into_iter()
+        .find_map(|suffix| checksum_key.strip_suffix(suffix))
+}
+
+fn checksum_suffix(path: &str) -> Option<&'static str> {
+    [".md5", ".sha1", ".sha256", ".sha512"]
+        .into_iter()
+        .find(|suffix| path.ends_with(suffix))
+        .map(|suffix| &suffix[1..])
 }
 
 fn classify_path(path: &str) -> MavenPathKind {
@@ -416,8 +507,26 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let metadata_request = match classify_path(&path) {
+        MavenPathKind::ArtifactMeta {
+            group_path,
+            artifact_id,
+            ..
+        } => Some((
+            group_path,
+            artifact_id,
+            metadata_document_key(&path).unwrap_or(&path).to_string(),
+            checksum_suffix(&path),
+        )),
+        _ => None,
+    };
+
     for proxy in &state.config.maven.proxies {
-        let url = format!("{}/{}", proxy.url().trim_end_matches('/'), path);
+        let upstream_path = metadata_request
+            .as_ref()
+            .map(|(_, _, document_path, _)| document_path.as_str())
+            .unwrap_or(&path);
+        let url = format!("{}/{}", proxy.url().trim_end_matches('/'), upstream_path);
 
         match proxy_fetch(
             &state.http_client,
@@ -442,7 +551,29 @@ async fn download(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "api", "", "maven", ""));
 
-                state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
+                let response_data =
+                    if let Some((group_path, artifact_id, document_path, requested_checksum)) =
+                        &metadata_request
+                    {
+                        let metadata = merge_and_cache_proxy_metadata(
+                            &state,
+                            group_path,
+                            artifact_id,
+                            document_path,
+                            &data,
+                        )
+                        .await;
+                        match requested_checksum {
+                            Some(suffix) => match checksum_hex(suffix, &metadata) {
+                                Some(checksum) => Bytes::from(checksum),
+                                None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                            },
+                            None => metadata,
+                        }
+                    } else {
+                        state.spawn_cache("maven", key.clone(), Bytes::from(data.clone()));
+                        Bytes::from(data.clone())
+                    };
 
                 // Quarantine only real version artifacts; never maven-metadata.xml.
                 if curation_coords.is_some() {
@@ -472,7 +603,7 @@ async fn download(
                         return resp;
                     }
                 }
-                return with_content_type(&path, data.into()).into_response();
+                return with_content_type(&path, response_data).into_response();
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
@@ -650,9 +781,33 @@ async fn upload(
             StatusCode::CREATED.into_response()
         }
 
-        MavenPathKind::ArtifactMeta { .. } => {
-            // Client uploading maven-metadata.xml — accept silently.
-            // We regenerate on primary artifact uploads anyway.
+        MavenPathKind::ArtifactMeta { filename, .. } => {
+            let server_managed = if filename == "maven-metadata.xml" {
+                classify_metadata_level(&body) == Some(MavenMetadataLevel::Artifact)
+            } else if let Some(metadata_key) = metadata_document_key(&key) {
+                match state.storage.get(metadata_key).await {
+                    Ok(metadata) => {
+                        classify_metadata_level(&metadata) == Some(MavenMetadataLevel::Artifact)
+                    }
+                    Err(StorageError::NotFound) => false,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            key = %metadata_key,
+                            "Failed to read Maven metadata for checksum classification"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            } else {
+                false
+            };
+
+            if server_managed {
+                state.metrics.record_upload("maven");
+                return StatusCode::CREATED.into_response();
+            }
+
             match state.storage.put(&key, &body).await {
                 Ok(()) => {
                     state.metrics.record_upload("maven");
@@ -692,19 +847,22 @@ async fn upload(
 // Checksum helpers
 // ============================================================================
 
-async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &str, data: &[u8]) {
-    let md5_hex = hex::encode(md5::Md5::digest(data));
-    let sha1_hex = hex::encode(sha1::Sha1::digest(data));
-    let sha256_hex = hex::encode(sha2::Sha256::digest(data));
-    let sha512_hex = hex::encode(sha2::Sha512::digest(data));
+fn checksum_hex(suffix: &str, data: &[u8]) -> Option<String> {
+    match suffix {
+        "md5" => Some(hex::encode(md5::Md5::digest(data))),
+        "sha1" => Some(hex::encode(sha1::Sha1::digest(data))),
+        "sha256" => Some(hex::encode(sha2::Sha256::digest(data))),
+        "sha512" => Some(hex::encode(sha2::Sha512::digest(data))),
+        _ => None,
+    }
+}
 
-    for (suffix, hash) in [
-        ("md5", md5_hex.as_str()),
-        ("sha1", sha1_hex.as_str()),
-        ("sha256", sha256_hex.as_str()),
-        ("sha512", sha512_hex.as_str()),
-    ] {
+async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &str, data: &[u8]) {
+    for suffix in ["md5", "sha1", "sha256", "sha512"] {
         let ck = format!("{}.{}", key, suffix);
+        let Some(hash) = checksum_hex(suffix, data) else {
+            continue;
+        };
         if let Err(e) = storage.put(&ck, hash.as_bytes()).await {
             tracing::warn!(key = %ck, error = %e, "maven: failed to store checksum");
         }
@@ -715,40 +873,245 @@ async fn compute_and_store_checksums(storage: &crate::storage::Storage, key: &st
 // Metadata generation
 // ============================================================================
 
-async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_id: &str) {
-    let prefix = format!("maven/{}/{}/", group_path, artifact_id);
-    let keys = match state.storage.list(&prefix).await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::warn!(error = ?e, prefix, "maven: failed to list storage for metadata generation");
-            return;
-        }
-    };
+#[derive(Default)]
+struct ArtifactMetadata {
+    latest: Option<String>,
+    release: Option<String>,
+    last_updated: Option<String>,
+    versions: Vec<String>,
+}
 
+fn parse_artifact_metadata(data: &[u8]) -> Option<ArtifactMetadata> {
+    if classify_metadata_level(data) != Some(MavenMetadataLevel::Artifact) {
+        return None;
+    }
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+    let mut metadata = ArtifactMetadata::default();
+    let mut in_versions = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"versions" => {
+                in_versions = true;
+            }
+            Ok(Event::Start(element))
+                if element.local_name().as_ref() == b"version" && in_versions =>
+            {
+                let text = reader.read_text(element.name()).ok()?.decode().ok()?;
+                let version = quick_xml::escape::unescape(&text).ok()?.into_owned();
+                if !version.is_empty() {
+                    metadata.versions.push(version);
+                }
+            }
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"latest" => {
+                let text = reader.read_text(element.name()).ok()?.decode().ok()?;
+                let latest = quick_xml::escape::unescape(&text).ok()?.into_owned();
+                if !latest.is_empty() {
+                    metadata.latest = Some(latest);
+                }
+            }
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"release" => {
+                let text = reader.read_text(element.name()).ok()?.decode().ok()?;
+                let release = quick_xml::escape::unescape(&text).ok()?.into_owned();
+                if !release.is_empty() {
+                    metadata.release = Some(release);
+                }
+            }
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"lastUpdated" => {
+                let text = reader.read_text(element.name()).ok()?.decode().ok()?;
+                let last_updated = quick_xml::escape::unescape(&text).ok()?.into_owned();
+                if !last_updated.is_empty() {
+                    metadata.last_updated = Some(last_updated);
+                }
+            }
+            Ok(Event::End(element)) if element.local_name().as_ref() == b"versions" => {
+                in_versions = false;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    Some(metadata)
+}
+
+async fn stored_artifact_versions(
+    state: &AppState,
+    group_path: &str,
+    artifact_id: &str,
+) -> Result<BTreeSet<String>, StorageError> {
+    let prefix = format!("maven/{}/{}/", group_path, artifact_id);
+    let keys = state.storage.list(&prefix).await?;
     let mut versions = BTreeSet::new();
+
     for key in &keys {
         let relative = match key.strip_prefix(&prefix) {
-            Some(r) => r,
+            Some(relative) => relative,
             None => continue,
         };
-        if let Some(ver_segment) = relative.split('/').next() {
-            if !ver_segment.is_empty() && !ver_segment.starts_with("maven-metadata") {
-                versions.insert(ver_segment.to_string());
+        if let Some(version) = relative.split('/').next() {
+            if !version.is_empty() && !version.starts_with("maven-metadata") {
+                versions.insert(version.to_string());
             }
         }
     }
+
+    Ok(versions)
+}
+
+fn merge_artifact_metadata(
+    group_id: &str,
+    artifact_id: &str,
+    base: Option<&[u8]>,
+    stored_versions: &BTreeSet<String>,
+    last_updated: Option<&str>,
+) -> Option<String> {
+    let mut metadata = match base {
+        Some(data) => parse_artifact_metadata(data)?,
+        None => ArtifactMetadata::default(),
+    };
+    let mut known = BTreeSet::new();
+    metadata
+        .versions
+        .retain(|version| known.insert(version.clone()));
+    let mut additional: Vec<String> = stored_versions
+        .iter()
+        .filter(|version| !known.contains(*version))
+        .cloned()
+        .collect();
+    sort_maven_versions(&mut additional);
+
+    for version in additional {
+        if metadata
+            .latest
+            .as_ref()
+            .is_none_or(|latest| compare_maven_versions(latest, &version).is_lt())
+        {
+            metadata.latest = Some(version.clone());
+        }
+        if !is_snapshot(&version)
+            && metadata
+                .release
+                .as_ref()
+                .is_none_or(|release| compare_maven_versions(release, &version).is_lt())
+        {
+            metadata.release = Some(version.clone());
+        }
+        metadata.versions.push(version);
+    }
+
+    if metadata.versions.is_empty() {
+        return None;
+    }
+    if metadata.latest.is_none() || metadata.release.is_none() {
+        let mut sorted = metadata.versions.clone();
+        sort_maven_versions(&mut sorted);
+        metadata
+            .latest
+            .get_or_insert_with(|| sorted.last().cloned().unwrap_or_default());
+        if metadata.release.is_none() {
+            metadata.release = sorted
+                .into_iter()
+                .rev()
+                .find(|version| !is_snapshot(version));
+        }
+    }
+
+    Some(generate_metadata_xml_with_versioning(
+        group_id,
+        artifact_id,
+        &metadata.versions,
+        metadata.latest.as_deref().unwrap_or(""),
+        metadata.release.as_deref().unwrap_or(""),
+        last_updated.or(metadata.last_updated.as_deref()),
+    ))
+}
+
+async fn merge_and_cache_proxy_metadata(
+    state: &AppState,
+    group_path: &str,
+    artifact_id: &str,
+    document_path: &str,
+    upstream: &[u8],
+) -> Bytes {
+    let key = storage_key(document_path);
+
+    // Serialize the read -> merge -> write -> checksums cycle with the upload-side
+    // regeneration (`update_artifact_metadata`) and any concurrent proxy merge: all of them
+    // write the same `maven-metadata.xml` key and its four checksum sidecars. Without a shared
+    // lock those five independent `put`s interleave, leaving a stored `.sha1`/`.md5`/… that
+    // corresponds to different bytes than the stored `.xml` (checksum-mismatch window). The
+    // upload path locks the artifact's `maven-metadata.xml` key; locking the document key here
+    // — identical for artifact-level metadata — keeps `publish_lock serializes all writes to the
+    // same artifact path` intact on the proxy path too (#886). Held across the writes below.
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+
+    let cached = state.storage.get(&key).await.ok();
+    let last_updated = [Some(upstream), cached.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(parse_artifact_metadata)
+        .filter_map(|metadata| metadata.last_updated)
+        .max();
+    let data = if let Ok(stored_versions) =
+        stored_artifact_versions(state, group_path, artifact_id).await
+    {
+        merge_artifact_metadata(
+            &group_path.replace('/', "."),
+            artifact_id,
+            Some(upstream),
+            &stored_versions,
+            last_updated.as_deref(),
+        )
+        .map_or_else(|| Bytes::copy_from_slice(upstream), Bytes::from)
+    } else {
+        Bytes::copy_from_slice(upstream)
+    };
+
+    if let Err(error) = state.storage.put(&key, &data).await {
+        tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
+    } else {
+        compute_and_store_checksums(&state.storage, &key, &data).await;
+    }
+
+    data
+}
+
+async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_id: &str) {
+    let versions = match stored_artifact_versions(state, group_path, artifact_id).await {
+        Ok(versions) => versions,
+        Err(e) => {
+            tracing::warn!(error = ?e, group_path, artifact_id, "maven: failed to list storage for metadata generation");
+            return;
+        }
+    };
 
     if versions.is_empty() {
         return;
     }
 
-    let mut sorted: Vec<String> = versions.into_iter().collect();
-    sort_maven_versions(&mut sorted);
-
-    let group_id_dotted = group_path.replace('/', ".");
-    let xml = generate_metadata_xml(&group_id_dotted, artifact_id, &sorted);
-
+    let prefix = format!("maven/{}/{}/", group_path, artifact_id);
     let metadata_key = format!("{}maven-metadata.xml", prefix);
+    let current = state.storage.get(&metadata_key).await.ok();
+    let group_id_dotted = group_path.replace('/', ".");
+    let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let xml = merge_artifact_metadata(
+        &group_id_dotted,
+        artifact_id,
+        current.as_deref(),
+        &versions,
+        Some(&last_updated),
+    )
+    .unwrap_or_else(|| {
+        let mut sorted: Vec<String> = versions.into_iter().collect();
+        sort_maven_versions(&mut sorted);
+        generate_metadata_xml(&group_id_dotted, artifact_id, &sorted)
+    });
+
     if state
         .storage
         .put(&metadata_key, xml.as_bytes())
@@ -814,7 +1177,25 @@ fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String])
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    let now = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    generate_metadata_xml_with_versioning(group_id, artifact_id, versions, latest, release, None)
+}
+
+fn generate_metadata_xml_with_versioning(
+    group_id: &str,
+    artifact_id: &str,
+    versions: &[String],
+    latest: &str,
+    release: &str,
+    last_updated: Option<&str>,
+) -> String {
+    let generated_last_updated;
+    let last_updated = match last_updated {
+        Some(last_updated) => last_updated,
+        None => {
+            generated_last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+            &generated_last_updated
+        }
+    };
 
     let version_elements: String = versions
         .iter()
@@ -842,7 +1223,7 @@ fn generate_metadata_xml(group_id: &str, artifact_id: &str, versions: &[String])
         xml_escape(latest),
         xml_escape(release),
         version_elements,
-        now
+        last_updated
     )
 }
 
@@ -1133,6 +1514,102 @@ mod tests {
         assert!(xml.contains("<latest>1.0.0-SNAPSHOT</latest>"));
         assert!(xml.contains("<release></release>"));
     }
+
+    #[test]
+    fn test_merge_artifact_metadata_keeps_public_and_hosted_versions() {
+        let upstream = br#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>library</artifactId>
+  <versioning>
+    <latest>2.0.0</latest>
+    <release>2.0.0</release>
+    <versions>
+      <version>1.0.0</version>
+      <version>2.0.0</version>
+    </versions>
+    <lastUpdated>20260728010000</lastUpdated>
+  </versioning>
+</metadata>
+"#;
+        let stored = BTreeSet::from(["0.5.0-internal".to_string(), "9.0.0-internal".to_string()]);
+
+        let merged =
+            merge_artifact_metadata("com.example", "library", Some(upstream), &stored, None)
+                .unwrap();
+
+        assert!(merged.contains("<version>1.0.0</version>"));
+        assert!(merged.contains("<version>2.0.0</version>"));
+        assert!(merged.contains("<version>0.5.0-internal</version>"));
+        assert!(merged.contains("<version>9.0.0-internal</version>"));
+        assert!(merged.contains("<latest>9.0.0-internal</latest>"));
+        assert!(merged.contains("<release>9.0.0-internal</release>"));
+        assert!(merged.contains("<lastUpdated>20260728010000</lastUpdated>"));
+
+        let lower_only = BTreeSet::from(["0.5.0-internal".to_string()]);
+        let merged =
+            merge_artifact_metadata("com.example", "library", Some(upstream), &lower_only, None)
+                .unwrap();
+        assert!(merged.contains("<latest>2.0.0</latest>"));
+        assert!(merged.contains("<release>2.0.0</release>"));
+    }
+
+    #[test]
+    fn test_classify_artifact_level_metadata() {
+        let xml = br#"
+            <metadata xmlns="http://maven.apache.org/METADATA/1.1.0">
+              <groupId>com.example</groupId>
+              <artifactId>library</artifactId>
+              <versioning>
+                <versions><version>1.0.0</version></versions>
+              </versioning>
+            </metadata>
+        "#;
+        assert_eq!(
+            classify_metadata_level(xml),
+            Some(MavenMetadataLevel::Artifact)
+        );
+    }
+
+    #[test]
+    fn test_classify_version_level_metadata() {
+        let xml = br#"
+            <metadata>
+              <groupId>com.example</groupId>
+              <artifactId>library</artifactId>
+              <version>1.0-SNAPSHOT</version>
+              <versioning><snapshot><buildNumber>1</buildNumber></snapshot></versioning>
+            </metadata>
+        "#;
+        assert_eq!(
+            classify_metadata_level(xml),
+            Some(MavenMetadataLevel::Version)
+        );
+    }
+
+    #[test]
+    fn test_classify_group_level_metadata() {
+        let xml = br#"
+            <metadata>
+              <plugins>
+                <plugin>
+                  <prefix>example</prefix>
+                  <artifactId>example-maven-plugin</artifactId>
+                </plugin>
+              </plugins>
+            </metadata>
+        "#;
+        assert_eq!(
+            classify_metadata_level(xml),
+            Some(MavenMetadataLevel::Group)
+        );
+    }
+
+    #[test]
+    fn test_reject_malformed_metadata() {
+        assert_eq!(classify_metadata_level(b"<metadata>"), None);
+        assert_eq!(classify_metadata_level(b"<project/>"), None);
+    }
 }
 
 // ============================================================================
@@ -1142,7 +1619,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
 
     #[tokio::test]
     async fn test_maven_namespace_scope_enforced() {
@@ -1504,6 +1983,332 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let hash = body_bytes(resp).await;
         assert_eq!(hash.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_maven_hosted_proxy_metadata_collision_in_both_orders() {
+        use crate::config::MavenProxyEntry;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let upstream_metadata = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>collision</artifactId>
+  <versioning>
+    <latest>2.0.0</latest>
+    <release>2.0.0</release>
+    <versions>
+      <version>1.0.0</version>
+      <version>2.0.0</version>
+    </versions>
+    <lastUpdated>20260728010000</lastUpdated>
+  </versioning>
+</metadata>
+"#;
+        Mock::given(method("GET"))
+            .and(path("/com/example/collision/maven-metadata.xml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(upstream_metadata, "application/xml"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let new_context = || {
+            let upstream_url = upstream.uri();
+            create_test_context_with_config(move |config| {
+                config.maven.proxies = vec![MavenProxyEntry::Simple(upstream_url)];
+                config.maven.metadata_ttl = 0;
+            })
+        };
+
+        let hosted_first = new_context();
+        let upload = send(
+            &hosted_first.app,
+            Method::PUT,
+            "/maven2/com/example/collision/9.0.0-internal/collision-9.0.0-internal.jar",
+            Body::from("hosted-first"),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let response = send(
+            &hosted_first.app,
+            Method::GET,
+            "/maven2/com/example/collision/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let metadata = body_bytes(response).await;
+        let metadata_text = String::from_utf8_lossy(&metadata);
+        assert!(metadata_text.contains("<version>1.0.0</version>"));
+        assert!(metadata_text.contains("<version>2.0.0</version>"));
+        assert!(metadata_text.contains("<version>9.0.0-internal</version>"));
+
+        let checksum = body_bytes(
+            send(
+                &hosted_first.app,
+                Method::GET,
+                "/maven2/com/example/collision/maven-metadata.xml.sha1",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&checksum),
+            hex::encode(sha1::Sha1::digest(&metadata))
+        );
+
+        let proxy_first = new_context();
+        let response = send(
+            &proxy_first.app,
+            Method::GET,
+            "/maven2/com/example/collision/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upload = send(
+            &proxy_first.app,
+            Method::PUT,
+            "/maven2/com/example/collision/9.1.0-internal/collision-9.1.0-internal.jar",
+            Body::from("proxy-first"),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let response = send(
+            &proxy_first.app,
+            Method::GET,
+            "/maven2/com/example/collision/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let metadata = String::from_utf8_lossy(&body_bytes(response).await).into_owned();
+        assert!(metadata.contains("<version>1.0.0</version>"));
+        assert!(metadata.contains("<version>2.0.0</version>"));
+        assert!(metadata.contains("<version>9.1.0-internal</version>"));
+    }
+
+    #[tokio::test]
+    async fn test_client_artifact_metadata_does_not_overwrite_generated_metadata() {
+        let ctx = create_test_context();
+
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race/1.0.0/race-1.0.0.jar",
+            Body::from("v1"),
+        )
+        .await;
+
+        let stale = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/race/maven-metadata.xml",
+                "",
+            )
+            .await,
+        )
+        .await;
+
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race/2.0.0/race-2.0.0.jar",
+            Body::from("v2"),
+        )
+        .await;
+
+        let upload = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race/maven-metadata.xml",
+            Body::from(stale),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let metadata = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/race/maven-metadata.xml",
+                "",
+            )
+            .await,
+        )
+        .await;
+        let metadata = String::from_utf8_lossy(&metadata);
+        assert!(metadata.contains("<version>1.0.0</version>"));
+        assert!(metadata.contains("<version>2.0.0</version>"));
+        assert!(metadata.contains("<latest>2.0.0</latest>"));
+        assert!(metadata.contains("<release>2.0.0</release>"));
+    }
+
+    #[tokio::test]
+    async fn test_client_artifact_metadata_checksum_does_not_overwrite_generated_checksum() {
+        let ctx = create_test_context();
+
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race-checksum/1.0.0/race-checksum-1.0.0.jar",
+            Body::from("v1"),
+        )
+        .await;
+        let stale = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/race-checksum/maven-metadata.xml.sha256",
+                "",
+            )
+            .await,
+        )
+        .await;
+
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race-checksum/2.0.0/race-checksum-2.0.0.jar",
+            Body::from("v2"),
+        )
+        .await;
+        let expected = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/race-checksum/maven-metadata.xml.sha256",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(stale, expected);
+
+        let upload = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/race-checksum/maven-metadata.xml.sha256",
+            Body::from(stale),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let actual = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/race-checksum/maven-metadata.xml.sha256",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_version_metadata_and_checksum_are_preserved() {
+        let ctx = create_test_context();
+        let metadata = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>snapshot</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <versioning>
+    <snapshot><timestamp>20260728.120000</timestamp><buildNumber>1</buildNumber></snapshot>
+    <lastUpdated>20260728120000</lastUpdated>
+  </versioning>
+</metadata>
+"#;
+
+        let upload = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/snapshot/1.0-SNAPSHOT/maven-metadata.xml",
+            Body::from(metadata),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let checksum = hex::encode(sha1::Sha1::digest(metadata.as_bytes()));
+        let checksum_upload = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/example/snapshot/1.0-SNAPSHOT/maven-metadata.xml.sha1",
+            Body::from(checksum.clone()),
+        )
+        .await;
+        assert_eq!(checksum_upload.status(), StatusCode::CREATED);
+
+        let stored_metadata = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/snapshot/1.0-SNAPSHOT/maven-metadata.xml",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(&stored_metadata[..], metadata.as_bytes());
+
+        let stored_checksum = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/com/example/snapshot/1.0-SNAPSHOT/maven-metadata.xml.sha1",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(String::from_utf8_lossy(&stored_checksum), checksum);
+    }
+
+    #[tokio::test]
+    async fn test_group_plugin_metadata_is_preserved() {
+        let ctx = create_test_context();
+        let metadata = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <plugins>
+    <plugin>
+      <name>Example Maven Plugin</name>
+      <prefix>example</prefix>
+      <artifactId>example-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>
+"#;
+
+        let upload = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/org/example/plugins/maven-metadata.xml",
+            Body::from(metadata),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::CREATED);
+
+        let stored = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                "/maven2/org/example/plugins/maven-metadata.xml",
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(&stored[..], metadata.as_bytes());
     }
 
     #[tokio::test]
