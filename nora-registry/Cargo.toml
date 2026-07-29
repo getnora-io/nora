@@ -59,6 +59,7 @@ subtle = "2"
 tokio-util = "0.7"
 arc-swap = "1"
 memchr = "2"
+quick-xml = "0.41"
 # Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
 socket2 = "0.6"
 rpm = { version = "0.25", default-features = false }
