@@ -166,41 +166,7 @@ impl RepoIndex {
 
         // Double-check under lock (another thread may have rebuilt)
         if index.is_dirty() {
-            let data = match reg_type {
-                RegistryType::Docker => build_docker_index(storage).await,
-                RegistryType::Maven => build_maven_index(storage).await,
-                RegistryType::Npm => build_npm_index(storage).await,
-                RegistryType::Cargo => build_cargo_index(storage).await,
-                RegistryType::PyPI => build_pypi_index(storage).await,
-                RegistryType::Go => build_go_index(storage).await,
-                RegistryType::Raw => build_raw_index(storage).await,
-                RegistryType::Nuget => {
-                    let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Gems => build_gems_index(storage).await,
-                RegistryType::Terraform => {
-                    let (p, s) = crate::registry::terraform::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Ansible => {
-                    let (p, s) = crate::registry::ansible::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::PubDart => {
-                    let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Conan => build_conan_index(storage).await,
-                RegistryType::Rpm => {
-                    let (p, s) = crate::registry::rpm::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Deb => {
-                    let (p, s) = crate::registry::deb::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-            };
+            let data = build_index(reg_type, storage).await;
             match data {
                 Some(data) => {
                     info!(registry = registry, count = data.len(), "Index rebuilt");
@@ -222,6 +188,29 @@ impl RepoIndex {
         index.get_cached()
     }
 
+    /// Rebuild a dirty index and surface storage uncertainty instead of
+    /// serving stale data. Protocol handlers use this when an empty/partial
+    /// answer would be semantically different from a UI's stale snapshot.
+    pub async fn get_strict(
+        &self,
+        registry: &str,
+        storage: &Storage,
+    ) -> Result<Arc<Vec<RepoInfo>>, ()> {
+        let reg_type = RegistryType::from_str_opt(registry).ok_or(())?;
+        let index = self.indexes.get(&reg_type).ok_or(())?;
+        if !index.is_dirty() {
+            return Ok(index.get_cached());
+        }
+
+        let _guard = index.rebuild_lock.lock().await;
+        if index.is_dirty() {
+            let data = build_index(reg_type, storage).await.ok_or(())?;
+            info!(registry, count = data.len(), "Index rebuilt");
+            index.set(data);
+        }
+        Ok(index.get_cached())
+    }
+
     /// Get counts for stats (no rebuild, just current state)
     pub fn counts(&self) -> HashMap<RegistryType, usize> {
         self.indexes
@@ -236,6 +225,44 @@ impl RepoIndex {
             .iter()
             .map(|(rt, idx)| (*rt, idx.total_size()))
             .collect()
+    }
+}
+
+async fn build_index(reg_type: RegistryType, storage: &Storage) -> Option<Vec<RepoInfo>> {
+    match reg_type {
+        RegistryType::Docker => build_docker_index(storage).await,
+        RegistryType::Maven => build_maven_index(storage).await,
+        RegistryType::Npm => build_npm_index(storage).await,
+        RegistryType::Cargo => build_cargo_index(storage).await,
+        RegistryType::PyPI => build_pypi_index(storage).await,
+        RegistryType::Go => build_go_index(storage).await,
+        RegistryType::Raw => build_raw_index(storage).await,
+        RegistryType::Nuget => {
+            let (prefix, suffix) = crate::registry::nuget::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
+        RegistryType::Gems => build_gems_index(storage).await,
+        RegistryType::Terraform => {
+            let (prefix, suffix) = crate::registry::terraform::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
+        RegistryType::Ansible => {
+            let (prefix, suffix) = crate::registry::ansible::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
+        RegistryType::PubDart => {
+            let (prefix, suffix) = crate::registry::pub_dart::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
+        RegistryType::Conan => build_conan_index(storage).await,
+        RegistryType::Rpm => {
+            let (prefix, suffix) = crate::registry::rpm::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
+        RegistryType::Deb => {
+            let (prefix, suffix) = crate::registry::deb::INDEX_PATTERN;
+            build_generic_index(storage, prefix, suffix).await
+        }
     }
 }
 
@@ -350,30 +377,60 @@ async fn build_maven_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
 async fn build_npm_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "npm/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    let by_key: HashMap<&str, &crate::storage::FileMeta> = keys
+        .iter()
+        .map(|(key, meta)| (key.as_str(), meta))
+        .collect();
 
-    // Count tarballs instead of parsing metadata.json (faster than parsing JSON)
+    // A hosted version manifest is the publish commit point: a staged tarball
+    // without it is an invisible orphan and must not become a UI artifact.
+    // Proxy cache has no hosted manifest, so its concrete tarballs remain the
+    // countable unit. Groups own no objects and never appear here.
     for (key, meta) in &keys {
-        if let Some(rest) = key.strip_prefix("npm/") {
-            // Pattern: npm/{package}/tarballs/{file}.tgz
-            // Scoped:  npm/@scope/package/tarballs/{file}.tgz
-            if rest.contains("/tarballs/") && ends_with_ci(key, ".tgz") {
-                let parts: Vec<_> = rest.split('/').collect();
-                if !parts.is_empty() {
-                    // Scoped packages: @scope/package → parts[0]="@scope", parts[1]="package"
-                    let name = if parts[0].starts_with('@') && parts.len() >= 4 {
-                        format!("{}/{}", parts[0], parts[1])
-                    } else {
-                        parts[0].to_string()
-                    };
-                    let entry = packages.entry(name).or_insert((0, 0, 0));
-                    entry.0 += 1;
-
-                    entry.1 += meta.size;
-                    if meta.modified > entry.2 {
-                        entry.2 = meta.modified;
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
+            continue;
+        };
+        let name = format!("repositories/{}/{}", parsed.repository, parsed.package);
+        match parsed.kind {
+            crate::npm_layout::NpmObjectKind::HostedVersion(_) => {
+                let manifest = match storage.get(key).await {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        tracing::warn!(
+                            key,
+                            error = %error,
+                            "npm index: cannot read hosted version manifest"
+                        );
+                        return None;
                     }
-                }
+                };
+                let Some(blob_key) = crate::npm_layout::hosted_blob_key_from_manifest(
+                    &parsed.repository,
+                    &parsed.package,
+                    &manifest,
+                ) else {
+                    tracing::warn!(
+                        key,
+                        "npm index: hosted manifest has no valid blob reference"
+                    );
+                    return None;
+                };
+                let blob = by_key.get(blob_key.as_str()).copied();
+                let entry = packages.entry(name).or_insert((0, 0, 0));
+                entry.0 += 1;
+                entry.1 += meta.size + blob.map(|value| value.size).unwrap_or(0);
+                entry.2 = entry
+                    .2
+                    .max(meta.modified)
+                    .max(blob.map(|value| value.modified).unwrap_or(0));
             }
+            crate::npm_layout::NpmObjectKind::ProxyTarball(_) => {
+                let entry = packages.entry(name).or_insert((0, 0, 0));
+                entry.0 += 1;
+                entry.1 += meta.size;
+                entry.2 = entry.2.max(meta.modified);
+            }
+            _ => {}
         }
     }
 
@@ -926,6 +983,128 @@ mod tests {
         // Size still sums every on-disk file (du), metadata bytes included.
         let size: u64 = repos.iter().map(|r| r.size).sum();
         assert_eq!(size, 200 + 30, "metadata bytes still count toward size==du");
+    }
+
+    #[tokio::test]
+    async fn maven_index_keeps_named_repository_paths_isolated() {
+        let (_d, storage) = temp_storage();
+        storage
+            .put(
+                "maven/repositories/releases/com/example/a/1.0/a-1.0.jar",
+                b"release",
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "maven/repositories/open/com/example/a/1.0/a-1.0.jar",
+                b"open",
+            )
+            .await
+            .unwrap();
+
+        let repos = build_maven_index(&storage).await.expect("index built");
+
+        assert!(repos
+            .iter()
+            .any(|entry| entry.name == "repositories/releases/com/example/a/1.0"));
+        assert!(repos
+            .iter()
+            .any(|entry| entry.name == "repositories/open/com/example/a/1.0"));
+        assert_eq!(repos.iter().map(|entry| entry.versions).sum::<usize>(), 2);
+    }
+
+    #[tokio::test]
+    async fn npm_index_keeps_hosted_and_proxy_repositories_isolated() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let (_d, storage) = temp_storage();
+        let hosted_manifest = |name: &str, version: &str, blob: &[u8]| {
+            serde_json::to_vec(&serde_json::json!({
+                "name": name,
+                "version": version,
+                "dist": {
+                    "integrity": format!(
+                        "sha512-{}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(sha2::Sha512::digest(blob))
+                    )
+                }
+            }))
+            .unwrap()
+        };
+        let scoped_manifest = hosted_manifest("@scope/pkg", "1.0.0", b"hosted");
+        let scoped_blob = crate::npm_layout::hosted_blob_key_from_manifest(
+            "npm-private",
+            "@scope/pkg",
+            &scoped_manifest,
+        )
+        .unwrap();
+        storage.put(&scoped_blob, b"hosted").await.unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.0.0.json",
+                &scoped_manifest,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-registry/proxy/tarballs/@scope/pkg/pkg-1.0.0.tgz",
+                b"proxy",
+            )
+            .await
+            .unwrap();
+        let proxy_manifest = hosted_manifest("proxy", "1.0.0", b"hosted-package-named-proxy");
+        let hosted_proxy_blob = crate::npm_layout::hosted_blob_key_from_manifest(
+            "npm-private",
+            "proxy",
+            &proxy_manifest,
+        )
+        .unwrap();
+        storage
+            .put(&hosted_proxy_blob, b"hosted-package-named-proxy")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/proxy/versions/1.0.0.json",
+                &proxy_manifest,
+            )
+            .await
+            .unwrap();
+        let orphan_manifest = hosted_manifest("orphan", "1.0.0", b"precommit-orphan");
+        let orphan_blob = crate::npm_layout::hosted_blob_key_from_manifest(
+            "npm-private",
+            "orphan",
+            &orphan_manifest,
+        )
+        .unwrap();
+        storage
+            .put(&orphan_blob, b"precommit-orphan")
+            .await
+            .unwrap();
+
+        let repos = build_npm_index(&storage).await.expect("index built");
+
+        assert_eq!(repos.len(), 3);
+        assert!(repos
+            .iter()
+            .any(|entry| entry.name == "repositories/npm-private/@scope/pkg"));
+        assert!(repos
+            .iter()
+            .any(|entry| entry.name == "repositories/npm-private/proxy"));
+        assert!(repos
+            .iter()
+            .any(|entry| entry.name == "repositories/npm-registry/@scope/pkg"));
+        assert_eq!(repos.iter().map(|entry| entry.versions).sum::<usize>(), 3);
+        assert!(
+            !repos
+                .iter()
+                .any(|entry| entry.name == "repositories/npm-private/orphan"),
+            "hosted pre-commit tarballs must not enter the index"
+        );
     }
 
     #[tokio::test]

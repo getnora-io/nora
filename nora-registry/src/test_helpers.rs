@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used)] // tests may use .unwrap() freely
 
+use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit},
@@ -15,11 +17,14 @@ use axum::{
     middleware, Router,
 };
 use http_body_util::BodyExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
+use tokio::io::AsyncRead;
 
 use crate::activity_log::ActivityLog;
 use crate::audit::AuditLog;
@@ -29,11 +34,133 @@ use crate::curation::CurationEngine;
 use crate::dashboard_metrics::DashboardMetrics;
 use crate::registry;
 use crate::repo_index::RepoIndex;
-use crate::storage::Storage;
+use crate::storage::{FileMeta, Storage, StorageBackend, StorageError};
 use crate::tokens::TokenStore;
 use crate::AppState;
 
 use parking_lot::RwLock;
+
+/// Test-only storage wrapper for exercising fail-closed behavior without
+/// teaching production backends about synthetic failures.
+pub struct FaultInjectBackend {
+    inner: Storage,
+    get_failures: HashSet<String>,
+    delete_failures: HashSet<String>,
+    stat_none: HashSet<String>,
+    delete_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+    list_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl FaultInjectBackend {
+    pub fn new(inner: Storage) -> Self {
+        Self {
+            inner,
+            get_failures: HashSet::new(),
+            delete_failures: HashSet::new(),
+            stat_none: HashSet::new(),
+            delete_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            list_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn fail_get(mut self, key: impl Into<String>) -> Self {
+        self.get_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_delete(mut self, key: impl Into<String>) -> Self {
+        self.delete_failures.insert(key.into());
+        self
+    }
+
+    #[allow(dead_code)] // consumed by binary-only cleanup tests, not lib test target
+    pub fn stat_none(mut self, key: impl Into<String>) -> Self {
+        self.stat_none.insert(key.into());
+        self
+    }
+
+    pub fn delete_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.delete_attempts)
+    }
+
+    pub fn list_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.list_attempts)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FaultInjectBackend {
+    async fn put(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> crate::storage::Result<Bytes> {
+        if self.get_failures.contains(key) {
+            return Err(StorageError::Network("injected get failure".to_string()));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+        self.delete_attempts.lock().push(key.to_string());
+        if self.delete_failures.contains(key) {
+            return Err(StorageError::Network("injected delete failure".to_string()));
+        }
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+        self.list_attempts.lock().push(prefix.to_string());
+        self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, key: &str) -> Option<FileMeta> {
+        if self.stat_none.contains(key) {
+            return None;
+        }
+        self.inner.stat(key).await
+    }
+
+    async fn list_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+        let mut entries = self.inner.list_with_meta(prefix).await?;
+        entries.retain(|(key, _)| !self.stat_none.contains(key));
+        Ok(entries)
+    }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
+
+    async fn total_size(&self) -> u64 {
+        self.inner.total_size().await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "fault-inject"
+    }
+
+    async fn refresh_total_size(&self) {
+        self.inner.refresh_total_size_cache().await;
+    }
+
+    async fn put_from_path(&self, key: &str, src: &Path) -> crate::storage::Result<()> {
+        self.inner.put_from_path(key, src, None).await
+    }
+
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        self.inner.get_reader(key).await
+    }
+}
 
 /// Everything a test needs: tempdir (must stay alive), shared state, and the router.
 pub struct TestContext {
@@ -58,6 +185,14 @@ pub fn create_test_context_with_auth(users: &[(&str, &str)]) -> TestContext {
 /// Build a test context with auth + anonymous_read.
 pub fn create_test_context_with_anonymous_read(users: &[(&str, &str)]) -> TestContext {
     build_context(true, users, true, |_| {})
+}
+
+/// Build a test context with auth + anonymous_read and custom registry config.
+pub fn create_test_context_with_anonymous_read_config(
+    users: &[(&str, &str)],
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context(true, users, true, customize)
 }
 
 /// Build a test context with auth + `docker_anon_pull` (general
@@ -115,9 +250,10 @@ fn build_context(
             enabled: true,
             proxies: vec![],
             proxy_timeout: 5,
-            checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
+            repositories: Vec::new(),
+            default_repository: None,
         },
         npm: NpmConfig {
             enabled: true,
@@ -127,6 +263,8 @@ fn build_context(
             metadata_ttl: -1,
             serve_stale: true,
             revalidate: true,
+            repositories: Vec::new(),
+            default_repository: None,
         },
         pypi: PypiConfig {
             enabled: true,
@@ -290,8 +428,13 @@ fn build_context(
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
+        no_redirect_http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test no-redirect HTTP client"),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
         oidc: None,
@@ -356,6 +499,11 @@ fn build_context(
                 registry_routes = registry_routes.merge(registry::deb_routes());
             }
         }
+    }
+    if enabled_registries.contains(&crate::registry_type::RegistryType::Maven)
+        || enabled_registries.contains(&crate::registry_type::RegistryType::Npm)
+    {
+        registry_routes = registry_routes.merge(registry::named_repository_routes());
     }
 
     let public_routes = Router::new()

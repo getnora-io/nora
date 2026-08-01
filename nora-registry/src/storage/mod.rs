@@ -34,6 +34,9 @@ pub enum StorageError {
     #[error("Object not found")]
     NotFound,
 
+    #[error("Object already exists")]
+    AlreadyExists,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -87,6 +90,17 @@ pub enum RepinOutcome {
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()>;
+    /// Atomically create `key`, returning [`StorageError::AlreadyExists`] if a
+    /// concurrent writer or a pre-existing object already owns the key.
+    ///
+    /// The default fails closed instead of emulating this with `stat` + `put`,
+    /// which would allow two callers to win the race. Production backends must
+    /// override this method with a backend-native conditional create.
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Err(StorageError::Network(
+            "atomic create is not supported by this storage backend".to_string(),
+        ))
+    }
     async fn get(&self, key: &str) -> Result<Bytes>;
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
@@ -293,6 +307,103 @@ impl Storage {
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically create `key` without replacing an existing object.
+    ///
+    /// Exactly one concurrent caller can succeed. Only that winner records a
+    /// hash pin; losing callers leave both the stored bytes and existing pin
+    /// untouched.
+    pub async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<()> {
+        validate_storage_key(key)?;
+        match self.inner.put_if_absent(key, data).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "ok"])
+                    .inc();
+                if let Some(ref pins) = self.pin_store {
+                    let pins = Arc::clone(pins);
+                    let key_owned = key.to_string();
+                    let data_owned = data.to_vec();
+                    // Match put(): the winning create is not reported complete
+                    // until its integrity pin is durable.
+                    match tokio::task::spawn_blocking(move || pins.record(&key_owned, &data_owned))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put_if_absent", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put_if_absent", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(StorageError::AlreadyExists) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "already_exists"])
+                    .inc();
+                // The create may have published the body and then failed while
+                // durably recording its local hash pin. An exact client retry
+                // is the only safe automatic repair: read the already-existing
+                // bytes without overwriting them, compare to the candidate,
+                // and fill the missing pin only on byte identity.
+                if let Some(ref pins) = self.pin_store {
+                    if pins.get(key).is_none() {
+                        let existing = self.inner.get(key).await?;
+                        if existing.as_ref() == data {
+                            let pins = Arc::clone(pins);
+                            let key_owned = key.to_string();
+                            let data_owned = data.to_vec();
+                            match tokio::task::spawn_blocking(move || {
+                                pins.record(&key_owned, &data_owned)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    STORAGE_OPERATIONS
+                                        .with_label_values(&["put_if_absent", "pin_error"])
+                                        .inc();
+                                    return Err(StorageError::Io(std::io::Error::other(format!(
+                                        "hash-pin retry repair failed: {e}"
+                                    ))));
+                                }
+                                Err(e) => {
+                                    STORAGE_OPERATIONS
+                                        .with_label_values(&["put_if_absent", "pin_error"])
+                                        .inc();
+                                    return Err(StorageError::Io(std::io::Error::other(format!(
+                                        "hash-pin retry repair task panicked: {e}"
+                                    ))));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(StorageError::AlreadyExists)
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "error"])
                     .inc();
                 Err(e)
             }
@@ -728,6 +839,70 @@ mod tests {
         );
         // And the recorded pin must match the bytes (a subsequent get verifies).
         assert_eq!(&storage.get("raw/x/app.bin").await.unwrap()[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_pins_only_the_winning_bytes() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+
+        storage.put_if_absent(key, b"winner").await.unwrap();
+        let winner_pin = hex::encode(Sha256::digest(b"winner"));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(winner_pin.as_str()),
+            "the successful create must persist its pin before returning"
+        );
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"loser").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(winner_pin.as_str()),
+            "a losing create must not replace the existing pin"
+        );
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_exact_retry_repairs_missing_pin_without_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+        let src = dir.path().join("published-before-pin.bin");
+        std::fs::write(&src, b"winner").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+        assert_eq!(storage.get_pin_hash(key), None);
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"winner").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(hex::encode(Sha256::digest(b"winner")).as_str())
+        );
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_different_retry_never_pins_candidate_or_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+        let src = dir.path().join("published-before-pin.bin");
+        std::fs::write(&src, b"winner").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"loser").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(storage.get_pin_hash(key), None);
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
     }
 
     #[test]

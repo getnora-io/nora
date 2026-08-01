@@ -3,7 +3,7 @@
 
 use axum::{
     body::Body,
-    extract::{MatchedPath, State},
+    extract::State,
     http::Request,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -92,14 +92,15 @@ pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
 });
 
 /// Upstream 4xx responses that carried a policy/geo block signature (e.g. an AWS
-/// WAF geo rule via `x-amzn-waf-reason`) and were relayed as a bare 404. Lets an
-/// operator tell an effective region/policy outage apart from a genuine not-found
-/// — which is otherwise invisible (a 4xx logs nothing and never trips the breaker).
+/// WAF geo rule via `x-amzn-waf-reason`). Lets an operator tell an effective
+/// region/policy outage apart from a genuine not-found. Protocol handlers may
+/// map the response differently; Maven, for example, maps a blocked 404 to 502
+/// so it cannot be mistaken for an authoritative negative-cacheable miss.
 /// Labels: `registry`, `reason` (bounded: `geo` | `waf`) (#881).
 pub static UPSTREAM_POLICY_BLOCKED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_upstream_policy_blocked_total",
-        "Upstream 4xx responses bearing a policy/geo block signature, relayed as 404",
+        "Upstream 4xx responses bearing a detected policy/geo block signature",
         &["registry", "reason"]
     )
     .expect("failed to create UPSTREAM_POLICY_BLOCKED_TOTAL metric at startup")
@@ -130,7 +131,7 @@ pub static PROXY_REVALIDATION_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::
 
 /// Concurrent upstream fetches collapsed into one by the single-flight
 /// coalescer: a follower served the leader's in-memory result without making
-/// its own upstream round-trip (#595).
+/// its own upstream round-trip.
 pub static PROXY_COALESCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_proxy_coalesced_total",
@@ -140,9 +141,7 @@ pub static PROXY_COALESCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create PROXY_COALESCED_TOTAL metric at startup")
 });
 
-/// Current number of in-flight single-flight leaders (distinct keys being
-/// fetched right now). A flat zero under load means coalescing is not engaging;
-/// a monotonic climb signals a guard leak (#595).
+/// Current number of distinct in-flight single-flight leaders.
 pub static PROXY_INFLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_proxy_inflight",
@@ -152,11 +151,8 @@ pub static PROXY_INFLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create PROXY_INFLIGHT metric at startup")
 });
 
-/// Followers that did NOT get the leader's result and fell through to their own
-/// upstream fetch — because the leader failed/cancelled (`leader`) or the wait
-/// budget elapsed while the leader was still fetching (`budget`). A `budget`
-/// rate rivalling `PROXY_COALESCED_TOTAL` means a slow upstream is re-stampeding
-/// past the coalescer; without this it degrades silently (#595).
+/// Followers that could not consume the leader result and performed their own
+/// upstream request (`leader` failure/cancellation or elapsed `budget`).
 pub static PROXY_COALESCE_FALLTHROUGH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_proxy_coalesce_fallthrough_total",
@@ -343,7 +339,7 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
 });
 
-/// Corrupt metadata detected during publish (#533)
+/// Corrupt metadata detected during publish.
 pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_metadata_corrupt_total",
@@ -460,18 +456,20 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Middleware to record request metrics
 pub async fn metrics_middleware(
-    matched_path: Option<MatchedPath>,
+    State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let start = Instant::now();
     let method = request.method().to_string();
-    let path = matched_path
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+    let request_path = request.uri().path().to_string();
 
     // Determine registry from path
-    let registry = detect_registry(&path);
+    // The matched route for named Maven and npm is intentionally identical, so
+    // classification must use the concrete repository name from the request
+    // URI and resolve it through config. Guessing from a name prefix would make
+    // custom Nexus-compatible names silently report under the wrong format.
+    let registry = detect_registry(&request_path, Some(&state.config));
 
     // Process request
     let response = next.run(request).await;
@@ -692,11 +690,24 @@ fn is_own_surface(path: &str) -> bool {
 }
 
 /// Detect registry type from path
-fn detect_registry(path: &str) -> String {
+fn detect_registry(path: &str, config: Option<&crate::config::Config>) -> String {
     if path.starts_with("/v2") {
         "docker".to_string()
     } else if path.starts_with("/maven2") {
         "maven".to_string()
+    } else if let Some(repository_path) = path.strip_prefix("/repository/") {
+        let repository = repository_path.split('/').next().unwrap_or("");
+        match config {
+            Some(config)
+                if config.maven.enabled && config.maven.repository(repository).is_some() =>
+            {
+                "maven".to_string()
+            }
+            Some(config) if config.npm.enabled && config.npm.repository(repository).is_some() => {
+                "npm".to_string()
+            }
+            _ => "other".to_string(),
+        }
     } else if path.starts_with("/npm") {
         "npm".to_string()
     } else if path.starts_with("/cargo") {
@@ -736,69 +747,114 @@ mod tests {
 
     #[test]
     fn test_detect_registry_docker() {
-        assert_eq!(detect_registry("/v2/nginx/manifests/latest"), "docker");
-        assert_eq!(detect_registry("/v2/"), "docker");
         assert_eq!(
-            detect_registry("/v2/library/alpine/blobs/sha256:abc"),
+            detect_registry("/v2/nginx/manifests/latest", None),
+            "docker"
+        );
+        assert_eq!(detect_registry("/v2/", None), "docker");
+        assert_eq!(
+            detect_registry("/v2/library/alpine/blobs/sha256:abc", None),
             "docker"
         );
     }
 
     #[test]
     fn test_detect_registry_maven() {
-        assert_eq!(detect_registry("/maven2/com/example/artifact"), "maven");
+        assert_eq!(
+            detect_registry("/maven2/com/example/artifact", None),
+            "maven"
+        );
+        let mut config = crate::config::Config::default();
+        config.maven.repositories = vec![crate::config::MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        }];
+        assert_eq!(
+            detect_registry("/repository/releases/com/example/artifact", Some(&config)),
+            "maven"
+        );
+        config.maven.enabled = false;
+        assert_eq!(
+            detect_registry("/repository/releases/com/example/artifact", Some(&config)),
+            "other"
+        );
     }
 
     #[test]
     fn test_detect_registry_npm() {
-        assert_eq!(detect_registry("/npm/lodash"), "npm");
-        assert_eq!(detect_registry("/npm/@scope/package"), "npm");
+        assert_eq!(detect_registry("/npm/lodash", None), "npm");
+        assert_eq!(detect_registry("/npm/@scope/package", None), "npm");
+        let mut config = crate::config::Config::default();
+        config.npm.repositories = vec![crate::config::NpmRepository::Hosted {
+            name: "packages".to_string(),
+            write_policy: crate::config::NpmWritePolicy::AllowOnce,
+        }];
+        assert_eq!(
+            detect_registry("/repository/packages/@scope/package", Some(&config)),
+            "npm"
+        );
+        assert_eq!(
+            detect_registry("/repository/unknown/pkg", Some(&config)),
+            "other"
+        );
+        config.npm.enabled = false;
+        assert_eq!(
+            detect_registry("/repository/packages/@scope/package", Some(&config)),
+            "other"
+        );
     }
 
     #[test]
     fn test_detect_registry_cargo_path() {
-        assert_eq!(detect_registry("/cargo/api/v1/crates"), "cargo");
+        assert_eq!(detect_registry("/cargo/api/v1/crates", None), "cargo");
     }
 
     #[test]
     fn test_detect_registry_pypi() {
-        assert_eq!(detect_registry("/simple/requests/"), "pypi");
+        assert_eq!(detect_registry("/simple/requests/", None), "pypi");
         assert_eq!(
-            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz"),
+            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz", None),
             "pypi"
         );
     }
 
     #[test]
     fn test_detect_registry_ui() {
-        assert_eq!(detect_registry("/ui/dashboard"), "ui");
-        assert_eq!(detect_registry("/ui"), "ui");
+        assert_eq!(detect_registry("/ui/dashboard", None), "ui");
+        assert_eq!(detect_registry("/ui", None), "ui");
     }
 
     #[test]
     fn test_detect_registry_other() {
-        assert_eq!(detect_registry("/health"), "other");
-        assert_eq!(detect_registry("/ready"), "other");
-        assert_eq!(detect_registry("/unknown/path"), "other");
+        assert_eq!(detect_registry("/health", None), "other");
+        assert_eq!(detect_registry("/ready", None), "other");
+        assert_eq!(detect_registry("/unknown/path", None), "other");
     }
 
     #[test]
     fn test_detect_registry_go_path() {
         assert_eq!(
-            detect_registry("/go/github.com/user/repo/@v/v1.0.0.info"),
+            detect_registry("/go/github.com/user/repo/@v/v1.0.0.info", None),
             "go"
         );
-        assert_eq!(detect_registry("/go/github.com/user/repo/@latest"), "go");
+        assert_eq!(
+            detect_registry("/go/github.com/user/repo/@latest", None),
+            "go"
+        );
         // Bare prefix without trailing slash should not match
-        assert_eq!(detect_registry("/goblin/something"), "other");
+        assert_eq!(detect_registry("/goblin/something", None), "other");
     }
 
     #[test]
     fn test_detect_registry_raw_path() {
-        assert_eq!(detect_registry("/raw/my-project/artifact.tar.gz"), "raw");
-        assert_eq!(detect_registry("/raw/data/file.bin"), "raw");
+        assert_eq!(
+            detect_registry("/raw/my-project/artifact.tar.gz", None),
+            "raw"
+        );
+        assert_eq!(detect_registry("/raw/data/file.bin", None), "raw");
         // Bare prefix without trailing slash should not match
-        assert_eq!(detect_registry("/rawdata/file"), "other");
+        assert_eq!(detect_registry("/rawdata/file", None), "other");
     }
 
     #[test]

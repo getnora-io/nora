@@ -7,7 +7,7 @@ use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, WriteMultipart};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -173,6 +173,7 @@ fn decode_object_key(key: &str) -> String {
 fn map_err(e: object_store::Error) -> StorageError {
     match e {
         object_store::Error::NotFound { .. } => StorageError::NotFound,
+        object_store::Error::AlreadyExists { .. } => StorageError::AlreadyExists,
         other => StorageError::Network(other.to_string()),
     }
 }
@@ -184,6 +185,17 @@ impl StorageBackend for ObjectStorage {
         let path = Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
         self.store.put(&path, payload).await.map_err(map_err)?;
+        Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<()> {
+        let encoded = encode_object_key(key);
+        let path = Path::from(encoded);
+        let payload = PutPayload::from(data.to_vec());
+        self.store
+            .put_opts(&path, payload, PutMode::Create.into())
+            .await
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -526,6 +538,51 @@ mod tests {
         assert!(storage.get(&listed_plain[0]).await.is_ok());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_put_if_absent_has_exactly_one_winner() {
+        const CONTENDERS: usize = 16;
+        let storage = std::sync::Arc::new(ObjectStorage {
+            store: Box::new(object_store::memory::InMemory::new()),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        });
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+
+        let mut handles = Vec::new();
+        for i in 0..CONTENDERS {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let payload = vec![i as u8; 4096];
+                barrier.wait().await;
+                (i as u8, storage.put_if_absent("raw/shared", &payload).await)
+            }));
+        }
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for handle in handles {
+            let (candidate, result) = handle.await.expect("task panicked");
+            match result {
+                Ok(()) => assert!(
+                    winner.replace(candidate).is_none(),
+                    "more than one conditional object put succeeded"
+                ),
+                Err(StorageError::AlreadyExists) => conflicts += 1,
+                Err(e) => panic!("unexpected conditional-put error: {e}"),
+            }
+        }
+
+        let winner = winner.expect("one contender must create the object");
+        assert_eq!(conflicts, CONTENDERS - 1);
+        let stored = storage.get("raw/shared").await.unwrap();
+        assert_eq!(stored.len(), 4096);
+        assert!(stored.iter().all(|byte| *byte == winner));
+    }
+
     #[test]
     fn test_s3_storage_creation_anonymous() {
         let storage = ObjectStorage::new(
@@ -626,6 +683,15 @@ mod tests {
             StorageError::NotFound => {}
             other => panic!("Expected NotFound, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_error_mapping_already_exists() {
+        let err = object_store::Error::AlreadyExists {
+            path: "test/key".to_string(),
+            source: "exists".into(),
+        };
+        assert!(matches!(map_err(err), StorageError::AlreadyExists));
     }
 
     #[test]

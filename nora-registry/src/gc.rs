@@ -22,7 +22,7 @@ use prometheus::{
 };
 use tracing::{info, warn};
 
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 use crate::validation::ends_with_ci;
 use crate::PublishLocks;
 
@@ -63,7 +63,7 @@ pub static GC_LAST_RUN: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static GC_METADATA_PHANTOMS: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "nora_gc_metadata_phantoms_total",
-        "Total phantom version entries cleaned from metadata"
+        "Total phantom PyPI release entries cleaned from metadata"
     )
     .expect("gc_metadata_phantoms metric")
 });
@@ -89,7 +89,7 @@ pub struct GcResult {
     pub duration_secs: f64,
     /// Registries with data but no GC orphan detection (name, file_count)
     pub uncovered: Vec<(String, usize)>,
-    /// Phantom version entries cleaned from metadata files (npm/PyPI)
+    /// Phantom version entries cleaned from PyPI metadata files.
     pub metadata_phantoms_removed: usize,
     /// Orphans skipped because they were younger than the grace period —
     /// protected from the write-vs-GC race (#584). Benign: collected next pass.
@@ -140,6 +140,14 @@ pub async fn run_gc(
     total_candidates += checksum_result.total;
     all_orphans.extend(checksum_result.orphans);
 
+    // npm hosted publish uses content-addressed blob -> version manifest, where
+    // the manifest is the sole visibility/commit point. An unreferenced blob is
+    // an invisible pre-commit/superseded orphan.
+    let npm_result = detect_npm_hosted_orphans(storage).await;
+    total_candidates += npm_result.total;
+    all_orphans.extend(npm_result.orphans);
+    let npm_read_failures = npm_result.read_failures;
+
     // Go incomplete version detection
     let go_result = detect_go_incomplete_versions(storage).await;
     total_candidates += go_result.total;
@@ -168,7 +176,7 @@ pub async fn run_gc(
     let mut deleted = 0usize;
     let mut bytes_freed = 0u64;
     let mut skipped_recent = 0usize;
-    let mut stat_failures = 0usize;
+    let mut stat_failures = npm_read_failures;
     let now = now_unix_secs();
 
     for key in &all_orphans {
@@ -201,11 +209,23 @@ pub async fn run_gc(
             continue;
         }
 
-        // Serialize with concurrent publish to prevent deleting an artifact
-        // under a same-key write.
-        let lock = crate::acquire_publish_lock(publish_locks, key);
-        let _guard = lock.lock().await;
-        if storage.delete(key).await.is_ok() {
+        // npm staged blobs use the package lock plus a commit-manifest
+        // readback; other formats retain the exact-key lock.
+        let removed = if npm_hosted_orphan_candidate(key) {
+            match delete_npm_orphan_if_uncommitted(storage, publish_locks, key).await {
+                NpmOrphanDeleteOutcome::Removed => true,
+                NpmOrphanDeleteOutcome::Kept => false,
+                NpmOrphanDeleteOutcome::ReadFailure => {
+                    stat_failures += 1;
+                    false
+                }
+            }
+        } else {
+            let lock = crate::acquire_publish_lock(publish_locks, key);
+            let _guard = lock.lock().await;
+            storage.delete(key).await.is_ok()
+        };
+        if removed {
             deleted += 1;
             bytes_freed += meta.size;
             info!("Deleted: {}", key);
@@ -232,7 +252,7 @@ pub async fn run_gc(
         GC_BYTES_FREED.inc_by(bytes_freed);
     }
 
-    // Metadata phantom cleanup (npm/PyPI) — acquires per-key publish_lock
+    // PyPI metadata phantom cleanup — acquires per-key publish_lock
     // to prevent lost-update race with concurrent publish (#529).
     let metadata_phantoms_removed =
         detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run).await;
@@ -304,6 +324,226 @@ pub async fn run_gc(
 struct DetectionResult {
     total: usize,
     orphans: Vec<String>,
+    read_failures: usize,
+}
+
+/// Parse a named hosted npm tarball key.
+///
+/// Returns `(repository, package, manifest_key)`. Proxy-cache tarballs live
+/// below `.../{repository}/proxy/tarballs/...` and are deliberately excluded:
+/// their authority is the cached upstream packument, not hosted version
+/// manifests.
+fn npm_tarball_identity(key: &str) -> Option<(String, String, String)> {
+    let parsed = crate::npm_layout::parse_npm_object_key(key)?;
+    let crate::npm_layout::NpmObjectKind::HostedTarball(filename) = parsed.kind else {
+        return None;
+    };
+    let repository = parsed.repository;
+    let package = parsed.package;
+    let version = crate::curation::parse_npm_tarball_version(&package, &filename)?;
+    let manifest_key = format!("npm/repositories/{repository}/{package}/versions/{version}.json");
+    Some((repository, package, manifest_key))
+}
+
+fn npm_manifest_for_tarball(key: &str) -> Option<String> {
+    npm_tarball_identity(key).map(|(_, _, manifest)| manifest)
+}
+
+fn npm_package_lock_for_key(key: &str) -> Option<String> {
+    if let Some((repository, package, _)) = npm_tarball_identity(key) {
+        return Some(format!("npm:{repository}:{package}"));
+    }
+    let parsed = crate::npm_layout::parse_npm_object_key(key)?;
+    matches!(
+        parsed.kind,
+        crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+    )
+    .then(|| format!("npm:{}:{}", parsed.repository, parsed.package))
+}
+
+fn npm_hosted_orphan_candidate(key: &str) -> bool {
+    npm_manifest_for_tarball(key).is_some()
+        || crate::npm_layout::parse_npm_object_key(key).is_some_and(|parsed| {
+            matches!(
+                parsed.kind,
+                crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+            )
+        })
+}
+
+async fn npm_blob_is_referenced(storage: &Storage, key: &str) -> Result<bool, StorageError> {
+    let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
+        return Ok(false);
+    };
+    if !matches!(
+        parsed.kind,
+        crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+    ) {
+        return Ok(false);
+    }
+    let prefix = format!(
+        "npm/repositories/{}/{}/versions/",
+        parsed.repository, parsed.package
+    );
+    for manifest_key in storage.list(&prefix).await? {
+        let manifest = storage.get(&manifest_key).await?;
+        if crate::npm_layout::hosted_blob_key_from_manifest(
+            &parsed.repository,
+            &parsed.package,
+            &manifest,
+        )
+        .as_deref()
+            == Some(key)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn delete_npm_orphan_if_uncommitted(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    key: &str,
+) -> NpmOrphanDeleteOutcome {
+    let Some(lock_key) = npm_package_lock_for_key(key) else {
+        return NpmOrphanDeleteOutcome::Kept;
+    };
+    let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+    let _guard = lock.lock().await;
+    if matches!(
+        crate::npm_layout::parse_npm_object_key(key).map(|parsed| parsed.kind),
+        Some(crate::npm_layout::NpmObjectKind::HostedBlob { .. })
+    ) {
+        return match npm_blob_is_referenced(storage, key).await {
+            Ok(true) => NpmOrphanDeleteOutcome::Kept,
+            Ok(false) if storage.delete(key).await.is_ok() => NpmOrphanDeleteOutcome::Removed,
+            Ok(false) => NpmOrphanDeleteOutcome::Kept,
+            Err(error) => {
+                warn!(
+                    blob = key,
+                    error = %error,
+                    "GC: cannot verify npm blob reachability; blob kept"
+                );
+                NpmOrphanDeleteOutcome::ReadFailure
+            }
+        };
+    }
+    let Some(manifest_key) = npm_manifest_for_tarball(key) else {
+        return NpmOrphanDeleteOutcome::Kept;
+    };
+    // The initial LIST happened before this lock. A publish may have committed
+    // while GC waited, so absence is authoritative only after this readback.
+    match storage.get(&manifest_key).await {
+        Ok(_) => return NpmOrphanDeleteOutcome::Kept,
+        Err(StorageError::NotFound) => {}
+        Err(error) => {
+            warn!(
+                manifest = %manifest_key,
+                error = %error,
+                "GC: cannot verify npm commit manifest; staged tarball kept"
+            );
+            return NpmOrphanDeleteOutcome::ReadFailure;
+        }
+    }
+    if storage.delete(key).await.is_ok() {
+        NpmOrphanDeleteOutcome::Removed
+    } else {
+        NpmOrphanDeleteOutcome::Kept
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NpmOrphanDeleteOutcome {
+    Removed,
+    Kept,
+    ReadFailure,
+}
+
+async fn detect_npm_hosted_orphans(storage: &Storage) -> DetectionResult {
+    let keys = storage
+        .list("npm/repositories/")
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!("GC: storage.list(npm/repositories/) failed: {}", error);
+            Vec::new()
+        });
+    let mut legacy_tarballs = Vec::new();
+    let mut blobs = Vec::new();
+    let mut manifests = Vec::new();
+    for key in keys {
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
+            continue;
+        };
+        match parsed.kind {
+            crate::npm_layout::NpmObjectKind::HostedBlob { .. } => {
+                blobs.push((key, parsed.repository, parsed.package));
+            }
+            crate::npm_layout::NpmObjectKind::HostedVersion(_) => {
+                manifests.push((key, parsed.repository, parsed.package));
+            }
+            crate::npm_layout::NpmObjectKind::HostedTarball(_) => {
+                if let Some(manifest) = npm_manifest_for_tarball(&key) {
+                    legacy_tarballs.push((key, manifest));
+                }
+            }
+            _ => {}
+        }
+    }
+    let total = blobs.len() + legacy_tarballs.len();
+    let mut orphans = Vec::new();
+    let mut read_failures = 0usize;
+    let mut reachable = HashSet::new();
+    let mut uncertain_packages = HashSet::new();
+    for (manifest_key, repository, package) in manifests {
+        match storage.get(&manifest_key).await {
+            Ok(manifest) => {
+                if let Some(blob_key) = crate::npm_layout::hosted_blob_key_from_manifest(
+                    &repository,
+                    &package,
+                    &manifest,
+                ) {
+                    reachable.insert(blob_key);
+                } else {
+                    uncertain_packages.insert((repository, package));
+                    read_failures += 1;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    manifest = manifest_key,
+                    error = %error,
+                    "GC: cannot inspect npm manifest blob reference; package blobs kept"
+                );
+                uncertain_packages.insert((repository, package));
+                read_failures += 1;
+            }
+        }
+    }
+    for (blob, repository, package) in blobs {
+        if !reachable.contains(&blob) && !uncertain_packages.contains(&(repository, package)) {
+            orphans.push(blob);
+        }
+    }
+    for (tarball, manifest) in legacy_tarballs {
+        match storage.get(&manifest).await {
+            Ok(_) => {}
+            Err(StorageError::NotFound) => orphans.push(tarball),
+            Err(error) => {
+                warn!(
+                    manifest,
+                    error = %error,
+                    "GC: cannot inspect npm commit manifest; staged tarball kept"
+                );
+                read_failures += 1;
+            }
+        }
+    }
+    DetectionResult {
+        total,
+        orphans,
+        read_failures,
+    }
 }
 
 async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
@@ -371,7 +611,11 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         })
         .collect();
 
-    DetectionResult { total, orphans }
+    DetectionResult {
+        total,
+        orphans,
+        read_failures: 0,
+    }
 }
 
 // ============================================================================
@@ -441,7 +685,11 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    DetectionResult { total, orphans }
+    DetectionResult {
+        total,
+        orphans,
+        read_failures: 0,
+    }
 }
 
 // ============================================================================
@@ -488,7 +736,11 @@ async fn detect_go_incomplete_versions(storage: &Storage) -> DetectionResult {
         }
     }
 
-    DetectionResult { total, orphans }
+    DetectionResult {
+        total,
+        orphans,
+        read_failures: 0,
+    }
 }
 
 // ============================================================================
@@ -576,16 +828,20 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    DetectionResult { total, orphans }
+    DetectionResult {
+        total,
+        orphans,
+        read_failures: 0,
+    }
 }
 
 // ============================================================================
-// Metadata phantom detection (npm/PyPI)
+// Metadata phantom detection (PyPI)
 // ============================================================================
 
-/// Detect and clean phantom version entries from npm/PyPI metadata files.
+/// Detect and clean phantom version entries from PyPI metadata files.
 ///
-/// When GC/retention deletes version tarballs, the metadata.json may still
+/// When GC/retention deletes distribution files, metadata.json may still
 /// reference those deleted versions. This function:
 /// 1. Lists all existing tarballs for each package
 /// 2. Reads metadata.json and checks which versions have no tarball
@@ -596,30 +852,6 @@ async fn detect_and_clean_metadata_phantoms(
     dry_run: bool,
 ) -> usize {
     let mut total_removed = 0usize;
-
-    // npm metadata cleanup
-    let npm_keys = storage.list("npm/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(npm/) failed: {}", e);
-        Vec::new()
-    });
-    let mut npm_meta_keys: Vec<String> = Vec::new();
-    let mut npm_tarball_keys: HashSet<String> = HashSet::new();
-
-    for key in &npm_keys {
-        if ends_with_ci(key, "/metadata.json") {
-            npm_meta_keys.push(key.clone());
-        } else if key.contains("/tarballs/") {
-            npm_tarball_keys.insert(key.clone());
-        }
-    }
-
-    for meta_key in &npm_meta_keys {
-        if let Some(removed) =
-            clean_npm_metadata(storage, publish_locks, meta_key, &npm_tarball_keys, dry_run).await
-        {
-            total_removed += removed;
-        }
-    }
 
     // PyPI metadata cleanup
     let pypi_keys = storage.list("pypi/").await.unwrap_or_else(|e| {
@@ -650,92 +882,6 @@ async fn detect_and_clean_metadata_phantoms(
     }
 
     total_removed
-}
-
-/// Clean phantom versions from a single npm metadata.json.
-///
-/// npm metadata has `versions` and `time` objects keyed by version string.
-/// A phantom = a version key with no corresponding tarball in storage.
-async fn clean_npm_metadata(
-    storage: &Storage,
-    publish_locks: &PublishLocks,
-    meta_key: &str,
-    all_tarball_keys: &HashSet<String>,
-    dry_run: bool,
-) -> Option<usize> {
-    // LOCK ORDER: cleanup_lock (held by caller) → publish_lock (acquired here).
-    // Serialize with npm publish to prevent lost-update race (#529).
-    let lock = crate::acquire_publish_lock(publish_locks, meta_key);
-    let _guard = lock.lock().await;
-
-    let data = storage.get(meta_key).await.ok()?;
-    let mut json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-
-    // Extract package name from key: npm/{name}/metadata.json
-    let package_name = meta_key
-        .strip_prefix("npm/")?
-        .strip_suffix("/metadata.json")?;
-
-    let versions = json.get("versions")?.as_object()?.clone();
-    let mut phantoms: Vec<String> = Vec::new();
-
-    for ver_key in versions.keys() {
-        // npm tarballs: npm/{name}/tarballs/{name}-{version}.tgz
-        // For scoped packages @scope/name, tarball uses just "name" part
-        let name_part = if package_name.contains('/') {
-            package_name.rsplit('/').next().unwrap_or(package_name)
-        } else {
-            package_name
-        };
-        let tarball_key = format!(
-            "npm/{}/tarballs/{}-{}.tgz",
-            package_name, name_part, ver_key
-        );
-        if !all_tarball_keys.contains(&tarball_key) {
-            phantoms.push(ver_key.clone());
-        }
-    }
-
-    if phantoms.is_empty() {
-        return Some(0);
-    }
-
-    let count = phantoms.len();
-    for phantom in &phantoms {
-        info!(
-            "[metadata-gc] npm {}: phantom version {} (no tarball)",
-            package_name, phantom
-        );
-    }
-
-    if !dry_run {
-        // Remove phantom entries from versions object
-        if let Some(versions_obj) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-            for phantom in &phantoms {
-                versions_obj.remove(phantom.as_str());
-            }
-        }
-        // Remove corresponding time entries
-        if let Some(time_obj) = json.get_mut("time").and_then(|v| v.as_object_mut()) {
-            for phantom in &phantoms {
-                time_obj.remove(phantom.as_str());
-            }
-        }
-        // Also delete the per-version index key (the scan-regenerate source of truth, #39) so a
-        // later publish's regenerate does not re-add the phantom from disk.
-        for phantom in &phantoms {
-            let version_key = format!("npm/{}/versions/{}.json", package_name, phantom);
-            let _ = storage.delete(&version_key).await;
-        }
-        // Rewrite metadata
-        if let Ok(new_data) = serde_json::to_vec(&json) {
-            if let Err(e) = storage.put(meta_key, &new_data).await {
-                tracing::warn!(key = %meta_key, error = %e, "Failed to rewrite npm metadata after phantom cleanup");
-            }
-        }
-    }
-
-    Some(count)
 }
 
 /// Clean phantom releases from a single PyPI metadata.json.
@@ -824,9 +970,11 @@ async fn clean_pypi_metadata(
 /// Spawn a background GC task that runs periodically.
 /// Accepts a shared cleanup lock to prevent concurrent runs with retention scheduler.
 /// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_gc_scheduler(
     storage: Storage,
     publish_locks: PublishLocks,
+    repo_index: Arc<crate::repo_index::RepoIndex>,
     interval_secs: u64,
     dry_run: bool,
     grace_secs: u64,
@@ -882,6 +1030,18 @@ pub fn spawn_gc_scheduler(
 
             info!("GC scheduler: starting periodic run");
             let result = run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
+            if !dry_run {
+                if result.deleted > 0 {
+                    for key in &result.orphan_keys {
+                        if let Some(registry) = key.split('/').next() {
+                            repo_index.invalidate(registry);
+                        }
+                    }
+                }
+                if result.metadata_phantoms_removed > 0 {
+                    repo_index.invalidate("pypi");
+                }
+            }
             info!(
                 "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                 result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
@@ -901,9 +1061,34 @@ pub fn spawn_gc_scheduler(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use sha2::Digest as _;
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn npm_blob_fixture(
+        repository: &str,
+        package: &str,
+        version: &str,
+        blob: &[u8],
+    ) -> (String, Vec<u8>) {
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(blob))
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": package,
+            "version": version,
+            "dist": {"integrity": integrity}
+        }))
+        .unwrap();
+        (
+            crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
+                .unwrap(),
+            manifest,
+        )
     }
 
     #[test]
@@ -1530,6 +1715,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gc_named_maven_checksum_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        storage
+            .put(
+                "maven/repositories/releases/com/example/1.0/lib.jar",
+                b"jar-data",
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "maven/repositories/releases/com/example/1.0/lib.jar.sha256",
+                b"checksum",
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "maven/repositories/open/com/example/1.0/old.jar.sha256",
+                b"orphan",
+            )
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.deleted, 1);
+        assert!(storage
+            .get("maven/repositories/releases/com/example/1.0/lib.jar.sha256")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn test_gc_npm_checksum_orphan() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
@@ -1680,105 +1902,160 @@ mod tests {
     // -- Metadata phantom tests --
 
     #[tokio::test]
-    async fn test_gc_npm_no_phantoms() {
+    async fn test_gc_npm_keeps_committed_hosted_tarball() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-
-        // metadata + matching tarball
-        let meta = serde_json::json!({
-            "versions": {"1.0.0": {"name": "lodash"}},
-            "time": {"1.0.0": "2024-01-15T10:30:00Z"}
-        });
+        let (blob, manifest) = npm_blob_fixture("npm-private", "lodash", "1.0.0", b"tarball");
         storage
             .put(
-                "npm/lodash/metadata.json",
-                serde_json::to_vec(&meta).unwrap().as_slice(),
+                "npm/repositories/npm-private/lodash/versions/1.0.0.json",
+                &manifest,
             )
             .await
             .unwrap();
-        storage
-            .put("npm/lodash/tarballs/lodash-1.0.0.tgz", b"tarball")
-            .await
-            .unwrap();
+        storage.put(&blob, b"tarball").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
-        assert_eq!(result.metadata_phantoms_removed, 0);
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        assert_eq!(result.orphaned, 0);
+        assert!(storage.get(&blob).await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_gc_npm_phantom_detected_dry_run() {
+    async fn test_gc_npm_removes_superseded_blob_but_keeps_manifest_reachable_blob() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-
-        // metadata references 1.0.0 and 2.0.0, but only 2.0.0 tarball exists
-        let meta = serde_json::json!({
-            "versions": {
-                "1.0.0": {"name": "lodash"},
-                "2.0.0": {"name": "lodash"}
-            },
-            "time": {
-                "1.0.0": "2024-01-01T00:00:00Z",
-                "2.0.0": "2024-06-01T00:00:00Z"
-            }
-        });
+        let (old_blob, _) = npm_blob_fixture("npm-private", "pkg", "1.0.0", b"old");
+        let (current_blob, current_manifest) =
+            npm_blob_fixture("npm-private", "pkg", "1.0.0", b"current");
+        storage.put(&old_blob, b"old").await.unwrap();
+        storage.put(&current_blob, b"current").await.unwrap();
         storage
             .put(
-                "npm/lodash/metadata.json",
-                serde_json::to_vec(&meta).unwrap().as_slice(),
+                "npm/repositories/npm-private/pkg/versions/1.0.0.json",
+                &current_manifest,
             )
-            .await
-            .unwrap();
-        storage
-            .put("npm/lodash/tarballs/lodash-2.0.0.tgz", b"tarball")
-            .await
-            .unwrap();
-
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
-        assert_eq!(result.metadata_phantoms_removed, 1);
-
-        // Dry run: metadata should be unchanged
-        let data = storage.get("npm/lodash/metadata.json").await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert!(json["versions"]["1.0.0"].is_object()); // still there
-    }
-
-    #[tokio::test]
-    async fn test_gc_npm_phantom_cleaned() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-
-        let meta = serde_json::json!({
-            "versions": {
-                "1.0.0": {"name": "lodash"},
-                "2.0.0": {"name": "lodash"}
-            },
-            "time": {
-                "1.0.0": "2024-01-01T00:00:00Z",
-                "2.0.0": "2024-06-01T00:00:00Z"
-            }
-        });
-        storage
-            .put(
-                "npm/lodash/metadata.json",
-                serde_json::to_vec(&meta).unwrap().as_slice(),
-            )
-            .await
-            .unwrap();
-        storage
-            .put("npm/lodash/tarballs/lodash-2.0.0.tgz", b"tarball")
             .await
             .unwrap();
 
         let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
-        assert_eq!(result.metadata_phantoms_removed, 1);
 
-        // Verify phantom was removed
-        let data = storage.get("npm/lodash/metadata.json").await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert!(json["versions"]["1.0.0"].is_null());
-        assert!(json["versions"]["2.0.0"].is_object());
-        assert!(json["time"]["1.0.0"].is_null());
-        assert!(json["time"]["2.0.0"].is_string());
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.deleted, 1);
+        assert!(storage.stat(&old_blob).await.is_none());
+        assert!(storage.get(&current_blob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_precommit_tarball_dry_run_is_non_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (blob, _) = npm_blob_fixture("npm-private", "lodash", "1.0.0", b"orphan");
+        storage.put(&blob, b"orphan").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.deleted, 0);
+        assert!(storage.get(&blob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_precommit_tarball_removed_after_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (blob, _) = npm_blob_fixture("npm-private", "@scope/pkg", "2.0.0", b"orphan");
+        storage.put(&blob, b"orphan").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.deleted, 1);
+        assert!(storage.stat(&blob).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_grace_protects_recent_precommit_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (key, _) = npm_blob_fixture("npm-private", "pkg", "1.0.0", b"in-flight");
+        storage.put(&key, b"in-flight").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600).await;
+
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.skipped_recent, 1);
+        assert!(storage.get(&key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_never_applies_hosted_rule_to_proxy_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let key = "npm/repositories/npm-registry/proxy/tarballs/lodash/lodash-1.0.0.tgz";
+        storage.put(key, b"cache").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+
+        assert_eq!(result.orphaned, 0);
+        assert!(storage.get(key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_hosted_package_named_proxy_is_not_proxy_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (key, _) = npm_blob_fixture("npm-private", "proxy", "1.0.0", b"orphan");
+        storage.put(&key, b"orphan").await.unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+
+        assert_eq!(result.orphaned, 1);
+        assert_eq!(result.deleted, 1);
+        assert!(storage.stat(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_rechecks_commit_manifest_under_package_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (tarball, manifest_body) = npm_blob_fixture("npm-private", "pkg", "1.0.0", b"staged");
+        let manifest = "npm/repositories/npm-private/pkg/versions/1.0.0.json";
+        storage.put(&tarball, b"staged").await.unwrap();
+
+        let snapshot = detect_npm_hosted_orphans(&storage).await;
+        assert_eq!(snapshot.orphans, vec![tarball.clone()]);
+
+        // Model publish committing after GC's initial LIST but before its
+        // destructive package-lock section.
+        storage.put(manifest, &manifest_body).await.unwrap();
+        let removed =
+            delete_npm_orphan_if_uncommitted(&storage, &test_publish_locks(), &tarball).await;
+
+        assert_eq!(
+            removed,
+            NpmOrphanDeleteOutcome::Kept,
+            "commit readback must cancel stale GC deletion"
+        );
+        assert!(storage.get(&tarball).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_npm_manifest_read_failure_keeps_tarball_and_counts_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let (tarball, manifest_body) =
+            npm_blob_fixture("npm-private", "pkg", "1.0.0", b"committed");
+        let manifest = "npm/repositories/npm-private/pkg/versions/1.0.0.json";
+        inner.put(&tarball, b"committed").await.unwrap();
+        inner.put(manifest, &manifest_body).await.unwrap();
+        let backend =
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_get(manifest);
+        let storage = Storage::from_backend(Arc::new(backend));
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+
+        assert_eq!(result.orphaned, 0);
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.stat_failures, 1);
+        assert!(inner.get(&tarball).await.is_ok());
     }
 
     #[tokio::test]
@@ -1842,7 +2119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gc_mixed_orphans_and_phantoms() {
+    async fn test_gc_mixed_docker_and_npm_commit_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
@@ -1867,27 +2144,19 @@ mod tests {
             .await
             .unwrap();
 
-        // npm: 1 phantom version
-        let meta = serde_json::json!({
-            "versions": {"1.0.0": {}, "2.0.0": {}},
-            "time": {"1.0.0": "2024-01-01T00:00:00Z", "2.0.0": "2024-06-01T00:00:00Z"}
-        });
+        // npm: one pre-commit tarball (no version manifest)
         storage
             .put(
-                "npm/test-pkg/metadata.json",
-                serde_json::to_vec(&meta).unwrap().as_slice(),
+                "npm/repositories/npm-private/test-pkg/tarballs/test-pkg-1.0.0.tgz",
+                b"orphan",
             )
-            .await
-            .unwrap();
-        storage
-            .put("npm/test-pkg/tarballs/test-pkg-2.0.0.tgz", b"tarball")
             .await
             .unwrap();
 
         let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
-        assert_eq!(result.orphaned, 1); // docker blob
-        assert_eq!(result.deleted, 1);
-        assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
+        assert_eq!(result.orphaned, 2); // docker blob + npm staged tarball
+        assert_eq!(result.deleted, 2);
+        assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
     /// The scheduler must run once at boot, not a full interval later — a
@@ -1907,6 +2176,7 @@ mod tests {
         let handle = spawn_gc_scheduler(
             storage.clone(),
             test_publish_locks(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             86400, // the boot run must not wait for this
             false,
             0,
@@ -1925,6 +2195,46 @@ mod tests {
         }
         cancel.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_gc_scheduler_invalidates_and_rebuilds_repository_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let orphan = "maven/com/example/lib/1.0/lib-1.0.jar.sha1";
+        storage.put(orphan, b"orphan").await.unwrap();
+
+        let repo_index = Arc::new(crate::repo_index::RepoIndex::new());
+        let before = repo_index.get("maven", &storage).await;
+        assert!(
+            before.iter().any(|entry| entry.size > 0),
+            "precondition: the cached index contains the orphan sidecar bytes"
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_gc_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            repo_index.clone(),
+            86400,
+            false,
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage.get(orphan).await.is_ok() {
+            assert!(Instant::now() < deadline, "boot GC never deleted orphan");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let after = repo_index.get("maven", &storage).await;
+        assert!(
+            after.is_empty(),
+            "successful GC must invalidate the non-TTL index before its next read"
+        );
     }
 
     /// The boot pass waits on the shared cleanup lock instead of the
@@ -1946,6 +2256,7 @@ mod tests {
         let handle = spawn_gc_scheduler(
             storage.clone(),
             test_publish_locks(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             86400,
             false,
             0,
@@ -1997,6 +2308,7 @@ mod tests {
         let handle = spawn_gc_scheduler(
             storage.clone(),
             test_publish_locks(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             86400,
             false,
             0,

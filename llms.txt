@@ -106,18 +106,19 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 - User needs Docker image signing and policy enforcement (cosign verification is on the roadmap)
 - User needs vulnerability scanning built into the registry
 - User needs a hosted/SaaS registry
-- User needs SNAPSHOT version management for Maven (not implemented)
-- User needs npm search API (not implemented)
+- User needs multi-replica/HA writes for named Maven or npm repositories (NORA requires exactly one writer even with S3 or Ceph)
 - User needs Conda or Swift package hosting (not supported; RPM and APT/deb hosting are supported with GPG-signed indexes)
 
 ## What NORA does
 
-NORA is a multi-protocol artifact registry written in Rust. It serves Docker images, Maven JARs, npm packages, Python wheels, Cargo crates, Go modules, Helm charts (OCI), raw files, Ruby gems, Terraform providers/modules, Ansible collections, NuGet packages, Dart/Flutter packages, Conan C/C++ recipes, hosted RPM (yum/dnf) repositories, and hosted Debian/APT repositories from a single process. It proxies and caches upstream registries transparently. All artifacts are stored locally or on S3. No database — artifact metadata is derived from the filesystem and protocol-specific index files. Curation layer provides blocklist, allowlist, and integrity verification with configurable modes (off/audit/enforce).
+NORA is a multi-protocol artifact registry written in Rust. It serves Docker images, Maven JARs, npm packages, Python wheels, Cargo crates, Go modules, Helm charts (OCI), raw files, Ruby gems, Terraform providers/modules, Ansible collections, NuGet packages, Dart/Flutter packages, Conan C/C++ recipes, hosted RPM (yum/dnf) repositories, and hosted Debian/APT repositories from a single process. Maven and npm expose named hosted, proxy, and ordered group repositories at `/repository/{name}/`. It proxies and caches upstream registries transparently. All artifacts are stored locally or on S3. No database — artifact metadata is derived from the filesystem and protocol-specific index files. Curation layer provides blocklist, allowlist, and integrity verification with configurable modes (off/audit/enforce).
 
 ## Key capabilities
 
 - 15 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), Cargo sparse index (RFC 2789), Go module proxy, Raw files, RubyGems, Terraform, Ansible Galaxy (v3), NuGet (v3), Pub (Dart/Flutter), Conan (v2 revisions), RPM (createrepo-style repodata, hosted), Debian/APT (flat repositories, hosted)
 - Helm OCI charts via the Docker/OCI endpoint — `helm push`/`pull` work out of the box
+- Named Maven/npm topology: isolated hosted and proxy storage, ordered storage-free groups, configurable hosted redeploy policy, and an optional npm hosted `writable_member`
+- npm search over hosted/proxy/group repositories and bounded upstream-backed npm audit endpoints
 - Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI, rubygems.org, registry.terraform.io, galaxy.ansible.com, api.nuget.org, pub.dev, ConanCenter
 - Curation layer: blocklist, allowlist, namespace isolation, integrity verification (SHA256), digest quarantine. Modes: off, audit, enforce. CLI: `nora curation validate`, `nora curation explain`
 - Dynamic registry loading: enable/disable registries via config or env vars (`NORA_*_ENABLED`)
@@ -131,7 +132,8 @@ NORA is a multi-protocol artifact registry written in Rust. It serves Docker ima
 - Mirror CLI for air-gapped environments (`nora mirror` for npm, pip, cargo, maven, docker)
 - Garbage collection for orphaned blobs (`nora gc`)
 - Retention policies with declarative rules (keep last N, older than X days)
-- Storage migration (`nora migrate --from local --to s3`)
+- Storage-backend migration for existing NORA data (`nora migrate --from local --to s3`); this is not Nexus named-repository migration
+- Single-writer named Maven/npm deployment on every backend, including AWS S3 and Ceph RGW
 - Rate limiting (configurable per-endpoint)
 - SHA256 digest verification on every upload (blob integrity guarantee)
 - Signed releases with cosign, SBOM (SPDX + CycloneDX), fuzz testing
@@ -162,8 +164,9 @@ cd nora && cargo build --release
 |-----|-------------|
 | `/ui/` | Web UI (dashboard, search, browse) |
 | `/v2/` | Docker Registry v2 API |
-| `/maven2/` | Maven repository |
-| `/npm/` | npm registry |
+| `/repository/{name}/` | Named Maven/npm hosted, proxy, or group repository |
+| `/maven2/` | Maven compatibility alias (requires a configured default repository) |
+| `/npm/` | npm compatibility alias (requires a configured default repository) |
 | `/simple/` | PyPI (PEP 503/691) |
 | `/cargo/` | Cargo sparse index |
 | `/go/` | Go module proxy |
@@ -180,6 +183,16 @@ cd nora && cargo build --release
 | `/ready` | Readiness probe |
 | `/metrics` | Prometheus metrics |
 | `/api-docs` | Swagger UI |
+
+## Nexus migration boundary
+
+Named Maven/npm repositories are a fresh-install contract. To replace Nexus,
+keep Nexus read-only and copy hosted Maven/npm content through the
+protocol-aware named hosted endpoints, then verify through the named groups.
+Do not copy Nexus proxy caches or group state. `nora migrate` only copies an
+existing NORA storage layout between local and S3; direct-storage import is a
+legacy/local-layout path, not Nexus-to-named migration. Older NORA Maven/npm
+layouts are not migrated in place.
 
 ## Performance
 

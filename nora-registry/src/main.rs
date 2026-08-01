@@ -38,6 +38,7 @@ mod import;
 mod metrics;
 mod migrate;
 mod mirror;
+mod npm_layout;
 mod openapi;
 mod proxy_coalesce;
 mod rate_limit;
@@ -243,9 +244,14 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
+    /// Shared outbound client with automatic redirects disabled. npm proxy
+    /// tarballs use it so every `Location` hop can be policy-checked before
+    /// credentials or a request are sent to the next URL.
+    pub no_redirect_http_client: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
+    pub(crate) maven_negative_cache: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
     /// Hot-reloadable curation config (swapped atomically on SIGHUP).
     pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
@@ -253,9 +259,8 @@ pub struct AppState {
     /// OIDC validator for workload identity (CI/CD)
     pub oidc: Option<Arc<auth::OidcValidator>>,
     pub(crate) circuit_breaker: Arc<circuit_breaker::CircuitBreakerRegistry>,
-    /// Single-flight coalescer for the proxy cache-miss path: collapses a
-    /// thundering herd of concurrent requests for the same key into one
-    /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
+    /// Single-flight coalescer for proxy cache misses. In-memory and
+    /// rebuildable; immutable cached bytes remain authoritative in storage.
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
@@ -386,8 +391,13 @@ fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
+    follow_redirects: bool,
 ) -> reqwest::Client {
     let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
+
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -459,6 +469,7 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
     let client = build_http_client(
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
+        true,
         true,
     );
     match client.get(&url).send().await {
@@ -696,12 +707,14 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Dry-run: plans only, no deletions and no index regeneration —
             // no signer needed.
-            let result = retention::run_retention(
+            let result = retention::run_retention_configured(
                 &storage,
                 &cli_publish_locks,
                 None,
                 &config.retention.rules,
                 true,
+                &config.maven,
+                None,
             )
             .await;
             println!("Retention Plan (dry-run):");
@@ -726,12 +739,14 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             if !yes {
                 // Show plan first, require --yes to execute
-                let result = retention::run_retention(
+                let result = retention::run_retention_configured(
                     &storage,
                     &cli_publish_locks,
                     None,
                     &config.retention.rules,
                     true,
+                    &config.maven,
+                    None,
                 )
                 .await;
                 println!("Retention Plan:");
@@ -759,12 +774,14 @@ async fn main() {
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
                 let signer = build_signer(&config, &config.enabled_registries());
-                let result = retention::run_retention(
+                let result = retention::run_retention_configured(
                     &storage,
                     &cli_publish_locks,
                     signer.as_deref(),
                     &config.retention.rules,
                     false,
+                    &config.maven,
+                    None,
                 )
                 .await;
                 println!("Retention Applied:");
@@ -798,6 +815,7 @@ async fn main() {
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
+                true,
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -1431,7 +1449,8 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None, false);
+    let http_client = build_http_client(&config.tls, None, false, true);
+    let no_redirect_http_client = build_http_client(&config.tls, None, false, false);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -1506,6 +1525,11 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
         }
+    }
+    if enabled_registries.contains(&RegistryType::Maven)
+        || enabled_registries.contains(&RegistryType::Npm)
+    {
+        registry_routes = registry_routes.merge(registry::named_repository_routes());
     }
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
@@ -1594,8 +1618,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
+        no_redirect_http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
         oidc: oidc_validator.map(Arc::new),
@@ -1621,6 +1647,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let handle = gc::spawn_gc_scheduler(
             state.storage.clone(),
             state.publish_locks.clone(),
+            state.repo_index.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
             state.config.gc.grace_secs,
@@ -1641,6 +1668,8 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.storage.clone(),
             state.publish_locks.clone(),
             state.signer.clone(),
+            state.config.maven.clone(),
+            state.repo_index.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,
@@ -1709,7 +1738,10 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.clone(),
             auth::auth_middleware,
         ))
-        .layer(middleware::from_fn(metrics::metrics_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::metrics_middleware,
+        ))
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 

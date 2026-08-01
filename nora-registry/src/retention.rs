@@ -12,10 +12,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
+use sha2::Digest as _;
 use tracing::info;
 
-use crate::config::RetentionRule;
-use crate::storage::Storage;
+use crate::config::{MavenConfig, MavenRepository, RetentionRule};
+use crate::storage::{Storage, StorageError};
 use crate::validation::ends_with_ci;
 use crate::PublishLocks;
 
@@ -78,6 +79,9 @@ pub struct VersionEntry {
 pub struct DeletionPlan {
     pub version_name: String,
     pub keys: Vec<String>,
+    /// Identity of the planned version directory at collection time.
+    /// Maven revalidates this under the GA publish lock before deletion.
+    pub modified: u64,
     pub size: u64,
     pub reason: String,
 }
@@ -148,6 +152,7 @@ pub fn plan_deletions(
             deletions.push(DeletionPlan {
                 version_name: version.name.clone(),
                 keys: version.keys.clone(),
+                modified: version.modified,
                 size: version.size,
                 reason: reason_parts.join(", "),
             });
@@ -245,57 +250,158 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
 // Version collectors (per-registry)
 // ============================================================================
 
-/// Collect Maven versions for a given group/artifact.
-async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("maven/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list maven/ keys: {}", e);
-        Vec::new()
-    });
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MavenRetentionKind {
+    /// Authoritative hosted content. Retention must rewrite artifact-level
+    /// discovery metadata before removing a version directory.
+    Hosted,
+    /// Rebuildable upstream cache. Artifact-level metadata remains
+    /// upstream-owned and must never be filtered by local cache retention.
+    ProxyCache,
+    /// Pre-named layout where hosted/proxy provenance is unknowable. Keep the
+    /// old deletion behaviour but never rewrite discovery metadata.
+    Legacy,
+}
+
+#[derive(Debug)]
+struct MavenVersionGroup {
+    group_name: String,
+    versions: Vec<VersionEntry>,
+    kind: MavenRetentionKind,
+    storage_prefix: String,
+    group_path: String,
+    artifact_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct MavenRetentionContext {
+    kind: MavenRetentionKind,
+    storage_prefix: String,
+    group_path: String,
+    artifact_id: String,
+}
+
+#[derive(Default)]
+struct MavenVersionDirectory {
+    keys: Vec<String>,
+    modified: u64,
+    size: u64,
+    has_payload: bool,
+}
+
+/// Collect Maven version directories while retaining repository provenance.
+///
+/// A directory is considered a version only when it contains at least one
+/// non-`maven-metadata.xml*` object. Once identified, every object in that
+/// directory is retained in the plan, including V-level SNAPSHOT metadata and
+/// all of its checksum sidecars. This avoids mistaking the artifact-level
+/// `maven-metadata.xml` directory itself for a version.
+async fn collect_maven_versions(storage: &Storage, config: &MavenConfig) -> Vec<MavenVersionGroup> {
+    let all_entries = match storage.list_with_meta("maven/").await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::error!(%error, "retention: failed to list Maven keys");
+            return Vec::new();
+        }
+    };
     let mut artifacts: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, Vec<String>>,
+        (String, String, MavenRetentionKind),
+        std::collections::HashMap<String, MavenVersionDirectory>,
     > = std::collections::HashMap::new();
 
-    for key in &all_keys {
-        let parts: Vec<&str> = key
-            .strip_prefix("maven/")
-            .unwrap_or("")
+    for (key, meta) in all_entries {
+        let Some(after_maven) = key.strip_prefix("maven/") else {
+            continue;
+        };
+        let (repository, relative, kind) =
+            if let Some(named) = after_maven.strip_prefix("repositories/") {
+                let Some((repository, relative)) = named.split_once('/') else {
+                    continue;
+                };
+                let kind = match config.repository(repository) {
+                    Some(MavenRepository::Hosted { .. }) => MavenRetentionKind::Hosted,
+                    Some(MavenRepository::Proxy { .. }) => MavenRetentionKind::ProxyCache,
+                    Some(MavenRepository::Group { .. }) => {
+                        tracing::warn!(
+                            repository,
+                            key,
+                            "retention: group repository unexpectedly owns Maven storage; key kept"
+                        );
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(
+                            repository,
+                            key,
+                            "retention: Maven repository is not configured; key kept"
+                        );
+                        continue;
+                    }
+                };
+                (Some(repository.to_string()), relative, kind)
+            } else {
+                (None, after_maven, MavenRetentionKind::Legacy)
+            };
+
+        let parts: Vec<&str> = relative
             .split('/')
+            .filter(|part| !part.is_empty())
             .collect();
-        // maven/{group...}/{artifact}/{version}/{file}
-        // Minimum: maven/g/a/v/f = 4+ segments after maven/
+        // {group...}/{artifact}/{version}/{file}
         if parts.len() < 4 {
             continue;
         }
-        // Skip maven-metadata.xml at artifact level
-        if parts[parts.len() - 1].starts_with("maven-metadata") {
-            continue;
-        }
+        let filename = parts[parts.len() - 1];
         let version = parts[parts.len() - 2];
         let artifact_path = parts[..parts.len() - 2].join("/");
-        artifacts
-            .entry(artifact_path)
+        let directory = artifacts
+            .entry((repository.unwrap_or_default(), artifact_path, kind))
             .or_default()
             .entry(version.to_string())
-            .or_default()
-            .push(key.clone());
+            .or_default();
+        directory.keys.push(key.clone());
+        directory.modified = directory.modified.max(meta.modified);
+        directory.size += meta.size;
+        directory.has_payload |= !filename.starts_with("maven-metadata.xml");
     }
 
-    let mut result = Vec::new();
-    for (artifact, versions) in &artifacts {
-        let mut entries = Vec::new();
-        for (version, keys) in versions {
-            let (modified, size) = aggregate_meta(storage, keys).await;
-            entries.push(VersionEntry {
-                name: version.clone(),
-                keys: keys.clone(),
-                modified,
-                size,
-            });
-        }
-        result.push((format!("maven:{}", artifact), entries));
-    }
-    result
+    artifacts
+        .into_iter()
+        .filter_map(|((repository, artifact_path, kind), versions)| {
+            let (group_path, artifact_id) = artifact_path.rsplit_once('/')?;
+            let versions: Vec<VersionEntry> = versions
+                .into_iter()
+                .filter(|(_, directory)| directory.has_payload)
+                .map(|(name, directory)| VersionEntry {
+                    name,
+                    keys: directory.keys,
+                    modified: directory.modified,
+                    size: directory.size,
+                })
+                .collect();
+            if versions.is_empty() {
+                return None;
+            }
+            let group_name = if repository.is_empty() {
+                format!("maven:{artifact_path}")
+            } else {
+                format!("maven:{repository}:{artifact_path}")
+            };
+            let storage_prefix = if repository.is_empty() {
+                "maven/".to_string()
+            } else {
+                format!("maven/repositories/{repository}/")
+            };
+            Some(MavenVersionGroup {
+                group_name,
+                versions,
+                kind,
+                storage_prefix,
+                group_path: group_path.to_string(),
+                artifact_id: artifact_id.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Collect rpm package versions per repository from the metadata sidecars
@@ -529,56 +635,709 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
     result
 }
 
-/// Collect npm package versions.
-async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    let all_keys = storage.list("npm/").await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list npm/ keys: {}", e);
-        Vec::new()
-    });
-    let mut packages: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+#[derive(Debug, Clone)]
+struct NpmVersionGroup {
+    group_name: String,
+    repository: String,
+    package: String,
+    versions: Vec<VersionEntry>,
+    /// Digest of the complete authoritative hosted package state observed
+    /// while planning. Every plan in this package is validated against the
+    /// same digest under the exact npm publish lock.
+    snapshot_guard: String,
+}
 
-    for key in &all_keys {
-        // npm/{package}/tarballs/{file} — each tarball is a "version"
-        // Skip metadata.json and checksum files — they are indexes, not versions.
-        if let Some(rest) = key.strip_prefix("npm/") {
-            if rest.contains("/tarballs/")
-                && !ends_with_ci(key, ".sha256")
-                && !ends_with_ci(key, "/metadata.json")
+#[derive(Debug)]
+struct NpmPackageSnapshot {
+    versions: Vec<VersionEntry>,
+    guard: String,
+}
+
+fn is_hosted_npm_object(kind: &crate::npm_layout::NpmObjectKind) -> bool {
+    matches!(
+        kind,
+        crate::npm_layout::NpmObjectKind::HostedPackage
+            | crate::npm_layout::NpmObjectKind::HostedVersion(_)
+            | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
+            | crate::npm_layout::NpmObjectKind::HostedTarball(_)
+            | crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+            | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
+            | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
+    )
+}
+
+fn npm_guard_bytes(hasher: &mut sha2::Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Read one exact hosted npm package snapshot.
+///
+/// `LIST` establishes the relevant key set, `HEAD` supplies metadata for every
+/// listed key, and mutable/visibility objects are read and hashed. Any
+/// uncertainty fails closed for the whole package. Blob bodies are not read:
+/// their content-addressed key plus metadata is sufficient identity, while
+/// avoiding a retention-time download of every tarball.
+async fn npm_package_snapshot(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    listed_keys: Vec<String>,
+) -> Result<NpmPackageSnapshot, String> {
+    use std::collections::BTreeMap;
+
+    let mut objects = BTreeMap::new();
+    for key in listed_keys {
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
+            continue;
+        };
+        if parsed.repository != repository
+            || parsed.package != package
+            || !is_hosted_npm_object(&parsed.kind)
+        {
+            continue;
+        }
+        let meta = storage
+            .stat(&key)
+            .await
+            .ok_or_else(|| format!("metadata unavailable for {key}"))?;
+        let contents = if matches!(
+            parsed.kind,
+            crate::npm_layout::NpmObjectKind::HostedPackage
+                | crate::npm_layout::NpmObjectKind::HostedVersion(_)
+                | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
+                | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
+                | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
+        ) {
+            let contents = storage
+                .get(&key)
+                .await
+                .map_err(|error| format!("cannot read {key}: {error}"))?;
+            if contents.len() as u64 != meta.size {
+                return Err(format!("size changed while reading {key}"));
+            }
+            let after = storage
+                .stat(&key)
+                .await
+                .ok_or_else(|| format!("metadata disappeared for {key}"))?;
+            if after.size != meta.size || after.modified != meta.modified {
+                return Err(format!("metadata changed while reading {key}"));
+            }
+            Some(contents)
+        } else {
+            None
+        };
+        if objects
+            .insert(key.clone(), (parsed.kind, meta, contents))
+            .is_some()
+        {
+            return Err(format!("duplicate key in listing: {key}"));
+        }
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    npm_guard_bytes(&mut hasher, b"nora/npm-retention-package/v1");
+    npm_guard_bytes(&mut hasher, repository.as_bytes());
+    npm_guard_bytes(&mut hasher, package.as_bytes());
+    for (key, (_, meta, contents)) in &objects {
+        npm_guard_bytes(&mut hasher, key.as_bytes());
+        hasher.update(meta.size.to_be_bytes());
+        hasher.update(meta.modified.to_be_bytes());
+        match contents {
+            Some(contents) => {
+                hasher.update([1]);
+                npm_guard_bytes(&mut hasher, contents);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut manifests = BTreeMap::new();
+    let mut deprecations = BTreeMap::new();
+    let mut completions = BTreeMap::new();
+    let mut tags = Vec::new();
+    for (key, (kind, _, contents)) in &objects {
+        match kind {
+            crate::npm_layout::NpmObjectKind::HostedVersion(version) => {
+                if manifests
+                    .insert(
+                        version.clone(),
+                        (
+                            key.clone(),
+                            contents
+                                .as_ref()
+                                .ok_or_else(|| format!("manifest unreadable: {key}"))?
+                                .clone(),
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(format!("duplicate manifest for npm version {version}"));
+                }
+            }
+            crate::npm_layout::NpmObjectKind::HostedDeprecation(version) => {
+                deprecations.insert(version.clone(), key.clone());
+            }
+            crate::npm_layout::NpmObjectKind::HostedPublishComplete(version) => {
+                completions.insert(version.clone(), key.clone());
+            }
+            crate::npm_layout::NpmObjectKind::HostedDistTag(_) => {
+                tags.push((
+                    key.clone(),
+                    contents
+                        .as_ref()
+                        .ok_or_else(|| format!("dist-tag unreadable: {key}"))?
+                        .clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut versions = Vec::with_capacity(manifests.len());
+    for (version, (manifest_key, manifest)) in manifests {
+        let blob_key =
+            crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
+                .ok_or_else(|| {
+                    format!("npm version manifest has no valid blob reference: {manifest_key}")
+                })?;
+        let Some((blob_kind, _, _)) = objects.get(&blob_key) else {
+            return Err(format!("npm version blob is missing: {blob_key}"));
+        };
+        if !matches!(
+            blob_kind,
+            crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+        ) {
+            return Err(format!("npm version blob has invalid layout: {blob_key}"));
+        }
+
+        let mut keys = vec![manifest_key, blob_key];
+        if let Some(key) = completions.get(&version) {
+            keys.push(key.clone());
+        }
+        if let Some(key) = deprecations.get(&version) {
+            keys.push(key.clone());
+        }
+        for (tag_key, target) in &tags {
+            if target.as_ref() == version.as_bytes() {
+                keys.push(tag_key.clone());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+
+        let mut modified = 0u64;
+        let mut size = 0u64;
+        for key in &keys {
+            let (_, meta, _) = objects
+                .get(key)
+                .ok_or_else(|| format!("snapshot key disappeared: {key}"))?;
+            modified = modified.max(meta.modified);
+            size += meta.size;
+        }
+        versions.push(VersionEntry {
+            name: version,
+            keys,
+            modified,
+            size,
+        });
+    }
+
+    Ok(NpmPackageSnapshot {
+        versions,
+        guard: hex::encode(hasher.finalize()),
+    })
+}
+
+async fn read_npm_package_snapshot(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<NpmPackageSnapshot, String> {
+    let prefix = format!("npm/repositories/{repository}/{package}/");
+    let keys = storage
+        .list(&prefix)
+        .await
+        .map_err(|error| format!("cannot list {prefix}: {error}"))?;
+    npm_package_snapshot(storage, repository, package, keys).await
+}
+
+/// Collect npm packages, including packages that only contain cleanup state.
+/// Empty packages are retained in the result so a failed post-commit cleanup
+/// is independently discoverable and retryable on the next retention run.
+async fn collect_npm_versions(storage: &Storage) -> Vec<NpmVersionGroup> {
+    let all_keys = match storage.list("npm/").await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::error!(%error, "retention: failed to list npm keys");
+            return Vec::new();
+        }
+    };
+    let mut packages: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for key in all_keys {
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
+            continue;
+        };
+        if is_hosted_npm_object(&parsed.kind) {
+            packages
+                .entry((parsed.repository, parsed.package))
+                .or_default()
+                .push(key);
+        }
+    }
+
+    let mut result = Vec::with_capacity(packages.len());
+    for ((repository, package), keys) in packages {
+        match npm_package_snapshot(storage, &repository, &package, keys).await {
+            Ok(snapshot) => result.push(NpmVersionGroup {
+                group_name: format!("npm:{repository}:{package}"),
+                repository,
+                package,
+                versions: snapshot.versions,
+                snapshot_guard: snapshot.guard,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    repository,
+                    package,
+                    %error,
+                    "retention: npm package snapshot is uncertain; package skipped"
+                );
+            }
+        }
+    }
+    result
+}
+
+#[derive(Debug, Default)]
+struct NpmCleanupOutcome {
+    complete: bool,
+    deleted_keys: usize,
+    bytes_freed: u64,
+}
+
+/// Remove package-level hosted state after retention deleted the last version
+/// manifest. Empty packages are collected independently, so a partial failure
+/// leaves at least one discoverable key and is retried on a later run.
+///
+/// The caller holds npm's exact package publish lock.
+async fn clean_empty_npm_package(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> NpmCleanupOutcome {
+    let versions_prefix = format!("npm/repositories/{repository}/{package}/versions/");
+    let versions = match storage.list(&versions_prefix).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(
+                repository,
+                package,
+                error = %error,
+                "retention: cannot verify empty npm package; package metadata kept"
+            );
+            return NpmCleanupOutcome::default();
+        }
+    };
+    if !versions.is_empty() {
+        return NpmCleanupOutcome {
+            complete: true,
+            ..NpmCleanupOutcome::default()
+        };
+    }
+
+    let package_prefix = format!("npm/repositories/{repository}/{package}/");
+    let mut keys = match storage.list(&package_prefix).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(
+                repository,
+                package,
+                error = %error,
+                "retention: cannot list empty npm package state; metadata kept"
+            );
+            return NpmCleanupOutcome::default();
+        }
+    };
+    keys.sort();
+    let mut outcome = NpmCleanupOutcome::default();
+    for key in keys {
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
+            continue;
+        };
+        if parsed.repository != repository || parsed.package != package {
+            continue;
+        }
+        if !matches!(
+            parsed.kind,
+            crate::npm_layout::NpmObjectKind::HostedPackage
+                | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
+                | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
+                | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
+        ) {
+            continue;
+        }
+        let Some(meta) = storage.stat(&key).await else {
+            tracing::warn!(
+                repository,
+                package,
+                key,
+                "retention: cannot stat empty npm package state; cleanup will retry"
+            );
+            return outcome;
+        };
+        match storage.delete(&key).await {
+            Ok(()) => {
+                outcome.deleted_keys += 1;
+                outcome.bytes_freed += meta.size;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    repository,
+                    package,
+                    key,
+                    %error,
+                    "retention: empty npm package cleanup failed; cleanup will retry"
+                );
+                return outcome;
+            }
+        }
+    }
+    outcome.complete = true;
+    outcome
+}
+
+async fn npm_blob_still_referenced(
+    storage: &Storage,
+    blob_key: &str,
+) -> Result<bool, StorageError> {
+    let Some(parsed) = crate::npm_layout::parse_npm_object_key(blob_key) else {
+        return Ok(false);
+    };
+    if !matches!(
+        parsed.kind,
+        crate::npm_layout::NpmObjectKind::HostedBlob { .. }
+    ) {
+        return Ok(false);
+    }
+    let prefix = format!(
+        "npm/repositories/{}/{}/versions/",
+        parsed.repository, parsed.package
+    );
+    for manifest_key in storage.list(&prefix).await? {
+        let manifest = storage.get(&manifest_key).await?;
+        if crate::npm_layout::hosted_blob_key_from_manifest(
+            &parsed.repository,
+            &parsed.package,
+            &manifest,
+        )
+        .as_deref()
+            == Some(blob_key)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Default)]
+struct NpmDeleteOutcome {
+    applied: bool,
+    deleted_keys: usize,
+    bytes_freed: u64,
+}
+
+/// Delete one hosted npm version with its version manifest as the visibility
+/// commit point. Mutable dependants are removed first, with
+/// `publish-complete` first of all: if a later pre-commit operation fails, an
+/// exact publish retry observes the missing completion marker and can repair
+/// the original publish state. Arbitrary tags or deprecations added later are
+/// not reconstructible, so this phase is fail-safe rather than atomic. The
+/// content-addressed blob is considered only after the manifest commit and may
+/// safely remain as a GC-healable orphan.
+async fn delete_npm_plan(
+    storage: &Storage,
+    group_name: &str,
+    plan: &DeletionPlan,
+) -> NpmDeleteOutcome {
+    let mut manifest_key = None;
+    let mut completion_keys = Vec::new();
+    let mut tag_keys = Vec::new();
+    let mut deprecation_keys = Vec::new();
+    let mut blob_keys = Vec::new();
+    for key in &plan.keys {
+        let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
+            tracing::error!(
+                group = group_name,
+                version = %plan.version_name,
+                key,
+                "retention: npm plan contains an invalid key; deletion aborted"
+            );
+            return NpmDeleteOutcome::default();
+        };
+        match parsed.kind {
+            crate::npm_layout::NpmObjectKind::HostedVersion(version)
+                if version == plan.version_name =>
             {
-                let pkg = rest.split("/tarballs/").next().unwrap_or("");
-                if !pkg.is_empty() {
-                    packages
-                        .entry(pkg.to_string())
-                        .or_default()
-                        .push(key.clone());
+                if manifest_key.replace(key.clone()).is_some() {
+                    tracing::error!(
+                        group = group_name,
+                        version = %plan.version_name,
+                        "retention: npm plan has multiple version manifests; deletion aborted"
+                    );
+                    return NpmDeleteOutcome::default();
+                }
+            }
+            crate::npm_layout::NpmObjectKind::HostedPublishComplete(version)
+                if version == plan.version_name =>
+            {
+                completion_keys.push(key.clone());
+            }
+            crate::npm_layout::NpmObjectKind::HostedDeprecation(version)
+                if version == plan.version_name =>
+            {
+                deprecation_keys.push(key.clone());
+            }
+            crate::npm_layout::NpmObjectKind::HostedDistTag(_) => tag_keys.push(key.clone()),
+            crate::npm_layout::NpmObjectKind::HostedBlob { .. } => blob_keys.push(key.clone()),
+            _ => {
+                tracing::error!(
+                    group = group_name,
+                    version = %plan.version_name,
+                    key,
+                    "retention: npm plan contains an unrelated key; deletion aborted"
+                );
+                return NpmDeleteOutcome::default();
+            }
+        }
+    }
+    let Some(manifest_key) = manifest_key else {
+        tracing::error!(
+            group = group_name,
+            version = %plan.version_name,
+            "retention: npm plan has no version manifest; deletion aborted"
+        );
+        return NpmDeleteOutcome::default();
+    };
+    completion_keys.sort();
+    tag_keys.sort();
+    deprecation_keys.sort();
+    blob_keys.sort();
+
+    let mut outcome = NpmDeleteOutcome::default();
+
+    // Pre-commit phase. A failure may leave already-deleted mutable state, but
+    // never removes the version manifest. Deleting the completion marker first
+    // makes the original publish state explicitly retryable by npm's
+    // exact-publish repair path. Later operator mutations are not
+    // reconstructible; the manifest nevertheless remains a safe visibility
+    // boundary and no tag can dangle from a deleted version.
+    for key in completion_keys
+        .iter()
+        .chain(tag_keys.iter())
+        .chain(deprecation_keys.iter())
+    {
+        if tag_keys.binary_search(key).is_ok() {
+            match storage.get(key).await {
+                Ok(target) if target.as_ref() == plan.version_name.as_bytes() => {}
+                Ok(_) => {
+                    tracing::warn!(
+                        group = group_name,
+                        version = %plan.version_name,
+                        key,
+                        "retention: npm dist-tag target changed; deletion aborted"
+                    );
+                    return outcome;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        group = group_name,
+                        version = %plan.version_name,
+                        key,
+                        %error,
+                        "retention: cannot verify npm dist-tag target; deletion aborted"
+                    );
+                    return outcome;
                 }
             }
         }
+        let Some(meta) = storage.stat(key).await else {
+            tracing::warn!(
+                group = group_name,
+                version = %plan.version_name,
+                key,
+                "retention: cannot stat dependent npm object; deletion aborted"
+            );
+            return outcome;
+        };
+        match storage.delete(key).await {
+            Ok(()) => {
+                outcome.deleted_keys += 1;
+                outcome.bytes_freed += meta.size;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    group = group_name,
+                    version = %plan.version_name,
+                    key,
+                    %error,
+                    "retention: dependent npm object deletion failed; manifest kept"
+                );
+                return outcome;
+            }
+        }
     }
 
-    let mut result = Vec::new();
-    for (pkg, tarball_keys) in &packages {
-        let mut entries = Vec::new();
-        for key in tarball_keys {
-            let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
-            // Include associated .sha256
-            let mut keys = vec![key.clone()];
-            let hash_key = format!("{}.sha256", key);
-            if storage.stat(&hash_key).await.is_some() {
-                keys.push(hash_key);
-            }
-            entries.push(VersionEntry {
-                name: filename.to_string(),
-                keys,
-                modified,
-                size,
-            });
+    let Some(manifest_meta) = storage.stat(&manifest_key).await else {
+        tracing::warn!(
+            group = group_name,
+            version = %plan.version_name,
+            key = %manifest_key,
+            "retention: cannot stat npm manifest; deletion aborted"
+        );
+        return outcome;
+    };
+    match storage.delete(&manifest_key).await {
+        Ok(()) => {
+            outcome.deleted_keys += 1;
+            outcome.bytes_freed += manifest_meta.size;
+            outcome.applied = true;
         }
-        result.push((format!("npm:{}", pkg), entries));
+        Err(error) => {
+            tracing::warn!(
+                group = group_name,
+                version = %plan.version_name,
+                key = %manifest_key,
+                %error,
+                "retention: npm manifest deletion failed; blob kept"
+            );
+            return outcome;
+        }
     }
-    result
+
+    // Post-commit phase: failures only leave content-addressed orphan blobs.
+    for key in blob_keys {
+        match npm_blob_still_referenced(storage, &key).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    group = group_name,
+                    version = %plan.version_name,
+                    key,
+                    %error,
+                    "retention: cannot prove npm blob is unreferenced; blob kept"
+                );
+                continue;
+            }
+        }
+        let Some(meta) = storage.stat(&key).await else {
+            tracing::warn!(
+                group = group_name,
+                version = %plan.version_name,
+                key,
+                "retention: cannot stat unreferenced npm blob; blob kept"
+            );
+            continue;
+        };
+        match storage.delete(&key).await {
+            Ok(()) => {
+                outcome.deleted_keys += 1;
+                outcome.bytes_freed += meta.size;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    group = group_name,
+                    version = %plan.version_name,
+                    key,
+                    %error,
+                    "retention: unreferenced npm blob deletion failed; GC will retry"
+                );
+            }
+        }
+    }
+
+    outcome
+}
+
+#[derive(Debug, Default)]
+struct NpmBatchOutcome {
+    applied_versions: usize,
+    deleted_keys: usize,
+    bytes_freed: u64,
+}
+
+/// Validate and apply a complete npm package plan while holding the same lock
+/// used by publish, dist-tag and deprecation mutations.
+///
+/// A package-wide guard is essential: validating only the candidate version
+/// would still allow another version to change retention ordering after
+/// `keep_last` was planned. The guard is checked once before any mutation and
+/// the lock is held across the complete package batch.
+async fn apply_npm_plans(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    group: &NpmVersionGroup,
+    plans: &[DeletionPlan],
+) -> NpmBatchOutcome {
+    let lock = crate::acquire_publish_lock(publish_locks, &group.group_name);
+    let _guard = lock.lock().await;
+
+    let current = match read_npm_package_snapshot(storage, &group.repository, &group.package).await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                repository = group.repository,
+                package = group.package,
+                %error,
+                "retention: cannot revalidate npm package snapshot; batch skipped"
+            );
+            return NpmBatchOutcome::default();
+        }
+    };
+    if current.guard != group.snapshot_guard {
+        tracing::info!(
+            repository = group.repository,
+            package = group.package,
+            "retention: npm package changed after planning; batch skipped"
+        );
+        return NpmBatchOutcome::default();
+    }
+
+    let mut outcome = NpmBatchOutcome::default();
+    for plan in plans {
+        let deleted = delete_npm_plan(storage, &group.group_name, plan).await;
+        outcome.deleted_keys += deleted.deleted_keys;
+        outcome.bytes_freed += deleted.bytes_freed;
+        if !deleted.applied {
+            // A pre-commit failure may already have removed mutable state.
+            // Stop the package batch. The manifest remains visible and no tag
+            // can dangle from a deleted version. Removing publish-complete
+            // first also lets an exact retry repair original publish state.
+            return outcome;
+        }
+        outcome.applied_versions += 1;
+        info!(
+            group = %group.group_name,
+            version = %plan.version_name,
+            reason = %plan.reason,
+            "Retention: deleted"
+        );
+    }
+
+    let cleanup = clean_empty_npm_package(storage, &group.repository, &group.package).await;
+    outcome.deleted_keys += cleanup.deleted_keys;
+    outcome.bytes_freed += cleanup.bytes_freed;
+    if !cleanup.complete {
+        tracing::warn!(
+            repository = group.repository,
+            package = group.package,
+            "retention: empty npm package cleanup remains pending"
+        );
+    }
+    outcome
 }
 
 /// Collect PyPI package files.
@@ -746,6 +1505,212 @@ async fn aggregate_meta(storage: &Storage, keys: &[String]) -> (u64, u64) {
     (max_modified, total_size)
 }
 
+#[derive(Default)]
+struct MavenDeletionOutcome {
+    applied: bool,
+    deleted_keys: usize,
+    bytes_freed: u64,
+}
+
+fn is_maven_metadata_base(key: &str) -> bool {
+    key.rsplit('/').next() == Some("maven-metadata.xml")
+}
+
+fn is_maven_metadata_sidecar(key: &str) -> bool {
+    matches!(
+        key.rsplit('/').next(),
+        Some(
+            "maven-metadata.xml.md5"
+                | "maven-metadata.xml.sha1"
+                | "maven-metadata.xml.sha256"
+                | "maven-metadata.xml.sha512"
+        )
+    )
+}
+
+fn is_checksum_sidecar(key: &str) -> bool {
+    [".md5", ".sha1", ".sha256", ".sha512"]
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
+}
+
+async fn delete_retention_key(storage: &Storage, key: &str) -> Result<(usize, u64), StorageError> {
+    let size = storage.stat(key).await.map(|meta| meta.size).unwrap_or(0);
+    match storage.delete(key).await {
+        Ok(()) => Ok((1, size)),
+        Err(StorageError::NotFound) => Ok((0, 0)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn maven_candidate_matches_plan(
+    storage: &Storage,
+    context: &MavenRetentionContext,
+    plan: &DeletionPlan,
+) -> Result<bool, StorageError> {
+    let prefix = format!(
+        "{}{}/{}/{}/",
+        context.storage_prefix, context.group_path, context.artifact_id, plan.version_name
+    );
+    let current = storage.list_with_meta(&prefix).await?;
+    let current_keys: std::collections::BTreeSet<&str> =
+        current.iter().map(|(key, _)| key.as_str()).collect();
+    let planned_keys: std::collections::BTreeSet<&str> =
+        plan.keys.iter().map(String::as_str).collect();
+    let current_size = current.iter().map(|(_, meta)| meta.size).sum::<u64>();
+    let current_modified = current
+        .iter()
+        .map(|(_, meta)| meta.modified)
+        .max()
+        .unwrap_or(0);
+
+    Ok(current_keys == planned_keys
+        && current_size == plan.size
+        && current_modified == plan.modified)
+}
+
+/// Delete one Maven version under the exact artifact metadata lock shared with
+/// publish/proxy metadata writes.
+///
+/// Hosted discovery is hidden first: A-level metadata is regenerated (or
+/// removed) and V-level metadata sidecars/base are deleted before any payload.
+/// A later payload failure therefore leaves only hidden orphan bytes. Proxy and
+/// legacy metadata remain untouched because their A-level version list is
+/// upstream-owned or has unknowable provenance.
+async fn delete_maven_plan(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    context: &MavenRetentionContext,
+    plan: &DeletionPlan,
+) -> MavenDeletionOutcome {
+    let metadata_key = format!(
+        "{}{}/{}/maven-metadata.xml",
+        context.storage_prefix, context.group_path, context.artifact_id
+    );
+    let lock = crate::acquire_publish_lock(publish_locks, &metadata_key);
+    let _guard = lock.lock().await;
+    let mut outcome = MavenDeletionOutcome::default();
+
+    match maven_candidate_matches_plan(storage, context, plan).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                group = %context.group_path,
+                artifact = %context.artifact_id,
+                version = %plan.version_name,
+                "retention: Maven version changed after planning; candidate skipped"
+            );
+            return outcome;
+        }
+        Err(error) => {
+            tracing::error!(
+                group = %context.group_path,
+                artifact = %context.artifact_id,
+                version = %plan.version_name,
+                error = %error,
+                "retention: cannot revalidate Maven version under publish lock; candidate skipped"
+            );
+            return outcome;
+        }
+    }
+
+    if context.kind == MavenRetentionKind::Hosted {
+        match crate::registry::update_hosted_metadata_after_retention(
+            storage,
+            &context.storage_prefix,
+            &context.group_path,
+            &context.artifact_id,
+            &plan.version_name,
+        )
+        .await
+        {
+            Ok((deleted_keys, bytes_freed)) => {
+                outcome.deleted_keys += deleted_keys;
+                outcome.bytes_freed += bytes_freed;
+            }
+            Err(error) => {
+                tracing::error!(
+                    group = %context.group_path,
+                    artifact = %context.artifact_id,
+                    version = %plan.version_name,
+                    error = %error,
+                    "retention: Maven metadata update failed; version payload kept"
+                );
+                return outcome;
+            }
+        }
+    }
+
+    // V-level SNAPSHOT discovery must disappear before version payloads.
+    for key in plan
+        .keys
+        .iter()
+        .filter(|key| is_maven_metadata_sidecar(key))
+    {
+        match delete_retention_key(storage, key).await {
+            Ok((deleted, bytes)) => {
+                outcome.deleted_keys += deleted;
+                outcome.bytes_freed += bytes;
+            }
+            Err(error) => {
+                tracing::error!(
+                    key,
+                    version = %plan.version_name,
+                    error = %error,
+                    "retention: Maven version metadata sidecar deletion failed; payload kept"
+                );
+                return outcome;
+            }
+        }
+    }
+    for key in plan.keys.iter().filter(|key| is_maven_metadata_base(key)) {
+        match delete_retention_key(storage, key).await {
+            Ok((deleted, bytes)) => {
+                outcome.deleted_keys += deleted;
+                outcome.bytes_freed += bytes;
+            }
+            Err(error) => {
+                tracing::error!(
+                    key,
+                    version = %plan.version_name,
+                    error = %error,
+                    "retention: Maven version metadata deletion failed; payload kept"
+                );
+                return outcome;
+            }
+        }
+    }
+
+    let mut payload_keys: Vec<&String> = plan
+        .keys
+        .iter()
+        .filter(|key| !is_maven_metadata_base(key) && !is_maven_metadata_sidecar(key))
+        .collect();
+    // Remove derived checksum sidecars before their base object. Once A/V
+    // discovery is hidden, an interruption can only leave invisible orphans.
+    payload_keys.sort_by_key(|key| !is_checksum_sidecar(key));
+    for key in payload_keys {
+        match delete_retention_key(storage, key).await {
+            Ok((deleted, bytes)) => {
+                outcome.deleted_keys += deleted;
+                outcome.bytes_freed += bytes;
+            }
+            Err(error) => {
+                tracing::error!(
+                    key,
+                    version = %plan.version_name,
+                    error = %error,
+                    "retention: Maven version payload deletion failed; remaining objects kept"
+                );
+                return outcome;
+            }
+        }
+    }
+
+    outcome.applied = true;
+    outcome
+}
+
 // ============================================================================
 // Retention execution
 // ============================================================================
@@ -764,12 +1729,27 @@ pub struct RetentionResult {
 /// `publish_locks` serializes deletions with concurrent publish operations
 /// to prevent race conditions (e.g., deleting a blob while a manifest
 /// referencing it is being written).
+#[cfg(test)]
 pub async fn run_retention(
     storage: &Storage,
     publish_locks: &PublishLocks,
     signer: Option<&crate::signing::RepoSigner>,
     rules: &[RetentionRule],
     dry_run: bool,
+) -> RetentionResult {
+    let maven = MavenConfig::default();
+    run_retention_configured(storage, publish_locks, signer, rules, dry_run, &maven, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_retention_configured(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    signer: Option<&crate::signing::RepoSigner>,
+    rules: &[RetentionRule],
+    dry_run: bool,
+    maven_config: &MavenConfig,
+    repo_index: Option<&crate::repo_index::RepoIndex>,
 ) -> RetentionResult {
     let start = Instant::now();
     let now = SystemTime::now()
@@ -779,9 +1759,25 @@ pub async fn run_retention(
 
     // Collect versions from all registries
     let mut all_groups: Vec<(String, Vec<VersionEntry>)> = Vec::new();
-    all_groups.extend(collect_maven_versions(storage).await);
+    let mut maven_contexts = std::collections::HashMap::new();
+    for group in collect_maven_versions(storage, maven_config).await {
+        maven_contexts.insert(
+            group.group_name.clone(),
+            MavenRetentionContext {
+                kind: group.kind,
+                storage_prefix: group.storage_prefix,
+                group_path: group.group_path,
+                artifact_id: group.artifact_id,
+            },
+        );
+        all_groups.push((group.group_name, group.versions));
+    }
     all_groups.extend(collect_docker_versions(storage).await);
-    all_groups.extend(collect_npm_versions(storage).await);
+    let mut npm_groups = std::collections::HashMap::new();
+    for group in collect_npm_versions(storage).await {
+        all_groups.push((group.group_name.clone(), group.versions.clone()));
+        npm_groups.insert(group.group_name.clone(), group);
+    }
     all_groups.extend(collect_pypi_versions(storage).await);
     all_groups.extend(collect_cargo_versions(storage).await);
     all_groups.extend(collect_go_versions(storage).await);
@@ -791,8 +1787,11 @@ pub async fn run_retention(
 
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
+    let mut total_applied = 0usize;
     let mut total_deleted_keys = 0usize;
     let mut total_bytes = 0u64;
+    let mut mutated_registries: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     // rpm/deb repos whose packages were deleted — their indexes must be
     // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
     let mut regen: std::collections::BTreeSet<(&'static str, String)> =
@@ -807,6 +1806,48 @@ pub async fn run_retention(
         };
 
         let plans = plan_deletions(versions, rule, now);
+
+        // npm is validated and applied as one package batch under its exact
+        // publish lock. Empty groups are intentionally retained so cleanup
+        // failures after the last manifest commit are retried independently.
+        if let Some(group) = npm_groups.get(&group_name) {
+            if plans.is_empty() {
+                if !dry_run && group.versions.is_empty() {
+                    let outcome = apply_npm_plans(storage, publish_locks, group, &[]).await;
+                    total_deleted_keys += outcome.deleted_keys;
+                    total_bytes += outcome.bytes_freed;
+                    if outcome.deleted_keys > 0 {
+                        mutated_registries.insert("npm".to_string());
+                    }
+                }
+                continue;
+            }
+
+            total_planned += plans.len();
+            if dry_run {
+                for plan in &plans {
+                    total_bytes += plan.size;
+                    info!(
+                        group = %group_name,
+                        version = %plan.version_name,
+                        keys = plan.keys.len(),
+                        reason = %plan.reason,
+                        "[dry-run] Retention: would delete"
+                    );
+                }
+            } else {
+                let outcome = apply_npm_plans(storage, publish_locks, group, &plans).await;
+                total_applied += outcome.applied_versions;
+                total_deleted_keys += outcome.deleted_keys;
+                total_bytes += outcome.bytes_freed;
+                if outcome.deleted_keys > 0 {
+                    mutated_registries.insert("npm".to_string());
+                }
+            }
+            all_plans.push((group_name, plans));
+            continue;
+        }
+
         if plans.is_empty() {
             continue;
         }
@@ -830,22 +1871,55 @@ pub async fn run_retention(
                 ));
             }
             for plan in &plans {
-                for key in &plan.keys {
-                    // Serialize with concurrent publish to prevent deleting
-                    // an artifact that is being referenced by a new publish.
-                    let lock = crate::acquire_publish_lock(publish_locks, key);
-                    let _guard = lock.lock().await;
-                    if storage.delete(key).await.is_ok() {
-                        total_deleted_keys += 1;
+                let applied = if let Some(context) = maven_contexts.get(&group_name) {
+                    // The helper may have changed A-level sidecars before
+                    // returning an error. Invalidate conservatively whenever a
+                    // hosted metadata mutation is attempted.
+                    if context.kind == MavenRetentionKind::Hosted {
+                        mutated_registries.insert("maven".to_string());
                     }
+                    let outcome = delete_maven_plan(storage, publish_locks, context, plan).await;
+                    total_deleted_keys += outcome.deleted_keys;
+                    total_bytes += outcome.bytes_freed;
+                    if outcome.deleted_keys > 0 {
+                        mutated_registries.insert("maven".to_string());
+                    }
+                    if !outcome.applied {
+                        // A storage failure on one version is evidence that
+                        // later deletions in the same GA cannot be trusted.
+                        // Stop this artifact group instead of compounding a
+                        // partial cleanup with more mutations.
+                        break;
+                    }
+                    total_applied += 1;
+                    true
+                } else {
+                    let mut deleted_any = false;
+                    for key in &plan.keys {
+                        // Serialize with concurrent publish to prevent deleting
+                        // an artifact that is being referenced by a new publish.
+                        let lock = crate::acquire_publish_lock(publish_locks, key);
+                        let _guard = lock.lock().await;
+                        if storage.delete(key).await.is_ok() {
+                            total_deleted_keys += 1;
+                            deleted_any = true;
+                        }
+                    }
+                    total_applied += 1;
+                    total_bytes += plan.size;
+                    if deleted_any {
+                        mutated_registries.insert(registry.to_string());
+                    }
+                    true
+                };
+                if applied {
+                    info!(
+                        group = %group_name,
+                        version = %plan.version_name,
+                        reason = %plan.reason,
+                        "Retention: deleted"
+                    );
                 }
-                total_bytes += plan.size;
-                info!(
-                    group = %group_name,
-                    version = %plan.version_name,
-                    reason = %plan.reason,
-                    "Retention: deleted"
-                );
             }
         } else {
             for plan in &plans {
@@ -895,11 +1969,16 @@ pub async fn run_retention(
     );
 
     if !dry_run {
-        RETENTION_VERSIONS_DELETED.inc_by(total_planned as u64);
+        if let Some(repo_index) = repo_index {
+            for registry in mutated_registries {
+                repo_index.invalidate(&registry);
+            }
+        }
+        RETENTION_VERSIONS_DELETED.inc_by(total_applied as u64);
         RETENTION_BYTES_FREED.inc_by(total_bytes);
-        if total_planned > 0 {
+        if total_applied > 0 {
             info!(
-                versions = total_planned,
+                versions = total_applied,
                 keys = total_deleted_keys,
                 bytes_freed = total_bytes,
                 "Retention complete"
@@ -928,9 +2007,21 @@ fn find_matching_rule<'a>(
         .split_once(':')
         .map(|(_, n)| n)
         .unwrap_or(group_name);
+    let npm_package = (registry == "npm")
+        .then(|| name.split_once(':').map(|(_, package)| package))
+        .flatten();
     rules.iter().find(|r| {
         (r.registry == registry || r.registry == "*")
-            && r.name_glob.as_deref().is_none_or(|g| glob_match(g, name))
+            && r.name_glob.as_deref().is_none_or(|glob| {
+                // Preserve the historical npm package selector across named
+                // hosted repositories. A glob containing ':' opts into the
+                // qualified `{repository}:{package}` identity.
+                if registry == "npm" && !glob.contains(':') {
+                    glob_match(glob, npm_package.unwrap_or(name))
+                } else {
+                    glob_match(glob, name)
+                }
+            })
     })
 }
 
@@ -946,6 +2037,8 @@ pub fn spawn_retention_scheduler(
     storage: Storage,
     publish_locks: PublishLocks,
     signer: Option<Arc<crate::signing::RepoSigner>>,
+    maven_config: MavenConfig,
+    repo_index: Arc<crate::repo_index::RepoIndex>,
     rules: Vec<RetentionRule>,
     interval_secs: u64,
     dry_run: bool,
@@ -1005,8 +2098,16 @@ pub fn spawn_retention_scheduler(
                 dry_run = dry_run,
                 "Retention scheduler: starting periodic run"
             );
-            let result =
-                run_retention(&storage, &publish_locks, signer.as_deref(), &rules, dry_run).await;
+            let result = run_retention_configured(
+                &storage,
+                &publish_locks,
+                signer.as_deref(),
+                &rules,
+                dry_run,
+                &maven_config,
+                Some(&repo_index),
+            )
+            .await;
             info!(
                 "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                 result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
@@ -1040,6 +2141,38 @@ pub fn spawn_retention_scheduler(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    async fn seed_npm_version(
+        storage: &Storage,
+        prefix: &str,
+        package: &str,
+        version: &str,
+        blob: &[u8],
+    ) -> (String, String) {
+        use base64::Engine as _;
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(blob))
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": package,
+            "version": version,
+            "dist": {"integrity": integrity}
+        }))
+        .unwrap();
+        let manifest_key = format!("{prefix}/versions/{version}.json");
+        let repository = prefix
+            .strip_prefix("npm/repositories/")
+            .and_then(|value| value.split_once('/'))
+            .map(|(repository, _)| repository)
+            .unwrap();
+        let blob_key =
+            crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
+                .unwrap();
+        storage.put(&blob_key, blob).await.unwrap();
+        storage.put(&manifest_key, &manifest).await.unwrap();
+        (manifest_key, blob_key)
+    }
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -1267,6 +2400,954 @@ mod tests {
             .is_ok());
     }
 
+    #[tokio::test]
+    async fn test_retention_keeps_named_maven_repositories_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for repository in ["releases", "open"] {
+            for version in ["1.0", "2.0"] {
+                storage
+                    .put(
+                        &format!(
+                            "maven/repositories/{repository}/com/example/lib/{version}/lib-{version}.jar"
+                        ),
+                        version.as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let mut maven = MavenConfig::default();
+        maven.proxies.clear();
+        maven.repositories = vec![
+            MavenRepository::Hosted {
+                name: "releases".to_string(),
+                version_policy: crate::config::MavenVersionPolicy::Mixed,
+                write_policy: crate::config::MavenWritePolicy::AllowOnce,
+            },
+            MavenRepository::Proxy {
+                name: "open".to_string(),
+                url: "https://repo1.maven.org/maven2".to_string(),
+                auth: None,
+                version_policy: crate::config::MavenVersionPolicy::Mixed,
+                metadata_ttl: None,
+                negative_ttl: 60,
+            },
+        ];
+
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &maven,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.planned, 2);
+        for repository in ["releases", "open"] {
+            assert!(storage
+                .get(&format!(
+                    "maven/repositories/{repository}/com/example/lib/1.0/lib-1.0.jar"
+                ))
+                .await
+                .is_err());
+            assert!(storage
+                .get(&format!(
+                    "maven/repositories/{repository}/com/example/lib/2.0/lib-2.0.jar"
+                ))
+                .await
+                .is_ok());
+        }
+    }
+
+    fn single_named_maven(repository: MavenRepository) -> MavenConfig {
+        let mut config = MavenConfig::default();
+        config.proxies.clear();
+        config.repositories = vec![repository];
+        config
+    }
+
+    async fn seed_maven_metadata(storage: &Storage, key: &str, document: &[u8]) {
+        storage.put(key, document).await.unwrap();
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            storage
+                .put(&format!("{key}.{suffix}"), b"old-checksum")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_retention_hides_discovery_then_removes_v_level_and_rebuilds_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/releases/com/example/lib";
+        for version in ["1.0-SNAPSHOT", "2.0"] {
+            storage
+                .put(
+                    &format!("{prefix}/{version}/lib-{version}.jar"),
+                    version.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let v_metadata = format!("{prefix}/1.0-SNAPSHOT/maven-metadata.xml");
+        seed_maven_metadata(
+            &storage,
+            &v_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version><versioning><snapshot><timestamp>20260730.010000</timestamp><buildNumber>1</buildNumber></snapshot></versioning></metadata>"#,
+        )
+        .await;
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &storage,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0-SNAPSHOT</version><version>2.0</version></versions><lastUpdated>20260730010000</lastUpdated></versioning><plugins><plugin><name>Retained</name><prefix>retained</prefix><artifactId>retained-plugin</artifactId></plugin></plugins></metadata>"#,
+        )
+        .await;
+
+        let repo_index = crate::repo_index::RepoIndex::new();
+        let before = repo_index.get("maven", &storage).await;
+        assert!(before
+            .iter()
+            .any(|entry| entry.name.contains("/1.0-SNAPSHOT")));
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let config = single_named_maven(MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        });
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &config,
+            Some(&repo_index),
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        assert!(storage
+            .get(&format!("{prefix}/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar"))
+            .await
+            .is_err());
+        for suffix in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            assert!(storage.get(&format!("{v_metadata}{suffix}")).await.is_err());
+        }
+        let metadata = storage.get(&a_metadata).await.unwrap();
+        let metadata = String::from_utf8_lossy(&metadata);
+        assert!(!metadata.contains("<version>1.0-SNAPSHOT</version>"));
+        assert!(metadata.contains("<version>2.0</version>"));
+        assert!(metadata.contains("<prefix>retained</prefix>"));
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            assert!(storage.get(&format!("{a_metadata}.{suffix}")).await.is_ok());
+        }
+
+        let after = repo_index.get("maven", &storage).await;
+        assert!(
+            !after
+                .iter()
+                .any(|entry| entry.name.contains("/1.0-SNAPSHOT")),
+            "retention must invalidate and rebuild the non-TTL repository index"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_snapshot_changed_after_plan_is_skipped_under_ga_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/snapshots/com/example/lib";
+        let snapshot_payload = format!("{prefix}/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
+        let snapshot_metadata = format!("{prefix}/1.0-SNAPSHOT/maven-metadata.xml");
+        storage.put(&snapshot_payload, b"old").await.unwrap();
+        storage
+            .put(&format!("{prefix}/2.0/lib-2.0.jar"), b"newer-version")
+            .await
+            .unwrap();
+        storage
+            .put(
+                &snapshot_metadata,
+                br#"<metadata><version>1.0-SNAPSHOT</version><versioning><snapshot><buildNumber>1</buildNumber></snapshot></versioning></metadata>"#,
+            )
+            .await
+            .unwrap();
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &storage,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0-SNAPSHOT</version><version>2.0</version></versions><lastUpdated>20260730010000</lastUpdated></versioning></metadata>"#,
+        )
+        .await;
+        let config = single_named_maven(MavenRepository::Hosted {
+            name: "snapshots".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::Allow,
+        });
+        let group = collect_maven_versions(&storage, &config)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "maven:snapshots:com/example/lib")
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plan = plan_deletions(group.versions, &rule, NOW)
+            .into_iter()
+            .find(|plan| plan.version_name == "1.0-SNAPSHOT")
+            .unwrap();
+        let context = MavenRetentionContext {
+            kind: group.kind,
+            storage_prefix: group.storage_prefix,
+            group_path: group.group_path,
+            artifact_id: group.artifact_id,
+        };
+
+        // Model a mutable SNAPSHOT publish completing after the retention scan
+        // but before retention acquires the exact GA metadata lock.
+        let republished_payload = b"new-snapshot-bytes-after-plan";
+        let republished_v_metadata = br#"<metadata><version>1.0-SNAPSHOT</version><versioning><snapshot><buildNumber>2</buildNumber></snapshot></versioning></metadata>"#;
+        let republished_a_metadata = br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>1.0-SNAPSHOT</latest><release>2.0</release><versions><version>1.0-SNAPSHOT</version><version>2.0</version></versions><lastUpdated>20260730020000</lastUpdated></versioning></metadata>"#;
+        storage
+            .put(&snapshot_payload, republished_payload)
+            .await
+            .unwrap();
+        storage
+            .put(&snapshot_metadata, republished_v_metadata)
+            .await
+            .unwrap();
+        storage
+            .put(&a_metadata, republished_a_metadata)
+            .await
+            .unwrap();
+
+        let outcome = delete_maven_plan(&storage, &test_publish_locks(), &context, &plan).await;
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.deleted_keys, 0);
+        assert_eq!(
+            storage.get(&snapshot_payload).await.unwrap().as_ref(),
+            republished_payload
+        );
+        assert_eq!(
+            storage.get(&snapshot_metadata).await.unwrap().as_ref(),
+            republished_v_metadata
+        );
+        assert_eq!(
+            storage.get(&a_metadata).await.unwrap().as_ref(),
+            republished_a_metadata
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_maven_retention_keeps_upstream_a_level_discovery_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/central/com/example/lib";
+        for version in ["1.0", "2.0"] {
+            storage
+                .put(
+                    &format!("{prefix}/{version}/lib-{version}.jar"),
+                    version.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        let document = br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0</version><version>2.0</version></versions><lastUpdated>20260730010000</lastUpdated></versioning></metadata>"#;
+        seed_maven_metadata(&storage, &a_metadata, document).await;
+        let before: Vec<_> = ["", ".md5", ".sha1", ".sha256", ".sha512"]
+            .iter()
+            .map(|suffix| format!("{a_metadata}{suffix}"))
+            .collect();
+        let mut before_bytes = Vec::new();
+        for key in &before {
+            before_bytes.push(storage.get(key).await.unwrap());
+        }
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let config = single_named_maven(MavenRepository::Proxy {
+            name: "central".to_string(),
+            url: "https://repo1.maven.org/maven2".to_string(),
+            auth: None,
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            metadata_ttl: Some(300),
+            negative_ttl: 60,
+        });
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &config,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        assert!(storage
+            .get(&format!("{prefix}/1.0/lib-1.0.jar"))
+            .await
+            .is_err());
+        for (key, expected) in before.iter().zip(before_bytes) {
+            assert_eq!(storage.get(key).await.unwrap(), expected);
+        }
+        let metadata =
+            String::from_utf8_lossy(&storage.get(&a_metadata).await.unwrap()).to_string();
+        assert!(
+            metadata.contains("<version>1.0</version>"),
+            "cache eviction must not edit upstream-owned discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_v_metadata_delete_failure_keeps_payload_hidden_as_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/releases/com/example/lib";
+        for version in ["1.0-SNAPSHOT", "2.0"] {
+            inner
+                .put(
+                    &format!("{prefix}/{version}/lib-{version}.jar"),
+                    version.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let v_metadata = format!("{prefix}/1.0-SNAPSHOT/maven-metadata.xml");
+        seed_maven_metadata(
+            &inner,
+            &v_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version></metadata>"#,
+        )
+        .await;
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &inner,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0-SNAPSHOT</version><version>2.0</version></versions></versioning></metadata>"#,
+        )
+        .await;
+        let failed_sidecar = format!("{v_metadata}.md5");
+        let backend = crate::test_helpers::FaultInjectBackend::new(inner.clone())
+            .fail_delete(&failed_sidecar);
+        let attempts = backend.delete_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let config = single_named_maven(MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        });
+
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &config,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        let payload = format!("{prefix}/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
+        assert!(inner.get(&payload).await.is_ok());
+        assert!(
+            !attempts.lock().contains(&payload),
+            "payload deletion must fail-stop after V-level metadata failure"
+        );
+        let metadata = String::from_utf8_lossy(&inner.get(&a_metadata).await.unwrap()).to_string();
+        assert!(
+            !metadata.contains("<version>1.0-SNAPSHOT</version>"),
+            "A-level discovery must be hidden before any version deletion attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_a_metadata_failure_deletes_no_version_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/releases/com/example/lib";
+        for version in ["1.0", "2.0"] {
+            inner
+                .put(
+                    &format!("{prefix}/{version}/lib-{version}.jar"),
+                    version.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &inner,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0</version><version>2.0</version></versions></versioning></metadata>"#,
+        )
+        .await;
+        let failed_sidecar = format!("{a_metadata}.md5");
+        let backend = crate::test_helpers::FaultInjectBackend::new(inner.clone())
+            .fail_delete(&failed_sidecar);
+        let attempts = backend.delete_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let config = single_named_maven(MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        });
+
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &config,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        let payload = format!("{prefix}/1.0/lib-1.0.jar");
+        assert!(inner.get(&payload).await.is_ok());
+        let attempts = attempts.lock();
+        assert!(attempts.contains(&failed_sidecar));
+        assert!(
+            !attempts.contains(&payload),
+            "A-level metadata failure must abort before every version-object delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_last_version_retention_removes_a_level_metadata_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/releases/com/example/lib";
+        storage
+            .put(&format!("{prefix}/1.0/lib-1.0.jar"), b"one")
+            .await
+            .unwrap();
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &storage,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>1.0</latest><release>1.0</release><versions><version>1.0</version></versions></versioning></metadata>"#,
+        )
+        .await;
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let config = single_named_maven(MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        });
+
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &config,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        for suffix in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            assert!(storage.get(&format!("{a_metadata}{suffix}")).await.is_err());
+        }
+        assert!(storage
+            .get(&format!("{prefix}/1.0/lib-1.0.jar"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_retention_keeps_named_npm_repositories_and_proxy_cache_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for repository in ["npm-private-a", "npm-private-b"] {
+            for version in ["1.0.0", "2.0.0"] {
+                seed_npm_version(
+                    &storage,
+                    &format!("npm/repositories/{repository}/pkg"),
+                    "pkg",
+                    version,
+                    version.as_bytes(),
+                )
+                .await;
+            }
+            storage
+                .put(
+                    &format!("npm/repositories/{repository}/pkg/dist-tags/old"),
+                    b"1.0.0",
+                )
+                .await
+                .unwrap();
+        }
+        let proxy_key = "npm/repositories/npm-registry/proxy/tarballs/pkg/pkg-1.0.0.tgz";
+        storage.put(proxy_key, b"cache").await.unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 2);
+        for repository in ["npm-private-a", "npm-private-b"] {
+            assert!(storage
+                .stat(&format!(
+                    "npm/repositories/{repository}/pkg/versions/1.0.0.json"
+                ))
+                .await
+                .is_none());
+            assert!(storage
+                .stat(&format!(
+                    "npm/repositories/{repository}/pkg/blobs/sha512/{}.tgz",
+                    hex::encode(sha2::Sha512::digest(b"1.0.0"))
+                ))
+                .await
+                .is_none());
+            assert!(storage
+                .stat(&format!("npm/repositories/{repository}/pkg/dist-tags/old"))
+                .await
+                .is_none());
+            assert!(storage
+                .stat(&format!(
+                    "npm/repositories/{repository}/pkg/versions/2.0.0.json"
+                ))
+                .await
+                .is_some());
+        }
+        assert!(storage.get(proxy_key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retention_keeps_blob_referenced_by_remaining_npm_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (_, first_blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"shared").await;
+        let (_, second_blob) = seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"shared").await;
+        assert_eq!(first_blob, second_blob);
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(storage
+            .stat(&format!("{prefix}/versions/1.0.0.json"))
+            .await
+            .is_none());
+        assert!(storage
+            .stat(&format!("{prefix}/versions/2.0.0.json"))
+            .await
+            .is_some());
+        assert!(storage.get(&first_blob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retention_handles_hosted_package_named_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        for version in ["1.0.0", "2.0.0"] {
+            seed_npm_version(
+                &storage,
+                "npm/repositories/npm-private/proxy",
+                "proxy",
+                version,
+                version.as_bytes(),
+            )
+            .await;
+        }
+
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(storage
+            .stat("npm/repositories/npm-private/proxy/versions/1.0.0.json")
+            .await
+            .is_none());
+        assert!(storage
+            .stat("npm/repositories/npm-private/proxy/versions/2.0.0.json")
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_retention_removes_package_state_after_last_npm_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"tarball").await;
+        storage
+            .put(&format!("{prefix}/pkg.json"), br#"{"name":"pkg"}"#)
+            .await
+            .unwrap();
+        storage
+            .put(&format!("{prefix}/dist-tags/latest"), b"1.0.0")
+            .await
+            .unwrap();
+        storage
+            .put(&format!("{prefix}/deprecations/1.0.0"), b"old")
+            .await
+            .unwrap();
+        storage
+            .put(&format!("{prefix}/publish-complete/1.0.0"), b"complete")
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(
+            storage
+                .list(&format!("{prefix}/"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "last-version retention must not leave a 200-but-empty package shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_npm_manifest_delete_failure_keeps_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, tarball) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"tarball").await;
+
+        let backend =
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&manifest);
+        let attempts = backend.delete_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&tarball).await.is_ok());
+        let attempts = attempts.lock();
+        assert!(attempts.contains(&manifest));
+        assert!(
+            !attempts.contains(&tarball),
+            "tarball deletion must not be attempted after manifest failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_npm_redeploy_plan_cannot_delete_replacement_manifest_or_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old-tarball").await;
+        seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"newer-version").await;
+        let group = collect_npm_versions(&storage)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "npm:npm-private:pkg")
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plans = plan_deletions(group.versions.clone(), &rule, NOW);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "1.0.0");
+
+        // Model write_policy=allow replacing the same version after scan and
+        // before retention acquires the package publish lock.
+        let (replacement_manifest, replacement_blob) =
+            seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"replacement-tarball").await;
+        let replacement_manifest_bytes = storage.get(&replacement_manifest).await.unwrap();
+
+        let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 0);
+        assert_eq!(outcome.deleted_keys, 0);
+        assert_eq!(
+            storage.get(&replacement_manifest).await.unwrap(),
+            replacement_manifest_bytes
+        );
+        assert!(storage.get(&replacement_blob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn npm_tag_introduced_after_plan_skips_whole_package_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old").await;
+        seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"new").await;
+        let group = collect_npm_versions(&storage)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "npm:npm-private:pkg")
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plans = plan_deletions(group.versions.clone(), &rule, NOW);
+        let tag = format!("{prefix}/dist-tags/stable");
+        storage.put(&tag, b"1.0.0").await.unwrap();
+
+        let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 0);
+        assert_eq!(outcome.deleted_keys, 0);
+        assert!(storage.get(&manifest).await.is_ok());
+        assert!(storage.get(&blob).await.is_ok());
+        assert_eq!(storage.get(&tag).await.unwrap().as_ref(), b"1.0.0");
+    }
+
+    #[tokio::test]
+    async fn npm_new_version_after_plan_invalidates_package_wide_keep_last_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (old_manifest, old_blob) =
+            seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old").await;
+        seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"new").await;
+        let group = collect_npm_versions(&storage)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "npm:npm-private:pkg")
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plans = plan_deletions(group.versions.clone(), &rule, NOW);
+        seed_npm_version(&storage, prefix, "pkg", "3.0.0", b"newest").await;
+
+        let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 0);
+        assert_eq!(outcome.deleted_keys, 0);
+        assert!(storage.get(&old_manifest).await.is_ok());
+        assert!(storage.get(&old_blob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn npm_target_tag_delete_failure_keeps_manifest_tag_and_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, blob) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"old").await;
+        seed_npm_version(&inner, prefix, "pkg", "2.0.0", b"new").await;
+        let completion = format!("{prefix}/publish-complete/1.0.0");
+        let tag = format!("{prefix}/dist-tags/stable");
+        inner.put(&completion, b"completed").await.unwrap();
+        inner.put(&tag, b"1.0.0").await.unwrap();
+        let backend = crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&tag);
+        let attempts = backend.delete_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let group = collect_npm_versions(&storage)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "npm:npm-private:pkg")
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plans = plan_deletions(group.versions.clone(), &rule, NOW);
+
+        let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 0);
+        assert_eq!(outcome.deleted_keys, 1);
+        assert!(
+            inner.get(&completion).await.is_err(),
+            "publish-complete must be removed first so an exact retry repairs partial state"
+        );
+        assert_eq!(inner.get(&tag).await.unwrap().as_ref(), b"1.0.0");
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&blob).await.is_ok());
+        let attempts = attempts.lock();
+        assert_eq!(attempts.first(), Some(&completion));
+        assert_eq!(attempts.get(1), Some(&tag));
+        assert!(!attempts.contains(&manifest));
+        assert!(!attempts.contains(&blob));
+    }
+
+    #[tokio::test]
+    async fn empty_npm_package_cleanup_is_discoverable_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let package_key = "npm/repositories/npm-private/pkg/pkg.json";
+        inner.put(package_key, br#"{"name":"pkg"}"#).await.unwrap();
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(package_key),
+        ));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let first = run_retention(&failing, &test_publish_locks(), None, &rules, false).await;
+        assert_eq!(first.planned, 0);
+        assert!(inner.get(package_key).await.is_ok());
+
+        let second = run_retention(&inner, &test_publish_locks(), None, &rules, false).await;
+        assert_eq!(second.planned, 0);
+        assert!(inner.get(package_key).await.is_err());
+        assert_eq!(second.deleted_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn test_retention_npm_missing_listing_metadata_skips_age_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, tarball) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"tarball").await;
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).stat_none(&manifest),
+        ));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: None,
+            older_than_days: Some(0),
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&tarball).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retention_npm_tag_read_failure_skips_whole_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, tarball) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"tarball").await;
+        let tag = format!("{prefix}/dist-tags/stable");
+        inner.put(&tag, b"1.0.0").await.unwrap();
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_get(&tag),
+        ));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&tarball).await.is_ok());
+        assert!(inner.get(&tag).await.is_ok());
+    }
+
     /// The scheduler must run once at boot, not a full interval later — a
     /// process that restarts more often than the interval otherwise never
     /// runs retention at all.
@@ -1295,6 +3376,8 @@ mod tests {
             storage.clone(),
             test_publish_locks(),
             None,
+            MavenConfig::default(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             rules,
             86400, // the boot run must not wait for this
             false,
@@ -1344,6 +3427,8 @@ mod tests {
             storage.clone(),
             test_publish_locks(),
             None,
+            MavenConfig::default(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             rules,
             86400,
             false,
@@ -1400,6 +3485,8 @@ mod tests {
             storage.clone(),
             test_publish_locks(),
             None,
+            MavenConfig::default(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
             rules,
             86400,
             false,
@@ -1597,6 +3684,37 @@ mod format_retention_tests {
             find_matching_rule(&rules, "rpm", "rpm:app-release/x86_64/pkg").is_none(),
             "no rule = keep forever"
         );
+    }
+
+    #[test]
+    fn test_npm_name_glob_preserves_package_match_and_can_qualify_repository() {
+        let package_rule = rule("npm", Some("@scope/*"), Some(5), None);
+        assert!(find_matching_rule(
+            std::slice::from_ref(&package_rule),
+            "npm",
+            "npm:npm-private:@scope/pkg"
+        )
+        .is_some());
+        assert!(find_matching_rule(
+            std::slice::from_ref(&package_rule),
+            "npm",
+            "npm:other-hosted:@scope/pkg"
+        )
+        .is_some());
+
+        let repository_rule = rule("npm", Some("npm-private:@scope/*"), Some(1), None);
+        assert!(find_matching_rule(
+            std::slice::from_ref(&repository_rule),
+            "npm",
+            "npm:npm-private:@scope/pkg"
+        )
+        .is_some());
+        assert!(find_matching_rule(
+            std::slice::from_ref(&repository_rule),
+            "npm",
+            "npm:other-hosted:@scope/pkg"
+        )
+        .is_none());
     }
 
     fn build_rpm(name: &str, version: &str) -> Vec<u8> {

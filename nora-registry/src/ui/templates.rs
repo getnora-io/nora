@@ -1153,7 +1153,18 @@ pub fn render_package_detail(
     };
 
     let install_cmd = match registry_type {
-        "npm" => format!("npm install {} --registry {}/npm", name, base_url),
+        "npm" => name
+            .strip_prefix("repositories/")
+            .and_then(|rest| rest.split_once('/'))
+            .map_or_else(
+                || format!("npm install {} --registry {}/npm", name, base_url),
+                |(repository, package)| {
+                    format!(
+                        "npm install {} --registry {}/repository/{}",
+                        package, base_url, repository
+                    )
+                },
+            ),
         "cargo" => format!("cargo add {}", name),
         "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
         "go" => format!("GOPROXY={}/go go get {}", base_url, name),
@@ -1195,7 +1206,18 @@ pub fn render_package_detail(
     };
 
     // Build breadcrumbs — make each path segment clickable for hierarchical names
-    let breadcrumb_html = if registry_type == "ansible" && name.contains('.') {
+    let named_npm = (registry_type == "npm")
+        .then(|| name.strip_prefix("repositories/"))
+        .flatten()
+        .and_then(|rest| rest.split_once('/'));
+    let breadcrumb_html = if let Some((repository, package)) = named_npm {
+        format!(
+            r#"<a href="/ui/npm" class="text-blue-400 hover:text-blue-300">{title}</a><span class="mx-2 text-slate-500">/</span><span class="text-slate-400">{repository}</span><span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{package}</span>"#,
+            title = registry_title,
+            repository = html_escape(repository),
+            package = html_escape(package),
+        )
+    } else if registry_type == "ansible" && name.contains('.') {
         // Ansible: community.general → Ansible Galaxy / community / general
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         let mut crumbs = format!(
@@ -1255,7 +1277,11 @@ pub fn render_package_detail(
         )
     };
 
-    let detail_title = if registry_type == "raw" && name.contains('/') {
+    let detail_title = if registry_type == "npm" {
+        named_npm
+            .map(|(_, package)| html_escape(package))
+            .unwrap_or_else(|| html_escape(name))
+    } else if registry_type == "raw" && name.contains('/') {
         html_escape(name.rsplit('/').next().unwrap_or(name))
     } else {
         html_escape(name)
@@ -1393,11 +1419,25 @@ pub fn render_maven_detail(
     auth_enabled: bool,
 ) -> String {
     let _t = get_translations(lang);
+    let (repository, coordinate_path) = path
+        .strip_prefix("repositories/")
+        .and_then(|rest| rest.split_once('/'))
+        .map_or((None, path), |(repository, coordinate_path)| {
+            (Some(repository), coordinate_path)
+        });
     let artifact_rows = if detail.artifacts.is_empty() {
         r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-500">No artifacts found</td></tr>"##.to_string()
     } else {
         detail.artifacts.iter().map(|a| {
-            let download_url = format!("/maven2/{}/{}", path, a.filename);
+            let download_url = repository.map_or_else(
+                || format!("/maven2/{coordinate_path}/{}", a.filename),
+                |repository| {
+                    format!(
+                        "/repository/{repository}/{coordinate_path}/{}",
+                        a.filename
+                    )
+                },
+            );
             format!(r##"
                 <tr class="hover:bg-slate-700">
                     <td class="px-3 md:px-6 py-3 md:py-4">
@@ -1410,7 +1450,7 @@ pub fn render_maven_detail(
     };
 
     // Extract artifact name from path (last component before version)
-    let parts: Vec<&str> = path.split('/').collect();
+    let parts: Vec<&str> = coordinate_path.split('/').collect();
     let artifact_name = if parts.len() >= 2 {
         parts[parts.len() - 2]
     } else {
@@ -1873,7 +1913,7 @@ pub fn encode_uri_component(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::api::PackageDetail;
+    use crate::ui::api::{MavenArtifact, PackageDetail};
 
     fn empty_detail() -> PackageDetail {
         PackageDetail {
@@ -1944,6 +1984,24 @@ mod tests {
         assert!(
             html.contains("https://registry.example.com/npm"),
             "npm install command must use public_url"
+        );
+        let html = render_package_detail(
+            "npm",
+            "repositories/npm-group/@scope/pkg",
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
+        assert!(
+            html.contains(
+                "npm install @scope/pkg --registry https://registry.example.com/repository/npm-group"
+            ),
+            "named npm install command must use the selected repository and real package name"
+        );
+        assert!(
+            !html.contains("npm install repositories/"),
+            "storage-index qualification must not leak into the npm package argument"
         );
 
         let html = render_package_detail(
@@ -2158,5 +2216,28 @@ mod tests {
             !html.contains("writeText('docker pull"),
             "Docker template must not use inline JS string interpolation"
         );
+    }
+
+    #[test]
+    fn named_maven_detail_uses_repository_route_and_coordinate() {
+        let detail = MavenDetail {
+            artifacts: vec![MavenArtifact {
+                filename: "library-1.2.3.jar".to_string(),
+                size: 42,
+            }],
+        };
+
+        let html = render_maven_detail(
+            "repositories/maven-releases/com/example/library/1.2.3",
+            &detail,
+            Lang::En,
+            false,
+        );
+
+        assert!(
+            html.contains("/repository/maven-releases/com/example/library/1.2.3/library-1.2.3.jar")
+        );
+        assert!(html.contains("&lt;groupId&gt;com.example&lt;/groupId&gt;"));
+        assert!(!html.contains("&lt;groupId&gt;repositories.maven-releases"));
     }
 }

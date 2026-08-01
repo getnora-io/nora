@@ -206,45 +206,76 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             size_bytes: size,
         });
 
-        let proxy_upstreams: Vec<String> = match reg {
-            RegistryType::Docker => state
-                .config
-                .docker
-                .upstreams
-                .iter()
-                .map(|u| u.url.clone())
-                .collect(),
-            RegistryType::Maven => state
-                .config
-                .maven
-                .proxies
-                .iter()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
-            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-            RegistryType::PyPI => state
-                .config
-                .pypi
-                .upstreams()
-                .iter()
-                .map(|u| u.url().to_string())
-                .collect(),
-            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-            RegistryType::Raw => vec![],
-            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-            RegistryType::Rpm => vec![],
-            RegistryType::Deb => vec![],
-        };
+        let proxy_upstreams: Vec<String> =
+            match reg {
+                RegistryType::Docker => state
+                    .config
+                    .docker
+                    .upstreams
+                    .iter()
+                    .map(|u| u.url.clone())
+                    .collect(),
+                RegistryType::Maven => {
+                    let mut upstreams: std::collections::BTreeSet<String> = state
+                        .config
+                        .maven
+                        .proxies
+                        .iter()
+                        .map(|proxy| proxy.url().to_string())
+                        .collect();
+                    upstreams.extend(state.config.maven.repositories.iter().filter_map(
+                        |repository| match repository {
+                            crate::config::MavenRepository::Proxy { url, .. } => Some(url.clone()),
+                            _ => None,
+                        },
+                    ));
+                    upstreams.into_iter().collect()
+                }
+                RegistryType::Npm => {
+                    let mut upstreams: std::collections::BTreeSet<String> =
+                        state.config.npm.proxy.clone().into_iter().collect();
+                    upstreams.extend(state.config.npm.repositories.iter().filter_map(
+                        |repository| match repository {
+                            crate::config::NpmRepository::Proxy { url, .. } => Some(url.clone()),
+                            _ => None,
+                        },
+                    ));
+                    upstreams.into_iter().collect()
+                }
+                RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+                RegistryType::PyPI => state
+                    .config
+                    .pypi
+                    .upstreams()
+                    .iter()
+                    .map(|u| u.url().to_string())
+                    .collect(),
+                RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+                RegistryType::Raw => vec![],
+                RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+                RegistryType::Terraform => {
+                    state.config.terraform.proxy.clone().into_iter().collect()
+                }
+                RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+                RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+                RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+                RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+                RegistryType::Rpm => vec![],
+                RegistryType::Deb => vec![],
+            };
 
+        let mount_path = match reg {
+            RegistryType::Maven if !state.config.maven.repositories.is_empty() => {
+                "/repository/{repository}/".to_string()
+            }
+            RegistryType::Npm if !state.config.npm.repositories.is_empty() => {
+                "/repository/{repository}/".to_string()
+            }
+            _ => reg.mount_point().to_string(),
+        };
         mount_points.push(MountPoint {
             registry: reg.display_name().to_string(),
-            mount_path: reg.mount_point().to_string(),
+            mount_path,
             proxy_upstreams,
         });
     }
@@ -573,64 +604,110 @@ pub async fn get_npm_detail(
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    let metadata_key = format!("npm/{}/metadata.json", name);
+    let Some((repository, package)) = name
+        .strip_prefix("repositories/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return PackageDetail {
+            versions: vec![],
+            prerelease_count: 0,
+            total_stable: 0,
+            metadata: PackageMetadata::default(),
+        };
+    };
+
+    let package_leaf = package.split('/').next_back().unwrap_or(package);
+    let hosted_versions_prefix = format!("npm/repositories/{repository}/{package}/versions/");
+    let hosted_version_keys = storage
+        .list(&hosted_versions_prefix)
+        .await
+        .unwrap_or_default();
+    let mut version_rows: Vec<(String, serde_json::Value, String, String)> = Vec::new();
+    let metadata_json = if hosted_version_keys.is_empty() {
+        let packument_key =
+            format!("npm/repositories/{repository}/proxy/packuments/{package}.json");
+        storage.get(&packument_key).await.ok().and_then(|data| {
+            let metadata = serde_json::from_slice::<serde_json::Value>(&data).ok()?;
+            let time = metadata.get("time").and_then(|value| value.as_object());
+            if let Some(versions) = metadata.get("versions").and_then(|value| value.as_object()) {
+                for (version, info) in versions {
+                    let published = time
+                        .and_then(|times| times.get(version))
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.get(..10).unwrap_or(value).to_string())
+                        .unwrap_or_else(|| "N/A".to_string());
+                    version_rows.push((
+                        version.clone(),
+                        info.clone(),
+                        published,
+                        format!(
+                            "npm/repositories/{repository}/proxy/tarballs/{package}/{package_leaf}-{version}.tgz"
+                        ),
+                    ));
+                }
+            }
+            Some(metadata)
+        })
+    } else {
+        for key in hosted_version_keys {
+            let Some(version) = key
+                .rsplit('/')
+                .next()
+                .and_then(|part| part.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(data) = storage.get(&key).await else {
+                continue;
+            };
+            let Ok(info) = serde_json::from_slice::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let Some(blob_key) =
+                crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &data)
+            else {
+                continue;
+            };
+            let published = storage
+                .stat(&key)
+                .await
+                .map(|meta| format_timestamp(meta.modified))
+                .unwrap_or_else(|| "N/A".to_string());
+            version_rows.push((version.to_string(), info, published, blob_key));
+        }
+        let package_key = format!("npm/repositories/{repository}/{package}/pkg.json");
+        storage
+            .get(&package_key)
+            .await
+            .ok()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+    };
 
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;
-
-    // Parse metadata.json for version info
-    if let Ok(data) = storage.get(&metadata_key).await {
-        if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
-            if let Some(versions_obj) = metadata.get("versions").and_then(|v| v.as_object()) {
-                let time_obj = metadata.get("time").and_then(|t| t.as_object());
-
-                for (version, info) in versions_obj {
-                    let is_prerelease = version.contains('-');
-
-                    let meta_size = info
-                        .get("dist")
-                        .and_then(|d| d.get("unpackedSize"))
-                        .and_then(|s| s.as_u64())
-                        .unwrap_or(0);
-
-                    let published = time_obj
-                        .and_then(|t| t.get(version))
-                        .and_then(|p| p.as_str())
-                        .map(|s| s.get(..10).unwrap_or(s).to_string())
-                        .unwrap_or_else(|| "N/A".to_string());
-
-                    // Count pre-release, skip unless toggled
-                    if is_prerelease {
-                        prerelease_count += 1;
-                        if !show_prerelease {
-                            continue;
-                        }
-                    }
-
-                    // Check if tarball is actually cached on disk
-                    // For scoped packages (@scope/name), tarball uses just the "name" part
-                    let name_part = if name.contains('/') {
-                        name.rsplit('/').next().unwrap_or(name)
-                    } else {
-                        name
-                    };
-                    let tarball_key =
-                        format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
-                        (meta.size, true)
-                    } else {
-                        (meta_size, false)
-                    };
-
-                    stable_versions.push(VersionInfo {
-                        version: version.clone(),
-                        size,
-                        published,
-                        cached,
-                    });
-                }
+    for (version, info, published, tarball_key) in version_rows {
+        let is_prerelease = version.contains('-');
+        if is_prerelease {
+            prerelease_count += 1;
+            if !show_prerelease {
+                continue;
             }
         }
+        let declared_size = info
+            .get("dist")
+            .and_then(|dist| dist.get("unpackedSize"))
+            .and_then(|size| size.as_u64())
+            .unwrap_or(0);
+        let (size, cached) = storage
+            .stat(&tarball_key)
+            .await
+            .map_or((declared_size, false), |meta| (meta.size, true));
+        stable_versions.push(VersionInfo {
+            version,
+            size,
+            published,
+            cached,
+        });
     }
 
     // Sort by version (semver-like, newest first)
@@ -658,56 +735,51 @@ pub async fn get_npm_detail(
         stable_versions.truncate(20);
     }
 
-    // Extract package-level metadata from the same JSON
     let mut metadata = PackageMetadata::default();
-    if let Ok(data) = storage.get(&metadata_key).await {
-        if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&data) {
-            metadata.description = meta_json
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            metadata.license = meta_json
-                .get("license")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            metadata.author = meta_json.get("author").and_then(|v| {
-                // author can be a string or { name: "..." }
-                v.as_str().map(|s| s.to_string()).or_else(|| {
-                    v.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string())
-                })
-            });
-            metadata.homepage = meta_json
-                .get("homepage")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .filter(|s| sanitize_href(s).is_some())
-                .map(|s| s.to_string());
-            metadata.repository = meta_json
-                .get("repository")
-                .and_then(|v| {
-                    // repository can be a string or { url: "..." }
-                    v.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
-                })
-                .map(|s| {
-                    s.trim_start_matches("git+")
-                        .trim_end_matches(".git")
-                        .to_string()
-                })
-                .filter(|s| sanitize_href(s).is_some());
-            metadata.keywords = meta_json
-                .get("keywords")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
+    if let Some(meta_json) = metadata_json {
+        metadata.description = meta_json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        metadata.license = meta_json
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        metadata.author = meta_json.get("author").and_then(|v| {
+            v.as_str().map(|s| s.to_string()).or_else(|| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+        });
+        metadata.homepage = meta_json
+            .get("homepage")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .filter(|s| sanitize_href(s).is_some())
+            .map(|s| s.to_string());
+        metadata.repository = meta_json
+            .get("repository")
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+            })
+            .map(|s| {
+                s.trim_start_matches("git+")
+                    .trim_end_matches(".git")
+                    .to_string()
+            })
+            .filter(|s| sanitize_href(s).is_some());
+        metadata.keywords = meta_json
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     PackageDetail {
@@ -1835,4 +1907,67 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
 
     (result, true)
+}
+
+#[cfg(test)]
+mod named_npm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn detail_reads_named_hosted_manifest_and_tarball() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let blob = b"tarball";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.2.3",
+            "description": "example",
+            "dist": {
+                "integrity": format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(blob))
+                )
+            }
+        }))
+        .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.2.3.json",
+                &manifest,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/pkg.json",
+                br#"{"name":"@scope/pkg","description":"example"}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &crate::npm_layout::hosted_blob_key_from_manifest(
+                    "npm-private",
+                    "@scope/pkg",
+                    &manifest,
+                )
+                .unwrap(),
+                blob,
+            )
+            .await
+            .unwrap();
+
+        let detail =
+            get_npm_detail(&storage, "repositories/npm-private/@scope/pkg", true, true).await;
+
+        assert_eq!(detail.versions.len(), 1);
+        assert_eq!(detail.versions[0].version, "1.2.3");
+        assert!(detail.versions[0].cached);
+        assert_eq!(detail.versions[0].size, 7);
+        assert_eq!(detail.metadata.description.as_deref(), Some("example"));
+    }
 }

@@ -296,13 +296,13 @@ async fn npm_internal_stale_not_refetched() {
         c.npm.metadata_ttl = 0; // every pull is "stale" → would trigger refetch_metadata
         c.npm.serve_stale = false; // without the guard, the failed refetch → 502
     });
-    // A locally-published internal packument whose cache is "stale" must be served
-    // from the local copy, NOT re-fetched upstream (the #725 residual leak).
+    // A locally-published internal package in the fresh named hosted layout
+    // must be served from local state, NOT re-fetched upstream.
     ctx.state
         .storage
         .put(
-            "npm/internalpkg/metadata.json",
-            br#"{"name":"internalpkg","versions":{}}"#,
+            "npm/repositories/npm-private/internalpkg/pkg.json",
+            br#"{"name":"internalpkg"}"#,
         )
         .await
         .unwrap();

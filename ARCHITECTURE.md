@@ -54,8 +54,8 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
-   │   Docker    │           │     Maven     │   ...    │    Debian     │
-   │  /v2/*      │           │  /maven2/*    │  (x15)   │    /deb/*     │
+   │   Docker    │           │ Maven / npm   │   ...    │    Debian     │
+   │  /v2/*      │           │/repository/*  │  (x15)   │    /deb/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -72,9 +72,26 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
                            └─────────────────────┘
 ```
 
-Every HTTP request follows this path top-to-bottom. The registry handler is
-selected by URL prefix (`/v2/` = Docker, `/maven2/` = Maven, etc.). Curation
-runs only on proxy downloads — hosted artifacts are trusted at publish time.
+Every HTTP request follows this path top-to-bottom. Most registry handlers are
+selected by URL prefix. Maven and npm share `/repository/{name}/...`; a named
+dispatcher selects the protocol from validated configuration, not from a name
+heuristic. Their repository names therefore occupy one global namespace.
+`/maven2/` and `/npm/` remain compatibility aliases only when a default named
+repository is configured. Curation runs only on proxy downloads — hosted
+artifacts are trusted at publish time.
+
+Named Maven and npm each support hosted, proxy, and ordered group repositories.
+Groups own no storage. Maven hosted/proxy objects are isolated under
+`maven/repositories/{name}/...`. npm keeps hosted version manifests,
+content-addressed tarball blobs, dist-tags, and deprecation overlays under
+`npm/repositories/{hosted}/...`, while proxy packuments and tarballs use
+`npm/repositories/{proxy}/proxy/...`. An npm group synthesizes a response from
+its members in configured order.
+
+This topology has a single-writer contract on local and object storage.
+Conditional create protects one immutable key, but mutable Maven/npm metadata
+updates span multiple keys and use an in-process lock. S3 or Ceph exact-key CAS
+therefore does not provide multi-replica write coordination or HA.
 
 ### Trust Boundaries
 
@@ -272,9 +289,17 @@ in front of other registries.
 **Rationale:** Each storage backend is a maintenance surface. S3 covers
 every cloud provider and on-prem S3-compatible stores. Local covers single-node and
 development. A third backend (e.g., GCS-native, Azure Blob) adds testing
-burden without meaningful capability gain — both are S3-compatible. For
-migrating away from other registries, the `nora migrate` CLI copies
-artifacts directly rather than proxying through the old system.
+burden without meaningful capability gain — both are S3-compatible.
+`nora migrate` copies an existing NORA storage layout between local and S3; it
+is not a Nexus-to-named-repository migrator.
+
+Named Maven/npm are a fresh-install contract. For Nexus replacement, keep the
+source read-only and copy only hosted content through the protocol-aware named
+hosted endpoints, then verify reads through the configured groups. Do not copy
+Nexus group state or proxy caches. Direct-storage import remains a legacy/local
+layout tool and is not supported for named npm or for Maven when named
+repositories are configured. No in-place migration from older NORA Maven/npm
+layouts is provided.
 
 ### ADR-4: Explicit Handlers over Plugin Traits
 
@@ -391,9 +416,10 @@ are implemented per-registry following each format's upstream specification.
 There is no shared conditional-request middleware.
 
 **Context:** RFC 9110 defines conditional requests for HTTP. Each registry
-protocol has its own immutability model: Docker uses content-addressable
-digests, Maven/npm/Cargo/PyPI enforce version immutability at publish time,
-Raw has no upstream spec. Implementing a generic conditional-request layer
+protocol has its own coordinate model: Docker uses content-addressable
+digests, Maven/npm apply repository-specific write policy, Cargo/PyPI enforce
+version immutability at publish time, and Raw has no upstream spec.
+Implementing a generic conditional-request layer
 would either be too narrow (not matching protocol-specific semantics) or too
 broad (imposing HTTP semantics on protocols that don't need them).
 
@@ -445,12 +471,14 @@ added rarely — the explicit approach trades one-time boilerplate for
 permanent simplicity, compile-time completeness checks, and full test
 coverage of each format in isolation.
 
-**No high availability.** NORA runs as a single instance with a single
-RWO volume. This is a design decision, not a missing feature. Artifact
+**No high availability.** NORA runs with exactly one writer, including when
+the storage backend is S3 or Ceph. Exact-key conditional create does not
+serialize the multi-key mutable metadata used by named Maven/npm. This is a
+design decision, not a missing feature. Artifact
 registries have a read-heavy, write-light workload — a single instance
-with S3 storage handles thousands of pulls per minute. Kubernetes
-`Recreate` strategy ensures zero-downtime upgrades for reads served from
-client-side caches.
+with S3 storage handles thousands of pulls per minute. Kubernetes `Recreate`
+or an explicit scale-to-zero upgrade prevents overlapping writers, at the cost
+of a short service interruption. High availability requires a separate design.
 
 **DRY violations between handlers.** Registry handlers share structural
 patterns (proxy logic, curation calls, config loading) but differ in
@@ -475,5 +503,6 @@ external tools (Grafana dashboards, git-based rule management).
 - **Not a CDN.** For geo-distributed artifact delivery, put a CDN
   (CloudFront, Cloudflare) in front of NORA.
 - **Not a middleware.** NORA is a standalone registry, not a caching
-  layer in front of Nexus or Artifactory. For migration, use
-  `nora migrate`.
+  layer in front of Nexus or Artifactory. Nexus hosted Maven/npm content is
+  migrated through protocol-aware named endpoints; `nora migrate` only copies
+  existing NORA storage between local and S3.
