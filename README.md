@@ -27,25 +27,27 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 ## Supported Registries
 
-| Registry | Mount Point | Upstream Proxy | Auth |
-|----------|------------|----------------|------|
-| Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✓ |
-| Maven | `/maven2/` | Maven Central, custom | ✓ |
-| npm | `/npm/` | npmjs.org, custom | ✓ |
-| Cargo | `/cargo/` | crates.io | ✓ |
-| PyPI | `/simple/` | pypi.org, custom | ✓ |
-| Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
-| Raw files | `/raw/` | — | ✓ |
-| RubyGems | `/gems/` | rubygems.org | ✓ |
-| Terraform | `/terraform/` | registry.terraform.io | ✓ |
-| Ansible Galaxy | `/ansible/` | galaxy.ansible.com | ✓ |
-| NuGet | `/nuget/` | api.nuget.org | ✓ |
-| Pub (Dart/Flutter) | `/pub/` | pub.dev | ✓ |
-| Conan (C/C++) | `/conan/` | ConanCenter | ✓ |
-| RPM (yum/dnf) | `/rpm/` | — (hosted, GPG-signed) | ✓ |
-| Debian/APT | `/deb/` | — (hosted, GPG-signed) | ✓ |
+| Registry | Mount Point | Upstream Proxy | Pull (proxy/cache) | Push/Publish | Default Upstream | Cache Type | Auth | Notes |
+|----------|------------|----------------|:---:|:---:|---|---|---|---|
+| Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✅ | ✅ | `registry-1.docker.io` | immutable blobs + TTL manifest | ✓ | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
+| Maven | `/maven2/` | Maven Central, custom | ✅ | ✅ | `repo1.maven.org/maven2` | metadata (TTL) + artifacts (immutable) | ✓ | hosted + proxy |
+| npm | `/npm/` | npmjs.org, custom | ✅ | ✅ | `registry.npmjs.org` | packuments (TTL) + tarball (immutable) | ✓ | hosted + proxy |
+| Cargo | `/cargo/` | crates.io | ✅ | ✅ | `crates.io` (sparse index) | index (TTL) + `.crate` (immutable) | ✓ | hosted + proxy (sparse index) |
+| PyPI | `/simple/` | pypi.org, custom | ✅ | ✅ | `pypi.org/simple/` | index (TTL) + files (immutable) | ✓ | hosted + proxy |
+| Go Modules | `/go/` | proxy.golang.org, custom | ✅ | — | `proxy.golang.org` | `@v`/`@latest` (TTL) + `.info`/`.mod`/`.zip` (immutable) | ✓ | proxy only (modules immutable, push not in protocol) |
+| Raw files | `/raw/` | — | ❌ | ✅ | — (no upstream) | — | ✓ | hosted only; conditional `PUT` (ETag/`If-Match` — local backend only; `If-None-Match: *` works on any backend) |
+| RubyGems | `/gems/` | rubygems.org | ✅ | ❌ | `rubygems.org` | `specs`/`latest_specs`/`info` (TTL) + `gem`/`gemspec` (immutable) | ✓ | proxy only — `gem push` not implemented in NORA v1.1.0 |
+| Terraform | `/terraform/` | registry.terraform.io | ✅ | — | `registry.terraform.io` | discovery (TTL) + providers (immutable) | ✓ | proxy only; requires `anonymous_read: true` (Terraform client sends no `Authorization`); geo-blocked for Yandex Cloud IPs → VLESS proxy needed |
+| Ansible Galaxy | `/ansible/` | galaxy.ansible.com | ✅ | ❌ | `galaxy.ansible.com` | collection list/detail (TTL) + tarball (immutable) | ✓ | proxy only — `ansible-galaxy collection publish` not implemented |
+| NuGet | `/nuget/` | api.nuget.org | ✅ | ❌ | `api.nuget.org` | registration/query (TTL) + `.nupkg`/`.nuspec` (immutable) | ✓ | proxy only — `dotnet nuget push` not implemented (no `PackagePublish/2.0.0` in service index) |
+| Pub (Dart/Flutter) | `/pub/` | pub.dev | ✅ | ❌ | `pub.dev` | package metadata (TTL) + archive (immutable) | ✓ | proxy only — `dart pub publish` not implemented (no `/api/packages/versions/new` upload-URL endpoint) |
+| Conan (C/C++) | `/conan/` | ConanCenter | ⚠️ | ❌ | `center2.conan.io` | revisions (TTL) + recipe/package files (immutable) | ✓ | v2 API works via curl (proxy/cache); Conan 2.x client does NOT work — v1 ping barrier (no `GET /conan/v1/ping`) |
+| RPM (yum/dnf) | `/rpm/` | — (hosted, GPG-signed) | ⚠️ | ✅ | — (none by default) | packages (immutable) + repodata (regenerated) | ✓ | hosted; pull-through via `config.registries.rpm.proxies` (e.g. `fedora: https://download.fedoraproject.org/...`), off by default; auto-generates `repodata/` |
+| Debian/APT | `/deb/` | — (hosted, GPG-signed) | ⚠️ | ✅ | — (none by default) | packages (immutable) + Packages/Release (regenerated) | ✓ | hosted; pull-through via `config.registries.deb.proxies` (e.g. `debian: https://deb.debian.org/debian`), off by default; flat & structured layouts; auto-generates `Packages`/`Release`/`InRelease` |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
+
+> **Pull/Push legend:** ✅ supported · ⚠️ partial (pull-through available but off by default, or client compatibility issue) · ❌ not implemented in NORA v1.1.0 · — not applicable (protocol has no push). See [Usage](#usage) for per-format details.
 
 ## Quick Start
 
