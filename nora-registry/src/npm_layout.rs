@@ -14,15 +14,25 @@ use sha2::Digest;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NpmObjectKind {
     HostedPackage,
+    /// Rebuildable materialized hosted packument. Authoritative hosted state
+    /// remains in the package/version/tag/deprecation objects.
+    HostedPackumentCache,
     HostedVersion(String),
     HostedPublishComplete(String),
     HostedTarball(String),
-    HostedBlob { algorithm: String, digest: String },
+    HostedBlob {
+        algorithm: String,
+        digest: String,
+    },
     HostedDistTag(String),
     HostedDeprecation(String),
     ProxyPackument,
     ProxyTarball(String),
     ProxyNegative,
+}
+
+pub(crate) fn hosted_packument_cache_key(repository: &str, package: &str) -> String {
+    format!("npm/repositories/{repository}/{package}/packument-cache.json")
 }
 
 pub(crate) fn hosted_blob_key_for_digest(repository: &str, package: &str, digest: &str) -> String {
@@ -128,6 +138,18 @@ pub(crate) fn parse_npm_object_key(key: &str) -> Option<NpmObjectPath> {
             repository: repository.to_string(),
             package,
             kind: NpmObjectKind::HostedPackage,
+        });
+    }
+
+    if tail.len() >= 2 && tail.last() == Some(&"packument-cache.json") {
+        let package = tail[..tail.len() - 1].join("/");
+        if package.is_empty() {
+            return None;
+        }
+        return Some(NpmObjectPath {
+            repository: repository.to_string(),
+            package,
+            kind: NpmObjectKind::HostedPackumentCache,
         });
     }
 
@@ -238,6 +260,12 @@ mod tests {
             marker.kind,
             NpmObjectKind::HostedPublishComplete("1.0.0".to_string())
         );
+
+        let packument_cache =
+            parse_npm_object_key("npm/repositories/npm-private/@scope/pkg/packument-cache.json")
+                .expect("hosted packument cache");
+        assert_eq!(packument_cache.package, "@scope/pkg");
+        assert_eq!(packument_cache.kind, NpmObjectKind::HostedPackumentCache);
 
         let digest = "a".repeat(128);
         let blob = parse_npm_object_key(&format!(

@@ -1307,6 +1307,34 @@ async fn apply_npm_plans(
     }
 
     let mut outcome = NpmBatchOutcome::default();
+    // The hosted packument cache is derived and deliberately excluded from
+    // the authoritative retention snapshot. Remove it before the first
+    // mutation while holding the exact publish lock; a later read will rebuild
+    // from whatever authoritative state the batch commits.
+    let cache_key =
+        crate::npm_layout::hosted_packument_cache_key(&group.repository, &group.package);
+    let cache_size = storage
+        .stat(&cache_key)
+        .await
+        .map(|meta| meta.size)
+        .unwrap_or(0);
+    match storage.delete(&cache_key).await {
+        Ok(()) => {
+            outcome.deleted_keys += 1;
+            outcome.bytes_freed += cache_size;
+        }
+        Err(StorageError::NotFound) => {}
+        Err(error) => {
+            tracing::warn!(
+                repository = group.repository,
+                package = group.package,
+                key = cache_key,
+                %error,
+                "retention: cannot invalidate npm hosted packument cache; batch skipped"
+            );
+            return outcome;
+        }
+    }
     for plan in plans {
         let deleted = delete_npm_plan(storage, &group.group_name, plan).await;
         outcome.deleted_keys += deleted.deleted_keys;
@@ -2936,6 +2964,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            storage
+                .put(
+                    &crate::npm_layout::hosted_packument_cache_key(repository, "pkg"),
+                    br#"{"name":"pkg","versions":{},"dist-tags":{}}"#,
+                )
+                .await
+                .unwrap();
         }
         let proxy_key = "npm/repositories/npm-registry/proxy/tarballs/pkg/pkg-1.0.0.tgz";
         storage.put(proxy_key, b"cache").await.unwrap();
@@ -2974,6 +3009,12 @@ mod tests {
                 ))
                 .await
                 .is_some());
+            assert!(storage
+                .stat(&crate::npm_layout::hosted_packument_cache_key(
+                    repository, "pkg"
+                ))
+                .await
+                .is_none());
         }
         assert!(storage.get(proxy_key).await.is_ok());
     }
@@ -3262,8 +3303,16 @@ mod tests {
         assert!(inner.get(&manifest).await.is_ok());
         assert!(inner.get(&blob).await.is_ok());
         let attempts = attempts.lock();
-        assert_eq!(attempts.first(), Some(&completion));
-        assert_eq!(attempts.get(1), Some(&tag));
+        assert_eq!(
+            attempts.first(),
+            Some(&crate::npm_layout::hosted_packument_cache_key(
+                "npm-private",
+                "pkg"
+            )),
+            "derived cache must be invalidated before authoritative state changes"
+        );
+        assert_eq!(attempts.get(1), Some(&completion));
+        assert_eq!(attempts.get(2), Some(&tag));
         assert!(!attempts.contains(&manifest));
         assert!(!attempts.contains(&blob));
     }

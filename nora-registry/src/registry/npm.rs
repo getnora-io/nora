@@ -4,8 +4,10 @@
 //! npm registry with explicit hosted, proxy and group repositories.
 //!
 //! Hosted and proxy state deliberately live in different namespaces. A group
-//! owns no package metadata: its packument is synthesized for every request
-//! using member order as the conflict-resolution rule.
+//! owns no package metadata: its packument is synthesized using member order
+//! as the conflict-resolution rule. Hosted authoritative state stays split by
+//! responsibility; a rebuildable materialized packument avoids object-store
+//! fan-out on every client metadata request.
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -31,7 +33,7 @@ use axum::{
 use base64::Engine;
 use futures::{stream, StreamExt};
 use sha2::Digest;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,6 +135,18 @@ async fn optional_storage_get(state: &AppState, key: &str) -> Result<Option<Byte
         Ok(bytes) => Ok(Some(bytes)),
         Err(StorageError::NotFound) => Ok(None),
         Err(error) => Err(storage_read_error(error)),
+    }
+}
+
+async fn invalidate_hosted_packument_cache(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+) -> Result<(), StorageError> {
+    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
+    match state.storage.delete(&key).await {
+        Ok(()) | Err(StorageError::NotFound) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -738,11 +752,62 @@ fn curated_tarball_response(
     tarball_response(data)
 }
 
-async fn hosted_packument(
+fn valid_cached_hosted_packument(bytes: &[u8], package: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let object = value.as_object()?;
+    (object.get("name").and_then(|value| value.as_str()) == Some(package)
+        && object
+            .get("versions")
+            .is_some_and(|value| value.is_object())
+        && object
+            .get("dist-tags")
+            .is_some_and(|value| value.is_object()))
+    .then_some(value)
+}
+
+fn hosted_packument_response(
+    mut packument: serde_json::Value,
+    package: &str,
+    response_base: &str,
+) -> serde_json::Value {
+    if let Some(versions) = packument
+        .get_mut("versions")
+        .and_then(|value| value.as_object_mut())
+    {
+        for (version, manifest) in versions {
+            set_tarball_url(manifest, response_base, package, version);
+        }
+    }
+    packument
+}
+
+async fn read_hosted_packument_cache(
     state: &AppState,
     repository: &str,
     package: &str,
-    response_base: &str,
+) -> Result<Option<serde_json::Value>, ReadError> {
+    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
+    let Some(bytes) = optional_storage_get(state, &key).await? else {
+        return Ok(None);
+    };
+    match valid_cached_hosted_packument(&bytes, package) {
+        Some(packument) => Ok(Some(packument)),
+        None => {
+            tracing::warn!(
+                repository,
+                package,
+                key,
+                "ignoring invalid rebuildable npm hosted packument cache"
+            );
+            Ok(None)
+        }
+    }
+}
+
+async fn build_hosted_packument(
+    state: &AppState,
+    repository: &str,
+    package: &str,
 ) -> Result<serde_json::Value, ReadError> {
     let prefix = package_prefix(repository, package);
     let version_prefix = format!("{prefix}/versions/");
@@ -751,6 +816,18 @@ async fn hosted_packument(
         .list(&version_prefix)
         .await
         .map_err(|_| ReadError::Unavailable)?;
+    let deprecation_prefix = format!("{prefix}/deprecations/");
+    let deprecation_keys = state
+        .storage
+        .list(&deprecation_prefix)
+        .await
+        .map_err(|_| ReadError::Unavailable)?
+        .into_iter()
+        .filter_map(|key| {
+            let version = key.strip_prefix(&deprecation_prefix)?.to_string();
+            (!version.is_empty() && !version.contains('/')).then_some((version, key))
+        })
+        .collect::<HashMap<_, _>>();
 
     let version_reads = stream::iter(version_keys.into_iter().filter_map(|key| {
         let version = key
@@ -759,38 +836,40 @@ async fn hosted_packument(
             .to_string();
         (!version.is_empty() && !version.contains('/')).then_some((version, key))
     }))
-    .map(|(version, key)| async move {
-        let bytes = state.storage.get(&key).await.map_err(|error| {
-            match storage_read_error(error) {
-                // LIST advertised this committed manifest. Disappearing between
-                // LIST and GET is an incomplete hosted read, not permission to
-                // let a lower-priority group member shadow the version.
-                ReadError::NotFound => ReadError::Unavailable,
-                other => other,
+    .map(|(version, key)| {
+        let deprecation_key = deprecation_keys.get(&version).cloned();
+        async move {
+            let bytes = state.storage.get(&key).await.map_err(|error| {
+                match storage_read_error(error) {
+                    // LIST advertised this committed manifest. Disappearing between
+                    // LIST and GET is an incomplete hosted read, not permission to
+                    // let a lower-priority group member shadow the version.
+                    ReadError::NotFound => ReadError::Unavailable,
+                    other => other,
+                }
+            })?;
+            let mut value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
+                crate::metrics::METADATA_CORRUPT_TOTAL
+                    .with_label_values(&["npm"])
+                    .inc();
+                ReadError::Corrupt
+            })?;
+            if let Some(deprecation_key) = deprecation_key {
+                let deprecated = state
+                    .storage
+                    .get(&deprecation_key)
+                    .await
+                    .map_err(storage_read_error)?;
+                let Some(message) = read_string(deprecated) else {
+                    return Err(ReadError::Corrupt);
+                };
+                let Some(object) = value.as_object_mut() else {
+                    return Err(ReadError::Corrupt);
+                };
+                object.insert("deprecated".to_string(), serde_json::Value::String(message));
             }
-        })?;
-        let mut value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
-            crate::metrics::METADATA_CORRUPT_TOTAL
-                .with_label_values(&["npm"])
-                .inc();
-            ReadError::Corrupt
-        })?;
-        if let Some(deprecated) = optional_storage_get(
-            state,
-            &hosted_deprecation_key(repository, package, &version),
-        )
-        .await?
-        {
-            let Some(message) = read_string(deprecated) else {
-                return Err(ReadError::Corrupt);
-            };
-            let Some(object) = value.as_object_mut() else {
-                return Err(ReadError::Corrupt);
-            };
-            object.insert("deprecated".to_string(), serde_json::Value::String(message));
+            Ok::<_, ReadError>((version, value))
         }
-        set_tarball_url(&mut value, response_base, package, &version);
-        Ok::<_, ReadError>((version, value))
     })
     .buffered(HOSTED_PACKUMENT_READ_CONCURRENCY)
     .collect::<Vec<_>>()
@@ -856,6 +935,54 @@ async fn hosted_packument(
     object.insert("versions".to_string(), serde_json::Value::Object(versions));
     object.insert("dist-tags".to_string(), serde_json::Value::Object(tags));
     Ok(packument)
+}
+
+async fn hosted_packument(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    response_base: &str,
+) -> Result<serde_json::Value, ReadError> {
+    if let Some(packument) = read_hosted_packument_cache(state, repository, package).await? {
+        return Ok(hosted_packument_response(packument, package, response_base));
+    }
+
+    // A cold read shares the exact package lock used by hosted mutations.
+    // This prevents a cache miss from materializing stale state after a
+    // concurrent mutation invalidated the previous cache.
+    let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
+    let _guard = lock.lock().await;
+    if let Some(packument) = read_hosted_packument_cache(state, repository, package).await? {
+        return Ok(hosted_packument_response(packument, package, response_base));
+    }
+
+    let packument = build_hosted_packument(state, repository, package).await?;
+    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
+    match serde_json::to_vec(&packument) {
+        Ok(bytes) => {
+            if let Err(error) = state.storage.put(&key, &bytes).await {
+                // The cache is derived. A failed cache write must not turn a
+                // complete authoritative read into an unavailable response.
+                tracing::warn!(
+                    repository,
+                    package,
+                    key,
+                    ?error,
+                    "failed to persist rebuildable npm hosted packument cache"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                repository,
+                package,
+                ?error,
+                "failed to serialize npm packument"
+            );
+            return Err(ReadError::Corrupt);
+        }
+    }
+    Ok(hosted_packument_response(packument, package, response_base))
 }
 
 fn negative_fresh(modified: u64, ttl: i64) -> bool {
@@ -2807,6 +2934,12 @@ async fn publish(
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+    if invalidate_hosted_packument_cache(state, repository, package)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     let pending_key = hosted_publish_pending_key(repository, package, &validated.version);
     let completion_digest = crate::npm_layout::hosted_manifest_digest(&validated.manifest);
@@ -3142,6 +3275,12 @@ async fn deprecate(
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+    if invalidate_hosted_packument_cache(state, repository, package)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let mut changed = 0usize;
     for (version, data) in versions {
         match hosted_has_version(state, repository, package, version).await {
@@ -3334,6 +3473,12 @@ async fn handle_dist_tag_put(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+    if invalidate_hosted_packument_cache(&state, &repository, &package)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     if state
         .storage
         .put(
@@ -3406,6 +3551,12 @@ async fn handle_dist_tag_delete(
         Ok(incomplete) if !incomplete.is_empty() => return incomplete_publish_response(),
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    if invalidate_hosted_packument_cache(&state, &repository, &package)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let key = hosted_tag_key(&repository, &package, &tag);
     match state.storage.delete(&key).await {
@@ -4893,6 +5044,227 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn hosted_packument_cache_removes_storage_fanout_and_rewrites_per_route() {
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .fail_get(hosted_deprecation_key("npm-private", "pkg", "1.0.0"));
+        let list_attempts = backend.list_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = crate::storage::Storage::from_backend(Arc::new(backend));
+
+        let hosted = hosted_packument(
+            &state,
+            "npm-private",
+            "pkg",
+            "https://nora.example/repository/npm-private",
+        )
+        .await
+        .expect("cold hosted packument");
+        assert_eq!(
+            hosted["versions"]["1.0.0"]["dist"]["tarball"],
+            "https://nora.example/repository/npm-private/pkg/-/pkg-1.0.0.tgz"
+        );
+        assert_eq!(list_attempts.lock().len(), 3);
+
+        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
+        let cache: serde_json::Value = serde_json::from_slice(
+            &state
+                .storage
+                .get(&cache_key)
+                .await
+                .expect("persisted cache"),
+        )
+        .unwrap();
+        assert!(cache["versions"]["1.0.0"]["dist"].get("tarball").is_none());
+
+        let grouped = hosted_packument(
+            &state,
+            "npm-private",
+            "pkg",
+            "https://nora.example/repository/npm-group",
+        )
+        .await
+        .expect("warm hosted packument");
+        assert_eq!(list_attempts.lock().len(), 3);
+        assert_eq!(
+            grouped["versions"]["1.0.0"]["dist"]["tarball"],
+            "https://nora.example/repository/npm-group/pkg/-/pkg-1.0.0.tgz"
+        );
+
+        let second: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "2.0.0", "next")).unwrap();
+        assert_eq!(
+            publish(
+                &state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(state.storage.stat(&cache_key).await.is_none());
+        let rebuilt = hosted_packument(
+            &state,
+            "npm-private",
+            "pkg",
+            "https://nora.example/repository/npm-private",
+        )
+        .await
+        .expect("rebuilt hosted packument");
+        assert_eq!(rebuilt["versions"].as_object().unwrap().len(), 2);
+        assert_eq!(rebuilt["dist-tags"]["next"], "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn hosted_mutation_fails_closed_when_packument_cache_cannot_be_invalidated() {
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        hosted_packument(
+            &ctx.state,
+            "npm-private",
+            "pkg",
+            "https://nora.example/repository/npm-private",
+        )
+        .await
+        .expect("materialize hosted cache");
+
+        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
+        let mut failing_state = ctx.state.clone();
+        failing_state.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_delete(&cache_key),
+        ));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "2.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &failing_state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat(&hosted_version_key("npm-private", "pkg", "2.0.0"))
+            .await
+            .is_none());
+        assert!(ctx.state.storage.stat(&cache_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn hosted_overlays_invalidate_and_rebuild_packument_cache() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(named_config);
+        let package_uri = "/repository/npm-private/pkg";
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                package_uri,
+                publish_payload("pkg", "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
+        assert_eq!(
+            send(&ctx.app, Method::GET, package_uri, "").await.status(),
+            StatusCode::OK
+        );
+        assert!(ctx.state.storage.stat(&cache_key).await.is_some());
+
+        let deprecation = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": {"deprecated": "do not use"}}
+        });
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                package_uri,
+                serde_json::to_vec(&deprecation).unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let response = send(&ctx.app, Method::GET, package_uri, "").await;
+        let packument: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(packument["versions"]["1.0.0"]["deprecated"], "do not use");
+
+        let tag_uri = "/repository/npm-private/-/package/pkg/dist-tags/next";
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                tag_uri,
+                serde_json::to_vec("1.0.0").unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let response = send(&ctx.app, Method::GET, package_uri, "").await;
+        let packument: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(packument["dist-tags"]["next"], "1.0.0");
+
+        assert_eq!(
+            send(&ctx.app, Method::DELETE, tag_uri, "").await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let response = send(&ctx.app, Method::GET, package_uri, "").await;
+        let packument: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(packument["dist-tags"].get("next").is_none());
     }
 
     #[tokio::test]
