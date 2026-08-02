@@ -27,25 +27,29 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 
 ## Supported Registries
 
-| Registry | Mount Point | Upstream Proxy | Auth |
-|----------|------------|----------------|------|
-| Docker Registry v2 | `/v2/` | Docker Hub, GHCR, any OCI, Helm OCI | ✓ |
-| Maven | `/maven2/` | Maven Central, custom | ✓ |
-| npm | `/npm/` | npmjs.org, custom | ✓ |
-| Cargo | `/cargo/` | crates.io | ✓ |
-| PyPI | `/simple/` | pypi.org, custom | ✓ |
-| Go Modules | `/go/` | proxy.golang.org, custom | ✓ |
-| Raw files | `/raw/` | — | ✓ |
-| RubyGems | `/gems/` | rubygems.org | ✓ |
-| Terraform | `/terraform/` | registry.terraform.io | ✓ |
-| Ansible Galaxy | `/ansible/` | galaxy.ansible.com | ✓ |
-| NuGet | `/nuget/` | api.nuget.org | ✓ |
-| Pub (Dart/Flutter) | `/pub/` | pub.dev | ✓ |
-| Conan (C/C++) | `/conan/` | ConanCenter | ✓ |
-| RPM (yum/dnf) | `/rpm/` | — (hosted, GPG-signed) | ✓ |
-| Debian/APT | `/deb/` | — (hosted, GPG-signed) | ✓ |
+All endpoints require authentication. Anonymous read is opt-in via `anonymous_read: true`.
+
+| Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
+|--------|:---:|:---:|---|---|
+| Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
+| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
+| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
+| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
+| Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
+| Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT` (ETag/`If-Match` — local backend only; `If-None-Match: *` works on any backend) |
+| RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented in NORA v1.1.0 |
+| Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
+| Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
+| NuGet | ✅ | ❌ | `api.nuget.org` | proxy only — `dotnet nuget push` not implemented |
+| Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
+| Conan (C/C++) | ⚠️ | ❌ | `center2.conan.io` | proxy only; Conan client compatibility tracked in COMPAT.md |
+| RPM (yum/dnf) | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `config.registries.rpm.proxies` (off by default); auto-generates `repodata/` |
+| Debian/APT | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `config.registries.deb.proxies` (off by default); flat & structured layouts; auto-generates `Packages`/`Release`/`InRelease` |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
+
+> **Pull/Push legend:** ✅ supported · ⚠️ partial (pull-through available but off by default, or client compatibility issue) · ❌ not implemented in NORA v1.1.0 · — not applicable (protocol has no push). Per-format details and cache strategy in [COMPAT.md](COMPAT.md).
 
 ## Quick Start
 
