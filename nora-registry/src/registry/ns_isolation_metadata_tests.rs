@@ -296,16 +296,19 @@ async fn npm_internal_stale_not_refetched() {
         c.npm.metadata_ttl = 0; // every pull is "stale" → would trigger refetch_metadata
         c.npm.serve_stale = false; // without the guard, the failed refetch → 502
     });
-    // A locally-published internal package in the fresh named hosted layout
-    // must be served from local state, NOT re-fetched upstream.
-    ctx.state
-        .storage
-        .put(
-            "npm/repositories/npm-private/internalpkg/pkg.json",
-            br#"{"name":"internalpkg"}"#,
+    // Seed through the legacy public publish route so this test exercises the
+    // same committed-generation contract as a real npm client.
+    assert_eq!(
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/internalpkg",
+            crate::test_helpers::npm_publish_payload("internalpkg", "1.0.0", "latest"),
         )
         .await
-        .unwrap();
+        .status(),
+        StatusCode::CREATED
+    );
     let resp = send(&ctx.app, Method::GET, "/npm/internalpkg", "").await;
     assert_eq!(
         resp.status(),

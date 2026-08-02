@@ -1092,29 +1092,36 @@ async fn upload_legacy(
     Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
 ) -> Response {
+    let authorize = move |namespace: &str| enforce_namespace_scope(&authority, namespace).is_ok();
     if let Some(repository) = state.config.maven.default_repository.clone() {
-        return upload_configured(state, &repository, path, authority, body).await;
+        return upload_configured(state, &repository, path, body, authorize).await;
     }
     let repository = DirectRepository::legacy(&state);
-    upload_direct(state, repository, path, authority, body).await
+    upload_direct(state, repository, path, body, authorize).await
 }
 
-pub(crate) async fn upload_named(
+pub(crate) async fn upload_named<F>(
     State(state): State<AppState>,
     Path((repository, path)): Path<(String, String)>,
-    Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
-) -> Response {
-    upload_configured(state, &repository, path, authority, body).await
+    authorize: F,
+) -> Response
+where
+    F: FnOnce(&str) -> bool,
+{
+    upload_configured(state, &repository, path, body, authorize).await
 }
 
-async fn upload_configured(
+async fn upload_configured<F>(
     state: AppState,
     repository: &str,
     path: String,
-    authority: NamespaceAuthority,
     body: Bytes,
-) -> Response {
+    authorize: F,
+) -> Response
+where
+    F: FnOnce(&str) -> bool,
+{
     let Some(config) = state.config.maven.repository(repository).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1124,16 +1131,19 @@ async fn upload_configured(
     if repository.is_proxy() || repository.write_policy == MavenWritePolicy::Deny {
         return method_not_allowed("GET");
     }
-    upload_direct(state, repository, path, authority, body).await
+    upload_direct(state, repository, path, body, authorize).await
 }
 
-async fn upload_direct(
+async fn upload_direct<F>(
     state: AppState,
     repository: DirectRepository,
     path: String,
-    authority: NamespaceAuthority,
     body: Bytes,
-) -> Response {
+    authorize: F,
+) -> Response
+where
+    F: FnOnce(&str) -> bool,
+{
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
@@ -1151,7 +1161,7 @@ async fn upload_direct(
             } => format!("{}/{}", group_path, artifact_id),
             MavenPathKind::Opaque => String::new(),
         });
-    if enforce_namespace_scope(&authority, &maven_namespace).is_err() {
+    if !authorize(&maven_namespace) {
         return StatusCode::FORBIDDEN.into_response();
     }
 

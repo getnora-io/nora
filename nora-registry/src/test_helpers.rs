@@ -45,10 +45,18 @@ use parking_lot::RwLock;
 pub struct FaultInjectBackend {
     inner: Storage,
     get_failures: HashSet<String>,
+    put_failures: HashSet<String>,
+    put_after_failures: HashSet<String>,
+    create_failures: HashSet<String>,
+    create_after_failures: HashSet<String>,
     delete_failures: HashSet<String>,
+    delete_after_failures: HashSet<String>,
     stat_none: HashSet<String>,
+    list_omissions: HashSet<String>,
     delete_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+    get_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     list_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+    write_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl FaultInjectBackend {
@@ -56,10 +64,18 @@ impl FaultInjectBackend {
         Self {
             inner,
             get_failures: HashSet::new(),
+            put_failures: HashSet::new(),
+            put_after_failures: HashSet::new(),
+            create_failures: HashSet::new(),
+            create_after_failures: HashSet::new(),
             delete_failures: HashSet::new(),
+            delete_after_failures: HashSet::new(),
             stat_none: HashSet::new(),
+            list_omissions: HashSet::new(),
             delete_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            get_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             list_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            write_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -68,8 +84,33 @@ impl FaultInjectBackend {
         self
     }
 
+    pub fn fail_put(mut self, key: impl Into<String>) -> Self {
+        self.put_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_put_after(mut self, key: impl Into<String>) -> Self {
+        self.put_after_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_create(mut self, key: impl Into<String>) -> Self {
+        self.create_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_create_after(mut self, key: impl Into<String>) -> Self {
+        self.create_after_failures.insert(key.into());
+        self
+    }
+
     pub fn fail_delete(mut self, key: impl Into<String>) -> Self {
         self.delete_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_delete_after(mut self, key: impl Into<String>) -> Self {
+        self.delete_after_failures.insert(key.into());
         self
     }
 
@@ -79,26 +120,62 @@ impl FaultInjectBackend {
         self
     }
 
+    /// Simulate an eventually-consistent object-store LIST that omits an
+    /// existing exact key while GET continues to return it.
+    pub fn omit_from_list(mut self, key: impl Into<String>) -> Self {
+        self.list_omissions.insert(key.into());
+        self
+    }
+
     pub fn delete_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
         Arc::clone(&self.delete_attempts)
     }
 
+    pub fn get_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.get_attempts)
+    }
+
     pub fn list_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
         Arc::clone(&self.list_attempts)
+    }
+
+    pub fn write_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.write_attempts)
     }
 }
 
 #[async_trait]
 impl StorageBackend for FaultInjectBackend {
     async fn put(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
-        self.inner.put(key, data).await
+        self.write_attempts.lock().push(format!("put:{key}"));
+        if self.put_failures.contains(key) {
+            return Err(StorageError::Network("injected put failure".to_string()));
+        }
+        let result = self.inner.put(key, data).await;
+        if result.is_ok() && self.put_after_failures.contains(key) {
+            return Err(StorageError::Network(
+                "injected post-commit put failure".to_string(),
+            ));
+        }
+        result
     }
 
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
-        self.inner.put_if_absent(key, data).await
+        self.write_attempts.lock().push(format!("create:{key}"));
+        if self.create_failures.contains(key) {
+            return Err(StorageError::Network("injected create failure".to_string()));
+        }
+        let result = self.inner.put_if_absent(key, data).await;
+        if result.is_ok() && self.create_after_failures.contains(key) {
+            return Err(StorageError::Network(
+                "injected post-commit create failure".to_string(),
+            ));
+        }
+        result
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<Bytes> {
+        self.get_attempts.lock().push(key.to_string());
         if self.get_failures.contains(key) {
             return Err(StorageError::Network("injected get failure".to_string()));
         }
@@ -110,12 +187,20 @@ impl StorageBackend for FaultInjectBackend {
         if self.delete_failures.contains(key) {
             return Err(StorageError::Network("injected delete failure".to_string()));
         }
-        self.inner.delete(key).await
+        let result = self.inner.delete(key).await;
+        if result.is_ok() && self.delete_after_failures.contains(key) {
+            return Err(StorageError::Network(
+                "injected post-commit delete failure".to_string(),
+            ));
+        }
+        result
     }
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.list_attempts.lock().push(prefix.to_string());
-        self.inner.list(prefix).await
+        let mut entries = self.inner.list(prefix).await?;
+        entries.retain(|key| !self.list_omissions.contains(key));
+        Ok(entries)
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -130,7 +215,8 @@ impl StorageBackend for FaultInjectBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
         let mut entries = self.inner.list_with_meta(prefix).await?;
-        entries.retain(|(key, _)| !self.stat_none.contains(key));
+        entries
+            .retain(|(key, _)| !self.stat_none.contains(key) && !self.list_omissions.contains(key));
         Ok(entries)
     }
 
@@ -584,6 +670,54 @@ pub async fn send_with_headers(
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
 
     app.clone().oneshot(request).await.unwrap()
+}
+
+/// Build a minimal, protocol-valid npm publish body for integration tests.
+///
+/// Keeping this in the shared test harness lets cross-router tests seed hosted
+/// state through the public publish contract instead of reconstructing Nora's
+/// private storage layout.
+pub fn npm_publish_payload(package: &str, version: &str, tag: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut archive = tar::Builder::new(encoder);
+    let package_json = serde_json::to_vec(&serde_json::json!({
+        "name": package,
+        "version": version,
+    }))
+    .unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(package_json.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "package/package.json", package_json.as_slice())
+        .unwrap();
+    let tarball = archive.into_inner().unwrap().finish().unwrap();
+    let package_basename = package.split('/').next_back().unwrap_or(package);
+    let filename = format!("{package_basename}-{version}.tgz");
+
+    serde_json::to_vec(&serde_json::json!({
+        "name": package,
+        "versions": {
+            (version): {
+                "name": package,
+                "version": version,
+                "dist": {},
+            },
+        },
+        "_attachments": {
+            (filename): {
+                "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                "length": tarball.len(),
+            },
+        },
+        "dist-tags": {(tag): version},
+    }))
+    .unwrap()
 }
 
 /// Read the full response body into bytes.

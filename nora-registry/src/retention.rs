@@ -641,6 +641,10 @@ struct NpmVersionGroup {
     repository: String,
     package: String,
     versions: Vec<VersionEntry>,
+    /// A durable package maintenance marker is resumed before rules are
+    /// consulted. Marker-only packages therefore remain discoverable even
+    /// after a last-version retention run removed all split authority.
+    active_maintenance: bool,
     /// Digest of the complete authoritative hosted package state observed
     /// while planning. Every plan in this package is validated against the
     /// same digest under the exact npm publish lock.
@@ -651,6 +655,13 @@ struct NpmVersionGroup {
 struct NpmPackageSnapshot {
     versions: Vec<VersionEntry>,
     guard: String,
+    pointer: crate::npm_layout::HostedPackumentPointer,
+    packument: serde_json::Value,
+    /// Exact hashes/sizes of mutable authoritative objects. These become the
+    /// recovery oracle persisted in a retention marker; content-addressed
+    /// blobs are deliberately excluded and left to GC once unreachable.
+    authority_sha256: std::collections::BTreeMap<String, String>,
+    authority_sizes: std::collections::BTreeMap<String, u64>,
 }
 
 fn is_hosted_npm_object(kind: &crate::npm_layout::NpmObjectKind) -> bool {
@@ -658,11 +669,19 @@ fn is_hosted_npm_object(kind: &crate::npm_layout::NpmObjectKind) -> bool {
         kind,
         crate::npm_layout::NpmObjectKind::HostedPackage
             | crate::npm_layout::NpmObjectKind::HostedVersion(_)
+            | crate::npm_layout::NpmObjectKind::HostedPublishPending(_)
+            | crate::npm_layout::NpmObjectKind::HostedPublishPendingIndex
             | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
             | crate::npm_layout::NpmObjectKind::HostedTarball(_)
             | crate::npm_layout::NpmObjectKind::HostedBlob { .. }
             | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
             | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
+            | crate::npm_layout::NpmObjectKind::HostedMaintenanceActive
+            | crate::npm_layout::NpmObjectKind::HostedPackumentCurrent
+            | crate::npm_layout::NpmObjectKind::HostedPackumentRetired
+            | crate::npm_layout::NpmObjectKind::HostedPackumentFull(_)
+            | crate::npm_layout::NpmObjectKind::HostedPackumentInstallV1(_)
+            | crate::npm_layout::NpmObjectKind::HostedImportPending
     )
 }
 
@@ -671,181 +690,340 @@ fn npm_guard_bytes(hasher: &mut sha2::Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+async fn npm_exact_object(
+    storage: &Storage,
+    key: &str,
+) -> Result<Option<(axum::body::Bytes, crate::storage::FileMeta)>, String> {
+    let bytes = match storage.get(key).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(error) => return Err(format!("cannot read {key}: {error}")),
+    };
+    let meta = storage
+        .stat(key)
+        .await
+        .ok_or_else(|| format!("metadata unavailable for exact key {key}"))?;
+    if meta.size != bytes.len() as u64 {
+        return Err(format!("size changed while reading exact key {key}"));
+    }
+    let after = storage
+        .get(key)
+        .await
+        .map_err(|error| format!("cannot re-read exact key {key}: {error}"))?;
+    if after != bytes {
+        return Err(format!("contents changed while reading exact key {key}"));
+    }
+    Ok(Some((bytes, meta)))
+}
+
+async fn npm_active_transaction_present(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<bool, String> {
+    match crate::registry::read_hosted_maintenance_marker(storage, repository, package).await {
+        Ok(Some(_)) => return Ok(true),
+        Ok(None) => {}
+        Err(error) => return Err(format!("maintenance marker unreadable: {error}")),
+    }
+    let transactions =
+        crate::registry::read_hosted_active_transactions(storage, repository, package)
+            .await
+            .map_err(|error| format!("active transaction journal unreadable: {error}"))?;
+    Ok(transactions.import.is_some() || transactions.publish.is_some())
+}
+
+fn npm_version_key(repository: &str, package: &str, version: &str) -> Result<String, String> {
+    let key = format!("npm/repositories/{repository}/{package}/versions/{version}.json");
+    match crate::npm_layout::parse_npm_object_key(&key) {
+        Some(parsed)
+            if parsed.repository == repository
+                && parsed.package == package
+                && matches!(
+                    parsed.kind,
+                    crate::npm_layout::NpmObjectKind::HostedVersion(ref parsed_version)
+                        if parsed_version == version
+                ) =>
+        {
+            Ok(key)
+        }
+        _ => Err(format!(
+            "invalid npm version in committed packument: {version}"
+        )),
+    }
+}
+
+fn npm_dist_tag_key(repository: &str, package: &str, tag: &str) -> Result<String, String> {
+    let key = format!("npm/repositories/{repository}/{package}/dist-tags/{tag}");
+    match crate::npm_layout::parse_npm_object_key(&key) {
+        Some(parsed)
+            if parsed.repository == repository
+                && parsed.package == package
+                && matches!(
+                    parsed.kind,
+                    crate::npm_layout::NpmObjectKind::HostedDistTag(ref parsed_tag)
+                        if parsed_tag == tag
+                ) =>
+        {
+            Ok(key)
+        }
+        _ => Err(format!(
+            "invalid npm dist-tag in committed packument: {tag}"
+        )),
+    }
+}
+
+fn npm_deprecation_key(repository: &str, package: &str, version: &str) -> String {
+    format!("npm/repositories/{repository}/{package}/deprecations/{version}")
+}
+
+fn npm_publish_complete_key(repository: &str, package: &str, version: &str) -> String {
+    format!("npm/repositories/{repository}/{package}/publish-complete/{version}")
+}
+
 /// Read one exact hosted npm package snapshot.
 ///
-/// `LIST` establishes the relevant key set, `HEAD` supplies metadata for every
-/// listed key, and mutable/visibility objects are read and hashed. Any
-/// uncertainty fails closed for the whole package. Blob bodies are not read:
-/// their content-addressed key plus metadata is sufficient identity, while
-/// avoiding a retention-time download of every tarball.
+/// LIST is deliberately absent here. The committed pointer and its immutable
+/// full document define the complete visible version/tag set. Every mutable
+/// object reachable from that set is then read through its exact key and
+/// compared with the immutable document. A LIST omission can therefore only
+/// hide a package from discovery; it can never shrink a destructive snapshot.
 async fn npm_package_snapshot(
     storage: &Storage,
     repository: &str,
     package: &str,
-    listed_keys: Vec<String>,
 ) -> Result<NpmPackageSnapshot, String> {
     use std::collections::BTreeMap;
+    if npm_active_transaction_present(storage, repository, package).await? {
+        return Err("npm package has an active transaction".to_string());
+    }
+    let pointer = crate::registry::read_hosted_packument_pointer(storage, repository, package)
+        .await
+        .map_err(|error| format!("current pointer unreadable: {error}"))?
+        .ok_or_else(|| "current pointer is missing".to_string())?;
+    crate::registry::validate_hosted_packument_pointer(storage, repository, package, &pointer)
+        .await
+        .map_err(|error| format!("current generation invalid: {error}"))?;
+    let full_key =
+        crate::npm_layout::hosted_packument_full_key(repository, package, &pointer.generation);
+    let (full, _) = npm_exact_object(storage, &full_key)
+        .await?
+        .ok_or_else(|| format!("current full packument is missing: {full_key}"))?;
+    if hex::encode(sha2::Sha256::digest(&full)) != pointer.full_sha256 {
+        return Err("current full packument hash mismatch".to_string());
+    }
+    let packument: serde_json::Value = serde_json::from_slice(&full)
+        .map_err(|_| "current full packument is invalid JSON".to_string())?;
+    if packument.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+        return Err("current full packument package name mismatch".to_string());
+    }
+    let committed_versions = packument
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "current full packument has invalid versions".to_string())?;
+    let committed_tags = packument
+        .get("dist-tags")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "current full packument has invalid dist-tags".to_string())?;
 
-    let mut objects = BTreeMap::new();
-    for key in listed_keys {
-        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
-            continue;
-        };
-        if parsed.repository != repository
-            || parsed.package != package
-            || !is_hosted_npm_object(&parsed.kind)
-        {
-            continue;
+    let mut authority_sha256 = BTreeMap::new();
+    let mut authority_sizes = BTreeMap::new();
+    let mut authority_meta = BTreeMap::new();
+    let mut exact_versions = serde_json::Map::new();
+    let mut exact_tags = serde_json::Map::new();
+    let mut tag_keys_by_version = BTreeMap::<String, Vec<String>>::new();
+
+    for (tag, target) in committed_tags {
+        let target = target
+            .as_str()
+            .ok_or_else(|| format!("dist-tag {tag} has a non-string target"))?;
+        let key = npm_dist_tag_key(repository, package, tag)?;
+        let (bytes, meta) = npm_exact_object(storage, &key)
+            .await?
+            .ok_or_else(|| format!("committed dist-tag authority is missing: {key}"))?;
+        if bytes.as_ref() != target.as_bytes() {
+            return Err(format!("committed dist-tag authority mismatch: {key}"));
         }
-        let meta = storage
-            .stat(&key)
-            .await
-            .ok_or_else(|| format!("metadata unavailable for {key}"))?;
-        let contents = if matches!(
-            parsed.kind,
-            crate::npm_layout::NpmObjectKind::HostedPackage
-                | crate::npm_layout::NpmObjectKind::HostedVersion(_)
-                | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
-                | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
-                | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
-        ) {
-            let contents = storage
-                .get(&key)
-                .await
-                .map_err(|error| format!("cannot read {key}: {error}"))?;
-            if contents.len() as u64 != meta.size {
-                return Err(format!("size changed while reading {key}"));
-            }
-            let after = storage
-                .stat(&key)
-                .await
-                .ok_or_else(|| format!("metadata disappeared for {key}"))?;
-            if after.size != meta.size || after.modified != meta.modified {
-                return Err(format!("metadata changed while reading {key}"));
-            }
-            Some(contents)
-        } else {
-            None
-        };
-        if objects
-            .insert(key.clone(), (parsed.kind, meta, contents))
-            .is_some()
-        {
-            return Err(format!("duplicate key in listing: {key}"));
-        }
+        authority_sha256.insert(key.clone(), hex::encode(sha2::Sha256::digest(&bytes)));
+        authority_sizes.insert(key.clone(), meta.size);
+        authority_meta.insert(key.clone(), meta);
+        tag_keys_by_version
+            .entry(target.to_string())
+            .or_default()
+            .push(key);
+        exact_tags.insert(tag.clone(), serde_json::Value::String(target.to_string()));
     }
 
-    let mut hasher = sha2::Sha256::new();
-    npm_guard_bytes(&mut hasher, b"nora/npm-retention-package/v1");
-    npm_guard_bytes(&mut hasher, repository.as_bytes());
-    npm_guard_bytes(&mut hasher, package.as_bytes());
-    for (key, (_, meta, contents)) in &objects {
-        npm_guard_bytes(&mut hasher, key.as_bytes());
-        hasher.update(meta.size.to_be_bytes());
-        hasher.update(meta.modified.to_be_bytes());
-        match contents {
-            Some(contents) => {
-                hasher.update([1]);
-                npm_guard_bytes(&mut hasher, contents);
-            }
-            None => hasher.update([0]),
-        }
-    }
-
-    let mut manifests = BTreeMap::new();
-    let mut deprecations = BTreeMap::new();
-    let mut completions = BTreeMap::new();
-    let mut tags = Vec::new();
-    for (key, (kind, _, contents)) in &objects {
-        match kind {
-            crate::npm_layout::NpmObjectKind::HostedVersion(version) => {
-                if manifests
+    let mut versions = Vec::with_capacity(committed_versions.len());
+    for (version, committed_manifest) in committed_versions {
+        let manifest_key = npm_version_key(repository, package, version)?;
+        let (manifest, manifest_meta) = npm_exact_object(storage, &manifest_key)
+            .await?
+            .ok_or_else(|| format!("committed manifest authority is missing: {manifest_key}"))?;
+        let mut exact_manifest: serde_json::Value = serde_json::from_slice(&manifest)
+            .map_err(|_| format!("committed manifest is invalid JSON: {manifest_key}"))?;
+        let deprecation_key = npm_deprecation_key(repository, package, version);
+        let deprecation = npm_exact_object(storage, &deprecation_key).await?;
+        match deprecation {
+            Some((bytes, meta)) => {
+                let message = std::str::from_utf8(&bytes)
+                    .map_err(|_| format!("deprecation is not UTF-8: {deprecation_key}"))?;
+                exact_manifest
+                    .as_object_mut()
+                    .ok_or_else(|| format!("manifest is not an object: {manifest_key}"))?
                     .insert(
-                        version.clone(),
-                        (
-                            key.clone(),
-                            contents
-                                .as_ref()
-                                .ok_or_else(|| format!("manifest unreadable: {key}"))?
-                                .clone(),
-                        ),
-                    )
-                    .is_some()
-                {
-                    return Err(format!("duplicate manifest for npm version {version}"));
+                        "deprecated".to_string(),
+                        serde_json::Value::String(message.to_string()),
+                    );
+                authority_sha256.insert(
+                    deprecation_key.clone(),
+                    hex::encode(sha2::Sha256::digest(&bytes)),
+                );
+                authority_sizes.insert(deprecation_key.clone(), meta.size);
+                authority_meta.insert(deprecation_key.clone(), meta);
+            }
+            None => {
+                if committed_manifest.get("deprecated").is_some() {
+                    return Err(format!(
+                        "committed deprecation authority is missing: {deprecation_key}"
+                    ));
                 }
             }
-            crate::npm_layout::NpmObjectKind::HostedDeprecation(version) => {
-                deprecations.insert(version.clone(), key.clone());
-            }
-            crate::npm_layout::NpmObjectKind::HostedPublishComplete(version) => {
-                completions.insert(version.clone(), key.clone());
-            }
-            crate::npm_layout::NpmObjectKind::HostedDistTag(_) => {
-                tags.push((
-                    key.clone(),
-                    contents
-                        .as_ref()
-                        .ok_or_else(|| format!("dist-tag unreadable: {key}"))?
-                        .clone(),
-                ));
-            }
-            _ => {}
         }
-    }
+        if &exact_manifest != committed_manifest {
+            return Err(format!(
+                "manifest authority does not match current full packument: {manifest_key}"
+            ));
+        }
 
-    let mut versions = Vec::with_capacity(manifests.len());
-    for (version, (manifest_key, manifest)) in manifests {
         let blob_key =
             crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
                 .ok_or_else(|| {
                     format!("npm version manifest has no valid blob reference: {manifest_key}")
                 })?;
-        let Some((blob_kind, _, _)) = objects.get(&blob_key) else {
-            return Err(format!("npm version blob is missing: {blob_key}"));
-        };
-        if !matches!(
-            blob_kind,
-            crate::npm_layout::NpmObjectKind::HostedBlob { .. }
-        ) {
-            return Err(format!("npm version blob has invalid layout: {blob_key}"));
-        }
+        let (_blob_size, blob_reader) = storage
+            .get_reader(&blob_key)
+            .await
+            .map_err(|error| format!("committed npm blob is unreadable at {blob_key}: {error}"))?;
+        drop(blob_reader);
 
-        let mut keys = vec![manifest_key, blob_key];
-        if let Some(key) = completions.get(&version) {
-            keys.push(key.clone());
-        }
-        if let Some(key) = deprecations.get(&version) {
-            keys.push(key.clone());
-        }
-        for (tag_key, target) in &tags {
-            if target.as_ref() == version.as_bytes() {
-                keys.push(tag_key.clone());
+        authority_sha256.insert(
+            manifest_key.clone(),
+            hex::encode(sha2::Sha256::digest(&manifest)),
+        );
+        authority_sizes.insert(manifest_key.clone(), manifest_meta.size);
+        authority_meta.insert(manifest_key.clone(), manifest_meta);
+        let mut keys = vec![manifest_key.clone()];
+
+        let completion_key = npm_publish_complete_key(repository, package, version);
+        if let Some((completion, meta)) = npm_exact_object(storage, &completion_key).await? {
+            let expected = crate::npm_layout::hosted_manifest_digest(&manifest);
+            if completion.as_ref() != expected.as_bytes() {
+                return Err(format!("publish completion mismatch: {completion_key}"));
             }
+            authority_sha256.insert(
+                completion_key.clone(),
+                hex::encode(sha2::Sha256::digest(&completion)),
+            );
+            authority_sizes.insert(completion_key.clone(), meta.size);
+            authority_meta.insert(completion_key.clone(), meta);
+            keys.push(completion_key);
+        }
+        if authority_meta.contains_key(&deprecation_key) {
+            keys.push(deprecation_key);
+        }
+        if let Some(tag_keys) = tag_keys_by_version.get(version) {
+            keys.extend(tag_keys.iter().cloned());
         }
         keys.sort();
         keys.dedup();
-
         let mut modified = 0u64;
         let mut size = 0u64;
         for key in &keys {
-            let (_, meta, _) = objects
+            let meta = authority_meta
                 .get(key)
-                .ok_or_else(|| format!("snapshot key disappeared: {key}"))?;
+                .ok_or_else(|| format!("snapshot metadata disappeared for exact key {key}"))?;
             modified = modified.max(meta.modified);
             size += meta.size;
         }
         versions.push(VersionEntry {
-            name: version,
+            name: version.clone(),
             keys,
             modified,
             size,
         });
+        exact_versions.insert(version.clone(), exact_manifest);
+    }
+
+    let package_key = crate::npm_layout::hosted_package_key(repository, package);
+    let mut rebuilt = match npm_exact_object(storage, &package_key).await? {
+        Some((bytes, meta)) => {
+            authority_sha256.insert(
+                package_key.clone(),
+                hex::encode(sha2::Sha256::digest(&bytes)),
+            );
+            authority_sizes.insert(package_key.clone(), meta.size);
+            authority_meta.insert(package_key, meta);
+            serde_json::from_slice(&bytes)
+                .map_err(|_| "npm package authority is invalid JSON".to_string())?
+        }
+        None => serde_json::json!({}),
+    };
+    let rebuilt_object = rebuilt
+        .as_object_mut()
+        .ok_or_else(|| "npm package authority is not an object".to_string())?;
+    rebuilt_object.insert(
+        "name".to_string(),
+        serde_json::Value::String(package.to_string()),
+    );
+    rebuilt_object.insert(
+        "versions".to_string(),
+        serde_json::Value::Object(exact_versions),
+    );
+    rebuilt_object.insert(
+        "dist-tags".to_string(),
+        serde_json::Value::Object(exact_tags),
+    );
+    if rebuilt != packument {
+        return Err("split npm authority does not match current full packument".to_string());
+    }
+
+    let pointer_after =
+        crate::registry::read_hosted_packument_pointer(storage, repository, package)
+            .await
+            .map_err(|error| format!("current pointer re-read failed: {error}"))?;
+    if pointer_after.as_ref() != Some(&pointer) {
+        return Err("current pointer changed while taking snapshot".to_string());
+    }
+    if npm_active_transaction_present(storage, repository, package).await? {
+        return Err("npm transaction appeared while taking snapshot".to_string());
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    npm_guard_bytes(&mut hasher, b"nora/npm-retention-package/v2");
+    npm_guard_bytes(&mut hasher, repository.as_bytes());
+    npm_guard_bytes(&mut hasher, package.as_bytes());
+    npm_guard_bytes(
+        &mut hasher,
+        &serde_json::to_vec(&pointer).map_err(|_| "cannot encode pointer".to_string())?,
+    );
+    npm_guard_bytes(&mut hasher, &full);
+    for (key, digest) in &authority_sha256 {
+        npm_guard_bytes(&mut hasher, key.as_bytes());
+        npm_guard_bytes(&mut hasher, digest.as_bytes());
+        if let Some(meta) = authority_meta.get(key) {
+            hasher.update(meta.size.to_be_bytes());
+            hasher.update(meta.modified.to_be_bytes());
+        }
     }
 
     Ok(NpmPackageSnapshot {
         versions,
         guard: hex::encode(hasher.finalize()),
+        pointer,
+        packument,
+        authority_sha256,
+        authority_sizes,
     })
 }
 
@@ -854,12 +1032,7 @@ async fn read_npm_package_snapshot(
     repository: &str,
     package: &str,
 ) -> Result<NpmPackageSnapshot, String> {
-    let prefix = format!("npm/repositories/{repository}/{package}/");
-    let keys = storage
-        .list(&prefix)
-        .await
-        .map_err(|error| format!("cannot list {prefix}: {error}"))?;
-    npm_package_snapshot(storage, repository, package, keys).await
+    npm_package_snapshot(storage, repository, package).await
 }
 
 /// Collect npm packages, including packages that only contain cleanup state.
@@ -873,28 +1046,49 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<NpmVersionGroup> {
             return Vec::new();
         }
     };
-    let mut packages: std::collections::BTreeMap<(String, String), Vec<String>> =
-        std::collections::BTreeMap::new();
+    let mut packages = std::collections::BTreeSet::new();
     for key in all_keys {
         let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
             continue;
         };
         if is_hosted_npm_object(&parsed.kind) {
-            packages
-                .entry((parsed.repository, parsed.package))
-                .or_default()
-                .push(key);
+            packages.insert((parsed.repository, parsed.package));
         }
     }
 
     let mut result = Vec::with_capacity(packages.len());
-    for ((repository, package), keys) in packages {
-        match npm_package_snapshot(storage, &repository, &package, keys).await {
+    for (repository, package) in packages {
+        match crate::registry::read_hosted_maintenance_marker(storage, &repository, &package).await
+        {
+            Ok(Some(_)) => {
+                result.push(NpmVersionGroup {
+                    group_name: format!("npm:{repository}:{package}"),
+                    repository,
+                    package,
+                    versions: Vec::new(),
+                    active_maintenance: true,
+                    snapshot_guard: String::new(),
+                });
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    repository,
+                    package,
+                    %error,
+                    "retention: npm maintenance marker is unreadable; package skipped"
+                );
+                continue;
+            }
+        }
+        match npm_package_snapshot(storage, &repository, &package).await {
             Ok(snapshot) => result.push(NpmVersionGroup {
                 group_name: format!("npm:{repository}:{package}"),
                 repository,
                 package,
                 versions: snapshot.versions,
+                active_maintenance: false,
                 snapshot_guard: snapshot.guard,
             }),
             Err(error) => {
@@ -911,361 +1105,283 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<NpmVersionGroup> {
 }
 
 #[derive(Debug, Default)]
-struct NpmCleanupOutcome {
-    complete: bool,
-    deleted_keys: usize,
-    bytes_freed: u64,
-}
-
-/// Remove package-level hosted state after retention deleted the last version
-/// manifest. Empty packages are collected independently, so a partial failure
-/// leaves at least one discoverable key and is retried on a later run.
-///
-/// The caller holds npm's exact package publish lock.
-async fn clean_empty_npm_package(
-    storage: &Storage,
-    repository: &str,
-    package: &str,
-) -> NpmCleanupOutcome {
-    let versions_prefix = format!("npm/repositories/{repository}/{package}/versions/");
-    let versions = match storage.list(&versions_prefix).await {
-        Ok(keys) => keys,
-        Err(error) => {
-            tracing::warn!(
-                repository,
-                package,
-                error = %error,
-                "retention: cannot verify empty npm package; package metadata kept"
-            );
-            return NpmCleanupOutcome::default();
-        }
-    };
-    if !versions.is_empty() {
-        return NpmCleanupOutcome {
-            complete: true,
-            ..NpmCleanupOutcome::default()
-        };
-    }
-
-    let package_prefix = format!("npm/repositories/{repository}/{package}/");
-    let mut keys = match storage.list(&package_prefix).await {
-        Ok(keys) => keys,
-        Err(error) => {
-            tracing::warn!(
-                repository,
-                package,
-                error = %error,
-                "retention: cannot list empty npm package state; metadata kept"
-            );
-            return NpmCleanupOutcome::default();
-        }
-    };
-    keys.sort();
-    let mut outcome = NpmCleanupOutcome::default();
-    for key in keys {
-        let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
-            continue;
-        };
-        if parsed.repository != repository || parsed.package != package {
-            continue;
-        }
-        if !matches!(
-            parsed.kind,
-            crate::npm_layout::NpmObjectKind::HostedPackage
-                | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
-                | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
-                | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
-        ) {
-            continue;
-        }
-        let Some(meta) = storage.stat(&key).await else {
-            tracing::warn!(
-                repository,
-                package,
-                key,
-                "retention: cannot stat empty npm package state; cleanup will retry"
-            );
-            return outcome;
-        };
-        match storage.delete(&key).await {
-            Ok(()) => {
-                outcome.deleted_keys += 1;
-                outcome.bytes_freed += meta.size;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    repository,
-                    package,
-                    key,
-                    %error,
-                    "retention: empty npm package cleanup failed; cleanup will retry"
-                );
-                return outcome;
-            }
-        }
-    }
-    outcome.complete = true;
-    outcome
-}
-
-async fn npm_blob_still_referenced(
-    storage: &Storage,
-    blob_key: &str,
-) -> Result<bool, StorageError> {
-    let Some(parsed) = crate::npm_layout::parse_npm_object_key(blob_key) else {
-        return Ok(false);
-    };
-    if !matches!(
-        parsed.kind,
-        crate::npm_layout::NpmObjectKind::HostedBlob { .. }
-    ) {
-        return Ok(false);
-    }
-    let prefix = format!(
-        "npm/repositories/{}/{}/versions/",
-        parsed.repository, parsed.package
-    );
-    for manifest_key in storage.list(&prefix).await? {
-        let manifest = storage.get(&manifest_key).await?;
-        if crate::npm_layout::hosted_blob_key_from_manifest(
-            &parsed.repository,
-            &parsed.package,
-            &manifest,
-        )
-        .as_deref()
-            == Some(blob_key)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[derive(Debug, Default)]
-struct NpmDeleteOutcome {
-    applied: bool,
-    deleted_keys: usize,
-    bytes_freed: u64,
-}
-
-/// Delete one hosted npm version with its version manifest as the visibility
-/// commit point. Mutable dependants are removed first, with
-/// `publish-complete` first of all: if a later pre-commit operation fails, an
-/// exact publish retry observes the missing completion marker and can repair
-/// the original publish state. Arbitrary tags or deprecations added later are
-/// not reconstructible, so this phase is fail-safe rather than atomic. The
-/// content-addressed blob is considered only after the manifest commit and may
-/// safely remain as a GC-healable orphan.
-async fn delete_npm_plan(
-    storage: &Storage,
-    group_name: &str,
-    plan: &DeletionPlan,
-) -> NpmDeleteOutcome {
-    let mut manifest_key = None;
-    let mut completion_keys = Vec::new();
-    let mut tag_keys = Vec::new();
-    let mut deprecation_keys = Vec::new();
-    let mut blob_keys = Vec::new();
-    for key in &plan.keys {
-        let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
-            tracing::error!(
-                group = group_name,
-                version = %plan.version_name,
-                key,
-                "retention: npm plan contains an invalid key; deletion aborted"
-            );
-            return NpmDeleteOutcome::default();
-        };
-        match parsed.kind {
-            crate::npm_layout::NpmObjectKind::HostedVersion(version)
-                if version == plan.version_name =>
-            {
-                if manifest_key.replace(key.clone()).is_some() {
-                    tracing::error!(
-                        group = group_name,
-                        version = %plan.version_name,
-                        "retention: npm plan has multiple version manifests; deletion aborted"
-                    );
-                    return NpmDeleteOutcome::default();
-                }
-            }
-            crate::npm_layout::NpmObjectKind::HostedPublishComplete(version)
-                if version == plan.version_name =>
-            {
-                completion_keys.push(key.clone());
-            }
-            crate::npm_layout::NpmObjectKind::HostedDeprecation(version)
-                if version == plan.version_name =>
-            {
-                deprecation_keys.push(key.clone());
-            }
-            crate::npm_layout::NpmObjectKind::HostedDistTag(_) => tag_keys.push(key.clone()),
-            crate::npm_layout::NpmObjectKind::HostedBlob { .. } => blob_keys.push(key.clone()),
-            _ => {
-                tracing::error!(
-                    group = group_name,
-                    version = %plan.version_name,
-                    key,
-                    "retention: npm plan contains an unrelated key; deletion aborted"
-                );
-                return NpmDeleteOutcome::default();
-            }
-        }
-    }
-    let Some(manifest_key) = manifest_key else {
-        tracing::error!(
-            group = group_name,
-            version = %plan.version_name,
-            "retention: npm plan has no version manifest; deletion aborted"
-        );
-        return NpmDeleteOutcome::default();
-    };
-    completion_keys.sort();
-    tag_keys.sort();
-    deprecation_keys.sort();
-    blob_keys.sort();
-
-    let mut outcome = NpmDeleteOutcome::default();
-
-    // Pre-commit phase. A failure may leave already-deleted mutable state, but
-    // never removes the version manifest. Deleting the completion marker first
-    // makes the original publish state explicitly retryable by npm's
-    // exact-publish repair path. Later operator mutations are not
-    // reconstructible; the manifest nevertheless remains a safe visibility
-    // boundary and no tag can dangle from a deleted version.
-    for key in completion_keys
-        .iter()
-        .chain(tag_keys.iter())
-        .chain(deprecation_keys.iter())
-    {
-        if tag_keys.binary_search(key).is_ok() {
-            match storage.get(key).await {
-                Ok(target) if target.as_ref() == plan.version_name.as_bytes() => {}
-                Ok(_) => {
-                    tracing::warn!(
-                        group = group_name,
-                        version = %plan.version_name,
-                        key,
-                        "retention: npm dist-tag target changed; deletion aborted"
-                    );
-                    return outcome;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        group = group_name,
-                        version = %plan.version_name,
-                        key,
-                        %error,
-                        "retention: cannot verify npm dist-tag target; deletion aborted"
-                    );
-                    return outcome;
-                }
-            }
-        }
-        let Some(meta) = storage.stat(key).await else {
-            tracing::warn!(
-                group = group_name,
-                version = %plan.version_name,
-                key,
-                "retention: cannot stat dependent npm object; deletion aborted"
-            );
-            return outcome;
-        };
-        match storage.delete(key).await {
-            Ok(()) => {
-                outcome.deleted_keys += 1;
-                outcome.bytes_freed += meta.size;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    group = group_name,
-                    version = %plan.version_name,
-                    key,
-                    %error,
-                    "retention: dependent npm object deletion failed; manifest kept"
-                );
-                return outcome;
-            }
-        }
-    }
-
-    let Some(manifest_meta) = storage.stat(&manifest_key).await else {
-        tracing::warn!(
-            group = group_name,
-            version = %plan.version_name,
-            key = %manifest_key,
-            "retention: cannot stat npm manifest; deletion aborted"
-        );
-        return outcome;
-    };
-    match storage.delete(&manifest_key).await {
-        Ok(()) => {
-            outcome.deleted_keys += 1;
-            outcome.bytes_freed += manifest_meta.size;
-            outcome.applied = true;
-        }
-        Err(error) => {
-            tracing::warn!(
-                group = group_name,
-                version = %plan.version_name,
-                key = %manifest_key,
-                %error,
-                "retention: npm manifest deletion failed; blob kept"
-            );
-            return outcome;
-        }
-    }
-
-    // Post-commit phase: failures only leave content-addressed orphan blobs.
-    for key in blob_keys {
-        match npm_blob_still_referenced(storage, &key).await {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(
-                    group = group_name,
-                    version = %plan.version_name,
-                    key,
-                    %error,
-                    "retention: cannot prove npm blob is unreferenced; blob kept"
-                );
-                continue;
-            }
-        }
-        let Some(meta) = storage.stat(&key).await else {
-            tracing::warn!(
-                group = group_name,
-                version = %plan.version_name,
-                key,
-                "retention: cannot stat unreferenced npm blob; blob kept"
-            );
-            continue;
-        };
-        match storage.delete(&key).await {
-            Ok(()) => {
-                outcome.deleted_keys += 1;
-                outcome.bytes_freed += meta.size;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    group = group_name,
-                    version = %plan.version_name,
-                    key,
-                    %error,
-                    "retention: unreferenced npm blob deletion failed; GC will retry"
-                );
-            }
-        }
-    }
-
-    outcome
-}
-
-#[derive(Debug, Default)]
 struct NpmBatchOutcome {
     applied_versions: usize,
     deleted_keys: usize,
     bytes_freed: u64,
+    changed: bool,
+}
+
+async fn delete_npm_authority_exact(
+    storage: &Storage,
+    key: &str,
+    expected_sha256: &str,
+) -> Result<bool, StorageError> {
+    let current = match storage.get(key).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if hex::encode(sha2::Sha256::digest(&current)) != expected_sha256 {
+        return Err(StorageError::AlreadyExists);
+    }
+
+    let deletion = storage.delete(key).await;
+    match storage.get(key).await {
+        Err(StorageError::NotFound) => Ok(true),
+        Ok(bytes) if hex::encode(sha2::Sha256::digest(&bytes)) != expected_sha256 => {
+            Err(StorageError::AlreadyExists)
+        }
+        Ok(_) => match deletion {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_npm_retired_marker(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<(), StorageError> {
+    let key = crate::npm_layout::hosted_packument_retired_key(repository, package);
+    match storage.get(&key).await {
+        Ok(bytes) if bytes.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 => {
+            return Ok(())
+        }
+        Ok(_) => return Err(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let write = storage
+        .put_if_absent(&key, crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1)
+        .await;
+    match storage.get(&key).await {
+        Ok(bytes) if bytes.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 => Ok(()),
+        Ok(_) => Err(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => match write {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_npm_retired_authority_absent(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    expected_authority: &std::collections::BTreeMap<String, String>,
+) -> Result<(), StorageError> {
+    let transactions =
+        crate::registry::read_hosted_active_transactions(storage, repository, package).await?;
+    if transactions.import.is_some() || transactions.publish.is_some() {
+        return Err(StorageError::AlreadyExists);
+    }
+    // Every destructive key came from the immutable base generation and was
+    // persisted in the maintenance marker before the pointer disappeared.
+    // Recheck that exact roster; LIST omission is never accepted as proof that
+    // retirement cleanup completed.
+    for key in expected_authority.keys() {
+        match storage.get(key).await {
+            Err(StorageError::NotFound) => {}
+            Ok(_) => return Err(StorageError::AlreadyExists),
+            Err(error) => return Err(error),
+        }
+    }
+    // The package root has a fixed exact key and may legitimately have been
+    // absent from the base generation. Probe it independently so a late or
+    // omitted live root cannot be hidden by a LIST snapshot.
+    let package_key = crate::npm_layout::hosted_package_key(repository, package);
+    match storage.get(&package_key).await {
+        Err(StorageError::NotFound) => {}
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// Resume one durable npm retention operation. The package publish lock is
+/// held by every caller. This function intentionally does not clear the active
+/// marker; the shared npm maintenance dispatcher removes it only after this
+/// complete state machine returns success.
+pub(crate) async fn resume_npm_retention_operation(
+    storage: &Storage,
+    marker: &crate::npm_layout::HostedMaintenanceMarker,
+) -> Result<(), StorageError> {
+    let crate::npm_layout::HostedMaintenanceAction::Retention {
+        removed_versions,
+        expected_authority,
+        ..
+    } = &marker.action
+    else {
+        return Err(StorageError::IntegrityViolation);
+    };
+    if removed_versions.is_empty() || expected_authority.is_empty() {
+        return Err(StorageError::IntegrityViolation);
+    }
+
+    match &marker.target {
+        crate::npm_layout::HostedMaintenanceTarget::Live { pointer: target } => {
+            crate::registry::validate_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+                target,
+            )
+            .await?;
+            match crate::registry::read_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+            )
+            .await?
+            {
+                Some(current) if current == marker.base => {
+                    crate::registry::commit_hosted_packument_pointer(
+                        storage,
+                        &marker.repository,
+                        &marker.package,
+                        target,
+                    )
+                    .await?;
+                }
+                Some(current) if current == *target => {}
+                _ => return Err(StorageError::AlreadyExists),
+            }
+        }
+        crate::npm_layout::HostedMaintenanceTarget::Retired => {
+            match crate::registry::read_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+            )
+            .await?
+            {
+                Some(current) if current == marker.base => {
+                    let pointer = serde_json::to_vec(&marker.base)
+                        .map_err(|_| StorageError::IntegrityViolation)?;
+                    let expected = hex::encode(sha2::Sha256::digest(pointer));
+                    delete_npm_authority_exact(
+                        storage,
+                        &crate::npm_layout::hosted_packument_current_key(
+                            &marker.repository,
+                            &marker.package,
+                        ),
+                        &expected,
+                    )
+                    .await?;
+                }
+                None => {}
+                Some(_) => return Err(StorageError::AlreadyExists),
+            }
+        }
+    }
+
+    // The pointer is the visibility boundary. Only after it is at the durable
+    // target do we remove exact source authority. Missing is an already-done
+    // step; a replacement body or read error fails closed and leaves the
+    // marker blocking every package writer.
+    let mut expected = expected_authority.iter().collect::<Vec<_>>();
+    expected.sort_by_key(|(key, _)| {
+        crate::npm_layout::parse_npm_object_key(key).is_some_and(|parsed| {
+            matches!(
+                parsed.kind,
+                crate::npm_layout::NpmObjectKind::HostedVersion(_)
+            )
+        })
+    });
+    for (key, expected_sha256) in expected {
+        delete_npm_authority_exact(storage, key, expected_sha256).await?;
+    }
+
+    match &marker.target {
+        crate::npm_layout::HostedMaintenanceTarget::Live { pointer: target } => {
+            crate::registry::validate_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+                target,
+            )
+            .await?;
+            match crate::registry::read_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+            )
+            .await?
+            {
+                Some(current) if current == *target => Ok(()),
+                _ => Err(StorageError::AlreadyExists),
+            }
+        }
+        crate::npm_layout::HostedMaintenanceTarget::Retired => {
+            ensure_npm_retired_authority_absent(
+                storage,
+                &marker.repository,
+                &marker.package,
+                expected_authority,
+            )
+            .await?;
+            ensure_npm_retired_marker(storage, &marker.repository, &marker.package).await?;
+            match crate::registry::read_hosted_packument_pointer(
+                storage,
+                &marker.repository,
+                &marker.package,
+            )
+            .await?
+            {
+                None => Ok(()),
+                Some(_) => Err(StorageError::AlreadyExists),
+            }
+        }
+    }
+}
+
+async fn npm_retention_target_matches_snapshot(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    snapshot: &NpmPackageSnapshot,
+    removed: &std::collections::HashSet<String>,
+    target: &crate::npm_layout::HostedMaintenanceTarget,
+) -> Result<bool, String> {
+    let mut expected = snapshot.packument.clone();
+    let versions = expected
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "snapshot packument has invalid versions".to_string())?;
+    versions.retain(|version, _| !removed.contains(version));
+    if versions.is_empty() {
+        return Ok(matches!(
+            target,
+            crate::npm_layout::HostedMaintenanceTarget::Retired
+        ));
+    }
+    let tags = expected
+        .get_mut("dist-tags")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "snapshot packument has invalid dist-tags".to_string())?;
+    tags.retain(|_, value| {
+        !value
+            .as_str()
+            .is_some_and(|version| removed.contains(version))
+    });
+    let crate::npm_layout::HostedMaintenanceTarget::Live { pointer } = target else {
+        return Ok(false);
+    };
+    crate::registry::validate_hosted_packument_pointer(storage, repository, package, pointer)
+        .await
+        .map_err(|error| format!("prepared target generation is invalid: {error}"))?;
+    let key =
+        crate::npm_layout::hosted_packument_full_key(repository, package, &pointer.generation);
+    let (full, _) = npm_exact_object(storage, &key)
+        .await?
+        .ok_or_else(|| format!("prepared target full document is missing: {key}"))?;
+    let prepared: serde_json::Value = serde_json::from_slice(&full)
+        .map_err(|_| "prepared target full document is invalid JSON".to_string())?;
+    Ok(prepared == expected)
 }
 
 /// Validate and apply a complete npm package plan while holding the same lock
@@ -1283,6 +1399,40 @@ async fn apply_npm_plans(
 ) -> NpmBatchOutcome {
     let lock = crate::acquire_publish_lock(publish_locks, &group.group_name);
     let _guard = lock.lock().await;
+
+    match crate::registry::resume_hosted_maintenance_operation(
+        storage,
+        &group.repository,
+        &group.package,
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!(
+                repository = group.repository,
+                package = group.package,
+                "retention: resumed prior npm maintenance operation; stale plan skipped"
+            );
+            return NpmBatchOutcome {
+                changed: true,
+                ..NpmBatchOutcome::default()
+            };
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                repository = group.repository,
+                package = group.package,
+                %error,
+                "retention: active npm maintenance cannot be resumed; package kept"
+            );
+            return NpmBatchOutcome::default();
+        }
+    }
+
+    if group.active_maintenance {
+        return NpmBatchOutcome::default();
+    }
 
     let current = match read_npm_package_snapshot(storage, &group.repository, &group.package).await
     {
@@ -1307,46 +1457,144 @@ async fn apply_npm_plans(
     }
 
     let mut outcome = NpmBatchOutcome::default();
-    // The hosted packument cache is derived and deliberately excluded from
-    // the authoritative retention snapshot. Remove it before the first
-    // mutation while holding the exact publish lock; a later read will rebuild
-    // from whatever authoritative state the batch commits.
-    let cache_key =
-        crate::npm_layout::hosted_packument_cache_key(&group.repository, &group.package);
-    let cache_size = storage
-        .stat(&cache_key)
-        .await
-        .map(|meta| meta.size)
-        .unwrap_or(0);
-    match storage.delete(&cache_key).await {
-        Ok(()) => {
-            outcome.deleted_keys += 1;
-            outcome.bytes_freed += cache_size;
-        }
-        Err(StorageError::NotFound) => {}
+    if plans.is_empty() {
+        return outcome;
+    }
+    let base = current.pointer.clone();
+
+    let removed = plans
+        .iter()
+        .map(|plan| plan.version_name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let target = match crate::registry::prepare_hosted_packument_after_retention(
+        storage,
+        &group.repository,
+        &group.package,
+        &removed,
+    )
+    .await
+    {
+        Ok(target) => target,
         Err(error) => {
             tracing::warn!(
                 repository = group.repository,
                 package = group.package,
-                key = cache_key,
                 %error,
-                "retention: cannot invalidate npm hosted packument cache; batch skipped"
+                "retention: cannot prepare next npm packument target; batch skipped"
+            );
+            return outcome;
+        }
+    };
+    match npm_retention_target_matches_snapshot(
+        storage,
+        &group.repository,
+        &group.package,
+        &current,
+        &removed,
+        &target,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                repository = group.repository,
+                package = group.package,
+                "retention: LIST-built target differs from exact current generation; batch skipped"
+            );
+            return outcome;
+        }
+        Err(error) => {
+            tracing::warn!(
+                repository = group.repository,
+                package = group.package,
+                %error,
+                "retention: cannot validate prepared target; batch skipped"
             );
             return outcome;
         }
     }
+
+    let mut removed_versions = std::collections::BTreeMap::new();
+    let mut expected_authority = std::collections::BTreeMap::new();
     for plan in plans {
-        let deleted = delete_npm_plan(storage, &group.group_name, plan).await;
-        outcome.deleted_keys += deleted.deleted_keys;
-        outcome.bytes_freed += deleted.bytes_freed;
-        if !deleted.applied {
-            // A pre-commit failure may already have removed mutable state.
-            // Stop the package batch. The manifest remains visible and no tag
-            // can dangle from a deleted version. Removing publish-complete
-            // first also lets an exact retry repair original publish state.
-            return outcome;
+        let mut manifest_digest = None;
+        for key in &plan.keys {
+            let Some(digest) = current.authority_sha256.get(key) else {
+                tracing::warn!(
+                    repository = group.repository,
+                    package = group.package,
+                    key,
+                    "retention: planned npm authority lacks an exact snapshot hash"
+                );
+                return outcome;
+            };
+            let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
+                return outcome;
+            };
+            if matches!(
+                parsed.kind,
+                crate::npm_layout::NpmObjectKind::HostedVersion(ref version)
+                    if version == &plan.version_name
+            ) && manifest_digest.replace(digest.clone()).is_some()
+            {
+                return outcome;
+            }
+            expected_authority.insert(key.clone(), digest.clone());
         }
-        outcome.applied_versions += 1;
+        let Some(manifest_digest) = manifest_digest else {
+            return outcome;
+        };
+        removed_versions.insert(plan.version_name.clone(), manifest_digest);
+    }
+    if matches!(&target, crate::npm_layout::HostedMaintenanceTarget::Retired) {
+        expected_authority = current.authority_sha256.clone();
+    }
+
+    let bytes_freed = expected_authority
+        .keys()
+        .filter_map(|key| current.authority_sizes.get(key))
+        .sum();
+    let operation = crate::npm_layout::HostedMaintenanceOperation {
+        schema: crate::npm_layout::HOSTED_MAINTENANCE_SCHEMA_V1,
+        repository: group.repository.clone(),
+        package: group.package.clone(),
+        base,
+        target,
+        action: crate::npm_layout::HostedMaintenanceAction::Retention {
+            snapshot_guard: current.guard,
+            removed_versions,
+            expected_authority: expected_authority.clone(),
+        },
+    };
+    if let Err(error) = crate::registry::create_hosted_maintenance_marker(storage, &operation).await
+    {
+        tracing::warn!(
+            repository = group.repository,
+            package = group.package,
+            %error,
+            "retention: cannot create durable npm maintenance marker; authority untouched"
+        );
+        return outcome;
+    }
+    outcome.changed = true;
+    if let Err(error) = crate::registry::resume_hosted_maintenance_operation(
+        storage,
+        &group.repository,
+        &group.package,
+    )
+    .await
+    {
+        tracing::warn!(
+            repository = group.repository,
+            package = group.package,
+            %error,
+            "retention: npm maintenance remains active for recovery"
+        );
+        return outcome;
+    }
+
+    for plan in plans {
         info!(
             group = %group.group_name,
             version = %plan.version_name,
@@ -1354,18 +1602,12 @@ async fn apply_npm_plans(
             "Retention: deleted"
         );
     }
-
-    let cleanup = clean_empty_npm_package(storage, &group.repository, &group.package).await;
-    outcome.deleted_keys += cleanup.deleted_keys;
-    outcome.bytes_freed += cleanup.bytes_freed;
-    if !cleanup.complete {
-        tracing::warn!(
-            repository = group.repository,
-            package = group.package,
-            "retention: empty npm package cleanup remains pending"
-        );
+    NpmBatchOutcome {
+        applied_versions: plans.len(),
+        deleted_keys: expected_authority.len(),
+        bytes_freed,
+        changed: true,
     }
-    outcome
 }
 
 /// Collect PyPI package files.
@@ -1826,6 +2068,31 @@ pub(crate) async fn run_retention_configured(
         std::collections::BTreeSet::new();
 
     for (group_name, versions) in all_groups {
+        // Durable npm maintenance is a recovery obligation, not a fresh
+        // policy decision. Resume it before rule lookup so changing/removing
+        // rules cannot strand a package behind an active marker. A dry-run is
+        // strictly observational and deliberately leaves the marker intact.
+        if let Some(group) = npm_groups
+            .get(&group_name)
+            .filter(|group| group.active_maintenance)
+        {
+            if dry_run {
+                info!(
+                    repository = group.repository,
+                    package = group.package,
+                    "[dry-run] Retention: active npm maintenance requires recovery"
+                );
+            } else {
+                let outcome = apply_npm_plans(storage, publish_locks, group, &[]).await;
+                total_deleted_keys += outcome.deleted_keys;
+                total_bytes += outcome.bytes_freed;
+                if outcome.changed {
+                    mutated_registries.insert("npm".to_string());
+                }
+            }
+            continue;
+        }
+
         // Find matching rule for this group
         let registry = group_name.split(':').next().unwrap_or("");
         let rule = match find_matching_rule(rules, registry, &group_name) {
@@ -1844,7 +2111,7 @@ pub(crate) async fn run_retention_configured(
                     let outcome = apply_npm_plans(storage, publish_locks, group, &[]).await;
                     total_deleted_keys += outcome.deleted_keys;
                     total_bytes += outcome.bytes_freed;
-                    if outcome.deleted_keys > 0 {
+                    if outcome.changed {
                         mutated_registries.insert("npm".to_string());
                     }
                 }
@@ -1868,7 +2135,7 @@ pub(crate) async fn run_retention_configured(
                 total_applied += outcome.applied_versions;
                 total_deleted_keys += outcome.deleted_keys;
                 total_bytes += outcome.bytes_freed;
-                if outcome.deleted_keys > 0 {
+                if outcome.changed {
                     mutated_registries.insert("npm".to_string());
                 }
             }
@@ -2204,6 +2471,130 @@ mod tests {
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    async fn seed_npm_current(storage: &Storage, repository: &str, package: &str) {
+        // Build the first immutable generation directly. The production
+        // retention preparer intentionally requires an existing exact base
+        // pointer, so it cannot bootstrap a test package.
+        let package_key = crate::npm_layout::hosted_package_key(repository, package);
+        let mut packument: serde_json::Value = match storage.get(&package_key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Err(StorageError::NotFound) => serde_json::json!({}),
+            Err(error) => panic!("cannot read seeded package root: {error}"),
+        };
+        let mut versions = serde_json::Map::new();
+        let mut tags = serde_json::Map::new();
+        let prefix = format!("npm/repositories/{repository}/{package}/");
+        for key in storage.list(&prefix).await.unwrap() {
+            let Some(parsed) = crate::npm_layout::parse_npm_object_key(&key) else {
+                continue;
+            };
+            if parsed.repository != repository || parsed.package != package {
+                continue;
+            }
+            match parsed.kind {
+                crate::npm_layout::NpmObjectKind::HostedVersion(version) => {
+                    let bytes = storage.get(&key).await.unwrap();
+                    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let deprecation = npm_deprecation_key(repository, package, &version);
+                    if let Ok(message) = storage.get(&deprecation).await {
+                        manifest.as_object_mut().unwrap().insert(
+                            "deprecated".to_string(),
+                            serde_json::Value::String(
+                                std::str::from_utf8(&message).unwrap().to_string(),
+                            ),
+                        );
+                    }
+                    versions.insert(version, manifest);
+                }
+                crate::npm_layout::NpmObjectKind::HostedDistTag(tag) => {
+                    let target = storage.get(&key).await.unwrap();
+                    tags.insert(
+                        tag,
+                        serde_json::Value::String(
+                            std::str::from_utf8(&target).unwrap().to_string(),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let object = packument.as_object_mut().unwrap();
+        object.insert(
+            "name".to_string(),
+            serde_json::Value::String(package.to_string()),
+        );
+        object.insert("versions".to_string(), serde_json::Value::Object(versions));
+        object.insert("dist-tags".to_string(), serde_json::Value::Object(tags));
+        let full = serde_json::to_vec(&packument).unwrap();
+        let generation = hex::encode(sha2::Sha256::digest(&full));
+        let install_v1 = full.clone();
+        let pointer = crate::npm_layout::HostedPackumentPointer {
+            generation: generation.clone(),
+            full_sha256: generation.clone(),
+            install_v1_sha256: hex::encode(sha2::Sha256::digest(&install_v1)),
+        };
+        storage
+            .put(
+                &crate::npm_layout::hosted_packument_full_key(repository, package, &generation),
+                &full,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &crate::npm_layout::hosted_packument_install_v1_key(
+                    repository,
+                    package,
+                    &generation,
+                ),
+                &install_v1,
+            )
+            .await
+            .unwrap();
+        crate::registry::commit_hosted_packument_pointer(storage, repository, package, &pointer)
+            .await
+            .unwrap();
+    }
+
+    async fn seed_npm_active_import(storage: &Storage, repository: &str, package: &str) -> String {
+        let key = crate::npm_layout::hosted_import_pending_key(repository, package);
+        let session = crate::npm_layout::HostedImportSession {
+            schema: crate::npm_layout::HOSTED_IMPORT_SESSION_SCHEMA_V1,
+            repository: repository.to_string(),
+            package: package.to_string(),
+            packument_sha256: "a".repeat(64),
+            base: None,
+            versions: std::collections::BTreeMap::from([("1.0.0".to_string(), "b".repeat(64))]),
+        };
+        storage
+            .put(&key, &serde_json::to_vec(&session).unwrap())
+            .await
+            .unwrap();
+        key
+    }
+
+    async fn npm_keep_zero_group_and_plans(
+        storage: &Storage,
+        repository: &str,
+        package: &str,
+    ) -> (NpmVersionGroup, Vec<DeletionPlan>) {
+        let group_name = format!("npm:{repository}:{package}");
+        let group = collect_npm_versions(storage)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == group_name)
+            .unwrap();
+        let rule = RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        };
+        let plans = plan_deletions(group.versions.clone(), &rule, NOW);
+        (group, plans)
     }
 
     fn make_rule(
@@ -2971,6 +3362,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            seed_npm_current(&storage, repository, "pkg").await;
         }
         let proxy_key = "npm/repositories/npm-registry/proxy/tarballs/pkg/pkg-1.0.0.tgz";
         storage.put(proxy_key, b"cache").await.unwrap();
@@ -2998,7 +3390,7 @@ mod tests {
                     hex::encode(sha2::Sha512::digest(b"1.0.0"))
                 ))
                 .await
-                .is_none());
+                .is_some());
             assert!(storage
                 .stat(&format!("npm/repositories/{repository}/pkg/dist-tags/old"))
                 .await
@@ -3014,7 +3406,29 @@ mod tests {
                     repository, "pkg"
                 ))
                 .await
-                .is_none());
+                .is_some());
+            let pointer: serde_json::Value = serde_json::from_slice(
+                &storage
+                    .get(&crate::npm_layout::hosted_packument_current_key(
+                        repository, "pkg",
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let full: serde_json::Value = serde_json::from_slice(
+                &storage
+                    .get(&crate::npm_layout::hosted_packument_full_key(
+                        repository,
+                        "pkg",
+                        pointer["generation"].as_str().unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(full["versions"].get("1.0.0").is_none());
+            assert!(full["versions"].get("2.0.0").is_some());
         }
         assert!(storage.get(proxy_key).await.is_ok());
     }
@@ -3027,6 +3441,7 @@ mod tests {
         let (_, first_blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"shared").await;
         let (_, second_blob) = seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"shared").await;
         assert_eq!(first_blob, second_blob);
+        seed_npm_current(&storage, "npm-private", "pkg").await;
         let rules = vec![RetentionRule {
             registry: "npm".to_string(),
             name_glob: None,
@@ -3050,6 +3465,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retention_npm_list_omission_cannot_shrink_exact_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (old_manifest, old_blob) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"old").await;
+        let (live_manifest, live_blob) =
+            seed_npm_version(&inner, prefix, "pkg", "2.0.0", b"live").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let pointer = crate::registry::read_hosted_packument_pointer(&inner, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone())
+                .omit_from_list(&old_manifest)
+                .omit_from_list(&live_manifest)
+                .omit_from_list(crate::npm_layout::hosted_packument_current_key(
+                    "npm-private",
+                    "pkg",
+                ))
+                .omit_from_list(crate::npm_layout::hosted_packument_full_key(
+                    "npm-private",
+                    "pkg",
+                    &pointer.generation,
+                ))
+                .omit_from_list(crate::npm_layout::hosted_packument_install_v1_key(
+                    "npm-private",
+                    "pkg",
+                    &pointer.generation,
+                )),
+        ));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 1);
+        assert!(inner.get(&old_manifest).await.is_err());
+        assert!(
+            inner.get(&old_blob).await.is_ok(),
+            "blob cleanup belongs to GC"
+        );
+        assert!(inner.get(&live_manifest).await.is_ok());
+        assert!(inner.get(&live_blob).await.is_ok());
+        let current = crate::registry::read_hosted_packument_pointer(&inner, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let full: serde_json::Value = serde_json::from_slice(
+            &inner
+                .get(&crate::npm_layout::hosted_packument_full_key(
+                    "npm-private",
+                    "pkg",
+                    &current.generation,
+                ))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(full["versions"].get("1.0.0").is_none());
+        assert!(full["versions"].get("2.0.0").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_retention_npm_list_omission_cannot_hide_active_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (old_manifest, old_blob) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"old").await;
+        let (live_manifest, live_blob) =
+            seed_npm_version(&inner, prefix, "pkg", "2.0.0", b"live").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let current_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pointer_before = inner.get(&current_key).await.unwrap();
+        let import = seed_npm_active_import(&inner, "npm-private", "pkg").await;
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).omit_from_list(&import),
+        ));
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert_eq!(result.deleted_keys, 0);
+        assert_eq!(inner.get(&current_key).await.unwrap(), pointer_before);
+        for key in [
+            &old_manifest,
+            &old_blob,
+            &live_manifest,
+            &live_blob,
+            &import,
+        ] {
+            assert!(
+                inner.get(key).await.is_ok(),
+                "active package object lost: {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_retention_handles_hosted_package_named_proxy() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
@@ -3063,6 +3591,7 @@ mod tests {
             )
             .await;
         }
+        seed_npm_current(&storage, "npm-private", "proxy").await;
 
         let rules = vec![RetentionRule {
             registry: "npm".to_string(),
@@ -3089,7 +3618,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
         let prefix = "npm/repositories/npm-private/pkg";
-        seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"tarball").await;
+        let (manifest, _) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"tarball").await;
         storage
             .put(&format!("{prefix}/pkg.json"), br#"{"name":"pkg"}"#)
             .await
@@ -3102,10 +3631,14 @@ mod tests {
             .put(&format!("{prefix}/deprecations/1.0.0"), b"old")
             .await
             .unwrap();
+        let completion = format!("{prefix}/publish-complete/1.0.0");
+        let manifest_digest =
+            crate::npm_layout::hosted_manifest_digest(&storage.get(&manifest).await.unwrap());
         storage
-            .put(&format!("{prefix}/publish-complete/1.0.0"), b"complete")
+            .put(&completion, manifest_digest.as_bytes())
             .await
             .unwrap();
+        seed_npm_current(&storage, "npm-private", "pkg").await;
 
         let rules = vec![RetentionRule {
             registry: "npm".to_string(),
@@ -3117,13 +3650,26 @@ mod tests {
         let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
 
         assert_eq!(result.planned, 1);
-        assert!(
+        for key in [
+            format!("{prefix}/versions/1.0.0.json"),
+            format!("{prefix}/pkg.json"),
+            format!("{prefix}/dist-tags/latest"),
+            format!("{prefix}/deprecations/1.0.0"),
+            completion,
+            crate::npm_layout::hosted_packument_current_key("npm-private", "pkg"),
+        ] {
+            assert!(storage.get(&key).await.is_err(), "authority remains: {key}");
+        }
+        assert_eq!(
             storage
-                .list(&format!("{prefix}/"))
+                .get(&crate::npm_layout::hosted_packument_retired_key(
+                    "npm-private",
+                    "pkg"
+                ))
                 .await
                 .unwrap()
-                .is_empty(),
-            "last-version retention must not leave a 200-but-empty package shadow"
+                .as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
         );
     }
 
@@ -3134,6 +3680,7 @@ mod tests {
         let prefix = "npm/repositories/npm-private/pkg";
         let (manifest, tarball) =
             seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"tarball").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
 
         let backend =
             crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&manifest);
@@ -3167,6 +3714,7 @@ mod tests {
         let prefix = "npm/repositories/npm-private/pkg";
         seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old-tarball").await;
         seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"newer-version").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
         let group = collect_npm_versions(&storage)
             .await
             .into_iter()
@@ -3187,6 +3735,7 @@ mod tests {
         // before retention acquires the package publish lock.
         let (replacement_manifest, replacement_blob) =
             seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"replacement-tarball").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
         let replacement_manifest_bytes = storage.get(&replacement_manifest).await.unwrap();
 
         let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
@@ -3207,6 +3756,7 @@ mod tests {
         let prefix = "npm/repositories/npm-private/pkg";
         let (manifest, blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old").await;
         seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"new").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
         let group = collect_npm_versions(&storage)
             .await
             .into_iter()
@@ -3222,6 +3772,7 @@ mod tests {
         let plans = plan_deletions(group.versions.clone(), &rule, NOW);
         let tag = format!("{prefix}/dist-tags/stable");
         storage.put(&tag, b"1.0.0").await.unwrap();
+        seed_npm_current(&storage, "npm-private", "pkg").await;
 
         let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
 
@@ -3240,6 +3791,7 @@ mod tests {
         let (old_manifest, old_blob) =
             seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"old").await;
         seed_npm_version(&storage, prefix, "pkg", "2.0.0", b"new").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
         let group = collect_npm_versions(&storage)
             .await
             .into_iter()
@@ -3254,6 +3806,7 @@ mod tests {
         };
         let plans = plan_deletions(group.versions.clone(), &rule, NOW);
         seed_npm_version(&storage, prefix, "pkg", "3.0.0", b"newest").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
 
         let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
 
@@ -3272,8 +3825,14 @@ mod tests {
         seed_npm_version(&inner, prefix, "pkg", "2.0.0", b"new").await;
         let completion = format!("{prefix}/publish-complete/1.0.0");
         let tag = format!("{prefix}/dist-tags/stable");
-        inner.put(&completion, b"completed").await.unwrap();
+        let manifest_digest =
+            crate::npm_layout::hosted_manifest_digest(&inner.get(&manifest).await.unwrap());
+        inner
+            .put(&completion, manifest_digest.as_bytes())
+            .await
+            .unwrap();
         inner.put(&tag, b"1.0.0").await.unwrap();
+        seed_npm_current(&inner, "npm-private", "pkg").await;
         let backend = crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&tag);
         let attempts = backend.delete_attempts();
         let storage = Storage::from_backend(Arc::new(backend));
@@ -3294,38 +3853,37 @@ mod tests {
         let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
 
         assert_eq!(outcome.applied_versions, 0);
-        assert_eq!(outcome.deleted_keys, 1);
-        assert!(
-            inner.get(&completion).await.is_err(),
-            "publish-complete must be removed first so an exact retry repairs partial state"
-        );
+        assert_eq!(outcome.deleted_keys, 0);
+        assert!(inner.get(&completion).await.is_ok());
         assert_eq!(inner.get(&tag).await.unwrap().as_ref(), b"1.0.0");
         assert!(inner.get(&manifest).await.is_ok());
         assert!(inner.get(&blob).await.is_ok());
-        let attempts = attempts.lock();
-        assert_eq!(
-            attempts.first(),
-            Some(&crate::npm_layout::hosted_packument_cache_key(
+        assert!(inner
+            .get(&crate::npm_layout::hosted_maintenance_active_key(
                 "npm-private",
                 "pkg"
-            )),
-            "derived cache must be invalidated before authoritative state changes"
-        );
-        assert_eq!(attempts.get(1), Some(&completion));
-        assert_eq!(attempts.get(2), Some(&tag));
+            ))
+            .await
+            .is_ok());
+        let attempts = attempts.lock();
+        assert!(attempts.contains(&tag));
         assert!(!attempts.contains(&manifest));
         assert!(!attempts.contains(&blob));
     }
 
     #[tokio::test]
-    async fn empty_npm_package_cleanup_is_discoverable_and_retryable() {
+    async fn markerless_retired_npm_state_is_not_reinterpreted_as_a_retention_operation() {
         let dir = tempfile::tempdir().unwrap();
         let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
         let package_key = "npm/repositories/npm-private/pkg/pkg.json";
         inner.put(package_key, br#"{"name":"pkg"}"#).await.unwrap();
-        let failing = Storage::from_backend(Arc::new(
-            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(package_key),
-        ));
+        inner
+            .put(
+                &crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg"),
+                crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1,
+            )
+            .await
+            .unwrap();
         let rules = vec![RetentionRule {
             registry: "npm".to_string(),
             name_glob: None,
@@ -3334,14 +3892,396 @@ mod tests {
             exclude_tags: vec![],
         }];
 
-        let first = run_retention(&failing, &test_publish_locks(), None, &rules, false).await;
-        assert_eq!(first.planned, 0);
+        let result = run_retention(&inner, &test_publish_locks(), None, &rules, false).await;
+        assert_eq!(result.planned, 0);
+        assert_eq!(result.deleted_keys, 0);
         assert!(inner.get(package_key).await.is_ok());
+        assert_eq!(
+            inner
+                .get(&crate::npm_layout::hosted_packument_retired_key(
+                    "npm-private",
+                    "pkg"
+                ))
+                .await
+                .unwrap()
+                .as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
+        );
+    }
 
-        let second = run_retention(&inner, &test_publish_locks(), None, &rules, false).await;
-        assert_eq!(second.planned, 0);
-        assert!(inner.get(package_key).await.is_err());
-        assert_eq!(second.deleted_keys, 1);
+    #[tokio::test]
+    async fn npm_last_version_retention_marker_failure_leaves_current_and_authority_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let current_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let current = inner.get(&current_key).await.unwrap();
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        let active_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_create(&active_key),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&storage, "npm-private", "pkg").await;
+
+        let outcome = apply_npm_plans(&storage, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 0);
+        assert_eq!(inner.get(&current_key).await.unwrap(), current);
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&retired_key).await.is_err());
+        assert!(inner.get(&active_key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_last_version_retention_pointer_failure_is_safe_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let current_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let current = inner.get(&current_key).await.unwrap();
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        let active_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&current_key),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&failing, "npm-private", "pkg").await;
+        let first = apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        assert_eq!(first.applied_versions, 0);
+        assert_eq!(inner.get(&current_key).await.unwrap(), current);
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&retired_key).await.is_err());
+        assert!(inner.get(&active_key).await.is_ok());
+
+        let retry = run_retention(&inner, &test_publish_locks(), None, &[], false).await;
+        assert_eq!(retry.planned, 0);
+        assert!(inner.get(&current_key).await.is_err());
+        assert!(inner.get(&manifest).await.is_err());
+        assert!(inner.get(&active_key).await.is_err());
+        assert_eq!(
+            inner.get(&retired_key).await.unwrap().as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_last_version_delete_failure_stays_resumable_until_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let current_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        let active_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&manifest),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&failing, "npm-private", "pkg").await;
+        let first = apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        assert_eq!(first.applied_versions, 0);
+        assert!(inner.get(&current_key).await.is_err());
+        assert!(inner.get(&manifest).await.is_ok());
+        assert!(inner.get(&retired_key).await.is_err());
+        assert!(inner.get(&active_key).await.is_ok());
+
+        let retry = run_retention(&inner, &test_publish_locks(), None, &[], false).await;
+        assert_eq!(retry.planned, 0);
+        assert!(inner.get(&manifest).await.is_err());
+        assert!(inner.get(&active_key).await.is_err());
+        assert_eq!(
+            inner.get(&retired_key).await.unwrap().as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_last_version_active_publish_pending_blocks_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
+        let pointer =
+            crate::registry::read_hosted_packument_pointer(&storage, "npm-private", "pkg")
+                .await
+                .unwrap()
+                .unwrap();
+        let pending_index =
+            crate::npm_layout::hosted_publish_pending_index_key("npm-private", "pkg");
+        let pending = crate::npm_layout::HostedPublishPending {
+            schema: crate::npm_layout::HOSTED_PUBLISH_PENDING_SCHEMA_V1,
+            repository: "npm-private".to_string(),
+            package: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            manifest_sha256: crate::npm_layout::hosted_manifest_digest(
+                &storage.get(&manifest).await.unwrap(),
+            ),
+            blob_sha512: hex::encode(sha2::Sha512::digest(b"one")),
+            target: crate::npm_layout::HostedPublishPendingTarget::Publish {
+                base: Some(pointer.clone()),
+                target: pointer,
+            },
+        };
+        storage
+            .put(&pending_index, &serde_json::to_vec(&pending).unwrap())
+            .await
+            .unwrap();
+        let current_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        let active_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert_eq!(result.deleted_keys, 0);
+        for key in [&current_key, &manifest, &blob, &pending_index] {
+            assert!(
+                storage.get(key).await.is_ok(),
+                "active package object lost: {key}"
+            );
+        }
+        assert!(storage.get(&retired_key).await.is_err());
+        assert!(storage.get(&active_key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_retention_recovery_rejects_replaced_expected_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&manifest),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&failing, "npm-private", "pkg").await;
+        let first = apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        assert_eq!(first.applied_versions, 0);
+
+        let replacement = br#"{"name":"pkg","version":"9.9.9"}"#;
+        inner.put(&manifest, replacement).await.unwrap();
+        let active = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let retry = run_retention(&inner, &test_publish_locks(), None, &[], false).await;
+
+        assert_eq!(retry.planned, 0);
+        assert_eq!(inner.get(&manifest).await.unwrap().as_ref(), replacement);
+        assert!(inner.get(&active).await.is_ok());
+        assert!(inner
+            .get(&crate::npm_layout::hosted_packument_retired_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_retention_without_committed_pointer_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"one").await;
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert_eq!(result.deleted_keys, 0);
+        assert!(storage.get(&manifest).await.is_ok());
+        assert!(storage.get(&blob).await.is_ok());
+        assert!(storage
+            .get(&crate::npm_layout::hosted_maintenance_active_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_retention_requires_split_authority_to_match_base_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, blob) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
+        let mut replacement: serde_json::Value =
+            serde_json::from_slice(&storage.get(&manifest).await.unwrap()).unwrap();
+        replacement["description"] = serde_json::json!("changed outside the pointer");
+        let replacement = serde_json::to_vec(&replacement).unwrap();
+        storage.put(&manifest, &replacement).await.unwrap();
+        let rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(0),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+
+        assert_eq!(result.planned, 0);
+        assert_eq!(result.deleted_keys, 0);
+        assert_eq!(storage.get(&manifest).await.unwrap().as_ref(), replacement);
+        assert!(storage.get(&blob).await.is_ok());
+        assert!(storage
+            .get(&crate::npm_layout::hosted_maintenance_active_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_retention_dry_run_never_resumes_active_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&manifest),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&failing, "npm-private", "pkg").await;
+        apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        let active = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        let marker_before = inner.get(&active).await.unwrap();
+        let manifest_before = inner.get(&manifest).await.unwrap();
+
+        let dry_run = run_retention(&inner, &test_publish_locks(), None, &[], true).await;
+
+        assert_eq!(dry_run.planned, 0);
+        assert_eq!(inner.get(&active).await.unwrap(), marker_before);
+        assert_eq!(inner.get(&manifest).await.unwrap(), manifest_before);
+        assert!(inner
+            .get(&crate::npm_layout::hosted_packument_retired_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn npm_non_last_recovery_finishes_after_rules_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (old_manifest, old_blob) =
+            seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"old").await;
+        let (new_manifest, _) = seed_npm_version(&inner, prefix, "pkg", "2.0.0", b"new").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_delete(&old_manifest),
+        ));
+        let group = collect_npm_versions(&failing)
+            .await
+            .into_iter()
+            .find(|group| group.group_name == "npm:npm-private:pkg")
+            .unwrap();
+        let plans = plan_deletions(
+            group.versions.clone(),
+            &RetentionRule {
+                registry: "npm".to_string(),
+                name_glob: None,
+                keep_last: Some(1),
+                older_than_days: None,
+                exclude_tags: vec![],
+            },
+            NOW,
+        );
+        let first = apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        assert_eq!(first.applied_versions, 0);
+        let active = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        assert!(inner.get(&active).await.is_ok());
+        let pointer = crate::registry::read_hosted_packument_pointer(&inner, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let full: serde_json::Value = serde_json::from_slice(
+            &inner
+                .get(&crate::npm_layout::hosted_packument_full_key(
+                    "npm-private",
+                    "pkg",
+                    &pointer.generation,
+                ))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(full["versions"].get("1.0.0").is_none());
+
+        let changed_rules = vec![RetentionRule {
+            registry: "npm".to_string(),
+            name_glob: None,
+            keep_last: Some(99),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let retry = run_retention(&inner, &test_publish_locks(), None, &changed_rules, false).await;
+        assert_eq!(retry.planned, 0);
+        assert!(inner.get(&active).await.is_err());
+        assert!(inner.get(&old_manifest).await.is_err());
+        assert!(inner.get(&new_manifest).await.is_ok());
+        assert!(
+            inner.get(&old_blob).await.is_ok(),
+            "blob cleanup belongs to GC"
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_exact_delete_post_commit_error_is_accepted_by_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&inner, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&inner, "npm-private", "pkg").await;
+        let ambiguous = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(inner.clone())
+                .fail_delete_after(&manifest),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&ambiguous, "npm-private", "pkg").await;
+
+        let outcome = apply_npm_plans(&ambiguous, &test_publish_locks(), &group, &plans).await;
+
+        assert_eq!(outcome.applied_versions, 1);
+        assert!(inner.get(&manifest).await.is_err());
+        assert!(inner
+            .get(&crate::npm_layout::hosted_maintenance_active_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_err());
+        assert_eq!(
+            inner
+                .get(&crate::npm_layout::hosted_packument_retired_key(
+                    "npm-private",
+                    "pkg"
+                ))
+                .await
+                .unwrap()
+                .as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
+        );
     }
 
     #[tokio::test]
@@ -3441,6 +4381,60 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(storage.get("maven/com/test/a/2.0/a.jar").await.is_ok());
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_boot_recovers_npm_marker_with_empty_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "npm/repositories/npm-private/pkg";
+        let (manifest, _) = seed_npm_version(&storage, prefix, "pkg", "1.0.0", b"one").await;
+        seed_npm_current(&storage, "npm-private", "pkg").await;
+        let failing = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(storage.clone()).fail_delete(&manifest),
+        ));
+        let (group, plans) = npm_keep_zero_group_and_plans(&failing, "npm-private", "pkg").await;
+        apply_npm_plans(&failing, &test_publish_locks(), &group, &plans).await;
+        let active = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+        assert!(storage.get(&active).await.is_ok());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_retention_scheduler(
+            storage.clone(),
+            test_publish_locks(),
+            None,
+            MavenConfig::default(),
+            Arc::new(crate::repo_index::RepoIndex::new()),
+            Vec::new(),
+            86400,
+            false,
+            None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            cancel.clone(),
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while storage.get(&active).await.is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "boot recovery never cleared marker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(storage.get(&manifest).await.is_err());
+        assert_eq!(
+            storage
+                .get(&crate::npm_layout::hosted_packument_retired_key(
+                    "npm-private",
+                    "pkg"
+                ))
+                .await
+                .unwrap()
+                .as_ref(),
+            crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1
+        );
         cancel.cancel();
         handle.await.unwrap();
     }

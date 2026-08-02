@@ -10,7 +10,7 @@
 //! matching protocol handler without guessing from naming conventions.
 
 use super::method_not_allowed;
-use crate::auth::{AuthenticatedUser, NamespaceAuthority};
+use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
 use crate::AppState;
 use axum::{
     body::{Body, Bytes},
@@ -50,20 +50,20 @@ async fn download(
 async fn upload(
     State(state): State<AppState>,
     Path((repository, path)): Path<(String, String)>,
+    headers: HeaderMap,
     Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
 ) -> Response {
     if state.config.maven.enabled && state.config.maven.repository(&repository).is_some() {
-        return super::maven::upload_named(
-            State(state),
-            Path((repository, path)),
-            Extension(authority),
-            body,
-        )
-        .await;
+        let authorize =
+            move |namespace: &str| enforce_namespace_scope(&authority, namespace).is_ok();
+        return super::maven::upload_named(State(state), Path((repository, path)), body, authorize)
+            .await;
     }
     if state.config.npm.enabled && state.config.npm.repository(&repository).is_some() {
-        return super::npm::named_put_request(state, repository, path, authority, body).await;
+        let authorize = move |package: &str| enforce_namespace_scope(&authority, package).is_ok();
+        return super::npm::named_put_request(state, repository, path, headers, body, authorize)
+            .await;
     }
     StatusCode::NOT_FOUND.into_response()
 }
@@ -89,7 +89,9 @@ mod tests {
     use crate::config::{
         MavenRepository, MavenVersionPolicy, MavenWritePolicy, NpmRepository, NpmWritePolicy,
     };
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, npm_publish_payload, send, TestContext,
+    };
     use axum::http::Method;
 
     fn combined_named_config(config: &mut crate::config::Config) {
@@ -104,6 +106,20 @@ mod tests {
             write_policy: NpmWritePolicy::AllowOnce,
         }];
         config.npm.default_repository = Some("npm-private".to_string());
+    }
+
+    async fn seed_npm_package(context: &TestContext, package: &str) {
+        assert_eq!(
+            send(
+                &context.app,
+                Method::PUT,
+                &format!("/repository/npm-private/{package}"),
+                npm_publish_payload(package, "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
     }
 
     #[tokio::test]
@@ -125,26 +141,7 @@ mod tests {
         assert_eq!(downloaded.status(), StatusCode::OK);
         assert_eq!(body_bytes(downloaded).await.as_ref(), b"maven-bytes");
 
-        let manifest = br#"{"name":"pkg","version":"1.0.0","dist":{}}"#;
-        context
-            .state
-            .storage
-            .put(
-                "npm/repositories/npm-private/pkg/versions/1.0.0.json",
-                manifest,
-            )
-            .await
-            .unwrap();
-        let completion = crate::npm_layout::hosted_manifest_digest(manifest);
-        context
-            .state
-            .storage
-            .put(
-                "npm/repositories/npm-private/pkg/publish-complete/1.0.0",
-                completion.as_bytes(),
-            )
-            .await
-            .unwrap();
+        seed_npm_package(&context, "pkg").await;
         let npm_path = "/repository/npm-private/pkg";
         let deprecated = send(
             &context.app,
@@ -169,12 +166,17 @@ mod tests {
         let npm_json: serde_json::Value = serde_json::from_slice(&body_bytes(npm).await).unwrap();
         assert_eq!(npm_json["versions"]["1.0.0"]["name"], "pkg");
 
-        context
-            .state
-            .storage
-            .put("npm/repositories/npm-private/pkg/dist-tags/next", b"1.0.0")
+        assert_eq!(
+            send(
+                &context.app,
+                Method::PUT,
+                "/repository/npm-private/-/package/pkg/dist-tags/next",
+                serde_json::to_vec("1.0.0").unwrap(),
+            )
             .await
-            .unwrap();
+            .status(),
+            StatusCode::CREATED
+        );
         let deleted = send(
             &context.app,
             Method::DELETE,
@@ -205,6 +207,66 @@ mod tests {
         )
         .await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn shared_dispatcher_enforces_protocol_canonical_namespace_once() {
+        use crate::config::ScopeEnforcement;
+
+        let context = create_test_context_with_config(combined_named_config);
+        let maven_scope = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["com/myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+        let denied_maven = upload(
+            State(context.state.clone()),
+            Path((
+                "maven-releases".to_string(),
+                "com/other/app/1.0/app-1.0.jar".to_string(),
+            )),
+            HeaderMap::new(),
+            Extension(maven_scope.clone()),
+            Bytes::from_static(b"denied"),
+        )
+        .await;
+        assert_eq!(denied_maven.status(), StatusCode::FORBIDDEN);
+        let allowed_maven = upload(
+            State(context.state.clone()),
+            Path((
+                "maven-releases".to_string(),
+                "com/myorg/app/1.0/app-1.0.jar".to_string(),
+            )),
+            HeaderMap::new(),
+            Extension(maven_scope),
+            Bytes::from_static(b"allowed"),
+        )
+        .await;
+        assert_eq!(allowed_maven.status(), StatusCode::CREATED);
+
+        let npm_scope = NamespaceAuthority::from_oidc_scope(
+            "ci",
+            &["@myorg/**".to_string()],
+            ScopeEnforcement::Enforce,
+        );
+        let denied_npm = upload(
+            State(context.state.clone()),
+            Path(("npm-private".to_string(), "other-package".to_string())),
+            HeaderMap::new(),
+            Extension(npm_scope.clone()),
+            Bytes::from(npm_publish_payload("other-package", "1.0.0", "latest")),
+        )
+        .await;
+        assert_eq!(denied_npm.status(), StatusCode::FORBIDDEN);
+        let allowed_npm = upload(
+            State(context.state.clone()),
+            Path(("npm-private".to_string(), "%40myorg%2Fpackage".to_string())),
+            HeaderMap::new(),
+            Extension(npm_scope),
+            Bytes::from(npm_publish_payload("@myorg/package", "1.0.0", "latest")),
+        )
+        .await;
+        assert_eq!(allowed_npm.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -240,15 +302,7 @@ mod tests {
             combined_named_config(config);
             config.maven.enabled = false;
         });
-        context
-            .state
-            .storage
-            .put(
-                "npm/repositories/npm-private/pkg/versions/1.0.0.json",
-                br#"{"name":"pkg","version":"1.0.0","dist":{}}"#,
-            )
-            .await
-            .unwrap();
+        seed_npm_package(&context, "pkg").await;
 
         assert_eq!(
             send(&context.app, Method::GET, "/repository/npm-private/pkg", "",)

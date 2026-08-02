@@ -1663,7 +1663,11 @@ async fn run_server(mut config: Config, storage: Storage) {
     }
 
     // Spawn background retention scheduler if enabled
-    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+    // An enabled retention scheduler must also recover durable npm
+    // maintenance operations left by an interrupted earlier run. Recovery is
+    // independent of the current rule set, so an empty/changed rule list must
+    // not prevent the boot pass from resuming those operations.
+    if state.config.retention.enabled {
         let handle = retention::spawn_retention_scheduler(
             state.storage.clone(),
             state.publish_locks.clone(),

@@ -13,6 +13,11 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
 use crate::config::{NpmRepository, NpmWritePolicy};
+use crate::npm_layout::{
+    HostedImportSession, HostedMaintenanceAction, HostedMaintenanceMarker,
+    HostedMaintenanceOperation, HostedMaintenanceTarget, HostedPackumentPointer,
+    HostedPublishPending, HostedPublishPendingTarget,
+};
 use crate::registry::{
     circuit_open_response, method_not_allowed, proxy_fetch_conditional_with_validated_redirects,
     proxy_fetch_with_validated_redirects, proxy_fetch_with_validated_redirects_bounded,
@@ -20,7 +25,7 @@ use crate::registry::{
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
-use crate::storage::StorageError;
+use crate::storage::{Storage, StorageError};
 use crate::AppState;
 use axum::{
     body::{Body, Bytes},
@@ -33,7 +38,7 @@ use axum::{
 use base64::Engine;
 use futures::{stream, StreamExt};
 use sha2::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,12 +50,18 @@ const NPM_SEARCH_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const PACKAGE_JSON_CAP: u64 = 2 * 1024 * 1024;
 const TAR_SCAN_CAP: u64 = 64 * 1024 * 1024;
 const MAX_NPM_PROXY_REDIRECTS: usize = 3;
-const HOSTED_PACKUMENT_READ_CONCURRENCY: usize = 8;
+const NPM_IMPORT_MUTATION_CONCURRENCY: usize = 32;
+const NPM_IMPORT_PACKUMENT_HEADER: &str = "x-nora-import-packument-sha256";
 const LEGACY_HOSTED: &str = "npm-private";
 const LEGACY_PROXY: &str = "npm-registry";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/repository/{repository}/-/nora/import/{package}",
+            axum::routing::put(named_import_finalize)
+                .fallback(|| async { method_not_allowed("PUT") }),
+        )
         .route(
             "/repository/{repository}/-/package/{package}/dist-tags",
             get(named_dist_tags_get).fallback(|| async { method_not_allowed("GET") }),
@@ -103,6 +114,7 @@ struct ProxyRepository {
 enum ReadError {
     NotFound,
     Unavailable,
+    MaterializationUnavailable,
     CircuitOpen(String),
     Corrupt,
     SearchScanLimit,
@@ -138,15 +150,14 @@ async fn optional_storage_get(state: &AppState, key: &str) -> Result<Option<Byte
     }
 }
 
-async fn invalidate_hosted_packument_cache(
+async fn optional_hosted_materialization_get(
     state: &AppState,
-    repository: &str,
-    package: &str,
-) -> Result<(), StorageError> {
-    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
-    match state.storage.delete(&key).await {
-        Ok(()) | Err(StorageError::NotFound) => Ok(()),
-        Err(error) => Err(error),
+    key: &str,
+) -> Result<Option<Bytes>, ReadError> {
+    match state.storage.get(key).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(_) => Err(ReadError::MaterializationUnavailable),
     }
 }
 
@@ -197,22 +208,8 @@ fn hosted_publish_complete_key(repository: &str, package: &str, version: &str) -
     )
 }
 
-fn hosted_publish_pending_prefix(repository: &str, package: &str) -> String {
-    format!("{}/publish-pending/", package_prefix(repository, package))
-}
-
-fn hosted_publish_pending_key(repository: &str, package: &str, version: &str) -> String {
-    format!(
-        "{}{version}",
-        hosted_publish_pending_prefix(repository, package)
-    )
-}
-
 fn hosted_publish_pending_index_key(repository: &str, package: &str) -> String {
-    format!(
-        "{}/publish-pending-index-v1",
-        package_prefix(repository, package)
-    )
+    crate::npm_layout::hosted_publish_pending_index_key(repository, package)
 }
 
 fn hosted_tag_key(repository: &str, package: &str, tag: &str) -> String {
@@ -227,69 +224,122 @@ fn hosted_deprecation_key(repository: &str, package: &str, version: &str) -> Str
 }
 
 fn hosted_package_key(repository: &str, package: &str) -> String {
-    format!("{}/pkg.json", package_prefix(repository, package))
+    crate::npm_layout::hosted_package_key(repository, package)
 }
 
-async fn pending_publish_versions(
-    state: &AppState,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedActiveTransactions {
+    pub(crate) import: Option<HostedImportSession>,
+    pub(crate) publish: Option<HostedPublishPending>,
+}
+
+fn parse_hosted_import_session(
+    bytes: &[u8],
     repository: &str,
     package: &str,
-) -> Result<HashSet<String>, StorageError> {
-    let prefix = hosted_publish_pending_prefix(repository, package);
-    let mut incomplete = HashSet::new();
-    for pending_key in state.storage.list(&prefix).await? {
-        let Some(version) = pending_key
-            .strip_prefix(&prefix)
-            .filter(|relative| !relative.contains('/'))
-            .filter(|version| !version.is_empty())
-        else {
-            return Err(StorageError::IntegrityViolation);
-        };
-        let expected = state.storage.get(&pending_key).await?;
-        let expected = std::str::from_utf8(&expected)
-            .ok()
-            .filter(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-            .ok_or(StorageError::IntegrityViolation)?;
-        let manifest = match state
-            .storage
-            .get(&hosted_version_key(repository, package, version))
-            .await
-        {
-            Ok(manifest) => manifest,
-            Err(StorageError::NotFound) => {
-                incomplete.insert(version.to_string());
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let manifest_digest = crate::npm_layout::hosted_manifest_digest(&manifest);
-        if manifest_digest != expected {
-            incomplete.insert(version.to_string());
-            continue;
-        }
-        match state
-            .storage
-            .get(&hosted_publish_complete_key(repository, package, version))
-            .await
-        {
-            Ok(completion) if completion.as_ref() == expected.as_bytes() => {
-                match state.storage.delete(&pending_key).await {
-                    Ok(()) | Err(StorageError::NotFound) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(_) | Err(StorageError::NotFound) => {
-                incomplete.insert(version.to_string());
-            }
-            Err(error) => return Err(error),
-        }
+) -> Result<HostedImportSession, StorageError> {
+    let session: HostedImportSession =
+        serde_json::from_slice(bytes).map_err(|_| StorageError::IntegrityViolation)?;
+    if session.schema != crate::npm_layout::HOSTED_IMPORT_SESSION_SCHEMA_V1
+        || session.repository != repository
+        || session.package != package
+        || !valid_sha256(&session.packument_sha256)
+        || session
+            .base
+            .as_ref()
+            .is_some_and(|base| !valid_hosted_packument_pointer(base))
+        || session.versions.is_empty()
+        || !session
+            .versions
+            .iter()
+            .all(|(version, digest)| is_valid_npm_version(version) && valid_sha256(digest))
+    {
+        return Err(StorageError::IntegrityViolation);
     }
-    Ok(incomplete)
+    Ok(session)
+}
+
+fn valid_sha512_hex(value: &str) -> bool {
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn parse_hosted_publish_pending(
+    bytes: &[u8],
+    repository: &str,
+    package: &str,
+) -> Result<HostedPublishPending, StorageError> {
+    let pending: HostedPublishPending =
+        serde_json::from_slice(bytes).map_err(|_| StorageError::IntegrityViolation)?;
+    let valid_target = match &pending.target {
+        HostedPublishPendingTarget::Publish { base, target } => {
+            base.as_ref().is_none_or(valid_hosted_packument_pointer)
+                && valid_hosted_packument_pointer(target)
+        }
+        HostedPublishPendingTarget::Import { packument_sha256 } => valid_sha256(packument_sha256),
+    };
+    if pending.schema != crate::npm_layout::HOSTED_PUBLISH_PENDING_SCHEMA_V1
+        || pending.repository != repository
+        || pending.package != package
+        || !is_valid_npm_version(&pending.version)
+        || !valid_sha256(&pending.manifest_sha256)
+        || !valid_sha512_hex(&pending.blob_sha512)
+        || !valid_target
+    {
+        return Err(StorageError::IntegrityViolation);
+    }
+    Ok(pending)
+}
+
+async fn read_optional_import_session(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<Option<HostedImportSession>, StorageError> {
+    match storage
+        .get(&crate::npm_layout::hosted_import_pending_key(
+            repository, package,
+        ))
+        .await
+    {
+        Ok(bytes) => parse_hosted_import_session(&bytes, repository, package).map(Some),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_optional_publish_pending(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<Option<HostedPublishPending>, StorageError> {
+    match storage
+        .get(&hosted_publish_pending_index_key(repository, package))
+        .await
+    {
+        Ok(bytes) => parse_hosted_publish_pending(&bytes, repository, package).map(Some),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Exact package transaction probe shared by mutation, retention and GC.
+/// Malformed records are integrity errors rather than apparent quiescence.
+pub(crate) async fn read_hosted_active_transactions(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<HostedActiveTransactions, StorageError> {
+    let (import, publish) = tokio::join!(
+        read_optional_import_session(storage, repository, package),
+        read_optional_publish_pending(storage, repository, package),
+    );
+    Ok(HostedActiveTransactions {
+        import: import?,
+        publish: publish?,
+    })
 }
 
 async fn incomplete_publish_versions(
@@ -297,28 +347,39 @@ async fn incomplete_publish_versions(
     repository: &str,
     package: &str,
 ) -> Result<HashSet<String>, StorageError> {
-    let index_key = hosted_publish_pending_index_key(repository, package);
-    match state.storage.get(&index_key).await {
-        Ok(index) if index.as_ref() == b"1" => {}
-        Ok(_) => return Err(StorageError::IntegrityViolation),
-        Err(StorageError::NotFound) => state.storage.put(&index_key, b"1").await?,
-        Err(error) => return Err(error),
-    }
-    pending_publish_versions(state, repository, package).await
+    Ok(
+        read_optional_publish_pending(&state.storage, repository, package)
+            .await?
+            .into_iter()
+            .map(|pending| pending.version)
+            .collect(),
+    )
 }
 
-async fn restore_publish_pending(
-    state: &AppState,
-    pending_key: &str,
-    previous: Option<&[u8]>,
+async fn create_hosted_publish_pending(
+    storage: &Storage,
+    pending: &HostedPublishPending,
 ) -> Result<(), StorageError> {
-    match previous {
-        Some(previous) => state.storage.put(pending_key, previous).await,
-        None => match state.storage.delete(pending_key).await {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(error) => Err(error),
-        },
-    }
+    let bytes = serde_json::to_vec(pending).map_err(|_| StorageError::IntegrityViolation)?;
+    put_immutable_storage(
+        storage,
+        &hosted_publish_pending_index_key(&pending.repository, &pending.package),
+        &bytes,
+    )
+    .await
+}
+
+async fn clear_hosted_publish_pending(
+    storage: &Storage,
+    pending: &HostedPublishPending,
+) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(pending).map_err(|_| StorageError::IntegrityViolation)?;
+    delete_exact_with_readback(
+        storage,
+        &hosted_publish_pending_index_key(&pending.repository, &pending.package),
+        &bytes,
+    )
+    .await
 }
 
 fn incomplete_publish_response() -> Response {
@@ -327,6 +388,201 @@ fn incomplete_publish_response() -> Response {
         "Package has an incomplete publish; retry that exact publish before mutating package metadata",
     )
         .into_response()
+}
+
+async fn current_full_for_mutation(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+) -> Result<Option<serde_json::Value>, StorageError> {
+    let pointer_key = crate::npm_layout::hosted_packument_current_key(repository, package);
+    let pointer = match state.storage.get(&pointer_key).await {
+        Ok(pointer) => pointer,
+        Err(StorageError::NotFound) => {
+            let package_exists = match state
+                .storage
+                .get(&hosted_package_key(repository, package))
+                .await
+            {
+                Ok(_) => true,
+                Err(StorageError::NotFound) => false,
+                Err(error) => return Err(error),
+            };
+            if package_exists {
+                return Err(StorageError::IntegrityViolation);
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let pointer: HostedPackumentPointer =
+        serde_json::from_slice(&pointer).map_err(|_| StorageError::IntegrityViolation)?;
+    if !valid_sha256(&pointer.generation)
+        || pointer.generation != pointer.full_sha256
+        || !valid_sha256(&pointer.install_v1_sha256)
+    {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let full = state
+        .storage
+        .get(&crate::npm_layout::hosted_packument_full_key(
+            repository,
+            package,
+            &pointer.generation,
+        ))
+        .await?;
+    if hex::encode(sha2::Sha256::digest(&full)) != pointer.full_sha256 {
+        return Err(StorageError::IntegrityViolation);
+    }
+    valid_hosted_packument(&full, package)
+        .map(Some)
+        .ok_or(StorageError::IntegrityViolation)
+}
+
+async fn hosted_import_active(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<bool, StorageError> {
+    read_optional_import_session(storage, repository, package)
+        .await
+        .map(|session| session.is_some())
+}
+
+fn packument_after_publish(
+    package: &str,
+    previous: Option<serde_json::Value>,
+    validated: &ValidatedPublish,
+) -> Result<serde_json::Value, StorageError> {
+    let mut packument = previous
+        .unwrap_or_else(|| serde_json::json!({"name": package, "versions": {}, "dist-tags": {}}));
+    let object = packument
+        .as_object_mut()
+        .ok_or(StorageError::IntegrityViolation)?;
+    for field in ["name", "_id", "description", "readme", "license"] {
+        object.remove(field);
+    }
+    let package_fields: serde_json::Value = serde_json::from_slice(&validated.package_fields)
+        .map_err(|_| StorageError::IntegrityViolation)?;
+    for (field, value) in package_fields
+        .as_object()
+        .ok_or(StorageError::IntegrityViolation)?
+    {
+        object.insert(field.clone(), value.clone());
+    }
+    object.insert(
+        "name".to_string(),
+        serde_json::Value::String(package.to_string()),
+    );
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&validated.manifest)
+        .map_err(|_| StorageError::IntegrityViolation)?;
+    let previous_deprecation = object
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|versions| versions.get(&validated.version))
+        .and_then(|manifest| manifest.get("deprecated"))
+        .cloned();
+    let manifest_object = manifest
+        .as_object_mut()
+        .ok_or(StorageError::IntegrityViolation)?;
+    match validated.deprecation.as_deref() {
+        Some("") => {
+            manifest_object.remove("deprecated");
+        }
+        Some(message) => {
+            manifest_object.insert(
+                "deprecated".to_string(),
+                serde_json::Value::String(message.to_string()),
+            );
+        }
+        None => {
+            if let Some(message) = previous_deprecation {
+                manifest_object.insert("deprecated".to_string(), message);
+            }
+        }
+    }
+    object
+        .entry("versions")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or(StorageError::IntegrityViolation)?
+        .insert(validated.version.clone(), manifest);
+    let tags = object
+        .entry("dist-tags")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or(StorageError::IntegrityViolation)?;
+    for (tag, target) in &validated.tags {
+        tags.insert(tag.clone(), serde_json::Value::String(target.clone()));
+    }
+    Ok(packument)
+}
+
+fn hosted_packument_pointer_for_value(
+    packument: &serde_json::Value,
+) -> Result<(Vec<u8>, HostedPackumentPointer), StorageError> {
+    let full = serde_json::to_vec(packument).map_err(|_| StorageError::IntegrityViolation)?;
+    let install_v1 = install_v1_packument(packument)
+        .map_err(|_| StorageError::IntegrityViolation)
+        .and_then(|value| {
+            serde_json::to_vec(&value).map_err(|_| StorageError::IntegrityViolation)
+        })?;
+    let full_sha256 = hex::encode(sha2::Sha256::digest(&full));
+    Ok((
+        full,
+        HostedPackumentPointer {
+            generation: full_sha256.clone(),
+            full_sha256,
+            install_v1_sha256: hex::encode(sha2::Sha256::digest(&install_v1)),
+        },
+    ))
+}
+
+async fn ensure_completed_publish_materialized(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    version: &str,
+) -> Result<(), StorageError> {
+    if current_full_for_mutation(state, repository, package)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|packument| {
+            packument
+                .get("versions")
+                .and_then(serde_json::Value::as_object)
+                .map(|versions| versions.contains_key(version))
+        })
+        == Some(true)
+    {
+        return Ok(());
+    }
+    Err(StorageError::IntegrityViolation)
+}
+
+pub(crate) async fn read_hosted_packument_pointer(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<Option<HostedPackumentPointer>, StorageError> {
+    let bytes = match storage
+        .get(&crate::npm_layout::hosted_packument_current_key(
+            repository, package,
+        ))
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let pointer: HostedPackumentPointer =
+        serde_json::from_slice(&bytes).map_err(|_| StorageError::IntegrityViolation)?;
+    if !valid_hosted_packument_pointer(&pointer) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    Ok(Some(pointer))
 }
 
 fn proxy_packument_key(repository: &str, package: &str) -> String {
@@ -531,6 +787,14 @@ fn set_tarball_url(
 }
 
 fn json_response(headers: &HeaderMap, value: &serde_json::Value) -> Response {
+    json_response_with_content_type(headers, value, "application/json")
+}
+
+fn json_response_with_content_type(
+    headers: &HeaderMap,
+    value: &serde_json::Value,
+    content_type: &'static str,
+) -> Response {
     let Ok(bytes) = serde_json::to_vec(value) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -545,7 +809,7 @@ fn json_response(headers: &HeaderMap, value: &serde_json::Value) -> Response {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (header::CACHE_CONTROL, "no-cache".to_string()),
             (header::ETAG, etag),
         ],
@@ -560,6 +824,24 @@ fn json_response_with_stale(
     stale: bool,
 ) -> Response {
     let mut response = json_response(headers, value);
+    if stale {
+        response
+            .headers_mut()
+            .insert("x-nora-stale", HeaderValue::from_static("true"));
+    }
+    response
+}
+
+fn packument_response(
+    headers: &HeaderMap,
+    value: &serde_json::Value,
+    stale: bool,
+    flavor: PackumentFlavor,
+) -> Response {
+    let mut response = json_response_with_content_type(headers, value, flavor.content_type());
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
     if stale {
         response
             .headers_mut()
@@ -626,11 +908,13 @@ async fn hosted_blob_key_for_version(
     package: &str,
     version: &str,
 ) -> Result<String, ReadError> {
-    let manifest = state
-        .storage
-        .get(&hosted_version_key(repository, package, version))
-        .await
-        .map_err(storage_read_error)?;
+    let manifest = match hosted_version_from_current(state, repository, package, version).await? {
+        HostedVersionResolution::Visible(manifest) => manifest,
+        HostedVersionResolution::Absent | HostedVersionResolution::AuthoritativelyAbsent => {
+            return Err(ReadError::NotFound)
+        }
+    };
+    let manifest = serde_json::to_vec(&manifest).map_err(|_| ReadError::Corrupt)?;
     crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
         .ok_or(ReadError::Corrupt)
 }
@@ -657,14 +941,21 @@ async fn target_publish_date(
                 };
                 match repository {
                     NpmRepository::Hosted { name, .. } => {
-                        if hosted_has_version(state, name, package, version).await? {
-                            let blob_key =
-                                hosted_blob_key_for_version(state, name, package, version).await?;
-                            return Ok(crate::curation::extract_mtime_as_publish_date(
-                                &state.storage,
-                                &blob_key,
-                            )
-                            .await);
+                        match hosted_version_from_current(state, name, package, version).await? {
+                            HostedVersionResolution::Visible(_) => {
+                                let blob_key =
+                                    hosted_blob_key_for_version(state, name, package, version)
+                                        .await?;
+                                return Ok(crate::curation::extract_mtime_as_publish_date(
+                                    &state.storage,
+                                    &blob_key,
+                                )
+                                .await);
+                            }
+                            HostedVersionResolution::AuthoritativelyAbsent => {
+                                return Err(ReadError::NotFound)
+                            }
+                            HostedVersionResolution::Absent => {}
                         }
                     }
                     NpmRepository::Proxy { name, .. } if !is_internal(state, package) => {
@@ -694,15 +985,22 @@ async fn target_publish_date(
             Ok(None)
         }
         RepositoryTarget::Legacy => {
-            if hosted_has_version(state, LEGACY_HOSTED, package, version).await? {
-                let blob_key =
-                    hosted_blob_key_for_version(state, LEGACY_HOSTED, package, version).await?;
-                Ok(crate::curation::extract_mtime_as_publish_date(&state.storage, &blob_key).await)
-            } else {
-                Ok(
-                    cached_proxy_publish_date(state, LEGACY_PROXY, package, version, filename)
-                        .await,
-                )
+            match hosted_version_from_current(state, LEGACY_HOSTED, package, version).await? {
+                HostedVersionResolution::Visible(_) => {
+                    let blob_key =
+                        hosted_blob_key_for_version(state, LEGACY_HOSTED, package, version).await?;
+                    Ok(
+                        crate::curation::extract_mtime_as_publish_date(&state.storage, &blob_key)
+                            .await,
+                    )
+                }
+                HostedVersionResolution::AuthoritativelyAbsent => Err(ReadError::NotFound),
+                HostedVersionResolution::Absent => {
+                    Ok(
+                        cached_proxy_publish_date(state, LEGACY_PROXY, package, version, filename)
+                            .await,
+                    )
+                }
             }
         }
     }
@@ -752,7 +1050,585 @@ fn curated_tarball_response(
     tarball_response(data)
 }
 
-fn valid_cached_hosted_packument(bytes: &[u8], package: &str) -> Option<serde_json::Value> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackumentFlavor {
+    Full,
+    InstallV1,
+}
+
+impl PackumentFlavor {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        // Store the quality selected by the most-specific media range for
+        // each representation. An exact q=0 must therefore override a more
+        // permissive wildcard instead of being resurrected by it.
+        let mut install_match = None::<(u8, f32)>;
+        let mut full_match = None::<(u8, f32)>;
+        let update_match = |current: &mut Option<(u8, f32)>, specificity, quality| match current {
+            Some((current_specificity, current_quality)) if *current_specificity > specificity => {}
+            Some((current_specificity, current_quality)) if *current_specificity == specificity => {
+                *current_quality = current_quality.max(quality);
+            }
+            _ => *current = Some((specificity, quality)),
+        };
+        for range in headers
+            .get_all(header::ACCEPT)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+        {
+            let mut parts = range.split(';');
+            let media_type = parts.next().unwrap_or_default().trim();
+            let mut quality = 1.0f32;
+            for parameter in parts {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|quality| (0.0..=1.0).contains(quality))
+                        .unwrap_or(0.0);
+                }
+            }
+            if media_type.eq_ignore_ascii_case("application/vnd.npm.install-v1+json") {
+                update_match(&mut install_match, 2, quality);
+            } else if media_type.eq_ignore_ascii_case("application/json") {
+                update_match(&mut full_match, 2, quality);
+            } else if media_type.eq_ignore_ascii_case("application/*") {
+                update_match(&mut install_match, 1, quality);
+                update_match(&mut full_match, 1, quality);
+            } else if media_type == "*/*" {
+                update_match(&mut install_match, 0, quality);
+                update_match(&mut full_match, 0, quality);
+            }
+        }
+        let full_quality = full_match.map(|(_, quality)| quality).unwrap_or(0.0);
+        if install_match.is_some_and(|(specificity, quality)| {
+            quality > 0.0
+                && (quality > full_quality || (quality == full_quality && specificity == 2))
+        }) {
+            Self::InstallV1
+        } else {
+            Self::Full
+        }
+    }
+
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::Full => "application/json",
+            Self::InstallV1 => "application/vnd.npm.install-v1+json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostedImportReceipt {
+    package: String,
+    version_count: usize,
+    full_sha256: String,
+    install_v1_sha256: String,
+    generation: String,
+}
+
+type WrittenPackumentGeneration = HostedPackumentPointer;
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_hosted_packument_pointer(pointer: &HostedPackumentPointer) -> bool {
+    valid_sha256(&pointer.generation)
+        && pointer.generation == pointer.full_sha256
+        && valid_sha256(&pointer.install_v1_sha256)
+}
+
+fn valid_hosted_maintenance_operation(operation: &HostedMaintenanceOperation) -> bool {
+    if operation.schema != crate::npm_layout::HOSTED_MAINTENANCE_SCHEMA_V1
+        || operation.repository.is_empty()
+        || operation.package.is_empty()
+        || !valid_hosted_packument_pointer(&operation.base)
+    {
+        return false;
+    }
+    if let HostedMaintenanceTarget::Live { pointer } = &operation.target {
+        if !valid_hosted_packument_pointer(pointer) {
+            return false;
+        }
+    }
+    match &operation.action {
+        HostedMaintenanceAction::DistTag { tag, value } => {
+            matches!(operation.target, HostedMaintenanceTarget::Live { .. })
+                && is_valid_dist_tag(tag)
+                && value.as_deref().is_none_or(is_valid_npm_version)
+        }
+        HostedMaintenanceAction::Deprecations { values } => {
+            matches!(operation.target, HostedMaintenanceTarget::Live { .. })
+                && !values.is_empty()
+                && values.iter().all(|(version, message)| {
+                    is_valid_npm_version(version)
+                        && message.as_deref().is_none_or(|message| !message.is_empty())
+                })
+        }
+        HostedMaintenanceAction::Retention {
+            snapshot_guard,
+            removed_versions,
+            expected_authority,
+        } => {
+            if !valid_sha256(snapshot_guard)
+                || removed_versions.is_empty()
+                || !removed_versions
+                    .iter()
+                    .all(|(version, digest)| is_valid_npm_version(version) && valid_sha256(digest))
+                || expected_authority.is_empty()
+            {
+                return false;
+            }
+            expected_authority.iter().all(|(key, digest)| {
+                if !valid_sha256(digest) {
+                    return false;
+                }
+                let Some(parsed) = crate::npm_layout::parse_npm_object_key(key) else {
+                    return false;
+                };
+                parsed.repository == operation.repository
+                    && parsed.package == operation.package
+                    && matches!(
+                        parsed.kind,
+                        crate::npm_layout::NpmObjectKind::HostedPackage
+                            | crate::npm_layout::NpmObjectKind::HostedVersion(_)
+                            | crate::npm_layout::NpmObjectKind::HostedPublishComplete(_)
+                            | crate::npm_layout::NpmObjectKind::HostedPublishPendingIndex
+                            | crate::npm_layout::NpmObjectKind::HostedDistTag(_)
+                            | crate::npm_layout::NpmObjectKind::HostedDeprecation(_)
+                    )
+            })
+        }
+    }
+}
+
+fn hosted_maintenance_marker_for_operation(
+    operation: &HostedMaintenanceOperation,
+) -> Result<HostedMaintenanceMarker, StorageError> {
+    if !valid_hosted_maintenance_operation(operation) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let operation_id = crate::npm_layout::hosted_maintenance_operation_id(operation)
+        .map_err(|_| StorageError::IntegrityViolation)?;
+    Ok(HostedMaintenanceMarker {
+        schema: operation.schema,
+        repository: operation.repository.clone(),
+        package: operation.package.clone(),
+        operation_id,
+        base: operation.base.clone(),
+        target: operation.target.clone(),
+        action: operation.action.clone(),
+    })
+}
+
+fn valid_hosted_maintenance_marker(
+    marker: &HostedMaintenanceMarker,
+    repository: &str,
+    package: &str,
+) -> bool {
+    marker.repository == repository
+        && marker.package == package
+        && valid_sha256(&marker.operation_id)
+        && valid_hosted_maintenance_operation(&marker.operation())
+        && crate::npm_layout::hosted_maintenance_operation_id(&marker.operation())
+            .is_ok_and(|operation_id| operation_id == marker.operation_id)
+}
+
+pub(crate) async fn read_hosted_maintenance_marker(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<Option<HostedMaintenanceMarker>, StorageError> {
+    let key = crate::npm_layout::hosted_maintenance_active_key(repository, package);
+    let bytes = match storage.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let marker: HostedMaintenanceMarker =
+        serde_json::from_slice(&bytes).map_err(|_| StorageError::IntegrityViolation)?;
+    if !valid_hosted_maintenance_marker(&marker, repository, package) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    Ok(Some(marker))
+}
+
+pub(crate) async fn create_hosted_maintenance_marker(
+    storage: &Storage,
+    operation: &HostedMaintenanceOperation,
+) -> Result<HostedMaintenanceMarker, StorageError> {
+    let marker = hosted_maintenance_marker_for_operation(operation)?;
+    let bytes = serde_json::to_vec(&marker).map_err(|_| StorageError::IntegrityViolation)?;
+    let key =
+        crate::npm_layout::hosted_maintenance_active_key(&operation.repository, &operation.package);
+    let create = storage.put_if_absent(&key, &bytes).await;
+    match storage.get(&key).await {
+        Ok(stored) if stored.as_ref() == bytes.as_slice() => Ok(marker),
+        Ok(_) => match create {
+            Err(StorageError::AlreadyExists) => Err(StorageError::AlreadyExists),
+            _ => Err(StorageError::IntegrityViolation),
+        },
+        Err(StorageError::NotFound) => match create {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn clear_hosted_maintenance_marker(
+    storage: &Storage,
+    marker: &HostedMaintenanceMarker,
+) -> Result<(), StorageError> {
+    if !valid_hosted_maintenance_marker(marker, &marker.repository, &marker.package) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let expected = serde_json::to_vec(marker).map_err(|_| StorageError::IntegrityViolation)?;
+    let key = crate::npm_layout::hosted_maintenance_active_key(&marker.repository, &marker.package);
+    match storage.get(&key).await {
+        Ok(current) if current.as_ref() == expected.as_slice() => {}
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let deleted = storage.delete(&key).await;
+    match storage.get(&key).await {
+        Err(StorageError::NotFound) => Ok(()),
+        Ok(current) if current.as_ref() == expected.as_slice() => match deleted {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Ok(_) => Err(StorageError::AlreadyExists),
+        Err(error) => Err(error),
+    }
+}
+
+async fn hosted_packument_for_pointer(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    pointer: &HostedPackumentPointer,
+) -> Result<serde_json::Value, StorageError> {
+    validate_hosted_packument_pointer(storage, repository, package, pointer).await?;
+    let full = storage
+        .get(&crate::npm_layout::hosted_packument_full_key(
+            repository,
+            package,
+            &pointer.generation,
+        ))
+        .await?;
+    valid_hosted_packument(&full, package).ok_or(StorageError::IntegrityViolation)
+}
+
+fn apply_hosted_maintenance_action(
+    mut packument: serde_json::Value,
+    action: &HostedMaintenanceAction,
+) -> Result<serde_json::Value, StorageError> {
+    match action {
+        HostedMaintenanceAction::DistTag { tag, value } => {
+            let tags = packument
+                .get_mut("dist-tags")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or(StorageError::IntegrityViolation)?;
+            match value {
+                Some(version) => {
+                    tags.insert(tag.clone(), serde_json::Value::String(version.clone()));
+                }
+                None => {
+                    tags.remove(tag);
+                }
+            }
+        }
+        HostedMaintenanceAction::Deprecations { values } => {
+            let versions = packument
+                .get_mut("versions")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or(StorageError::IntegrityViolation)?;
+            for (version, message) in values {
+                let manifest = versions
+                    .get_mut(version)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or(StorageError::IntegrityViolation)?;
+                match message {
+                    Some(message) => {
+                        manifest.insert(
+                            "deprecated".to_string(),
+                            serde_json::Value::String(message.clone()),
+                        );
+                    }
+                    None => {
+                        manifest.remove("deprecated");
+                    }
+                }
+            }
+        }
+        HostedMaintenanceAction::Retention { .. } => return Err(StorageError::IntegrityViolation),
+    }
+    Ok(packument)
+}
+
+fn optional_packument_string(
+    packument: &serde_json::Value,
+    action: &HostedMaintenanceAction,
+) -> Result<Vec<(String, Option<String>)>, StorageError> {
+    match action {
+        HostedMaintenanceAction::DistTag { tag, .. } => {
+            let value = packument
+                .get("dist-tags")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(StorageError::IntegrityViolation)?
+                .get(tag)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or(StorageError::IntegrityViolation)
+                })
+                .transpose()?;
+            Ok(vec![(tag.clone(), value)])
+        }
+        HostedMaintenanceAction::Deprecations { values } => {
+            let versions = packument
+                .get("versions")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(StorageError::IntegrityViolation)?;
+            values
+                .keys()
+                .map(|version| {
+                    let manifest = versions
+                        .get(version)
+                        .and_then(serde_json::Value::as_object)
+                        .ok_or(StorageError::IntegrityViolation)?;
+                    let message = manifest
+                        .get("deprecated")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .ok_or(StorageError::IntegrityViolation)
+                        })
+                        .transpose()?;
+                    Ok((version.clone(), message))
+                })
+                .collect()
+        }
+        HostedMaintenanceAction::Retention { .. } => Err(StorageError::IntegrityViolation),
+    }
+}
+
+async fn read_optional_string(
+    storage: &Storage,
+    key: &str,
+) -> Result<Option<String>, StorageError> {
+    match storage.get(key).await {
+        Ok(bytes) => read_string(bytes)
+            .map(Some)
+            .ok_or(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn commit_authority_value(
+    storage: &Storage,
+    key: &str,
+    base: Option<&str>,
+    target: Option<&str>,
+) -> Result<(), StorageError> {
+    let current = read_optional_string(storage, key).await?;
+    if current.as_deref() == target {
+        return Ok(());
+    }
+    if current.as_deref() != base {
+        return Err(StorageError::AlreadyExists);
+    }
+    let mutation = match target {
+        Some(value) => storage.put(key, value.as_bytes()).await,
+        None => storage.delete(key).await,
+    };
+    let readback = read_optional_string(storage, key).await;
+    match readback {
+        Ok(value) if value.as_deref() == target => Ok(()),
+        Ok(value) if value.as_deref() != base => Err(StorageError::AlreadyExists),
+        Ok(_) => match mutation {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn resume_hosted_metadata_maintenance(
+    storage: &Storage,
+    marker: &HostedMaintenanceMarker,
+) -> Result<(), StorageError> {
+    let HostedMaintenanceTarget::Live { pointer: target } = &marker.target else {
+        return Err(StorageError::IntegrityViolation);
+    };
+    let base_packument =
+        hosted_packument_for_pointer(storage, &marker.repository, &marker.package, &marker.base)
+            .await?;
+    let expected_packument =
+        apply_hosted_maintenance_action(base_packument.clone(), &marker.action)?;
+    let expected_full =
+        serde_json::to_vec(&expected_packument).map_err(|_| StorageError::IntegrityViolation)?;
+    if hex::encode(sha2::Sha256::digest(&expected_full)) != target.full_sha256 {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let expected_install = install_v1_packument(&expected_packument)
+        .map_err(|_| StorageError::IntegrityViolation)
+        .and_then(|value| {
+            serde_json::to_vec(&value).map_err(|_| StorageError::IntegrityViolation)
+        })?;
+    if hex::encode(sha2::Sha256::digest(&expected_install)) != target.install_v1_sha256 {
+        return Err(StorageError::IntegrityViolation);
+    }
+    validate_hosted_packument_pointer(storage, &marker.repository, &marker.package, target).await?;
+    match read_hosted_packument_pointer(storage, &marker.repository, &marker.package).await? {
+        Some(current) if current == marker.base || current == *target => {}
+        _ => return Err(StorageError::AlreadyExists),
+    }
+
+    let base_values = optional_packument_string(&base_packument, &marker.action)?;
+    match &marker.action {
+        HostedMaintenanceAction::DistTag { tag, value } => {
+            let (_, base) = base_values
+                .first()
+                .ok_or(StorageError::IntegrityViolation)?;
+            commit_authority_value(
+                storage,
+                &hosted_tag_key(&marker.repository, &marker.package, tag),
+                base.as_deref(),
+                value.as_deref(),
+            )
+            .await?;
+        }
+        HostedMaintenanceAction::Deprecations { values } => {
+            let base_values = base_values.into_iter().collect::<HashMap<_, _>>();
+            for (version, target) in values {
+                let base = base_values
+                    .get(version)
+                    .ok_or(StorageError::IntegrityViolation)?;
+                commit_authority_value(
+                    storage,
+                    &hosted_deprecation_key(&marker.repository, &marker.package, version),
+                    base.as_deref(),
+                    target.as_deref(),
+                )
+                .await?;
+            }
+        }
+        HostedMaintenanceAction::Retention { .. } => return Err(StorageError::IntegrityViolation),
+    }
+    commit_hosted_packument_pointer(storage, &marker.repository, &marker.package, target).await
+}
+
+pub(crate) async fn resume_hosted_maintenance_operation(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+) -> Result<bool, StorageError> {
+    let Some(marker) = read_hosted_maintenance_marker(storage, repository, package).await? else {
+        return Ok(false);
+    };
+    match &marker.action {
+        HostedMaintenanceAction::DistTag { .. } | HostedMaintenanceAction::Deprecations { .. } => {
+            resume_hosted_metadata_maintenance(storage, &marker).await?
+        }
+        HostedMaintenanceAction::Retention { .. } => {
+            crate::retention::resume_npm_retention_operation(storage, &marker).await?
+        }
+    }
+    clear_hosted_maintenance_marker(storage, &marker).await?;
+    Ok(true)
+}
+
+async fn execute_hosted_metadata_maintenance(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    base: HostedPackumentPointer,
+    target_packument: &serde_json::Value,
+    action: HostedMaintenanceAction,
+) -> Result<(), StorageError> {
+    let full =
+        serde_json::to_vec(target_packument).map_err(|_| StorageError::IntegrityViolation)?;
+    let target = write_hosted_packument_generation_documents(
+        storage,
+        repository,
+        package,
+        target_packument,
+        &full,
+    )
+    .await?;
+    let operation = HostedMaintenanceOperation {
+        schema: crate::npm_layout::HOSTED_MAINTENANCE_SCHEMA_V1,
+        repository: repository.to_string(),
+        package: package.to_string(),
+        base: base.clone(),
+        target: HostedMaintenanceTarget::Live { pointer: target },
+        action,
+    };
+    let marker = match create_hosted_maintenance_marker(storage, &operation).await {
+        Ok(marker) => marker,
+        Err(StorageError::AlreadyExists) => {
+            resume_hosted_maintenance_operation(storage, repository, package).await?;
+            return Err(StorageError::AlreadyExists);
+        }
+        Err(error) => return Err(error),
+    };
+    match read_hosted_packument_pointer(storage, repository, package).await? {
+        Some(current) if current == base => {}
+        Some(current)
+            if matches!(
+                &marker.target,
+                HostedMaintenanceTarget::Live { pointer } if *pointer == current
+            ) => {}
+        _ => {
+            clear_hosted_maintenance_marker(storage, &marker).await?;
+            return Err(StorageError::AlreadyExists);
+        }
+    }
+    if !resume_hosted_maintenance_operation(storage, repository, package).await? {
+        return Err(StorageError::IntegrityViolation);
+    }
+    Ok(())
+}
+
+fn import_packument_sha256(headers: &HeaderMap) -> Result<Option<String>, NpmHttpError> {
+    let values = headers
+        .get_all(NPM_IMPORT_PACKUMENT_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 {
+        return Err(NpmHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "Exactly one npm import packument hash is required",
+        ));
+    }
+    let value = values[0].to_str().ok().filter(|value| valid_sha256(value));
+    value.map(|value| Some(value.to_string())).ok_or_else(|| {
+        NpmHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid npm import packument SHA-256",
+        )
+    })
+}
+
+fn valid_hosted_packument(bytes: &[u8], package: &str) -> Option<serde_json::Value> {
     let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     let object = value.as_object()?;
     (object.get("name").and_then(|value| value.as_str()) == Some(package)
@@ -763,6 +1639,239 @@ fn valid_cached_hosted_packument(bytes: &[u8], package: &str) -> Option<serde_js
             .get("dist-tags")
             .is_some_and(|value| value.is_object()))
     .then_some(value)
+}
+
+fn install_v1_packument(packument: &serde_json::Value) -> Result<serde_json::Value, ReadError> {
+    let object = packument.as_object().ok_or(ReadError::Corrupt)?;
+    let mut abbreviated = serde_json::Map::new();
+    for field in ["name", "modified", "dist-tags"] {
+        if let Some(value) = object.get(field) {
+            abbreviated.insert(field.to_string(), value.clone());
+        }
+    }
+    let versions = object
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ReadError::Corrupt)?;
+    let allowed = [
+        "name",
+        "version",
+        "dist",
+        "dependencies",
+        "optionalDependencies",
+        "peerDependencies",
+        "peerDependenciesMeta",
+        "devDependencies",
+        "bundleDependencies",
+        "engines",
+        "funding",
+        "os",
+        "cpu",
+        "deprecated",
+        "bin",
+        "directories",
+        "acceptDependencies",
+        "_hasShrinkwrap",
+        "hasInstallScript",
+    ];
+    let mut abbreviated_versions = serde_json::Map::new();
+    for (version, manifest) in versions {
+        let manifest = manifest.as_object().ok_or(ReadError::Corrupt)?;
+        let mut projected = serde_json::Map::new();
+        for field in allowed {
+            if let Some(value) = manifest.get(field) {
+                projected.insert(field.to_string(), value.clone());
+            }
+        }
+        abbreviated_versions.insert(version.clone(), serde_json::Value::Object(projected));
+    }
+    abbreviated.insert(
+        "versions".to_string(),
+        serde_json::Value::Object(abbreviated_versions),
+    );
+    Ok(serde_json::Value::Object(abbreviated))
+}
+
+fn project_packument(
+    packument: serde_json::Value,
+    flavor: PackumentFlavor,
+) -> Result<serde_json::Value, ReadError> {
+    match flavor {
+        PackumentFlavor::Full => Ok(packument),
+        PackumentFlavor::InstallV1 => install_v1_packument(&packument),
+    }
+}
+
+async fn put_immutable_storage(
+    storage: &Storage,
+    key: &str,
+    data: &[u8],
+) -> Result<(), StorageError> {
+    let created = storage.put_if_absent(key, data).await;
+    match storage.get(key).await {
+        Ok(existing) if existing.as_ref() == data => Ok(()),
+        Ok(_) => Err(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => match created {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_hosted_packument_generation_documents(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    packument: &serde_json::Value,
+    full: &[u8],
+) -> Result<WrittenPackumentGeneration, StorageError> {
+    let parsed = valid_hosted_packument(full, package).ok_or(StorageError::IntegrityViolation)?;
+    if &parsed != packument {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let full_sha256 = hex::encode(sha2::Sha256::digest(full));
+    let install_v1 = install_v1_packument(packument)
+        .map_err(|_| StorageError::IntegrityViolation)
+        .and_then(|value| {
+            serde_json::to_vec(&value).map_err(|_| StorageError::IntegrityViolation)
+        })?;
+    let install_v1_sha256 = hex::encode(sha2::Sha256::digest(&install_v1));
+    let generation = full_sha256.clone();
+    let full_key = crate::npm_layout::hosted_packument_full_key(repository, package, &generation);
+    let install_key =
+        crate::npm_layout::hosted_packument_install_v1_key(repository, package, &generation);
+    put_immutable_storage(storage, &full_key, full).await?;
+    put_immutable_storage(storage, &install_key, &install_v1).await?;
+
+    Ok(WrittenPackumentGeneration {
+        generation,
+        full_sha256,
+        install_v1_sha256,
+    })
+}
+
+pub(crate) async fn commit_hosted_packument_pointer(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    generation: &HostedPackumentPointer,
+) -> Result<(), StorageError> {
+    // The mutable pointer is the sole read-model commit point and is written
+    // only after both immutable documents (and, for imports, the receipt) are
+    // durable.
+    if !valid_hosted_packument_pointer(generation) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    validate_hosted_packument_pointer(storage, repository, package, generation).await?;
+    let retired_key = crate::npm_layout::hosted_packument_retired_key(repository, package);
+    match storage.get(&retired_key).await {
+        Ok(marker) if marker.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 => {
+            let deleted = storage.delete(&retired_key).await;
+            match storage.get(&retired_key).await {
+                Err(StorageError::NotFound) => {}
+                Ok(current)
+                    if current.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 =>
+                {
+                    return match deleted {
+                        Ok(()) => Err(StorageError::IntegrityViolation),
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(_) => return Err(StorageError::IntegrityViolation),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(_) => return Err(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let pointer = serde_json::to_vec(generation).map_err(|_| StorageError::IntegrityViolation)?;
+    let key = crate::npm_layout::hosted_packument_current_key(repository, package);
+    let committed = storage.put(&key, &pointer).await;
+    match storage.get(&key).await {
+        Ok(stored) if stored.as_ref() == pointer.as_slice() => Ok(()),
+        Ok(_) => Err(StorageError::IntegrityViolation),
+        Err(StorageError::NotFound) => match committed {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn validate_hosted_packument_pointer(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    generation: &HostedPackumentPointer,
+) -> Result<(), StorageError> {
+    if !valid_hosted_packument_pointer(generation) {
+        return Err(StorageError::IntegrityViolation);
+    }
+    let full = storage
+        .get(&crate::npm_layout::hosted_packument_full_key(
+            repository,
+            package,
+            &generation.generation,
+        ))
+        .await?;
+    let install_v1 = storage
+        .get(&crate::npm_layout::hosted_packument_install_v1_key(
+            repository,
+            package,
+            &generation.generation,
+        ))
+        .await?;
+    if hex::encode(sha2::Sha256::digest(&full)) != generation.full_sha256
+        || hex::encode(sha2::Sha256::digest(&install_v1)) != generation.install_v1_sha256
+        || valid_hosted_packument(&full, package).is_none()
+    {
+        return Err(StorageError::IntegrityViolation);
+    }
+    Ok(())
+}
+
+pub(crate) async fn prepare_hosted_packument_after_retention(
+    storage: &Storage,
+    repository: &str,
+    package: &str,
+    removed_versions: &HashSet<String>,
+) -> Result<HostedMaintenanceTarget, StorageError> {
+    // Retention derives its target from the exact developer-visible snapshot.
+    // LIST is neither an authority source nor an availability dependency.
+    let base = read_hosted_packument_pointer(storage, repository, package)
+        .await?
+        .ok_or(StorageError::NotFound)?;
+    validate_hosted_packument_pointer(storage, repository, package, &base).await?;
+    let mut packument = hosted_packument_for_pointer(storage, repository, package, &base).await?;
+    let versions = packument
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(StorageError::IntegrityViolation)?;
+    versions.retain(|version, _| !removed_versions.contains(version));
+    if versions.is_empty() {
+        return Ok(HostedMaintenanceTarget::Retired);
+    }
+    let tags = packument
+        .get_mut("dist-tags")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(StorageError::IntegrityViolation)?;
+    tags.retain(|_, target| {
+        !target
+            .as_str()
+            .is_some_and(|version| removed_versions.contains(version))
+    });
+    let full = serde_json::to_vec(&packument).map_err(|_| StorageError::IntegrityViolation)?;
+    let generation = write_hosted_packument_generation_documents(
+        storage, repository, package, &packument, &full,
+    )
+    .await?;
+    // The package-wide maintenance marker owns the eventual pointer swap.
+    // Preparing immutable documents cannot change developer visibility.
+    Ok(HostedMaintenanceTarget::Live {
+        pointer: generation,
+    })
 }
 
 fn hosted_packument_response(
@@ -781,160 +1890,94 @@ fn hosted_packument_response(
     packument
 }
 
-async fn read_hosted_packument_cache(
+async fn read_hosted_packument_generation(
     state: &AppState,
     repository: &str,
     package: &str,
-) -> Result<Option<serde_json::Value>, ReadError> {
-    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
-    let Some(bytes) = optional_storage_get(state, &key).await? else {
-        return Ok(None);
+    flavor: PackumentFlavor,
+) -> Result<serde_json::Value, ReadError> {
+    let pointer_key = crate::npm_layout::hosted_packument_current_key(repository, package);
+    let pointer = match state.storage.get(&pointer_key).await {
+        Ok(pointer) => pointer,
+        Err(StorageError::NotFound) => {
+            // Developer GET remains strictly read-only. Bounded intent probes
+            // distinguish a quiescent absence/retirement from a live package
+            // or crash-recoverable import/publish/maintenance whose pointer is
+            // temporarily missing. No LIST or repair is allowed here.
+            let package_key = hosted_package_key(repository, package);
+            let import_key = crate::npm_layout::hosted_import_pending_key(repository, package);
+            let pending_index_key = hosted_publish_pending_index_key(repository, package);
+            let retired_key = crate::npm_layout::hosted_packument_retired_key(repository, package);
+            let (maintenance, package_state, import, pending_index, retired) = tokio::join!(
+                read_hosted_maintenance_marker(&state.storage, repository, package),
+                optional_hosted_materialization_get(state, &package_key),
+                optional_hosted_materialization_get(state, &import_key),
+                optional_hosted_materialization_get(state, &pending_index_key),
+                optional_hosted_materialization_get(state, &retired_key),
+            );
+            let maintenance = maintenance.map_err(|_| ReadError::MaterializationUnavailable)?;
+            let package_state = package_state?;
+            let import = import?;
+            let pending_index = pending_index?;
+            let retired = retired?;
+            if import.as_ref().is_some_and(|marker| {
+                parse_hosted_import_session(marker, repository, package).is_err()
+            }) || pending_index.as_ref().is_some_and(|pending| {
+                parse_hosted_publish_pending(pending, repository, package).is_err()
+            }) {
+                return Err(ReadError::MaterializationUnavailable);
+            }
+            if maintenance.is_some()
+                || package_state.is_some()
+                || import.is_some()
+                || pending_index.is_some()
+            {
+                return Err(ReadError::MaterializationUnavailable);
+            }
+            return match retired {
+                Some(marker)
+                    if marker.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 =>
+                {
+                    Err(ReadError::NotFound)
+                }
+                Some(_) => Err(ReadError::MaterializationUnavailable),
+                None => Err(ReadError::NotFound),
+            };
+        }
+        Err(_) => return Err(ReadError::MaterializationUnavailable),
     };
-    match valid_cached_hosted_packument(&bytes, package) {
-        Some(packument) => Ok(Some(packument)),
-        None => {
-            tracing::warn!(
+    let pointer: HostedPackumentPointer =
+        serde_json::from_slice(&pointer).map_err(|_| ReadError::MaterializationUnavailable)?;
+    if !valid_sha256(&pointer.generation)
+        || !valid_sha256(&pointer.full_sha256)
+        || !valid_sha256(&pointer.install_v1_sha256)
+        || pointer.generation != pointer.full_sha256
+    {
+        return Err(ReadError::MaterializationUnavailable);
+    }
+    let (key, expected) = match flavor {
+        PackumentFlavor::Full => (
+            crate::npm_layout::hosted_packument_full_key(repository, package, &pointer.generation),
+            pointer.full_sha256,
+        ),
+        PackumentFlavor::InstallV1 => (
+            crate::npm_layout::hosted_packument_install_v1_key(
                 repository,
                 package,
-                key,
-                "ignoring invalid rebuildable npm hosted packument cache"
-            );
-            Ok(None)
-        }
-    }
-}
-
-async fn build_hosted_packument(
-    state: &AppState,
-    repository: &str,
-    package: &str,
-) -> Result<serde_json::Value, ReadError> {
-    let prefix = package_prefix(repository, package);
-    let version_prefix = format!("{prefix}/versions/");
-    let version_keys = state
-        .storage
-        .list(&version_prefix)
-        .await
-        .map_err(|_| ReadError::Unavailable)?;
-    let deprecation_prefix = format!("{prefix}/deprecations/");
-    let deprecation_keys = state
-        .storage
-        .list(&deprecation_prefix)
-        .await
-        .map_err(|_| ReadError::Unavailable)?
-        .into_iter()
-        .filter_map(|key| {
-            let version = key.strip_prefix(&deprecation_prefix)?.to_string();
-            (!version.is_empty() && !version.contains('/')).then_some((version, key))
-        })
-        .collect::<HashMap<_, _>>();
-
-    let version_reads = stream::iter(version_keys.into_iter().filter_map(|key| {
-        let version = key
-            .strip_prefix(&version_prefix)?
-            .strip_suffix(".json")?
-            .to_string();
-        (!version.is_empty() && !version.contains('/')).then_some((version, key))
-    }))
-    .map(|(version, key)| {
-        let deprecation_key = deprecation_keys.get(&version).cloned();
-        async move {
-            let bytes = state.storage.get(&key).await.map_err(|error| {
-                match storage_read_error(error) {
-                    // LIST advertised this committed manifest. Disappearing between
-                    // LIST and GET is an incomplete hosted read, not permission to
-                    // let a lower-priority group member shadow the version.
-                    ReadError::NotFound => ReadError::Unavailable,
-                    other => other,
-                }
-            })?;
-            let mut value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
-                crate::metrics::METADATA_CORRUPT_TOTAL
-                    .with_label_values(&["npm"])
-                    .inc();
-                ReadError::Corrupt
-            })?;
-            if let Some(deprecation_key) = deprecation_key {
-                let deprecated = state
-                    .storage
-                    .get(&deprecation_key)
-                    .await
-                    .map_err(storage_read_error)?;
-                let Some(message) = read_string(deprecated) else {
-                    return Err(ReadError::Corrupt);
-                };
-                let Some(object) = value.as_object_mut() else {
-                    return Err(ReadError::Corrupt);
-                };
-                object.insert("deprecated".to_string(), serde_json::Value::String(message));
-            }
-            Ok::<_, ReadError>((version, value))
-        }
-    })
-    .buffered(HOSTED_PACKUMENT_READ_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut versions = serde_json::Map::new();
-    for result in version_reads {
-        let (version, value) = result?;
-        versions.insert(version, value);
-    }
-
-    let mut tags = serde_json::Map::new();
-    let tag_prefix = format!("{prefix}/dist-tags/");
-    for key in state
-        .storage
-        .list(&tag_prefix)
-        .await
-        .map_err(|_| ReadError::Unavailable)?
-    {
-        let Some(tag) = key.rsplit('/').next() else {
-            continue;
-        };
-        let value =
-            state
-                .storage
-                .get(&key)
-                .await
-                .map_err(|error| match storage_read_error(error) {
-                    ReadError::NotFound => ReadError::Unavailable,
-                    other => other,
-                })?;
-        let Some(version) = read_string(value) else {
-            return Err(ReadError::Corrupt);
-        };
-        tags.insert(tag.to_string(), serde_json::Value::String(version));
-    }
-
-    let package_fields =
-        match optional_storage_get(state, &hosted_package_key(repository, package)).await? {
-            Some(bytes) => Some(serde_json::from_slice::<serde_json::Value>(&bytes).map_err(
-                |_| {
-                    crate::metrics::METADATA_CORRUPT_TOTAL
-                        .with_label_values(&["npm"])
-                        .inc();
-                    ReadError::Corrupt
-                },
-            )?),
-            None => None,
-        };
-
-    if versions.is_empty() && tags.is_empty() && package_fields.is_none() {
-        return Err(ReadError::NotFound);
-    }
-
-    let mut packument = package_fields.unwrap_or_else(|| serde_json::json!({}));
-    let Some(object) = packument.as_object_mut() else {
-        return Err(ReadError::Corrupt);
+                &pointer.generation,
+            ),
+            pointer.install_v1_sha256,
+        ),
     };
-    object.insert(
-        "name".to_string(),
-        serde_json::Value::String(package.to_string()),
-    );
-    object.insert("versions".to_string(), serde_json::Value::Object(versions));
-    object.insert("dist-tags".to_string(), serde_json::Value::Object(tags));
-    Ok(packument)
+    let bytes = state
+        .storage
+        .get(&key)
+        .await
+        .map_err(|_| ReadError::MaterializationUnavailable)?;
+    if hex::encode(sha2::Sha256::digest(&bytes)) != expected {
+        return Err(ReadError::MaterializationUnavailable);
+    }
+    valid_hosted_packument(&bytes, package).ok_or(ReadError::MaterializationUnavailable)
 }
 
 async fn hosted_packument(
@@ -942,46 +1985,9 @@ async fn hosted_packument(
     repository: &str,
     package: &str,
     response_base: &str,
+    flavor: PackumentFlavor,
 ) -> Result<serde_json::Value, ReadError> {
-    if let Some(packument) = read_hosted_packument_cache(state, repository, package).await? {
-        return Ok(hosted_packument_response(packument, package, response_base));
-    }
-
-    // A cold read shares the exact package lock used by hosted mutations.
-    // This prevents a cache miss from materializing stale state after a
-    // concurrent mutation invalidated the previous cache.
-    let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
-    let _guard = lock.lock().await;
-    if let Some(packument) = read_hosted_packument_cache(state, repository, package).await? {
-        return Ok(hosted_packument_response(packument, package, response_base));
-    }
-
-    let packument = build_hosted_packument(state, repository, package).await?;
-    let key = crate::npm_layout::hosted_packument_cache_key(repository, package);
-    match serde_json::to_vec(&packument) {
-        Ok(bytes) => {
-            if let Err(error) = state.storage.put(&key, &bytes).await {
-                // The cache is derived. A failed cache write must not turn a
-                // complete authoritative read into an unavailable response.
-                tracing::warn!(
-                    repository,
-                    package,
-                    key,
-                    ?error,
-                    "failed to persist rebuildable npm hosted packument cache"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                repository,
-                package,
-                ?error,
-                "failed to serialize npm packument"
-            );
-            return Err(ReadError::Corrupt);
-        }
-    }
+    let packument = read_hosted_packument_generation(state, repository, package, flavor).await?;
     Ok(hosted_packument_response(packument, package, response_base))
 }
 
@@ -1264,6 +2270,7 @@ async fn group_packument(
     members: &[String],
     package: &str,
     response_base: &str,
+    flavor: PackumentFlavor,
 ) -> Result<PackumentRead, ReadError> {
     let mut packuments = Vec::new();
     let mut stale = false;
@@ -1273,24 +2280,24 @@ async fn group_packument(
         };
         let result = match repository {
             NpmRepository::Hosted { name, .. } => {
-                hosted_packument(state, &name, package, response_base)
+                hosted_packument(state, &name, package, response_base, flavor)
                     .await
                     .map(PackumentRead::fresh)
             }
             NpmRepository::Proxy { .. } if is_internal(state, package) => Err(ReadError::NotFound),
             NpmRepository::Proxy { .. } => {
                 let proxy = configured_proxy(state, &repository).expect("proxy config");
-                proxy_packument_raw(state, &proxy, package)
-                    .await
-                    .map(|read| PackumentRead {
-                        value: rewrite_packument_urls(
-                            read.value,
-                            response_base,
-                            package,
-                            &proxy.url,
-                        ),
+                match proxy_packument_raw(state, &proxy, package).await {
+                    Ok(read) => project_packument(
+                        rewrite_packument_urls(read.value, response_base, package, &proxy.url),
+                        flavor,
+                    )
+                    .map(|value| PackumentRead {
+                        value,
                         stale: read.stale,
-                    })
+                    }),
+                    Err(error) => Err(error),
+                }
             }
             NpmRepository::Group { .. } => continue,
         };
@@ -1318,29 +2325,32 @@ async fn target_packument(
     target: &RepositoryTarget,
     package: &str,
     response_base: &str,
+    flavor: PackumentFlavor,
 ) -> Result<PackumentRead, ReadError> {
     match target {
         RepositoryTarget::Named(NpmRepository::Hosted { name, .. }) => {
-            hosted_packument(state, name, package, response_base)
+            hosted_packument(state, name, package, response_base, flavor)
                 .await
                 .map(PackumentRead::fresh)
         }
         RepositoryTarget::Named(repository @ NpmRepository::Proxy { .. }) => {
             let proxy = configured_proxy(state, repository).expect("proxy config");
-            proxy_packument_raw(state, &proxy, package)
-                .await
-                .map(|read| PackumentRead {
-                    value: rewrite_packument_urls(read.value, response_base, package, &proxy.url),
-                    stale: read.stale,
-                })
+            let read = proxy_packument_raw(state, &proxy, package).await?;
+            Ok(PackumentRead {
+                value: project_packument(
+                    rewrite_packument_urls(read.value, response_base, package, &proxy.url),
+                    flavor,
+                )?,
+                stale: read.stale,
+            })
         }
         RepositoryTarget::Named(NpmRepository::Group { members, .. }) => {
-            group_packument(state, members, package, response_base).await
+            group_packument(state, members, package, response_base, flavor).await
         }
         RepositoryTarget::Legacy => {
             let mut packuments = Vec::new();
             let mut stale = false;
-            match hosted_packument(state, LEGACY_HOSTED, package, response_base).await {
+            match hosted_packument(state, LEGACY_HOSTED, package, response_base, flavor).await {
                 Ok(hosted) => packuments.push(hosted),
                 Err(ReadError::NotFound) => {}
                 Err(error) => return Err(error),
@@ -1350,12 +2360,15 @@ async fn target_packument(
                     match proxy_packument_raw(state, &proxy, package).await {
                         Ok(read) => {
                             stale |= read.stale;
-                            packuments.push(rewrite_packument_urls(
-                                read.value,
-                                response_base,
-                                package,
-                                &proxy.url,
-                            ))
+                            packuments.push(project_packument(
+                                rewrite_packument_urls(
+                                    read.value,
+                                    response_base,
+                                    package,
+                                    &proxy.url,
+                                ),
+                                flavor,
+                            )?)
                         }
                         Err(ReadError::NotFound) => {}
                         Err(error) if packuments.is_empty() => return Err(error),
@@ -1377,6 +2390,12 @@ fn read_error_response(error: ReadError) -> Response {
         ReadError::NotFound => StatusCode::NOT_FOUND.into_response(),
         ReadError::CircuitOpen(name) => circuit_open_response(&name),
         ReadError::Unavailable => StatusCode::BAD_GATEWAY.into_response(),
+        ReadError::MaterializationUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "Hosted npm packument is not ready; retry after package repair/finalize",
+        )
+            .into_response(),
         ReadError::Corrupt => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         ReadError::SearchScanLimit => (
             StatusCode::BAD_GATEWAY,
@@ -1386,15 +2405,69 @@ fn read_error_response(error: ReadError) -> Response {
     }
 }
 
-async fn hosted_has_version(
+enum HostedVersionResolution {
+    Absent,
+    AuthoritativelyAbsent,
+    Visible(serde_json::Value),
+}
+
+async fn hosted_version_from_current(
     state: &AppState,
     repository: &str,
     package: &str,
     version: &str,
-) -> Result<bool, ReadError> {
-    optional_storage_get(state, &hosted_version_key(repository, package, version))
-        .await
-        .map(|manifest| manifest.is_some())
+) -> Result<HostedVersionResolution, ReadError> {
+    match read_hosted_packument_generation(state, repository, package, PackumentFlavor::Full).await
+    {
+        Ok(packument) => {
+            if let Some(manifest) = packument
+                .get("versions")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|versions| versions.get(version))
+                .cloned()
+            {
+                return Ok(HostedVersionResolution::Visible(manifest));
+            }
+            // A leftover exact split manifest is a bounded tombstone probe
+            // for a version removed from the committed generation. It must
+            // not be served or bypassed through a later group member.
+            return match state
+                .storage
+                .get(&hosted_version_key(repository, package, version))
+                .await
+            {
+                Ok(_) => Ok(HostedVersionResolution::AuthoritativelyAbsent),
+                Err(StorageError::NotFound) => Ok(HostedVersionResolution::Absent),
+                Err(error) => Err(storage_read_error(error)),
+            };
+        }
+        Err(ReadError::NotFound) => {
+            // A valid retired marker is an explicit absence authority even
+            // while best-effort split cleanup is still pending.
+            let retired_key = crate::npm_layout::hosted_packument_retired_key(repository, package);
+            match state.storage.get(&retired_key).await {
+                Ok(marker) if marker.as_ref() == crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1 => {
+                    return Ok(HostedVersionResolution::AuthoritativelyAbsent)
+                }
+                Ok(_) => return Err(ReadError::MaterializationUnavailable),
+                Err(StorageError::NotFound) => {}
+                Err(error) => return Err(storage_read_error(error)),
+            }
+            // The requested exact split key is only an intent/corruption
+            // probe when current is absent; it can never make a version
+            // visible or cause group/legacy fallthrough.
+            match state
+                .storage
+                .get(&hosted_version_key(repository, package, version))
+                .await
+            {
+                Ok(_) => Err(ReadError::MaterializationUnavailable),
+                Err(StorageError::NotFound) => Ok(HostedVersionResolution::Absent),
+                Err(error) => Err(storage_read_error(error)),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn dist_digest_matches(data: &[u8], version_data: &serde_json::Value) -> bool {
@@ -1439,22 +2512,39 @@ async fn serve_hosted_tarball(
     let Some(version) = crate::curation::parse_npm_tarball_version(package, filename) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let manifest = match state
-        .storage
-        .get(&hosted_version_key(repository, package, &version))
-        .await
+    let version_data = match hosted_version_from_current(state, repository, package, &version).await
     {
-        Ok(manifest) => manifest,
-        Err(error) => return read_error_response(storage_read_error(error)),
+        Ok(HostedVersionResolution::Visible(version_data)) => version_data,
+        Ok(HostedVersionResolution::Absent | HostedVersionResolution::AuthoritativelyAbsent) => {
+            return StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => return read_error_response(error),
     };
-    let Ok(version_data) = serde_json::from_slice::<serde_json::Value>(&manifest) else {
-        crate::metrics::METADATA_CORRUPT_TOTAL
-            .with_label_values(&["npm"])
-            .inc();
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    serve_hosted_tarball_version(
+        state,
+        repository,
+        package,
+        &version,
+        version_data,
+        publish_date,
+    )
+    .await
+}
+
+async fn serve_hosted_tarball_version(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    version: &str,
+    version_data: serde_json::Value,
+    publish_date: Option<i64>,
+) -> Response {
+    let manifest = match serde_json::to_vec(&version_data) {
+        Ok(manifest) => manifest,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let Some(key) =
-        crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &manifest)
+        crate::npm_layout::hosted_blob_key_from_manifest(repository, package, manifest.as_slice())
     else {
         crate::metrics::METADATA_CORRUPT_TOTAL
             .with_label_values(&["npm"])
@@ -1471,7 +2561,7 @@ async fn serve_hosted_tarball(
     if !dist_digest_matches(&data, &version_data) {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    curated_tarball_response(state, package, &version, data, "hosted", publish_date)
+    curated_tarball_response(state, package, version, data, "hosted", publish_date)
 }
 
 async fn serve_proxy_tarball(
@@ -1655,15 +2745,25 @@ async fn group_tarball(
         };
         match repository {
             NpmRepository::Hosted { name, .. } => {
-                match hosted_has_version(state, &name, package, &version).await {
-                    Ok(true) => {
+                match hosted_version_from_current(state, &name, package, &version).await {
+                    Ok(HostedVersionResolution::Visible(version_data)) => {
                         // Once a member claims the version, its tarball is the
                         // only legal origin. Do not fall through after an
                         // incomplete or corrupt member.
-                        return serve_hosted_tarball(state, &name, package, filename, publish_date)
-                            .await;
+                        return serve_hosted_tarball_version(
+                            state,
+                            &name,
+                            package,
+                            &version,
+                            version_data,
+                            publish_date,
+                        )
+                        .await;
                     }
-                    Ok(false) => {}
+                    Ok(HostedVersionResolution::AuthoritativelyAbsent) => {
+                        return StatusCode::NOT_FOUND.into_response()
+                    }
+                    Ok(HostedVersionResolution::Absent) => {}
                     Err(error) => return read_error_response(error),
                 }
             }
@@ -1713,18 +2813,22 @@ async fn target_tarball(
             else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            match hosted_has_version(state, LEGACY_HOSTED, package, &version).await {
-                Ok(true) => {
-                    return serve_hosted_tarball(
+            match hosted_version_from_current(state, LEGACY_HOSTED, package, &version).await {
+                Ok(HostedVersionResolution::Visible(version_data)) => {
+                    return serve_hosted_tarball_version(
                         state,
                         LEGACY_HOSTED,
                         package,
-                        filename,
+                        &version,
+                        version_data,
                         publish_date,
                     )
                     .await
                 }
-                Ok(false) => {}
+                Ok(HostedVersionResolution::AuthoritativelyAbsent) => {
+                    return StatusCode::NOT_FOUND.into_response()
+                }
+                Ok(HostedVersionResolution::Absent) => {}
                 Err(error) => return read_error_response(error),
             }
             if let Some(proxy) = legacy_proxy(state) {
@@ -2464,6 +3568,7 @@ async fn handle_get(
     query: Option<String>,
     user: AuthenticatedUser,
 ) -> Response {
+    let packument_flavor = PackumentFlavor::from_headers(&headers);
     if path == "-/ping" {
         return axum::Json(serde_json::json!({})).into_response();
     }
@@ -2504,8 +3609,13 @@ async fn handle_get(
         }
         target_tarball(&state, &target, &package, &filename, publish_date).await
     } else {
-        match target_packument(&state, &target, &package, &response_base).await {
-            Ok(packument) => json_response_with_stale(&headers, &packument.value, packument.stale),
+        match target_packument(&state, &target, &package, &response_base, packument_flavor).await {
+            Ok(packument) => packument_response(
+                &headers,
+                &packument.value,
+                packument.stale,
+                packument_flavor,
+            ),
             Err(error) => read_error_response(error),
         }
     };
@@ -2909,170 +4019,439 @@ fn validate_publish(
     })
 }
 
-async fn publish(
+#[derive(Debug)]
+struct ImportVersionPreflight {
+    completed_receipt: bool,
+    session: Option<HostedImportSession>,
+    pending_present: bool,
+    blob_present: bool,
+    manifest_present: bool,
+    completion_present: bool,
+    evidence_present: bool,
+}
+
+async fn import_version_preflight(
     state: &AppState,
     repository: &str,
-    write_policy: NpmWritePolicy,
     package: &str,
-    payload: &serde_json::Value,
-) -> Response {
-    let validated = match validate_publish(package, payload) {
-        Ok(validated) => validated,
-        Err(error) => return error.into_response(),
-    };
-    let lock_key = format!("npm:{repository}:{package}");
-    let lock = state.publish_lock(&lock_key);
-    let _guard = lock.lock().await;
-    match incomplete_publish_versions(state, repository, package).await {
-        Ok(incomplete)
-            if incomplete
-                .iter()
-                .any(|version| version != &validated.version) =>
-        {
-            return incomplete_publish_response()
+    expected_packument_sha256: &str,
+    validated: &ValidatedPublish,
+) -> Result<ImportVersionPreflight, StorageError> {
+    let manifest_digest = crate::npm_layout::hosted_manifest_digest(&validated.manifest);
+    let receipt_key = crate::npm_layout::hosted_import_receipt_key(
+        repository,
+        package,
+        expected_packument_sha256,
+    );
+    let receipt = match state.storage.get(&receipt_key).await {
+        Ok(bytes) => {
+            let receipt: HostedImportReceipt =
+                serde_json::from_slice(&bytes).map_err(|_| StorageError::IntegrityViolation)?;
+            if receipt.package != package
+                || receipt.generation != expected_packument_sha256
+                || receipt.full_sha256 != expected_packument_sha256
+                || !valid_sha256(&receipt.install_v1_sha256)
+            {
+                return Err(StorageError::IntegrityViolation);
+            }
+            Some(receipt)
         }
-        Ok(_) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-    if invalidate_hosted_packument_cache(state, repository, package)
-        .await
-        .is_err()
+        Err(StorageError::NotFound) => None,
+        Err(error) => return Err(error),
+    };
+
+    let session = read_optional_import_session(&state.storage, repository, package).await?;
+    if session
+        .as_ref()
+        .is_some_and(|session| session.packument_sha256 != expected_packument_sha256)
+        || session
+            .as_ref()
+            .and_then(|session| session.versions.get(&validated.version))
+            .is_some_and(|digest| digest != &manifest_digest)
     {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(StorageError::AlreadyExists);
     }
 
-    let pending_key = hosted_publish_pending_key(repository, package, &validated.version);
-    let completion_digest = crate::npm_layout::hosted_manifest_digest(&validated.manifest);
-    let previous_pending = match state.storage.get(&pending_key).await {
-        Ok(previous) if previous.as_ref() == completion_digest.as_bytes() => Some(previous),
-        Ok(_) => return incomplete_publish_response(),
-        Err(StorageError::NotFound) => None,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let pending_present =
+        match read_optional_publish_pending(&state.storage, repository, package).await? {
+            Some(pending)
+                if pending.version == validated.version
+                    && pending.manifest_sha256 == manifest_digest
+                    && pending.blob_sha512 == validated.blob_digest
+                    && pending.target
+                        == (HostedPublishPendingTarget::Import {
+                            packument_sha256: expected_packument_sha256.to_string(),
+                        }) =>
+            {
+                true
+            }
+            Some(_) => return Err(StorageError::AlreadyExists),
+            None => false,
+        };
+
+    let manifest_key = hosted_version_key(repository, package, &validated.version);
+    let manifest_present = match state.storage.get(&manifest_key).await {
+        Ok(manifest) if manifest.as_ref() == validated.manifest.as_slice() => true,
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => false,
+        Err(error) => return Err(error),
     };
-    if state
-        .storage
-        .put(&pending_key, completion_digest.as_bytes())
-        .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let completion_key = hosted_publish_complete_key(repository, package, &validated.version);
+    let completion_present = match state.storage.get(&completion_key).await {
+        Ok(completion) if completion.as_ref() == manifest_digest.as_bytes() => true,
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => false,
+        Err(error) => return Err(error),
+    };
 
     let blob_key =
         crate::npm_layout::hosted_blob_key_for_digest(repository, package, &validated.blob_digest);
-    match put_immutable(state, &blob_key, &validated.tarball).await {
-        Ok(ImmutableWrite::Created | ImmutableWrite::ExistingSame) => {}
-        Ok(ImmutableWrite::Conflict) => {
-            if restore_publish_pending(state, &pending_key, previous_pending.as_deref())
-                .await
-                .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            tracing::error!(key = %blob_key, "npm content digest collision");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let blob_present = match state.storage.get(&blob_key).await {
+        Ok(blob) if blob.as_ref() == validated.tarball.as_slice() => true,
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => false,
+        Err(error) => return Err(error),
+    };
+
+    let evidence_key = crate::npm_layout::hosted_import_evidence_key(
+        repository,
+        package,
+        expected_packument_sha256,
+        &validated.version,
+        &manifest_digest,
+    );
+    let evidence_present = match state.storage.get(&evidence_key).await {
+        Ok(value) if value.as_ref() == b"1" => true,
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => false,
+        Err(error) => return Err(error),
+    };
+
+    if let Some(receipt) = &receipt {
+        if pending_present
+            || !(manifest_present && completion_present && blob_present && evidence_present)
+        {
+            return Err(StorageError::AlreadyExists);
         }
-        Err(error) => {
-            if restore_publish_pending(state, &pending_key, previous_pending.as_deref())
-                .await
-                .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        let generation = HostedPackumentPointer {
+            generation: receipt.generation.clone(),
+            full_sha256: receipt.full_sha256.clone(),
+            install_v1_sha256: receipt.install_v1_sha256.clone(),
+        };
+        match validate_hosted_packument_pointer(&state.storage, repository, package, &generation)
+            .await
+        {
+            Ok(()) => {}
+            Err(StorageError::NotFound | StorageError::IntegrityViolation) => {
+                return Err(StorageError::AlreadyExists)
             }
-            tracing::error!(key = %blob_key, error = ?error, "npm tarball blob create failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            Err(error) => return Err(error),
         }
+        let full = match state
+            .storage
+            .get(&crate::npm_layout::hosted_packument_full_key(
+                repository,
+                package,
+                &receipt.generation,
+            ))
+            .await
+        {
+            Ok(full) => full,
+            Err(StorageError::NotFound | StorageError::IntegrityViolation) => {
+                return Err(StorageError::AlreadyExists)
+            }
+            Err(error) => return Err(error),
+        };
+        let full = valid_hosted_packument(&full, package).ok_or(StorageError::AlreadyExists)?;
+        let versions = full
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(StorageError::AlreadyExists)?;
+        if versions.len() != receipt.version_count {
+            return Err(StorageError::AlreadyExists);
+        }
+        let mut receipt_manifest = versions
+            .get(&validated.version)
+            .cloned()
+            .ok_or(StorageError::AlreadyExists)?;
+        receipt_manifest
+            .as_object_mut()
+            .ok_or(StorageError::AlreadyExists)?
+            .remove("deprecated");
+        let expected_manifest: serde_json::Value = serde_json::from_slice(&validated.manifest)
+            .map_err(|_| StorageError::IntegrityViolation)?;
+        if receipt_manifest != expected_manifest {
+            return Err(StorageError::AlreadyExists);
+        }
+    } else if manifest_present {
+        // A missing completion is resumable only behind this exact pending
+        // digest. The tarball blob was ordered before the manifest, so its
+        // absence is corruption rather than permission to recreate history.
+        if !blob_present
+            || (!completion_present && !pending_present)
+            || (!completion_present && evidence_present)
+            || (evidence_present
+                && session
+                    .as_ref()
+                    .and_then(|session| session.versions.get(&validated.version))
+                    != Some(&manifest_digest))
+        {
+            return Err(StorageError::AlreadyExists);
+        }
+    } else if completion_present || evidence_present {
+        return Err(StorageError::AlreadyExists);
     }
 
-    // The version manifest is the sole visibility/commit point. The referenced
-    // tarball blob is content-addressed and is always durable before this write.
-    let manifest_key = hosted_version_key(repository, package, &validated.version);
-    let manifest_outcome =
-        match commit_hosted_manifest(state, &manifest_key, &validated.manifest, write_policy).await
-        {
-            Ok(outcome) => outcome,
-            Err(ManifestCommitError::Conflict) => {
-                if restore_publish_pending(state, &pending_key, previous_pending.as_deref())
-                    .await
-                    .is_err()
-                {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                return (
-                    StatusCode::CONFLICT,
-                    "Version already exists with other metadata or tarball bytes",
-                )
-                    .into_response();
-            }
-            Err(ManifestCommitError::Storage(error)) => {
-                if restore_publish_pending(state, &pending_key, previous_pending.as_deref())
-                    .await
-                    .is_err()
-                {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                tracing::error!(key = %manifest_key, error = ?error, "npm version commit failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    Ok(ImportVersionPreflight {
+        completed_receipt: receipt.is_some(),
+        session,
+        pending_present,
+        blob_present,
+        manifest_present,
+        completion_present,
+        evidence_present,
+    })
+}
 
-    let completion_key = hosted_publish_complete_key(repository, package, &validated.version);
-    let needs_completion = if manifest_outcome == ManifestCommit::ExistingSame
-        && write_policy != NpmWritePolicy::Allow
-    {
-        match state.storage.get(&completion_key).await {
-            Ok(existing) if existing.as_ref() == completion_digest.as_bytes() => false,
-            Ok(_) => {
-                tracing::error!(
-                    key = %completion_key,
-                    "npm publish completion marker does not match the committed manifest"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            Err(StorageError::NotFound) => {
-                // An allow-once retry must repair an interrupted first
-                // publish without overwriting a newer explicit
-                // tag/deprecation value.
-                if fill_missing_retry_state(state, repository, package, &validated)
-                    .await
-                    .is_err()
-                {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                true
-            }
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+async fn put_exact_with_readback(
+    storage: &Storage,
+    key: &str,
+    value: &[u8],
+) -> Result<(), StorageError> {
+    let written = storage.put(key, value).await;
+    match storage.get(key).await {
+        Ok(current) if current.as_ref() == value => Ok(()),
+        Ok(_) => Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => match written {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_import_session_version(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    packument_sha256: &str,
+    version: &str,
+    manifest_sha256: &str,
+    existing: Option<HostedImportSession>,
+) -> Result<HostedImportSession, StorageError> {
+    let marker_key = crate::npm_layout::hosted_import_pending_key(repository, package);
+    let expected_previous = existing
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| StorageError::IntegrityViolation)?;
+    let mut session = if let Some(session) = existing {
+        session
     } else {
-        // `allow` is a real redeploy even when the immutable version
-        // manifest happens to be byte-identical: npm publish's selected
-        // dist-tag and package fields are mutable payload state. Remove
-        // the completion marker before touching that state so a failed
-        // post-commit phase cannot be acknowledged as complete on retry.
-        match state.storage.delete(&completion_key).await {
-            Ok(()) | Err(StorageError::NotFound) => {}
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        let base = read_hosted_packument_pointer(&state.storage, repository, package).await?;
+        if let Some(base) = &base {
+            validate_hosted_packument_pointer(&state.storage, repository, package, base).await?;
+        } else {
+            match state
+                .storage
+                .get(&hosted_package_key(repository, package))
+                .await
+            {
+                Err(StorageError::NotFound) => {}
+                Ok(_) => return Err(StorageError::IntegrityViolation),
+                Err(error) => return Err(error),
+            }
         }
-        if replace_publish_state(state, repository, package, &validated)
-            .await
-            .is_err()
-        {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        HostedImportSession {
+            schema: crate::npm_layout::HOSTED_IMPORT_SESSION_SCHEMA_V1,
+            repository: repository.to_string(),
+            package: package.to_string(),
+            packument_sha256: packument_sha256.to_string(),
+            base,
+            versions: BTreeMap::new(),
         }
-        true
     };
-    if needs_completion
-        && state
-            .storage
-            .put(&completion_key, completion_digest.as_bytes())
-            .await
-            .is_err()
+    if session.packument_sha256 != packument_sha256 {
+        return Err(StorageError::AlreadyExists);
+    }
+    match session.versions.get(version) {
+        Some(existing) if existing == manifest_sha256 => return Ok(session),
+        Some(_) => return Err(StorageError::AlreadyExists),
+        None => {
+            session
+                .versions
+                .insert(version.to_string(), manifest_sha256.to_string());
+        }
+    }
+    let bytes = serde_json::to_vec(&session).map_err(|_| StorageError::IntegrityViolation)?;
+    match (state.storage.get(&marker_key).await, expected_previous) {
+        (Ok(current), Some(previous)) if current.as_ref() == previous.as_slice() => {
+            put_exact_with_readback(&state.storage, &marker_key, &bytes).await?
+        }
+        (Ok(_), _) => return Err(StorageError::AlreadyExists),
+        (Err(StorageError::NotFound), None) => {
+            put_immutable_storage(&state.storage, &marker_key, &bytes).await?
+        }
+        (Err(StorageError::NotFound), Some(_)) => return Err(StorageError::AlreadyExists),
+        (Err(error), _) => return Err(error),
+    }
+    let stored = state.storage.get(&marker_key).await?;
+    let stored = parse_hosted_import_session(&stored, repository, package)?;
+    if stored != session {
+        return Err(StorageError::AlreadyExists);
+    }
+    Ok(session)
+}
+
+async fn delete_exact_with_readback(
+    storage: &Storage,
+    key: &str,
+    expected: &[u8],
+) -> Result<(), StorageError> {
+    match storage.get(key).await {
+        Ok(current) if current.as_ref() == expected => {}
+        Ok(_) => return Err(StorageError::AlreadyExists),
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let deleted = storage.delete(key).await;
+    match storage.get(key).await {
+        Err(StorageError::NotFound) => Ok(()),
+        Ok(current) if current.as_ref() == expected => match deleted {
+            Ok(()) => Err(StorageError::IntegrityViolation),
+            Err(error) => Err(error),
+        },
+        Ok(_) => Err(StorageError::AlreadyExists),
+        Err(error) => Err(error),
+    }
+}
+
+async fn publish_import_version_locked(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    expected_packument_sha256: &str,
+    validated: &ValidatedPublish,
+) -> Response {
+    fn immutable_write_error(error: StorageError) -> Response {
+        match error {
+            StorageError::AlreadyExists | StorageError::IntegrityViolation => (
+                StatusCode::CONFLICT,
+                "Imported npm version state changed during exact preflight",
+            )
+                .into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+    let preflight = match import_version_preflight(
+        state,
+        repository,
+        package,
+        expected_packument_sha256,
+        validated,
+    )
+    .await
+    {
+        Ok(preflight) => preflight,
+        Err(StorageError::AlreadyExists) => {
+            return (
+                StatusCode::CONFLICT,
+                "Imported npm version state differs from the exact import payload",
+            )
+                .into_response()
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if preflight.completed_receipt {
+        // A delayed version PUT from an already completed import is an exact,
+        // read-only acknowledgement. Never rewind package metadata, tags,
+        // deprecations or a later packument pointer.
+        return StatusCode::CREATED.into_response();
+    }
+    let active_pending =
+        match read_optional_publish_pending(&state.storage, repository, package).await {
+            Ok(pending) => pending,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    if active_pending
+        .as_ref()
+        .is_some_and(|pending| pending.version != validated.version)
+    {
+        return incomplete_publish_response();
+    }
+
+    let manifest_digest = crate::npm_layout::hosted_manifest_digest(&validated.manifest);
+    if let Err(error) = ensure_import_session_version(
+        state,
+        repository,
+        package,
+        expected_packument_sha256,
+        &validated.version,
+        &manifest_digest,
+        preflight.session.clone(),
+    )
+    .await
+    {
+        return immutable_write_error(error);
+    }
+    let pending = HostedPublishPending {
+        schema: crate::npm_layout::HOSTED_PUBLISH_PENDING_SCHEMA_V1,
+        repository: repository.to_string(),
+        package: package.to_string(),
+        version: validated.version.clone(),
+        manifest_sha256: manifest_digest.clone(),
+        blob_sha512: validated.blob_digest.clone(),
+        target: HostedPublishPendingTarget::Import {
+            packument_sha256: expected_packument_sha256.to_string(),
+        },
+    };
+    if !preflight.pending_present {
+        if let Err(error) = create_hosted_publish_pending(&state.storage, &pending).await {
+            return immutable_write_error(error);
+        }
+    }
+    let blob_key =
+        crate::npm_layout::hosted_blob_key_for_digest(repository, package, &validated.blob_digest);
+    if !preflight.blob_present {
+        if let Err(error) =
+            put_immutable_storage(&state.storage, &blob_key, &validated.tarball).await
+        {
+            return immutable_write_error(error);
+        }
+    }
+    let manifest_key = hosted_version_key(repository, package, &validated.version);
+    if !preflight.manifest_present {
+        if let Err(error) =
+            put_immutable_storage(&state.storage, &manifest_key, &validated.manifest).await
+        {
+            return immutable_write_error(error);
+        }
+    }
+    let completion_key = hosted_publish_complete_key(repository, package, &validated.version);
+    if !preflight.completion_present {
+        if let Err(error) =
+            put_immutable_storage(&state.storage, &completion_key, manifest_digest.as_bytes()).await
+        {
+            return immutable_write_error(error);
+        }
+    }
+    let evidence_key = crate::npm_layout::hosted_import_evidence_key(
+        repository,
+        package,
+        expected_packument_sha256,
+        &validated.version,
+        &manifest_digest,
+    );
+    if !preflight.evidence_present {
+        if let Err(error) = put_immutable_storage(&state.storage, &evidence_key, b"1").await {
+            return immutable_write_error(error);
+        }
+    }
+    if clear_hosted_publish_pending(&state.storage, &pending)
+        .await
+        .is_err()
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match state.storage.delete(&pending_key).await {
-        Ok(()) | Err(StorageError::NotFound) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 
     state.metrics.record_upload("npm");
@@ -3089,46 +4468,1205 @@ async fn publish(
     StatusCode::CREATED.into_response()
 }
 
-async fn replace_publish_state(
+async fn publish_with_import(
+    state: &AppState,
+    repository: &str,
+    write_policy: NpmWritePolicy,
+    package: &str,
+    payload: &serde_json::Value,
+    import_packument_sha256: Option<&str>,
+) -> Response {
+    let validated = match validate_publish(package, payload) {
+        Ok(validated) => validated,
+        Err(error) => return error.into_response(),
+    };
+    let lock_key = format!("npm:{repository}:{package}");
+    let lock = state.publish_lock(&lock_key);
+    let _guard = lock.lock().await;
+    match resume_hosted_maintenance_operation(&state.storage, repository, package).await {
+        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    if let Some(expected) = import_packument_sha256 {
+        return publish_import_version_locked(state, repository, package, expected, &validated)
+            .await;
+    }
+    match hosted_import_active(&state.storage, repository, package).await {
+        Ok(true) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package has an active bulk import; finalize it before normal mutation",
+            )
+                .into_response()
+        }
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let active_pending =
+        match read_optional_publish_pending(&state.storage, repository, package).await {
+            Ok(pending) => pending,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    if active_pending
+        .as_ref()
+        .is_some_and(|pending| pending.version != validated.version)
+    {
+        return incomplete_publish_response();
+    }
+
+    let manifest_key = hosted_version_key(repository, package, &validated.version);
+    let completion_key = hosted_publish_complete_key(repository, package, &validated.version);
+    let completion_digest = crate::npm_layout::hosted_manifest_digest(&validated.manifest);
+    let (completed_exact_allow_once, missing_completion_allow_once) =
+        if write_policy == NpmWritePolicy::AllowOnce {
+            match state.storage.get(&manifest_key).await {
+                Ok(existing) if existing.as_ref() == validated.manifest.as_slice() => {
+                    match state.storage.get(&completion_key).await {
+                        Ok(completion) if completion.as_ref() == completion_digest.as_bytes() => {
+                            (true, false)
+                        }
+                        Ok(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        Err(StorageError::NotFound) => (false, true),
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+                Ok(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        "Version already exists with other metadata or tarball bytes",
+                    )
+                        .into_response()
+                }
+                Err(StorageError::NotFound) => (false, false),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        } else {
+            (false, false)
+        };
+
+    if completed_exact_allow_once && active_pending.is_none() {
+        // An accepted exact retry is a no-op. In particular, do not rewind a
+        // dist-tag/deprecation changed after the original publish. The
+        // committed current generation must already contain this version.
+        if ensure_completed_publish_materialized(state, repository, package, &validated.version)
+            .await
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        return StatusCode::CREATED.into_response();
+    }
+
+    if missing_completion_allow_once && active_pending.is_none() {
+        // Completion is committed before the current pointer and pending is
+        // cleared only after both verify exactly. No legitimate crash can
+        // therefore leave an exact manifest with missing completion and no
+        // pending intent, regardless of whether current exists. Treat it as
+        // corruption and never manufacture recovery state from visibility.
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let (base, previous_packument, recorded_target) = match active_pending.as_ref() {
+        Some(HostedPublishPending {
+            target: HostedPublishPendingTarget::Publish { base, target },
+            ..
+        }) => {
+            let previous = match base {
+                Some(base) => {
+                    match hosted_packument_for_pointer(&state.storage, repository, package, base)
+                        .await
+                    {
+                        Ok(packument) => Some(packument),
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+                None => None,
+            };
+            let current =
+                match read_hosted_packument_pointer(&state.storage, repository, package).await {
+                    Ok(current) => current,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+            if current.as_ref() != base.as_ref() && current.as_ref() != Some(target) {
+                return incomplete_publish_response();
+            }
+            (base.clone(), previous, Some(target.clone()))
+        }
+        Some(_) => return incomplete_publish_response(),
+        None => {
+            let base =
+                match read_hosted_packument_pointer(&state.storage, repository, package).await {
+                    Ok(base) => base,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+            let previous = match &base {
+                Some(base) => {
+                    match hosted_packument_for_pointer(&state.storage, repository, package, base)
+                        .await
+                    {
+                        Ok(packument) => Some(packument),
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+                None => {
+                    match state
+                        .storage
+                        .get(&hosted_package_key(repository, package))
+                        .await
+                    {
+                        Err(StorageError::NotFound) => None,
+                        Ok(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+            };
+            (base, previous, None)
+        }
+    };
+    let target_packument =
+        match packument_after_publish(package, previous_packument.clone(), &validated) {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    let (target_full, target_pointer) = match hosted_packument_pointer_for_value(&target_packument)
+    {
+        Ok(target) => target,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if recorded_target
+        .as_ref()
+        .is_some_and(|recorded| recorded != &target_pointer)
+    {
+        return incomplete_publish_response();
+    }
+    let base_mutable = match hosted_mutable_state_from_packument(previous_packument.as_ref()) {
+        Ok(state) => state,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let target_mutable = match hosted_mutable_state_from_packument(Some(&target_packument)) {
+        Ok(state) => state,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mutable_authorities =
+        hosted_mutable_authorities(repository, package, &base_mutable, &target_mutable);
+    let pending = HostedPublishPending {
+        schema: crate::npm_layout::HOSTED_PUBLISH_PENDING_SCHEMA_V1,
+        repository: repository.to_string(),
+        package: package.to_string(),
+        version: validated.version.clone(),
+        manifest_sha256: completion_digest.clone(),
+        blob_sha512: validated.blob_digest.clone(),
+        target: HostedPublishPendingTarget::Publish {
+            base,
+            target: target_pointer.clone(),
+        },
+    };
+    if active_pending
+        .as_ref()
+        .is_some_and(|active| active != &pending)
+    {
+        return incomplete_publish_response();
+    }
+    if active_pending.is_none()
+        && create_hosted_publish_pending(&state.storage, &pending)
+            .await
+            .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let blob_key =
+        crate::npm_layout::hosted_blob_key_for_digest(repository, package, &validated.blob_digest);
+    match put_immutable(state, &blob_key, &validated.tarball).await {
+        Ok(ImmutableWrite::Created | ImmutableWrite::ExistingSame) => {}
+        Ok(ImmutableWrite::Conflict) => {
+            tracing::error!(key = %blob_key, "npm content digest collision");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(key = %blob_key, error = ?error, "npm tarball blob create failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    // Split objects are prepared behind the immutable current-generation
+    // pointer. The referenced tarball blob is content-addressed and durable
+    // before the version manifest changes.
+    let manifest_outcome =
+        match commit_hosted_manifest(state, &manifest_key, &validated.manifest, write_policy).await
+        {
+            Ok(outcome) => outcome,
+            Err(ManifestCommitError::Conflict) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "Version already exists with other metadata or tarball bytes",
+                )
+                    .into_response();
+            }
+            Err(ManifestCommitError::Storage(error)) => {
+                tracing::error!(key = %manifest_key, error = ?error, "npm version commit failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    let needs_completion = if manifest_outcome == ManifestCommit::ExistingSame
+        && write_policy != NpmWritePolicy::Allow
+    {
+        match state.storage.get(&completion_key).await {
+            Ok(existing) if existing.as_ref() == completion_digest.as_bytes() => false,
+            Ok(_) => {
+                tracing::error!(
+                    key = %completion_key,
+                    "npm publish completion marker does not match the committed manifest"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(StorageError::NotFound) => true,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        // `allow` is a real redeploy even when the immutable version
+        // manifest happens to be byte-identical: npm publish's selected
+        // dist-tag and package fields are mutable payload state. Remove
+        // the completion marker before touching that state so a failed
+        // post-commit phase cannot be acknowledged as complete on retry.
+        match read_optional_exact(&state.storage, &completion_key).await {
+            Ok(Some(current)) => {
+                if delete_exact_with_readback(&state.storage, &completion_key, &current)
+                    .await
+                    .is_err()
+                {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+        true
+    };
+    if converge_hosted_mutable_target(&state.storage, &mutable_authorities)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if needs_completion
+        && put_exact_with_readback(
+            &state.storage,
+            &completion_key,
+            completion_digest.as_bytes(),
+        )
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let written_target = match write_hosted_packument_generation_documents(
+        &state.storage,
+        repository,
+        package,
+        &target_packument,
+        &target_full,
+    )
+    .await
+    {
+        Ok(target) if target == target_pointer => target,
+        Ok(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let verification = HostedPublishVerification {
+        manifest_key: &manifest_key,
+        manifest: &validated.manifest,
+        blob_key: &blob_key,
+        blob: &validated.tarball,
+        completion_key: &completion_key,
+        completion_digest: &completion_digest,
+        mutable_authorities: &mutable_authorities,
+    };
+    if verify_publish_target_state(&state.storage, &verification)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if commit_hosted_packument_pointer(&state.storage, repository, package, &written_target)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    // The pending marker is the crash-recovery boundary. Remove it only after
+    // the developer-visible generation pointer and every exact target have
+    // committed successfully.
+    let pointer_matches = matches!(
+        read_hosted_packument_pointer(&state.storage, repository, package).await,
+        Ok(Some(current)) if current == written_target
+    );
+    if !pointer_matches
+        || verify_publish_target_state(&state.storage, &verification)
+            .await
+            .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if clear_hosted_publish_pending(&state.storage, &pending)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    state.metrics.record_upload("npm");
+    state
+        .audit
+        .log(AuditEntry::new("push", "api", package, "npm", repository));
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        package.to_string(),
+        RegistryType::Npm,
+        "LOCAL",
+    ));
+    state.repo_index.invalidate("npm");
+    StatusCode::CREATED.into_response()
+}
+
+#[cfg(test)]
+async fn publish(
+    state: &AppState,
+    repository: &str,
+    write_policy: NpmWritePolicy,
+    package: &str,
+    payload: &serde_json::Value,
+) -> Response {
+    publish_with_import(state, repository, write_policy, package, payload, None).await
+}
+
+struct DesiredImportVersion {
+    manifest: serde_json::Value,
+    manifest_sha256: String,
+    deprecation: Option<String>,
+}
+
+struct ValidatedHostedImport {
+    versions: std::collections::BTreeMap<String, DesiredImportVersion>,
+    tags: std::collections::BTreeMap<String, String>,
+    package_fields: serde_json::Value,
+}
+
+fn validate_hosted_import(
+    package: &str,
+    packument: &serde_json::Value,
+) -> Result<ValidatedHostedImport, NpmHttpError> {
+    let object = packument.as_object().ok_or_else(|| {
+        NpmHttpError::new(StatusCode::BAD_REQUEST, "Invalid npm import packument")
+    })?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+        return Err(NpmHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "Imported npm package name does not match the route",
+        ));
+    }
+    let allowed_top = [
+        "name",
+        "_id",
+        "description",
+        "readme",
+        "license",
+        "versions",
+        "dist-tags",
+    ];
+    if object
+        .keys()
+        .any(|field| !allowed_top.contains(&field.as_str()))
+    {
+        return Err(NpmHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "Imported npm packument has unsupported package fields",
+        ));
+    }
+    let desired_versions = object
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .filter(|versions| !versions.is_empty())
+        .ok_or_else(|| {
+            NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm packument has no versions",
+            )
+        })?;
+    let mut versions = std::collections::BTreeMap::new();
+    for (version, desired) in desired_versions {
+        if !is_valid_npm_version(version)
+            || desired.get("name").and_then(serde_json::Value::as_str) != Some(package)
+            || desired.get("version").and_then(serde_json::Value::as_str) != Some(version.as_str())
+        {
+            return Err(NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm version metadata has an invalid coordinate",
+            ));
+        }
+        let mut manifest = desired.clone();
+        let manifest_object = manifest.as_object_mut().ok_or_else(|| {
+            NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm version metadata is not an object",
+            )
+        })?;
+        let deprecation = match manifest_object.remove("deprecated") {
+            Some(serde_json::Value::String(message)) => Some(message),
+            Some(_) => {
+                return Err(NpmHttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Imported npm deprecation is invalid",
+                ))
+            }
+            None => None,
+        };
+        let dist = manifest_object
+            .get("dist")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                NpmHttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Imported npm version has invalid dist metadata",
+                )
+            })?;
+        if dist.contains_key("tarball")
+            || !dist
+                .get("shasum")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|digest| {
+                    digest.len() == 40 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || crate::npm_layout::hosted_blob_digest_from_manifest(
+                &serde_json::to_vec(&manifest).unwrap_or_default(),
+            )
+            .is_none()
+        {
+            return Err(NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm dist checksums are invalid or include a route URL",
+            ));
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| {
+            NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm version metadata is not serializable",
+            )
+        })?;
+        versions.insert(
+            version.clone(),
+            DesiredImportVersion {
+                manifest,
+                manifest_sha256: crate::npm_layout::hosted_manifest_digest(&manifest_bytes),
+                deprecation,
+            },
+        );
+    }
+
+    let desired_tags = object
+        .get("dist-tags")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm dist-tags are invalid",
+            )
+        })?;
+    let mut tags = std::collections::BTreeMap::new();
+    for (tag, target) in desired_tags {
+        let target = target.as_str().ok_or_else(|| {
+            NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm dist-tag target is invalid",
+            )
+        })?;
+        if !is_valid_dist_tag(tag) || !versions.contains_key(target) {
+            return Err(NpmHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "Imported npm dist-tag references a missing version",
+            ));
+        }
+        tags.insert(tag.clone(), target.to_string());
+    }
+
+    let mut package_fields = serde_json::Map::new();
+    for field in ["name", "_id", "description", "readme", "license"] {
+        if let Some(value) = object.get(field) {
+            package_fields.insert(field.to_string(), value.clone());
+        }
+    }
+    Ok(ValidatedHostedImport {
+        versions,
+        tags,
+        package_fields: serde_json::Value::Object(package_fields),
+    })
+}
+
+async fn validate_import_version_state(
     state: &AppState,
     repository: &str,
     package: &str,
-    validated: &ValidatedPublish,
-) -> Result<(), ()> {
-    state
-        .storage
-        .put(
-            &hosted_package_key(repository, package),
-            &validated.package_fields,
-        )
-        .await
-        .map_err(|_| ())?;
-    for (tag, version) in &validated.tags {
-        state
-            .storage
-            .put(
-                &hosted_tag_key(repository, package, tag),
-                version.as_bytes(),
-            )
-            .await
-            .map_err(|_| ())?;
+    full_sha256: &str,
+    desired: &ValidatedHostedImport,
+    session: &HostedImportSession,
+) -> Result<(), StorageError> {
+    let desired_roster = desired
+        .versions
+        .iter()
+        .map(|(version, desired)| (version.clone(), desired.manifest_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if session.repository != repository
+        || session.package != package
+        || session.packument_sha256 != full_sha256
+        || session.versions != desired_roster
+    {
+        return Err(StorageError::AlreadyExists);
     }
-    if let Some(message) = &validated.deprecation {
-        let key = hosted_deprecation_key(repository, package, &validated.version);
-        if message.is_empty() {
-            match state.storage.delete(&key).await {
-                Ok(()) | Err(StorageError::NotFound) => {}
-                Err(_) => return Err(()),
-            }
-        } else {
-            state
-                .storage
-                .put(&key, message.as_bytes())
-                .await
-                .map_err(|_| ())?;
+
+    if let Some(base) = &session.base {
+        let base_packument =
+            hosted_packument_for_pointer(&state.storage, repository, package, base).await?;
+        let base_versions = base_packument
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(StorageError::IntegrityViolation)?;
+        if !base_versions
+            .keys()
+            .all(|version| desired.versions.contains_key(version))
+        {
+            return Err(StorageError::AlreadyExists);
         }
     }
+
+    let desired_checks = desired
+        .versions
+        .iter()
+        .map(|(version, desired)| {
+            (
+                version.clone(),
+                desired.manifest.clone(),
+                desired.manifest_sha256.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let checks = stream::iter(desired_checks)
+        .map(
+            |(version, desired_manifest, desired_manifest_sha256)| async move {
+                let manifest = state
+                    .storage
+                    .get(&hosted_version_key(repository, package, &version))
+                    .await?;
+                let desired_manifest_bytes = serde_json::to_vec(&desired_manifest)
+                    .map_err(|_| StorageError::IntegrityViolation)?;
+                if manifest.as_ref() != desired_manifest_bytes.as_slice() {
+                    return Err(StorageError::AlreadyExists);
+                }
+                let completion = state
+                    .storage
+                    .get(&hosted_publish_complete_key(repository, package, &version))
+                    .await?;
+                if completion.as_ref() != desired_manifest_sha256.as_bytes() {
+                    return Err(StorageError::IntegrityViolation);
+                }
+                let blob_key = crate::npm_layout::hosted_blob_key_from_manifest(
+                    repository,
+                    package,
+                    &desired_manifest_bytes,
+                )
+                .ok_or(StorageError::IntegrityViolation)?;
+                let blob = state.storage.get(&blob_key).await?;
+                let actual_blob_digest = hex::encode(sha2::Sha512::digest(&blob));
+                if !blob_key.ends_with(&format!("/{actual_blob_digest}.tgz")) {
+                    return Err(StorageError::IntegrityViolation);
+                }
+                let evidence_key = crate::npm_layout::hosted_import_evidence_key(
+                    repository,
+                    package,
+                    full_sha256,
+                    &version,
+                    &desired_manifest_sha256,
+                );
+                let evidence = state.storage.get(&evidence_key).await?;
+                if evidence.as_ref() != b"1" {
+                    return Err(StorageError::IntegrityViolation);
+                }
+                Ok::<(), StorageError>(())
+            },
+        )
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    for check in checks {
+        check?;
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct HostedMutableState {
+    package: Option<Vec<u8>>,
+    tags: BTreeMap<String, Vec<u8>>,
+    deprecations: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct HostedMutableAuthority {
+    key: String,
+    base: Option<Vec<u8>>,
+    target: Option<Vec<u8>>,
+}
+
+fn package_fields_from_packument(packument: &serde_json::Value) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    for field in ["name", "_id", "description", "readme", "license"] {
+        if let Some(value) = packument.get(field) {
+            fields.insert(field.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(fields)
+}
+
+fn hosted_mutable_state_from_packument(
+    packument: Option<&serde_json::Value>,
+) -> Result<HostedMutableState, StorageError> {
+    let Some(packument) = packument else {
+        return Ok(HostedMutableState::default());
+    };
+    let package = Some(
+        serde_json::to_vec(&package_fields_from_packument(packument))
+            .map_err(|_| StorageError::IntegrityViolation)?,
+    );
+    let tags = packument
+        .get("dist-tags")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(StorageError::IntegrityViolation)?
+        .iter()
+        .map(|(tag, target)| {
+            target
+                .as_str()
+                .map(|target| (tag.clone(), target.as_bytes().to_vec()))
+                .ok_or(StorageError::IntegrityViolation)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let deprecations = packument
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(StorageError::IntegrityViolation)?
+        .iter()
+        .filter_map(|(version, manifest)| {
+            manifest
+                .get("deprecated")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .map(|message| (version.clone(), message.as_bytes().to_vec()))
+        })
+        .collect();
+    Ok(HostedMutableState {
+        package,
+        tags,
+        deprecations,
+    })
+}
+
+fn hosted_mutable_state_from_import(
+    desired: &ValidatedHostedImport,
+) -> Result<HostedMutableState, StorageError> {
+    let package = Some(
+        serde_json::to_vec(&desired.package_fields)
+            .map_err(|_| StorageError::IntegrityViolation)?,
+    );
+    let tags = desired
+        .tags
+        .iter()
+        .map(|(tag, target)| (tag.clone(), target.as_bytes().to_vec()))
+        .collect();
+    let deprecations = desired
+        .versions
+        .iter()
+        .filter_map(|(version, desired)| {
+            desired
+                .deprecation
+                .as_deref()
+                .filter(|message| !message.is_empty())
+                .map(|message| (version.clone(), message.as_bytes().to_vec()))
+        })
+        .collect();
+    Ok(HostedMutableState {
+        package,
+        tags,
+        deprecations,
+    })
+}
+
+fn hosted_mutable_authorities(
+    repository: &str,
+    package: &str,
+    base: &HostedMutableState,
+    target: &HostedMutableState,
+) -> Vec<HostedMutableAuthority> {
+    let mut authorities = BTreeMap::<String, (Option<Vec<u8>>, Option<Vec<u8>>)>::new();
+    authorities.insert(
+        hosted_package_key(repository, package),
+        (base.package.clone(), target.package.clone()),
+    );
+    for tag in base.tags.keys().chain(target.tags.keys()) {
+        authorities
+            .entry(hosted_tag_key(repository, package, tag))
+            .or_insert_with(|| (base.tags.get(tag).cloned(), target.tags.get(tag).cloned()));
+    }
+    for version in base.deprecations.keys().chain(target.deprecations.keys()) {
+        authorities
+            .entry(hosted_deprecation_key(repository, package, version))
+            .or_insert_with(|| {
+                (
+                    base.deprecations.get(version).cloned(),
+                    target.deprecations.get(version).cloned(),
+                )
+            });
+    }
+    authorities
+        .into_iter()
+        .map(|(key, (base, target))| HostedMutableAuthority { key, base, target })
+        .collect()
+}
+
+async fn read_optional_exact(
+    storage: &Storage,
+    key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    match storage.get(key).await {
+        Ok(value) => Ok(Some(value.to_vec())),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn verify_hosted_mutable_target(
+    storage: &Storage,
+    authorities: &[HostedMutableAuthority],
+) -> Result<(), StorageError> {
+    let reads = stream::iter(authorities.iter().cloned())
+        .map(|authority| async move {
+            let current = read_optional_exact(storage, &authority.key).await?;
+            if current.as_deref() == authority.target.as_deref() {
+                Ok(())
+            } else {
+                Err(StorageError::AlreadyExists)
+            }
+        })
+        .buffer_unordered(NPM_IMPORT_MUTATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for read in reads {
+        read?;
+    }
+    Ok(())
+}
+
+async fn converge_hosted_mutable_target(
+    storage: &Storage,
+    authorities: &[HostedMutableAuthority],
+) -> Result<(), StorageError> {
+    #[derive(Debug)]
+    enum Mutation {
+        Put { key: String, value: Vec<u8> },
+        Delete { key: String, expected: Vec<u8> },
+    }
+
+    // Exact preflight is the recovery fence: every authority must still be at
+    // the recorded base or target before the first retry write.
+    let reads = stream::iter(authorities.iter().cloned())
+        .map(|authority| async move {
+            let current = read_optional_exact(storage, &authority.key).await?;
+            if current.as_deref() == authority.target.as_deref() {
+                return Ok(None);
+            }
+            if current.as_deref() != authority.base.as_deref() {
+                return Err(StorageError::AlreadyExists);
+            }
+            Ok(match (&current, &authority.target) {
+                (_, Some(value)) => Some(Mutation::Put {
+                    key: authority.key.clone(),
+                    value: value.clone(),
+                }),
+                (Some(expected), None) => Some(Mutation::Delete {
+                    key: authority.key.clone(),
+                    expected: expected.clone(),
+                }),
+                (None, None) => None,
+            })
+        })
+        .buffer_unordered(NPM_IMPORT_MUTATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut mutations = Vec::new();
+    for read in reads {
+        if let Some(mutation) = read? {
+            mutations.push(mutation);
+        }
+    }
+    let writes = stream::iter(mutations)
+        .map(|mutation| async move {
+            match mutation {
+                Mutation::Put { key, value } => {
+                    put_exact_with_readback(storage, &key, &value).await
+                }
+                Mutation::Delete { key, expected } => {
+                    delete_exact_with_readback(storage, &key, &expected).await
+                }
+            }
+        })
+        .buffer_unordered(NPM_IMPORT_MUTATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for write in writes {
+        write?;
+    }
+    verify_hosted_mutable_target(storage, authorities).await
+}
+
+struct HostedPublishVerification<'a> {
+    manifest_key: &'a str,
+    manifest: &'a [u8],
+    blob_key: &'a str,
+    blob: &'a [u8],
+    completion_key: &'a str,
+    completion_digest: &'a str,
+    mutable_authorities: &'a [HostedMutableAuthority],
+}
+
+async fn verify_publish_target_state(
+    storage: &Storage,
+    verification: &HostedPublishVerification<'_>,
+) -> Result<(), StorageError> {
+    let (stored_manifest, stored_blob, stored_completion, mutable) = tokio::join!(
+        storage.get(verification.manifest_key),
+        storage.get(verification.blob_key),
+        storage.get(verification.completion_key),
+        verify_hosted_mutable_target(storage, verification.mutable_authorities),
+    );
+    if stored_manifest?.as_ref() != verification.manifest
+        || stored_blob?.as_ref() != verification.blob
+        || stored_completion?.as_ref() != verification.completion_digest.as_bytes()
+    {
+        return Err(StorageError::AlreadyExists);
+    }
+    mutable
+}
+
+async fn replace_import_mutable_state(
+    state: &AppState,
+    repository: &str,
+    package: &str,
+    desired: &ValidatedHostedImport,
+    base_packument: Option<&serde_json::Value>,
+) -> Result<(), StorageError> {
+    let base = hosted_mutable_state_from_packument(base_packument)?;
+    let target = hosted_mutable_state_from_import(desired)?;
+    let authorities = hosted_mutable_authorities(repository, package, &base, &target);
+    converge_hosted_mutable_target(&state.storage, &authorities).await
+}
+
+fn import_receipt_response(receipt: HostedImportReceipt, status: StatusCode) -> Response {
+    let mut response = axum::Json(receipt).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+async fn named_import_finalize(
+    State(state): State<AppState>,
+    Path((repository, encoded_package)): Path<(String, String)>,
+    headers: HeaderMap,
+    Extension(authority): Extension<NamespaceAuthority>,
+    body: Bytes,
+) -> Response {
+    let Some(package) = decode_package_name(&encoded_package) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if enforce_namespace_scope(&authority, &package).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(NpmRepository::Hosted { write_policy, .. }) = state.config.npm.repository(&repository)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "npm import finalize must target a named hosted repository",
+        )
+            .into_response();
+    };
+    if *write_policy == NpmWritePolicy::Deny {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let expected = match import_packument_sha256(&headers) {
+        Ok(Some(expected)) => expected,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "npm import finalize requires a packument SHA-256",
+            )
+                .into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
+    if hex::encode(sha2::Sha256::digest(&body)) != expected {
+        return (
+            StatusCode::CONFLICT,
+            "npm import packument body does not match its SHA-256 header",
+        )
+            .into_response();
+    }
+    let packument = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(packument) => packument,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(),
+    };
+    let desired = match validate_hosted_import(&package, &packument) {
+        Ok(desired) => desired,
+        Err(error) => return error.into_response(),
+    };
+
+    let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
+    let _guard = lock.lock().await;
+    match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
+        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let receipt_key =
+        crate::npm_layout::hosted_import_receipt_key(&repository, &package, &expected);
+    let marker_key = crate::npm_layout::hosted_import_pending_key(&repository, &package);
+    let session = match read_optional_import_session(&state.storage, &repository, &package).await {
+        Ok(Some(session)) if session.packument_sha256 == expected => Some(session),
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package bulk import is bound to a different packument",
+            )
+                .into_response()
+        }
+        Ok(None) => None,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let receipt = match state.storage.get(&receipt_key).await {
+        Ok(receipt) => Some(receipt),
+        Err(StorageError::NotFound) => None,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if let Some(receipt) = receipt {
+        let receipt: HostedImportReceipt = match serde_json::from_slice(&receipt) {
+            Ok(receipt) => receipt,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if receipt.package != package
+            || receipt.full_sha256 != expected
+            || receipt.generation != expected
+            || receipt.version_count != desired.versions.len()
+            || !valid_sha256(&receipt.install_v1_sha256)
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let generation = WrittenPackumentGeneration {
+            generation: receipt.generation.clone(),
+            full_sha256: receipt.full_sha256.clone(),
+            install_v1_sha256: receipt.install_v1_sha256.clone(),
+        };
+        if validate_hosted_packument_pointer(&state.storage, &repository, &package, &generation)
+            .await
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let Some(session) = session.as_ref() else {
+            // A fully completed receipt is immutable history, not a request to
+            // restore its generation. Later versions, tags, deprecations and
+            // pointer generations are deliberately ignored on replay.
+            return import_receipt_response(receipt, StatusCode::OK);
+        };
+        if let Err(error) = validate_import_version_state(
+            &state,
+            &repository,
+            &package,
+            &expected,
+            &desired,
+            session,
+        )
+        .await
+        {
+            return match error {
+                StorageError::AlreadyExists => (
+                    StatusCode::CONFLICT,
+                    "Imported npm version state no longer matches the completed receipt",
+                )
+                    .into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+        }
+        let base_packument = match &session.base {
+            Some(base) => {
+                match hosted_packument_for_pointer(&state.storage, &repository, &package, base)
+                    .await
+                {
+                    Ok(packument) => Some(packument),
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+            None => None,
+        };
+        if replace_import_mutable_state(
+            &state,
+            &repository,
+            &package,
+            &desired,
+            base_packument.as_ref(),
+        )
+        .await
+        .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        match read_hosted_packument_pointer(&state.storage, &repository, &package).await {
+            Ok(current) if current.as_ref() == session.base.as_ref() => {
+                if commit_hosted_packument_pointer(
+                    &state.storage,
+                    &repository,
+                    &package,
+                    &generation,
+                )
+                .await
+                .is_err()
+                {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            Ok(Some(current)) if current == generation => {}
+            Ok(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "Completed npm import cannot replace a later package generation",
+                )
+                    .into_response()
+            }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+        let session_bytes = match serde_json::to_vec(session) {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if delete_exact_with_readback(&state.storage, &marker_key, &session_bytes)
+            .await
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        return import_receipt_response(receipt, StatusCode::OK);
+    }
+
+    // Fresh-install imports must have an exact journal written by version PUTs;
+    // adopting unjournaled pre-existing objects would make omitted LIST keys
+    // indistinguishable from absence.
+    let Some(session) = session.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            "Package bulk import has no exact version journal",
+        )
+            .into_response();
+    };
+    match incomplete_publish_versions(&state, &repository, &package).await {
+        Ok(incomplete) if !incomplete.is_empty() => return incomplete_publish_response(),
+        Ok(_) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    if let Err(error) =
+        validate_import_version_state(&state, &repository, &package, &expected, &desired, session)
+            .await
+    {
+        return match error {
+            StorageError::AlreadyExists => (
+                StatusCode::CONFLICT,
+                "Imported npm version set or metadata does not match committed hosted state",
+            )
+                .into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+    match read_hosted_packument_pointer(&state.storage, &repository, &package).await {
+        Ok(current) if current.as_ref() == session.base.as_ref() => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package generation changed after bulk import started",
+            )
+                .into_response()
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let base_packument = match &session.base {
+        Some(base) => {
+            match hosted_packument_for_pointer(&state.storage, &repository, &package, base).await {
+                Ok(packument) => Some(packument),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        None => None,
+    };
+    if replace_import_mutable_state(
+        &state,
+        &repository,
+        &package,
+        &desired,
+        base_packument.as_ref(),
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let generation = match write_hosted_packument_generation_documents(
+        &state.storage,
+        &repository,
+        &package,
+        &packument,
+        &body,
+    )
+    .await
+    {
+        Ok(generation) if generation.full_sha256 == expected => generation,
+        Ok(_) => return StatusCode::CONFLICT.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let receipt = HostedImportReceipt {
+        package: package.clone(),
+        version_count: desired.versions.len(),
+        full_sha256: generation.full_sha256.clone(),
+        install_v1_sha256: generation.install_v1_sha256.clone(),
+        generation: generation.generation.clone(),
+    };
+    let receipt_bytes = match serde_json::to_vec(&receipt) {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if put_immutable_storage(&state.storage, &receipt_key, &receipt_bytes)
+        .await
+        .is_err()
+        || commit_hosted_packument_pointer(&state.storage, &repository, &package, &generation)
+            .await
+            .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let session_bytes = match serde_json::to_vec(session) {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if delete_exact_with_readback(&state.storage, &marker_key, &session_bytes)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    state.repo_index.invalidate("npm");
+    import_receipt_response(receipt, StatusCode::CREATED)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3183,79 +5721,6 @@ async fn commit_hosted_manifest(
     }
 }
 
-async fn fill_missing_retry_state(
-    state: &AppState,
-    repository: &str,
-    package: &str,
-    validated: &ValidatedPublish,
-) -> Result<(), ()> {
-    let package_key = hosted_package_key(repository, package);
-    match state.storage.get(&package_key).await {
-        Ok(existing) => {
-            let mut current =
-                serde_json::from_slice::<serde_json::Value>(&existing).map_err(|_| ())?;
-            let candidate = serde_json::from_slice::<serde_json::Value>(&validated.package_fields)
-                .map_err(|_| ())?;
-            let (Some(current), Some(candidate)) = (current.as_object_mut(), candidate.as_object())
-            else {
-                return Err(());
-            };
-            let mut changed = false;
-            for (field, value) in candidate {
-                if !current.contains_key(field) {
-                    current.insert(field.clone(), value.clone());
-                    changed = true;
-                }
-            }
-            if changed {
-                let merged = serde_json::to_vec(&serde_json::Value::Object(current.clone()))
-                    .map_err(|_| ())?;
-                state
-                    .storage
-                    .put(&package_key, &merged)
-                    .await
-                    .map_err(|_| ())?;
-            }
-        }
-        Err(StorageError::NotFound) => state
-            .storage
-            .put(&package_key, &validated.package_fields)
-            .await
-            .map_err(|_| ())?,
-        Err(_) => return Err(()),
-    }
-
-    for (tag, version) in &validated.tags {
-        let key = hosted_tag_key(repository, package, tag);
-        match state.storage.get(&key).await {
-            Ok(_) => {}
-            Err(StorageError::NotFound) => state
-                .storage
-                .put(&key, version.as_bytes())
-                .await
-                .map_err(|_| ())?,
-            Err(_) => return Err(()),
-        }
-    }
-    if let Some(message) = validated
-        .deprecation
-        .as_deref()
-        .filter(|message| !message.is_empty())
-    {
-        let key = hosted_deprecation_key(repository, package, &validated.version);
-        match state.storage.get(&key).await {
-            Ok(_) => {}
-            Err(StorageError::NotFound) => state
-                .storage
-                .put(&key, message.as_bytes())
-                .await
-                .map_err(|_| ())?,
-            Err(_) => return Err(()),
-        }
-    }
-    Ok(())
-}
-
 async fn deprecate(
     state: &AppState,
     repository: &str,
@@ -3270,106 +5735,222 @@ async fn deprecate(
     };
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
+    match resume_hosted_maintenance_operation(&state.storage, repository, package).await {
+        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state
+        .storage
+        .get(&crate::npm_layout::hosted_import_pending_key(
+            repository, package,
+        ))
+        .await
+    {
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package has an active bulk import; finalize it before normal mutation",
+            )
+                .into_response()
+        }
+        Err(StorageError::NotFound) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
     match incomplete_publish_versions(state, repository, package).await {
         Ok(incomplete) if !incomplete.is_empty() => return incomplete_publish_response(),
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    if invalidate_hosted_packument_cache(state, repository, package)
+    for attempt in 0..2 {
+        let base = match read_hosted_packument_pointer(&state.storage, repository, package).await {
+            Ok(Some(pointer)) => pointer,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let base_packument =
+            match hosted_packument_for_pointer(&state.storage, repository, package, &base).await {
+                Ok(packument) => packument,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+        let Some(committed_versions) = base_packument
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let mut matched = 0usize;
+        let mut changes = std::collections::BTreeMap::new();
+        for (version, data) in versions {
+            let Some(manifest) = committed_versions
+                .get(version)
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let Some(message) = data.get("deprecated").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            matched += 1;
+            let current = match manifest.get("deprecated") {
+                Some(value) => match value.as_str() {
+                    Some(value) => Some(value.to_string()),
+                    None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                },
+                None => None,
+            };
+            let desired = (!message.is_empty()).then(|| message.to_string());
+            let key = hosted_deprecation_key(repository, package, version);
+            match read_optional_string(&state.storage, &key).await {
+                Ok(authoritative) if authoritative == current => {}
+                _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+            if current != desired {
+                changes.insert(version.clone(), desired);
+            }
+        }
+        if matched == 0 {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if changes.is_empty() {
+            return StatusCode::CREATED.into_response();
+        }
+        let action = HostedMaintenanceAction::Deprecations { values: changes };
+        let target_packument = match apply_hosted_maintenance_action(base_packument, &action) {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match execute_hosted_metadata_maintenance(
+            &state.storage,
+            repository,
+            package,
+            base,
+            &target_packument,
+            action,
+        )
         .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let mut changed = 0usize;
-    for (version, data) in versions {
-        match hosted_has_version(state, repository, package, version).await {
-            Ok(true) => {}
-            Ok(false) => continue,
+        {
+            Ok(()) => {
+                state.repo_index.invalidate("npm");
+                return StatusCode::CREATED.into_response();
+            }
+            Err(StorageError::AlreadyExists) if attempt == 0 => continue,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        let Some(message) = data.get("deprecated").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let key = hosted_deprecation_key(repository, package, version);
-        let result = if message.is_empty() {
-            match state.storage.delete(&key).await {
-                Ok(()) | Err(StorageError::NotFound) => Ok(()),
-                Err(error) => Err(error),
-            }
-        } else {
-            state.storage.put(&key, message.as_bytes()).await
-        };
-        if result.is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        changed += 1;
     }
-    if changed == 0 {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    state.repo_index.invalidate("npm");
-    StatusCode::CREATED.into_response()
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
-async fn handle_put(
+async fn handle_put<F>(
     state: AppState,
     target: RepositoryTarget,
     path: String,
-    authority: NamespaceAuthority,
+    headers: HeaderMap,
     body: Bytes,
-) -> Response {
+    authorize: F,
+) -> Response
+where
+    F: FnOnce(&str) -> bool,
+{
     let Some(package) = decode_package_name(&path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if enforce_namespace_scope(&authority, &package).is_err() {
+    if !authorize(&package) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let hosted = match writable_hosted(&state, &target, true) {
-        Ok(hosted) => hosted,
+    let import_hash = match import_packument_sha256(&headers) {
+        Ok(value) => value,
         Err(error) => return error.into_response(),
+    };
+    if import_hash.is_some()
+        && !matches!(
+            target,
+            RepositoryTarget::Named(NpmRepository::Hosted { .. })
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Bulk import version PUT must target a named hosted npm repository",
+        )
+            .into_response();
+    }
+    let hosted = if import_hash.is_some() {
+        match &target {
+            RepositoryTarget::Named(NpmRepository::Hosted { name, write_policy })
+                if *write_policy != NpmWritePolicy::Deny =>
+            {
+                // Bulk import is exact-only. Repository `allow` must not turn
+                // a delayed or conflicting import PUT into a redeploy.
+                WritableHosted {
+                    name: name.clone(),
+                    write_policy: NpmWritePolicy::AllowOnce,
+                }
+            }
+            RepositoryTarget::Named(NpmRepository::Hosted { .. }) => {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response()
+            }
+            _ => unreachable!("import target shape was validated above"),
+        }
+    } else {
+        match writable_hosted(&state, &target, true) {
+            Ok(hosted) => hosted,
+            Err(error) => return error.into_response(),
+        }
     };
     let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(),
     };
     if payload.get("_attachments").is_some() {
-        publish(
+        publish_with_import(
             &state,
             &hosted.name,
             hosted.write_policy,
             &package,
             &payload,
+            import_hash.as_deref(),
         )
         .await
+    } else if import_hash.is_some() {
+        (
+            StatusCode::BAD_REQUEST,
+            "npm import hash is valid only for a version publish PUT",
+        )
+            .into_response()
     } else {
         deprecate(&state, &hosted.name, &package, &payload).await
     }
 }
 
-pub(crate) async fn named_put_request(
+pub(crate) async fn named_put_request<F>(
     state: AppState,
     repository: String,
     path: String,
-    authority: NamespaceAuthority,
+    headers: HeaderMap,
     body: Bytes,
-) -> Response {
+    authorize: F,
+) -> Response
+where
+    F: FnOnce(&str) -> bool,
+{
     let Some(target) = named_target(&state, &repository) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    handle_put(state, target, path, authority, body).await
+    handle_put(state, target, path, headers, body, authorize).await
 }
 
 async fn alias_put(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     Extension(authority): Extension<NamespaceAuthority>,
     body: Bytes,
 ) -> Response {
     let Some(target) = alias_target(&state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    handle_put(state, target, path, authority, body).await
+    let authorize = move |package: &str| enforce_namespace_scope(&authority, package).is_ok();
+    handle_put(state, target, path, headers, body, authorize).await
 }
 
 async fn handle_dist_tags_get(
@@ -3382,7 +5963,15 @@ async fn handle_dist_tags_get(
     let Some(package) = decode_package_name(&package) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match target_packument(&state, &target, &package, &response_base).await {
+    match target_packument(
+        &state,
+        &target,
+        &package,
+        &response_base,
+        PackumentFlavor::Full,
+    )
+    .await
+    {
         Ok(packument) => {
             let tags = packument
                 .value
@@ -3456,42 +6045,100 @@ async fn handle_dist_tag_put(
         Ok(version) if is_valid_npm_version(&version) => version,
         _ => return (StatusCode::BAD_REQUEST, "Invalid version").into_response(),
     };
-    match hosted_has_version(&state, &repository, &package, &version).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
+    match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
+        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match hosted_import_active(&state.storage, &repository, &package).await {
+        Ok(true) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package has an active bulk import; finalize it before normal mutation",
+            )
+                .into_response()
+        }
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
     match incomplete_publish_versions(&state, &repository, &package).await {
         Ok(incomplete) if !incomplete.is_empty() => return incomplete_publish_response(),
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    match hosted_has_version(&state, &repository, &package, &version).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-    if invalidate_hosted_packument_cache(&state, &repository, &package)
-        .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if state
-        .storage
-        .put(
-            &hosted_tag_key(&repository, &package, &tag),
-            version.as_bytes(),
+    for attempt in 0..2 {
+        let base = match read_hosted_packument_pointer(&state.storage, &repository, &package).await
+        {
+            Ok(Some(pointer)) => pointer,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let base_packument = match hosted_packument_for_pointer(
+            &state.storage,
+            &repository,
+            &package,
+            &base,
         )
         .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if !base_packument
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|versions| versions.contains_key(&version))
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let current = match base_packument
+            .get("dist-tags")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|tags| tags.get(&tag))
+        {
+            Some(value) => match value.as_str() {
+                Some(value) => Some(value.to_string()),
+                None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            },
+            None => None,
+        };
+        let tag_key = hosted_tag_key(&repository, &package, &tag);
+        match read_optional_string(&state.storage, &tag_key).await {
+            Ok(authoritative) if authoritative == current => {}
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+        if current.as_deref() == Some(version.as_str()) {
+            return StatusCode::CREATED.into_response();
+        }
+        let action = HostedMaintenanceAction::DistTag {
+            tag: tag.clone(),
+            value: Some(version.clone()),
+        };
+        let target_packument = match apply_hosted_maintenance_action(base_packument, &action) {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match execute_hosted_metadata_maintenance(
+            &state.storage,
+            &repository,
+            &package,
+            base,
+            &target_packument,
+            action,
+        )
+        .await
+        {
+            Ok(()) => {
+                state.repo_index.invalidate("npm");
+                return StatusCode::CREATED.into_response();
+            }
+            Err(StorageError::AlreadyExists) if attempt == 0 => continue,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
-    state.repo_index.invalidate("npm");
-    StatusCode::CREATED.into_response()
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 async fn named_dist_tag_put(
@@ -3547,24 +6194,91 @@ async fn handle_dist_tag_delete(
     };
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
+    match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
+        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match hosted_import_active(&state.storage, &repository, &package).await {
+        Ok(true) => {
+            return (
+                StatusCode::CONFLICT,
+                "Package has an active bulk import; finalize it before normal mutation",
+            )
+                .into_response()
+        }
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
     match incomplete_publish_versions(&state, &repository, &package).await {
         Ok(incomplete) if !incomplete.is_empty() => return incomplete_publish_response(),
         Ok(_) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    if invalidate_hosted_packument_cache(&state, &repository, &package)
+    for attempt in 0..2 {
+        let base = match read_hosted_packument_pointer(&state.storage, &repository, &package).await
+        {
+            Ok(Some(pointer)) => pointer,
+            Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let base_packument = match hosted_packument_for_pointer(
+            &state.storage,
+            &repository,
+            &package,
+            &base,
+        )
         .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let current = match base_packument
+            .get("dist-tags")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|tags| tags.get(&tag))
+        {
+            Some(value) => match value.as_str() {
+                Some(value) => Some(value.to_string()),
+                None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            },
+            None => None,
+        };
+        let key = hosted_tag_key(&repository, &package, &tag);
+        match read_optional_string(&state.storage, &key).await {
+            Ok(authoritative) if authoritative == current => {}
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+        if current.is_none() {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        let action = HostedMaintenanceAction::DistTag {
+            tag: tag.clone(),
+            value: None,
+        };
+        let target_packument = match apply_hosted_maintenance_action(base_packument, &action) {
+            Ok(packument) => packument,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match execute_hosted_metadata_maintenance(
+            &state.storage,
+            &repository,
+            &package,
+            base,
+            &target_packument,
+            action,
+        )
+        .await
+        {
+            Ok(()) => {
+                state.repo_index.invalidate("npm");
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            Err(StorageError::AlreadyExists) if attempt == 0 => continue,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
-    let key = hosted_tag_key(&repository, &package, &tag);
-    match state.storage.delete(&key).await {
-        Ok(()) | Err(StorageError::NotFound) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-    state.repo_index.invalidate("npm");
-    StatusCode::NO_CONTENT.into_response()
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 async fn named_dist_tag_delete(
@@ -4023,6 +6737,99 @@ mod tests {
         assert!(!is_valid_dist_tag("^1"));
     }
 
+    #[tokio::test]
+    async fn maintenance_marker_and_pointer_ambiguous_results_use_exact_readback() {
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let base = read_hosted_packument_pointer(&ctx.state.storage, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let base_packument =
+            hosted_packument_for_pointer(&ctx.state.storage, "npm-private", "pkg", &base)
+                .await
+                .unwrap();
+        let action = HostedMaintenanceAction::DistTag {
+            tag: "next".to_string(),
+            value: Some("1.0.0".to_string()),
+        };
+        let target_packument = apply_hosted_maintenance_action(base_packument, &action).unwrap();
+        let full = serde_json::to_vec(&target_packument).unwrap();
+        let target = write_hosted_packument_generation_documents(
+            &ctx.state.storage,
+            "npm-private",
+            "pkg",
+            &target_packument,
+            &full,
+        )
+        .await
+        .unwrap();
+        let operation = HostedMaintenanceOperation {
+            schema: crate::npm_layout::HOSTED_MAINTENANCE_SCHEMA_V1,
+            repository: "npm-private".to_string(),
+            package: "pkg".to_string(),
+            base,
+            target: HostedMaintenanceTarget::Live {
+                pointer: target.clone(),
+            },
+            action,
+        };
+        let marker_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+
+        let create_backend =
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_create_after(&marker_key);
+        let create_storage = Storage::from_backend(Arc::new(create_backend));
+        let marker = create_hosted_maintenance_marker(&create_storage, &operation)
+            .await
+            .expect("post-commit create error is resolved by exact readback");
+
+        let delete_backend =
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_delete_after(&marker_key);
+        let delete_storage = Storage::from_backend(Arc::new(delete_backend));
+        clear_hosted_maintenance_marker(&delete_storage, &marker)
+            .await
+            .expect("post-commit delete error is resolved by NotFound readback");
+        assert!(ctx.state.storage.stat(&marker_key).await.is_none());
+
+        let create_backend =
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_create(&marker_key);
+        let create_storage = Storage::from_backend(Arc::new(create_backend));
+        assert!(
+            create_hosted_maintenance_marker(&create_storage, &operation)
+                .await
+                .is_err()
+        );
+        assert!(ctx.state.storage.stat(&marker_key).await.is_none());
+
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pointer_backend =
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put_after(&pointer_key);
+        let pointer_storage = Storage::from_backend(Arc::new(pointer_backend));
+        commit_hosted_packument_pointer(&pointer_storage, "npm-private", "pkg", &target)
+            .await
+            .expect("post-commit pointer error is resolved by exact readback");
+        assert_eq!(
+            read_hosted_packument_pointer(&ctx.state.storage, "npm-private", "pkg")
+                .await
+                .unwrap(),
+            Some(target)
+        );
+    }
+
     #[cfg(test)]
     fn npm_tarball(package: &str, version: &str) -> Vec<u8> {
         npm_tarball_with_marker(package, version, "")
@@ -4119,6 +6926,27 @@ mod tests {
         .unwrap()
     }
 
+    fn import_fixture(
+        package: &str,
+        version: &str,
+        tag: &str,
+        marker: &str,
+    ) -> (serde_json::Value, Vec<u8>, String) {
+        let payload: serde_json::Value =
+            serde_json::from_slice(&publish_payload_with_tarball(package, version, tag, marker))
+                .unwrap();
+        let validated = validate_publish(package, &payload).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&validated.manifest).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": package,
+            "versions": {(version): manifest},
+            "dist-tags": {(tag): version},
+        }))
+        .unwrap();
+        let sha256 = hex::encode(sha2::Sha256::digest(&body));
+        (payload, body, sha256)
+    }
+
     fn publish_payload_with_tarball(
         package: &str,
         version: &str,
@@ -4136,46 +6964,1135 @@ mod tests {
         serde_json::to_vec(&payload).unwrap()
     }
 
+    #[test]
+    fn install_v1_accept_requires_a_positive_quality() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "application/vnd.npm.install-v1+json;q=0, application/json;q=1",
+            ),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::Full
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "application/vnd.npm.install-v1+json;q=1, application/json;q=0.8, */*",
+            ),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::InstallV1
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "application/vnd.npm.install-v1+json;q=0.9, application/json;q=0.8, */*",
+            ),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::InstallV1
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/vnd.npm.install-v1+json;q=0, */*;q=1"),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::Full
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "application/vnd.npm.install-v1+json;q=1, application/json;q=1",
+            ),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::InstallV1
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/vnd.npm.install-v1+json; q=0.5"),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::InstallV1
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(
+                "application/json;q=1, application/vnd.npm.install-v1+json;q=0.9",
+            ),
+        );
+        assert_eq!(
+            PackumentFlavor::from_headers(&headers),
+            PackumentFlavor::Full
+        );
+    }
+
     #[tokio::test]
-    async fn publish_through_group_commits_only_hosted_and_exact_retry_repairs() {
-        use crate::test_helpers::{create_test_context_with_config, send};
+    async fn bulk_import_withholds_until_finalize_and_serves_both_packuments() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_config, send, send_with_headers,
+        };
         use axum::http::Method;
+
         let ctx = create_test_context_with_config(named_config);
-        let body = publish_payload("pkg", "1.0.0", "latest");
-        let first = send(
+        let (payload, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let response = send_with_headers(
             &ctx.app,
             Method::PUT,
-            "/repository/npm-group/pkg",
-            body.clone(),
+            "/repository/npm-private/pkg",
+            vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+            serde_json::to_vec(&payload).unwrap(),
         )
         .await;
-        assert_eq!(first.status(), StatusCode::CREATED);
-        // Model a crash after the version-manifest commit and before the
-        // durable post-commit marker. Only this incomplete state is repairable.
-        ctx.state
-            .storage
-            .delete(&hosted_tag_key("npm-private", "pkg", "latest"))
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .delete(&hosted_publish_complete_key("npm-private", "pkg", "1.0.0"))
-            .await
-            .unwrap();
-        let manifest = ctx
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(ctx
             .state
             .storage
-            .get(&hosted_version_key("npm-private", "pkg", "1.0.0"))
+            .stat(&crate::npm_layout::hosted_packument_current_key(
+                "npm-private",
+                "pkg"
+            ))
             .await
+            .is_none());
+        let hidden = send(&ctx.app, Method::GET, "/repository/npm-private/pkg", "").await;
+        assert_eq!(hidden.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hidden.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+        let finalized = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/repository/npm-private/-/nora/import/pkg",
+            vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+            full.clone(),
+        )
+        .await;
+        assert_eq!(finalized.status(), StatusCode::CREATED);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&body_bytes(finalized).await).unwrap();
+        assert_eq!(receipt.as_object().unwrap().len(), 5);
+        assert_eq!(receipt["generation"], sha256);
+
+        let full_response = send(&ctx.app, Method::GET, "/repository/npm-private/pkg", "").await;
+        assert_eq!(full_response.status(), StatusCode::OK);
+        let install = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/repository/npm-private/pkg",
+            vec![(
+                "accept",
+                "application/vnd.npm.install-v1+json, application/json;q=0.5",
+            )],
+            "",
+        )
+        .await;
+        assert_eq!(install.status(), StatusCode::OK);
+        assert_eq!(
+            install.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.npm.install-v1+json"
+        );
+        assert_eq!(install.headers().get(header::VARY).unwrap(), "Accept");
+        let etag = install
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
             .unwrap();
-        ctx.state
-            .storage
-            .put(
-                &hosted_publish_pending_key("npm-private", "pkg", "1.0.0"),
-                crate::npm_layout::hosted_manifest_digest(&manifest).as_bytes(),
+        let not_modified = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/repository/npm-private/pkg",
+            vec![
+                (
+                    "accept",
+                    "application/vnd.npm.install-v1+json, application/json;q=0.5",
+                ),
+                ("if-none-match", etag),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers().get(header::VARY).unwrap(), "Accept");
+
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/nora/import/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                full.clone(),
             )
             .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/package/pkg/dist-tags/next",
+                serde_json::to_vec("1.0.0").unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/nora/import/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                full,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let after_replay = send(&ctx.app, Method::GET, "/repository/npm-private/pkg", "").await;
+        assert_eq!(after_replay.status(), StatusCode::OK);
+        let after_replay: serde_json::Value =
+            serde_json::from_slice(&body_bytes(after_replay).await).unwrap();
+        assert_eq!(after_replay["dist-tags"]["next"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn deferred_version_evidence_is_last_and_get_is_two_reads_without_list() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use axum::http::HeaderName;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (payload, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = crate::storage::Storage::from_backend(Arc::new(backend));
+        assert_eq!(
+            publish_with_import(
+                &state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let writes = writes.lock().clone();
+        let evidence = writes
+            .iter()
+            .position(|entry| entry.contains("/import/generations/"))
             .unwrap();
+        for needle in [
+            "/blobs/sha512/",
+            "/versions/1.0.0.json",
+            "/publish-complete/1.0.0",
+        ] {
+            assert!(
+                writes
+                    .iter()
+                    .position(|entry| entry.contains(needle))
+                    .unwrap()
+                    < evidence
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .all(|entry| !entry.contains("/hosted-packuments/")),
+            "deferred version PUT must not build any package generation"
+        );
+        assert!(state
+            .storage
+            .stat(&crate::npm_layout::hosted_packument_current_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_none());
+
+        let response = named_import_finalize(
+            State(state.clone()),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            HeaderMap::from_iter([(
+                HeaderName::from_static(NPM_IMPORT_PACKUMENT_HEADER),
+                HeaderValue::from_str(&sha256).unwrap(),
+            )]),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let backend = FaultInjectBackend::new(state.storage.clone());
+        let gets = backend.get_attempts();
+        let lists = backend.list_attempts();
+        let mut read_state = state;
+        read_state.storage = crate::storage::Storage::from_backend(Arc::new(backend));
+        hosted_packument(
+            &read_state,
+            "npm-private",
+            "pkg",
+            "https://nora.example/repository/npm-private",
+            PackumentFlavor::Full,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gets.lock().len(), 2);
+        assert!(lists.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_finalize_rejects_omitted_roster_entries_without_list() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use axum::http::HeaderName;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (first, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let (second, _, _) = import_fixture("pkg", "2.0.0", "latest", "");
+        for payload in [&first, &second] {
+            assert_eq!(
+                publish_with_import(
+                    &ctx.state,
+                    "npm-private",
+                    NpmWritePolicy::AllowOnce,
+                    "pkg",
+                    payload,
+                    Some(&sha256),
+                )
+                .await
+                .status(),
+                StatusCode::CREATED
+            );
+        }
+
+        let second_manifest = validate_publish("pkg", &second).unwrap();
+        let second_digest = crate::npm_layout::hosted_manifest_digest(&second_manifest.manifest);
+        let omitted_manifest = hosted_version_key("npm-private", "pkg", "2.0.0");
+        let omitted_evidence = crate::npm_layout::hosted_import_evidence_key(
+            "npm-private",
+            "pkg",
+            &sha256,
+            "2.0.0",
+            &second_digest,
+        );
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .omit_from_list(omitted_manifest)
+            .omit_from_list(omitted_evidence);
+        let lists = backend.list_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let response = named_import_finalize(
+            State(state),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            HeaderMap::from_iter([(
+                HeaderName::from_static(NPM_IMPORT_PACKUMENT_HEADER),
+                HeaderValue::from_str(&sha256).unwrap(),
+            )]),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(lists.lock().is_empty());
+        assert!(ctx
+            .state
+            .storage
+            .stat(&crate::npm_layout::hosted_import_pending_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_some());
+        assert!(ctx
+            .state
+            .storage
+            .stat(&crate::npm_layout::hosted_packument_current_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn import_finalize_exactly_removes_base_authority_when_list_omits_it() {
+        use crate::test_helpers::{
+            create_test_context_with_config, send, send_with_headers, FaultInjectBackend,
+        };
+        use axum::http::{HeaderName, Method};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (payload, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                serde_json::to_vec(&payload).unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/package/pkg/dist-tags/next",
+                serde_json::to_vec("1.0.0").unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "pkg",
+                    "versions": {"1.0.0": {"deprecated": "superseded"}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                serde_json::to_vec(&payload).unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let stale_tag = hosted_tag_key("npm-private", "pkg", "next");
+        let stale_deprecation = hosted_deprecation_key("npm-private", "pkg", "1.0.0");
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .omit_from_list(stale_tag.clone())
+            .omit_from_list(stale_deprecation.clone());
+        let lists = backend.list_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let response = named_import_finalize(
+            State(state),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            HeaderMap::from_iter([(
+                HeaderName::from_static(NPM_IMPORT_PACKUMENT_HEADER),
+                HeaderValue::from_str(&sha256).unwrap(),
+            )]),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(lists.lock().is_empty());
+        assert!(matches!(
+            ctx.state.storage.get(&stale_tag).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            ctx.state.storage.get(&stale_deprecation).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn omitted_publish_intent_blocks_other_publish_and_exact_retry_recovers_without_list() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let base: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &base,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let second: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "2.0.0", "latest")).unwrap();
+        let base_version = hosted_version_key("npm-private", "pkg", "1.0.0");
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let failing_backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .omit_from_list(base_version.clone())
+            .fail_put(&pointer_key);
+        let failing_lists = failing_backend.list_attempts();
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(failing_backend));
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pending_key).await.is_some());
+
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .omit_from_list(base_version)
+            .omit_from_list(pending_key.clone());
+        let lists = backend.list_attempts();
+        let mut retry = ctx.state.clone();
+        retry.storage = Storage::from_backend(Arc::new(backend));
+        let other: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "3.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &retry,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &other,
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publish(
+                &retry,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(failing_lists.lock().is_empty());
+        assert!(lists.lock().is_empty());
+        assert!(ctx.state.storage.stat(&pending_key).await.is_none());
+        let current = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current["versions"].get("1.0.0").is_some());
+        assert!(current["versions"].get("2.0.0").is_some());
+    }
+
+    #[tokio::test]
+    async fn retention_target_uses_exact_pointer_when_list_omits_authority() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let omitted_version = hosted_version_key("npm-private", "pkg", "1.0.0");
+        let backend =
+            FaultInjectBackend::new(ctx.state.storage.clone()).omit_from_list(omitted_version);
+        let lists = backend.list_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let target = prepare_hosted_packument_after_retention(
+            &storage,
+            "npm-private",
+            "pkg",
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(target, HostedMaintenanceTarget::Live { .. }));
+        assert!(lists.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_receipt_delayed_put_is_read_only_and_exact_only() {
+        use crate::test_helpers::{
+            create_test_context_with_config, send, send_with_headers, FaultInjectBackend,
+        };
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(|config| {
+            named_config(config);
+            let NpmRepository::Hosted { write_policy, .. } = &mut config.npm.repositories[0] else {
+                unreachable!()
+            };
+            *write_policy = NpmWritePolicy::Allow;
+        });
+        let (first, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "first");
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                serde_json::to_vec(&first).unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/nora/import/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                full.clone(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/package/pkg/dist-tags/next",
+                serde_json::to_vec("1.0.0").unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let deletes = backend.delete_attempts();
+        let mut delayed_state = ctx.state.clone();
+        delayed_state.storage = Storage::from_backend(Arc::new(backend));
+        assert_eq!(
+            publish_with_import(
+                &delayed_state,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &first,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(writes.lock().is_empty());
+        assert!(deletes.lock().is_empty());
+
+        let (changed, _, _) = import_fixture("pkg", "1.0.0", "latest", "changed");
+        assert_eq!(
+            publish_with_import(
+                &delayed_state,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &changed,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(writes.lock().is_empty());
+        assert!(deletes.lock().is_empty());
+
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "2.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "pkg",
+                    "versions": {"1.0.0": {"deprecated": "superseded"}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let replay = named_import_finalize(
+            State(delayed_state),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            HeaderMap::from_iter([(
+                header::HeaderName::from_static(NPM_IMPORT_PACKUMENT_HEADER),
+                HeaderValue::from_str(&sha256).unwrap(),
+            )]),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert!(writes.lock().is_empty());
+        assert!(deletes.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_finalize_receipt_resumes_only_the_missing_target_pointer() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use axum::http::HeaderName;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (payload, full, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        assert_eq!(
+            publish_with_import(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let headers = || {
+            HeaderMap::from_iter([(
+                HeaderName::from_static(NPM_IMPORT_PACKUMENT_HEADER),
+                HeaderValue::from_str(&sha256).unwrap(),
+            )])
+        };
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let marker_key = crate::npm_layout::hosted_import_pending_key("npm-private", "pkg");
+        let receipt_key =
+            crate::npm_layout::hosted_import_receipt_key("npm-private", "pkg", &sha256);
+        let mut failing_state = ctx.state.clone();
+        failing_state.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        let failed = named_import_finalize(
+            State(failing_state),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            headers(),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full.clone()),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_none());
+        assert!(ctx.state.storage.stat(&marker_key).await.is_some());
+        assert!(ctx.state.storage.stat(&receipt_key).await.is_some());
+
+        let resumed = named_import_finalize(
+            State(ctx.state.clone()),
+            Path(("npm-private".to_string(), "pkg".to_string())),
+            headers(),
+            Extension(NamespaceAuthority::Unrestricted),
+            Bytes::from(full),
+        )
+        .await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_some());
+        assert!(ctx.state.storage.stat(&marker_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_preflight_rejects_blob_collision_before_any_mutation() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(|config| {
+            named_config(config);
+            let NpmRepository::Hosted { write_policy, .. } = &mut config.npm.repositories[0] else {
+                unreachable!()
+            };
+            *write_policy = NpmWritePolicy::Allow;
+        });
+        let (payload, _, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let validated = validate_publish("pkg", &payload).unwrap();
+        let blob_key = crate::npm_layout::hosted_blob_key_for_digest(
+            "npm-private",
+            "pkg",
+            &validated.blob_digest,
+        );
+        ctx.state
+            .storage
+            .put(&blob_key, b"digest-key collision")
+            .await
+            .unwrap();
+
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let deletes = backend.delete_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        assert_eq!(
+            publish_with_import(
+                &state,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &payload,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(writes.lock().is_empty());
+        assert!(deletes.lock().is_empty());
+        assert!(ctx
+            .state
+            .storage
+            .stat(&crate::npm_layout::hosted_import_pending_key(
+                "npm-private",
+                "pkg"
+            ))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_an_unjournaled_prepopulated_package() {
+        use crate::test_helpers::{create_test_context_with_config, send, send_with_headers};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(named_config);
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let pointer: HostedPackumentPointer = serde_json::from_slice(
+            &ctx.state
+                .storage
+                .get(&crate::npm_layout::hosted_packument_current_key(
+                    "npm-private",
+                    "pkg",
+                ))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let full = ctx
+            .state
+            .storage
+            .get(&crate::npm_layout::hosted_packument_full_key(
+                "npm-private",
+                "pkg",
+                &pointer.generation,
+            ))
+            .await
+            .unwrap();
+        let sha256 = hex::encode(sha2::Sha256::digest(&full));
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/nora/import/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                full,
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_publish_retry_repairs_a_failed_first_pointer_commit() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_none());
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn additive_publish_pointer_failure_blocks_later_publish_until_exact_retry() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let first: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &first,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let second: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "2.0.0", "latest")).unwrap();
+        let mut failing = ctx.state.clone();
+        failing.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat(&hosted_publish_pending_index_key("npm-private", "pkg"))
+            .await
+            .is_some());
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(visible["versions"].get("1.0.0").is_some());
+        assert!(visible["versions"].get("2.0.0").is_none());
+
+        let third: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "3.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &third,
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat(&hosted_publish_pending_index_key("npm-private", "pkg"))
+            .await
+            .is_none());
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &third,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        for version in ["1.0.0", "2.0.0", "3.0.0"] {
+            assert!(visible["versions"].get(version).is_some(), "{version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn import_header_is_rejected_outside_named_hosted_version_publish() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (payload, _, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let payload = serde_json::to_vec(&payload).unwrap();
+        for uri in ["/repository/npm-group/pkg", "/repository/npm-registry/pkg"] {
+            assert_eq!(
+                send_with_headers(
+                    &ctx.app,
+                    Method::PUT,
+                    uri,
+                    vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                    payload.clone(),
+                )
+                .await
+                .status(),
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "pkg",
+                    "versions": {"1.0.0": {"deprecated": "old"}},
+                }))
+                .unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_import_finalize_supports_scoped_packages() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(named_config);
+        let (payload, full, sha256) = import_fixture("@scope/pkg", "1.0.0", "latest", "");
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/%40scope%2Fpkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                serde_json::to_vec(&payload).unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/-/nora/import/%40scope%2Fpkg",
+                vec![(NPM_IMPORT_PACKUMENT_HEADER, sha256.as_str())],
+                full,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_through_group_commits_only_hosted_and_exact_retry_repairs() {
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
+        use axum::http::Method;
+        use std::sync::Arc;
+        let ctx = create_test_context_with_config(named_config);
+        let body = publish_payload("pkg", "1.0.0", "latest");
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         let retry = send(&ctx.app, Method::PUT, "/repository/npm-group/pkg", body).await;
         assert_eq!(retry.status(), StatusCode::CREATED);
         assert!(ctx
@@ -4202,7 +8119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_publish_scans_only_pending_markers() {
+    async fn fresh_publish_uses_only_the_exact_pending_intent() {
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
         let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
         let list_attempts = backend.list_attempts();
@@ -4226,41 +8143,32 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            list_attempts.lock().as_slice(),
-            [
-                "npm/repositories/npm-private/pkg/publish-pending/",
-                "npm/repositories/npm-private/pkg/publish-pending/",
-            ]
-        );
-        assert_eq!(
+        assert!(list_attempts.lock().is_empty());
+        assert!(matches!(
             state
                 .storage
                 .get(&hosted_publish_pending_index_key("npm-private", "pkg"))
-                .await
-                .unwrap()
-                .as_ref(),
-            b"1"
-        );
-        for version in ["1.0.0", "2.0.0"] {
-            assert!(matches!(
-                state
-                    .storage
-                    .get(&hosted_publish_pending_key("npm-private", "pkg", version))
-                    .await,
-                Err(StorageError::NotFound)
-            ));
-        }
+                .await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[tokio::test]
-    async fn completed_pending_marker_is_cleaned_before_the_next_publish() {
+    async fn completed_pending_marker_blocks_until_the_exact_cleanup_retry() {
+        use crate::test_helpers::FaultInjectBackend;
+        use std::sync::Arc;
+
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
         let first: serde_json::Value =
             serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_delete(&pending_key),
+        ));
         assert_eq!(
             publish(
-                &ctx.state,
+                &failing,
                 "npm-private",
                 NpmWritePolicy::AllowOnce,
                 "pkg",
@@ -4268,24 +8176,9 @@ mod tests {
             )
             .await
             .status(),
-            StatusCode::CREATED
+            StatusCode::INTERNAL_SERVER_ERROR
         );
-
-        let manifest = ctx
-            .state
-            .storage
-            .get(&hosted_version_key("npm-private", "pkg", "1.0.0"))
-            .await
-            .unwrap();
-        let pending_key = hosted_publish_pending_key("npm-private", "pkg", "1.0.0");
-        ctx.state
-            .storage
-            .put(
-                &pending_key,
-                crate::npm_layout::hosted_manifest_digest(&manifest).as_bytes(),
-            )
-            .await
-            .unwrap();
+        assert!(ctx.state.storage.stat(&pending_key).await.is_some());
 
         let second: serde_json::Value =
             serde_json::from_slice(&publish_payload("pkg", "2.0.0", "latest")).unwrap();
@@ -4299,37 +8192,67 @@ mod tests {
             )
             .await
             .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &first,
+            )
+            .await
+            .status(),
             StatusCode::CREATED
         );
         assert!(matches!(
             ctx.state.storage.get(&pending_key).await,
             Err(StorageError::NotFound)
         ));
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
     }
 
     #[tokio::test]
     async fn pending_publish_accepts_only_the_exact_manifest_retry() {
+        use crate::test_helpers::FaultInjectBackend;
+        use std::sync::Arc;
+
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
         let exact: serde_json::Value = serde_json::from_slice(&publish_payload_with_tarball(
             "pkg", "1.0.0", "latest", "exact",
         ))
         .unwrap();
-        let exact_publish = validate_publish("pkg", &exact).unwrap();
-        let exact_digest = crate::npm_layout::hosted_manifest_digest(&exact_publish.manifest);
-        let pending_key = hosted_publish_pending_key("npm-private", "pkg", "1.0.0");
-        ctx.state
-            .storage
-            .put(
-                &hosted_publish_pending_index_key("npm-private", "pkg"),
-                b"1",
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &exact,
             )
             .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put(&pending_key, exact_digest.as_bytes())
-            .await
-            .unwrap();
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let exact_pending = ctx.state.storage.get(&pending_key).await.unwrap();
 
         let different: serde_json::Value = serde_json::from_slice(&publish_payload_with_tarball(
             "pkg",
@@ -4351,8 +8274,8 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
-            ctx.state.storage.get(&pending_key).await.unwrap().as_ref(),
-            exact_digest.as_bytes()
+            ctx.state.storage.get(&pending_key).await.unwrap(),
+            exact_pending
         );
         assert_eq!(
             publish(
@@ -4375,7 +8298,7 @@ mod tests {
     #[tokio::test]
     async fn failed_pending_marker_cleanup_is_recovered_by_exact_retry() {
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
-        let pending_key = hosted_publish_pending_key("npm-private", "pkg", "1.0.0");
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
         let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone())
             .fail_delete(&pending_key);
         let mut failing_state = ctx.state.clone();
@@ -4413,6 +8336,46 @@ mod tests {
             ctx.state.storage.get(&pending_key).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn import_evidence_commits_before_pending_cleanup_and_exact_retry_cleans_it() {
+        let ctx = crate::test_helpers::create_test_context_with_config(named_config);
+        let (payload, _, sha256) = import_fixture("pkg", "1.0.0", "latest", "");
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone())
+            .fail_delete(&pending_key);
+        let mut failing_state = ctx.state.clone();
+        failing_state.storage = crate::storage::Storage::from_backend(std::sync::Arc::new(backend));
+
+        assert_eq!(
+            publish_with_import(
+                &failing_state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pending_key).await.is_some());
+        assert_eq!(
+            publish_with_import(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+                Some(&sha256),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(ctx.state.storage.stat(&pending_key).await.is_none());
     }
 
     #[tokio::test]
@@ -4460,9 +8423,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_deprecation_uses_overlay_and_completed_retry_does_not_resurrect_it() {
-        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    async fn publish_deprecation_markerless_corruption_fails_closed_without_repair() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_config, send, FaultInjectBackend,
+        };
         use axum::http::Method;
+        use std::sync::Arc;
 
         let ctx = create_test_context_with_config(named_config);
         let mut payload: serde_json::Value =
@@ -4499,87 +8465,59 @@ mod tests {
             b"do not use"
         );
 
-        // An exact retry repairs a publish that reached the manifest commit
-        // but not the mutable overlay/completion phase.
+        // Completion precedes pointer and pending cleanup, so deleting both a
+        // completed overlay and completion marker is corruption rather than a
+        // reachable crash state. An exact body must not manufacture repairs.
         ctx.state.storage.delete(&deprecation_key).await.unwrap();
         ctx.state.storage.delete(&completion_key).await.unwrap();
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pointer_before = ctx.state.storage.get(&pointer_key).await.unwrap();
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let write_attempts = backend.write_attempts();
+        let mut corrupt = ctx.state.clone();
+        corrupt.storage = Storage::from_backend(Arc::new(backend));
         assert_eq!(
-            send(
-                &ctx.app,
-                Method::PUT,
-                "/repository/npm-group/pkg",
-                body.clone(),
+            publish(
+                &corrupt,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
             )
             .await
             .status(),
-            StatusCode::CREATED
+            StatusCode::INTERNAL_SERVER_ERROR
         );
+        assert!(write_attempts.lock().is_empty());
+        assert!(matches!(
+            ctx.state.storage.get(&deprecation_key).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            ctx.state.storage.get(&completion_key).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            ctx.state.storage.get(&pending_key).await,
+            Err(StorageError::NotFound)
+        ));
         assert_eq!(
-            ctx.state
-                .storage
-                .get(&deprecation_key)
-                .await
-                .unwrap()
-                .as_ref(),
-            b"do not use"
+            ctx.state.storage.get(&pointer_key).await.unwrap(),
+            pointer_before
         );
         let response = send(&ctx.app, Method::GET, "/repository/npm-group/pkg", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let packument: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert_eq!(packument["versions"]["1.0.0"]["deprecated"], "do not use");
-
-        let clear = serde_json::json!({
-            "name": "pkg",
-            "versions": {
-                "1.0.0": {"deprecated": ""}
-            }
-        });
-        assert_eq!(
-            send(
-                &ctx.app,
-                Method::PUT,
-                "/repository/npm-group/pkg",
-                serde_json::to_vec(&clear).unwrap(),
-            )
-            .await
-            .status(),
-            StatusCode::CREATED
-        );
-        assert!(matches!(
-            ctx.state.storage.get(&deprecation_key).await,
-            Err(StorageError::NotFound)
-        ));
-
-        let response = send(&ctx.app, Method::GET, "/repository/npm-group/pkg", "").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let packument: serde_json::Value =
-            serde_json::from_slice(&body_bytes(response).await).unwrap();
-        assert!(packument["versions"]["1.0.0"].get("deprecated").is_none());
-
-        // Once the original publish completed, retrying that exact body must
-        // not rewind the later mutable undeprecation.
-        assert_eq!(
-            send(&ctx.app, Method::PUT, "/repository/npm-group/pkg", body)
-                .await
-                .status(),
-            StatusCode::CREATED
-        );
-        assert!(matches!(
-            ctx.state.storage.get(&deprecation_key).await,
-            Err(StorageError::NotFound)
-        ));
-        let response = send(&ctx.app, Method::GET, "/repository/npm-group/pkg", "").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let packument: serde_json::Value =
-            serde_json::from_slice(&body_bytes(response).await).unwrap();
-        assert!(packument["versions"]["1.0.0"].get("deprecated").is_none());
     }
 
     #[tokio::test]
     async fn incomplete_publish_must_be_retried_before_later_mutable_operations() {
-        use crate::test_helpers::{create_test_context_with_config, send};
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
         use axum::http::Method;
+        use std::sync::Arc;
 
         let ctx = create_test_context_with_config(named_config);
         let mut first: serde_json::Value =
@@ -4587,41 +8525,24 @@ mod tests {
         first["description"] = serde_json::Value::String("old description".to_string());
         first["versions"]["1.0.0"]["deprecated"] =
             serde_json::Value::String("old deprecation".to_string());
-        let first = serde_json::to_vec(&first).unwrap();
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
         assert_eq!(
-            send(
-                &ctx.app,
-                Method::PUT,
-                "/repository/npm-private/pkg",
-                first.clone(),
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &first,
             )
             .await
             .status(),
-            StatusCode::CREATED
+            StatusCode::INTERNAL_SERVER_ERROR
         );
-
-        // Model a process loss after the manifest became visible but before
-        // the durable completion marker. No later mutable operation may race
-        // the exact retry that repairs this state.
-        ctx.state
-            .storage
-            .delete(&hosted_publish_complete_key("npm-private", "pkg", "1.0.0"))
-            .await
-            .unwrap();
-        let manifest = ctx
-            .state
-            .storage
-            .get(&hosted_version_key("npm-private", "pkg", "1.0.0"))
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put(
-                &hosted_publish_pending_key("npm-private", "pkg", "1.0.0"),
-                crate::npm_layout::hosted_manifest_digest(&manifest).as_bytes(),
-            )
-            .await
-            .unwrap();
+        let first = serde_json::to_vec(&first).unwrap();
         let clear = serde_json::json!({
             "name": "pkg",
             "versions": {"1.0.0": {"deprecated": ""}}
@@ -4837,6 +8758,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allow_once_retry_converges_the_exact_recorded_mutable_target() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let mut first: serde_json::Value = serde_json::from_slice(&publish_payload_with_tarball(
+            "pkg", "1.0.0", "latest", "first",
+        ))
+        .unwrap();
+        first["description"] = serde_json::json!("old package");
+        first["versions"]["1.0.0"]["deprecated"] = serde_json::json!("old version");
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &first,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+
+        let mut second: serde_json::Value = serde_json::from_slice(&publish_payload_with_tarball(
+            "pkg", "2.0.0", "latest", "second",
+        ))
+        .unwrap();
+        second["description"] = serde_json::json!("new package");
+        second["versions"]["2.0.0"]["deprecated"] = serde_json::json!("new version");
+        let package_key = hosted_package_key("npm-private", "pkg");
+        let pending_key = hosted_publish_pending_index_key("npm-private", "pkg");
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&package_key);
+        let interrupted_lists = backend.list_attempts();
+        let mut interrupted = ctx.state.clone();
+        interrupted.storage = Storage::from_backend(Arc::new(backend));
+        assert_eq!(
+            publish(
+                &interrupted,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pending_key).await.is_some());
+        assert!(ctx
+            .state
+            .storage
+            .stat(&hosted_version_key("npm-private", "pkg", "2.0.0"))
+            .await
+            .is_some());
+
+        let retry_backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .omit_from_list(package_key.clone())
+            .omit_from_list(hosted_tag_key("npm-private", "pkg", "latest"))
+            .omit_from_list(hosted_deprecation_key("npm-private", "pkg", "2.0.0"));
+        let retry_lists = retry_backend.list_attempts();
+        let mut retry = ctx.state.clone();
+        retry.storage = Storage::from_backend(Arc::new(retry_backend));
+        assert_eq!(
+            publish(
+                &retry,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &second,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert!(interrupted_lists.lock().is_empty());
+        assert!(retry_lists.lock().is_empty());
+        assert!(ctx.state.storage.stat(&pending_key).await.is_none());
+        let package: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(&package_key).await.unwrap()).unwrap();
+        assert_eq!(package["description"], "new package");
+        assert_eq!(
+            ctx.state
+                .storage
+                .get(&hosted_tag_key("npm-private", "pkg", "latest"))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"2.0.0"
+        );
+        assert_eq!(
+            ctx.state
+                .storage
+                .get(&hosted_deprecation_key("npm-private", "pkg", "2.0.0"))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"new version"
+        );
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible["description"], "new package");
+        assert_eq!(visible["dist-tags"]["latest"], "2.0.0");
+        assert_eq!(visible["versions"]["1.0.0"]["deprecated"], "old version");
+        assert_eq!(visible["versions"]["2.0.0"]["deprecated"], "new version");
+    }
+
+    #[tokio::test]
+    async fn markerless_fresh_allow_once_manifest_fails_closed() {
+        let ctx = crate::test_helpers::create_test_context_with_config(named_config);
+        let payload: serde_json::Value = serde_json::from_slice(&publish_payload_with_tarball(
+            "pkg", "1.0.0", "latest", "orphan",
+        ))
+        .unwrap();
+        let validated = validate_publish("pkg", &payload).unwrap();
+        let manifest_key = hosted_version_key("npm-private", "pkg", "1.0.0");
+        ctx.state
+            .storage
+            .put(&manifest_key, &validated.manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &payload,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        for key in [
+            hosted_publish_pending_index_key("npm-private", "pkg"),
+            hosted_publish_complete_key("npm-private", "pkg", "1.0.0"),
+            hosted_package_key("npm-private", "pkg"),
+            crate::npm_layout::hosted_packument_current_key("npm-private", "pkg"),
+        ] {
+            assert!(ctx.state.storage.stat(&key).await.is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
     async fn group_tarball_does_not_fall_through_on_hosted_manifest_read_error() {
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
         let manifest = hosted_version_key("npm-private", "pkg", "1.0.0");
@@ -4890,33 +8958,32 @@ mod tests {
                 &["npm-private".to_string(), "npm-registry".to_string()],
                 "pkg",
                 "http://localhost/repository/npm-group",
+                PackumentFlavor::Full,
             )
             .await,
-            Err(ReadError::Unavailable)
+            Err(ReadError::MaterializationUnavailable)
         ));
     }
 
     #[tokio::test]
     async fn deprecation_and_dist_tag_delete_are_idempotent_but_not_error_blind() {
+        use crate::test_helpers::send;
+        use axum::http::Method;
+
         let ctx = crate::test_helpers::create_test_context_with_config(named_config);
-        let manifest = hosted_version_key("npm-private", "pkg", "1.0.0");
-        let manifest_bytes = br#"{"name":"pkg","version":"1.0.0"}"#;
-        let completion = hosted_publish_complete_key("npm-private", "pkg", "1.0.0");
-        let deprecation = hosted_deprecation_key("npm-private", "pkg", "1.0.0");
-        let tag = hosted_tag_key("npm-private", "pkg", "next");
-        ctx.state
-            .storage
-            .put(&manifest, manifest_bytes)
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put(
-                &completion,
-                crate::npm_layout::hosted_manifest_digest(manifest_bytes).as_bytes(),
+        assert_eq!(
+            send(
+                &ctx.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
             )
             .await
-            .unwrap();
+            .status(),
+            StatusCode::CREATED
+        );
+        let deprecation = hosted_deprecation_key("npm-private", "pkg", "1.0.0");
+        let tag = hosted_tag_key("npm-private", "pkg", "next");
         ctx.state.storage.put(&deprecation, b"old").await.unwrap();
         ctx.state.storage.put(&tag, b"1.0.0").await.unwrap();
         let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone())
@@ -4952,21 +9019,17 @@ mod tests {
         );
 
         let clean = crate::test_helpers::create_test_context_with_config(named_config);
-        clean
-            .state
-            .storage
-            .put(&manifest, manifest_bytes)
-            .await
-            .unwrap();
-        clean
-            .state
-            .storage
-            .put(
-                &completion,
-                crate::npm_layout::hosted_manifest_digest(manifest_bytes).as_bytes(),
+        assert_eq!(
+            send(
+                &clean.app,
+                Method::PUT,
+                "/repository/npm-private/pkg",
+                publish_payload("pkg", "1.0.0", "latest"),
             )
             .await
-            .unwrap();
+            .status(),
+            StatusCode::CREATED
+        );
         assert_eq!(
             deprecate(&clean.state, "npm-private", "pkg", &payload)
                 .await
@@ -4988,6 +9051,149 @@ mod tests {
             .status(),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn overlay_pointer_failures_resume_from_immutable_maintenance_marker() {
+        use crate::test_helpers::{create_test_context_with_config, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(named_config);
+        let initial: serde_json::Value =
+            serde_json::from_slice(&publish_payload("pkg", "1.0.0", "latest")).unwrap();
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::AllowOnce,
+                "pkg",
+                &initial,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let target = || {
+            RepositoryTarget::Named(NpmRepository::Hosted {
+                name: "npm-private".to_string(),
+                write_policy: NpmWritePolicy::AllowOnce,
+            })
+        };
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let marker_key = crate::npm_layout::hosted_maintenance_active_key("npm-private", "pkg");
+
+        let mut failing_deprecation = ctx.state.clone();
+        failing_deprecation.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        let deprecated = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": {"deprecated": "old"}}
+        });
+        assert_eq!(
+            deprecate(&failing_deprecation, "npm-private", "pkg", &deprecated,)
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_some());
+        assert!(ctx.state.storage.stat(&marker_key).await.is_some());
+        let still_visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(still_visible["versions"]["1.0.0"]
+            .get("deprecated")
+            .is_none());
+        assert_eq!(
+            handle_dist_tag_put(
+                ctx.state.clone(),
+                target(),
+                "pkg".to_string(),
+                "next".to_string(),
+                NamespaceAuthority::Unrestricted,
+                Bytes::from(serde_json::to_vec("1.0.0").unwrap()),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible["versions"]["1.0.0"]["deprecated"], "old");
+        assert_eq!(visible["dist-tags"]["next"], "1.0.0");
+        assert!(ctx.state.storage.stat(&marker_key).await.is_none());
+
+        let mut failing_tag_put = ctx.state.clone();
+        failing_tag_put.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            handle_dist_tag_put(
+                failing_tag_put,
+                target(),
+                "pkg".to_string(),
+                "beta".to_string(),
+                NamespaceAuthority::Unrestricted,
+                Bytes::from(serde_json::to_vec("1.0.0").unwrap()),
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_some());
+        assert!(ctx.state.storage.stat(&marker_key).await.is_some());
+        let newer = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": {"deprecated": "newer"}}
+        });
+        assert_eq!(
+            deprecate(&ctx.state, "npm-private", "pkg", &newer)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible["versions"]["1.0.0"]["deprecated"], "newer");
+        assert_eq!(visible["dist-tags"]["beta"], "1.0.0");
+
+        let mut failing_tag_delete = ctx.state.clone();
+        failing_tag_delete.storage = crate::storage::Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            handle_dist_tag_delete(
+                failing_tag_delete,
+                target(),
+                "pkg".to_string(),
+                "next".to_string(),
+                NamespaceAuthority::Unrestricted,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(ctx.state.storage.stat(&pointer_key).await.is_some());
+        assert!(ctx.state.storage.stat(&marker_key).await.is_some());
+        assert_eq!(
+            deprecate(&ctx.state, "npm-private", "pkg", &newer)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        let visible = current_full_for_mutation(&ctx.state, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(visible["dist-tags"].get("next").is_none());
+        assert_eq!(visible["dist-tags"]["beta"], "1.0.0");
+        assert_eq!(visible["versions"]["1.0.0"]["deprecated"], "newer");
+        assert!(ctx.state.storage.stat(&marker_key).await.is_none());
     }
 
     #[tokio::test]
@@ -5047,7 +9253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_packument_cache_removes_storage_fanout_and_rewrites_per_route() {
+    async fn hosted_packument_generation_removes_storage_fanout_and_rewrites_per_route() {
         use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
         use axum::http::Method;
         use std::sync::Arc;
@@ -5076,35 +9282,42 @@ mod tests {
             "npm-private",
             "pkg",
             "https://nora.example/repository/npm-private",
+            PackumentFlavor::Full,
         )
         .await
-        .expect("cold hosted packument");
+        .expect("hosted packument");
         assert_eq!(
             hosted["versions"]["1.0.0"]["dist"]["tarball"],
             "https://nora.example/repository/npm-private/pkg/-/pkg-1.0.0.tgz"
         );
-        assert_eq!(list_attempts.lock().len(), 3);
-
-        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
-        let cache: serde_json::Value = serde_json::from_slice(
+        assert!(list_attempts.lock().is_empty());
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pointer_before = state.storage.get(&pointer_key).await.unwrap();
+        let pointer: HostedPackumentPointer = serde_json::from_slice(&pointer_before).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(
             &state
                 .storage
-                .get(&cache_key)
+                .get(&crate::npm_layout::hosted_packument_full_key(
+                    "npm-private",
+                    "pkg",
+                    &pointer.generation,
+                ))
                 .await
-                .expect("persisted cache"),
+                .unwrap(),
         )
         .unwrap();
-        assert!(cache["versions"]["1.0.0"]["dist"].get("tarball").is_none());
+        assert!(stored["versions"]["1.0.0"]["dist"].get("tarball").is_none());
 
         let grouped = hosted_packument(
             &state,
             "npm-private",
             "pkg",
             "https://nora.example/repository/npm-group",
+            PackumentFlavor::Full,
         )
         .await
-        .expect("warm hosted packument");
-        assert_eq!(list_attempts.lock().len(), 3);
+        .expect("group-route hosted packument");
+        assert!(list_attempts.lock().is_empty());
         assert_eq!(
             grouped["versions"]["1.0.0"]["dist"]["tarball"],
             "https://nora.example/repository/npm-group/pkg/-/pkg-1.0.0.tgz"
@@ -5124,21 +9337,25 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        assert!(state.storage.stat(&cache_key).await.is_none());
+        assert_ne!(
+            state.storage.get(&pointer_key).await.unwrap(),
+            pointer_before
+        );
         let rebuilt = hosted_packument(
             &state,
             "npm-private",
             "pkg",
             "https://nora.example/repository/npm-private",
+            PackumentFlavor::Full,
         )
         .await
-        .expect("rebuilt hosted packument");
+        .expect("next hosted generation");
         assert_eq!(rebuilt["versions"].as_object().unwrap().len(), 2);
         assert_eq!(rebuilt["dist-tags"]["next"], "2.0.0");
     }
 
     #[tokio::test]
-    async fn hosted_mutation_fails_closed_when_packument_cache_cannot_be_invalidated() {
+    async fn hosted_mutation_fails_closed_when_retired_marker_cannot_be_cleared() {
         use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
         use axum::http::Method;
         use std::sync::Arc;
@@ -5155,19 +9372,17 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        hosted_packument(
-            &ctx.state,
-            "npm-private",
-            "pkg",
-            "https://nora.example/repository/npm-private",
-        )
-        .await
-        .expect("materialize hosted cache");
-
-        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let pointer_before = ctx.state.storage.get(&pointer_key).await.unwrap();
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        ctx.state
+            .storage
+            .put(&retired_key, crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1)
+            .await
+            .unwrap();
         let mut failing_state = ctx.state.clone();
         failing_state.storage = crate::storage::Storage::from_backend(Arc::new(
-            FaultInjectBackend::new(ctx.state.storage.clone()).fail_delete(&cache_key),
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_delete(&retired_key),
         ));
         let payload: serde_json::Value =
             serde_json::from_slice(&publish_payload("pkg", "2.0.0", "latest")).unwrap();
@@ -5183,17 +9398,52 @@ mod tests {
             .status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert!(ctx
-            .state
-            .storage
-            .stat(&hosted_version_key("npm-private", "pkg", "2.0.0"))
-            .await
-            .is_none());
-        assert!(ctx.state.storage.stat(&cache_key).await.is_some());
+        assert_eq!(
+            ctx.state.storage.get(&pointer_key).await.unwrap(),
+            pointer_before
+        );
+        assert!(ctx.state.storage.stat(&retired_key).await.is_some());
     }
 
     #[tokio::test]
-    async fn hosted_overlays_invalidate_and_rebuild_packument_cache() {
+    async fn retired_marker_returns_not_found_only_after_resumable_state_is_gone() {
+        let ctx = crate::test_helpers::create_test_context_with_config(named_config);
+        let retired_key = crate::npm_layout::hosted_packument_retired_key("npm-private", "pkg");
+        let pending_index =
+            crate::npm_layout::hosted_publish_pending_index_key("npm-private", "pkg");
+        ctx.state
+            .storage
+            .put(&retired_key, crate::npm_layout::HOSTED_PACKUMENT_RETIRED_V1)
+            .await
+            .unwrap();
+        ctx.state.storage.put(&pending_index, b"1").await.unwrap();
+        assert!(matches!(
+            hosted_packument(
+                &ctx.state,
+                "npm-private",
+                "pkg",
+                "https://nora.example/repository/npm-private",
+                PackumentFlavor::Full,
+            )
+            .await,
+            Err(ReadError::MaterializationUnavailable)
+        ));
+        ctx.state.storage.delete(&pending_index).await.unwrap();
+        assert!(matches!(
+            hosted_packument(
+                &ctx.state,
+                "npm-private",
+                "pkg",
+                "https://nora.example/repository/npm-private",
+                PackumentFlavor::Full,
+            )
+            .await,
+            Err(ReadError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hosted_overlays_commit_new_packument_generations() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::Method;
 
@@ -5210,12 +9460,8 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        let cache_key = crate::npm_layout::hosted_packument_cache_key("npm-private", "pkg");
-        assert_eq!(
-            send(&ctx.app, Method::GET, package_uri, "").await.status(),
-            StatusCode::OK
-        );
-        assert!(ctx.state.storage.stat(&cache_key).await.is_some());
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let initial_pointer = ctx.state.storage.get(&pointer_key).await.unwrap();
 
         let deprecation = serde_json::json!({
             "name": "pkg",
@@ -5232,7 +9478,8 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let deprecated_pointer = ctx.state.storage.get(&pointer_key).await.unwrap();
+        assert_ne!(deprecated_pointer, initial_pointer);
         let response = send(&ctx.app, Method::GET, package_uri, "").await;
         let packument: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
@@ -5250,7 +9497,8 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let tagged_pointer = ctx.state.storage.get(&pointer_key).await.unwrap();
+        assert_ne!(tagged_pointer, deprecated_pointer);
         let response = send(&ctx.app, Method::GET, package_uri, "").await;
         let packument: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
@@ -5260,7 +9508,8 @@ mod tests {
             send(&ctx.app, Method::DELETE, tag_uri, "").await.status(),
             StatusCode::NO_CONTENT
         );
-        assert!(ctx.state.storage.stat(&cache_key).await.is_none());
+        let untagged_pointer = ctx.state.storage.get(&pointer_key).await.unwrap();
+        assert_ne!(untagged_pointer, tagged_pointer);
         let response = send(&ctx.app, Method::GET, package_uri, "").await;
         let packument: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
@@ -5379,9 +9628,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_redeploy_stale_completion_blocks_later_mutations_until_retry() {
-        use crate::test_helpers::{create_test_context_with_config, send};
+    async fn allow_redeploy_pointer_failure_blocks_later_mutations_until_retry() {
+        use crate::test_helpers::{create_test_context_with_config, send, FaultInjectBackend};
         use axum::http::Method;
+        use std::sync::Arc;
 
         let ctx = create_test_context_with_config(|config| {
             named_config(config);
@@ -5404,42 +9654,22 @@ mod tests {
 
         let second = publish_payload_with_tarball("pkg", "1.0.0", "latest", "second");
         let second_value: serde_json::Value = serde_json::from_slice(&second).unwrap();
-        let validated = validate_publish("pkg", &second_value).unwrap();
-        let blob_key = crate::npm_layout::hosted_blob_key_for_digest(
-            "npm-private",
-            "pkg",
-            &validated.blob_digest,
-        );
-        ctx.state
-            .storage
-            .put(&blob_key, &validated.tarball)
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put(
-                &hosted_version_key("npm-private", "pkg", "1.0.0"),
-                &validated.manifest,
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut failing = ctx.state.clone();
+        failing.storage = Storage::from_backend(Arc::new(
+            FaultInjectBackend::new(ctx.state.storage.clone()).fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            publish(
+                &failing,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &second_value,
             )
             .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put(
-                &hosted_publish_pending_key("npm-private", "pkg", "1.0.0"),
-                crate::npm_layout::hosted_manifest_digest(&validated.manifest).as_bytes(),
-            )
-            .await
-            .unwrap();
-        let stale_marker = ctx
-            .state
-            .storage
-            .get(&hosted_publish_complete_key("npm-private", "pkg", "1.0.0"))
-            .await
-            .unwrap();
-        assert_ne!(
-            stale_marker.as_ref(),
-            crate::npm_layout::hosted_manifest_digest(&validated.manifest).as_bytes()
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
 
         let deprecation = serde_json::json!({
@@ -5500,6 +9730,167 @@ mod tests {
                 .as_ref(),
             crate::npm_layout::hosted_manifest_digest(&manifest).as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn allow_redeploy_pointer_failure_keeps_tarball_on_the_visible_generation() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(|config| {
+            named_config(config);
+            let NpmRepository::Hosted { write_policy, .. } = &mut config.npm.repositories[0] else {
+                unreachable!()
+            };
+            *write_policy = NpmWritePolicy::Allow;
+        });
+        let first = publish_payload_with_tarball("pkg", "1.0.0", "latest", "first");
+        let first_value: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let first_tarball = base64::engine::general_purpose::STANDARD
+            .decode(
+                first_value["_attachments"]["pkg-1.0.0.tgz"]["data"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::PUT, "/repository/npm-private/pkg", first,)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let second = publish_payload_with_tarball("pkg", "1.0.0", "latest", "second");
+        let second_value: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        let second_tarball = base64::engine::general_purpose::STANDARD
+            .decode(
+                second_value["_attachments"]["pkg-1.0.0.tgz"]["data"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let pointer_key = crate::npm_layout::hosted_packument_current_key("npm-private", "pkg");
+        let mut interrupted = ctx.state.clone();
+        interrupted.storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone())
+                .fail_put(&pointer_key),
+        ));
+        assert_eq!(
+            publish(
+                &interrupted,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &second_value,
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let visible = send(&ctx.app, Method::GET, "/repository/npm-private/pkg", "").await;
+        assert_eq!(visible.status(), StatusCode::OK);
+        let visible: serde_json::Value =
+            serde_json::from_slice(&body_bytes(visible).await).unwrap();
+        assert_eq!(
+            visible["versions"]["1.0.0"]["dist"]["integrity"],
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha512::digest(&first_tarball))
+            )
+        );
+        let tarball = send(
+            &ctx.app,
+            Method::GET,
+            "/repository/npm-private/pkg/-/pkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(body_bytes(tarball).await.as_ref(), first_tarball.as_slice());
+
+        assert_eq!(
+            publish(
+                &ctx.state,
+                "npm-private",
+                NpmWritePolicy::Allow,
+                "pkg",
+                &second_value,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let visible = send(&ctx.app, Method::GET, "/repository/npm-private/pkg", "").await;
+        let visible: serde_json::Value =
+            serde_json::from_slice(&body_bytes(visible).await).unwrap();
+        assert_eq!(
+            visible["versions"]["1.0.0"]["dist"]["integrity"],
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha512::digest(&second_tarball))
+            )
+        );
+        let tarball = send(
+            &ctx.app,
+            Method::GET,
+            "/repository/npm-private/pkg/-/pkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(tarball).await.as_ref(),
+            second_tarball.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_removed_version_is_not_served_from_leftover_split_state() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::Method;
+
+        let ctx = create_test_context_with_config(named_config);
+        for version in ["1.0.0", "2.0.0"] {
+            assert_eq!(
+                send(
+                    &ctx.app,
+                    Method::PUT,
+                    "/repository/npm-private/pkg",
+                    publish_payload_with_tarball("pkg", version, "latest", version),
+                )
+                .await
+                .status(),
+                StatusCode::CREATED
+            );
+        }
+        let removed_manifest = hosted_version_key("npm-private", "pkg", "1.0.0");
+        let target = prepare_hosted_packument_after_retention(
+            &ctx.state.storage,
+            "npm-private",
+            "pkg",
+            &HashSet::from(["1.0.0".to_string()]),
+        )
+        .await
+        .unwrap();
+        let HostedMaintenanceTarget::Live { pointer } = target else {
+            panic!("one retained version must keep the package live")
+        };
+        commit_hosted_packument_pointer(&ctx.state.storage, "npm-private", "pkg", &pointer)
+            .await
+            .unwrap();
+        assert!(ctx.state.storage.stat(&removed_manifest).await.is_some());
+
+        for uri in [
+            "/repository/npm-private/pkg/-/pkg-1.0.0.tgz",
+            "/repository/npm-group/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            let response = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[tokio::test]
