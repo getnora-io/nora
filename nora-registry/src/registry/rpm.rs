@@ -815,6 +815,7 @@ async fn upload(
 
 async fn download(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((repo, path)): Path<(String, String)>,
 ) -> Response {
     if !state.config.rpm.enabled {
@@ -862,6 +863,38 @@ async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // Range applies to package payloads only — repodata/ is regenerated on every
+    // publish, so a resumed range could splice two generations.
+    let is_package = {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".rpm") || lower.ends_with(".drpm")
+    };
+
+    // 206 Partial Content, or 416 when the client asks past the end, straight from
+    // the backend's ranged read — a resumed dnf download transfers only the bytes
+    // it is missing. A partial body cannot be rehashed, so this path skips the pin
+    // check `get_verified` does below and relies on the client's own checksum
+    // (primary.xml records one) — the docker #657 precedent.
+    if is_package {
+        if let Some(meta) = state.storage.stat(&key).await {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key],
+                &headers,
+                meta.size,
+                content_type(&path),
+                &[],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("rpm");
+                }
+                return response;
+            }
+        }
+    }
+
     match state.storage.get_verified(&key).await {
         Ok(outcome) => {
             state.metrics.record_download("rpm");
@@ -879,6 +912,9 @@ async fn download(
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type(&path));
+            if is_package {
+                builder = builder.header(header::ACCEPT_RANGES, "bytes");
+            }
             // repomd.xml is rewritten in place on every publish — clients must
             // revalidate it. Hashed repodata blobs and .rpm files are immutable.
             if path == format!("{REPODATA}/repomd.xml") {
@@ -1277,7 +1313,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use super::REPODATA;
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
     use axum::http::{Method, StatusCode};
     use std::io::Read;
 
@@ -1517,6 +1553,80 @@ mod integration_tests {
         let a = primary.find("<name>aaa</name>").unwrap();
         let b = primary.find("<name>bbb</name>").unwrap();
         assert!(a < b, "packages must be sorted by name");
+    }
+
+    /// Resume support on a `.rpm`: 206 for a byte range, 416 past the end,
+    /// `Accept-Ranges` on the full 200 — and never on repodata.
+    #[tokio::test]
+    async fn test_rpm_package_range_request() {
+        let ctx = create_test_context();
+        let url = "/rpm/myrepo/Packages/rng-1.0-1.x86_64.rpm";
+        ctx.state
+            .storage
+            .put("rpm/myrepo/Packages/rng-1.0-1.x86_64.rpm", b"0123456789")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(&format!("rpm/myrepo/{REPODATA}/repomd.xml"), b"<repomd/>")
+            .await
+            .unwrap();
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+
+        // repodata is regenerated on every publish — no ranged serve.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/rpm/myrepo/{REPODATA}/repomd.xml"),
+            vec![("range", "bytes=2-5")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("accept-ranges").is_none());
     }
 
     #[tokio::test]

@@ -239,106 +239,6 @@ async fn storage_get_reader_with_fallback(
     }
 }
 
-/// Parse a single `Range: bytes=start-end` header against a known object size, returning the
-/// inclusive `(start, end)` clamped to the object, or `None` if it is absent, unparsable,
-/// multipart, or unsatisfiable (the caller then serves the full object). Suffix ranges
-/// (`bytes=-N`, the last N bytes) are supported.
-fn parse_byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
-    let spec = value.strip_prefix("bytes=")?.split(',').next()?.trim();
-    let (s, e) = spec.split_once('-')?;
-    if s.is_empty() {
-        // suffix form "bytes=-N": the last N bytes
-        let n: u64 = e.trim().parse().ok()?;
-        byte_range_core(true, 0, false, n, size)
-    } else {
-        let start: u64 = s.trim().parse().ok()?;
-        let (end_empty, end_in) = if e.trim().is_empty() {
-            (true, 0)
-        } else {
-            (false, e.trim().parse::<u64>().ok()?)
-        };
-        byte_range_core(false, start, end_empty, end_in, size)
-    }
-}
-
-/// Arithmetic core of [`parse_byte_range`], split out so the out-of-bounds /
-/// inverted-range / overflow bug-class can be *proven* absent over the whole
-/// `u64` space. String lexing stays in the caller — symbolically lexing a
-/// UTF-8 string is intractable for a bounded model checker, while the bounds
-/// invariant lives entirely in this arithmetic. For any inputs it never
-/// panics/overflows; any `Some((start, end))` satisfies `start <= end < size`.
-fn byte_range_core(
-    suffix: bool,
-    start_in: u64,
-    end_empty: bool,
-    end_in: u64,
-    size: u64,
-) -> Option<(u64, u64)> {
-    let (start, end) = if suffix {
-        let n = end_in;
-        if n == 0 || size == 0 {
-            return None;
-        }
-        (size.saturating_sub(n), size - 1)
-    } else {
-        let start = start_in;
-        let end = if end_empty {
-            size.saturating_sub(1)
-        } else {
-            end_in.min(size.saturating_sub(1))
-        };
-        (start, end)
-    };
-    if size == 0 || start > end || start >= size {
-        return None;
-    }
-    Some((start, end))
-}
-
-/// Kani proof: [`byte_range_core`] is total and bounds-safe. For ANY
-/// `(suffix, start_in, end_empty, end_in, size)` over the full `u64` space it
-/// never panics or overflows, and any `Some((start, end))` is well-formed:
-/// `start <= end < size` — the whole "out-of-bounds / inverted Range" bug-class
-/// discharged at verification time, not at runtime. (Verified GREEN in-crate,
-/// 17/17 checks in ~0.3s.)
-///
-/// Run: `make kani`, or `cargo kani -p nora-registry` (CI: `.github/workflows/kani.yml`).
-/// Compiled only under `--cfg kani`; invisible to the normal build/clippy/test.
-#[cfg(kani)]
-#[kani::proof]
-fn byte_range_core_is_bounds_safe() {
-    let suffix: bool = kani::any();
-    let start_in: u64 = kani::any();
-    let end_empty: bool = kani::any();
-    let end_in: u64 = kani::any();
-    let size: u64 = kani::any();
-    if let Some((start, end)) = byte_range_core(suffix, start_in, end_empty, end_in, size) {
-        assert!(start <= end, "Range start must never exceed end");
-        assert!(end < size, "Range end must stay within the object size");
-        assert!(start < size, "Range start must stay within the object size");
-    }
-}
-
-async fn storage_get_range_with_fallback(
-    storage: &Storage,
-    ns_key: &str,
-    legacy_key: &str,
-    start: u64,
-    end: u64,
-) -> Result<
-    (
-        u64,
-        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
-    ),
-    crate::storage::StorageError,
-> {
-    match storage.get_range(ns_key, start, end).await {
-        Ok(r) => Ok(r),
-        Err(_) if ns_key != legacy_key => storage.get_range(legacy_key, start, end).await,
-        Err(e) => Err(e),
-    }
-}
-
 /// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
 /// mismatch at EOF, fails the stream instead of letting a tampered blob complete
 /// cleanly. `get_reader` (#580) streams large docker blobs without buffering, so
@@ -1282,44 +1182,35 @@ async fn download_blob(
             return resp;
         }
 
-        // Range request: serve the requested byte range (206 Partial Content). A ranged
-        // response is partial, so the streaming SHA-256 verify (full-GET only) does not
-        // apply — a ranged serve relies on the content-addressed storage key plus the
-        // client's own content-digest check, as Docker/Harbor do. An absent/invalid range
-        // falls through to the full 200 below.
-        if let Some((start, end)) = headers
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| parse_byte_range(v, size))
+        // Range request: 206 Partial Content, or 416 when the client asks past the end
+        // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
+        // only) does not apply — a ranged serve relies on the content-addressed storage
+        // key plus the client's own content-digest check, as Docker/Harbor do. An
+        // absent/malformed range falls through to the full 200 below.
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&key, &legacy_key],
+            &headers,
+            size,
+            "application/octet-stream",
+            &[
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+                (
+                    HeaderName::from_static("docker-content-digest"),
+                    digest.clone(),
+                ),
+            ],
+        )
+        .await
         {
-            drop(reader);
-            let ranged = match storage_get_range_with_fallback(
-                &state.storage,
-                &key,
-                &legacy_key,
-                start,
-                end,
-            )
-            .await
-            {
-                Ok((_, r)) => r,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            state.metrics.record_download("docker");
-            state.metrics.record_cache_hit("docker");
-            return Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, end - start + 1)
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, size),
-                )
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .header("docker-content-digest", &digest)
-                .body(Body::from_stream(ReaderStream::new(ranged)))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("docker");
+                state.metrics.record_cache_hit("docker");
+            }
+            return response;
         }
 
         state.metrics.record_download("docker");
@@ -4440,43 +4331,6 @@ mod integration_tests {
         assert_eq!(body.as_ref(), &blob_data[..]);
     }
 
-    #[test]
-    fn test_parse_byte_range() {
-        use super::parse_byte_range;
-        assert_eq!(parse_byte_range("bytes=0-3", 10), Some((0, 3)));
-        assert_eq!(parse_byte_range("bytes=5-", 10), Some((5, 9))); // open-ended
-        assert_eq!(parse_byte_range("bytes=-4", 10), Some((6, 9))); // suffix (last 4)
-        assert_eq!(parse_byte_range("bytes=8-100", 10), Some((8, 9))); // clamp end to size
-        assert_eq!(parse_byte_range("bytes=10-12", 10), None); // start past end
-        assert_eq!(parse_byte_range("bytes=5-3", 10), None); // reversed
-        assert_eq!(parse_byte_range("nonsense", 10), None); // unparsable
-        assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
-
-        // mutation-found gaps (cargo-mutants): exercise the single-byte range
-        // and the suffix form against an empty object.
-        assert_eq!(parse_byte_range("bytes=5-5", 10), Some((5, 5))); // single byte (kills `>`→`>=`)
-        assert_eq!(parse_byte_range("bytes=-5", 0), None); // suffix + empty (kills `||`→`&&`)
-    }
-
-    proptest::proptest! {
-        /// Property test (#3): fuzz the string LEXER of `parse_byte_range` — the
-        /// part Kani cannot symbolically execute. Over biased range-like strings
-        /// and any size it must never panic, and any `Some((s, e))` is
-        /// well-formed: `s <= e < size`. Pairs with the Kani proof of
-        /// `byte_range_core` (the arithmetic) for full-function coverage.
-        #[test]
-        fn parse_byte_range_lexer_invariant(
-            value in "bytes=-?[0-9]{0,9}-?[0-9]{0,9}",
-            size in proptest::prelude::any::<u64>(),
-        ) {
-            if let Some((s, e)) = super::parse_byte_range(&value, size) {
-                proptest::prop_assert!(s <= e, "inverted: {} > {}", s, e);
-                proptest::prop_assert!(e < size, "oob end: {} >= {}", e, size);
-                proptest::prop_assert!(s < size, "oob start: {} >= {}", s, size);
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_docker_blob_range_request() {
         use tower::ServiceExt;
@@ -4520,6 +4374,35 @@ mod integration_tests {
         );
         let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), &blob[4..=7]);
+
+        // A client holding the whole blob resumes with `bytes=<size>-`: 416, not a
+        // full re-download (#657, matches the reference `distribution` registry).
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v2/rng/blobs/{}", digest))
+            .header(header::RANGE, format!("bytes={}-", blob.len()))
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", blob.len())
+        );
+
+        // A malformed range is ignored: full 200 (RFC 9110 §14.2).
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v2/rng/blobs/{}", digest))
+            .header(header::RANGE, "kilobytes=1-2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

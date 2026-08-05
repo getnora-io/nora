@@ -423,14 +423,6 @@ async fn recipe_file_download(
             return response;
         }
 
-        state.metrics.record_download("conan");
-        state.metrics.record_cache_hit("conan");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            artifact,
-            crate::registry_type::RegistryType::Conan,
-            "CACHE",
-        ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
             state.config.curation.conan.quarantine.as_ref().or(state
                 .config
@@ -456,6 +448,35 @@ async fn recipe_file_download(
         ) {
             return resp;
         }
+
+        // Range request: 206 Partial Content, or 416 when the client asks past the
+        // end. The gates above ran on the whole object; the partial body itself
+        // cannot be rehashed, so the client's own checksum covers it (#657).
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&storage_key],
+            &headers,
+            data.len() as u64,
+            "application/octet-stream",
+            &[],
+        )
+        .await
+        {
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("conan");
+                state.metrics.record_cache_hit("conan");
+            }
+            return response;
+        }
+
+        state.metrics.record_download("conan");
+        state.metrics.record_cache_hit("conan");
+        state.activity.push(ActivityEntry::new(
+            ActionType::CacheHit,
+            artifact,
+            crate::registry_type::RegistryType::Conan,
+            "CACHE",
+        ));
         return with_binary(data.to_vec());
     }
 
@@ -833,14 +854,6 @@ async fn package_file_download(
             return response;
         }
 
-        state.metrics.record_download("conan");
-        state.metrics.record_cache_hit("conan");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            artifact,
-            crate::registry_type::RegistryType::Conan,
-            "CACHE",
-        ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
             state.config.curation.conan.quarantine.as_ref().or(state
                 .config
@@ -866,6 +879,35 @@ async fn package_file_download(
         ) {
             return resp;
         }
+
+        // Range request: 206 Partial Content, or 416 when the client asks past the
+        // end. The gates above ran on the whole object; the partial body itself
+        // cannot be rehashed, so the client's own checksum covers it (#657).
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&storage_key],
+            &headers,
+            data.len() as u64,
+            "application/octet-stream",
+            &[],
+        )
+        .await
+        {
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("conan");
+                state.metrics.record_cache_hit("conan");
+            }
+            return response;
+        }
+
+        state.metrics.record_download("conan");
+        state.metrics.record_cache_hit("conan");
+        state.activity.push(ActivityEntry::new(
+            ActionType::CacheHit,
+            artifact,
+            crate::registry_type::RegistryType::Conan,
+            "CACHE",
+        ));
         return with_binary(data.to_vec());
     }
 
@@ -1198,6 +1240,7 @@ fn with_binary(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
         ],
         data,
     )
@@ -1319,7 +1362,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
 
     #[tokio::test]
@@ -1401,6 +1446,68 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"fake-tgz-data");
+    }
+
+    /// Resume support on a cached package binary: 206 for a byte range, 416 past
+    /// the end, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_conan_package_file_range_request() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = true;
+        });
+        let url = "/conan/v2/conans/zlib/1.2.13/_/_/revisions/abc123/packages/deadbeef/revisions/cafe42/files/conan_package.tgz";
+        ctx.state
+            .storage
+            .put(
+                "conan/zlib/1.2.13/_/_/revisions/abc123/packages/deadbeef/revisions/cafe42/files/conan_package.tgz",
+                b"0123456789",
+            )
+            .await
+            .unwrap();
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
     }
 
     #[tokio::test]

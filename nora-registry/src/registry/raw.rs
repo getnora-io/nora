@@ -113,6 +113,47 @@ async fn download(
     let pin = state.storage.get_pin_hash(&key);
     match state.storage.get_reader(&key).await {
         Ok((len, reader)) => {
+            let content_type = guess_content_type(&key);
+            let etag = pin.as_ref().map(|h| format!("\"{}\"", h));
+
+            // Range request: 206 Partial Content, or 416 when the client asks past
+            // the end. A partial body cannot be hashed, so a ranged serve skips the
+            // streaming pin check below and relies on the client's own checksum —
+            // the precedent docker set in #657.
+            //
+            // Raw objects are overwritable, so a resumed range against a replaced
+            // object would splice two versions together: an `If-Range` that no
+            // longer matches the current ETag falls through to the full 200.
+            let if_range_matches = match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok())
+            {
+                Some(v) => etag.as_deref() == Some(v.trim()),
+                None => true,
+            };
+            if if_range_matches {
+                let mut extra = vec![(
+                    header::CACHE_CONTROL,
+                    state.config.raw.cache_control.clone(),
+                )];
+                if let Some(tag) = etag {
+                    extra.push((header::ETAG, tag));
+                }
+                if let Some(response) = crate::registry::range::range_response(
+                    &state.storage,
+                    &[&key],
+                    &headers,
+                    len,
+                    content_type,
+                    &extra,
+                )
+                .await
+                {
+                    if response.status() == StatusCode::PARTIAL_CONTENT {
+                        state.metrics.record_download("raw");
+                    }
+                    return response;
+                }
+            }
+
             state.metrics.record_download("raw");
             state.activity.push(ActivityEntry::new(
                 ActionType::Pull,
@@ -124,11 +165,11 @@ async fn download(
                 .audit
                 .log(AuditEntry::new("pull", "api", "", "raw", ""));
 
-            let content_type = guess_content_type(&key);
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, len.to_string())
+                .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
             if let Some(ref hash) = pin {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
@@ -1219,6 +1260,136 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], b"updated");
+    }
+
+    /// Resume support: a byte range is served as 206 from the backend's ranged
+    /// read, a range past the end is a 416, and the full 200 advertises it.
+    #[tokio::test]
+    async fn test_raw_range_request() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/range.bin",
+            b"0123456789".to_vec(),
+        )
+        .await;
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/range.bin",
+            vec![("range", "bytes=2-5")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        // A client holding the whole file resumes with `bytes=<size>-`: 416.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/range.bin",
+            vec![("range", "bytes=10-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/raw/range.bin", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+    }
+
+    /// Raw objects are overwritable: a stale `If-Range` validator must serve the
+    /// whole current object, never splice a range of it onto the client's copy
+    /// of the previous one.
+    #[tokio::test]
+    async fn test_raw_range_honors_if_range() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/ifr.bin",
+            b"0123456789".to_vec(),
+        )
+        .await;
+        // The ETag is the hash-pin, recorded fire-and-forget after PUT (#603).
+        for _ in 0..200 {
+            if ctx.state.storage.get_pin_hash("raw/ifr.bin").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let head = send(&ctx.app, Method::HEAD, "/raw/ifr.bin", "").await;
+        let etag = head
+            .headers()
+            .get("etag")
+            .expect("pin must be recorded")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let stale = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/ifr.bin",
+            vec![
+                ("range", "bytes=2-5"),
+                (
+                    "if-range",
+                    "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+                ),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(stale).await[..], b"0123456789");
+
+        let fresh = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/ifr.bin",
+            vec![("range", "bytes=2-5"), ("if-range", &etag)],
+            "",
+        )
+        .await;
+        assert_eq!(fresh.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(fresh.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(&body_bytes(fresh).await[..], b"2345");
     }
 
     #[tokio::test]

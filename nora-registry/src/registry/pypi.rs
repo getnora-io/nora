@@ -319,6 +319,38 @@ async fn download_file(
             .or(state.config.curation.quarantine_ttl.as_deref()),
     );
 
+    // Resumable download (#657): serve the requested bytes from the backend and skip
+    // the full read below. Package files only — the simple index is generated, never
+    // ranged. A partial read cannot be hashed, so neither the quarantine gate nor the
+    // curation integrity check can run on it: the range serve stands down while
+    // quarantine holds artifacts, and integrity is the client's own hash (the PEP 691
+    // `hashes` field), as docker does.
+    if headers.contains_key(header::RANGE)
+        && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+    {
+        if let Some(meta) = state.storage.stat(&key).await {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key],
+                &headers,
+                meta.size,
+                pypi_content_type(&filename),
+                &[(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                )],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("pypi");
+                    state.metrics.record_cache_hit("pypi");
+                }
+                return response;
+            }
+        }
+    }
+
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
     if let Ok(outcome) = state.storage.get_verified(&key).await {
@@ -368,6 +400,7 @@ async fn download_file(
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                (header::ACCEPT_RANGES, "bytes"),
             ],
             data,
         )
@@ -1352,7 +1385,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
-    use axum::http::{Method, StatusCode};
+    use axum::http::{header, Method, StatusCode};
 
     #[tokio::test]
     async fn test_pypi_list_empty() {
@@ -1504,6 +1537,78 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         assert_eq!(&body[..], tarball_data);
+    }
+
+    #[tokio::test]
+    async fn test_pypi_download_range_request() {
+        let ctx = create_test_context();
+        let sdist = b"0123456789abcdef";
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", sdist)
+            .await
+            .unwrap();
+        let url = "/simple/flask/flask-2.0.tar.gz";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 2-5/{}", sdist.len())
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/gzip"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &sdist[2..=5]);
+
+        // A client that already holds the whole file resumes with `bytes=<size>-`.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            url,
+            vec![("range", &format!("bytes={}-", sdist.len())[..])],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", sdist.len())
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &sdist[..]);
     }
 
     #[tokio::test]
