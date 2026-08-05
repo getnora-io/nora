@@ -86,9 +86,10 @@ impl ObjectStorage {
             .with_endpoint(url)
             .with_bucket_name(bucket)
             .with_region(region)
-            .with_allow_http(allow_http)
+            // One combined ClientOptions: with_client_options REPLACES the
+            // options with_allow_http would have accumulated.
+            .with_client_options(streaming_client_options().with_allow_http(allow_http))
             .with_virtual_hosted_style_request(virtual_hosted)
-            .with_client_options(streaming_client_options())
             .with_retry(streaming_retry_config());
 
         match (access_key, secret_key) {
