@@ -13,6 +13,26 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
+/// Downloads stream store -> server -> client under backpressure, so a slow
+/// download client paces the store read. object_store's request timeout covers
+/// the whole body of an attempt, and its retry deadline runs from the FIRST
+/// request while gating every transparent ranged resume of a streamed body —
+/// with the defaults (30 s attempt, 180 s deadline) any transfer slower than
+/// object-size / 180 s is reset mid-stream. Size both for the slowest
+/// tolerated download instead.
+const STREAM_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn streaming_client_options() -> object_store::ClientOptions {
+    object_store::ClientOptions::new().with_timeout(STREAM_ATTEMPT_TIMEOUT)
+}
+
+fn streaming_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        retry_timeout: STREAM_ATTEMPT_TIMEOUT.saturating_mul(2),
+        ..Default::default()
+    }
+}
+
 /// Object-store backend (S3-compatible or Google Cloud Storage) using the
 /// `object_store` crate. Everything past construction goes through the
 /// [`ObjectStore`] trait, so both providers share one implementation.
@@ -66,8 +86,11 @@ impl ObjectStorage {
             .with_endpoint(url)
             .with_bucket_name(bucket)
             .with_region(region)
-            .with_allow_http(allow_http)
-            .with_virtual_hosted_style_request(virtual_hosted);
+            // One combined ClientOptions: with_client_options REPLACES the
+            // options with_allow_http would have accumulated.
+            .with_client_options(streaming_client_options().with_allow_http(allow_http))
+            .with_virtual_hosted_style_request(virtual_hosted)
+            .with_retry(streaming_retry_config());
 
         match (access_key, secret_key) {
             (Some(ak), Some(sk)) => {
@@ -104,15 +127,26 @@ impl ObjectStorage {
         service_account_path: Option<&str>,
         base_url: Option<&str>,
     ) -> Self {
-        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        let mut builder = GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(bucket)
+            .with_retry(streaming_retry_config());
+        // `with_client_options` would replace every env-derived client option
+        // (`GOOGLE_PROXY_URL`, ...), so merge only the timeout — and only when
+        // the operator has not set `GOOGLE_TIMEOUT` themselves.
+        if std::env::var_os("GOOGLE_TIMEOUT").is_none() {
+            builder = builder.with_config(
+                object_store::gcp::GoogleConfigKey::Client(object_store::ClientConfigKey::Timeout),
+                format!("{}s", STREAM_ATTEMPT_TIMEOUT.as_secs()),
+            );
+        }
         if let Some(path) = service_account_path {
             builder = builder.with_service_account_path(path);
         }
         if let Some(url) = base_url {
             let allow_http = url.starts_with("http://");
-            builder = builder.with_base_url(url).with_client_options(
-                object_store::ClientOptions::new().with_allow_http(allow_http),
-            );
+            builder = builder
+                .with_base_url(url)
+                .with_client_options(streaming_client_options().with_allow_http(allow_http));
             if allow_http {
                 builder = builder.with_skip_signature(true);
             }
