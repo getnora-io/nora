@@ -481,6 +481,28 @@ fn max_upload_sessions() -> usize {
         .unwrap_or(DEFAULT_MAX_UPLOAD_SESSIONS)
 }
 
+/// OCI-conformant 429 for the concurrent-upload ceiling. containers/common
+/// retry logic only backs off on errcode TOOMANYREQUESTS in a JSON body; a
+/// plain-text 429 aborts the client push outright.
+fn too_many_uploads() -> Response {
+    let body = json!({
+        "errors": [{
+            "code": "TOOMANYREQUESTS",
+            "message": "too many concurrent uploads",
+            "detail": { "limit": max_upload_sessions() }
+        }]
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::RETRY_AFTER, "5"),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Read max session size from env (in MB) or use default
 fn max_session_size() -> usize {
     let mb = std::env::var("NORA_MAX_UPLOAD_SESSION_SIZE_MB")
@@ -1525,7 +1547,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
                 current = sessions.len(),
                 "Upload session limit reached — rejecting new upload"
             );
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response();
+            return too_many_uploads();
         }
         sessions.insert(
             uuid.clone(),
@@ -1572,9 +1594,7 @@ async fn patch_blob(
     // the session map) so streaming to disk cannot fan out unboundedly (#817).
     let _inflight = match InFlightGuard::try_acquire() {
         Some(g) => g,
-        None => {
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
-        }
+        None => return too_many_uploads(),
     };
 
     // Phase 1: Validate session under lock, extract temp_path + current size (no I/O)
@@ -1738,9 +1758,7 @@ async fn upload_blob(
     // map, so `max_upload_sessions` alone does not cap their concurrency (#817).
     let _inflight = match InFlightGuard::try_acquire() {
         Some(g) => g,
-        None => {
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
-        }
+        None => return too_many_uploads(),
     };
 
     let digest = match params.get("digest") {
@@ -3457,6 +3475,51 @@ mod tests {
         let max = max_upload_sessions();
         assert!(max > 0);
         assert_eq!(max, DEFAULT_MAX_UPLOAD_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn test_upload_session_limit_returns_oci_429() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+
+        // Pre-fill the session map to the ceiling — no env mutation, so this is
+        // safe under parallel tests.
+        let ctx = create_test_context();
+        {
+            let mut sessions = ctx.state.upload_sessions.write();
+            for i in 0..max_upload_sessions() {
+                sessions.insert(
+                    format!("fill-{i}"),
+                    UploadSession {
+                        temp_path: std::env::temp_dir().join(format!("fill-{i}")),
+                        size: 0,
+                        name: "alpine".to_string(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+            "application/json"
+        );
+        assert!(
+            resp.headers().contains_key(header::RETRY_AFTER),
+            "429 must carry Retry-After so clients back off"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
+        assert_eq!(
+            body["errors"][0]["detail"]["limit"],
+            max_upload_sessions() as u64
+        );
     }
 
     #[test]
