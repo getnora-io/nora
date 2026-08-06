@@ -125,7 +125,7 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/maven", get(maven_list))
         .route("/ui/maven/{*path}", get(maven_detail))
         .route("/ui/npm", get(npm_list))
-        .route("/ui/npm/{name}", get(npm_detail))
+        .route("/ui/npm/{*name}", get(npm_detail))
         .route("/ui/cargo", get(cargo_list))
         .route("/ui/cargo/{name}", get(cargo_detail))
         .route("/ui/pypi", get(pypi_list))
@@ -167,7 +167,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
         .route("/api/ui/{registry_type}/list", get(api_list))
-        .route("/api/ui/{registry_type}/{name}", get(api_detail))
+        .route("/api/ui/{registry_type}/{*name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
 }
 
@@ -1081,5 +1081,76 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+}
+
+#[cfg(test)]
+mod named_npm_route_tests {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn encoded_repository_qualified_npm_link_opens_detail_page() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let context = create_test_context_with_config(|config| {
+            config.npm.repositories = vec![crate::config::NpmRepository::Hosted {
+                name: "npm-private".to_string(),
+                write_policy: crate::config::NpmWritePolicy::AllowOnce,
+            }];
+            config.npm.default_repository = Some("npm-private".to_string());
+        });
+        let blob = b"tarball";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.0.0",
+            "dist": {
+                "integrity": format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(blob))
+                )
+            }
+        }))
+        .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.0.0.json",
+                &manifest,
+            )
+            .await
+            .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                &crate::npm_layout::hosted_blob_key_from_manifest(
+                    "npm-private",
+                    "@scope/pkg",
+                    &manifest,
+                )
+                .unwrap(),
+                blob,
+            )
+            .await
+            .unwrap();
+        context.state.repo_index.invalidate("npm");
+
+        let list = send(&context.app, Method::GET, "/ui/npm", "").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_html = String::from_utf8(body_bytes(list).await.to_vec()).unwrap();
+        let detail_path = "/ui/npm/repositories%2Fnpm-private%2F%40scope%2Fpkg";
+        assert!(list_html.contains(detail_path));
+
+        let detail = send(&context.app, Method::GET, detail_path, "").await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_html = String::from_utf8(body_bytes(detail).await.to_vec()).unwrap();
+        assert!(detail_html.contains(&format!(
+            "npm install @scope/pkg --registry {}/repository/npm-private",
+            context.state.config.server.public_base_url()
+        )));
     }
 }

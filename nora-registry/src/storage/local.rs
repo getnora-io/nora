@@ -13,6 +13,33 @@ use super::{FileMeta, Result, StorageBackend, StorageError};
 /// Monotonic counter for unique temp file names (atomic — no collisions).
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Best-effort cancellation cleanup for an atomic-write staging file.
+///
+/// Normal paths remove the file asynchronously. If the future is dropped
+/// between staging-file creation and that cleanup, `Drop` makes one synchronous
+/// removal attempt so cancelled requests do not routinely leak temp files.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// fsync the parent directory of `path` so the directory entry written by a
 /// just-completed `rename` is durable across power-loss. The file's own data is
 /// fsync'd (`sync_all`) before the rename; the rename only becomes crash-durable
@@ -138,6 +165,79 @@ impl StorageBackend for LocalStorage {
             let _ = fs::remove_file(&tmp).await;
         }
         write_result
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<()> {
+        let path = self.key_to_path(key);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Stage complete bytes beside the destination, then publish them with
+        // an atomic hard-link create. Exactly one contender can create `path`;
+        // readers never observe the staging write or a partial destination.
+        let open_path = path.clone();
+        let opened = tokio::task::spawn_blocking(move || loop {
+            let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = open_path.with_file_name(format!(".nora-tmp.{}.{}", std::process::id(), seq));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(file) => {
+                    let cleanup = TempFileGuard::new(tmp.clone());
+                    return Ok::<_, std::io::Error>((tmp, file, cleanup));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Io(std::io::Error::other(format!(
+                "atomic-create staging task failed: {error}"
+            )))
+        })?
+        .map_err(StorageError::Io)?;
+        let (tmp, file, mut cleanup) = opened;
+        let mut file = fs::File::from_std(file);
+
+        let publish_result: Result<()> = async {
+            file.write_all(data).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            fs::hard_link(&tmp, &path).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    StorageError::AlreadyExists
+                } else {
+                    StorageError::Io(e)
+                }
+            })?;
+            Ok(())
+        }
+        .await;
+        drop(file);
+
+        match fs::remove_file(&tmp).await {
+            Ok(()) => cleanup.disarm(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => cleanup.disarm(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %tmp.display(),
+                    "failed to clean up atomic-create staging file"
+                );
+            }
+        }
+
+        if publish_result.is_ok() {
+            // Persist both the destination link and staging-name removal before
+            // returning success.
+            sync_parent_dir(&path).await?;
+        }
+        publish_result
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
@@ -372,6 +472,73 @@ mod tests {
         storage.put("test/key", b"test data").await.unwrap();
         let data = storage.get("test/key").await.unwrap();
         assert_eq!(&*data, b"test data");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_preserves_existing_bytes_and_cleans_staging() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        storage.put_if_absent("nested/key", b"first").await.unwrap();
+        assert!(matches!(
+            storage.put_if_absent("nested/key", b"second").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(&storage.get("nested/key").await.unwrap()[..], b"first");
+        assert_eq!(
+            storage.list("").await.unwrap(),
+            vec!["nested/key".to_string()],
+            "atomic-create staging files must be cleaned on success and conflict"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_put_if_absent_has_exactly_one_winner() {
+        const CONTENDERS: usize = 16;
+        const LEN: usize = 32 * 1024;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+
+        let mut handles = Vec::new();
+        for i in 0..CONTENDERS {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let payload = vec![i as u8; LEN];
+                barrier.wait().await;
+                (i as u8, storage.put_if_absent("shared/key", &payload).await)
+            }));
+        }
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for handle in handles {
+            let (candidate, result) = handle.await.expect("task panicked");
+            match result {
+                Ok(()) => assert!(
+                    winner.replace(candidate).is_none(),
+                    "more than one atomic create succeeded"
+                ),
+                Err(StorageError::AlreadyExists) => conflicts += 1,
+                Err(e) => panic!("unexpected atomic-create error: {e}"),
+            }
+        }
+
+        let winner = winner.expect("one contender must create the key");
+        assert_eq!(conflicts, CONTENDERS - 1);
+        let stored = storage.get("shared/key").await.unwrap();
+        assert_eq!(stored.len(), LEN);
+        assert!(
+            stored.iter().all(|byte| *byte == winner),
+            "published bytes must be the complete winning payload"
+        );
+        assert_eq!(
+            storage.list("").await.unwrap(),
+            vec!["shared/key".to_string()],
+            "no contender may leave a staging file behind"
+        );
     }
 
     #[tokio::test]

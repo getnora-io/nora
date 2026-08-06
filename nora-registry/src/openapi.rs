@@ -34,6 +34,7 @@ use crate::AppState;
         (name = "metrics", description = "Prometheus metrics"),
         (name = "dashboard", description = "Dashboard & Metrics API"),
         (name = "docker", description = "Docker Registry v2 API"),
+        (name = "repository", description = "Named Maven and npm repositories"),
         (name = "maven", description = "Maven Repository API"),
         (name = "npm", description = "npm Registry API"),
         (name = "cargo", description = "Cargo Registry API"),
@@ -74,6 +75,10 @@ use crate::AppState;
         // Maven
         crate::openapi::maven_artifact_get,
         crate::openapi::maven_artifact_put,
+        crate::openapi::named_repository_get,
+        crate::openapi::named_repository_put,
+        crate::openapi::named_repository_post,
+        crate::openapi::named_repository_delete,
         // npm
         crate::openapi::npm_package,
         crate::openapi::npm_publish,
@@ -545,6 +550,93 @@ pub async fn maven_artifact_get() {}
     )
 )]
 pub async fn maven_artifact_put() {}
+
+/// Read from a named Maven or npm repository
+#[utoipa::path(
+    get,
+    path = "/repository/{repository}/{path}",
+    tag = "repository",
+    params(
+        ("repository" = String, Path, description = "Hosted, proxy or group repository name"),
+        ("path" = String, Path, description = "Slash-preserving Maven artifact path or npm package/tarball endpoint")
+    ),
+    responses(
+        (status = 200, description = "Maven artifact bytes or npm registry response"),
+        (status = 400, description = "Invalid protocol path", body = ErrorResponse),
+        (status = 404, description = "Repository, artifact or package not found"),
+        (status = 502, description = "Upstream proxy unavailable")
+    )
+)]
+pub async fn named_repository_get() {}
+
+/// Mutate a named Maven or npm repository
+///
+/// Maven accepts artifact uploads only into hosted repositories. npm publish
+/// and deprecation payloads may target a hosted repository or a group; group
+/// routing uses the configured writable member. npm dist-tag add/update
+/// mutations are direct-hosted only, and group endpoints return 400. Proxy
+/// repositories are read-only.
+#[utoipa::path(
+    put,
+    path = "/repository/{repository}/{path}",
+    tag = "repository",
+    params(
+        ("repository" = String, Path, description = "Hosted repository; an npm group is writable only for publish/deprecate"),
+        ("path" = String, Path, description = "Slash-preserving Maven artifact path or npm publish/deprecation/dist-tag endpoint; npm dist-tag mutations require a direct hosted repository")
+    ),
+    responses(
+        (status = 200, description = "npm mutation completed"),
+        (status = 201, description = "Maven artifact or npm package created"),
+        (status = 400, description = "Payload or repository policy rejected the mutation; npm group dist-tag mutations return 400", body = ErrorResponse),
+        (status = 405, description = "Method is not supported for this repository or endpoint"),
+        (status = 409, description = "Immutable coordinate exists with different content"),
+        (status = 500, description = "Storage error")
+    )
+)]
+pub async fn named_repository_put() {}
+
+/// Submit an npm read-semantics POST endpoint
+///
+/// npm security audit requests are forwarded through named npm proxy/group
+/// repositories. Named Maven repositories reject POST with 405.
+#[utoipa::path(
+    post,
+    path = "/repository/{repository}/{path}",
+    tag = "repository",
+    params(
+        ("repository" = String, Path, description = "npm hosted, proxy or group repository name"),
+        ("path" = String, Path, description = "Slash-preserving npm POST endpoint, such as -/npm/v1/security/advisories/bulk")
+    ),
+    responses(
+        (status = 200, description = "npm upstream response"),
+        (status = 400, description = "Invalid npm request", body = ErrorResponse),
+        (status = 404, description = "Repository not found"),
+        (status = 405, description = "POST is not supported for this repository format"),
+        (status = 502, description = "Upstream proxy unavailable")
+    )
+)]
+pub async fn named_repository_post() {}
+
+/// Delete a mutable npm dist-tag in a named hosted repository
+///
+/// Dist-tag deletion is direct-hosted only; group endpoints return 400.
+#[utoipa::path(
+    delete,
+    path = "/repository/{repository}/{path}",
+    tag = "repository",
+    params(
+        ("repository" = String, Path, description = "Direct named npm hosted repository; group endpoints return 400"),
+        ("path" = String, Path, description = "npm dist-tag endpoint: -/package/{package}/dist-tags/{tag}")
+    ),
+    responses(
+        (status = 204, description = "Dist-tag deleted or already absent"),
+        (status = 400, description = "Invalid package/tag, protected latest tag, or group endpoint"),
+        (status = 404, description = "Repository not found"),
+        (status = 405, description = "DELETE is not supported for this path or repository format"),
+        (status = 500, description = "Storage error")
+    )
+)]
+pub async fn named_repository_delete() {}
 
 // -------------------- npm --------------------
 
@@ -1339,4 +1431,47 @@ pub async fn admin_reindex() {}
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_named_repository_path_documents_both_protocol_dispatch_methods() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let path = &document["paths"]["/repository/{repository}/{path}"];
+        for method in ["get", "put", "post", "delete"] {
+            assert!(
+                path.get(method).is_some(),
+                "shared named repository path must document {method}"
+            );
+            assert_eq!(
+                path[method]["tags"][0], "repository",
+                "shared path must not claim to be Maven-only"
+            );
+        }
+    }
+
+    #[test]
+    fn named_npm_group_write_contract_limits_routing_to_publish_and_deprecate() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let path = &document["paths"]["/repository/{repository}/{path}"];
+
+        let put_description = path["put"]["description"].as_str().unwrap();
+        assert!(put_description.contains(
+            "npm publish\nand deprecation payloads may target a hosted repository or a group"
+        ));
+        assert!(put_description.contains(
+            "npm dist-tag add/update\nmutations are direct-hosted only, and group endpoints return 400"
+        ));
+
+        let delete_description = path["delete"]["description"].as_str().unwrap();
+        assert!(delete_description
+            .contains("Dist-tag deletion is direct-hosted only; group endpoints return 400"));
+        assert_eq!(
+            path["delete"]["responses"]["400"]["description"],
+            "Invalid package/tag, protected latest tag, or group endpoint"
+        );
+    }
 }

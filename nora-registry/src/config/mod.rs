@@ -324,8 +324,16 @@ impl Config {
     fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
         match rt {
             RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
-            RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
-            RegistryType::Npm => self.npm.enabled && self.npm.proxy.is_some(),
+            RegistryType::Maven => self.maven.enabled && self.maven.has_proxy(),
+            RegistryType::Npm => {
+                self.npm.enabled
+                    && (self.npm.proxy.is_some()
+                        || self
+                            .npm
+                            .repositories
+                            .iter()
+                            .any(|repository| matches!(repository, NpmRepository::Proxy { .. })))
+            }
             RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
             RegistryType::PyPI => {
                 self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
@@ -451,6 +459,20 @@ impl Config {
                 );
             }
         }
+        for repository in &self.maven.repositories {
+            if let MavenRepository::Proxy {
+                name, url, auth, ..
+            } = repository
+            {
+                if auth.is_some() && std::env::var("NORA_MAVEN_REPOSITORIES_JSON").is_err() {
+                    tracing::warn!(
+                        repository = %name,
+                        url = %url,
+                        "Maven proxy credentials in config.toml are plaintext — consider NORA_MAVEN_REPOSITORIES_JSON"
+                    );
+                }
+            }
+        }
         // Go
         if self.go.proxy_auth.is_some() && std::env::var("NORA_GO_PROXY_AUTH").is_err() {
             tracing::warn!("Go proxy credentials in config.toml are plaintext — consider NORA_GO_PROXY_AUTH env var");
@@ -458,6 +480,20 @@ impl Config {
         // npm
         if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
             tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
+        }
+        for repository in &self.npm.repositories {
+            if let NpmRepository::Proxy {
+                name, url, auth, ..
+            } = repository
+            {
+                if auth.is_some() && std::env::var("NORA_NPM_REPOSITORIES_JSON").is_err() {
+                    tracing::warn!(
+                        repository = %name,
+                        url = %url,
+                        "npm proxy credentials in config.toml are plaintext — consider NORA_NPM_REPOSITORIES_JSON"
+                    );
+                }
+            }
         }
         // PyPI
         if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
@@ -560,6 +596,20 @@ impl Config {
         for proxy in &self.maven.proxies {
             if let Some(host) = extract_host(proxy.url()) {
                 result.push(("maven".to_string(), host));
+            }
+        }
+        for repository in &self.maven.repositories {
+            if let MavenRepository::Proxy { url, .. } = repository {
+                if let Some(host) = extract_host(url) {
+                    result.push(("maven".to_string(), host));
+                }
+            }
+        }
+        for repository in &self.npm.repositories {
+            if let NpmRepository::Proxy { url, .. } = repository {
+                if let Some(host) = extract_host(url) {
+                    result.push(("npm".to_string(), host));
+                }
             }
         }
 
@@ -772,6 +822,24 @@ impl Config {
             warnings.push(
                 "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
             );
+        }
+
+        errors.extend(self.maven.validate_repositories());
+        errors.extend(self.npm.validate_repositories());
+        let maven_repository_names: HashSet<&str> = self
+            .maven
+            .repositories
+            .iter()
+            .map(MavenRepository::name)
+            .collect();
+        for npm_repository in &self.npm.repositories {
+            if maven_repository_names.contains(npm_repository.name()) {
+                errors.push(format!(
+                    "repository name {:?} is declared by both Maven and npm; \
+                     /repository/{{repository}} must identify exactly one format",
+                    npm_repository.name()
+                ));
+            }
         }
 
         // 8. Curation validation.
@@ -1014,8 +1082,8 @@ impl Config {
 
         // Registry configs (each handles its own NORA_*_ENABLED + format-specific vars)
         self.docker.apply_env_overrides();
-        self.maven.apply_env_overrides();
-        self.npm.apply_env_overrides();
+        self.maven.apply_env_overrides()?;
+        self.npm.apply_env_overrides()?;
         self.pypi.apply_env_overrides();
         self.go.apply_env_overrides();
         self.cargo.apply_env_overrides();
@@ -1429,17 +1497,72 @@ mod tests {
     }
 
     #[test]
-    fn test_env_override_maven_checksum_and_immutable() {
+    fn test_env_override_maven_immutable() {
         let mut config = Config::default();
-        assert!(config.maven.checksum_verify); // default true
         assert!(config.maven.immutable_releases); // default true
-        std::env::set_var("NORA_MAVEN_CHECKSUM_VERIFY", "false");
         std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
         config.apply_env_overrides().unwrap();
-        assert!(!config.maven.checksum_verify);
         assert!(!config.maven.immutable_releases);
-        std::env::remove_var("NORA_MAVEN_CHECKSUM_VERIFY");
         std::env::remove_var("NORA_MAVEN_IMMUTABLE_RELEASES");
+    }
+
+    #[test]
+    fn test_env_override_named_maven_repositories() {
+        let mut config = Config::default();
+        std::env::set_var(
+            "NORA_MAVEN_REPOSITORIES_JSON",
+            r#"[
+                {"kind":"hosted","name":"releases","version_policy":"release","write_policy":"allow"},
+                {"kind":"proxy","name":"central","url":"https://repo.maven.apache.org/maven2"},
+                {"kind":"group","name":"public","members":["central","releases"]}
+            ]"#,
+        );
+        std::env::set_var("NORA_MAVEN_DEFAULT_REPOSITORY", "public");
+        config.apply_env_overrides().unwrap();
+
+        assert_eq!(config.maven.repositories.len(), 3);
+        assert_eq!(config.maven.default_repository.as_deref(), Some("public"));
+        assert!(config.maven.validate_repositories().is_empty());
+
+        std::env::remove_var("NORA_MAVEN_REPOSITORIES_JSON");
+        std::env::remove_var("NORA_MAVEN_DEFAULT_REPOSITORY");
+    }
+
+    #[test]
+    fn test_named_maven_repository_validation_rejects_unknown_group_member() {
+        let mut config = Config::default();
+        config.maven.repositories = vec![MavenRepository::Group {
+            name: "public".to_string(),
+            members: vec!["missing".to_string()],
+        }];
+        config.maven.default_repository = Some("public".to_string());
+
+        let errors = config.maven.validate_repositories();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown member \"missing\"")));
+    }
+
+    #[test]
+    fn repository_names_are_unique_across_maven_and_npm() {
+        let mut config = Config::default();
+        config.maven.repositories = vec![MavenRepository::Hosted {
+            name: "private".to_string(),
+            version_policy: MavenVersionPolicy::Mixed,
+            write_policy: MavenWritePolicy::Allow,
+        }];
+        config.maven.default_repository = Some("private".to_string());
+        config.npm.repositories = vec![NpmRepository::Hosted {
+            name: "private".to_string(),
+            write_policy: NpmWritePolicy::AllowOnce,
+        }];
+        config.npm.default_repository = Some("private".to_string());
+
+        let (_, errors) = config.validate();
+        assert!(errors.iter().any(|error| {
+            error.contains("declared by both Maven and npm")
+                && error.contains("/repository/{repository}")
+        }));
     }
 
     #[test]

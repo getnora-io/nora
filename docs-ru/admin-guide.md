@@ -120,9 +120,28 @@ htpasswd -Bc /etc/nora/users.htpasswd admin
 | `NORA_NPM_PROXY` | URL npm-реестра | `https://registry.npmjs.org` |
 | `NORA_NPM_PROXY_AUTH` | Учётные данные (`user:pass`) | — |
 | `NORA_NPM_METADATA_TTL` | TTL кэша метаданных (секунды) | `300` |
+| `NORA_NPM_REPOSITORIES_JSON` | JSON-массив named hosted/proxy/group | `[]` |
+| `NORA_NPM_DEFAULT_REPOSITORY` | Репозиторий для совместимого alias `/npm` | — |
 | `NORA_PYPI_PROXY` | URL PyPI-реестра | `https://pypi.org/simple/` |
 | `NORA_MAVEN_PROXIES` | Список Maven-репозиториев через запятую | `https://repo1.maven.org/maven2` |
+| `NORA_MAVEN_REPOSITORIES_JSON` | JSON-массив named hosted/proxy/group | `[]` |
+| `NORA_MAVEN_DEFAULT_REPOSITORY` | Репозиторий для совместимого alias `/maven2` | — |
 | `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), формат: `url\|auth,url2` | `https://registry-1.docker.io` |
+
+Рекомендуемая production-топология:
+
+```bash
+NORA_NPM_REPOSITORIES_JSON='[{"kind":"hosted","name":"npm-private","write_policy":"allow"},{"kind":"proxy","name":"npm-registry","url":"https://registry.npmjs.org"},{"kind":"group","name":"npm-group","members":["npm-private","npm-registry"]}]'
+NORA_NPM_DEFAULT_REPOSITORY=npm-group
+
+NORA_MAVEN_REPOSITORIES_JSON='[{"kind":"hosted","name":"maven-releases","version_policy":"release","write_policy":"allow"},{"kind":"hosted","name":"maven-snapshots","version_policy":"snapshot","write_policy":"allow"},{"kind":"proxy","name":"maven-central","url":"https://repo1.maven.org/maven2","version_policy":"release"},{"kind":"group","name":"maven-public","members":["maven-central","maven-releases","maven-snapshots"]}]'
+NORA_MAVEN_DEFAULT_REPOSITORY=maven-public
+```
+
+Имена Maven и npm проверяются в одном namespace `/repository/{name}` и
+не могут совпадать. Group не хранит собственные артефакты. Поддерживается один
+экземпляр NORA с правом записи (`replicaCount: 1`); S3 не превращает отдельные
+объектные операции в распределённую транзакцию между несколькими writers.
 
 > **Рекомендация для production.** Для Docker-прокси с аутентификацией используйте `config.toml` вместо переменной окружения. Это позволяет хранить учётные данные отдельно (например, в Kubernetes Secret, смонтированном как файл) и упрощает ротацию токенов.
 >
@@ -245,6 +264,24 @@ nora migrate --from local --to s3 --dry-run   # Просмотр
 nora migrate --from local --to s3              # Выполнение
 ```
 
+### 7.1. Миграция hosted-репозиториев из Nexus
+
+Для новой установки сначала создайте named hosted/proxy/group topology.
+Зафиксируйте исходный inventory, привяжите его к фактическому времени старта
+Job и соберите непрерывный request-audit до high-water. После остановки записей
+сформируйте из baseline и audit конечное desired state. Maven releases и
+snapshots копируйте протокольными PUT-запросами в `maven-releases` и
+`maven-snapshots`; npm packages публикуйте в `npm-private`. Чтение и
+контрольные проверки выполняйте через `maven-public` и `npm-group`.
+При production `write_policy=allow` повторный copy-run может безопасно
+восстановить фактическое содержимое той же координаты.
+
+Не переносите proxy cache или group state: proxy прогревается обычными
+клиентскими запросами, а group не владеет объектами. Встроенный
+direct-storage `nora import` не поддерживает named npm layout и отклоняется;
+для Maven он также не используется при настроенных named repositories.
+In-place миграция из старых layout NORA не предусмотрена.
+
 ---
 
 ## 8. Безопасность
@@ -257,7 +294,20 @@ nora migrate --from local --to s3              # Выполнение
 
 - Валидация имён файлов при публикации (защита от обхода каталогов).
 - Проверка соответствия имени пакета в URL и теле запроса.
-- Иммутабельность версий: повторная публикация той же версии запрещена.
+- Политика hosted-записи задаётся явно: `allow` разрешает замену координаты,
+  `allow_once` (по умолчанию) делает точный retry идемпотентным и отклоняет
+  другие байты.
+- npm manifest версии не содержит `deprecated`: это изменяемый overlay.
+  `publish-complete/{version}` отмечает завершение первой post-commit фазы.
+  При `allow_once` точный retry без маркера восстанавливает только
+  отсутствующий state; до его успеха другие версии, dist-tags и deprecation
+  этого пакета получают `409`, поэтому запаздывающий retry не перематывает
+  более новый mutable state. После корректного маркера retry state не меняет,
+  несовпадающий маркер считается повреждением (`500`). При `allow` каждый
+  publish повторно применяет переданные package fields, tags и deprecation,
+  даже если manifest byte-identical. Manifest — точка видимости, но не
+  multi-object транзакция: после post-commit HTTP 500 требуется идентичный
+  retry до любых следующих mutable-операций.
 
 ### 8.3. Аудит
 
@@ -279,8 +329,8 @@ nora migrate --from local --to s3              # Выполнение
 | Протокол | Endpoint | Описание |
 |----------|----------|----------|
 | Docker / OCI | `/v2/` | Docker Registry V2 API |
-| npm | `/npm/` | npm-реестр (прокси + публикация) |
-| Maven | `/maven2/` | Maven-репозиторий |
+| npm | `/repository/{name}/` | Named hosted/proxy/group (`/npm/` — compatibility alias) |
+| Maven | `/repository/{name}/` | Named hosted/proxy/group (`/maven2/` — compatibility alias) |
 | PyPI | `/simple/` | Python Simple API (PEP 503) |
 | Cargo | `/cargo/` | Cargo-реестр |
 | Helm | `/v2/` (OCI) | Helm-чарты через OCI-протокол |
@@ -304,8 +354,8 @@ journalctl -u nora --no-pager -n 50
 ### Прокси-кэш не работает
 
 1. Проверьте доступность внешнего реестра: `curl https://registry.npmjs.org/lodash`.
-2. Убедитесь, что переменная `NORA_NPM_PROXY` задана корректно.
-3. При использовании приватного реестра укажите `NORA_NPM_PROXY_AUTH`.
+2. Для named topology проверьте URL нужного proxy в `NORA_NPM_REPOSITORIES_JSON` и порядок members в `npm-group`.
+3. При использовании приватного upstream передайте `auth` proxy-репозитория через Secret; для compatibility alias проверьте `NORA_NPM_PROXY_AUTH`.
 
 ### Ошибка целостности (Integrity check failed)
 

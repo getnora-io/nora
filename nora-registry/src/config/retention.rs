@@ -13,8 +13,11 @@ pub struct RetentionRule {
     pub registry: String,
     /// Optional glob matched against the group name within the registry
     /// (e.g. `myrepo/*` for one rpm/deb repository, `archive/*` for one raw
-    /// top-level prefix). Absent = rule applies to every group in the
-    /// registry. First matching rule wins, so put specific rules first.
+    /// top-level prefix). npm globs remain package-relative across named
+    /// hosted repositories; include the repository and `:` (for example
+    /// `npm-private:@scope/*`) to target one hosted repository. Absent = rule
+    /// applies to every group in the registry. First matching rule wins, so
+    /// put specific rules first.
     #[serde(default)]
     pub name_glob: Option<String>,
     /// Keep the N most recent versions

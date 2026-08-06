@@ -21,14 +21,17 @@ NORA — реестр артефактов для команд разработ�
 Укажите NORA в качестве реестра:
 
 ```bash
-npm config set registry http://nora.example.com:4000/npm
+npm config set registry http://nora.example.com:4000/repository/npm-group/
 ```
 
 Или создайте файл `.npmrc` в корне проекта:
 
 ```
-registry=http://nora.example.com:4000/npm
+registry=http://nora.example.com:4000/repository/npm-group/
 ```
+
+Не убирайте завершающий `/` у path-based registry URL: npm учитывает его
+при выборе привязанных к пути учётных данных из `.npmrc`.
 
 После этого все команды `npm install` будут загружать пакеты через NORA. При первом обращении NORA загрузит пакет из внешнего реестра (npmjs.org) и сохранит его в кэш. Последующие обращения обслуживаются из кэша.
 
@@ -49,7 +52,7 @@ docker push nora.example.com:4000/myteam/myapp:1.0.0
   <mirror>
     <id>nora</id>
     <mirrorOf>central</mirrorOf>
-    <url>http://nora.example.com:4000/maven2</url>
+    <url>http://nora.example.com:4000/repository/maven-public</url>
   </mirror>
 </mirrors>
 ```
@@ -95,12 +98,17 @@ helm pull oci://nora.example.com:4000/helm/mychart --version 0.1.0
 ### 3.1. npm
 
 ```bash
-npm publish --registry http://nora.example.com:4000/npm
+npm publish --registry http://nora.example.com:4000/repository/npm-private/
 ```
 
 Требования:
 - Файл `package.json` с полями `name` и `version`.
-- Каждая версия публикуется однократно. Повторная публикация той же версии запрещена.
+- Публикация, deprecate и изменение dist-tag выполняются напрямую через
+  hosted-репозиторий `npm-private`; install, search и audit — через `npm-group`.
+- При `write_policy=allow` повтор тех же `name`/`version` заменяет содержимое,
+  как в выбранной Nexus hosted policy. Без явной настройки действует
+  `allow_once`: точный retry идемпотентен, другие байты возвращают HTTP 409.
+- Dist-tag-записи через group отклоняются; `latest` нельзя удалить.
 
 ### 3.2. Docker
 
@@ -112,7 +120,7 @@ docker push nora.example.com:4000/myteam/myapp:1.0.0
 ### 3.3. Maven
 
 ```bash
-mvn deploy -DaltDeploymentRepository=nora::default::http://nora.example.com:4000/maven2
+mvn deploy -DaltDeploymentRepository=nora::default::http://nora.example.com:4000/repository/maven-releases
 ```
 
 ### 3.4. Raw (произвольные файлы)
@@ -193,13 +201,13 @@ curl -u admin:password http://nora.example.com:4000/auth/token
 
 ```bash
 # npm
-npm config set //nora.example.com:4000/npm/:_authToken TOKEN
+npm config set //nora.example.com:4000/repository/npm-group/:_authToken TOKEN
 
 # Docker
 docker login nora.example.com:4000
 
 # curl
-curl -H "Authorization: Bearer TOKEN" http://nora.example.com:4000/npm/my-package
+curl -H "Authorization: Bearer TOKEN" http://nora.example.com:4000/repository/npm-group/my-package
 ```
 
 Операции чтения по умолчанию не требуют аутентификации (роль `read` назначается автоматически).
@@ -215,7 +223,7 @@ curl -H "Authorization: Bearer TOKEN" http://nora.example.com:4000/npm/my-packag
 О: Да. Пакеты, опубликованные через `npm publish` или `docker push`, сохраняются в локальном хранилище NORA и доступны всем пользователям данного экземпляра.
 
 **В: Как обновить кэш метаданных?**
-О: Кэш метаданных npm обновляется автоматически по истечении TTL (по умолчанию 5 минут). Для немедленного обновления удалите файл `metadata.json` из каталога хранилища.
+О: Кэш proxy-репозитория npm обновляется автоматически по истечении его `metadata_ttl`. Не удаляйте и не переносите объекты хранилища вручную: hosted manifests и proxy packuments находятся в разных пространствах и являются частью протокольного состояния.
 
 **В: Поддерживаются ли scoped-пакеты npm (@scope/package)?**
-О: Да, полностью. Например: `npm install @babel/core --registry http://nora.example.com:4000/npm`.
+О: Да, полностью. Например: `npm install @babel/core --registry http://nora.example.com:4000/repository/npm-group/`.

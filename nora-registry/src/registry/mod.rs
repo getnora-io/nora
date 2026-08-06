@@ -10,6 +10,7 @@ pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
 mod maven;
+mod named;
 mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pub_dart;
@@ -31,12 +32,20 @@ pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
+pub use named::routes as named_repository_routes;
 pub use npm::routes as npm_routes;
 
 // Storage-key builders reused by `nora import` so imported keys are
 // byte-identical to the keys these handlers serve — GC/retention/UI browse walk
 // keys as strings (review R7, contract `import-key-format-equals-handler-key-format`).
 pub(crate) use maven::storage_key as maven_storage_key;
+pub(crate) use maven::update_hosted_metadata_after_retention;
+pub(crate) use npm::{
+    commit_hosted_packument_pointer, create_hosted_maintenance_marker,
+    prepare_hosted_packument_after_retention, read_hosted_active_transactions,
+    read_hosted_maintenance_marker, read_hosted_packument_pointer,
+    resume_hosted_maintenance_operation, validate_hosted_packument_pointer,
+};
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
@@ -196,7 +205,8 @@ where
                     // operator cannot tell it apart from a genuine 404. Surface it
                     // distinctly when the response carries a block signature (#881).
                     // A plain 4xx (no signature) stays silent, exactly as before.
-                    if let Some(reason) = policy_block_reason(response.headers()) {
+                    let policy_block = policy_block_reason(response.headers());
+                    if let Some(reason) = policy_block {
                         UPSTREAM_POLICY_BLOCKED_TOTAL
                             .with_label_values(&[registry_str, reason])
                             .inc();
@@ -205,7 +215,7 @@ where
                             url,
                             status,
                             reason,
-                            "upstream returned a policy/geo block, relayed as 404 (not a genuine not-found) — check egress/region"
+                            "upstream returned a policy/geo block (not a genuine not-found) — check egress/region"
                         );
                     }
                     // A 4xx means the upstream is alive and answered — not an
@@ -214,7 +224,13 @@ where
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
                     cb.record_alive(registry_str, probe);
-                    return Err(ProxyError::NotFound);
+                    return if response.status() == reqwest::StatusCode::NOT_FOUND
+                        && policy_block.is_none()
+                    {
+                        Err(ProxyError::NotFound)
+                    } else {
+                        Err(ProxyError::Upstream(status))
+                    };
                 }
                 if attempt == 0 {
                     UPSTREAM_REQUEST_DURATION
@@ -270,6 +286,315 @@ pub(crate) async fn proxy_fetch(
         registry,
     )
     .await
+}
+
+fn is_followable_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::FOUND
+            | reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn validate_initial_url<F>(url: &str, allowed: &F) -> Result<reqwest::Url, ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| ProxyError::Network(format!("invalid upstream URL: {error}")))?;
+    if !allowed(&parsed) {
+        return Err(ProxyError::Network(
+            "initial upstream URL rejected by repository URL policy".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectTargetError {
+    MissingOrInvalidLocation,
+    LimitExceeded,
+    Disallowed,
+}
+
+impl RedirectTargetError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::MissingOrInvalidLocation => "missing or invalid Location",
+            Self::LimitExceeded => "redirect limit exceeded",
+            Self::Disallowed => "target rejected by repository URL policy",
+        }
+    }
+}
+
+fn validated_redirect_target<F>(
+    current_url: &reqwest::Url,
+    response: &reqwest::Response,
+    followed: usize,
+    max_redirects: usize,
+    allowed: &F,
+) -> Result<reqwest::Url, RedirectTargetError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    if followed >= max_redirects {
+        return Err(RedirectTargetError::LimitExceeded);
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(RedirectTargetError::MissingOrInvalidLocation)?;
+    let target = current_url
+        .join(location)
+        .map_err(|_| RedirectTargetError::MissingOrInvalidLocation)?;
+    if !allowed(&target) {
+        return Err(RedirectTargetError::Disallowed);
+    }
+    Ok(target)
+}
+
+/// Fetch binary content while following only the initial URL and redirect
+/// targets accepted by `redirect_allowed`.
+///
+/// `client` MUST have reqwest's automatic redirect policy disabled. The
+/// initial URL and every resolved `Location` are checked before the request
+/// (and its Authorization header) is built.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_with_validated_redirects<F>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+    max_redirects: usize,
+    redirect_allowed: F,
+) -> Result<Vec<u8>, ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    proxy_fetch_with_validated_redirects_impl(
+        client,
+        url,
+        timeout,
+        auth,
+        cb,
+        registry,
+        max_redirects,
+        None,
+        redirect_allowed,
+    )
+    .await
+}
+
+/// The redirect-validated GET flow with a strict response-body budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_with_validated_redirects_bounded<F>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+    max_redirects: usize,
+    body_cap: usize,
+    redirect_allowed: F,
+) -> Result<Vec<u8>, ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    proxy_fetch_with_validated_redirects_impl(
+        client,
+        url,
+        timeout,
+        auth,
+        cb,
+        registry,
+        max_redirects,
+        Some(body_cap),
+        redirect_allowed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_with_validated_redirects_impl<F>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+    max_redirects: usize,
+    body_cap: Option<usize>,
+    redirect_allowed: F,
+) -> Result<Vec<u8>, ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    let initial_url = validate_initial_url(url, &redirect_allowed)?;
+    let registry_str = registry.as_str();
+    let probe = cb.check(registry_str)?;
+
+    for attempt in 0..2 {
+        let mut current_url = initial_url.clone();
+        let mut followed = 0;
+
+        loop {
+            let mut request = client.get(current_url.clone()).timeout(timeout);
+            if let Some(credentials) = auth {
+                request = request.header("Authorization", basic_auth_header(credentials));
+            }
+
+            let upstream_start = Instant::now();
+            match request.send().await {
+                Ok(response) => {
+                    let elapsed = upstream_start.elapsed().as_secs_f64();
+                    let status = response.status();
+                    if status.is_success() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "2xx"])
+                            .observe(elapsed);
+                        let result = match body_cap {
+                            Some(body_cap) => {
+                                read_response_body_bounded(
+                                    response,
+                                    body_cap,
+                                    "validated proxy response",
+                                )
+                                .await
+                            }
+                            None => response
+                                .bytes()
+                                .await
+                                .map(|bytes| bytes.to_vec())
+                                .map_err(|error| ProxyError::Network(error.to_string())),
+                        };
+                        if result.is_ok() {
+                            cb.record_success(registry_str, probe);
+                        } else {
+                            cb.record_failure(registry_str, probe);
+                        }
+                        return result;
+                    }
+
+                    if is_followable_redirect(status) {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "3xx"])
+                            .observe(elapsed);
+                        let next_url = match validated_redirect_target(
+                            &current_url,
+                            &response,
+                            followed,
+                            max_redirects,
+                            &redirect_allowed,
+                        ) {
+                            Ok(target) => target,
+                            Err(error) => {
+                                cb.record_alive(registry_str, probe);
+                                tracing::warn!(
+                                    registry = registry_str,
+                                    status = status.as_u16(),
+                                    reason = error.reason(),
+                                    "upstream redirect rejected"
+                                );
+                                return Err(ProxyError::Upstream(status.as_u16()));
+                            }
+                        };
+                        followed += 1;
+                        current_url = next_url;
+                        continue;
+                    }
+                    if status.is_redirection() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "3xx"])
+                            .observe(elapsed);
+                        cb.record_alive(registry_str, probe);
+                        tracing::warn!(
+                            registry = registry_str,
+                            status = status.as_u16(),
+                            "unsupported upstream redirect status"
+                        );
+                        return Err(ProxyError::Upstream(status.as_u16()));
+                    }
+
+                    let status_code = status.as_u16();
+                    if status.is_client_error() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "4xx"])
+                            .observe(elapsed);
+                        let policy_block = policy_block_reason(response.headers());
+                        if let Some(reason) = policy_block {
+                            UPSTREAM_POLICY_BLOCKED_TOTAL
+                                .with_label_values(&[registry_str, reason])
+                                .inc();
+                            tracing::warn!(
+                                registry = registry_str,
+                                url = %current_url,
+                                status = status_code,
+                                reason,
+                                "upstream returned a policy/geo block (not a genuine not-found) — check egress/region"
+                            );
+                        }
+                        cb.record_alive(registry_str, probe);
+                        return if status == reqwest::StatusCode::NOT_FOUND && policy_block.is_none()
+                        {
+                            Err(ProxyError::NotFound)
+                        } else {
+                            Err(ProxyError::Upstream(status_code))
+                        };
+                    }
+
+                    if attempt == 0 {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "5xx"])
+                            .observe(elapsed);
+                        tracing::debug!(
+                            url = %current_url,
+                            status = status_code,
+                            "upstream 5xx, retrying in 1s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "5xx"])
+                        .observe(elapsed);
+                    cb.record_failure(registry_str, probe);
+                    return Err(ProxyError::Upstream(status_code));
+                }
+                Err(error) => {
+                    let elapsed = upstream_start.elapsed().as_secs_f64();
+                    let status_label = if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, status_label])
+                        .observe(elapsed);
+                    if attempt == 0 {
+                        tracing::debug!(
+                            url = %current_url,
+                            error = %error,
+                            "upstream error, retrying in 1s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                    cb.record_failure(registry_str, probe);
+                    return Err(ProxyError::Network(error.to_string()));
+                }
+            }
+        }
+    }
+
+    cb.record_failure(registry_str, probe);
+    Err(ProxyError::Network("max retries exceeded".into()))
 }
 
 /// Fetch text content from upstream proxy with timeout and 1 retry.
@@ -458,10 +783,43 @@ pub(crate) async fn repo_proxy_download(
     }
 }
 
+async fn read_response_body_bounded(
+    response: reqwest::Response,
+    cap: usize,
+    description: &str,
+) -> Result<Vec<u8>, ProxyError> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > cap as u64) {
+        return Err(ProxyError::Network(format!(
+            "upstream {description} exceeds {cap} byte limit"
+        )));
+    }
+
+    let mut body = Vec::with_capacity(content_length.unwrap_or_default().min(cap as u64) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ProxyError::Network(error.to_string()))?;
+        if chunk.len() > cap.saturating_sub(body.len()) {
+            return Err(ProxyError::Network(format!(
+                "upstream {description} exceeds {cap} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+const NPM_AUDIT_RESPONSE_BODY_CAP: usize = 8 * 1024 * 1024;
+
+async fn read_npm_audit_response_body(response: reqwest::Response) -> Result<Vec<u8>, ProxyError> {
+    read_response_body_bounded(response, NPM_AUDIT_RESPONSE_BODY_CAP, "npm audit response").await
+}
+
 /// Forward a POST (request body + an allowlist of headers) to an upstream and
-/// return its `(status, body, content-type)` verbatim. Mirrors `proxy_fetch_core`'s
-/// circuit-breaker discipline (`check` → send → `record_success`/`record_alive`/
-/// `record_failure`, one retry on 5xx/network).
+/// return its `(status, body, content-type)` verbatim. Mirrors
+/// `proxy_fetch_core`'s circuit-breaker discipline (`check` → send →
+/// `record_success`/`record_alive`/`record_failure`). Request-send and 5xx
+/// failures get one retry; response-body failures fail immediately.
 ///
 /// Used for `npm audit` (#597): a query POST that must return the upstream's answer
 /// as-is — including a 4xx (a real audit response, upstream is alive) — with only
@@ -469,9 +827,17 @@ pub(crate) async fn repo_proxy_download(
 ///
 /// `auth` is the configured proxy credential (Basic); the caller's own
 /// `Authorization` is never forwarded — pass only the intended headers in
-/// `fwd_headers` (allowlist). The body is not inspected or decompressed here.
+/// `fwd_headers` (allowlist). A 2xx or 4xx response is accepted only after its
+/// body has been read completely within the strict 8 MiB npm-audit response
+/// budget. A truncated or oversized body is an upstream failure, never an
+/// empty successful response, and is recorded against the circuit breaker.
+///
+/// `client` must have automatic redirects disabled. The initial URL and every
+/// redirect target are policy-checked before a request or Authorization header
+/// is built. 307/308 preserve the method, body and headers. 301/302/303 switch
+/// permanently to a bodyless GET and retain only `Accept` plus configured auth.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn proxy_forward_post(
+pub(crate) async fn proxy_forward_post<F>(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
@@ -480,82 +846,170 @@ pub(crate) async fn proxy_forward_post(
     body: &[u8],
     cb: &CircuitBreakerRegistry,
     registry: RegistryType,
-) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
+    max_redirects: usize,
+    redirect_allowed: F,
+) -> Result<(u16, Vec<u8>, Option<String>), ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    let initial_url = validate_initial_url(url, &redirect_allowed)?;
     let registry_str = registry.as_str();
     let probe = cb.check(registry_str)?;
 
     for attempt in 0..2 {
-        let mut request = client.post(url).timeout(timeout).body(body.to_vec());
-        if let Some(credentials) = auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
-        }
-        for (k, v) in fwd_headers {
-            request = request.header(*k, *v);
-        }
+        let mut current_url = initial_url.clone();
+        let mut followed = 0;
+        let mut send_body = true;
 
-        let upstream_start = Instant::now();
-        match request.send().await {
-            Ok(response) => {
-                let elapsed = upstream_start.elapsed().as_secs_f64();
-                let code = response.status().as_u16();
-                let content_type = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                if response.status().is_success() {
-                    UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry_str, "2xx"])
-                        .observe(elapsed);
-                    match response.bytes().await {
-                        Ok(b) => {
-                            cb.record_success(registry_str, probe);
-                            return Ok((code, b.to_vec(), content_type));
+        loop {
+            let mut request = if send_body {
+                client
+                    .post(current_url.clone())
+                    .timeout(timeout)
+                    .body(body.to_vec())
+            } else {
+                client.get(current_url.clone()).timeout(timeout)
+            };
+            if let Some(credentials) = auth {
+                request = request.header(header::AUTHORIZATION, basic_auth_header(credentials));
+            }
+            for (name, value) in fwd_headers {
+                if send_body || name.eq_ignore_ascii_case("accept") {
+                    request = request.header(*name, *value);
+                }
+            }
+
+            let upstream_start = Instant::now();
+            match request.send().await {
+                Ok(response) => {
+                    let elapsed = upstream_start.elapsed().as_secs_f64();
+                    let status = response.status();
+                    let code = status.as_u16();
+                    if is_followable_redirect(status) {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "3xx"])
+                            .observe(elapsed);
+                        let next_url = match validated_redirect_target(
+                            &current_url,
+                            &response,
+                            followed,
+                            max_redirects,
+                            &redirect_allowed,
+                        ) {
+                            Ok(target) => target,
+                            Err(error) => {
+                                cb.record_alive(registry_str, probe);
+                                tracing::warn!(
+                                    registry = registry_str,
+                                    status = code,
+                                    reason = error.reason(),
+                                    "upstream POST redirect rejected"
+                                );
+                                return Err(ProxyError::Upstream(code));
+                            }
+                        };
+                        if send_body
+                            && matches!(
+                                status,
+                                reqwest::StatusCode::MOVED_PERMANENTLY
+                                    | reqwest::StatusCode::FOUND
+                                    | reqwest::StatusCode::SEE_OTHER
+                            )
+                        {
+                            send_body = false;
                         }
-                        Err(e) => {
-                            cb.record_failure(registry_str, probe);
-                            return Err(ProxyError::Network(e.to_string()));
+                        followed += 1;
+                        current_url = next_url;
+                        continue;
+                    }
+                    if status.is_redirection() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "3xx"])
+                            .observe(elapsed);
+                        cb.record_alive(registry_str, probe);
+                        tracing::warn!(
+                            registry = registry_str,
+                            status = code,
+                            "unsupported upstream POST redirect status"
+                        );
+                        return Err(ProxyError::Upstream(code));
+                    }
+
+                    let content_type = response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    if status.is_success() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "2xx"])
+                            .observe(elapsed);
+                        match read_npm_audit_response_body(response).await {
+                            Ok(response_body) => {
+                                cb.record_success(registry_str, probe);
+                                return Ok((code, response_body, content_type));
+                            }
+                            Err(error) => {
+                                cb.record_failure(registry_str, probe);
+                                return Err(error);
+                            }
                         }
                     }
-                }
-                if (400..500).contains(&code) {
+                    if status.is_client_error() {
+                        UPSTREAM_REQUEST_DURATION
+                            .with_label_values(&[registry_str, "4xx"])
+                            .observe(elapsed);
+                        // A fully read 4xx audit response is a real answer and
+                        // proves that the upstream is alive. A truncated or
+                        // oversized body is instead an availability failure.
+                        return match read_npm_audit_response_body(response).await {
+                            Ok(response_body) => {
+                                cb.record_alive(registry_str, probe);
+                                Ok((code, response_body, content_type))
+                            }
+                            Err(error) => {
+                                cb.record_failure(registry_str, probe);
+                                Err(error)
+                            }
+                        };
+                    }
                     UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry_str, "4xx"])
+                        .with_label_values(&[registry_str, "5xx"])
                         .observe(elapsed);
-                    // Upstream is alive and answered — a 4xx audit response is a real
-                    // answer, forward it verbatim (not an availability failure). #606.
-                    cb.record_alive(registry_str, probe);
-                    let b = response
-                        .bytes()
-                        .await
-                        .map(|b| b.to_vec())
-                        .unwrap_or_default();
-                    return Ok((code, b, content_type));
+                    if attempt == 0 {
+                        tracing::debug!(
+                            url = %current_url,
+                            status = code,
+                            "upstream 5xx on POST, retrying in 1s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                    cb.record_failure(registry_str, probe);
+                    return Err(ProxyError::Upstream(code));
                 }
-                UPSTREAM_REQUEST_DURATION
-                    .with_label_values(&[registry_str, "5xx"])
-                    .observe(elapsed);
-                if attempt == 0 {
-                    tracing::debug!(url, status = code, "upstream 5xx on POST, retrying in 1s");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                Err(error) => {
+                    let elapsed = upstream_start.elapsed().as_secs_f64();
+                    let status_label = if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, status_label])
+                        .observe(elapsed);
+                    if attempt == 0 {
+                        tracing::debug!(
+                            url = %current_url,
+                            error = %error,
+                            "upstream error on POST, retrying in 1s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                    cb.record_failure(registry_str, probe);
+                    return Err(ProxyError::Network(error.to_string()));
                 }
-                cb.record_failure(registry_str, probe);
-                return Err(ProxyError::Upstream(code));
-            }
-            Err(e) => {
-                let elapsed = upstream_start.elapsed().as_secs_f64();
-                let status_label = if e.is_timeout() { "timeout" } else { "error" };
-                UPSTREAM_REQUEST_DURATION
-                    .with_label_values(&[registry_str, status_label])
-                    .observe(elapsed);
-                if attempt == 0 {
-                    tracing::debug!(url, error = %e, "upstream error on POST, retrying in 1s");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                cb.record_failure(registry_str, probe);
-                return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
@@ -807,7 +1261,14 @@ pub(crate) async fn proxy_fetch_conditional(
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
                 cb.record_alive(registry_str, probe);
-                return Err(ProxyError::NotFound);
+                // Only an actual 404 is safe to feed a negative cache. Auth,
+                // throttling and policy failures must remain distinguishable
+                // from package absence.
+                return if status == reqwest::StatusCode::NOT_FOUND {
+                    Err(ProxyError::NotFound)
+                } else {
+                    Err(ProxyError::Upstream(code))
+                };
             }
             cb.record_failure(registry_str, probe);
             Err(ProxyError::Upstream(code))
@@ -815,6 +1276,138 @@ pub(crate) async fn proxy_fetch_conditional(
         Err(e) => {
             cb.record_failure(registry_str, probe);
             Err(ProxyError::Network(e.to_string()))
+        }
+    }
+}
+
+/// Conditional upstream fetch with explicit validation of the initial URL and
+/// every redirect target.
+///
+/// The client must have automatic redirects disabled. Conditional validators
+/// are retained on every GET hop; the final response alone determines whether
+/// the result is `NotModified` or captures a new body and validators. Like
+/// [`proxy_fetch_conditional`], this helper never retries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_conditional_with_validated_redirects<F>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<&str>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    registry: RegistryType,
+    max_redirects: usize,
+    redirect_allowed: F,
+) -> Result<Revalidation, ProxyError>
+where
+    F: Fn(&reqwest::Url) -> bool,
+{
+    let initial_url = validate_initial_url(url, &redirect_allowed)?;
+    let registry_str = registry.as_str();
+    let probe = cb.check(registry_str)?;
+    let mut current_url = initial_url;
+    let mut followed = 0;
+
+    loop {
+        let mut request = client.get(current_url.clone()).timeout(timeout);
+        if let Some(credentials) = auth {
+            request = request.header(header::AUTHORIZATION, basic_auth_header(credentials));
+        }
+        if let Some(ref etag) = validators.etag {
+            request = request.header(header::IF_NONE_MATCH, etag);
+        }
+        if let Some(ref last_modified) = validators.last_modified {
+            request = request.header(header::IF_MODIFIED_SINCE, last_modified);
+        }
+
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status == reqwest::StatusCode::NOT_MODIFIED {
+                    cb.record_success(registry_str, probe);
+                    return Ok(Revalidation::NotModified);
+                }
+                if status.is_success() {
+                    let new_validators = Validators {
+                        etag: header_string(&response, header::ETAG),
+                        last_modified: header_string(&response, header::LAST_MODIFIED),
+                    };
+                    let body = match response.bytes().await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            cb.record_failure(registry_str, probe);
+                            return Err(ProxyError::Network(error.to_string()));
+                        }
+                    };
+                    cb.record_success(registry_str, probe);
+                    return Ok(Revalidation::Modified {
+                        body: body.to_vec(),
+                        validators: new_validators,
+                    });
+                }
+                if is_followable_redirect(status) {
+                    let next_url = match validated_redirect_target(
+                        &current_url,
+                        &response,
+                        followed,
+                        max_redirects,
+                        &redirect_allowed,
+                    ) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            cb.record_alive(registry_str, probe);
+                            tracing::warn!(
+                                registry = registry_str,
+                                status = status.as_u16(),
+                                reason = error.reason(),
+                                "conditional upstream redirect rejected"
+                            );
+                            return Err(ProxyError::Upstream(status.as_u16()));
+                        }
+                    };
+                    followed += 1;
+                    current_url = next_url;
+                    continue;
+                }
+
+                let code = status.as_u16();
+                if status.is_redirection() {
+                    cb.record_alive(registry_str, probe);
+                    tracing::warn!(
+                        registry = registry_str,
+                        status = code,
+                        "unsupported conditional upstream redirect status"
+                    );
+                    return Err(ProxyError::Upstream(code));
+                }
+                if status.is_client_error() {
+                    let policy_block = policy_block_reason(response.headers());
+                    if let Some(reason) = policy_block {
+                        UPSTREAM_POLICY_BLOCKED_TOTAL
+                            .with_label_values(&[registry_str, reason])
+                            .inc();
+                        tracing::warn!(
+                            registry = registry_str,
+                            url = %current_url,
+                            status = code,
+                            reason,
+                            "conditional upstream returned a policy/geo block (not a genuine not-found) — check egress/region"
+                        );
+                    }
+                    cb.record_alive(registry_str, probe);
+                    return if status == reqwest::StatusCode::NOT_FOUND && policy_block.is_none() {
+                        Err(ProxyError::NotFound)
+                    } else {
+                        Err(ProxyError::Upstream(code))
+                    };
+                }
+                cb.record_failure(registry_str, probe);
+                return Err(ProxyError::Upstream(code));
+            }
+            Err(error) => {
+                cb.record_failure(registry_str, probe);
+                return Err(ProxyError::Network(error.to_string()));
+            }
         }
     }
 }
@@ -841,6 +1434,51 @@ mod tests {
         assert!(matches!(result, Err(ProxyError::Network(_))));
     }
 
+    #[tokio::test]
+    async fn proxy_fetch_only_classifies_exact_404_as_not_found() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for status in [401_u16, 403, 429, 451] {
+            upstream.reset().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&upstream)
+                .await;
+
+            let result = proxy_fetch(
+                &reqwest::Client::new(),
+                &upstream.uri(),
+                Duration::from_secs(5),
+                None,
+                &noop_cb(),
+                RegistryType::Maven,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ProxyError::Upstream(actual)) if actual == status),
+                "HTTP {status} must remain distinguishable from a missing artifact"
+            );
+        }
+
+        upstream.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let result = proxy_fetch(
+            &reqwest::Client::new(),
+            &upstream.uri(),
+            Duration::from_secs(5),
+            None,
+            &noop_cb(),
+            RegistryType::Maven,
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyError::NotFound)));
+    }
+
     // --- Policy/geo upstream block observability (#881) ---
 
     #[test]
@@ -859,7 +1497,7 @@ mod tests {
     }
 
     /// A geo-blocked upstream 4xx (WAF `x-amzn-waf-reason: geo`) bumps the policy-block
-    /// metric and is still relayed as `NotFound`; a plain 4xx does neither (#881).
+    /// metric and remains distinguishable from `NotFound`; a plain 404 does neither (#881).
     #[tokio::test]
     async fn upstream_waf_geo_block_surfaced_but_plain_4xx_silent() {
         use wiremock::matchers::any;
@@ -885,7 +1523,7 @@ mod tests {
             reg,
         )
         .await;
-        assert!(matches!(r, Err(ProxyError::NotFound)));
+        assert!(matches!(r, Err(ProxyError::Upstream(404))));
         assert_eq!(
             UPSTREAM_POLICY_BLOCKED_TOTAL
                 .with_label_values(&[reg.as_str(), "geo"])
@@ -928,6 +1566,40 @@ mod tests {
 
     fn noop_cb() -> CircuitBreakerRegistry {
         CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig::default())
+    }
+
+    fn one_failure_cb() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 1,
+            reset_timeout: 30,
+            overrides: std::collections::HashMap::new(),
+        })
+    }
+
+    fn assert_npm_breaker_open(cb: &CircuitBreakerRegistry) {
+        let health = cb
+            .health_snapshot(RegistryType::Npm.as_str())
+            .expect("npm breaker must have recorded the response-body failure");
+        assert_eq!(health.status, "open");
+        assert_eq!(health.failure_count, 1);
+        assert!(matches!(
+            cb.check(RegistryType::Npm.as_str()),
+            Err(ProxyError::CircuitOpen(_))
+        ));
+    }
+
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    fn same_origin(expected: &reqwest::Url, candidate: &reqwest::Url) -> bool {
+        expected.scheme() == candidate.scheme()
+            && expected.host_str() == candidate.host_str()
+            && expected.port_or_known_default() == candidate.port_or_known_default()
     }
 
     /// With no stored validators, the conditional fetch sends no `If-None-Match`,
@@ -1003,6 +1675,772 @@ mod tests {
         .unwrap();
 
         assert!(matches!(out, Revalidation::NotModified));
+    }
+
+    #[tokio::test]
+    async fn conditional_non_404_client_error_is_not_negative_cacheable() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let result = proxy_fetch_conditional(
+            &reqwest::Client::new(),
+            &upstream.uri(),
+            Duration::from_secs(5),
+            None,
+            &Validators::default(),
+            &noop_cb(),
+            RegistryType::Npm,
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyError::Upstream(401))));
+    }
+
+    #[tokio::test]
+    async fn validated_fetch_rejects_initial_url_before_any_request() {
+        use wiremock::MockServer;
+
+        let upstream = MockServer::start().await;
+        let result = proxy_fetch_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/artifact", upstream.uri()),
+            Duration::from_secs(5),
+            Some("user:password"),
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |_| false,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Network(_))));
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a rejected initial URL must not receive a request or credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_fetch_resolves_relative_location_and_rejects_invalid_location() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repo/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "artifact"))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repo/artifact"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("artifact-body"))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/invalid"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "http://["))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(302))
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let fetched = proxy_fetch_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/repo/start", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched, b"artifact-body");
+
+        let invalid = proxy_fetch_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/invalid", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+        assert!(matches!(invalid, Err(ProxyError::Upstream(302))));
+
+        let missing = proxy_fetch_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/missing", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+        assert!(matches!(missing, Err(ProxyError::Upstream(302))));
+    }
+
+    #[tokio::test]
+    async fn validated_fetch_only_classifies_plain_404_as_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for (request_path, status) in [("/unauthorized", 401), ("/throttled", 429)] {
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/blocked"))
+            .respond_with(
+                ResponseTemplate::new(404).insert_header("x-amzn-waf-reason", "rate-based"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        for (request_path, expected) in [
+            ("/unauthorized", ProxyError::Upstream(401)),
+            ("/throttled", ProxyError::Upstream(429)),
+            ("/blocked", ProxyError::Upstream(404)),
+            ("/missing", ProxyError::NotFound),
+        ] {
+            let result = proxy_fetch_with_validated_redirects(
+                &no_redirect_client(),
+                &format!("{}{request_path}", upstream.uri()),
+                Duration::from_secs(5),
+                None,
+                &noop_cb(),
+                RegistryType::Npm,
+                3,
+                |candidate| same_origin(&origin, candidate),
+            )
+            .await;
+            assert!(
+                matches!(
+                    (&result, &expected),
+                    (Err(ProxyError::Upstream(actual)), ProxyError::Upstream(wanted))
+                        if actual == wanted
+                ) || matches!(
+                    (&result, &expected),
+                    (Err(ProxyError::NotFound), ProxyError::NotFound)
+                ),
+                "unexpected classification for {request_path}"
+            );
+        }
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn validated_bounded_fetch_rejects_oversized_response_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"oversized"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_fetch_with_validated_redirects_bounded(
+            &no_redirect_client(),
+            &format!("{}/search", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            4,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyError::Network(_))));
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn conditional_redirect_preserves_validators_and_final_304() {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for request_path in ["/metadata", "/revalidated"] {
+            let response = if request_path == "/metadata" {
+                ResponseTemplate::new(302).insert_header("location", "revalidated")
+            } else {
+                ResponseTemplate::new(304)
+            };
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .and(header("if-none-match", "\"v1\""))
+                .and(header_exists("if-modified-since"))
+                .and(header("authorization", basic_auth_header("user:password")))
+                .respond_with(response)
+                .mount(&upstream)
+                .await;
+        }
+
+        let validators = Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".to_string()),
+        };
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_fetch_conditional_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/metadata", upstream.uri()),
+            Duration::from_secs(5),
+            Some("user:password"),
+            &validators,
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Revalidation::NotModified));
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            requests.len(),
+            2,
+            "conditional redirects must not trigger a retry"
+        );
+        assert!(requests.iter().all(|request| {
+            request
+                .headers
+                .get("if-modified-since")
+                .and_then(|value| value.to_str().ok())
+                == Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        }));
+    }
+
+    #[tokio::test]
+    async fn conditional_validated_fetch_only_classifies_plain_404_as_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for (request_path, status) in [("/unauthorized", 401), ("/throttled", 429)] {
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/blocked"))
+            .respond_with(
+                ResponseTemplate::new(404).insert_header("x-amzn-waf-reason", "rate-based"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        for (request_path, expected) in [
+            ("/unauthorized", ProxyError::Upstream(401)),
+            ("/throttled", ProxyError::Upstream(429)),
+            ("/blocked", ProxyError::Upstream(404)),
+            ("/missing", ProxyError::NotFound),
+        ] {
+            let result = proxy_fetch_conditional_with_validated_redirects(
+                &no_redirect_client(),
+                &format!("{}{request_path}", upstream.uri()),
+                Duration::from_secs(5),
+                None,
+                &Validators::default(),
+                &noop_cb(),
+                RegistryType::Npm,
+                3,
+                |candidate| same_origin(&origin, candidate),
+            )
+            .await;
+            assert!(
+                matches!(
+                    (&result, &expected),
+                    (Err(ProxyError::Upstream(actual)), ProxyError::Upstream(wanted))
+                        if actual == wanted
+                ) || matches!(
+                    (&result, &expected),
+                    (Err(ProxyError::NotFound), ProxyError::NotFound)
+                ),
+                "unexpected classification for {request_path}"
+            );
+        }
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn conditional_validated_fetch_does_not_retry_5xx() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_fetch_conditional_with_validated_redirects(
+            &no_redirect_client(),
+            &format!("{}/metadata", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &Validators::default(),
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream(503))));
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            1,
+            "conditional fetches must not retry upstream failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_forwards_fully_read_4xx_body_and_content_type_exactly() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let expected = vec![0, 1, 2, b'{', b'}', 0xff];
+        Mock::given(method("POST"))
+            .and(path("/audit"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .insert_header("content-type", "application/problem+json")
+                    .set_body_bytes(expected.clone()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &format!("{}/audit", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &[("content-type", "application/json")],
+            b"{}",
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            (422, expected, Some("application/problem+json".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn post_rejects_oversized_2xx_body_and_opens_breaker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audit"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(vec![b'x'; NPM_AUDIT_RESPONSE_BODY_CAP + 1]),
+            )
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let cb = one_failure_cb();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &format!("{}/audit", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &[("content-type", "application/json")],
+            b"{}",
+            &cb,
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ProxyError::Network(message)) if message.contains("exceeds")),
+            "an oversized 2xx must fail specifically at the response-body cap"
+        );
+        assert_npm_breaker_open(&cb);
+    }
+
+    #[tokio::test]
+    async fn post_rejects_oversized_4xx_body_and_opens_breaker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audit"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(vec![b'x'; NPM_AUDIT_RESPONSE_BODY_CAP + 1]),
+            )
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let cb = one_failure_cb();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &format!("{}/audit", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &[("content-type", "application/json")],
+            b"{}",
+            &cb,
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ProxyError::Network(message)) if message.contains("exceeds")),
+            "an oversized 4xx must fail specifically at the response-body cap"
+        );
+        assert_npm_breaker_open(&cb);
+    }
+
+    #[tokio::test]
+    async fn post_rejects_truncated_4xx_body_and_opens_breaker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\n\
+                      Content-Type: application/json\r\n\
+                      Content-Length: 64\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      {\"partial\":true}",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let url = format!("http://{address}/audit");
+        let origin = reqwest::Url::parse(&url).unwrap();
+        let cb = one_failure_cb();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &url,
+            Duration::from_secs(5),
+            None,
+            &[("content-type", "application/json")],
+            b"{}",
+            &cb,
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+        server.await.unwrap();
+
+        assert!(matches!(result, Err(ProxyError::Network(_))));
+        assert_npm_breaker_open(&cb);
+    }
+
+    #[tokio::test]
+    async fn post_307_and_308_preserve_body_and_payload_headers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [307, 308] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/audit"))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("location", "/audit/final"),
+                )
+                .mount(&upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/audit/final"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("audit-result"))
+                .mount(&upstream)
+                .await;
+
+            let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+            let result = proxy_forward_post(
+                &no_redirect_client(),
+                &format!("{}/audit", upstream.uri()),
+                Duration::from_secs(5),
+                Some("user:password"),
+                &[
+                    ("content-type", "application/json"),
+                    ("content-encoding", "gzip"),
+                    ("accept", "application/json"),
+                ],
+                b"audit-body",
+                &noop_cb(),
+                RegistryType::Npm,
+                3,
+                |candidate| same_origin(&origin, candidate),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.0, 200);
+            assert_eq!(result.1, b"audit-result");
+
+            let requests = upstream.received_requests().await.unwrap_or_default();
+            let final_request = requests
+                .iter()
+                .find(|request| request.url.path() == "/audit/final")
+                .expect("redirect target received request");
+            assert_eq!(final_request.method.as_str(), "POST");
+            assert_eq!(final_request.body, b"audit-body");
+            assert_eq!(
+                final_request.headers["content-type"], "application/json",
+                "{status} must preserve Content-Type"
+            );
+            assert_eq!(
+                final_request.headers["content-encoding"], "gzip",
+                "{status} must preserve Content-Encoding"
+            );
+            assert_eq!(final_request.headers["accept"], "application/json");
+            assert_eq!(
+                final_request.headers["authorization"],
+                basic_auth_header("user:password")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_301_302_303_switch_permanently_to_bodyless_get() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [301, 302, 303] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/audit"))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("location", "/audit/get-hop"),
+                )
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/audit/get-hop"))
+                .respond_with(ResponseTemplate::new(307).insert_header("location", "/audit/final"))
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/audit/final"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("audit-result"))
+                .mount(&upstream)
+                .await;
+
+            let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+            let result = proxy_forward_post(
+                &no_redirect_client(),
+                &format!("{}/audit", upstream.uri()),
+                Duration::from_secs(5),
+                Some("user:password"),
+                &[
+                    ("content-type", "application/json"),
+                    ("content-encoding", "gzip"),
+                    ("accept", "application/json"),
+                ],
+                b"audit-body",
+                &noop_cb(),
+                RegistryType::Npm,
+                3,
+                |candidate| same_origin(&origin, candidate),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.1, b"audit-result");
+
+            let requests = upstream.received_requests().await.unwrap_or_default();
+            for request_path in ["/audit/get-hop", "/audit/final"] {
+                let request = requests
+                    .iter()
+                    .find(|request| request.url.path() == request_path)
+                    .expect("redirect target received request");
+                assert_eq!(
+                    request.method.as_str(),
+                    "GET",
+                    "{status} must switch POST to GET permanently"
+                );
+                assert!(
+                    request.body.is_empty(),
+                    "{status} redirected GET must have no body"
+                );
+                assert!(
+                    !request.headers.contains_key("content-type"),
+                    "{status} redirected GET must drop Content-Type"
+                );
+                assert!(
+                    !request.headers.contains_key("content-encoding"),
+                    "{status} redirected GET must drop Content-Encoding"
+                );
+                assert_eq!(request.headers["accept"], "application/json");
+                assert_eq!(
+                    request.headers["authorization"],
+                    basic_auth_header("user:password")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_redirect_rejects_disallowed_target_before_sending_auth_or_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let disallowed = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audit"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/capture", disallowed.uri())),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/capture"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&disallowed)
+            .await;
+
+        let allowed_origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &format!("{}/audit", upstream.uri()),
+            Duration::from_secs(5),
+            Some("user:password"),
+            &[("content-type", "application/json")],
+            b"sensitive-audit-body",
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&allowed_origin, candidate),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream(307))));
+        assert!(
+            disallowed
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a disallowed target must receive neither configured auth nor the POST body"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_redirect_rejects_fourth_hop_without_sending_fifth_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for hop in 0..=3 {
+            Mock::given(method("POST"))
+                .and(path(format!("/hop/{hop}")))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", format!("/hop/{}", hop + 1)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/hop/4"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+
+        let origin = reqwest::Url::parse(&upstream.uri()).unwrap();
+        let result = proxy_forward_post(
+            &no_redirect_client(),
+            &format!("{}/hop/0", upstream.uri()),
+            Duration::from_secs(5),
+            None,
+            &[],
+            b"audit-body",
+            &noop_cb(),
+            RegistryType::Npm,
+            3,
+            |candidate| same_origin(&origin, candidate),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::Upstream(307))));
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 4, "only the initial request plus 3 hops");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/hop/4"),
+            "the fourth redirect target must be rejected before request construction"
+        );
     }
 
     /// Validators round-trip through storage (the sidecar lives on disk, so they

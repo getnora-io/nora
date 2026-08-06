@@ -114,8 +114,10 @@ pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, Do
 pub use self::gems::GemsConfig;
 pub use self::go::GoConfig;
 #[allow(unused_imports)]
-pub use self::maven::{MavenConfig, MavenProxy, MavenProxyEntry};
-pub use self::npm::NpmConfig;
+pub use self::maven::{
+    MavenConfig, MavenProxy, MavenProxyEntry, MavenRepository, MavenVersionPolicy, MavenWritePolicy,
+};
+pub use self::npm::{NpmConfig, NpmRepository, NpmWritePolicy};
 pub use self::nuget::NugetConfig;
 pub use self::pub_dart::PubDartConfig;
 pub use self::pypi::PypiConfig;

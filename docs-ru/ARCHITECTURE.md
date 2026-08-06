@@ -73,8 +73,11 @@ pip и т.д.), а не хранилище данных. Нет базы дан�
                            └─────────────────────┘
 ```
 
-Каждый HTTP-запрос проходит этот путь сверху вниз. Обработчик реестра
-выбирается по URL-префиксу (`/v2/` = Docker, `/maven/` = Maven и т.д.).
+Каждый HTTP-запрос проходит этот путь сверху вниз. Большинство обработчиков
+выбирается по URL-префиксу. Maven и npm используют общий
+`/repository/{repository}/...`: единый dispatcher определяет формат только по
+проверенной конфигурации. Поэтому имена Maven/npm глобально уникальны и
+никаких эвристик по имени репозитория нет.
 Курация выполняется только при проксировании скачиваний — локально
 размещённые артефакты проверяются при публикации.
 
@@ -207,6 +210,47 @@ Docker-образ — ~31 МБ. Компромисс в том, что неис�
 - Токены хранятся в `tokens.json` — тот же подход, что htpasswd
 - Docker Distribution обслуживает Docker Hub в масштабе на чистой файловой системе
 
+Named Maven/npm layout:
+
+```text
+maven/repositories/{hosted-or-proxy}/...
+npm/repositories/{hosted}/{package}/pkg.json
+npm/repositories/{hosted}/{package}/versions/{version}.json
+npm/repositories/{hosted}/{package}/publish-complete/{version}
+npm/repositories/{hosted}/{package}/blobs/sha512/{digest}.tgz
+npm/repositories/{hosted}/{package}/dist-tags/{tag}
+npm/repositories/{proxy}/proxy/packuments/{package}.json
+npm/repositories/{proxy}/proxy/tarballs/{package}/{file}.tgz
+```
+
+`versions/{version}.json` — точка фиксации опубликованной версии.
+`publish-complete/{version}` — служебный durable-маркер завершения изменяемой
+post-commit части (`pkg.json`, dist-tags и deprecation overlay). При
+`allow_once` точный retry с теми же байтами без маркера может заполнить только
+отсутствующие значения; до успешного retry последующие publish другой версии,
+изменения dist-tags и deprecation этого пакета отклоняются с `409`, чтобы
+запаздывающий retry не мог перемотать новый изменяемый state. Retry с корректным
+маркером state уже не меняет, а несовпадающий с manifest маркер считается
+повреждением (`500`). При `allow` каждый publish намеренно работает как
+last-writer-wins даже при byte-identical version manifest: переданные package
+fields, tags и deprecation применяются повторно. Поэтому completion marker —
+средство восстановления, а не reader visibility gate.
+
+Hosted npm version manifest — точка видимости/commit; content-addressed blob
+пишется раньше и удаляется GC, если commit не появился после grace period.
+Замена manifest и изменяемого state не является одной multi-object
+транзакцией: ошибка storage после видимого manifest может вернуть HTTP 500, а
+следующий идентичный retry должен завершить восстановление до других mutable
+операций. `allow` повторно применяет state при отсутствующем или несовпадающем
+completion marker; `allow_once` восстанавливается только при отсутствующем
+маркере.
+Proxy cache физически отделён от hosted provenance. `deprecated` не хранится
+в version manifest, а читается из изменяемого overlay. Maven/npm group не имеет
+storage prefix и материализует ответ из ordered members. Поддерживается ровно
+один NORA writer даже на S3/Ceph; atomic create-if-absent защищает одну
+`allow_once`-координату, но не является multi-writer транзакцией для
+изменяемых metadata.
+
 ### ADR-3: Два хранилища (локальная ФС + S3)
 
 **Решение:** NORA поддерживает ровно два хранилища: локальную файловую систему
@@ -220,8 +264,10 @@ Docker-образ — ~31 МБ. Компромисс в том, что неис�
 всех облачных провайдеров и локальные S3-совместимые хранилища. Локальная ФС покрывает
 однонодовые установки и разработку. Третье хранилище (GCS-native, Azure Blob)
 добавляет нагрузку на тестирование без существенного выигрыша — оба
-S3-совместимы. Для миграции с других реестров утилита `nora migrate` копирует
-артефакты напрямую, а не проксирует через старую систему.
+S3-совместимы. `nora migrate` переносит storage между local и S3. Миграция
+hosted Maven/npm из Nexus выполняется через protocol-aware named endpoints:
+source остаётся read-only, group/proxy state не копируется. Старые layout NORA
+в named layout in-place не преобразуются.
 
 ### ADR-4: Явные обработчики вместо типажей-расширений
 
@@ -381,12 +427,13 @@ Firewall/Lifecycle для фильтрации пакетов. В итоге
 постоянную простоту, проверку полноты на этапе компиляции и полное покрытие
 тестами каждого формата изолированно.
 
-**Нет высокой доступности.** NORA работает как единственный экземпляр
-с одним томом (RWO). Это проектное решение, а не упущенная возможность.
+**Нет высокой доступности.** NORA работает с единственным writer даже при
+S3/Ceph: exact-key conditional create не сериализует изменяемые multi-key
+metadata named Maven/npm. Это проектное решение, а не упущенная возможность.
 Реестры артефактов имеют нагрузку с преобладанием чтений — один экземпляр
-с S3-хранилищем обрабатывает тысячи скачиваний в минуту. Стратегия
-Kubernetes `Recreate` обеспечивает обновления без простоя для чтений,
-обслуживаемых из клиентского кэша.
+с S3-хранилищем обрабатывает тысячи скачиваний в минуту. Kubernetes
+`Recreate` или явный scale-to-zero исключает overlap writers ценой короткого
+перерыва в обслуживании. Высокая доступность требует отдельного дизайна.
 
 **Повторения между обработчиками.** Обработчики реестров разделяют
 структурные шаблоны (логика проксирования, вызовы курации, загрузка
@@ -414,5 +461,6 @@ Kubernetes `Recreate` обеспечивает обновления без пр�
 - **Не CDN.** Для географически распределённой доставки артефактов
   поставьте CDN (CloudFront, Cloudflare) перед NORA.
 - **Не промежуточный слой.** NORA — самостоятельный реестр, а не
-  кэширующая прослойка перед Nexus или Artifactory. Для миграции
-  используйте `nora migrate`.
+  кэширующая прослойка перед Nexus или Artifactory. При миграции из Nexus
+  hosted content копируется протокольным migrator в named hosted repositories;
+  `nora migrate` относится только к переносу собственного storage local ↔ S3.

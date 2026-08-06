@@ -37,33 +37,76 @@ This document describes which parts of each registry protocol are implemented in
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Package metadata (GET) | Full | JSON with all versions |
+| Named hosted/proxy/group | Full | `/repository/{name}/`; ordered group members, optional hosted `writable_member` |
+| Package metadata (GET) | Full | Synthesized from authoritative hosted version manifests or isolated proxy packuments |
 | Scoped packages `@scope/name` | Full | URL-encoded path |
-| Tarball download | Full | SHA256 verified |
+| Tarball download | Full | `dist.integrity`/`shasum` verified |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
-| Publish (`npm publish`) | Full | Immutable versions |
+| Publish (`npm publish`) | Full | Hosted only; `write_policy=allow` replaces a coordinate, `allow_once` (default) makes exact retries idempotent and rejects different bytes |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
-| Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
-| Search (`/-/v1/search`) | — | Not implemented |
-| Audit (`bulk` npm7 / `audits/quick` npm6) | Full | Proxy repos: forwarded to upstream verbatim; internal-namespace names stripped/refused; anonymous-read eligible. Proxied packages only (no local advisory DB). (#597) |
-| Upstream proxy | Full | Configurable TTL |
+| Dist-tags (`latest`, `next`) | Full | Mutate hosted only; group mutations fail closed; `latest` cannot be deleted |
+| Search (`/-/v1/search`) | Partial | Plain-text hosted search plus proxy results; each upstream response body is capped at 8 MiB. A direct proxy preserves exact `from`/`size`/`total` when namespace filtering is inactive. Hosted scans are limited to 10,000 packages and 10,000 versions per package; filtered direct/group proxy scans are limited to 10,000 results and 40 pages; all multi-object scans share a 30-second request deadline. Such filtered/group responses report `totalIsApproximate: true`; `total` is the deduplicated/summed estimate from successful members, because exact filtering and cross-member deduplication would require draining every upstream result. Group search is deliberately fail-soft: an unavailable member is omitted, so this estimate may be below the true cross-member total while the response still contains results from healthy members. Requests whose filtered/group window itself exceeds the budget fail with `400`; exhausting a scan/body budget fails with `502`. Advanced hosted qualifiers are not interpreted |
+| Audit (`bulk`, `audits/quick`, `audits`) | Full | Forwarded through a proxy after bounded gzip/JSON decoding and internal-namespace pruning; request and upstream-response bodies are capped at 8 MiB, client auth is never forwarded, and truncated/invalid/unavailable exchanges fail explicitly |
+| Upstream proxy | Full | Per-repository URL, TTL, negative TTL and credentials; only a true upstream 404 is negatively cached |
+
+Hosted state lives under
+`npm/repositories/{hosted}/{package}/{pkg.json,versions/,publish-complete/,blobs/sha512/,dist-tags/,deprecations/}`.
+The authoritative version manifest is the visibility commit point;
+its `dist.integrity` selects the content-addressed hosted blob.
+`publish-complete/{version}` records that mutable post-commit state finished.
+With `allow_once`, a missing marker makes the same coordinate repairable.
+Until that exact publish succeeds, later versions, dist-tag changes and
+deprecation changes for the package fail with `409`; this prevents a delayed
+repair from rewinding newer package fields, tags or deprecation state. After
+completion, exact retries are read-only. A present marker with the wrong
+manifest digest is treated as corrupt (`500`), not as repair permission. With
+`allow`, every publish is intentionally last-writer-wins even when the version
+manifest is byte-identical, so its supplied package fields, tags, and
+deprecation are applied again. Deprecation is a mutable overlay and is never
+embedded in the version manifest.
+
+The version manifest is the visibility commit, not a multi-object transaction
+barrier. A storage failure after a replacement manifest is visible can return
+HTTP 500 with mutable state still incomplete; an identical retry is required
+before later mutable operations are accepted. For `allow`, the retry reapplies
+state even if the completion marker is absent or mismatched; for `allow_once`,
+only an absent marker is repairable. Readers do not wait for that repair.
+Proxy state lives separately under
+`npm/repositories/{proxy}/proxy/{packuments/,tarballs/,negative/}`. A group
+materializes a response from its members and never owns metadata or tarballs.
 
 ## Maven
 
 | Feature | Status | Notes |
 |---------|--------|-------|
+| Named hosted/proxy/group | Full | `/repository/{name}/`; groups resolve members in declared order |
 | Artifact download (GET) | Full | JAR, POM, checksums |
-| Artifact upload (PUT) | Full | Any file type |
+| Artifact upload (PUT) | Full | Hosted repository only; per-repository version/write policy |
 | GroupId path layout | Full | Dots → slashes |
-| SHA1/MD5 checksums | Full | Stored alongside artifacts |
-| `maven-metadata.xml` | Partial | Stored as-is, no auto-generation |
-| SNAPSHOT versions | — | No SNAPSHOT resolution |
-| Multi-proxy fallback | Full | Tries proxies in order |
+| Checksums | Full | MD5, SHA-1, SHA-256 and SHA-512 stored alongside artifacts |
+| `maven-metadata.xml` | Full | Hosted artifact metadata is server-generated and merged with proxy metadata |
+| SNAPSHOT versions | Full | Repository version policy separates release/snapshot/mixed content |
+| Proxy/group fallback | Full | Ordered group members; proxy cache is repository-isolated |
 | Content-Type by extension | Full | .jar, .pom, .xml, .sha1, .md5 |
 
 ### Known Limitations
-- `maven-metadata.xml` not auto-generated on publish (must be uploaded explicitly)
-- No SNAPSHOT version management (`-SNAPSHOT` → latest timestamp)
+- Named Maven and npm repository names share one public namespace and therefore
+  must be globally unique.
+- The supported deployment has exactly one NORA writer. Atomic create protects
+  one immutable object/coordinate; it is not a multi-writer transaction model.
+- Named groups own no storage. Browse/GC/retention operate on concrete hosted
+  and proxy repositories.
+
+### Installation and Nexus migration boundary
+
+The named layout is a fresh-install contract. NORA does not provide an
+in-place migration from older NORA Maven/npm storage layouts. To move from
+Nexus, derive a final desired state from a bound baseline plus a complete
+request-audit window, freeze writes at the declared high-water mark, and copy
+hosted Maven/npm content through the protocol-aware hosted endpoints. Verify
+reads through the groups. Do not copy group state or proxy caches; warm proxy
+repositories through normal client reads. Built-in direct-storage import is
+not a substitute for this flow.
 
 ## Cargo (Sparse Index, RFC 2789)
 
@@ -372,8 +415,8 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
 | Swagger/OpenAPI | Full | `/api-docs` |
-| S3 backend | Full | AWS S3, Ceph RGW. Basic storage works on any S3-compatible; multi-replica write-serialization has a caveat — see note below. |
-| GCS backend | Full | Native Google Cloud Storage (`storage.mode = "gcs"`): Workload Identity / service-account JSON / ambient credentials; endpoint override for emulators and Private Google Access. Same single-writer caveat as S3 for rpm/deb publishing (in-process publish lock). Hash-pinning (at-rest integrity verification) is unavailable on ALL object-store backends, not only S3. |
+| S3 backend | Full | AWS S3, Ceph RGW and compatible object stores. Named Maven/npm still require one NORA writer; see note below. |
+| GCS backend | Full | Native Google Cloud Storage (`storage.mode = "gcs"`): Workload Identity / service-account JSON / ambient credentials; endpoint override for emulators and Private Google Access. The same single-writer requirement applies. Hash-pinning (at-rest integrity verification) is unavailable on ALL object-store backends, not only S3. |
 | Local filesystem backend | Full | Default, content-addressable |
 | Activity log | Full | Recent push/pull in dashboard |
 | Backup/restore | Full | CLI commands |
@@ -381,10 +424,8 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 
 ### Storage backend notes
 
-- **Multi-replica write-serialization needs conditional-write/CAS.** NORA's write lock
-  (`publish_lock`) is safe under a **single writer** — one replica, or an RWO volume
-  single-mounted so only one pod writes. Serializing concurrent writes across multiple
-  replicas requires an object store with atomic conditional-write / compare-and-swap:
-  AWS S3 and Ceph RGW provide it; **Garage** (no consensus layer) and **SeaweedFS**
-  (immature) do not — on those, run single-writer. Not every "S3-compatible" backend is
-  equivalent here.
+- **Named Maven/npm are single-writer on every backend.** Run exactly one NORA
+  writer, including with AWS S3 or Ceph RGW. Backend conditional create protects
+  one immutable key from replacement, but mutable Maven/npm metadata spans
+  multiple keys and is coordinated by an in-process lock. Exact-key CAS is not
+  a distributed transaction and does not make a multi-replica deployment safe.
