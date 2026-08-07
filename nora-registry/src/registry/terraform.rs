@@ -357,6 +357,7 @@ async fn provider_download_meta(
 
 async fn provider_download_binary(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
     if !is_safe_path(&path) {
@@ -424,6 +425,16 @@ async fn provider_download_binary(
             publish_date,
         ) {
             return resp;
+        }
+
+        // Resume support: 206 for a `Range` request, 416 when the client asks past the
+        // end — a provider zip is large and worth resuming. It sits after the gates
+        // above because the quarantine digest check needs the whole object. A partial
+        // body cannot be rehashed, so the serve relies on the SHA256SUMS terraform
+        // verifies itself (docker did the same in #657). An absent/malformed range
+        // falls through to the full 200.
+        if let Some(response) = range_binary(&state, &storage_key, &headers, data.len()).await {
+            return response;
         }
         return with_binary(data.to_vec());
     }
@@ -702,6 +713,7 @@ async fn module_download(
 
 async fn module_source_download(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -750,6 +762,12 @@ async fn module_source_download(
             "cache",
         ) {
             return resp;
+        }
+
+        // Resume support for the module archive — same rationale as the provider
+        // binary above.
+        if let Some(response) = range_binary(&state, &storage_key, &headers, data.len()).await {
+            return response;
         }
         return with_binary(data.to_vec());
     }
@@ -1418,10 +1436,32 @@ fn with_binary(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
         ],
         data,
     )
         .into_response()
+}
+
+/// 206/416 counterpart of [`with_binary`]; `None` when there is no usable `Range`.
+async fn range_binary(
+    state: &AppState,
+    storage_key: &str,
+    headers: &axum::http::HeaderMap,
+    size: usize,
+) -> Option<Response> {
+    crate::registry::range::range_response(
+        &state.storage,
+        &[storage_key],
+        headers,
+        size as u64,
+        "application/zip",
+        &[(
+            header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable".to_string(),
+        )],
+    )
+    .await
 }
 
 /// Rewrite download_url, shasums_url, and shasums_signature_url in provider
@@ -2452,5 +2492,115 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A cached provider zip resumes: 206 for a satisfiable range, 416 once the
+    /// client already holds the whole archive, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_terraform_provider_binary_range_request() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+        let zip = b"0123456789";
+        ctx.state
+            .storage
+            .put(
+                "terraform/download/hashicorp/null/3.2.1/terraform-provider-null_3.2.1_linux_amd64.zip",
+                zip,
+            )
+            .await
+            .unwrap();
+        let url =
+            "/terraform/v1/providers/download/hashicorp/null/3.2.1/terraform-provider-null_3.2.1_linux_amd64.zip";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], zip);
+    }
+
+    /// The module source archive shares the provider binary's ranged serve.
+    #[tokio::test]
+    async fn test_terraform_module_source_range_request() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/acme/vpc/aws/1.0.0/source.tar.gz",
+                b"0123456789",
+            )
+            .await
+            .unwrap();
+        let url = "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
     }
 }

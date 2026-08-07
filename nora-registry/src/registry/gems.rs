@@ -408,7 +408,8 @@ async fn download_gem(
     //
     // #754: only fetch on a cache MISS — on a cache hit the digest is already recorded
     // (quarantine `record` is idempotent), so a cheap local stat skips the round-trip.
-    let already_cached = state.storage.stat(&storage_key).await.is_some();
+    let cached_meta = state.storage.stat(&storage_key).await;
+    let already_cached = cached_meta.is_some();
     let publish_date = if state.config.gems.proxy.is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
     } else if !already_cached && state.config.server.trust_upstream_dates {
@@ -450,6 +451,51 @@ async fn download_gem(
         }
     }
 
+    // Resolved here, not at the serve site, so the range branch below can see it.
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.gems.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .gems
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    // Resumable download (#657): serve the requested bytes from the backend and skip
+    // the full read below. .gem files only — the specs/compact indexes are mutable. A
+    // partial read cannot be hashed, so neither the quarantine gate nor the curation
+    // integrity check can run on it: the range serve stands down while quarantine holds
+    // artifacts, and integrity is the client's own checksum, as docker does.
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        if let Some(meta) = cached_meta.as_ref() {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&storage_key],
+                &headers,
+                meta.size,
+                "application/octet-stream",
+                &[(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                )],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("gems");
+                    state.metrics.record_cache_hit("gems");
+                }
+                return response;
+            }
+        }
+    }
+
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at the serve site (compile-time guarantee — see crate::verified).
     if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
@@ -477,20 +523,6 @@ async fn download_gem(
             crate::registry_type::RegistryType::Gems,
             "CACHE",
         ));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.gems.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state
-                .config
-                .curation
-                .gems
-                .quarantine_ttl
-                .as_deref()
-                .or(state.config.curation.quarantine_ttl.as_deref()),
-        );
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "gems",
@@ -502,7 +534,11 @@ async fn download_gem(
         ) {
             return resp;
         }
-        return with_binary(data.to_vec(), "application/octet-stream");
+        let mut response = with_binary(data.to_vec(), "application/octet-stream");
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        return response;
     }
 
     // #733: an internal-namespace gem with no local copy is never proxied upstream.
@@ -544,20 +580,6 @@ async fn download_gem(
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
-            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                state.config.curation.gems.quarantine.as_ref().or(state
-                    .config
-                    .curation
-                    .quarantine
-                    .as_ref()),
-                state
-                    .config
-                    .curation
-                    .gems
-                    .quarantine_ttl
-                    .as_deref()
-                    .or(state.config.curation.quarantine_ttl.as_deref()),
-            );
             if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
                 "gems",
@@ -942,8 +964,10 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
-    use axum::http::{Method, StatusCode};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers,
+    };
+    use axum::http::{header, Method, StatusCode};
 
     #[tokio::test]
     async fn test_gems_disabled_returns_404() {
@@ -995,6 +1019,72 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"gem-binary-data");
+    }
+
+    #[tokio::test]
+    async fn test_gems_range_request() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+        });
+        let gem = b"0123456789abcdef";
+        ctx.state
+            .storage
+            .put("gems/gems/test-gem-1.0.0.gem", gem)
+            .await
+            .unwrap();
+        let url = "/gems/gems/test-gem-1.0.0.gem";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 2-5/{}", gem.len())
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &gem[2..=5]);
+
+        // A client that already holds the whole gem resumes with `bytes=<size>-`.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            url,
+            vec![("range", &format!("bytes={}-", gem.len())[..])],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", gem.len())
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &gem[..]);
     }
 
     #[tokio::test]

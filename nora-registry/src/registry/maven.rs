@@ -19,7 +19,7 @@ use crate::AppState;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Router,
@@ -328,7 +328,8 @@ async fn download(
     // #754: the Central query only happens on a cache MISS. On a cache hit the digest
     // is already recorded (quarantine `record` is idempotent → the date is ignored),
     // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
-    let already_cached = state.storage.stat(&key).await.is_some();
+    let cached_meta = state.storage.stat(&key).await;
+    let already_cached = cached_meta.is_some();
     let publish_date: Option<i64> =
         if let Some((ref maven_name, ref maven_version)) = curation_coords {
             if state.config.maven.proxies.is_empty() {
@@ -377,6 +378,54 @@ async fn download(
         }
     }
 
+    // Resolved here, not at the serve site, so the range branch below can see it.
+    let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+        state.config.curation.maven.quarantine.as_ref().or(state
+            .config
+            .curation
+            .quarantine
+            .as_ref()),
+        state
+            .config
+            .curation
+            .maven
+            .quarantine_ttl
+            .as_deref()
+            .or(state.config.curation.quarantine_ttl.as_deref()),
+    );
+
+    // Resumable download (#657): serve the requested bytes from the backend and skip
+    // the full read below. Release artifacts only — maven-metadata.xml and SNAPSHOT
+    // paths are mutable and need the freshness check. A partial read cannot be hashed,
+    // so neither the quarantine gate nor the curation integrity check can run on it:
+    // the range serve stands down while quarantine holds artifacts, and integrity is
+    // the client's own checksum, as docker does.
+    if !is_mutable_maven_path(&path)
+        && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+    {
+        if let Some(meta) = cached_meta.as_ref() {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key],
+                &headers,
+                meta.size,
+                maven_content_type(&path),
+                &[(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                )],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("maven");
+                    state.metrics.record_cache_hit("maven");
+                }
+                return response;
+            }
+        }
+    }
+
     // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
     let cached = state.storage.get(&key).await.ok();
 
@@ -388,7 +437,7 @@ async fn download(
         None => false,
         Some(_) if !is_mutable_maven_path(&path) => true,
         Some(_) => {
-            let modified = state.storage.stat(&key).await.map(|m| m.modified);
+            let modified = cached_meta.as_ref().map(|m| m.modified);
             crate::cache_ttl::mutable_ref_fresh(
                 !state.config.maven.proxies.is_empty(),
                 state.config.maven.metadata_ttl,
@@ -427,20 +476,6 @@ async fn download(
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
             if curation_coords.is_some() {
-                let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-                    state.config.curation.maven.quarantine.as_ref().or(state
-                        .config
-                        .curation
-                        .quarantine
-                        .as_ref()),
-                    state
-                        .config
-                        .curation
-                        .maven
-                        .quarantine_ttl
-                        .as_deref()
-                        .or(state.config.curation.quarantine_ttl.as_deref()),
-                );
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                     &state.digest_store,
                     "maven",
@@ -453,7 +488,13 @@ async fn download(
                     return resp;
                 }
             }
-            return with_content_type(&path, data.clone()).into_response();
+            let mut response = with_content_type(&path, data.clone()).into_response();
+            if !is_mutable_maven_path(&path) {
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            }
+            return response;
         }
     }
 
@@ -1231,11 +1272,8 @@ fn generate_metadata_xml_with_versioning(
 // Content type
 // ============================================================================
 
-fn with_content_type(
-    path: &str,
-    data: Bytes,
-) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
-    let content_type = if ends_with_ci(path, ".pom") {
+fn maven_content_type(path: &str) -> &'static str {
+    if ends_with_ci(path, ".pom") {
         "application/xml"
     } else if ends_with_ci(path, ".jar") {
         "application/java-archive"
@@ -1249,7 +1287,14 @@ fn with_content_type(
         "text/plain"
     } else {
         "application/octet-stream"
-    };
+    }
+}
+
+fn with_content_type(
+    path: &str,
+    data: Bytes,
+) -> (StatusCode, [(header::HeaderName, &'static str); 2], Bytes) {
+    let content_type = maven_content_type(path);
 
     // maven-metadata.xml is mutable; release artifacts are immutable
     let cache_control = if ends_with_ci(path, "maven-metadata.xml")
@@ -1620,7 +1665,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{
-        body_bytes, create_test_context, create_test_context_with_config, send,
+        body_bytes, create_test_context, create_test_context_with_config, send, send_with_headers,
     };
 
     #[tokio::test]
@@ -2363,5 +2408,100 @@ mod integration_tests {
         )
         .await;
         assert_eq!(r3.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_maven_range_request() {
+        let ctx = create_test_context();
+        let jar = b"0123456789abcdef";
+        ctx.state
+            .storage
+            .put("maven/com/example/rng/1.0/rng-1.0.jar", jar)
+            .await
+            .unwrap();
+        let url = "/maven2/com/example/rng/1.0/rng-1.0.jar";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 2-5/{}", jar.len())
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/java-archive"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &jar[2..=5]);
+
+        // A client that already holds the whole artifact resumes with `bytes=<size>-`.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            url,
+            vec![("range", &format!("bytes={}-", jar.len())[..])],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", jar.len())
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &jar[..]);
+    }
+
+    #[tokio::test]
+    async fn test_maven_range_ignored_on_mutable_path() {
+        let ctx = create_test_context();
+        let xml = b"<metadata>0123456789</metadata>";
+        ctx.state
+            .storage
+            .put("maven/com/example/rng/maven-metadata.xml", xml)
+            .await
+            .unwrap();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/rng/maven-metadata.xml",
+            vec![("range", "bytes=2-5")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::ACCEPT_RANGES).is_none());
+        assert_eq!(body_bytes(resp).await.as_ref(), &xml[..]);
     }
 }

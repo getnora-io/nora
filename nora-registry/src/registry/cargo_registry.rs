@@ -484,6 +484,26 @@ async fn download(
         ) {
             return resp;
         }
+        // Resume support: 206 for a `Range` request, 416 when the client asks past
+        // the end. It sits after the gates above because the quarantine digest check
+        // needs the whole object. A partial body cannot be rehashed, so the serve
+        // relies on the lockfile checksum cargo verifies itself (docker did the same
+        // in #657). An absent/malformed range falls through to the full 200.
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&key],
+            &headers,
+            data.len() as u64,
+            "application/x-tar",
+            &[(
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            )],
+        )
+        .await
+        {
+            return response;
+        }
         return (
             StatusCode::OK,
             [
@@ -495,6 +515,7 @@ async fn download(
                     header::CACHE_CONTROL,
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ),
+                (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
             ],
             data,
         )
@@ -2067,5 +2088,66 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"safe-data");
+    }
+
+    /// A cached .crate resumes: 206 for a satisfiable range, 416 once the client
+    /// already holds the whole file, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_cargo_download_range_request() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context();
+        let krate = b"0123456789";
+        ctx.state
+            .storage
+            .put("cargo/rng/1.0.0/rng-1.0.0.crate", krate)
+            .await
+            .unwrap();
+        let url = "/cargo/api/v1/crates/rng/1.0.0/download";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], krate);
     }
 }

@@ -191,6 +191,35 @@ async fn handle(
                 ) {
                     return resp;
                 }
+
+                // Resume support: 206 for a `Range` request, 416 when the client asks
+                // past the end. Only the .zip archive — the metadata endpoints are not
+                // resumable payloads. It sits after the gates above because the
+                // quarantine digest check needs the whole object. A partial body cannot
+                // be rehashed, so the serve relies on the go.sum hash the client checks
+                // itself (docker did the same in #657). An absent/malformed range falls
+                // through to the full 200.
+                if let Some(response) = crate::registry::range::range_response(
+                    &state.storage,
+                    &[&storage_key],
+                    &headers,
+                    data.len() as u64,
+                    content_type,
+                    &[(
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable".to_string(),
+                    )],
+                )
+                .await
+                {
+                    return response;
+                }
+
+                let mut response = with_content_type(data.to_vec(), content_type, is_mutable);
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                return response;
             }
             return with_content_type(data.to_vec(), content_type, is_mutable);
         }
@@ -960,5 +989,96 @@ mod tests {
             format_artifact("github.com/user/repo", "@v/v1.0.0.zip"),
             "github.com/user/repo@v1.0.0"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod integration_tests {
+    use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
+    use axum::http::{Method, StatusCode};
+
+    /// A cached module .zip resumes: 206 for a satisfiable range, 416 once the
+    /// client already holds the whole archive, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_go_zip_range_request() {
+        let ctx = create_test_context();
+        let zip = b"0123456789";
+        ctx.state
+            .storage
+            .put("go/example.com/mod/@v/v1.0.0.zip", zip)
+            .await
+            .unwrap();
+        let url = "/go/example.com/mod/@v/v1.0.0.zip";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], zip);
+    }
+
+    /// Metadata endpoints are not resumable payloads: a .mod ignores `Range`.
+    #[tokio::test]
+    async fn test_go_mod_ignores_range() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put(
+                "go/example.com/mod/@v/v1.0.0.mod",
+                b"module example.com/mod",
+            )
+            .await
+            .unwrap();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/go/example.com/mod/@v/v1.0.0.mod",
+            vec![("range", "bytes=2-5")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("accept-ranges").is_none());
     }
 }

@@ -349,6 +349,54 @@ async fn handle_request(
         }
     }
 
+    // Resolved here, not at the serve site, so the range branch below can see it.
+    let (q_mode, q_secs) =
+        crate::digest_quarantine::resolve_global(
+            state.config.curation.npm.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state.config.curation.npm.quarantine_ttl.as_deref().or(state
+                .config
+                .curation
+                .quarantine_ttl
+                .as_deref()),
+        );
+
+    // Resumable download (#657): serve the requested bytes from the backend and skip
+    // the full read below. Tarballs only — a packument is mutable and has a TTL. A
+    // partial read cannot be hashed, so neither the quarantine gate nor the .sha256
+    // sidecar / curation integrity checks can run on it: the range serve stands down
+    // while quarantine holds artifacts, and integrity is the client's own lockfile
+    // hash, as docker does.
+    if is_tarball
+        && headers.contains_key(header::RANGE)
+        && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+    {
+        if let Some(meta) = state.storage.stat(&key).await {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key],
+                &headers,
+                meta.size,
+                "application/octet-stream",
+                &[(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                )],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("npm");
+                    state.metrics.record_cache_hit("npm");
+                }
+                return response;
+            }
+        }
+    }
+
     // --- Cache hit path ---
     // get_verified discharges the integrity witness at the serve site (compile-time
     // guarantee — see crate::verified). Both the tarball serve (pinned, Verified arm)
@@ -470,18 +518,6 @@ async fn handle_request(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "api", "", "npm", ""));
-        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
-            state.config.curation.npm.quarantine.as_ref().or(state
-                .config
-                .curation
-                .quarantine
-                .as_ref()),
-            state.config.curation.npm.quarantine_ttl.as_deref().or(state
-                .config
-                .curation
-                .quarantine_ttl
-                .as_deref()),
-        );
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "npm",
@@ -493,7 +529,11 @@ async fn handle_request(
         ) {
             return resp;
         }
-        return with_content_type(true, data).into_response();
+        let mut response = with_content_type(true, data).into_response();
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        return response;
     }
 
     // --- Namespace isolation: prevent proxying internal namespaces ---
@@ -1529,7 +1569,7 @@ mod integration_tests {
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
     use axum::body::Body;
-    use axum::http::{Method, StatusCode};
+    use axum::http::{header, Method, StatusCode};
     use base64::Engine;
 
     #[tokio::test]
@@ -1580,6 +1620,70 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         assert_eq!(&body[..], tarball_data);
+    }
+
+    #[tokio::test]
+    async fn test_npm_tarball_range_request() {
+        let ctx = create_test_context();
+        let tarball = b"0123456789abcdef";
+        ctx.state
+            .storage
+            .put("npm/lodash/tarballs/lodash-4.17.21.tgz", tarball)
+            .await
+            .unwrap();
+        let url = "/npm/lodash/-/lodash-4.17.21.tgz";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 2-5/{}", tarball.len())
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &tarball[2..=5]);
+
+        // A client that already holds the whole tarball resumes with `bytes=<size>-`.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            url,
+            vec![("range", &format!("bytes={}-", tarball.len())[..])],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", tarball.len())
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), &tarball[..]);
     }
 
     #[tokio::test]
