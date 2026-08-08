@@ -392,10 +392,14 @@ fn too_many_uploads() -> Response {
             "detail": { "limit": max_upload_sessions() }
         }]
     });
+    // Jittered, not fixed: a constant retry window re-synchronizes every refused
+    // client onto the same cadence, so the herd returns together and the same
+    // subset wins each round.
+    let retry_after = rand::Rng::gen_range(&mut rand::thread_rng(), 3..=10).to_string();
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
-            (header::RETRY_AFTER, "5"),
+            (header::RETRY_AFTER, retry_after.as_str()),
             (header::CONTENT_TYPE, "application/json"),
         ],
         body.to_string(),
@@ -456,6 +460,11 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         IN_FLIGHT_UPLOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
+}
+
+/// Current in-flight streaming upload count, sampled by the `/metrics` scrape.
+pub fn in_flight_uploads() -> usize {
+    IN_FLIGHT_UPLOADS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// RAII guard for `PROXY_ACTIVE_DOWNLOADS` gauge — decrements on drop (#580).
@@ -910,7 +919,10 @@ async fn docker_v2_dispatch(
                     )
                     .await
                 }
-                _ => method_not_allowed("PATCH, PUT"),
+                Method::DELETE => {
+                    cancel_upload(state, Path((name.to_string(), after.to_string()))).await
+                }
+                _ => method_not_allowed("PATCH, PUT, DELETE"),
             }
         };
     }
@@ -1428,8 +1440,10 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Single write lock: check limit + insert atomically (no TOCTOU)
-    {
+    // Single write lock: check limit + insert atomically (no TOCTOU). The guard's
+    // scope must end before the reject path awaits, so the temp to reclaim is
+    // handed back out of the block rather than removed inside it.
+    let rejected_temp = {
         let mut sessions = state.upload_sessions.write();
         let max_sessions = max_upload_sessions();
         if sessions.len() >= max_sessions {
@@ -1438,17 +1452,23 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
                 current = sessions.len(),
                 "Upload session limit reached — rejecting new upload"
             );
-            return too_many_uploads();
+            Some(temp_path)
+        } else {
+            sessions.insert(
+                uuid.clone(),
+                UploadSession {
+                    temp_path,
+                    size: 0,
+                    name: name.clone(),
+                    created_at: std::time::Instant::now(),
+                },
+            );
+            None
         }
-        sessions.insert(
-            uuid.clone(),
-            UploadSession {
-                temp_path,
-                size: 0,
-                name: name.clone(),
-                created_at: std::time::Instant::now(),
-            },
-        );
+    };
+    if let Some(p) = rejected_temp {
+        let _ = tokio::fs::remove_file(&p).await;
+        return too_many_uploads();
     }
 
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
@@ -1622,6 +1642,58 @@ async fn patch_blob(
         ],
     )
         .into_response()
+}
+
+/// DELETE handler: cancel an in-progress upload (OCI end-blob-upload cancel).
+///
+/// Without it the session is only reclaimed by `SESSION_TTL`, so a client that
+/// correctly cancels still holds a `max_upload_sessions` slot for 30 minutes.
+/// Concurrent CI pushes then saturate the ceiling and 429 each other while the
+/// map is mostly dead entries.
+async fn cancel_upload(
+    State(state): State<AppState>,
+    Path((name, uuid)): Path<(String, String)>,
+) -> Response {
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_upload_uuid(&uuid) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    // `map` yields an owned bool so no borrow of `sessions` outlives the match.
+    let temp_path = {
+        let mut sessions = state.upload_sessions.write();
+        match sessions.get(&uuid).map(|s| s.name == name) {
+            None => None,
+            Some(false) => {
+                tracing::warn!(
+                    request_name = %name,
+                    uuid = %uuid,
+                    "SECURITY: upload cancel name mismatch — possible session fixation"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Session does not belong to this repository",
+                )
+                    .into_response();
+            }
+            Some(true) => sessions.remove(&uuid).map(|s| s.temp_path),
+        }
+    }; // lock released before file I/O
+
+    match temp_path {
+        Some(p) => {
+            let _ = tokio::fs::remove_file(&p).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Upload session not found or expired").into_response(),
+    }
 }
 
 /// PUT handler for completing blob uploads
@@ -3366,6 +3438,45 @@ mod tests {
         let max = max_upload_sessions();
         assert!(max > 0);
         assert_eq!(max, DEFAULT_MAX_UPLOAD_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_upload_frees_session_and_temp() {
+        use crate::test_helpers::{create_test_context, send};
+
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let temp_path = {
+            let sessions = ctx.state.upload_sessions.read();
+            assert_eq!(sessions.len(), 1);
+            sessions.values().next().unwrap().temp_path.clone()
+        };
+        assert!(temp_path.exists());
+
+        let resp = send(&ctx.app, Method::DELETE, &location, Body::empty()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "cancel must be honoured, not 405 — a refused cancel holds a session slot until SESSION_TTL"
+        );
+        assert_eq!(ctx.state.upload_sessions.read().len(), 0);
+        assert!(!temp_path.exists(), "cancel must reclaim the temp file");
+
+        // Cancelling twice is a 404, not a panic or a second free.
+        let resp = send(&ctx.app, Method::DELETE, &location, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -375,6 +375,32 @@ pub static PROXY_ACTIVE_DOWNLOADS: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("failed to create PROXY_ACTIVE_DOWNLOADS metric at startup")
 });
 
+/// Open Docker blob upload sessions, sampled on scrape.
+///
+/// Compare against `NORA_MAX_UPLOAD_SESSIONS`: a level that tracks concurrent
+/// pushes is healthy, one that ratchets toward the ceiling and only drops on the
+/// 30-minute TTL sweep means sessions are leaking rather than finalizing.
+pub static UPLOAD_SESSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_upload_sessions",
+        "Docker blob upload sessions currently held in the session map"
+    )
+    .expect("failed to create UPLOAD_SESSIONS metric at startup")
+});
+
+/// Docker blob uploads streaming to disk right now, sampled on scrape.
+///
+/// Bounded by the same ceiling as the session map. Unlike `UPLOAD_SESSIONS` this
+/// counts only requests actively moving bytes, so the gap between the two is the
+/// idle-session backlog.
+pub static UPLOAD_IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_upload_in_flight",
+        "Docker blob uploads currently streaming to disk"
+    )
+    .expect("failed to create UPLOAD_IN_FLIGHT metric at startup")
+});
+
 /// Total bytes successfully downloaded from upstream via proxy (#580).
 ///
 /// Only incremented after a complete, verified download (not on failures).
@@ -446,7 +472,10 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Handler for /metrics endpoint
-async fn metrics_handler() -> impl IntoResponse {
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    UPLOAD_SESSIONS.set(state.upload_sessions.read().len() as i64);
+    UPLOAD_IN_FLIGHT.set(crate::registry::docker::in_flight_uploads() as i64);
+
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
