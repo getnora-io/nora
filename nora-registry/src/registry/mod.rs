@@ -14,6 +14,7 @@ mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pub_dart;
 mod pypi;
+pub(crate) mod range;
 mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;

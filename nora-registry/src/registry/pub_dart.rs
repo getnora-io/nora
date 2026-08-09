@@ -524,18 +524,6 @@ async fn download_archive(
             }
         }
 
-        state.metrics.record_download("pub");
-        state.metrics.record_cache_hit("pub");
-        state.activity.push(ActivityEntry::new(
-            ActionType::Pull,
-            format!("{}@{}", package, version),
-            crate::registry_type::RegistryType::PubDart,
-            "LOCAL",
-        ));
-        state
-            .audit
-            .log(AuditEntry::new("pull", "api", "", "pub", ""));
-
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
             state.config.curation.pub_dart.quarantine.as_ref().or(state
                 .config
@@ -561,6 +549,38 @@ async fn download_archive(
         ) {
             return resp;
         }
+
+        // Range request: 206 Partial Content, or 416 when the client asks past the
+        // end. The gates above ran on the whole object; the partial body itself
+        // cannot be rehashed, so the client's own checksum covers it (#657).
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&key],
+            &headers,
+            data.len() as u64,
+            PUB_ARCHIVE_CONTENT_TYPE,
+            &[],
+        )
+        .await
+        {
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("pub");
+                state.metrics.record_cache_hit("pub");
+            }
+            return response;
+        }
+
+        state.metrics.record_download("pub");
+        state.metrics.record_cache_hit("pub");
+        state.activity.push(ActivityEntry::new(
+            ActionType::Pull,
+            format!("{}@{}", package, version),
+            crate::registry_type::RegistryType::PubDart,
+            "LOCAL",
+        ));
+        state
+            .audit
+            .log(AuditEntry::new("pull", "api", "", "pub", ""));
         return archive_response(data.to_vec());
     }
 
@@ -735,6 +755,7 @@ fn archive_response(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
         ],
         data,
     )
@@ -965,7 +986,9 @@ fn is_valid_pub_version(version: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers, TestContext,
+    };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1276,6 +1299,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"archive-data");
+    }
+
+    /// Resume support on a cached package archive: 206 for a byte range, 416 past
+    /// the end, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_pub_archive_range_request() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pub_dart.enabled = true;
+        });
+        let url = "/pub/packages/http/versions/1.3.0.tar.gz";
+        ctx.state
+            .storage
+            .put("pub/packages/http/versions/1.3.0.tar.gz", b"0123456789")
+            .await
+            .unwrap();
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
     }
 
     #[tokio::test]

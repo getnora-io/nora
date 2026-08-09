@@ -981,7 +981,31 @@ async fn flatcontainer_download(
         ) {
             return resp;
         }
-        return (
+
+        // Resume support: 206 for a `Range` request, 416 when the client asks past the
+        // end. Only the .nupkg package — the .nuspec manifest is a metadata read. It
+        // sits after the gates above because the quarantine digest check needs the whole
+        // object. A partial body cannot be rehashed, so the serve relies on the package
+        // hash the client verifies itself (docker did the same in #657). An
+        // absent/malformed range falls through to the full 200.
+        if ends_with_ci(filename, ".nupkg") {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&storage_key],
+                &headers,
+                data.len() as u64,
+                content_type,
+                &[(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                )],
+            )
+            .await
+            {
+                return response;
+            }
+        }
+        let mut response = (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, content_type),
@@ -990,6 +1014,12 @@ async fn flatcontainer_download(
             data.to_vec(),
         )
             .into_response();
+        if ends_with_ci(filename, ".nupkg") {
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
+        return response;
     }
 
     // #733: an internal-namespace .nupkg with no local copy is never proxied upstream.
@@ -2565,6 +2595,69 @@ mod integration_tests {
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/autocomplete?q=test", "").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get("x-nora-stale").is_none());
+    }
+
+    /// A cached .nupkg resumes: 206 for a satisfiable range, 416 once the client
+    /// already holds the whole package, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_nuget_nupkg_range_request() {
+        use crate::test_helpers::send_with_headers;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+        });
+        let nupkg = b"0123456789";
+        ctx.state
+            .storage
+            .put("nuget/flatcontainer/rngpkg/1.0.0/rngpkg.1.0.0.nupkg", nupkg)
+            .await
+            .unwrap();
+        let url = "/nuget/v3/flatcontainer/rngpkg/1.0.0/rngpkg.1.0.0.nupkg";
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], nupkg);
     }
 }
 

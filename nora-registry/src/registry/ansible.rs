@@ -362,14 +362,6 @@ async fn download_tarball(
             return response;
         }
 
-        state.metrics.record_download("ansible");
-        state.metrics.record_cache_hit("ansible");
-        state.activity.push(ActivityEntry::new(
-            ActionType::CacheHit,
-            filename,
-            crate::registry_type::RegistryType::Ansible,
-            "CACHE",
-        ));
         let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
             state.config.curation.ansible.quarantine.as_ref().or(state
                 .config
@@ -395,6 +387,35 @@ async fn download_tarball(
         ) {
             return resp;
         }
+
+        // Range request: 206 Partial Content, or 416 when the client asks past the
+        // end. The gates above ran on the whole object; the partial body itself
+        // cannot be rehashed, so the client's own checksum covers it (#657).
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&storage_key],
+            &headers,
+            data.len() as u64,
+            "application/gzip",
+            &[],
+        )
+        .await
+        {
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("ansible");
+                state.metrics.record_cache_hit("ansible");
+            }
+            return response;
+        }
+
+        state.metrics.record_download("ansible");
+        state.metrics.record_cache_hit("ansible");
+        state.activity.push(ActivityEntry::new(
+            ActionType::CacheHit,
+            filename,
+            crate::registry_type::RegistryType::Ansible,
+            "CACHE",
+        ));
         return with_binary(data.to_vec());
     }
 
@@ -818,6 +839,7 @@ fn with_binary(data: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
         ],
         data,
     )
@@ -1139,7 +1161,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
 
     #[tokio::test]
@@ -1182,6 +1206,68 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], b"tarball-data");
+    }
+
+    /// Resume support on a cached collection tarball: 206 for a byte range, 416
+    /// past the end, `Accept-Ranges` on the full 200.
+    #[tokio::test]
+    async fn test_ansible_tarball_range_request() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.ansible.enabled = true;
+        });
+        let url = "/ansible/download/community-general-7.0.1.tar.gz";
+        ctx.state
+            .storage
+            .put(
+                "ansible/download/community-general-7.0.1.tar.gz",
+                b"0123456789",
+            )
+            .await
+            .unwrap();
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
     }
 
     #[tokio::test]

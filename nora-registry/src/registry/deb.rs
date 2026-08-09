@@ -751,6 +751,7 @@ async fn upload(
 
 async fn download(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((repo, path)): Path<(String, String)>,
 ) -> Response {
     if !state.config.deb.enabled {
@@ -799,6 +800,38 @@ async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // Range applies to package payloads only — the dists/ indexes are rewritten in
+    // place on every publish, so a resumed range could splice two generations.
+    let is_package = {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".deb") || lower.ends_with(".udeb")
+    };
+
+    // 206 Partial Content, or 416 when the client asks past the end, straight from
+    // the backend's ranged read — a resumed apt download transfers only the bytes
+    // it is missing. A partial body cannot be rehashed, so this path skips the
+    // pin check `get_verified` does below and relies on the client's own
+    // checksum (the Packages index records one) — the docker #657 precedent.
+    if is_package {
+        if let Some(meta) = state.storage.stat(&key).await {
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key],
+                &headers,
+                meta.size,
+                content_type(&path),
+                &[],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("deb");
+                }
+                return response;
+            }
+        }
+    }
+
     match state.storage.get_verified(&key).await {
         Ok(outcome) => {
             state.metrics.record_download("deb");
@@ -816,6 +849,9 @@ async fn download(
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type(&path));
+            if is_package {
+                builder = builder.header(header::ACCEPT_RANGES, "bytes");
+            }
             // Index files are rewritten in place on every publish (fixed
             // names, no by-hash) — clients must revalidate.
             if RESERVED.contains(&path.as_str()) || path.starts_with("dists/") {
@@ -1218,7 +1254,7 @@ pub(crate) mod test_fixtures {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use super::RESERVED;
-    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
     use axum::http::{Method, StatusCode};
     use sha2::Digest;
     use std::io::Write;
@@ -1424,6 +1460,80 @@ mod integration_tests {
 
         let resp = send(&ctx.app, Method::DELETE, "/deb/myrepo/tree.deb", "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Resume support on a pool `.deb`: 206 for a byte range, 416 past the end,
+    /// `Accept-Ranges` on the full 200 — and never on an index.
+    #[tokio::test]
+    async fn test_deb_package_range_request() {
+        let ctx = create_test_context();
+        let url = "/deb/myrepo/pool/rng_1.0_amd64.deb";
+        ctx.state
+            .storage
+            .put("deb/myrepo/pool/rng_1.0_amd64.deb", b"0123456789")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("deb/myrepo/Packages", b"Package: rng\n")
+            .await
+            .unwrap();
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=2-5")], "").await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"2345");
+
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, url, vec![("range", "bytes=10-")], "").await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */10"
+        );
+
+        let resp = send(&ctx.app, Method::GET, url, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+
+        // Indexes are rewritten in place — no ranged serve, no advertisement.
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/deb/myrepo/Packages",
+            vec![("range", "bytes=2-5")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("accept-ranges").is_none());
     }
 
     #[tokio::test]

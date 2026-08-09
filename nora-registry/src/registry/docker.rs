@@ -239,106 +239,6 @@ async fn storage_get_reader_with_fallback(
     }
 }
 
-/// Parse a single `Range: bytes=start-end` header against a known object size, returning the
-/// inclusive `(start, end)` clamped to the object, or `None` if it is absent, unparsable,
-/// multipart, or unsatisfiable (the caller then serves the full object). Suffix ranges
-/// (`bytes=-N`, the last N bytes) are supported.
-fn parse_byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
-    let spec = value.strip_prefix("bytes=")?.split(',').next()?.trim();
-    let (s, e) = spec.split_once('-')?;
-    if s.is_empty() {
-        // suffix form "bytes=-N": the last N bytes
-        let n: u64 = e.trim().parse().ok()?;
-        byte_range_core(true, 0, false, n, size)
-    } else {
-        let start: u64 = s.trim().parse().ok()?;
-        let (end_empty, end_in) = if e.trim().is_empty() {
-            (true, 0)
-        } else {
-            (false, e.trim().parse::<u64>().ok()?)
-        };
-        byte_range_core(false, start, end_empty, end_in, size)
-    }
-}
-
-/// Arithmetic core of [`parse_byte_range`], split out so the out-of-bounds /
-/// inverted-range / overflow bug-class can be *proven* absent over the whole
-/// `u64` space. String lexing stays in the caller — symbolically lexing a
-/// UTF-8 string is intractable for a bounded model checker, while the bounds
-/// invariant lives entirely in this arithmetic. For any inputs it never
-/// panics/overflows; any `Some((start, end))` satisfies `start <= end < size`.
-fn byte_range_core(
-    suffix: bool,
-    start_in: u64,
-    end_empty: bool,
-    end_in: u64,
-    size: u64,
-) -> Option<(u64, u64)> {
-    let (start, end) = if suffix {
-        let n = end_in;
-        if n == 0 || size == 0 {
-            return None;
-        }
-        (size.saturating_sub(n), size - 1)
-    } else {
-        let start = start_in;
-        let end = if end_empty {
-            size.saturating_sub(1)
-        } else {
-            end_in.min(size.saturating_sub(1))
-        };
-        (start, end)
-    };
-    if size == 0 || start > end || start >= size {
-        return None;
-    }
-    Some((start, end))
-}
-
-/// Kani proof: [`byte_range_core`] is total and bounds-safe. For ANY
-/// `(suffix, start_in, end_empty, end_in, size)` over the full `u64` space it
-/// never panics or overflows, and any `Some((start, end))` is well-formed:
-/// `start <= end < size` — the whole "out-of-bounds / inverted Range" bug-class
-/// discharged at verification time, not at runtime. (Verified GREEN in-crate,
-/// 17/17 checks in ~0.3s.)
-///
-/// Run: `make kani`, or `cargo kani -p nora-registry` (CI: `.github/workflows/kani.yml`).
-/// Compiled only under `--cfg kani`; invisible to the normal build/clippy/test.
-#[cfg(kani)]
-#[kani::proof]
-fn byte_range_core_is_bounds_safe() {
-    let suffix: bool = kani::any();
-    let start_in: u64 = kani::any();
-    let end_empty: bool = kani::any();
-    let end_in: u64 = kani::any();
-    let size: u64 = kani::any();
-    if let Some((start, end)) = byte_range_core(suffix, start_in, end_empty, end_in, size) {
-        assert!(start <= end, "Range start must never exceed end");
-        assert!(end < size, "Range end must stay within the object size");
-        assert!(start < size, "Range start must stay within the object size");
-    }
-}
-
-async fn storage_get_range_with_fallback(
-    storage: &Storage,
-    ns_key: &str,
-    legacy_key: &str,
-    start: u64,
-    end: u64,
-) -> Result<
-    (
-        u64,
-        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
-    ),
-    crate::storage::StorageError,
-> {
-    match storage.get_range(ns_key, start, end).await {
-        Ok(r) => Ok(r),
-        Err(_) if ns_key != legacy_key => storage.get_range(legacy_key, start, end).await,
-        Err(e) => Err(e),
-    }
-}
-
 /// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
 /// mismatch at EOF, fails the stream instead of letting a tampered blob complete
 /// cleanly. `get_reader` (#580) streams large docker blobs without buffering, so
@@ -481,6 +381,32 @@ fn max_upload_sessions() -> usize {
         .unwrap_or(DEFAULT_MAX_UPLOAD_SESSIONS)
 }
 
+/// OCI-conformant 429 for the concurrent-upload ceiling. containers/common
+/// retry logic only backs off on errcode TOOMANYREQUESTS in a JSON body; a
+/// plain-text 429 aborts the client push outright.
+fn too_many_uploads() -> Response {
+    let body = json!({
+        "errors": [{
+            "code": "TOOMANYREQUESTS",
+            "message": "too many concurrent uploads",
+            "detail": { "limit": max_upload_sessions() }
+        }]
+    });
+    // Jittered, not fixed: a constant retry window re-synchronizes every refused
+    // client onto the same cadence, so the herd returns together and the same
+    // subset wins each round.
+    let retry_after = rand::Rng::gen_range(&mut rand::thread_rng(), 3..=10).to_string();
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::RETRY_AFTER, retry_after.as_str()),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Read max session size from env (in MB) or use default
 fn max_session_size() -> usize {
     let mb = std::env::var("NORA_MAX_UPLOAD_SESSION_SIZE_MB")
@@ -534,6 +460,11 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         IN_FLIGHT_UPLOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
+}
+
+/// Current in-flight streaming upload count, sampled by the `/metrics` scrape.
+pub fn in_flight_uploads() -> usize {
+    IN_FLIGHT_UPLOADS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// RAII guard for `PROXY_ACTIVE_DOWNLOADS` gauge — decrements on drop (#580).
@@ -988,7 +919,10 @@ async fn docker_v2_dispatch(
                     )
                     .await
                 }
-                _ => method_not_allowed("PATCH, PUT"),
+                Method::DELETE => {
+                    cancel_upload(state, Path((name.to_string(), after.to_string()))).await
+                }
+                _ => method_not_allowed("PATCH, PUT, DELETE"),
             }
         };
     }
@@ -1260,44 +1194,35 @@ async fn download_blob(
             return resp;
         }
 
-        // Range request: serve the requested byte range (206 Partial Content). A ranged
-        // response is partial, so the streaming SHA-256 verify (full-GET only) does not
-        // apply — a ranged serve relies on the content-addressed storage key plus the
-        // client's own content-digest check, as Docker/Harbor do. An absent/invalid range
-        // falls through to the full 200 below.
-        if let Some((start, end)) = headers
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| parse_byte_range(v, size))
+        // Range request: 206 Partial Content, or 416 when the client asks past the end
+        // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
+        // only) does not apply — a ranged serve relies on the content-addressed storage
+        // key plus the client's own content-digest check, as Docker/Harbor do. An
+        // absent/malformed range falls through to the full 200 below.
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[&key, &legacy_key],
+            &headers,
+            size,
+            "application/octet-stream",
+            &[
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+                (
+                    HeaderName::from_static("docker-content-digest"),
+                    digest.clone(),
+                ),
+            ],
+        )
+        .await
         {
-            drop(reader);
-            let ranged = match storage_get_range_with_fallback(
-                &state.storage,
-                &key,
-                &legacy_key,
-                start,
-                end,
-            )
-            .await
-            {
-                Ok((_, r)) => r,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            state.metrics.record_download("docker");
-            state.metrics.record_cache_hit("docker");
-            return Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, end - start + 1)
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, size),
-                )
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .header("docker-content-digest", &digest)
-                .body(Body::from_stream(ReaderStream::new(ranged)))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.metrics.record_download("docker");
+                state.metrics.record_cache_hit("docker");
+            }
+            return response;
         }
 
         state.metrics.record_download("docker");
@@ -1515,8 +1440,10 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Single write lock: check limit + insert atomically (no TOCTOU)
-    {
+    // Single write lock: check limit + insert atomically (no TOCTOU). The guard's
+    // scope must end before the reject path awaits, so the temp to reclaim is
+    // handed back out of the block rather than removed inside it.
+    let rejected_temp = {
         let mut sessions = state.upload_sessions.write();
         let max_sessions = max_upload_sessions();
         if sessions.len() >= max_sessions {
@@ -1525,17 +1452,23 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
                 current = sessions.len(),
                 "Upload session limit reached — rejecting new upload"
             );
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response();
+            Some(temp_path)
+        } else {
+            sessions.insert(
+                uuid.clone(),
+                UploadSession {
+                    temp_path,
+                    size: 0,
+                    name: name.clone(),
+                    created_at: std::time::Instant::now(),
+                },
+            );
+            None
         }
-        sessions.insert(
-            uuid.clone(),
-            UploadSession {
-                temp_path,
-                size: 0,
-                name: name.clone(),
-                created_at: std::time::Instant::now(),
-            },
-        );
+    };
+    if let Some(p) = rejected_temp {
+        let _ = tokio::fs::remove_file(&p).await;
+        return too_many_uploads();
     }
 
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
@@ -1572,9 +1505,7 @@ async fn patch_blob(
     // the session map) so streaming to disk cannot fan out unboundedly (#817).
     let _inflight = match InFlightGuard::try_acquire() {
         Some(g) => g,
-        None => {
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
-        }
+        None => return too_many_uploads(),
     };
 
     // Phase 1: Validate session under lock, extract temp_path + current size (no I/O)
@@ -1713,6 +1644,58 @@ async fn patch_blob(
         .into_response()
 }
 
+/// DELETE handler: cancel an in-progress upload (OCI end-blob-upload cancel).
+///
+/// Without it the session is only reclaimed by `SESSION_TTL`, so a client that
+/// correctly cancels still holds a `max_upload_sessions` slot for 30 minutes.
+/// Concurrent CI pushes then saturate the ceiling and 429 each other while the
+/// map is mostly dead entries.
+async fn cancel_upload(
+    State(state): State<AppState>,
+    Path((name, uuid)): Path<(String, String)>,
+) -> Response {
+    let c = canonicalize(&name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(e) = validate_upload_uuid(&uuid) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    // `map` yields an owned bool so no borrow of `sessions` outlives the match.
+    let temp_path = {
+        let mut sessions = state.upload_sessions.write();
+        match sessions.get(&uuid).map(|s| s.name == name) {
+            None => None,
+            Some(false) => {
+                tracing::warn!(
+                    request_name = %name,
+                    uuid = %uuid,
+                    "SECURITY: upload cancel name mismatch — possible session fixation"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Session does not belong to this repository",
+                )
+                    .into_response();
+            }
+            Some(true) => sessions.remove(&uuid).map(|s| s.temp_path),
+        }
+    }; // lock released before file I/O
+
+    match temp_path {
+        Some(p) => {
+            let _ = tokio::fs::remove_file(&p).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Upload session not found or expired").into_response(),
+    }
+}
+
 /// PUT handler for completing blob uploads
 /// Handles both monolithic uploads (body contains all data) and
 /// chunked upload finalization (body may be empty, data in session)
@@ -1738,9 +1721,7 @@ async fn upload_blob(
     // map, so `max_upload_sessions` alone does not cap their concurrency (#817).
     let _inflight = match InFlightGuard::try_acquire() {
         Some(g) => g,
-        None => {
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many concurrent uploads").into_response()
-        }
+        None => return too_many_uploads(),
     };
 
     let digest = match params.get("digest") {
@@ -3459,6 +3440,90 @@ mod tests {
         assert_eq!(max, DEFAULT_MAX_UPLOAD_SESSIONS);
     }
 
+    #[tokio::test]
+    async fn test_cancel_upload_frees_session_and_temp() {
+        use crate::test_helpers::{create_test_context, send};
+
+        let ctx = create_test_context();
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let temp_path = {
+            let sessions = ctx.state.upload_sessions.read();
+            assert_eq!(sessions.len(), 1);
+            sessions.values().next().unwrap().temp_path.clone()
+        };
+        assert!(temp_path.exists());
+
+        let resp = send(&ctx.app, Method::DELETE, &location, Body::empty()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "cancel must be honoured, not 405 — a refused cancel holds a session slot until SESSION_TTL"
+        );
+        assert_eq!(ctx.state.upload_sessions.read().len(), 0);
+        assert!(!temp_path.exists(), "cancel must reclaim the temp file");
+
+        // Cancelling twice is a 404, not a panic or a second free.
+        let resp = send(&ctx.app, Method::DELETE, &location, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_upload_session_limit_returns_oci_429() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+
+        // Pre-fill the session map to the ceiling — no env mutation, so this is
+        // safe under parallel tests.
+        let ctx = create_test_context();
+        {
+            let mut sessions = ctx.state.upload_sessions.write();
+            for i in 0..max_upload_sessions() {
+                sessions.insert(
+                    format!("fill-{i}"),
+                    UploadSession {
+                        temp_path: std::env::temp_dir().join(format!("fill-{i}")),
+                        size: 0,
+                        name: "alpine".to_string(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/v2/alpine/blobs/uploads/",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+            "application/json"
+        );
+        assert!(
+            resp.headers().contains_key(header::RETRY_AFTER),
+            "429 must carry Retry-After so clients back off"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
+        assert_eq!(
+            body["errors"][0]["detail"]["limit"],
+            max_upload_sessions() as u64
+        );
+    }
+
     #[test]
     fn test_max_session_size_default() {
         let max = max_session_size();
@@ -4377,43 +4442,6 @@ mod integration_tests {
         assert_eq!(body.as_ref(), &blob_data[..]);
     }
 
-    #[test]
-    fn test_parse_byte_range() {
-        use super::parse_byte_range;
-        assert_eq!(parse_byte_range("bytes=0-3", 10), Some((0, 3)));
-        assert_eq!(parse_byte_range("bytes=5-", 10), Some((5, 9))); // open-ended
-        assert_eq!(parse_byte_range("bytes=-4", 10), Some((6, 9))); // suffix (last 4)
-        assert_eq!(parse_byte_range("bytes=8-100", 10), Some((8, 9))); // clamp end to size
-        assert_eq!(parse_byte_range("bytes=10-12", 10), None); // start past end
-        assert_eq!(parse_byte_range("bytes=5-3", 10), None); // reversed
-        assert_eq!(parse_byte_range("nonsense", 10), None); // unparsable
-        assert_eq!(parse_byte_range("bytes=0-3", 0), None); // empty object
-
-        // mutation-found gaps (cargo-mutants): exercise the single-byte range
-        // and the suffix form against an empty object.
-        assert_eq!(parse_byte_range("bytes=5-5", 10), Some((5, 5))); // single byte (kills `>`→`>=`)
-        assert_eq!(parse_byte_range("bytes=-5", 0), None); // suffix + empty (kills `||`→`&&`)
-    }
-
-    proptest::proptest! {
-        /// Property test (#3): fuzz the string LEXER of `parse_byte_range` — the
-        /// part Kani cannot symbolically execute. Over biased range-like strings
-        /// and any size it must never panic, and any `Some((s, e))` is
-        /// well-formed: `s <= e < size`. Pairs with the Kani proof of
-        /// `byte_range_core` (the arithmetic) for full-function coverage.
-        #[test]
-        fn parse_byte_range_lexer_invariant(
-            value in "bytes=-?[0-9]{0,9}-?[0-9]{0,9}",
-            size in proptest::prelude::any::<u64>(),
-        ) {
-            if let Some((s, e)) = super::parse_byte_range(&value, size) {
-                proptest::prop_assert!(s <= e, "inverted: {} > {}", s, e);
-                proptest::prop_assert!(e < size, "oob end: {} >= {}", e, size);
-                proptest::prop_assert!(s < size, "oob start: {} >= {}", s, size);
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_docker_blob_range_request() {
         use tower::ServiceExt;
@@ -4457,6 +4485,35 @@ mod integration_tests {
         );
         let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), &blob[4..=7]);
+
+        // A client holding the whole blob resumes with `bytes=<size>-`: 416, not a
+        // full re-download (#657, matches the reference `distribution` registry).
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v2/rng/blobs/{}", digest))
+            .header(header::RANGE, format!("bytes={}-", blob.len()))
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes */{}", blob.len())
+        );
+
+        // A malformed range is ignored: full 200 (RFC 9110 §14.2).
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v2/rng/blobs/{}", digest))
+            .header(header::RANGE, "kilobytes=1-2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
