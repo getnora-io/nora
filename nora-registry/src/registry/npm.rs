@@ -314,6 +314,16 @@ async fn handle_request(
     // version, so this is `None` without any extra storage read.
     let publish_date = if let Some(ref ver) = tarball_version {
         let meta_key = format!("npm/{}/metadata.json", package_name);
+        // #748: a tarball download may arrive without a prior packument request
+        // (direct/locked fetch), so `metadata.json` (the carrier of per-version
+        // `time[version]`) would never be cached and the quarantine would fall
+        // back to NORA's own clock. Self-prime the metadata here (synchronously,
+        // so the date is readable on this same request) — gated on trust,
+        // namespace-safe, best-effort. Mirrors Cargo's `ensure_cargo_metadata_cached`
+        // and PyPI's `ensure_pypi_dates_cached`.
+        if state.config.server.trust_upstream_dates {
+            ensure_npm_metadata_cached(&state, &package_name).await;
+        }
         extract_npm_publish_date(
             &state.storage,
             &meta_key,
@@ -1160,6 +1170,64 @@ fn semver_key(v: &str) -> (u64, u64, u64, bool) {
     let mut it = core.trim_start_matches('v').split('.');
     let n = |x: Option<&str>| x.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     (n(it.next()), n(it.next()), n(it.next()), !v.contains('-'))
+}
+
+/// Self-prime `npm/{name}/metadata.json` so the release-age date (#748) is
+/// available on the tarball download path itself.
+///
+/// A locked/direct tarball fetch (`/npm/{name}/-/{name}-{version}.tgz`) may
+/// arrive without a prior packument request, so `metadata.json` (the carrier of
+/// the per-version `time[version]`) would never be cached and the quarantine
+/// would always fall back to NORA's own clock — a provably-old npm artifact is
+/// then held for the full TTL as "new to this mirror". Without this, the
+/// release-age maturation never fires for npm. Synchronous `put` (not
+/// `spawn_cache`) so the date is readable on the same request. Best-effort: any
+/// failure leaves the date `None` (fail-safe — the package is held as new).
+/// Namespace-safe: an internal-namespace package is never fetched upstream
+/// (#68). Mirrors Cargo's `ensure_cargo_metadata_cached` and PyPI's
+/// `ensure_pypi_dates_cached`.
+async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
+    let key = format!("npm/{}/metadata.json", package_name);
+    if state.storage.get(&key).await.is_ok() {
+        return;
+    }
+    // #68: never fetch an internal-namespace package's metadata upstream.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        package_name,
+    ) {
+        return;
+    }
+    let Some(proxy_url) = state.config.npm.proxy.clone() else {
+        return;
+    };
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
+    if let Ok(data) = proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.npm.proxy_timeout),
+        expose_opt(&state.config.npm.proxy_auth),
+        &state.circuit_breaker,
+        RegistryType::Npm,
+    )
+    .await
+    {
+        // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
+        // refetch_metadata do, so a subsequent client reading the cached
+        // packument is not sent back to the upstream.
+        let nora_base = nora_base_url(state);
+        let rewritten = rewrite_tarball_urls(&data, &nora_base, &proxy_url).unwrap_or_else(|()| {
+            tracing::warn!(
+                package = %package_name,
+                "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
+            );
+            let upstream_trimmed = proxy_url.trim_end_matches('/');
+            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
+        });
+        let _ = state.storage.put(&key, &rewritten).await;
+    }
 }
 
 /// Extract publish date for a specific version from cached npm metadata.
