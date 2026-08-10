@@ -2136,9 +2136,7 @@ mod integration_tests {
         });
         Mock::given(method("GET"))
             .and(path("/testpkg"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(packument.to_string()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
             .mount(&upstream)
             .await;
 
@@ -2179,7 +2177,9 @@ mod integration_tests {
             "upstream release date must survive into the cached packument"
         );
         // Tarball URLs must be rewritten to NORA, not left pointing upstream.
-        let tarball_url = json["versions"]["1.0.0"]["dist"]["tarball"].as_str().unwrap();
+        let tarball_url = json["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
         assert!(
             !tarball_url.contains(&upstream.uri()[..]),
             "upstream tarball URL leaked into cached metadata: {tarball_url}"
@@ -2234,7 +2234,13 @@ mod integration_tests {
         });
         ctx_seed_metadata(&ctx, "cachedpkg", &packument).await;
 
-        let resp = send(&ctx.app, Method::GET, "/npm/cachedpkg/-/cachedpkg-1.0.0.tgz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/cachedpkg/-/cachedpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(&body_bytes(resp).await[..], tarball);
 
@@ -2326,7 +2332,13 @@ mod integration_tests {
             cfg.server.trust_upstream_dates = false; // gate closed
         });
 
-        let resp = send(&ctx.app, Method::GET, "/npm/distrust/-/distrust-1.0.0.tgz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/distrust/-/distrust-1.0.0.tgz",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(&body_bytes(resp).await[..], tarball);
 
@@ -2354,7 +2366,13 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.npm.proxy = None;
         });
-        let resp = send(&ctx.app, Method::GET, "/npm/noproxy/-/noproxy-1.0.0.tgz", "").await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/noproxy/-/noproxy-1.0.0.tgz",
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // metadata.json must NOT exist (self-prime had no upstream to fetch from).
         assert!(
@@ -2427,7 +2445,11 @@ mod integration_tests {
 
     // ── ensure_npm_metadata_cached test helpers ──
 
-    async fn ctx_seed_metadata(ctx: &crate::test_helpers::TestContext, name: &str, packument: &serde_json::Value) {
+    async fn ctx_seed_metadata(
+        ctx: &crate::test_helpers::TestContext,
+        name: &str,
+        packument: &serde_json::Value,
+    ) {
         ctx.state
             .storage
             .put(
