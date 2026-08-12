@@ -314,6 +314,16 @@ async fn handle_request(
     // version, so this is `None` without any extra storage read.
     let publish_date = if let Some(ref ver) = tarball_version {
         let meta_key = format!("npm/{}/metadata.json", package_name);
+        // #748: a tarball download may arrive without a prior packument request
+        // (direct/locked fetch), so `metadata.json` (the carrier of per-version
+        // `time[version]`) would never be cached and the quarantine would fall
+        // back to NORA's own clock. Self-prime the metadata here (synchronously,
+        // so the date is readable on this same request) — gated on trust,
+        // namespace-safe, best-effort. Mirrors Cargo's `ensure_cargo_metadata_cached`
+        // and PyPI's `ensure_pypi_dates_cached`.
+        if state.config.server.trust_upstream_dates {
+            ensure_npm_metadata_cached(&state, &package_name).await;
+        }
         extract_npm_publish_date(
             &state.storage,
             &meta_key,
@@ -1160,6 +1170,64 @@ fn semver_key(v: &str) -> (u64, u64, u64, bool) {
     let mut it = core.trim_start_matches('v').split('.');
     let n = |x: Option<&str>| x.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     (n(it.next()), n(it.next()), n(it.next()), !v.contains('-'))
+}
+
+/// Self-prime `npm/{name}/metadata.json` so the release-age date (#748) is
+/// available on the tarball download path itself.
+///
+/// A locked/direct tarball fetch (`/npm/{name}/-/{name}-{version}.tgz`) may
+/// arrive without a prior packument request, so `metadata.json` (the carrier of
+/// the per-version `time[version]`) would never be cached and the quarantine
+/// would always fall back to NORA's own clock — a provably-old npm artifact is
+/// then held for the full TTL as "new to this mirror". Without this, the
+/// release-age maturation never fires for npm. Synchronous `put` (not
+/// `spawn_cache`) so the date is readable on the same request. Best-effort: any
+/// failure leaves the date `None` (fail-safe — the package is held as new).
+/// Namespace-safe: an internal-namespace package is never fetched upstream
+/// (#68). Mirrors Cargo's `ensure_cargo_metadata_cached` and PyPI's
+/// `ensure_pypi_dates_cached`.
+async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
+    let key = format!("npm/{}/metadata.json", package_name);
+    if state.storage.get(&key).await.is_ok() {
+        return;
+    }
+    // #68: never fetch an internal-namespace package's metadata upstream.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        package_name,
+    ) {
+        return;
+    }
+    let Some(proxy_url) = state.config.npm.proxy.clone() else {
+        return;
+    };
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
+    if let Ok(data) = proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.npm.proxy_timeout),
+        expose_opt(&state.config.npm.proxy_auth),
+        &state.circuit_breaker,
+        RegistryType::Npm,
+    )
+    .await
+    {
+        // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
+        // refetch_metadata do, so a subsequent client reading the cached
+        // packument is not sent back to the upstream.
+        let nora_base = nora_base_url(state);
+        let rewritten = rewrite_tarball_urls(&data, &nora_base, &proxy_url).unwrap_or_else(|()| {
+            tracing::warn!(
+                package = %package_name,
+                "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
+            );
+            let upstream_trimmed = proxy_url.trim_end_matches('/');
+            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
+        });
+        let _ = state.storage.put(&key, &rewritten).await;
+    }
 }
 
 /// Extract publish date for a specific version from cached npm metadata.
@@ -2032,6 +2100,364 @@ mod integration_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["username"], evil);
         assert!(json.get("admin").is_none());
+    }
+
+    // ── ensure_npm_metadata_cached self-prime (#748) ──
+    //
+    // A tarball download (direct/locked fetch) arrives without a prior packument
+    // request, so metadata.json is uncached. ensure_npm_metadata_cached fetches
+    // the packument upstream and caches it (rewritten to NORA URLs) so the
+    // per-version `time[version]` date is readable on the same request.
+
+    /// Happy path: tarball cache-miss → ensure_npm_metadata_cached fetches and
+    /// caches the packument; tarball is also proxied and served. The cached
+    /// metadata must carry the upstream release date AND have its tarball URLs
+    /// rewritten to NORA.
+    #[tokio::test]
+    async fn test_npm_tarball_self_primes_metadata_on_cache_miss() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+
+        // Packument (fetched by ensure_npm_metadata_cached → GET {proxy}/testpkg).
+        let packument = serde_json::json!({
+            "name": "testpkg",
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": format!("{}/testpkg/-/testpkg-1.0.0.tgz", upstream.uri())
+                    }
+                }
+            },
+            "time": { "1.0.0": "2020-01-15T10:30:00.000Z" }
+        });
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&upstream)
+            .await;
+
+        // Tarball (fetched by the cache-miss proxy path → GET {proxy}/testpkg/-/testpkg-1.0.0.tgz).
+        let tarball = b"TGZ-BYTES";
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+
+        // Direct/locked tarball fetch — no prior packument request.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], tarball);
+
+        // ensure_npm_metadata_cached must have synchronously cached the packument.
+        let cached = ctx
+            .state
+            .storage
+            .get("npm/testpkg/metadata.json")
+            .await
+            .expect("metadata.json must be self-primed");
+        let json: serde_json::Value = serde_json::from_slice(&cached).unwrap();
+        assert_eq!(
+            json["time"]["1.0.0"].as_str().unwrap(),
+            "2020-01-15T10:30:00.000Z",
+            "upstream release date must survive into the cached packument"
+        );
+        // Tarball URLs must be rewritten to NORA, not left pointing upstream.
+        let tarball_url = json["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !tarball_url.contains(&upstream.uri()[..]),
+            "upstream tarball URL leaked into cached metadata: {tarball_url}"
+        );
+        assert!(
+            tarball_url.starts_with("http://127.0.0.1") && tarball_url.contains("/npm/"),
+            "tarball URL not rewritten to NORA: {tarball_url}"
+        );
+
+        // The publish date must now be resolvable from the cached packument.
+        let date = super::extract_npm_publish_date(
+            &ctx.state.storage,
+            "npm/testpkg/metadata.json",
+            "1.0.0",
+            true,
+        )
+        .await;
+        assert_eq!(
+            date,
+            Some(1579084200),
+            "ISO 8601 → Unix for 2020-01-15T10:30:00Z"
+        );
+    }
+
+    /// Cached metadata short-circuits ensure_npm_metadata_cached — no upstream
+    /// hit on a second tarball fetch (the packument is already in storage).
+    #[tokio::test]
+    async fn test_npm_tarball_self_prime_skips_when_metadata_cached() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+
+        // Pre-seed the packument so ensure_npm_metadata_cached early-returns.
+        let packument = serde_json::json!({
+            "name": "cachedpkg",
+            "versions": { "1.0.0": { "dist": {} } },
+            "time": { "1.0.0": "2019-05-01T00:00:00.000Z" }
+        });
+
+        let tarball = b"TGZ";
+        Mock::given(method("GET"))
+            .and(path("/cachedpkg/-/cachedpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        ctx_seed_metadata(&ctx, "cachedpkg", &packument).await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/cachedpkg/-/cachedpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], tarball);
+
+        let packument_hits = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/cachedpkg")
+            .count();
+        assert_eq!(
+            packument_hits, 0,
+            "metadata already cached → ensure_npm_metadata_cached must NOT hit upstream"
+        );
+    }
+
+    /// Internal-namespace package: ensure_npm_metadata_cached must never fetch
+    /// the packument upstream (#68 dependency confusion).
+    #[tokio::test]
+    async fn test_npm_tarball_self_prime_skips_internal_namespace() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Any upstream hit would be a dependency-confusion leak — mount a canary.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["@internal/*".to_string()];
+        });
+
+        // Tarball not in cache → proxy path, but ensure_npm_metadata_cached must
+        // skip the packument fetch for the internal name. Namespace isolation
+        // blocks the upstream branch for an internal name → 403 (not 404).
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/@internal/secret/-/secret-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let packument_hits = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().contains("@internal/secret"))
+            .count();
+        assert_eq!(
+            packument_hits, 0,
+            "internal-namespace packument must never be fetched upstream (#68)"
+        );
+    }
+
+    /// `trust_upstream_dates = false` → ensure_npm_metadata_cached is never
+    /// called (the gating `if` in handle_request is false).
+    #[tokio::test]
+    async fn test_npm_tarball_self_prime_skipped_when_distrust_upstream_dates() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let tarball = b"TGZ";
+        Mock::given(method("GET"))
+            .and(path("/distrust/-/distrust-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
+            .mount(&upstream)
+            .await;
+        // A packument hit would prove ensure_npm_metadata_cached ran.
+        Mock::given(method("GET"))
+            .and(path("/distrust"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.server.trust_upstream_dates = false; // gate closed
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/distrust/-/distrust-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], tarball);
+
+        let packument_hits = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/distrust")
+            .count();
+        assert_eq!(
+            packument_hits, 0,
+            "trust_upstream_dates=false must skip ensure_npm_metadata_cached"
+        );
+    }
+
+    /// No upstream proxy configured → ensure_npm_metadata_cached early-returns
+    /// (proxy_url is None) and the tarball cache-miss yields 404.
+    #[tokio::test]
+    async fn test_npm_tarball_self_prime_skipped_when_no_proxy() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        // No proxy → both the tarball and the self-prime fetch have nowhere to go.
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = None;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/noproxy/-/noproxy-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // metadata.json must NOT exist (self-prime had no upstream to fetch from).
+        assert!(
+            ctx.state
+                .storage
+                .get("npm/noproxy/metadata.json")
+                .await
+                .is_err(),
+            "no proxy → metadata.json must not be self-primed"
+        );
+    }
+
+    /// JSON-parse failure in the upstream packument falls back to byte-level URL
+    /// rewrite (replace_upstream_bytes), so the cached metadata still has NORA
+    /// URLs and the body is preserved (fail-safe, not dropped).
+    #[tokio::test]
+    async fn test_npm_tarball_self_prime_byte_level_rewrite_on_invalid_json() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+
+        // Malformed packument (not valid JSON) carrying an upstream tarball URL
+        // that the byte-level rewrite must still replace.
+        let upstream_uri = upstream.uri();
+        let upstream_uri_trimmed = upstream_uri.trim_end_matches('/');
+        let bogus_packument = format!(
+            "{{ not-valid-json \"tarball\": \"{upstream_uri_trimmed}/badpkg/-/badpkg-1.0.0.tgz\" }}"
+        );
+        Mock::given(method("GET"))
+            .and(path("/badpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bogus_packument.clone()))
+            .mount(&upstream)
+            .await;
+
+        let tarball = b"TGZ";
+        Mock::given(method("GET"))
+            .and(path("/badpkg/-/badpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/npm/badpkg/-/badpkg-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], tarball);
+
+        let cached = ctx
+            .state
+            .storage
+            .get("npm/badpkg/metadata.json")
+            .await
+            .expect("metadata.json must be cached even for non-JSON packument");
+        let cached_str = String::from_utf8_lossy(&cached);
+        assert!(
+            !cached_str.contains(upstream_uri_trimmed),
+            "upstream URL leaked through byte-level rewrite: {cached_str}"
+        );
+        // Body preserved (byte-level rewrite is a prefix replace, not a drop).
+        assert!(
+            cached_str.contains("/npm/badpkg/-/badpkg-1.0.0.tgz"),
+            "byte-level rewrite must substitute the NORA npm base: {cached_str}"
+        );
+    }
+
+    // ── ensure_npm_metadata_cached test helpers ──
+
+    async fn ctx_seed_metadata(
+        ctx: &crate::test_helpers::TestContext,
+        name: &str,
+        packument: &serde_json::Value,
+    ) {
+        ctx.state
+            .storage
+            .put(
+                &format!("npm/{name}/metadata.json"),
+                &serde_json::to_vec(packument).unwrap(),
+            )
+            .await
+            .unwrap();
     }
 }
 
