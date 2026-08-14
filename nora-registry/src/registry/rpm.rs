@@ -592,21 +592,7 @@ pub(crate) async fn regenerate_repodata(
     repo: &str,
 ) -> Result<(), String> {
     let meta_prefix = format!("rpm/{repo}/{META_DIR}/");
-    let keys = storage
-        .list(&meta_prefix)
-        .await
-        .map_err(|e| format!("list sidecars: {e}"))?;
-
-    let mut pkgs = Vec::with_capacity(keys.len());
-    for key in &keys {
-        let data = storage
-            .get(key)
-            .await
-            .map_err(|e| format!("read sidecar {key}: {e}"))?;
-        let rec: PkgRecord =
-            serde_json::from_slice(&data).map_err(|e| format!("parse sidecar {key}: {e}"))?;
-        pkgs.push(rec);
-    }
+    let mut pkgs: Vec<PkgRecord> = super::read_json_sidecars(storage, &meta_prefix).await?;
     // Deterministic output: same package set → byte-identical repodata.
     pkgs.sort_by(|a, b| {
         (&a.name, a.epoch, &a.version, &a.release, &a.arch)

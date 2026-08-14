@@ -513,21 +513,7 @@ pub(crate) async fn regenerate_indexes(
     repo: &str,
 ) -> Result<(), String> {
     let meta_prefix = format!("deb/{repo}/{META_DIR}/");
-    let keys = storage
-        .list(&meta_prefix)
-        .await
-        .map_err(|e| format!("list sidecars: {e}"))?;
-
-    let mut pkgs = Vec::with_capacity(keys.len());
-    for key in &keys {
-        let data = storage
-            .get(key)
-            .await
-            .map_err(|e| format!("read sidecar {key}: {e}"))?;
-        let rec: PkgRecord =
-            serde_json::from_slice(&data).map_err(|e| format!("parse sidecar {key}: {e}"))?;
-        pkgs.push(rec);
-    }
+    let mut pkgs: Vec<PkgRecord> = super::read_json_sidecars(storage, &meta_prefix).await?;
     // Deterministic output: same package set → byte-identical indexes
     // (modulo the Release Date field).
     pkgs.sort_by(|a, b| {

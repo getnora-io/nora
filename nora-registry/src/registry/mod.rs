@@ -63,6 +63,38 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, allow)]).into_response()
 }
 
+/// How many JSON sidecars an index rebuild fetches from storage at once.
+/// The rpm/deb rebuild runs inside every publish request; sequential reads
+/// made each PUT O(repo size) in storage round-trips (~2 min per upload at
+/// ~1.7k packages on GCS).
+const SIDECAR_READ_CONCURRENCY: usize = 32;
+
+/// Read and parse every JSON sidecar under `prefix`, fetching concurrently.
+///
+/// Returns records in arbitrary order — callers sort for deterministic
+/// index output, so ordering here is free to follow fetch completion.
+pub(crate) async fn read_json_sidecars<T: serde::de::DeserializeOwned>(
+    storage: &crate::storage::Storage,
+    prefix: &str,
+) -> Result<Vec<T>, String> {
+    use futures::TryStreamExt;
+    let keys = storage
+        .list(prefix)
+        .await
+        .map_err(|e| format!("list sidecars: {e}"))?;
+    futures::stream::iter(keys)
+        .map(|key| async move {
+            let data = storage
+                .get(&key)
+                .await
+                .map_err(|e| format!("read sidecar {key}: {e}"))?;
+            serde_json::from_slice::<T>(&data).map_err(|e| format!("parse sidecar {key}: {e}"))
+        })
+        .buffer_unordered(SIDECAR_READ_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
 /// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
 /// its content mirrors the upstream; local publish/delete/reindex would
 /// diverge from (and be clobbered by) the next upstream metadata refresh.
