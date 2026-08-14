@@ -179,8 +179,7 @@ impl TokenStore {
         let file_path = self.storage_path.join(format!("{}.json", &file_id[..16]));
         let json =
             serde_json::to_string_pretty(&info).map_err(|e| TokenError::Storage(e.to_string()))?;
-        fs::write(&file_path, &json).map_err(|e| TokenError::Storage(e.to_string()))?;
-        set_file_permissions_600(&file_path);
+        write_token_file(&file_path, &json).map_err(|e| TokenError::Storage(e.to_string()))?;
 
         Ok(raw_token)
     }
@@ -242,8 +241,7 @@ impl TokenStore {
                 if let Ok(new_hash) = hash_token_argon2(token) {
                     info.token_hash = new_hash;
                     if let Ok(json) = serde_json::to_string_pretty(&info) {
-                        let _ = fs::write(&file_path, &json);
-                        set_file_permissions_600(&file_path);
+                        let _ = write_token_file(&file_path, &json);
                     }
                 }
                 true
@@ -354,9 +352,18 @@ impl TokenStore {
                 Err(_) => continue,
             };
             info.last_used = Some(*timestamp);
+            // Atomic replace (write temp + rename), NOT an in-place `fs::write`:
+            // this runs every 30s for every active token while `verify_token`
+            // reads the same file on its cache-miss path. An in-place write
+            // truncates first, so a concurrent read can observe a torn/empty
+            // file — a VALID token then 401s ("Invalid username or password")
+            // until a clean read repopulates the verify cache.
             if let Ok(json) = serde_json::to_string_pretty(&info) {
-                let _ = tokio::fs::write(&file_path, &json).await;
-                set_file_permissions_600(&file_path);
+                let tmp = file_path.with_extension("json.tmp");
+                if tokio::fs::write(&tmp, &json).await.is_ok() {
+                    set_file_permissions_600(&tmp);
+                    let _ = tokio::fs::rename(&tmp, &file_path).await;
+                }
             }
         }
 
@@ -462,6 +469,19 @@ fn set_file_permissions_600(path: &Path) {
     {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
+}
+
+/// Write a token file atomically: temp file in the same directory, permissions
+/// fixed, then rename over the target. `verify_token` reads these files on its
+/// cache-miss path while background rewrites happen, and a plain `fs::write`
+/// truncates in place — a concurrent reader can observe a torn/empty file and
+/// fail a valid token. Listings skip the temp name (extension is `tmp`, not
+/// `json`), and `is_valid_hash_prefix` keeps it out of revoke paths.
+fn write_token_file(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    set_file_permissions_600(&tmp);
+    fs::rename(&tmp, path)
 }
 
 #[derive(Debug, Error)]
@@ -921,6 +941,59 @@ mod tests {
         assert!(!is_valid_hash_prefix("../../etc/passwd")); // path traversal
         assert!(!is_valid_hash_prefix("..%2f..%2fetcpwd")); // encoded traversal
         assert!(!is_valid_hash_prefix("zzzzzzzzzzzzzzzz")); // non-hex
+    }
+
+    /// A corrupt/torn token file must surface as `Storage`, not `NotFound` —
+    /// the auth middleware maps `Storage` to 503 (retryable outage) and
+    /// everything else to 401 (credential verdict). Misclassifying a torn file
+    /// as `NotFound` turns a storage blip into an auth denial.
+    #[test]
+    fn verify_reports_storage_error_on_corrupt_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .unwrap();
+
+        // Corrupt the on-disk file the way a torn in-place write would.
+        let file = temp_dir
+            .path()
+            .join(format!("{}.json", &sha256_hex(&token)[..16]));
+        std::fs::write(&file, "{\"token_ha").unwrap();
+
+        assert!(matches!(
+            store.verify_token(&token),
+            Err(TokenError::Storage(_))
+        ));
+    }
+
+    /// `flush_last_used` must leave the token file whole (atomic replace) with
+    /// the timestamp applied, and clean up its temp file — a verify racing the
+    /// flush then can never observe a truncated file from NORA's own writes.
+    #[tokio::test]
+    async fn flush_last_used_replaces_file_atomically() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let token = store
+            .create_token("ci", 30, None, Role::Read)
+            .unwrap();
+
+        // Schedules a pending last_used update.
+        store.verify_token(&token).unwrap();
+        store.flush_last_used().await;
+
+        let prefix = &sha256_hex(&token)[..16];
+        let file = temp_dir.path().join(format!("{prefix}.json"));
+        let info: TokenInfo =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(info.last_used.is_some(), "flush must apply the timestamp");
+        assert!(
+            !temp_dir.path().join(format!("{prefix}.json.tmp")).exists(),
+            "temp file must be renamed away, not left behind"
+        );
+        // And the token still verifies from disk (fresh store = no warm cache).
+        let cold = TokenStore::new(temp_dir.path());
+        assert!(cold.verify_token(&token).is_ok());
     }
 
     #[test]
