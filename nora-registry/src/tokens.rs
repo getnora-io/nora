@@ -951,9 +951,7 @@ mod tests {
     fn verify_reports_storage_error_on_corrupt_file() {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
-        let token = store
-            .create_token("ci", 30, None, Role::Read)
-            .unwrap();
+        let token = store.create_token("ci", 30, None, Role::Read).unwrap();
 
         // Corrupt the on-disk file the way a torn in-place write would.
         let file = temp_dir
@@ -974,9 +972,7 @@ mod tests {
     async fn flush_last_used_replaces_file_atomically() {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
-        let token = store
-            .create_token("ci", 30, None, Role::Read)
-            .unwrap();
+        let token = store.create_token("ci", 30, None, Role::Read).unwrap();
 
         // Schedules a pending last_used update.
         store.verify_token(&token).unwrap();
