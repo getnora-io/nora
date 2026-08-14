@@ -1,0 +1,98 @@
+name: PR Image Cleanup
+
+# Garbage-collects the per-PR test images that ci.yml's `pr-image` job pushes
+# (ghcr.io/getnora-io/nora:pr-<N>). GHCR has no native TTL for container tags, so
+# rotation is explicit — two layers:
+#   1. delete-on-close  — remove pr-<N> the moment its PR closes (lifetime = PR lifetime)
+#   2. 7-day sweep      — daily cron deletes any pr-* orphan whose close-delete didn't run
+#
+# Closes #909.
+#
+# ⚠️ Token: deleting an org-owned container version (DELETE /orgs/{org}/packages/...) may,
+# per org policy, need a token with `delete:packages` rather than the workflow GITHUB_TOKEN.
+# We try GITHUB_TOKEN (packages: write, which covers repo-linked packages) and fall back to
+# a GHCR_CLEANUP_TOKEN secret if set. If the first live close 403s on DELETE, provision
+# GHCR_CLEANUP_TOKEN (a least-privilege PAT scoped to delete:packages) and re-run.
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: "17 3 * * *" # daily 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+concurrency:
+  group: pr-image-cleanup-${{ github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  delete-on-close:
+    name: Delete pr-<N> on PR close
+    # Only same-repo PRs ever get an image (ci.yml pr-image skips forks), so only they
+    # need cleanup; fork close events carry a read-only token and have nothing to delete.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete the closed PR's image tag
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN || secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          pkg=nora
+          tag="pr-${PR}"
+          # No `| head` here: under pipefail a closed pipe SIGPIPEs gh (141) and aborts.
+          vids=$(gh api --paginate \
+            "/orgs/${OWNER}/packages/container/${pkg}/versions" \
+            --jq ".[] | select((.metadata.container.tags // []) | index(\"${tag}\")) | .id")
+          vid="${vids%%$'\n'*}"
+          if [ -z "${vid}" ]; then
+            echo "no image tagged ${tag} — nothing to delete"
+            exit 0
+          fi
+          echo "deleting ${pkg}:${tag} (version ${vid})"
+          gh api -X DELETE "/orgs/${OWNER}/packages/container/${pkg}/versions/${vid}"
+
+  sweep-stale:
+    name: Sweep pr-* images older than 7 days
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete pr-* versions with updated_at older than 7 days
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN || secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          pkg=nora
+          cutoff=$(date -u -d '7 days ago' +%s)
+          deleted=0
+          # 404 = no such package yet (nothing pushed) -> nothing to sweep, exit clean.
+          # Any other failure (e.g. 403 on the token) must surface, not be swallowed.
+          if ! gh api --paginate \
+            "/orgs/${OWNER}/packages/container/${pkg}/versions" \
+            --jq '.[] | select((.metadata.container.tags // []) | any(startswith("pr-"))) | [.id, .updated_at] | @tsv' \
+            > versions.tsv 2>list.err; then
+            if grep -q '"status": *"404"' list.err; then
+              echo "package ${pkg} has no versions yet — nothing to sweep"
+              exit 0
+            fi
+            echo "::error::failed to list ${pkg} versions (token/permission?):"; cat list.err
+            exit 1
+          fi
+          while IFS=$'\t' read -r id upd; do
+            [ -z "${id:-}" ] && continue
+            ts=$(date -u -d "${upd}" +%s)
+            if [ "${ts}" -lt "${cutoff}" ]; then
+              echo "deleting stale version ${id} (updated ${upd})"
+              gh api -X DELETE "/orgs/${OWNER}/packages/container/${pkg}/versions/${id}"
+              deleted=$((deleted + 1))
+            fi
+          done < versions.tsv
+          echo "swept ${deleted} stale pr-* image(s)"
