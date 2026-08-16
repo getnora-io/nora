@@ -1049,6 +1049,9 @@ mod tests {
             )> {
                 Err(crate::storage::StorageError::NotFound)
             }
+            async fn copy(&self, _src: &str, _dst: &str) -> crate::storage::Result<()> {
+                Err(crate::storage::StorageError::NotFound)
+            }
         }
 
         let stat_calls = Arc::new(AtomicUsize::new(0));

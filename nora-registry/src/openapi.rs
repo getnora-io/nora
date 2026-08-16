@@ -455,14 +455,19 @@ pub async fn docker_manifest_delete() {}
 /// Start blob upload
 ///
 /// Initiates a resumable blob upload. Returns a Location header with the upload URL.
+/// With `mount` + `from`, links a blob the source repository already holds instead;
+/// if it cannot be mounted, an upload session is started as usual.
 #[utoipa::path(
     post,
     path = "/v2/{name}/blobs/uploads/",
     tag = "docker",
     params(
-        ("name" = String, Path, description = "Repository name")
+        ("name" = String, Path, description = "Repository name"),
+        ("mount" = Option<String>, Query, description = "Digest of an existing blob to mount (sha256:...)"),
+        ("from" = Option<String>, Query, description = "Repository that holds the blob to mount")
     ),
     responses(
+        (status = 201, description = "Blob mounted, Location header contains the blob URL"),
         (status = 202, description = "Upload started, Location header contains upload URL"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")

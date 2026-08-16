@@ -1110,6 +1110,9 @@ mod tests {
         )> {
             Err(crate::storage::StorageError::NotFound)
         }
+        async fn copy(&self, _src: &str, _dst: &str) -> crate::storage::Result<()> {
+            Err(crate::storage::StorageError::NotFound)
+        }
     }
 
     /// #610 (hardening for #584): an orphan whose age cannot be determined
