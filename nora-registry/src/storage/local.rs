@@ -321,6 +321,38 @@ impl StorageBackend for LocalStorage {
         }
     }
 
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        let src_path = self.key_to_path(src);
+        let dst_path = self.key_to_path(dst);
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        // Hard link: the two keys share one inode, so a mounted blob costs no
+        // extra bytes and cannot drift from its source.
+        let linked = match fs::hard_link(&src_path, &dst_path).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&dst_path).await?;
+                fs::hard_link(&src_path, &dst_path).await
+            }
+            other => other,
+        };
+        match linked {
+            Ok(()) => sync_parent_dir(&dst_path).await,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+            // Cross-device, or a filesystem without links — copy the bytes.
+            Err(_) => {
+                fs::copy(&src_path, &dst_path).await.map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        StorageError::NotFound
+                    } else {
+                        StorageError::Io(e)
+                    }
+                })?;
+                sync_parent_dir(&dst_path).await
+            }
+        }
+    }
+
     async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let path = self.key_to_path(key);
         let file = fs::File::open(&path).await.map_err(|e| {

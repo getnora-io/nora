@@ -401,6 +401,14 @@ impl StorageBackend for ObjectStorage {
         Ok(())
     }
 
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        // Store-side copy (S3 CopyObject / GCS rewrite) — no bytes cross the
+        // network through this process.
+        let from_path = Path::from(encode_object_key(src));
+        let to_path = Path::from(encode_object_key(dst));
+        self.store.copy(&from_path, &to_path).await.map_err(map_err)
+    }
+
     async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);

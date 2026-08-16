@@ -121,6 +121,13 @@ pub trait StorageBackend: Send + Sync {
     /// The caller is responsible for deleting `src` on error.
     async fn put_from_path(&self, key: &str, src: &Path) -> Result<()>;
 
+    /// Server-side copy of `src` to `dst` inside the backend — the bytes never
+    /// transit this process.
+    ///
+    /// Returns [`StorageError::NotFound`] when `src` does not exist; an existing
+    /// `dst` is overwritten.
+    async fn copy(&self, src: &str, dst: &str) -> Result<()>;
+
     /// Open an artifact for streaming read without loading it into memory (#580).
     ///
     /// Returns `(size_bytes, reader)`. The caller converts the reader to a
@@ -630,6 +637,61 @@ impl Storage {
         }
     }
 
+    /// Server-side copy of `src` to `dst` (see [`StorageBackend::copy`]).
+    ///
+    /// `sha256` is the lowercase hex digest of the copied bytes; when present it
+    /// is pinned for `dst` without reading the object back. When it is `None`,
+    /// `dst` inherits the pin of `src` if `src` carries one, and otherwise stays
+    /// open-world — as [`put_from_path`](Self::put_from_path) does.
+    pub async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+        validate_storage_key(src)?;
+        validate_storage_key(dst)?;
+        match self.inner.copy(src, dst).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS.with_label_values(&["copy", "ok"]).inc();
+                let hash = sha256
+                    .map(str::to_ascii_lowercase)
+                    .or_else(|| self.get_pin_hash(src));
+                if let (Some(hash), Some(ref pins)) = (hash, &self.pin_store) {
+                    let pins = Arc::clone(pins);
+                    let key_owned = dst.to_string();
+                    // Fail closed like `put`/`put_from_path`: a copied-but-unpinned
+                    // blob would be served without verification (#582/#604).
+                    match tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["copy", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %dst, "hash-pin record failed");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["copy", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %dst, "hash-pin record task panicked");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["copy", "error"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
     /// Open an artifact for streaming read without loading into memory (#580).
     ///
     /// Returns `(size_bytes, reader)`. Pin-store integrity is NOT checked here
@@ -728,6 +790,49 @@ mod tests {
         );
         // And the recorded pin must match the bytes (a subsequent get verifies).
         assert_eq!(&storage.get("raw/x/app.bin").await.unwrap()[..], b"payload");
+    }
+
+    /// A cross-repo copy must land the same bytes AND arrive pinned, so the
+    /// destination is served verified rather than open-world.
+    #[tokio::test]
+    async fn copy_duplicates_bytes_and_pins_destination() {
+        use nora_registry::verified::GateOutcome;
+
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let hash = hex::encode(Sha256::digest(b"layer"));
+
+        storage.put("docker/src/blobs/x", b"layer").await.unwrap();
+        storage
+            .copy("docker/src/blobs/x", "docker/dst/blobs/x", Some(&hash))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &storage.get("docker/dst/blobs/x").await.unwrap()[..],
+            b"layer"
+        );
+        assert_eq!(
+            storage.get_pin_hash("docker/dst/blobs/x").as_deref(),
+            Some(hash.as_str())
+        );
+        assert!(matches!(
+            storage.get_verified("docker/dst/blobs/x").await.unwrap(),
+            GateOutcome::Verified(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn copy_missing_source_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+
+        assert!(matches!(
+            storage
+                .copy("docker/src/blobs/gone", "docker/dst/blobs/gone", None)
+                .await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]
