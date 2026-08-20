@@ -14,7 +14,7 @@
 //! - **Raw**: no orphan detection (no version/reference model)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use prometheus::{
@@ -818,82 +818,6 @@ async fn clean_pypi_metadata(
 }
 
 // ============================================================================
-// Background scheduler
-// ============================================================================
-
-/// Spawn a background GC task that runs periodically.
-/// Accepts a shared cleanup lock to prevent concurrent runs with retention scheduler.
-/// Returns a `JoinHandle` so the caller can await graceful completion on shutdown.
-pub fn spawn_gc_scheduler(
-    storage: Storage,
-    publish_locks: PublishLocks,
-    interval_secs: u64,
-    dry_run: bool,
-    grace_secs: u64,
-    cleanup_lock: Arc<tokio::sync::Mutex<()>>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        // The interval's first tick fires immediately: GC runs once at boot,
-        // then every `interval_secs` — a process restarting more often than
-        // the interval otherwise never collects anything (see the matching
-        // note in `spawn_retention_scheduler`).
-        let mut boot_run = true;
-
-        loop {
-            // CANCEL-SAFETY: interval.tick() holds no state between polls.
-            // cancel.cancelled() is a CancellationToken — safe to drop at any point.
-            // GC work happens entirely within the tick handler below, not across awaits.
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("GC scheduler: cancellation requested, stopping");
-                    break;
-                }
-                _ = interval.tick() => {}
-            }
-
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            // Cross-scheduler lock: skip if GC or retention is already running.
-            // The boot run waits for the lock instead — retention's boot pass
-            // fires at the same instant, and skipping would postpone the first
-            // GC by a whole interval again.
-            let guard = if boot_run {
-                boot_run = false;
-                // CANCEL-SAFETY: the boot pass waits on the lock (vs skip-if-held) so it
-                // can't forfeit its first run to retention's simultaneous boot pass — but
-                // race the wait against cancellation, so a SIGTERM during boot contention
-                // breaks promptly instead of blocking behind the sibling's whole pass.
-                // Dropping the not-yet-acquired lock() future only removes this waiter.
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    g = cleanup_lock.lock() => Ok(g),
-                }
-            } else {
-                cleanup_lock.try_lock()
-            };
-            let Ok(guard) = guard else {
-                info!("GC: cleanup lock held (GC or retention running), skipping");
-                continue;
-            };
-
-            info!("GC scheduler: starting periodic run");
-            let result = run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
-            info!(
-                "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
-                result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
-                result.metadata_phantoms_removed, result.skipped_recent
-            );
-
-            drop(guard);
-        }
-    })
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -901,6 +825,7 @@ pub fn spawn_gc_scheduler(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -1888,138 +1813,5 @@ mod tests {
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
-    }
-
-    /// The scheduler must run once at boot, not a full interval later — a
-    /// process that restarts more often than the interval otherwise never
-    /// collects anything.
-    #[tokio::test]
-    async fn test_gc_scheduler_runs_at_boot() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-        // Orphan checksum sidecar: no primary artifact next to it.
-        storage
-            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
-            .await
-            .unwrap();
-
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_gc_scheduler(
-            storage.clone(),
-            test_publish_locks(),
-            86400, // the boot run must not wait for this
-            false,
-            0,
-            Arc::new(tokio::sync::Mutex::new(())),
-            cancel.clone(),
-        );
-
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while storage
-            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
-            .await
-            .is_ok()
-        {
-            assert!(Instant::now() < deadline, "boot run never fired");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        cancel.cancel();
-        handle.await.unwrap();
-    }
-
-    /// The boot pass waits on the shared cleanup lock instead of the
-    /// periodic skip-if-held — losing the boot race to the sibling scheduler
-    /// must delay the first run, not forfeit it for a whole interval.
-    #[tokio::test]
-    async fn test_gc_boot_run_waits_for_cleanup_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-        storage
-            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
-            .await
-            .unwrap();
-
-        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let held = cleanup_lock.clone().lock_owned().await;
-
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_gc_scheduler(
-            storage.clone(),
-            test_publish_locks(),
-            86400,
-            false,
-            0,
-            cleanup_lock,
-            cancel.clone(),
-        );
-
-        // While the lock is held the boot pass must be parked, not skipped.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(storage
-            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
-            .await
-            .is_ok());
-
-        drop(held);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while storage
-            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
-            .await
-            .is_ok()
-        {
-            assert!(
-                Instant::now() < deadline,
-                "boot run skipped instead of waiting for the lock"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        cancel.cancel();
-        handle.await.unwrap();
-    }
-
-    /// A shutdown requested while the boot pass is parked on the cleanup lock
-    /// must break promptly — not wait out the lock holder and then run a full
-    /// pass after cancellation was already requested.
-    #[tokio::test]
-    async fn test_gc_boot_run_cancels_while_parked() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-        // Orphan checksum sidecar the boot GC would collect if it ever ran.
-        storage
-            .put("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256", b"deadbeef")
-            .await
-            .unwrap();
-
-        let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let held = cleanup_lock.clone().lock_owned().await;
-
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_gc_scheduler(
-            storage.clone(),
-            test_publish_locks(),
-            86400,
-            false,
-            0,
-            cleanup_lock,
-            cancel.clone(),
-        );
-
-        // Let the boot pass reach the parked lock().await, then ask to stop.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        cancel.cancel();
-
-        // The scheduler must stop even though the lock is still held — the boot
-        // acquire races cancellation, so it can't block behind the holder.
-        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-            .await
-            .expect("scheduler did not stop when cancelled while parked on the boot lock")
-            .unwrap();
-
-        // It never acquired the lock, so it never collected the orphan.
-        assert!(storage
-            .get("npm/lodash/tarballs/lodash-1.0.0.tgz.sha256")
-            .await
-            .is_ok());
-        drop(held);
     }
 }

@@ -26,6 +26,7 @@ mod auth;
 mod backup;
 mod cache_ttl;
 mod circuit_breaker;
+mod cleanup;
 mod config;
 mod curation;
 mod dashboard_metrics;
@@ -1611,23 +1612,99 @@ async fn run_server(mut config: Config, storage: Storage) {
     let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
     state.circuit_breaker.init_gauges(&registry_names);
 
-    // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
+    // Shared lock: nothing that calls storage.delete may run concurrently.
+    // The periodic cleanup cycle takes it once per cycle and runs every due
+    // pass under it; it also serializes future manual/admin cleanup entry
+    // points against that cycle.
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Spawn background GC scheduler if enabled
-    if state.config.gc.enabled {
-        let handle = gc::spawn_gc_scheduler(
-            state.storage.clone(),
-            state.publish_locks.clone(),
-            state.config.gc.interval,
-            state.config.gc.dry_run,
-            state.config.gc.grace_secs,
-            cleanup_lock.clone(),
-            cancel_token.clone(),
+    // Retention is pushed first: it deletes expired versions, creating the
+    // orphans the GC pass then sweeps in the same cycle.
+    let mut cleanup_passes: Vec<cleanup::CleanupPass> = Vec::new();
+
+    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+        let storage = state.storage.clone();
+        let publish_locks = state.publish_locks.clone();
+        let signer = state.signer.clone();
+        let rules = state.config.retention.rules.clone();
+        let dry_run = state.config.retention.dry_run;
+        let audit = state.audit.clone();
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "retention",
+            interval: std::time::Duration::from_secs(state.config.retention.interval),
+            run: Box::new(move || {
+                let storage = storage.clone();
+                let publish_locks = publish_locks.clone();
+                let signer = signer.clone();
+                let rules = rules.clone();
+                let audit = audit.clone();
+                async move {
+                    info!(
+                        dry_run = dry_run,
+                        "Retention scheduler: starting periodic run"
+                    );
+                    let result = retention::run_retention(
+                        &storage,
+                        &publish_locks,
+                        signer.as_deref(),
+                        &rules,
+                        dry_run,
+                    )
+                    .await;
+                    info!(
+                        "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
+                        result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
+                    );
+
+                    if result.planned > 0 {
+                        audit.log(audit::AuditEntry::new(
+                            "retention-apply",
+                            "scheduler",
+                            &format!("{} versions", result.planned),
+                            "*",
+                            &format!(
+                                "keys={} bytes_freed={} duration={:.1}s",
+                                result.deleted_keys, result.bytes_freed, result.duration_secs
+                            ),
+                        ));
+                    }
+                }
+                .boxed()
+            }),
+        });
+        info!(
+            interval_secs = state.config.retention.interval,
+            rules = state.config.retention.rules.len(),
+            dry_run = state.config.retention.dry_run,
+            "Retention scheduler started"
         );
-        scheduler_handles.push(handle);
+    }
+
+    if state.config.gc.enabled {
+        let storage = state.storage.clone();
+        let publish_locks = state.publish_locks.clone();
+        let dry_run = state.config.gc.dry_run;
+        let grace_secs = state.config.gc.grace_secs;
+        cleanup_passes.push(cleanup::CleanupPass {
+            name: "gc",
+            interval: std::time::Duration::from_secs(state.config.gc.interval),
+            run: Box::new(move || {
+                let storage = storage.clone();
+                let publish_locks = publish_locks.clone();
+                async move {
+                    info!("GC scheduler: starting periodic run");
+                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
+                    info!(
+                        "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
+                        result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
+                        result.metadata_phantoms_removed, result.skipped_recent
+                    );
+                }
+                .boxed()
+            }),
+        });
         info!(
             interval_secs = state.config.gc.interval,
             dry_run = state.config.gc.dry_run,
@@ -1635,26 +1712,12 @@ async fn run_server(mut config: Config, storage: Storage) {
         );
     }
 
-    // Spawn background retention scheduler if enabled
-    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
-        let handle = retention::spawn_retention_scheduler(
-            state.storage.clone(),
-            state.publish_locks.clone(),
-            state.signer.clone(),
-            state.config.retention.rules.clone(),
-            state.config.retention.interval,
-            state.config.retention.dry_run,
-            Some(state.audit.clone()),
-            cleanup_lock.clone(),
+    if !cleanup_passes.is_empty() {
+        scheduler_handles.push(cleanup::spawn_cleanup_scheduler(
+            cleanup_passes,
+            cleanup_lock,
             cancel_token.clone(),
-        );
-        scheduler_handles.push(handle);
-        info!(
-            interval_secs = state.config.retention.interval,
-            rules = state.config.retention.rules.len(),
-            dry_run = state.config.retention.dry_run,
-            "Retention scheduler started"
-        );
+        ));
     }
 
     let app = Router::new()
