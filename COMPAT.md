@@ -27,6 +27,22 @@ This document describes which parts of each registry protocol are implemented in
 | Cross-repo blob mount | POST | — | Not implemented |
 | Referrers API | GET | — | OCI 1.1 referrers |
 
+### Proxy cache and tag freshness
+
+- Digest references (`sha256:…`) are content-addressed: cached forever, never
+  revalidated.
+- Tag references on **proxied** images are revalidated against the upstream on
+  every pull by default (`docker.metadata_ttl = -1`). A positive
+  `metadata_ttl` (seconds) is the staleness bound: within the window the
+  cached tag is served without an upstream round trip; after it, the next pull
+  revalidates. `0` or negative always revalidates.
+- If every configured upstream fails and `docker.serve_stale = true`
+  (default), the last cached manifest is served with `x-nora-stale: true`.
+- Locally **pushed** (hosted) images are authoritative: a pushed tag is served
+  as-is and never revalidated against an upstream. Pushing to a name that
+  would otherwise proxy pins that tag to the pushed copy — to keep a tag
+  tracking the upstream, do not push to it.
+
 ### Known Limitations
 - Max 2-level image path: `org/image:tag` works, `org/sub/path/image:tag` returns 404
 - Large monolithic blob PUT (>~500MB) may fail even with high body limit

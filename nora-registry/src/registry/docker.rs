@@ -208,19 +208,25 @@ pub(crate) fn canonicalize(
 /// Try to get content from namespaced key, falling back to legacy (non-namespaced) key.
 ///
 /// This provides backward compatibility during migration from flat to namespaced storage.
+/// The fallback fires ONLY on `NotFound`: the two keys can hold different bytes (a
+/// proxied-current copy vs a pre-migration one), so falling back on a transient backend
+/// error would make which copy is served depend on backend weather — a per-request
+/// divergent answer for the same reference. Transient errors propagate instead.
 async fn storage_get_with_fallback(
     storage: &Storage,
     ns_key: &str,
     legacy_key: &str,
 ) -> Result<Bytes, crate::storage::StorageError> {
     match storage.get(ns_key).await {
-        Ok(data) => Ok(data),
-        Err(_) if ns_key != legacy_key => storage.get(legacy_key).await,
-        Err(e) => Err(e),
+        Err(crate::storage::StorageError::NotFound) if ns_key != legacy_key => {
+            storage.get(legacy_key).await
+        }
+        other => other,
     }
 }
 
 /// Open a streaming reader for a blob, trying namespaced then legacy key (#580).
+/// Legacy fallback on `NotFound` only, like [`storage_get_with_fallback`].
 async fn storage_get_reader_with_fallback(
     storage: &Storage,
     ns_key: &str,
@@ -233,9 +239,10 @@ async fn storage_get_reader_with_fallback(
     crate::storage::StorageError,
 > {
     match storage.get_reader(ns_key).await {
-        Ok(reader) => Ok(reader),
-        Err(_) if ns_key != legacy_key => storage.get_reader(legacy_key).await,
-        Err(e) => Err(e),
+        Err(crate::storage::StorageError::NotFound) if ns_key != legacy_key => {
+            storage.get_reader(legacy_key).await
+        }
+        other => other,
     }
 }
 
@@ -2145,10 +2152,29 @@ async fn get_manifest(
     // bare key is what `put_manifest` writes — a bare-key hit is a locally pushed (hosted)
     // manifest. (Pre-#349 flat-keyed proxy caches are consequently read as hosted; the cost
     // is skipped tag revalidation on those legacy entries.)
+    // Provenance decides freshness below, so a transient storage error must fail closed
+    // (500) rather than fall through to the legacy key or the proxy: an error-driven
+    // fallback silently flips WHICH copy answers (proxied-current vs legacy/hosted), and
+    // an error-driven proxy would resolve a hosted name against an upstream that may be
+    // squatted. Only `NotFound` may advance to the next source.
+    use crate::storage::StorageError;
     let (cached, hosted) = match state.storage.get(&key).await {
         Ok(data) => (Some(data), key == legacy_key),
-        Err(_) if key != legacy_key => (state.storage.get(&legacy_key).await.ok(), true),
-        Err(_) => (None, true),
+        Err(StorageError::NotFound) if key != legacy_key => {
+            match state.storage.get(&legacy_key).await {
+                Ok(data) => (Some(data), true),
+                Err(StorageError::NotFound) => (None, true),
+                Err(e) => {
+                    tracing::error!(error = %e, key = %legacy_key, "manifest read failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        Err(StorageError::NotFound) => (None, true),
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "manifest read failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     // Digest references are immutable (content-addressed) → the cache is authoritative forever.
     // Tag references on PROXIED copies are MUTABLE: a tag can be re-pushed to point at a
@@ -5471,5 +5497,154 @@ mod integration_tests {
             ctx.state.storage.get(&key).await.is_ok(),
             "verified blob must be cached"
         );
+    }
+
+    /// Storage backend that delegates to local storage but fails `get`/`get_reader`
+    /// with a transient (non-`NotFound`) error for keys under a given prefix —
+    /// models an object-store blip on the namespaced key while the legacy key
+    /// stays readable.
+    struct FailingPrefixBackend {
+        inner: crate::storage::LocalStorage,
+        fail_prefix: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for FailingPrefixBackend {
+        async fn put(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn get(&self, key: &str) -> crate::storage::Result<axum::body::Bytes> {
+            if key.starts_with(&self.fail_prefix) {
+                return Err(crate::storage::StorageError::Network("injected".into()));
+            }
+            self.inner.get(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "failing-prefix-test"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            if key.starts_with(&self.fail_prefix) {
+                return Err(crate::storage::StorageError::Network("injected".into()));
+            }
+            self.inner.get_reader(key).await
+        }
+    }
+
+    fn unreachable_upstream() -> crate::config::DockerUpstream {
+        crate::config::DockerUpstream {
+            // Reserved port on localhost — connect fails fast, no real network.
+            url: "http://127.0.0.1:9".to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }
+    }
+
+    async fn get_manifest_via_dispatch(
+        state: &crate::AppState,
+        path: &str,
+    ) -> axum::response::Response {
+        use axum::extract::{Path, State};
+        use axum::http::Uri;
+        use axum::Extension;
+        super::docker_v2_dispatch(
+            State(state.clone()),
+            Method::GET,
+            Path(path.to_string()),
+            Extension(crate::auth::NamespaceAuthority::Unrestricted),
+            format!("/v2/{path}").parse::<Uri>().unwrap(),
+            axum::http::HeaderMap::new(),
+            Body::empty(),
+        )
+        .await
+    }
+
+    /// A transient storage error on the namespaced manifest key must fail closed
+    /// (500) — NOT silently serve the legacy (flat-key) copy. The two keys can
+    /// hold different bytes (proxied-current vs pre-migration), so an
+    /// error-driven fallback makes tag resolution flip per request with backend
+    /// weather. Drives the real `get_manifest` read via `docker_v2_dispatch`.
+    #[tokio::test]
+    async fn manifest_get_fails_closed_on_transient_storage_error() {
+        use std::sync::Arc;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![unreachable_upstream()];
+        });
+
+        // Legacy (flat) copy exists and is readable.
+        ctx.state
+            .storage
+            .put("docker/app/manifests/latest.json", b"{\"legacy\":true}")
+            .await
+            .unwrap();
+
+        // Same files, but the namespaced key errors transiently. Namespace for
+        // an http://127.0.0.1:9 upstream is "127.0.0.1".
+        let mut flaky = ctx.state.clone();
+        flaky.storage = crate::storage::Storage::from_backend(Arc::new(FailingPrefixBackend {
+            inner: crate::storage::LocalStorage::new(ctx._tempdir.path().to_str().unwrap()),
+            fail_prefix: "docker/127.0.0.1/".to_string(),
+        }));
+
+        let resp = get_manifest_via_dispatch(&flaky, "app/manifests/latest").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "transient error on the namespaced key must fail closed, not fall back"
+        );
+    }
+
+    /// The legacy-key fallback still works for the case it exists for: the
+    /// namespaced key is genuinely absent (`NotFound`) and a flat-key hosted
+    /// copy exists. Served as locally authoritative — no upstream round trip,
+    /// so no `x-nora-stale` even though the configured upstream is unreachable.
+    #[tokio::test]
+    async fn manifest_get_serves_hosted_legacy_on_ns_not_found() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![unreachable_upstream()];
+        });
+
+        ctx.state
+            .storage
+            .put("docker/app/manifests/latest.json", b"{\"legacy\":true}")
+            .await
+            .unwrap();
+
+        let resp = get_manifest_via_dispatch(&ctx.state, "app/manifests/latest").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-nora-stale").is_none(),
+            "hosted copy is authoritative — must not be served via the stale path"
+        );
+        let body = body_bytes(resp).await;
+        assert_eq!(body.as_ref(), b"{\"legacy\":true}");
     }
 }
