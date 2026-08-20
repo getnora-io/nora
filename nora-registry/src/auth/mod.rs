@@ -398,6 +398,19 @@ pub async fn auth_middleware(
                     request.extensions_mut().insert(AuthenticatedRole(role));
                     return next.run(request).await;
                 }
+                // A store I/O/parse failure is not a credential verdict. Only an
+                // `nra_`-prefixed token reaches disk (anything else returns
+                // `InvalidFormat` first), so there is no OIDC identity to fall
+                // through to: answer 503 so the client retries, instead of a 401
+                // that makes valid creds flap during a storage blip.
+                Err(crate::tokens::TokenError::Storage(e)) => {
+                    tracing::error!(error = %e, "token store read failed during Bearer auth");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Token verification unavailable",
+                    )
+                        .into_response();
+                }
                 Err(_) => {
                     // Token verification failed — fall through to OIDC
                 }
@@ -496,11 +509,19 @@ pub async fn auth_middleware(
     // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
     // path must fall through to token verification for token auth to work at all. (#736)
     if !auth.authenticate(username, password) {
-        if let Some((token_user, role)) = state
-            .tokens
-            .as_ref()
-            .and_then(|ts| ts.verify_token(password).ok())
-        {
+        let token_result = state.tokens.as_ref().map(|ts| ts.verify_token(password));
+        // Same fail-closed rule as the Bearer path: a store I/O/parse failure is
+        // not "wrong password". A 401 here makes valid token creds flap and feeds
+        // the failure tracker toward lockout for the duration of a storage blip.
+        if let Some(Err(crate::tokens::TokenError::Storage(ref e))) = token_result {
+            tracing::error!(error = %e, "token store read failed during Basic auth fallback");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Token verification unavailable",
+            )
+                .into_response();
+        }
+        if let Some(Ok((token_user, role))) = token_result {
             if let Some(ip) = client_ip {
                 state.auth_failures.record_success(&ip);
             }
@@ -1165,6 +1186,73 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Path of a stored token's on-disk file inside a test context.
+    fn token_file_path(ctx: &crate::test_helpers::TestContext, token: &str) -> std::path::PathBuf {
+        use sha2::Digest;
+        let prefix = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+        ctx._tempdir
+            .path()
+            .join("tokens")
+            .join(format!("{}.json", &prefix[..16]))
+    }
+
+    /// A token-store read failure (torn/corrupt file, I/O error) is an outage,
+    /// not a credential verdict: Basic auth with a valid-format token must
+    /// answer 503 (retryable), never 401 — a 401 makes valid creds flap and
+    /// walks the per-IP failure tracker toward lockout for the duration of a
+    /// storage blip. Regression for the 2026-08 same-creds 200↔401 flap.
+    #[tokio::test]
+    async fn test_basic_auth_token_store_error_returns_503_not_401() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        // Corrupt the file the way a torn in-place rewrite would. The token was
+        // never verified, so the in-memory cache is cold and the disk is read.
+        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+
+        let header_val = format!("Basic {}", STANDARD.encode(format!("ci:{token}")));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Same rule on the Bearer path: an `nra_` token that cannot be verified
+    /// because the store read failed must 503, not fall through to OIDC and 401.
+    #[tokio::test]
+    async fn test_bearer_token_store_error_returns_503_not_401() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+
+        let header_val = format!("Bearer {token}");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
