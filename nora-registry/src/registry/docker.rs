@@ -5731,6 +5731,9 @@ mod integration_tests {
         fn backend_name(&self) -> &'static str {
             "failing-prefix-test"
         }
+        async fn copy(&self, src: &str, dst: &str) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst).await
+        }
         async fn put_from_path(
             &self,
             key: &str,
