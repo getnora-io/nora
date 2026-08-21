@@ -1108,6 +1108,9 @@ mod tests {
             ) -> StorageResult<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
                 Err(StorageError::NotFound)
             }
+            async fn copy(&self, _src: &str, _dst: &str) -> StorageResult<()> {
+                Err(StorageError::NotFound)
+            }
         }
 
         let storage = Storage::from_backend(std::sync::Arc::new(FailingGetBackend));

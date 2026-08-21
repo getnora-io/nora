@@ -905,6 +905,10 @@ async fn docker_v2_dispatch(
                             body,
                         )
                         .await
+                    } else if let (Some(digest), Some(from)) =
+                        (params.get("mount"), params.get("from"))
+                    {
+                        mount_blob(state, name, from, digest).await
                     } else {
                         start_upload(state, Path(name.to_string())).await
                     }
@@ -1425,6 +1429,97 @@ async fn download_blob(
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// 201 for a blob that is now present in `name`, in the shape `upload_blob`
+/// returns.
+fn blob_created(name: &str, digest: &str) -> Response {
+    (
+        StatusCode::CREATED,
+        [
+            (header::LOCATION, format!("/v2/{}/blobs/{}", name, digest)),
+            (
+                HeaderName::from_static("docker-content-digest"),
+                digest.to_string(),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// Cross-repo blob mount: `POST /v2/{name}/blobs/uploads/?mount=<digest>&from=<repo>`
+/// links a blob that `from` already holds into `name` with no re-upload.
+///
+/// Every reason a mount cannot happen — unknown digest, unusable source repo,
+/// storage failure, a digest still held by quarantine — degrades to a normal
+/// upload session (202) instead of an error, as the OCI distribution spec
+/// requires: the client then pushes the blob itself.
+async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: &str) -> Response {
+    let c = canonicalize(raw_name, &state.config.docker);
+    if let Some(r) = c.denied_response() {
+        return r;
+    }
+    let name = c.name;
+    if let Err(e) = validate_docker_name(&name) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    };
+    if validate_digest(digest).is_err() {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    }
+
+    // Reads are never namespace-gated (see docker_v2_dispatch); the write scope
+    // on `name` was already enforced there.
+    let c_from = canonicalize(from, &state.config.docker);
+    if c_from.denied || validate_docker_name(&c_from.name).is_err() {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    }
+
+    // Must match the key upload finalization writes.
+    let dst_key = format!("docker/{}/blobs/{}", name, digest);
+    if state.storage.stat(&dst_key).await.is_some() {
+        return blob_created(&name, digest);
+    }
+
+    // A digest still inside its proxy cooldown must not be laundered into a
+    // local repository by a mount.
+    if quarantine_cache_serve_gate(&state, digest).is_some() {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    }
+
+    let ns_key = blob_key(c_from.namespace.as_deref(), &c_from.name, digest);
+    let legacy_key = blob_key(None, &c_from.name, digest);
+    let src_key = if state.storage.stat(&ns_key).await.is_some() {
+        ns_key
+    } else if ns_key != legacy_key && state.storage.stat(&legacy_key).await.is_some() {
+        legacy_key
+    } else {
+        return start_upload(state, Path(raw_name.to_string())).await;
+    };
+
+    if let Err(e) = state.storage.copy(&src_key, &dst_key, Some(hex)).await {
+        tracing::warn!(error = %e, src = %src_key, dst = %dst_key, "Blob mount failed, falling back to upload");
+        return start_upload(state, Path(raw_name.to_string())).await;
+    }
+
+    state.audit.log(AuditEntry::new(
+        "mount",
+        "api",
+        &format!("{}@{}", name, digest),
+        "docker",
+        "blob",
+    ));
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        format!("{}@{}", name, &digest[..19.min(digest.len())]),
+        crate::registry_type::RegistryType::Docker,
+        "LOCAL",
+    ));
+    state.repo_index.invalidate("docker");
+    blob_created(&name, digest)
+}
+
 async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -1890,18 +1985,7 @@ async fn upload_blob(
                 "LOCAL",
             ));
             state.repo_index.invalidate("docker");
-            let location = format!("/v2/{}/blobs/{}", name, digest);
-            (
-                StatusCode::CREATED,
-                [
-                    (header::LOCATION, location),
-                    (
-                        HeaderName::from_static("docker-content-digest"),
-                        digest.to_string(),
-                    ),
-                ],
-            )
-                .into_response()
+            blob_created(&name, digest)
         }
         Err(e) => {
             tracing::error!(error = %e, key = %key, name = %name, "Failed to store blob");
@@ -4230,6 +4314,116 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_docker_cross_repo_blob_mount() {
+        let ctx = create_test_context();
+        let blob_data = b"cross-repo mounted layer";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob_data)));
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/srcrepo/blobs/uploads/?digest={}", digest),
+            Body::from(&blob_data[..]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let mount_url = format!("/v2/dstrepo/blobs/uploads/?mount={}&from=srcrepo", digest);
+        let resp = send(&ctx.app, Method::POST, &mount_url, Body::empty()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a blob the source repo holds must mount without an upload"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("/v2/dstrepo/blobs/{}", digest)
+        );
+        assert_eq!(
+            resp.headers()
+                .get("docker-content-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            digest
+        );
+
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/dstrepo/blobs/{}", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(get).await[..], &blob_data[..]);
+
+        // Already in the destination: answered from the destination copy, so a
+        // source that holds nothing still yields 201.
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/dstrepo/blobs/uploads/?mount={}&from=otherrepo", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_docker_mount_unknown_blob_falls_back_to_upload() {
+        let ctx = create_test_context();
+        let digest = format!("sha256:{}", "b".repeat(64));
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/dstrepo/blobs/uploads/?mount={}&from=srcrepo", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "an unmountable blob must degrade to a normal upload session"
+        );
+        assert!(resp.headers().contains_key("docker-upload-uuid"));
+    }
+
+    #[tokio::test]
+    async fn test_docker_mount_invalid_source_repo_falls_back_to_upload() {
+        let ctx = create_test_context();
+        let blob_data = b"blob behind an unusable source name";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(blob_data)));
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/srcrepo/blobs/uploads/?digest={}", digest),
+            Body::from(&blob_data[..]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            &format!("/v2/dstrepo/blobs/uploads/?mount={}&from=SRCREPO", digest),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "an invalid source repository must degrade to an upload session, not 4xx"
+        );
+        assert!(resp.headers().contains_key("docker-upload-uuid"));
+    }
+
+    #[tokio::test]
     async fn test_docker_single_post_digest_mismatch_rejected() {
         // A single-POST upload whose body does not match ?digest= must be rejected.
         let ctx = create_test_context();
@@ -5536,6 +5730,9 @@ mod integration_tests {
         }
         fn backend_name(&self) -> &'static str {
             "failing-prefix-test"
+        }
+        async fn copy(&self, src: &str, dst: &str) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst).await
         }
         async fn put_from_path(
             &self,
