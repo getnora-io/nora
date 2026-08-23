@@ -49,7 +49,11 @@ const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        // Ping — must come before the wildcard
+        // Ping — must come before the wildcard.
+        // v1/ping is required by Conan 2.x clients (#901): discovery always
+        // goes through v1/ping (hard-coded in ClientV2Router.ping()), then
+        // all subsequent requests use v2 endpoints.
+        .route("/conan/v1/ping", get(ping))
         .route("/conan/v2/ping", get(ping))
         // Search
         .route("/conan/v2/conans/search", get(search))
@@ -1821,5 +1825,40 @@ mod integration_tests {
             .with_label_values(&["conan"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// Regression test for #901: Conan 2.x client always pings `/conan/v1/ping`
+    /// before using v2 endpoints. Without this route, the client fails with
+    /// `ERROR: b''` and never reaches the working v2 API.
+    #[tokio::test]
+    async fn test_conan_v1_ping() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/conan/v1/ping", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Conan 2.x client requires v1/ping to return 200 (#901)"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Conan-Server-Capabilities")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "revisions",
+            "v1/ping must advertise 'revisions' capability (#901)"
+        );
+    }
+
+    /// v1/ping must also 404 when conan is disabled.
+    #[tokio::test]
+    async fn test_conan_v1_ping_disabled() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = false;
+        });
+        let resp = send(&ctx.app, Method::GET, "/conan/v1/ping", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -144,7 +144,10 @@ async fn package_versions(
     let mut local_files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            if !filename.is_empty() && !ends_with_ci(filename, ".sha256") {
+            if !filename.is_empty()
+                && !ends_with_ci(filename, ".sha256")
+                && is_valid_pypi_filename(filename)
+            {
                 let sha256 = state
                     .storage
                     .get(&format!("{}.sha256", key))
@@ -1618,6 +1621,65 @@ mod integration_tests {
         let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test for #891: internal `dates.json` must not leak into the
+    /// PEP 691 simple index. `uv` and other strict clients parse all entries as
+    /// package files and reject `dates.json` (no `hashes` field → hard parse
+    /// failure). The listing must contain ONLY valid package filenames.
+    #[tokio::test]
+    async fn test_pypi_dates_json_excluded_from_index() {
+        let ctx = create_test_context();
+
+        // Simulate a package with a cached dates.json (written by ensure_pypi_dates_cached)
+        ctx.state
+            .storage
+            .put("pypi/loguru/loguru-0.7.0.tar.gz", b"fake-sdist")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/loguru/loguru-0.7.0.tar.gz.sha256", b"aabbccdd")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "pypi/loguru/dates.json",
+                br#"{"loguru-0.7.0.tar.gz":"2023-08-20T12:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+
+        // HTML index must not contain dates.json
+        let response = send(&ctx.app, Method::GET, "/simple/loguru/", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("loguru-0.7.0.tar.gz"),
+            "real package file must appear"
+        );
+        assert!(
+            !html.contains("dates.json"),
+            "internal dates.json must NOT appear in simple index (#891)"
+        );
+
+        // PEP 691 JSON index must also exclude dates.json
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/loguru/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "only the real package file, not dates.json");
+        assert_eq!(files[0]["filename"], "loguru-0.7.0.tar.gz");
     }
 }
 
