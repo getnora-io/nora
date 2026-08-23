@@ -6,6 +6,7 @@
 //! Implements a caching proxy for ConanCenter (center2.conan.io):
 //!
 //! ## Endpoints
+//!   GET /conan/v1/ping                             — health + capabilities (v2 client compat)
 //!   GET /conan/v2/ping                             — health + capabilities
 //!   GET /conan/v2/conans/search                    — search recipes
 //!   GET /conan/v2/conans/{name}/{ver}/{user}/{chan}/latest — latest recipe revision
@@ -49,7 +50,10 @@ const UPSTREAM_DEFAULT: &str = "https://center2.conan.io";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        // Ping — must come before the wildcard
+        // Ping — must come before the wildcard.
+        // v1/ping is required: Conan 2.x client calls GET /v1/ping first
+        // (ClientV2Router.ping()) before any v2 API calls (#901).
+        .route("/conan/v1/ping", get(ping))
         .route("/conan/v2/ping", get(ping))
         // Search
         .route("/conan/v2/conans/search", get(search))
@@ -1821,5 +1825,35 @@ mod integration_tests {
             .with_label_values(&["conan"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// Regression test for #901: Conan 2.x client calls `GET /v1/ping` before
+    /// any v2 API interaction (`ClientV2Router.ping()`). Missing route caused
+    /// 404 → client refused to proceed.
+    #[tokio::test]
+    async fn test_conan_v1_ping() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = true;
+        });
+        let resp = send(&ctx.app, Method::GET, "/conan/v1/ping", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("X-Conan-Server-Capabilities")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "revisions"
+        );
+    }
+
+    /// Verify v1/ping is also gated behind `conan.enabled`.
+    #[tokio::test]
+    async fn test_conan_v1_ping_disabled() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.conan.enabled = false;
+        });
+        let resp = send(&ctx.app, Method::GET, "/conan/v1/ping", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
