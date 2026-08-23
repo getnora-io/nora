@@ -144,7 +144,10 @@ async fn package_versions(
     let mut local_files: Vec<FileEntry> = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            if !filename.is_empty() && !ends_with_ci(filename, ".sha256") {
+            if !filename.is_empty()
+                && !ends_with_ci(filename, ".sha256")
+                && is_valid_pypi_filename(filename)
+            {
                 let sha256 = state
                     .storage
                     .get(&format!("{}.sha256", key))
@@ -259,6 +262,12 @@ async fn download_file(
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
     let normalized = normalize_name(&name);
+
+    // Block download of internal bookkeeping files (dates.json, etc.) that
+    // live alongside packages in storage but are not real artifacts (#891).
+    if !is_valid_pypi_filename(&filename) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
@@ -1618,6 +1627,86 @@ mod integration_tests {
         let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test for #891 path 1: internal `dates.json` must not leak
+    /// into the PEP 691 simple index. `uv` and other strict clients require
+    /// `hashes` on every file entry; `dates.json` has no sidecar → parse failure.
+    #[tokio::test]
+    async fn test_pypi_dates_json_excluded_from_index() {
+        let ctx = create_test_context();
+
+        ctx.state
+            .storage
+            .put("pypi/loguru/loguru-0.7.0.tar.gz", b"fake-sdist")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/loguru/loguru-0.7.0.tar.gz.sha256", b"aabbccdd")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "pypi/loguru/dates.json",
+                br#"{"loguru-0.7.0.tar.gz":"2023-08-20T12:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+
+        // HTML index must not contain dates.json
+        let response = send(&ctx.app, Method::GET, "/simple/loguru/", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("loguru-0.7.0.tar.gz"),
+            "real package must appear"
+        );
+        assert!(
+            !html.contains("dates.json"),
+            "dates.json must NOT appear in index (#891)"
+        );
+
+        // PEP 691 JSON index must also exclude dates.json
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/loguru/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "only the real package file, not dates.json");
+        assert_eq!(files[0]["filename"], "loguru-0.7.0.tar.gz");
+    }
+
+    /// Regression test for #891 path 2: `GET /simple/{name}/dates.json` must
+    /// return 404, not serve the internal bookkeeping file.
+    #[tokio::test]
+    async fn test_pypi_dates_json_not_downloadable() {
+        let ctx = create_test_context();
+
+        ctx.state
+            .storage
+            .put(
+                "pypi/loguru/dates.json",
+                br#"{"loguru-0.7.0.tar.gz":"2023-08-20T12:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/simple/loguru/dates.json", "").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "internal dates.json must not be downloadable (#891)"
+        );
     }
 }
 
