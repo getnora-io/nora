@@ -804,6 +804,14 @@ async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
     if state.storage.get(&key).await.is_ok() {
         return;
     }
+    // #68: never fetch an internal-namespace package's metadata upstream.
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        normalized,
+    ) {
+        return;
+    }
     let mut map = serde_json::Map::new();
     for up in &state.config.pypi.upstreams() {
         let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
@@ -1706,6 +1714,76 @@ mod integration_tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "internal dates.json must not be downloadable (#891)"
+        );
+    }
+
+    /// Regression test for #905: `ensure_pypi_dates_cached` must never fetch
+    /// an internal-namespace package's metadata upstream (#68 dependency
+    /// confusion). Verify that a tarball download for an internal-namespace
+    /// package does not trigger any upstream requests for the dates endpoint.
+    #[tokio::test]
+    async fn test_pypi_self_prime_skips_internal_namespace() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+
+        // Any request to the upstream = test failure (the guard must prevent it).
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces = vec!["internal-*".to_string()];
+        });
+
+        // Pre-populate a tarball so the download path is exercised.
+        ctx.state
+            .storage
+            .put(
+                "pypi/internal-secret/internal_secret-1.0.0.tar.gz",
+                b"fake-sdist",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "pypi/internal-secret/internal_secret-1.0.0.tar.gz.sha256",
+                b"aabbccdd",
+            )
+            .await
+            .unwrap();
+
+        // Download the tarball — this triggers ensure_pypi_dates_cached.
+        let _resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/internal-secret/internal_secret-1.0.0.tar.gz",
+            "",
+        )
+        .await;
+
+        // The internal-namespace guard must have prevented any upstream fetch.
+        let upstream_hits = upstream.received_requests().await.unwrap().len();
+        assert_eq!(
+            upstream_hits, 0,
+            "internal-namespace package dates must never be fetched upstream (#68, #905)"
+        );
+
+        // dates.json must NOT have been written for an internal package.
+        assert!(
+            ctx.state
+                .storage
+                .get("pypi/internal-secret/dates.json")
+                .await
+                .is_err(),
+            "dates.json must not be created for internal-namespace packages"
         );
     }
 }
