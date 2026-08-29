@@ -4,6 +4,7 @@
 use super::components::{format_size, format_timestamp, html_escape, sanitize_href};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
+use crate::auth::AuthenticatedUser;
 use crate::registry_type::RegistryType;
 use crate::repo_index::RepoInfo;
 use crate::validation::ends_with_ci;
@@ -12,6 +13,7 @@ use crate::Storage;
 use axum::{
     extract::{Path, Query, State},
     response::Json,
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -179,7 +181,19 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
     })
 }
 
-pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
+pub async fn api_dashboard(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthenticatedUser>>,
+) -> Json<DashboardResponse> {
+    let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
+    Json(build_dashboard_response(&state, authenticated).await)
+}
+
+/// Build the dashboard JSON payload.
+///
+/// When `authenticated` is false, `proxy_upstreams` is redacted (empty vec)
+/// to avoid leaking upstream registry topology to anonymous callers.
+pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> DashboardResponse {
     let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
     let mut registry_card_stats = Vec::new();
@@ -206,40 +220,46 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             size_bytes: size,
         });
 
-        let proxy_upstreams: Vec<String> = match reg {
-            RegistryType::Docker => state
-                .config
-                .docker
-                .upstreams
-                .iter()
-                .map(|u| u.url.clone())
-                .collect(),
-            RegistryType::Maven => state
-                .config
-                .maven
-                .proxies
-                .iter()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
-            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-            RegistryType::PyPI => state
-                .config
-                .pypi
-                .upstreams()
-                .iter()
-                .map(|u| u.url().to_string())
-                .collect(),
-            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-            RegistryType::Raw => vec![],
-            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-            RegistryType::Rpm => vec![],
-            RegistryType::Deb => vec![],
+        let proxy_upstreams: Vec<String> = if authenticated {
+            match reg {
+                RegistryType::Docker => state
+                    .config
+                    .docker
+                    .upstreams
+                    .iter()
+                    .map(|u| u.url.clone())
+                    .collect(),
+                RegistryType::Maven => state
+                    .config
+                    .maven
+                    .proxies
+                    .iter()
+                    .map(|p| p.url().to_string())
+                    .collect(),
+                RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
+                RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+                RegistryType::PyPI => state
+                    .config
+                    .pypi
+                    .upstreams()
+                    .iter()
+                    .map(|u| u.url().to_string())
+                    .collect(),
+                RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+                RegistryType::Raw => vec![],
+                RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+                RegistryType::Terraform => {
+                    state.config.terraform.proxy.clone().into_iter().collect()
+                }
+                RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+                RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+                RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+                RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+                RegistryType::Rpm => vec![],
+                RegistryType::Deb => vec![],
+            }
+        } else {
+            vec![]
         };
 
         mount_points.push(MountPoint {
@@ -260,14 +280,14 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
     let activity = state.activity.recent(20);
     let uptime_seconds = state.start_time.elapsed().as_secs();
 
-    Json(DashboardResponse {
+    DashboardResponse {
         global_stats,
         registry_stats: registry_card_stats,
         mount_points,
         activity,
         uptime_seconds,
         startup_duration_ms: state.startup_duration_ms,
-    })
+    }
 }
 
 pub async fn api_list(

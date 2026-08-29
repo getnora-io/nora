@@ -251,13 +251,15 @@ async fn dashboard(
     State(state): State<AppState>,
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
+    user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let lang = extract_lang(
         &Query(query),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let auth_enabled = state.auth.is_some();
-    let response = api_dashboard(State(state)).await.0;
+    let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
+    let response = build_dashboard_response(&state, authenticated).await;
     Html(render_dashboard(&response, lang, auth_enabled))
 }
 
