@@ -242,6 +242,41 @@ pub async fn auth_middleware(
             || (is_web_surface(path) && (config.anonymous_read || config.public_web_ui))
             || (path == "/metrics" && config.public_metrics);
         if open {
+            // Opportunistic auth: if the caller provided credentials on an
+            // open path, try to validate them so downstream handlers can
+            // distinguish "anonymous browse" from "authenticated browse"
+            // (e.g. to gate proxy_upstreams disclosure). If validation fails
+            // we fall through to anonymous — the path is open regardless.
+            if let Some(auth_val) = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+            {
+                if let Some(encoded) = auth_val.strip_prefix("Basic ") {
+                    if let Some(username) = try_basic_auth(encoded, state.auth.as_deref()) {
+                        request
+                            .extensions_mut()
+                            .insert(NamespaceAuthority::Unrestricted);
+                        request.extensions_mut().insert(AuthenticatedUser(username));
+                        request
+                            .extensions_mut()
+                            .insert(AuthenticatedRole(crate::tokens::Role::Write));
+                        return next.run(request).await;
+                    }
+                } else if let Some(token) = auth_val.strip_prefix("Bearer ") {
+                    if let Some(ref token_store) = state.tokens {
+                        if let Ok((user, role)) = token_store.verify_token(token) {
+                            request
+                                .extensions_mut()
+                                .insert(NamespaceAuthority::Unrestricted);
+                            request.extensions_mut().insert(AuthenticatedUser(user));
+                            request.extensions_mut().insert(AuthenticatedRole(role));
+                            return next.run(request).await;
+                        }
+                    }
+                }
+            }
+            // No credentials or validation failed — anonymous browse
             let mut request = request;
             request
                 .extensions_mut()
@@ -576,6 +611,23 @@ pub async fn auth_middleware(
         .extensions_mut()
         .insert(AuthenticatedRole(crate::tokens::Role::Write));
     next.run(request).await
+}
+
+/// Attempt to validate a Base64-encoded Basic auth credential against the
+/// htpasswd store. Returns the username on success, `None` on any failure.
+/// Used by the opportunistic-auth path on open web surfaces so that
+/// authenticated users get their real identity even on publicly browsable
+/// pages.
+fn try_basic_auth(encoded: &str, auth: Option<&HtpasswdAuth>) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    let htpasswd = auth?;
+    if htpasswd.authenticate(username, password) {
+        Some(username.to_string())
+    } else {
+        None
+    }
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
