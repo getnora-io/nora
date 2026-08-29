@@ -7,7 +7,8 @@ use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority
 use crate::metrics::METADATA_CORRUPT_TOTAL;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    proxy_forward_post, read_validators, write_validators, ProxyError, Revalidation, Validators,
+    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
+    Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -703,22 +704,37 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         // refresh its freshness so we don't revalidate again until the next TTL
         // window. No body was downloaded.
         Ok(Revalidation::NotModified) => {
-            let cached = state.storage.get(key).await.ok()?; // body gone → fail-open
-            crate::metrics::PROXY_UPSTREAM_304_TOTAL
-                .with_label_values(&["npm"])
-                .inc();
-            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
-                .with_label_values(&["npm"])
-                .inc_by(cached.len() as u64);
-            // Re-put bumps the file mtime (the freshness source) without an
-            // upstream download.
-            let storage = state.storage.clone();
-            let key_clone = key.to_string();
-            let body = cached.clone();
-            tokio::spawn(async move {
-                let _ = storage.put(&key_clone, &body).await;
-            });
-            Some(cached.to_vec())
+            match state.storage.get(key).await {
+                Ok(cached) => {
+                    crate::metrics::PROXY_UPSTREAM_304_TOTAL
+                        .with_label_values(&["npm"])
+                        .inc();
+                    crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                        .with_label_values(&["npm"])
+                        .inc_by(cached.len() as u64);
+                    // Re-put bumps the file mtime (the freshness source) without an
+                    // upstream download.
+                    let storage = state.storage.clone();
+                    let key_clone = key.to_string();
+                    let body = cached.clone();
+                    tokio::spawn(async move {
+                        let _ = storage.put(&key_clone, &body).await;
+                    });
+                    Some(cached.to_vec())
+                }
+                Err(_) => {
+                    // Body gone (GC, retention, corruption). Delete the stale
+                    // validator sidecar so the next revalidation cycle does a
+                    // full unconditional fetch instead of looping on 304 (#867).
+                    let vkey = validators_key(key);
+                    let _ = state.storage.delete(&vkey).await;
+                    tracing::warn!(
+                        key = %key,
+                        "304 but cached body missing; cleared validators for full refetch"
+                    );
+                    None
+                }
+            }
         }
         // New body — rewrite, cache it, then persist the fresh validators.
         Ok(Revalidation::Modified { body, validators }) => {
@@ -3152,5 +3168,78 @@ mod spec_conformance_tests {
         // A non-audit npm POST is not read-eligible → still requires auth.
         let other = send(&ctx.app, Method::POST, "/npm/somepkg", "x").await;
         assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #867: when a 304 revalidation finds the cached body missing (deleted by
+    /// GC, retention, or corruption between the handler's `get_verified` and
+    /// `refetch_metadata`'s second read), the stale `.meta` validator sidecar
+    /// must be deleted so the next revalidation cycle does a full unconditional
+    /// GET instead of looping on 304 forever.
+    ///
+    /// The handler's cache-hit gate (`get_verified`) requires the body to be
+    /// present, so the GC race can't be reproduced through the HTTP layer.
+    /// We call `refetch_metadata` directly with `.meta` seeded but body absent.
+    #[tokio::test]
+    async fn test_867_304_body_miss_clears_validators() {
+        use crate::registry::{read_validators, write_validators, Validators};
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // Respond 304 to any conditional request (has If-None-Match).
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+
+        let key = "npm/ghost-pkg/metadata.json";
+
+        // Seed validator sidecar WITHOUT the body — simulates GC/retention
+        // deleting the cached body while .meta survives.
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"stale-etag\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        // Preconditions: .meta exists, body does not.
+        assert!(
+            read_validators(&ctx.state.storage, key).await.is_some(),
+            "precondition: .meta must exist"
+        );
+        assert!(
+            ctx.state.storage.get(key).await.is_err(),
+            "precondition: body must be absent"
+        );
+
+        // Call refetch_metadata directly — simulates the race where the handler
+        // entered the cache-hit path (body was present at get_verified), TTL
+        // expired, but GC deleted the body before refetch_metadata re-reads it.
+        let result = refetch_metadata(&ctx.state, "ghost-pkg", key).await;
+        assert!(
+            result.is_none(),
+            "must return None when body is missing on 304"
+        );
+
+        // The critical assertion: .meta must be gone after the 304 body-miss.
+        // Before the fix, `.ok()?` silently returned None but left .meta intact,
+        // causing an infinite 304 loop on every subsequent TTL expiry.
+        assert!(
+            read_validators(&ctx.state.storage, key).await.is_none(),
+            "#867: validators must be cleared after 304 body-miss to break the infinite loop"
+        );
     }
 }
