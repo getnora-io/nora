@@ -2275,9 +2275,13 @@ Jd74nq6dNCjpWG4drIsyhqX+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod web_surface_gating_tests {
-    use crate::test_helpers::{create_test_context_with_auth, send, send_with_headers};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_anonymous_read,
+        create_test_context_with_anonymous_read_and_config, create_test_context_with_auth, send,
+        send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
-    use base64::Engine;
+    use base64::{engine::general_purpose::STANDARD, Engine};
 
     fn basic(user: &str, pass: &str) -> String {
         format!(
@@ -2368,5 +2372,153 @@ mod web_surface_gating_tests {
         });
         let resp = send(&ctx.app, Method::GET, "/api/ui/tokens", "").await;
         assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    // -- #934: opportunistic auth on open web surfaces --
+
+    /// try_basic_auth returns the username for valid htpasswd credentials.
+    #[test]
+    fn test_try_basic_auth_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htpasswd");
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
+        let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
+        let encoded = STANDARD.encode("admin:secret");
+        assert_eq!(
+            super::try_basic_auth(&encoded, Some(&htpasswd)),
+            Some("admin".to_string())
+        );
+    }
+
+    /// try_basic_auth returns None for wrong password.
+    #[test]
+    fn test_try_basic_auth_wrong_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htpasswd");
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
+        let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
+        let encoded = STANDARD.encode("admin:wrong");
+        assert_eq!(super::try_basic_auth(&encoded, Some(&htpasswd)), None);
+    }
+
+    /// try_basic_auth returns None when no htpasswd store is available.
+    #[test]
+    fn test_try_basic_auth_no_store() {
+        let encoded = STANDARD.encode("admin:secret");
+        assert_eq!(super::try_basic_auth(&encoded, None), None);
+    }
+
+    /// try_basic_auth returns None for garbage base64.
+    #[test]
+    fn test_try_basic_auth_invalid_base64() {
+        assert_eq!(super::try_basic_auth("%%%not-base64%%%", None), None);
+    }
+
+    /// On an open web surface (anonymous_read=true), valid Basic credentials
+    /// must produce a real AuthenticatedUser — not "anonymous". Verified via
+    /// /api/ui/dashboard: anonymous sees empty proxy_upstreams; authenticated
+    /// sees the configured npm upstream.
+    #[tokio::test]
+    async fn test_opportunistic_basic_auth_on_open_surface() {
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
+            c.npm.proxy = Some("https://registry.npmjs.org".into());
+        });
+
+        // Anonymous: proxy_upstreams redacted
+        let resp = send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for mp in json["mount_points"].as_array().unwrap() {
+            assert!(
+                mp["proxy_upstreams"].as_array().unwrap().is_empty(),
+                "anonymous must see empty proxy_upstreams"
+            );
+        }
+
+        // Valid Basic creds: proxy_upstreams populated
+        let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/api/ui/dashboard",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let npm = json["mount_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["registry"].as_str() == Some("npm"))
+            .expect("npm mount");
+        assert!(
+            !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
+            "authenticated must see populated proxy_upstreams for npm"
+        );
+    }
+
+    /// On an open web surface, invalid Basic credentials fall through to
+    /// anonymous (the path is open — no 401).
+    #[tokio::test]
+    async fn test_opportunistic_bad_creds_fall_through_to_anonymous() {
+        let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
+
+        let bad = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/api/ui/dashboard",
+            vec![("authorization", &bad)],
+            "",
+        )
+        .await;
+        // Open path — no 401 even with bad creds
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// On an open web surface, a valid Bearer token must produce a real
+    /// AuthenticatedUser, enabling proxy_upstreams disclosure.
+    #[tokio::test]
+    async fn test_opportunistic_bearer_auth_on_open_surface() {
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
+            c.npm.proxy = Some("https://registry.npmjs.org".into());
+        });
+
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+
+        let header_val = format!("Bearer {token}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/api/ui/dashboard",
+            vec![("authorization", &header_val)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let npm = json["mount_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["registry"].as_str() == Some("npm"))
+            .expect("npm mount");
+        assert!(
+            !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
+            "bearer-authenticated must see populated proxy_upstreams"
+        );
     }
 }
