@@ -663,6 +663,7 @@ async fn main() {
                 dry_run,
                 config.gc.grace_secs,
                 config.npm.proxy.is_some(),
+                config.gc.proxy_cache_max_bytes,
             )
             .await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
@@ -689,6 +690,15 @@ async fn main() {
                     println!("  {}", key);
                 }
                 println!("\nRun with --apply to delete orphans.");
+            }
+            if result.proxy_cache_eviction.evicted_files > 0
+                || result.proxy_cache_eviction.total_bytes > 0
+            {
+                let e = &result.proxy_cache_eviction;
+                println!(
+                    "  Proxy cache:       {} bytes total, {} files evicted, {} bytes freed",
+                    e.total_bytes, e.evicted_files, e.bytes_freed
+                );
             }
             if !result.uncovered.is_empty() {
                 let parts: Vec<String> = result
@@ -1694,6 +1704,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
         let npm_is_proxy = state.config.npm.proxy.is_some();
+        let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
@@ -1702,7 +1713,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let publish_locks = publish_locks.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy).await;
+                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes).await;
                     info!(
                         "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                         result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
