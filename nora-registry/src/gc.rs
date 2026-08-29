@@ -120,6 +120,7 @@ pub async fn run_gc(
     publish_locks: &PublishLocks,
     dry_run: bool,
     grace_secs: u64,
+    npm_is_proxy: bool,
 ) -> GcResult {
     let start = Instant::now();
     info!(
@@ -235,7 +236,7 @@ pub async fn run_gc(
     // Metadata phantom cleanup (npm/PyPI) — acquires per-key publish_lock
     // to prevent lost-update race with concurrent publish (#529).
     let metadata_phantoms_removed =
-        detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run).await;
+        detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run, npm_is_proxy).await;
     if metadata_phantoms_removed > 0 {
         if !dry_run {
             GC_METADATA_PHANTOMS.inc_by(metadata_phantoms_removed as u64);
@@ -594,30 +595,39 @@ async fn detect_and_clean_metadata_phantoms(
     storage: &Storage,
     publish_locks: &PublishLocks,
     dry_run: bool,
+    npm_is_proxy: bool,
 ) -> usize {
     let mut total_removed = 0usize;
 
-    // npm metadata cleanup
-    let npm_keys = storage.list("npm/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(npm/) failed: {}", e);
-        Vec::new()
-    });
-    let mut npm_meta_keys: Vec<String> = Vec::new();
-    let mut npm_tarball_keys: HashSet<String> = HashSet::new();
-
-    for key in &npm_keys {
-        if ends_with_ci(key, "/metadata.json") {
-            npm_meta_keys.push(key.clone());
-        } else if key.contains("/tarballs/") {
-            npm_tarball_keys.insert(key.clone());
-        }
+    // npm metadata cleanup — skip when npm is configured as a proxy (#925).
+    // Proxy metadata is upstream-authoritative: absence of a local tarball is
+    // expected (on-demand caching), not an orphan signal.
+    if npm_is_proxy {
+        info!("GC: skipping npm phantom cleanup (proxy mode — tarballs are cached on demand)");
     }
+    if !npm_is_proxy {
+        let npm_keys = storage.list("npm/").await.unwrap_or_else(|e| {
+            tracing::error!("GC: storage.list(npm/) failed: {}", e);
+            Vec::new()
+        });
+        let mut npm_meta_keys: Vec<String> = Vec::new();
+        let mut npm_tarball_keys: HashSet<String> = HashSet::new();
 
-    for meta_key in &npm_meta_keys {
-        if let Some(removed) =
-            clean_npm_metadata(storage, publish_locks, meta_key, &npm_tarball_keys, dry_run).await
-        {
-            total_removed += removed;
+        for key in &npm_keys {
+            if ends_with_ci(key, "/metadata.json") {
+                npm_meta_keys.push(key.clone());
+            } else if key.contains("/tarballs/") {
+                npm_tarball_keys.insert(key.clone());
+            }
+        }
+
+        for meta_key in &npm_meta_keys {
+            if let Some(removed) =
+                clean_npm_metadata(storage, publish_locks, meta_key, &npm_tarball_keys, dry_run)
+                    .await
+            {
+                total_removed += removed;
+            }
         }
     }
 
@@ -875,7 +885,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.total_candidates, 0);
         assert_eq!(result.orphaned, 0);
         assert_eq!(result.deleted, 0);
@@ -906,7 +916,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -939,7 +949,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 0);
         assert!(result.orphan_keys[0].contains("orphan999"));
@@ -968,7 +978,7 @@ mod tests {
             .unwrap();
 
         // Generous grace: the orphan is detected but must NOT be deleted.
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
         assert_eq!(result.orphaned, 1, "orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -985,7 +995,7 @@ mod tests {
 
         // Dry-run honors grace too, so the preview matches `--apply`: a
         // protected orphan is reported as skipped, not as "would delete".
-        let preview = run_gc(&storage, &test_publish_locks(), true, 3600).await;
+        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false).await;
         assert_eq!(preview.skipped_recent, 1);
         assert_eq!(
             preview.bytes_freed, 0,
@@ -993,7 +1003,7 @@ mod tests {
         );
 
         // grace=0 (no concurrent writes): the same orphan is now collected.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.deleted, 1, "grace=0 deletes the orphan");
         assert!(storage
             .get("docker/test/blobs/sha256:fresh000")
@@ -1025,7 +1035,7 @@ mod tests {
 
         // A short grace: a normal old orphan would be deleted, but a future
         // mtime must still be treated as "too young" and kept.
-        let result = run_gc(&storage, &test_publish_locks(), false, 60).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 60, false).await;
         assert_eq!(
             result.skipped_recent, 1,
             "future-mtime orphan must be protected (saturating_sub)"
@@ -1046,7 +1056,7 @@ mod tests {
         let key = "maven/com/example/1.0/old.jar.sha256";
         storage.put(key, b"deadbeef").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
         assert_eq!(result.orphaned, 1, "checksum orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -1128,7 +1138,7 @@ mod tests {
 
         // grace=0 would collect any normal orphan; the un-stattable one must
         // still survive because its age is unknown.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
 
         assert_eq!(result.orphaned, 1, "the blob is detected as an orphan");
         assert_eq!(
@@ -1180,7 +1190,7 @@ mod tests {
             }
         };
 
-        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0), writer);
+        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false), writer);
 
         // Every key is either reaped by GC or present with exactly one of the two
         // intended bodies — atomic writes guarantee no partial/torn content.
@@ -1225,7 +1235,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert!(result.deleted >= 1);
 
         assert!(
@@ -1267,7 +1277,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -1308,7 +1318,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -1330,7 +1340,7 @@ mod tests {
         // Raw: no GC coverage
         storage.put("raw/some-file.txt", b"raw-data").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         // Cargo crate without index entry = 1 orphan
         // Go .zip without .info = 1 orphan (incomplete version)
         assert_eq!(result.orphaned, 2);
@@ -1359,7 +1369,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(
             result.orphaned, 0,
             "complete Go version should have no orphans"
@@ -1377,7 +1387,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
@@ -1396,7 +1406,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(
             result.orphaned, 0,
             "cargo with matching index should have no orphans"
@@ -1414,7 +1424,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].contains("index"));
     }
@@ -1445,7 +1455,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 2);
         assert_eq!(result.deleted, 2);
         // Non-orphan checksum still exists
@@ -1476,7 +1486,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(storage
@@ -1504,7 +1514,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
     }
@@ -1541,7 +1551,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 2); // 1 docker blob + 1 maven checksum
         assert_eq!(result.deleted, 2);
     }
@@ -1572,7 +1582,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         // 4 checksums scanned, 0 orphans
         assert_eq!(result.total_candidates, 4);
         assert_eq!(result.orphaned, 0);
@@ -1600,7 +1610,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
     }
@@ -1629,7 +1639,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1661,7 +1671,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Dry run: metadata should be unchanged
@@ -1697,7 +1707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1731,7 +1741,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1759,7 +1769,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1812,9 +1822,50 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
+    }
+
+    /// npm phantom cleanup must be skipped when npm is in proxy mode (#925).
+    /// Proxy metadata is upstream-authoritative; missing local tarballs are
+    /// expected (on-demand caching), not orphan signals.
+    #[tokio::test]
+    async fn test_gc_npm_proxy_skips_phantom_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // npm metadata with 2 versions, but only 1 tarball — a "phantom" in
+        // hosted mode, but legitimate in proxy mode.
+        let meta = serde_json::json!({
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z", "2.0.0": "2024-06-01T00:00:00Z"}
+        });
+        storage
+            .put(
+                "npm/express/metadata.json",
+                serde_json::to_vec(&meta).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/express/tarballs/express-2.0.0.tgz", b"tarball")
+            .await
+            .unwrap();
+
+        // Hosted mode: phantom is cleaned
+        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        assert_eq!(
+            hosted.metadata_phantoms_removed, 1,
+            "hosted: phantom detected"
+        );
+
+        // Proxy mode: phantom cleanup is skipped entirely
+        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true).await;
+        assert_eq!(
+            proxy.metadata_phantoms_removed, 0,
+            "proxy: npm phantom cleanup must be skipped"
+        );
     }
 }

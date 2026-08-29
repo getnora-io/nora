@@ -657,8 +657,14 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Grace applies to manual GC too: `nora gc --apply` is often run while
             // traffic is live, when in-flight pushes are most likely (#584).
-            let result =
-                gc::run_gc(&storage, &cli_publish_locks, dry_run, config.gc.grace_secs).await;
+            let result = gc::run_gc(
+                &storage,
+                &cli_publish_locks,
+                dry_run,
+                config.gc.grace_secs,
+                config.npm.proxy.is_some(),
+            )
+            .await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
@@ -1687,6 +1693,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let publish_locks = state.publish_locks.clone();
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
+        let npm_is_proxy = state.config.npm.proxy.is_some();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
@@ -1695,7 +1702,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let publish_locks = publish_locks.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
+                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy).await;
                     info!(
                         "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                         result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
