@@ -109,9 +109,10 @@ pub fn plan_deletions(
     });
 
     let mut deletions = Vec::new();
+    let mut non_excluded_pos: usize = 0;
 
-    for (i, version) in versions.iter().enumerate() {
-        // Check exclusion patterns
+    for version in &versions {
+        // Check exclusion patterns — excluded versions are invisible to keep_last (#926)
         if is_excluded(&version.name, &rule.exclude_tags) {
             continue;
         }
@@ -119,9 +120,9 @@ pub fn plan_deletions(
         let mut dominated = false;
         let mut reason_parts = Vec::new();
 
-        // keep_last: versions beyond the Nth newest are candidates
+        // keep_last: versions beyond the Nth newest non-excluded are candidates
         if let Some(keep_last) = rule.keep_last {
-            if i >= keep_last as usize {
+            if non_excluded_pos >= keep_last as usize {
                 dominated = true;
                 reason_parts.push(format!("beyond keep_last={}", keep_last));
             }
@@ -152,6 +153,7 @@ pub fn plan_deletions(
                 reason: reason_parts.join(", "),
             });
         }
+        non_excluded_pos += 1;
     }
 
     deletions
@@ -1073,6 +1075,23 @@ mod tests {
     }
 
     #[test]
+    fn test_exclude_does_not_consume_keep_budget() {
+        // Regression test for #926: excluded versions must not consume keep_last
+        // budget. "latest" is newest and excluded; keep_last=2 should protect
+        // the next 2 non-excluded versions, deleting only "1.0.0".
+        let versions = vec![
+            make_version("latest", NOW, 100),
+            make_version("3.0.0", NOW - DAY, 200),
+            make_version("2.0.0", NOW - 7 * DAY, 300),
+            make_version("1.0.0", NOW - 30 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), None, vec!["latest"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "1.0.0");
+    }
+
+    #[test]
     fn test_exclude_glob_pattern() {
         let versions = vec![
             make_version("release-1.0", NOW - 100 * DAY, 100),
@@ -1081,9 +1100,438 @@ mod tests {
         ];
         let rule = make_rule(Some(1), None, vec!["release-*"]);
         let plans = plan_deletions(versions, &rule, NOW);
-        // Both release-* excluded, only dev-build is candidate (and it's beyond keep_last=1)
+        // Both release-* excluded, dev-build is the only non-excluded version.
+        // keep_last=1 protects it — nothing to delete (#926: excluded versions
+        // don't consume the keep budget).
+        assert_eq!(plans.len(), 0);
+    }
+
+    // ── #926 AB matrix: exhaustive exclude_tags × keep_last interaction ──
+
+    /// A: excluded version is newest — must not steal slot from non-excluded
+    #[test]
+    fn test_926_a_excluded_newest() {
+        let versions = vec![
+            make_version("latest", NOW, 100), // excluded, newest
+            make_version("v3", NOW - DAY, 200),
+            make_version("v2", NOW - 7 * DAY, 300),
+            make_version("v1", NOW - 30 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), None, vec!["latest"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // keep 2 non-excluded: v3, v2 kept; v1 deleted
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].version_name, "dev-build");
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    /// B: multiple excluded versions at top positions
+    #[test]
+    fn test_926_b_multiple_excluded_at_top() {
+        let versions = vec![
+            make_version("latest", NOW, 100),        // excluded
+            make_version("nightly", NOW - DAY, 100), // excluded
+            make_version("v3", NOW - 2 * DAY, 200),
+            make_version("v2", NOW - 10 * DAY, 300),
+            make_version("v1", NOW - 30 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), None, vec!["latest", "nightly"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // keep 2 non-excluded: v3, v2; delete v1
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    /// C: excluded version in the middle of the sorted list
+    #[test]
+    fn test_926_c_excluded_in_middle() {
+        let versions = vec![
+            make_version("v4", NOW, 100),
+            make_version("stable", NOW - 5 * DAY, 200), // excluded, middle
+            make_version("v3", NOW - 10 * DAY, 300),
+            make_version("v2", NOW - 20 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), None, vec!["stable"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // keep 2 non-excluded: v4, v3; delete v2
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v2");
+    }
+
+    /// D: excluded version at bottom — no effect on keep budget
+    #[test]
+    fn test_926_d_excluded_at_bottom() {
+        let versions = vec![
+            make_version("v3", NOW, 100),
+            make_version("v2", NOW - 5 * DAY, 200),
+            make_version("v1", NOW - 10 * DAY, 300),
+            make_version("pinned", NOW - 100 * DAY, 400), // excluded, oldest
+        ];
+        let rule = make_rule(Some(2), None, vec!["pinned"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // keep 2 non-excluded: v3, v2; delete v1; pinned excluded (protected)
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    /// E: all versions excluded — nothing to delete
+    #[test]
+    fn test_926_e_all_excluded() {
+        let versions = vec![
+            make_version("release-3", NOW, 100),
+            make_version("release-2", NOW - 5 * DAY, 200),
+            make_version("release-1", NOW - 10 * DAY, 300),
+        ];
+        let rule = make_rule(Some(1), None, vec!["release-*"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        assert!(plans.is_empty());
+    }
+
+    /// F: no exclusions — baseline behavior unchanged
+    #[test]
+    fn test_926_f_no_exclusions_baseline() {
+        let versions = vec![
+            make_version("v3", NOW, 100),
+            make_version("v2", NOW - 5 * DAY, 200),
+            make_version("v1", NOW - 10 * DAY, 300),
+        ];
+        let rule = make_rule(Some(1), None, vec![]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plans.len(), 2);
+        let names: Vec<&str> = plans.iter().map(|p| p.version_name.as_str()).collect();
+        assert!(names.contains(&"v2"));
+        assert!(names.contains(&"v1"));
+    }
+
+    /// G: keep_last + older_than_days + exclusions (AND logic)
+    #[test]
+    fn test_926_g_keep_last_age_exclusion_and_logic() {
+        let versions = vec![
+            make_version("latest", NOW, 100),        // excluded
+            make_version("v4", NOW - DAY, 200),      // newest non-excluded
+            make_version("v3", NOW - 10 * DAY, 300), // within keep, recent
+            make_version("v2", NOW - 60 * DAY, 400), // beyond keep, old → DELETE
+            make_version("v1", NOW - 90 * DAY, 500), // beyond keep, old → DELETE
+        ];
+        let rule = make_rule(Some(2), Some(30), vec!["latest"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // v4 kept (pos 0), v3 kept (pos 1), v2 deleted (pos 2 + old), v1 deleted (pos 3 + old)
+        assert_eq!(plans.len(), 2);
+        let names: Vec<&str> = plans.iter().map(|p| p.version_name.as_str()).collect();
+        assert!(names.contains(&"v2"));
+        assert!(names.contains(&"v1"));
+    }
+
+    /// H: excluded version beyond keep_last + recent — still protected
+    #[test]
+    fn test_926_h_excluded_beyond_keep_still_protected() {
+        let versions = vec![
+            make_version("v3", NOW, 100),
+            make_version("v2", NOW - 5 * DAY, 200),
+            make_version("pinned", NOW - 50 * DAY, 300), // excluded, old, beyond keep
+            make_version("v1", NOW - 60 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), Some(30), vec!["pinned"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // v3 kept, v2 kept, pinned excluded, v1 deleted (pos 2 + old)
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    /// I: keep_last=0 + exclusions — delete all non-excluded
+    #[test]
+    fn test_926_i_keep_zero_with_exclusions() {
+        let versions = vec![
+            make_version("latest", NOW, 100), // excluded
+            make_version("v2", NOW - 5 * DAY, 200),
+            make_version("v1", NOW - 10 * DAY, 300),
+        ];
+        let rule = make_rule(Some(0), None, vec!["latest"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // keep_last=0: all non-excluded deleted
+        assert_eq!(plans.len(), 2);
+        let names: Vec<&str> = plans.iter().map(|p| p.version_name.as_str()).collect();
+        assert!(names.contains(&"v2"));
+        assert!(names.contains(&"v1"));
+    }
+
+    /// J: single non-excluded version within budget — kept
+    #[test]
+    fn test_926_j_single_non_excluded_within_budget() {
+        let versions = vec![
+            make_version("latest", NOW, 100),        // excluded
+            make_version("nightly", NOW - DAY, 100), // excluded
+            make_version("v1", NOW - 30 * DAY, 200), // only non-excluded
+        ];
+        let rule = make_rule(Some(1), None, vec!["latest", "nightly"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // v1 is the only non-excluded, fits in keep_last=1
+        assert!(plans.is_empty());
+    }
+
+    /// K: glob exclusion + keep_last — excluded by pattern at various positions
+    #[test]
+    fn test_926_k_glob_exclusion_scattered() {
+        let versions = vec![
+            make_version("rc-4", NOW, 100), // excluded by rc-*
+            make_version("v3", NOW - 2 * DAY, 200),
+            make_version("rc-3", NOW - 5 * DAY, 100), // excluded by rc-*
+            make_version("v2", NOW - 10 * DAY, 300),
+            make_version("rc-2", NOW - 15 * DAY, 100), // excluded by rc-*
+            make_version("v1", NOW - 20 * DAY, 400),
+        ];
+        let rule = make_rule(Some(2), None, vec!["rc-*"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // non-excluded sorted: v3(pos 0), v2(pos 1), v1(pos 2)
+        // keep 2: v3, v2 kept; v1 deleted
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    /// L: older_than_days ONLY (no keep_last) + exclusions — non_excluded_pos
+    /// is irrelevant here, but verify exclusions still protect.
+    #[test]
+    fn test_926_l_age_only_with_exclusions() {
+        let versions = vec![
+            make_version("pinned", NOW - 90 * DAY, 100), // excluded, old
+            make_version("v2", NOW - 60 * DAY, 200),     // old → DELETE
+            make_version("v1", NOW - 5 * DAY, 300),      // recent → kept
+        ];
+        let rule = make_rule(None, Some(30), vec!["pinned"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // pinned excluded (protected), v2 old (deleted), v1 recent (kept)
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v2");
+    }
+
+    /// M: AND-logic protection — beyond keep_last but NOT old enough, with
+    /// excluded version stealing old enumerate position. The AND gate must
+    /// still protect the recent version.
+    #[test]
+    fn test_926_m_and_logic_recent_beyond_keep_with_exclusion() {
+        let versions = vec![
+            make_version("latest", NOW, 100),        // excluded
+            make_version("v3", NOW - DAY, 200),      // pos 0, kept by keep
+            make_version("v2", NOW - 5 * DAY, 300),  // pos 1, beyond keep BUT recent → AND protects
+            make_version("v1", NOW - 60 * DAY, 400), // pos 2, beyond keep AND old → DELETE
+        ];
+        let rule = make_rule(Some(1), Some(30), vec!["latest"]);
+        let plans = plan_deletions(versions, &rule, NOW);
+        // v3: pos 0 < 1, kept
+        // v2: pos 1 >= 1 (dominated by keep), but 5d < 30d (not old) → AND fails → kept
+        // v1: pos 2 >= 1 (dominated by keep), 60d > 30d (old) → AND satisfied → deleted
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version_name, "v1");
+    }
+
+    // =====================================================================
+    // TRUE A/B: old (buggy) implementation vs new (fixed) implementation
+    // Proves the bug exists in old code and is fixed in new code.
+    // =====================================================================
+
+    /// Clone of the pre-fix plan_deletions with the enumerate bug (#926).
+    /// Used ONLY in tests to prove the before/after difference.
+    fn plan_deletions_old(
+        mut versions: Vec<VersionEntry>,
+        rule: &RetentionRule,
+        now_secs: u64,
+    ) -> Vec<DeletionPlan> {
+        if versions.is_empty() {
+            return vec![];
+        }
+        versions.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| cmp_version_names(&b.name, &a.name))
+        });
+        let mut deletions = Vec::new();
+        // BUG: enumerate index counts excluded versions
+        for (i, version) in versions.iter().enumerate() {
+            if is_excluded(&version.name, &rule.exclude_tags) {
+                continue;
+            }
+            let mut dominated = false;
+            let mut reason_parts = Vec::new();
+            if let Some(keep_last) = rule.keep_last {
+                if i >= keep_last as usize {
+                    dominated = true;
+                    reason_parts.push(format!("beyond keep_last={}", keep_last));
+                }
+            }
+            if let Some(days) = rule.older_than_days {
+                let threshold = now_secs.saturating_sub(days as u64 * 86400);
+                if version.modified < threshold {
+                    if rule.keep_last.is_none() {
+                        dominated = true;
+                    }
+                    reason_parts.push(format!("older than {} days", days));
+                } else if rule.keep_last.is_some() {
+                    dominated = false;
+                    reason_parts.clear();
+                }
+            }
+            if dominated {
+                deletions.push(DeletionPlan {
+                    version_name: version.name.clone(),
+                    keys: version.keys.clone(),
+                    size: version.size,
+                    reason: reason_parts.join(", "),
+                });
+            }
+        }
+        deletions
+    }
+
+    /// Helper: names of deleted versions
+    fn deleted_names(plans: &[DeletionPlan]) -> Vec<&str> {
+        plans.iter().map(|p| p.version_name.as_str()).collect()
+    }
+
+    /// TRUE A/B: runs every scenario through BOTH implementations,
+    /// prints the diff, and asserts the new code is correct.
+    #[test]
+    fn test_926_ab_old_vs_new() {
+        struct Scenario {
+            name: &'static str,
+            versions: Vec<VersionEntry>,
+            rule: RetentionRule,
+            /// Expected deletions from the NEW (correct) implementation
+            expect_new: Vec<&'static str>,
+            /// Expected deletions from the OLD (buggy) implementation
+            expect_old: Vec<&'static str>,
+        }
+
+        let scenarios = vec![
+            Scenario {
+                name: "A: excluded newest, keep_last=2",
+                versions: vec![
+                    make_version("latest", NOW, 100),
+                    make_version("v3", NOW - DAY, 200),
+                    make_version("v2", NOW - 7 * DAY, 300),
+                    make_version("v1", NOW - 30 * DAY, 400),
+                ],
+                rule: make_rule(Some(2), None, vec!["latest"]),
+                expect_new: vec!["v1"], // correct: latest invisible, v3+v2 kept, v1 deleted
+                expect_old: vec!["v2", "v1"], // BUG: latest ate index 0, v2 pushed to index 2 >= 2
+            },
+            Scenario {
+                name: "B: two excluded at top, keep_last=2",
+                versions: vec![
+                    make_version("latest", NOW, 100),
+                    make_version("stable", NOW - DAY, 150),
+                    make_version("v3", NOW - 2 * DAY, 200),
+                    make_version("v2", NOW - 7 * DAY, 300),
+                    make_version("v1", NOW - 30 * DAY, 400),
+                ],
+                rule: make_rule(Some(2), None, vec!["latest", "stable"]),
+                expect_new: vec!["v1"], // correct: v3+v2 kept (budget=2)
+                expect_old: vec!["v3", "v2", "v1"], // BUG: 2 excluded eat indices 0,1 → v3 at index 2 >= 2
+            },
+            Scenario {
+                name: "C: excluded in middle, keep_last=2",
+                versions: vec![
+                    make_version("v3", NOW - DAY, 300),
+                    make_version("latest", NOW - 2 * DAY, 100),
+                    make_version("v2", NOW - 7 * DAY, 200),
+                    make_version("v1", NOW - 30 * DAY, 400),
+                ],
+                rule: make_rule(Some(2), None, vec!["latest"]),
+                expect_new: vec!["v1"], // correct: v3 (pos 0), v2 (pos 1), v1 (pos 2 → delete)
+                expect_old: vec!["v2", "v1"], // BUG: latest at index 1 → v2 at index 2 >= 2
+            },
+            Scenario {
+                name: "D: excluded at bottom (no difference)",
+                versions: vec![
+                    make_version("v3", NOW - DAY, 300),
+                    make_version("v2", NOW - 7 * DAY, 200),
+                    make_version("v1", NOW - 30 * DAY, 400),
+                    make_version("latest", NOW - 60 * DAY, 100),
+                ],
+                rule: make_rule(Some(2), None, vec!["latest"]),
+                expect_new: vec!["v1"],
+                expect_old: vec!["v1"], // Same: excluded is beyond budget anyway
+            },
+            Scenario {
+                name: "F: no exclusions baseline (no difference)",
+                versions: vec![
+                    make_version("v3", NOW - DAY, 300),
+                    make_version("v2", NOW - 7 * DAY, 200),
+                    make_version("v1", NOW - 30 * DAY, 400),
+                ],
+                rule: make_rule(Some(2), None, vec![]),
+                expect_new: vec!["v1"],
+                expect_old: vec!["v1"],
+            },
+            Scenario {
+                name: "G: keep+age+exclusion AND logic",
+                versions: vec![
+                    make_version("latest", NOW, 100),
+                    make_version("v3", NOW - DAY, 300),
+                    make_version("v2", NOW - 5 * DAY, 200),
+                    make_version("v1", NOW - 40 * DAY, 400),
+                ],
+                rule: make_rule(Some(1), Some(30), vec!["latest"]),
+                expect_new: vec!["v1"], // correct: v3 pos 0 (kept), v2 pos 1 (beyond keep but recent→AND), v1 (old+beyond)
+                expect_old: vec!["v1"], // AND-logic protects v2: 5d < 30d resets dominated even with buggy index
+            },
+            Scenario {
+                name: "K: glob exclusion scattered",
+                versions: vec![
+                    make_version("release-3", NOW - DAY, 300),
+                    make_version("dev-3", NOW - 2 * DAY, 200),
+                    make_version("release-2", NOW - 7 * DAY, 150),
+                    make_version("dev-2", NOW - 14 * DAY, 100),
+                    make_version("release-1", NOW - 30 * DAY, 150),
+                    make_version("dev-1", NOW - 60 * DAY, 50),
+                ],
+                rule: make_rule(Some(2), None, vec!["release-*"]),
+                expect_new: vec!["dev-1"], // correct: dev-3 pos 0, dev-2 pos 1, dev-1 pos 2 → delete
+                expect_old: vec!["dev-2", "dev-1"], // BUG: releases inflate indices
+            },
+        ];
+
+        let mut any_diff = false;
+        for s in &scenarios {
+            let old_result = plan_deletions_old(s.versions.clone(), &s.rule, NOW);
+            let new_result = plan_deletions(s.versions.clone(), &s.rule, NOW);
+            let old_names = deleted_names(&old_result);
+            let new_names = deleted_names(&new_result);
+
+            let differs = old_names != new_names;
+            if differs {
+                any_diff = true;
+            }
+
+            eprintln!(
+                "[{}] {} | OLD deletes: {:?} | NEW deletes: {:?} | {}",
+                if differs { "DIFF" } else { "SAME" },
+                s.name,
+                old_names,
+                new_names,
+                if differs {
+                    "<<< BUG PROVEN"
+                } else {
+                    "no change"
+                }
+            );
+
+            // Assert old matches expected old behavior
+            assert_eq!(
+                old_names, s.expect_old,
+                "Scenario '{}': old implementation mismatch",
+                s.name
+            );
+            // Assert new matches expected new behavior
+            assert_eq!(
+                new_names, s.expect_new,
+                "Scenario '{}': new implementation mismatch",
+                s.name
+            );
+        }
+
+        assert!(
+            any_diff,
+            "At least one scenario must show a difference between old and new"
+        );
     }
 
     #[test]
