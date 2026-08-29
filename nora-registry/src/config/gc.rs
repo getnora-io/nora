@@ -26,6 +26,11 @@ pub struct GcConfig {
     /// only during a read-only maintenance window with no concurrent writes.
     #[serde(default = "default_gc_grace")]
     pub grace_secs: u64,
+    /// Maximum bytes for proxy-cached artifacts (rpm/deb). When total proxy
+    /// cache exceeds this cap, GC evicts the oldest files (by mtime) until
+    /// usage is within budget. 0 = disabled (default). Env: `NORA_GC_PROXY_CACHE_MAX_BYTES`.
+    #[serde(default)]
+    pub proxy_cache_max_bytes: u64,
 }
 
 fn default_gc_interval() -> u64 {
@@ -47,6 +52,7 @@ impl Default for GcConfig {
             interval: 86400,
             dry_run: false,
             grace_secs: default_gc_grace(),
+            proxy_cache_max_bytes: 0,
         }
     }
 }
@@ -65,6 +71,13 @@ impl GcConfig {
         }
         if let Ok(val) = env::var("NORA_GC_GRACE") {
             super::parse_env_warn("NORA_GC_GRACE", &val, &mut self.grace_secs);
+        }
+        if let Ok(val) = env::var("NORA_GC_PROXY_CACHE_MAX_BYTES") {
+            super::parse_env_warn(
+                "NORA_GC_PROXY_CACHE_MAX_BYTES",
+                &val,
+                &mut self.proxy_cache_max_bytes,
+            );
         }
     }
 }

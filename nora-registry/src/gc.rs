@@ -68,6 +68,22 @@ pub static GC_METADATA_PHANTOMS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_metadata_phantoms metric")
 });
 
+pub static GC_PROXY_CACHE_EVICTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_proxy_cache_evicted_total",
+        "Total proxy-cached files evicted by size-based GC"
+    )
+    .expect("gc_proxy_cache_evicted metric")
+});
+
+pub static GC_PROXY_CACHE_BYTES_FREED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_proxy_cache_bytes_freed_total",
+        "Total bytes freed by proxy-cache eviction"
+    )
+    .expect("gc_proxy_cache_bytes_freed metric")
+});
+
 pub static GC_STAT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "nora_gc_stat_failures_total",
@@ -99,6 +115,8 @@ pub struct GcResult {
     /// silently). Tracked separately from `skipped_recent` and metered via
     /// `nora_gc_stat_failures_total` so it can be alerted on.
     pub stat_failures: usize,
+    /// Proxy-cache eviction result (#866).
+    pub proxy_cache_eviction: ProxyCacheEviction,
 }
 
 // ============================================================================
@@ -121,6 +139,7 @@ pub async fn run_gc(
     dry_run: bool,
     grace_secs: u64,
     npm_is_proxy: bool,
+    proxy_cache_max_bytes: u64,
 ) -> GcResult {
     let start = Instant::now();
     info!(
@@ -248,6 +267,11 @@ pub async fn run_gc(
         );
     }
 
+    // Proxy-cache eviction (#866): size-based LRU for rpm/deb proxy-cached
+    // files that have no sidecar and are not indexes.
+    let proxy_cache_eviction =
+        evict_proxy_cache(storage, publish_locks, proxy_cache_max_bytes, dry_run).await;
+
     // Detect registries with data but no GC coverage
     // Raw has no version model and no reference graph — nothing to GC by design
     // Terraform/Pub/Ansible/NuGet store only cached metadata — no orphan graph,
@@ -295,6 +319,7 @@ pub async fn run_gc(
         metadata_phantoms_removed,
         skipped_recent,
         stat_failures,
+        proxy_cache_eviction,
     }
 }
 
@@ -307,6 +332,63 @@ struct DetectionResult {
     orphans: Vec<String>,
 }
 
+/// Extract config.digest + layers[].digest into `referenced`, and
+/// manifests[].digest (manifest list entries) into `sub_manifests`.
+fn collect_manifest_refs(
+    json: &serde_json::Value,
+    referenced: &mut HashSet<String>,
+    sub_manifests: &mut HashSet<String>,
+) {
+    // config digest
+    if let Some(digest) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+    {
+        referenced.insert(digest.to_string());
+    }
+    // layer digests
+    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                referenced.insert(digest.to_string());
+            }
+        }
+    }
+    // manifest list / image index: sub-manifest digests
+    if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
+        for m in manifests {
+            if let Some(digest) = m.get("digest").and_then(|v| v.as_str()) {
+                sub_manifests.insert(digest.to_string());
+            }
+        }
+    }
+}
+
+/// Extract config.digest + layers[].digest into `referenced` (blob refs only,
+/// no sub-manifest traversal).
+fn collect_blob_refs(json: &serde_json::Value, referenced: &mut HashSet<String>) {
+    if let Some(digest) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+    {
+        referenced.insert(digest.to_string());
+    }
+    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                referenced.insert(digest.to_string());
+            }
+        }
+    }
+}
+
+/// True if `ref_name` is a digest reference (sha256:… or sha512:…), not a tag.
+fn is_digest_ref(ref_name: &str) -> bool {
+    ref_name.starts_with("sha256:") || ref_name.starts_with("sha512:")
+}
+
 async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     let keys = storage.list("docker/").await.unwrap_or_else(|e| {
         tracing::error!("GC: storage.list(docker/) failed: {}", e);
@@ -314,55 +396,71 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     });
 
     let mut blobs: Vec<String> = Vec::new();
-    let mut referenced = HashSet::new();
+    let mut all_manifest_keys: Vec<String> = Vec::new();
 
     for key in &keys {
         if key.contains("/blobs/") {
             blobs.push(key.clone());
+        } else if key.contains("/manifests/")
+            && ends_with_ci(key, ".json")
+            && !ends_with_ci(key, ".meta.json")
+        {
+            all_manifest_keys.push(key.clone());
         }
     }
 
-    // Parse manifests for referenced digests
-    for key in &keys {
-        if !key.contains("/manifests/")
-            || !ends_with_ci(key, ".json")
-            || ends_with_ci(key, ".meta.json")
-        {
-            continue;
-        }
+    // Step 1: Identify tag manifests (filename does NOT start with sha256:/sha512:)
+    let tag_manifests: Vec<&String> = all_manifest_keys
+        .iter()
+        .filter(|k| {
+            let filename = k.rsplit('/').next().unwrap_or("");
+            let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+            !is_digest_ref(ref_name)
+        })
+        .collect();
 
+    // Step 2: Read tag manifests, collect referenced blob digests.
+    // For manifest lists, also collect sub-manifest digests to resolve in step 3.
+    let mut referenced = HashSet::new();
+    let mut sub_manifest_digests: HashSet<String> = HashSet::new();
+
+    for key in &tag_manifests {
         if let Ok(data) = storage.get(key).await {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                // config digest
-                if let Some(digest) = json
-                    .get("config")
-                    .and_then(|c| c.get("digest"))
-                    .and_then(|v| v.as_str())
-                {
-                    referenced.insert(digest.to_string());
-                }
-                // layer digests
-                if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
-                    for layer in layers {
-                        if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
-                            referenced.insert(digest.to_string());
-                        }
-                    }
-                }
-                // manifest list digests
-                if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
-                    for m in manifests {
-                        if let Some(digest) = m.get("digest").and_then(|v| v.as_str()) {
-                            referenced.insert(digest.to_string());
-                        }
-                    }
+                collect_manifest_refs(&json, &mut referenced, &mut sub_manifest_digests);
+            }
+        }
+    }
+
+    // Step 3: Resolve sub-manifests (manifest list entries) — these are
+    // digest-keyed but reachable from a tag, so their blobs must be kept.
+    for key in &all_manifest_keys {
+        let filename = key.rsplit('/').next().unwrap_or("");
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if sub_manifest_digests.contains(ref_name) {
+            if let Ok(data) = storage.get(key).await {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    // Only collect blob refs, not further sub-manifests (2 levels deep enough)
+                    collect_blob_refs(&json, &mut referenced);
                 }
             }
         }
     }
 
+    // Step 4: Detect orphaned digest manifests — digest-keyed manifests not
+    // reachable from any tag (neither directly tagged nor a sub-manifest of a
+    // tagged manifest list).
+    let mut orphan_digest_manifests: Vec<String> = Vec::new();
+    for key in &all_manifest_keys {
+        let filename = key.rsplit('/').next().unwrap_or("");
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if is_digest_ref(ref_name) && !sub_manifest_digests.contains(ref_name) {
+            orphan_digest_manifests.push(key.clone());
+        }
+    }
+
     let total = blobs.len();
-    let orphans: Vec<String> = blobs
+    let mut orphans: Vec<String> = blobs
         .into_iter()
         .filter(|key| {
             key.rsplit('/')
@@ -371,6 +469,10 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
                 .unwrap_or(false)
         })
         .collect();
+
+    // Append orphaned digest manifests — they will be sorted after blobs by
+    // the caller (run_gc's #305 invariant: blobs before manifests).
+    orphans.extend(orphan_digest_manifests);
 
     DetectionResult { total, orphans }
 }
@@ -828,6 +930,159 @@ async fn clean_pypi_metadata(
 }
 
 // ============================================================================
+// Proxy-cache eviction (#866)
+// ============================================================================
+
+/// Result of proxy-cache eviction.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyCacheEviction {
+    /// Total proxy-cached bytes before eviction.
+    pub total_bytes: u64,
+    /// Number of files evicted.
+    pub evicted_files: usize,
+    /// Bytes freed by eviction.
+    pub bytes_freed: u64,
+}
+
+/// Index files that must never be evicted — they are regenerated indexes,
+/// not proxy-cached packages.
+fn is_index_file(key: &str) -> bool {
+    // rpm: repodata/
+    if key.contains("/repodata/") {
+        return true;
+    }
+    // deb: Packages, Packages.gz, Release, InRelease, etc.
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    matches!(
+        filename,
+        "Packages"
+            | "Packages.gz"
+            | "Packages.bz2"
+            | "Packages.xz"
+            | "Release"
+            | "Release.gpg"
+            | "InRelease"
+    )
+}
+
+/// Evict proxy-cached artifacts (rpm/deb) when total size exceeds `max_bytes`.
+///
+/// Proxy-cached files = files under `rpm/` or `deb/` that:
+/// - have NO corresponding `.nora-meta/` sidecar (hosted packages have one)
+/// - are NOT themselves under `.nora-meta/`
+/// - are NOT index files (repodata/, Packages, Release, etc.)
+///
+/// Eviction order: oldest by mtime first (LRU approximation; immutable files
+/// are never re-written, so mtime ≈ "least recently cached").
+async fn evict_proxy_cache(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    max_bytes: u64,
+    dry_run: bool,
+) -> ProxyCacheEviction {
+    if max_bytes == 0 {
+        return ProxyCacheEviction::default();
+    }
+
+    let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
+    let mut sidecar_covered: HashSet<String> = HashSet::new();
+
+    for prefix in ["rpm/", "deb/"] {
+        let entries = match storage.list_with_meta(prefix).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("GC proxy-cache: list_with_meta({prefix}) failed: {e}");
+                continue;
+            }
+        };
+
+        // First pass: collect sidecar-covered paths
+        for (key, _meta) in &entries {
+            // {registry}/{repo}/.nora-meta/{path}.json → covers {registry}/{repo}/{path}
+            if let Some(rest) = key.strip_prefix(prefix) {
+                if let Some((repo, meta_rest)) = rest.split_once("/.nora-meta/") {
+                    if let Some(pkg_path) = meta_rest.strip_suffix(".json") {
+                        let covered = format!("{prefix}{repo}/{pkg_path}");
+                        sidecar_covered.insert(covered);
+                    }
+                }
+            }
+        }
+
+        // Second pass: identify proxy-only files
+        for (key, meta) in &entries {
+            // Skip .nora-meta/ entries themselves
+            if key.contains("/.nora-meta/") {
+                continue;
+            }
+            // Skip index files
+            if is_index_file(key) {
+                continue;
+            }
+            // Skip hosted files (have sidecar)
+            if sidecar_covered.contains(key) {
+                continue;
+            }
+            proxy_files.push((key.clone(), meta.size, meta.modified));
+        }
+    }
+
+    let total_bytes: u64 = proxy_files.iter().map(|(_, s, _)| s).sum();
+
+    if total_bytes <= max_bytes {
+        return ProxyCacheEviction {
+            total_bytes,
+            evicted_files: 0,
+            bytes_freed: 0,
+        };
+    }
+
+    // Sort by mtime ascending (oldest first) for LRU eviction
+    proxy_files.sort_by_key(|&(_, _, mtime)| mtime);
+
+    let mut bytes_freed = 0u64;
+    let mut evicted = 0usize;
+    let bytes_to_free = total_bytes - max_bytes;
+
+    for (key, size, _mtime) in &proxy_files {
+        if bytes_freed >= bytes_to_free {
+            break;
+        }
+        if dry_run {
+            info!("[dry-run] proxy-cache evict: {} ({} bytes)", key, size);
+        } else {
+            let lock = crate::acquire_publish_lock(publish_locks, key);
+            let _guard = lock.lock().await;
+            if storage.delete(key).await.is_ok() {
+                info!("proxy-cache evicted: {} ({} bytes)", key, size);
+            }
+        }
+        bytes_freed += size;
+        evicted += 1;
+    }
+
+    if !dry_run && evicted > 0 {
+        GC_PROXY_CACHE_EVICTED.inc_by(evicted as u64);
+        GC_PROXY_CACHE_BYTES_FREED.inc_by(bytes_freed);
+    }
+
+    info!(
+        "Proxy-cache eviction{}: {} files, {} bytes freed (was {} / cap {})",
+        if dry_run { " (dry-run)" } else { "" },
+        evicted,
+        bytes_freed,
+        total_bytes,
+        max_bytes
+    );
+
+    ProxyCacheEviction {
+        total_bytes,
+        evicted_files: evicted,
+        bytes_freed,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -854,6 +1109,7 @@ mod tests {
             metadata_phantoms_removed: 0,
             skipped_recent: 0,
             stat_failures: 0,
+            proxy_cache_eviction: ProxyCacheEviction::default(),
         };
         assert_eq!(result.total_candidates, 0);
         assert!(result.orphan_keys.is_empty());
@@ -885,7 +1141,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.total_candidates, 0);
         assert_eq!(result.orphaned, 0);
         assert_eq!(result.deleted, 0);
@@ -916,7 +1172,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -949,7 +1205,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 0);
         assert!(result.orphan_keys[0].contains("orphan999"));
@@ -978,7 +1234,7 @@ mod tests {
             .unwrap();
 
         // Generous grace: the orphan is detected but must NOT be deleted.
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
         assert_eq!(result.orphaned, 1, "orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -995,7 +1251,7 @@ mod tests {
 
         // Dry-run honors grace too, so the preview matches `--apply`: a
         // protected orphan is reported as skipped, not as "would delete".
-        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false).await;
+        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false, 0).await;
         assert_eq!(preview.skipped_recent, 1);
         assert_eq!(
             preview.bytes_freed, 0,
@@ -1003,7 +1259,7 @@ mod tests {
         );
 
         // grace=0 (no concurrent writes): the same orphan is now collected.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.deleted, 1, "grace=0 deletes the orphan");
         assert!(storage
             .get("docker/test/blobs/sha256:fresh000")
@@ -1035,7 +1291,7 @@ mod tests {
 
         // A short grace: a normal old orphan would be deleted, but a future
         // mtime must still be treated as "too young" and kept.
-        let result = run_gc(&storage, &test_publish_locks(), false, 60, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 60, false, 0).await;
         assert_eq!(
             result.skipped_recent, 1,
             "future-mtime orphan must be protected (saturating_sub)"
@@ -1056,7 +1312,7 @@ mod tests {
         let key = "maven/com/example/1.0/old.jar.sha256";
         storage.put(key, b"deadbeef").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
         assert_eq!(result.orphaned, 1, "checksum orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -1138,7 +1394,7 @@ mod tests {
 
         // grace=0 would collect any normal orphan; the un-stattable one must
         // still survive because its age is unknown.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
 
         assert_eq!(result.orphaned, 1, "the blob is detected as an orphan");
         assert_eq!(
@@ -1190,7 +1446,7 @@ mod tests {
             }
         };
 
-        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false), writer);
+        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false, 0), writer);
 
         // Every key is either reaped by GC or present with exactly one of the two
         // intended bodies — atomic writes guarantee no partial/torn content.
@@ -1235,7 +1491,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert!(result.deleted >= 1);
 
         assert!(
@@ -1277,7 +1533,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -1291,16 +1547,27 @@ mod tests {
             .is_ok());
     }
 
+    /// Manifest list (image index) tag transitively protects sub-manifest blobs.
     #[tokio::test]
     async fn test_gc_manifest_list_references() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
+        // Manifest list (image index) references two sub-manifests by digest.
         let manifest = serde_json::json!({
             "manifests": [
                 {"digest": "sha256:platformA", "size": 100},
                 {"digest": "sha256:platformB", "size": 200}
             ]
+        });
+        // Sub-manifests (stored as digest-keyed files) reference actual blobs.
+        let sub_a = serde_json::json!({
+            "config": {"digest": "sha256:cfg_a"},
+            "layers": [{"digest": "sha256:layer_a", "size": 50}]
+        });
+        let sub_b = serde_json::json!({
+            "config": {"digest": "sha256:cfg_b"},
+            "layers": [{"digest": "sha256:layer_b", "size": 60}]
         });
         storage
             .put(
@@ -1310,16 +1577,354 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put("docker/multi/blobs/sha256:platformA", b"arch-a")
+            .put(
+                "docker/multi/manifests/sha256:platformA.json",
+                sub_a.to_string().as_bytes(),
+            )
             .await
             .unwrap();
         storage
-            .put("docker/multi/blobs/sha256:platformB", b"arch-b")
+            .put(
+                "docker/multi/manifests/sha256:platformB.json",
+                sub_b.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_a", b"cfg-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_a", b"layer-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_b", b"cfg-b")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_b", b"layer-b")
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 0);
+    }
+
+    // -- #655: Tag-rooted Docker GC tests --
+
+    /// #655 (part 2): Two tags with different blobs — all blobs are tag-reachable,
+    /// no orphans detected.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_no_orphans_for_tagged_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let manifest_a = serde_json::json!({
+            "config": {"digest": "sha256:cfg_a"},
+            "layers": [{"digest": "sha256:layer_a", "size": 100}]
+        });
+        let manifest_b = serde_json::json!({
+            "config": {"digest": "sha256:cfg_b"},
+            "layers": [{"digest": "sha256:layer_b", "size": 200}]
+        });
+        storage
+            .put(
+                "docker/repo/manifests/v1.json",
+                manifest_a.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/repo/manifests/v2.json",
+                manifest_b.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:cfg_a", b"config-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:layer_a", b"layer-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:cfg_b", b"config-b")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:layer_b", b"layer-b")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+        assert_eq!(result.orphans.len(), 0, "all blobs are tag-referenced");
+    }
+
+    /// #655 (part 2): Re-pushing a tag with new content makes the OLD digest
+    /// manifest and its exclusive blobs orphaned.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_repush_orphans_old_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Simulate: tag "latest" was pushed with content A, then re-pushed with B.
+        // After re-push, the tag manifest points to B's content. The old digest
+        // manifest (sha256:old_digest) still exists alongside B.
+
+        let old_manifest = serde_json::json!({
+            "config": {"digest": "sha256:old_config"},
+            "layers": [{"digest": "sha256:old_layer", "size": 100}]
+        });
+        let new_manifest = serde_json::json!({
+            "config": {"digest": "sha256:new_config"},
+            "layers": [{"digest": "sha256:new_layer", "size": 200}]
+        });
+
+        // Current tag points to new content
+        storage
+            .put(
+                "docker/repo/manifests/latest.json",
+                new_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Old digest manifest lingers from previous push
+        storage
+            .put(
+                "docker/repo/manifests/sha256:old_digest.json",
+                old_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // New digest manifest (current)
+        storage
+            .put(
+                "docker/repo/manifests/sha256:new_digest.json",
+                new_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Blobs for both versions
+        storage
+            .put("docker/repo/blobs/sha256:old_config", b"old-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:old_layer", b"old-layer")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:new_config", b"new-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:new_layer", b"new-layer")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+
+        // Old blobs (old_config, old_layer) are orphaned because only the tag
+        // manifest (latest.json) is consulted, and it references new_* blobs.
+        let orphan_blobs: Vec<&String> = result
+            .orphans
+            .iter()
+            .filter(|k| k.contains("/blobs/"))
+            .collect();
+        assert_eq!(orphan_blobs.len(), 2, "old config + old layer are orphaned");
+        assert!(
+            orphan_blobs.iter().any(|k| k.contains("old_config")),
+            "old config blob must be orphaned"
+        );
+        assert!(
+            orphan_blobs.iter().any(|k| k.contains("old_layer")),
+            "old layer blob must be orphaned"
+        );
+
+        // New blobs must NOT be orphaned
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("new_config")),
+            "new config blob must be kept"
+        );
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("new_layer")),
+            "new layer blob must be kept"
+        );
+
+        // The old digest manifest itself should be detected as orphaned
+        let orphan_manifests: Vec<&String> = result
+            .orphans
+            .iter()
+            .filter(|k| k.contains("/manifests/"))
+            .collect();
+        assert_eq!(
+            orphan_manifests.len(),
+            2,
+            "both orphan digest manifests (old + new, new is not tag-reachable as sub-manifest)"
+        );
+        assert!(
+            orphan_manifests
+                .iter()
+                .any(|k| k.contains("sha256:old_digest")),
+            "old digest manifest must be orphaned"
+        );
+    }
+
+    /// #655 (part 2): A manifest list tag transitively protects sub-manifests'
+    /// blobs. Digest-keyed sub-manifests referenced by the index are resolved
+    /// in step 3 and their blobs kept.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_manifest_list_transitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Tag "latest" is a manifest list (image index)
+        let index = serde_json::json!({
+            "manifests": [
+                {"digest": "sha256:sub_amd64", "size": 100, "platform": {"architecture": "amd64"}},
+                {"digest": "sha256:sub_arm64", "size": 100, "platform": {"architecture": "arm64"}}
+            ]
+        });
+        // Sub-manifest for amd64
+        let sub_amd64 = serde_json::json!({
+            "config": {"digest": "sha256:cfg_amd64"},
+            "layers": [{"digest": "sha256:layer_amd64", "size": 500}]
+        });
+        // Sub-manifest for arm64
+        let sub_arm64 = serde_json::json!({
+            "config": {"digest": "sha256:cfg_arm64"},
+            "layers": [{"digest": "sha256:layer_arm64", "size": 600}]
+        });
+
+        storage
+            .put(
+                "docker/multi/manifests/latest.json",
+                index.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/multi/manifests/sha256:sub_amd64.json",
+                sub_amd64.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/multi/manifests/sha256:sub_arm64.json",
+                sub_arm64.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_amd64", b"cfg-amd64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_amd64", b"layer-amd64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_arm64", b"cfg-arm64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_arm64", b"layer-arm64")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+        assert_eq!(
+            result.orphans.len(),
+            0,
+            "all blobs and sub-manifests are transitively reachable from the tag"
+        );
+    }
+
+    /// #655 (part 2): A digest manifest with no tag pointing to it (and not a
+    /// sub-manifest of any tagged manifest list) is detected as an orphan.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_orphan_digest_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let tagged = serde_json::json!({
+            "config": {"digest": "sha256:live_cfg"},
+            "layers": [{"digest": "sha256:live_layer", "size": 100}]
+        });
+        let orphan = serde_json::json!({
+            "config": {"digest": "sha256:dead_cfg"},
+            "layers": [{"digest": "sha256:dead_layer", "size": 200}]
+        });
+
+        // A proper tagged manifest
+        storage
+            .put(
+                "docker/repo/manifests/v1.json",
+                tagged.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // A digest-only manifest — no tag points to it
+        storage
+            .put(
+                "docker/repo/manifests/sha256:orphan_digest.json",
+                orphan.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Blobs for both
+        storage
+            .put("docker/repo/blobs/sha256:live_cfg", b"cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:live_layer", b"layer")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:dead_cfg", b"dead-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:dead_layer", b"dead-layer")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+
+        // The orphan digest manifest itself
+        assert!(
+            result
+                .orphans
+                .iter()
+                .any(|k| k.contains("sha256:orphan_digest")),
+            "digest manifest with no tag must be orphaned"
+        );
+        // Its exclusive blobs
+        assert!(
+            result.orphans.iter().any(|k| k.contains("dead_cfg")),
+            "blob only referenced by orphaned digest manifest must be orphaned"
+        );
+        assert!(
+            result.orphans.iter().any(|k| k.contains("dead_layer")),
+            "blob only referenced by orphaned digest manifest must be orphaned"
+        );
+        // Live blobs must NOT be orphaned
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("live_cfg")),
+            "tag-referenced blob must be kept"
+        );
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("live_layer")),
+            "tag-referenced blob must be kept"
+        );
     }
 
     #[tokio::test]
@@ -1340,7 +1945,7 @@ mod tests {
         // Raw: no GC coverage
         storage.put("raw/some-file.txt", b"raw-data").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         // Cargo crate without index entry = 1 orphan
         // Go .zip without .info = 1 orphan (incomplete version)
         assert_eq!(result.orphaned, 2);
@@ -1369,7 +1974,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "complete Go version should have no orphans"
@@ -1387,7 +1992,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
@@ -1406,7 +2011,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "cargo with matching index should have no orphans"
@@ -1424,7 +2029,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].contains("index"));
     }
@@ -1455,7 +2060,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 2);
         assert_eq!(result.deleted, 2);
         // Non-orphan checksum still exists
@@ -1486,7 +2091,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(storage
@@ -1514,7 +2119,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
     }
@@ -1551,7 +2156,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 2); // 1 docker blob + 1 maven checksum
         assert_eq!(result.deleted, 2);
     }
@@ -1582,7 +2187,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         // 4 checksums scanned, 0 orphans
         assert_eq!(result.total_candidates, 4);
         assert_eq!(result.orphaned, 0);
@@ -1610,7 +2215,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
     }
@@ -1639,7 +2244,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1671,7 +2276,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Dry run: metadata should be unchanged
@@ -1707,7 +2312,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1741,7 +2346,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1769,7 +2374,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1822,7 +2427,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
@@ -1855,17 +2460,185 @@ mod tests {
             .unwrap();
 
         // Hosted mode: phantom is cleaned
-        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             hosted.metadata_phantoms_removed, 1,
             "hosted: phantom detected"
         );
 
         // Proxy mode: phantom cleanup is skipped entirely
-        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true).await;
+        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true, 0).await;
         assert_eq!(
             proxy.metadata_phantoms_removed, 0,
             "proxy: npm phantom cleanup must be skipped"
         );
+    }
+
+    // -- #866: Proxy-cache eviction tests --
+
+    /// Basic eviction: 5 proxy files at 100 bytes each = 500 bytes total.
+    /// Cap = 300 → 2 oldest files evicted (freeing 200 bytes → 300 remaining).
+    #[tokio::test]
+    async fn test_evict_proxy_cache_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+
+        // Create 5 proxy files with staggered mtime
+        let payload = vec![0u8; 100];
+        for i in 0..5u32 {
+            let key = format!("rpm/repo/Packages/{}-1.0.rpm", i);
+            storage.put(&key, &payload).await.unwrap();
+            // Set mtime: file 0 is oldest, file 4 is newest
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + u64::from(i) * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 300, false).await;
+        assert_eq!(result.total_bytes, 500);
+        assert_eq!(result.evicted_files, 2, "2 oldest files evicted");
+        assert_eq!(result.bytes_freed, 200);
+
+        // Files 0 and 1 (oldest) should be gone
+        assert!(storage.get("rpm/repo/Packages/0-1.0.rpm").await.is_err());
+        assert!(storage.get("rpm/repo/Packages/1-1.0.rpm").await.is_err());
+        // Files 2-4 still present
+        assert!(storage.get("rpm/repo/Packages/2-1.0.rpm").await.is_ok());
+        assert!(storage.get("rpm/repo/Packages/3-1.0.rpm").await.is_ok());
+        assert!(storage.get("rpm/repo/Packages/4-1.0.rpm").await.is_ok());
+    }
+
+    /// Files WITH .nora-meta/ sidecars (hosted packages) must never be evicted.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_skips_hosted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let payload = vec![0u8; 200];
+        // Hosted package (has sidecar)
+        storage
+            .put("rpm/myrepo/Packages/hosted-1.0.rpm", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("rpm/myrepo/.nora-meta/Packages/hosted-1.0.rpm.json", b"{}")
+            .await
+            .unwrap();
+        // Proxy package (no sidecar)
+        storage
+            .put("rpm/myrepo/Packages/proxy-1.0.rpm", &payload)
+            .await
+            .unwrap();
+
+        // Cap = 100 → only proxy file can be evicted
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 100, false).await;
+        assert_eq!(result.evicted_files, 1);
+        // Hosted file must survive
+        assert!(storage
+            .get("rpm/myrepo/Packages/hosted-1.0.rpm")
+            .await
+            .is_ok());
+        // Proxy file evicted
+        assert!(storage
+            .get("rpm/myrepo/Packages/proxy-1.0.rpm")
+            .await
+            .is_err());
+    }
+
+    /// cap=0 means eviction is disabled — nothing evicted regardless of size.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        storage
+            .put("rpm/repo/Packages/big-1.0.rpm", &vec![0u8; 1000])
+            .await
+            .unwrap();
+
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 0, false).await;
+        assert_eq!(result.evicted_files, 0);
+        assert_eq!(result.total_bytes, 0); // disabled returns immediately
+        assert!(storage.get("rpm/repo/Packages/big-1.0.rpm").await.is_ok());
+    }
+
+    /// Index files (repodata/repomd.xml, Packages, Release) must never be evicted.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_skips_index_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let payload = vec![0u8; 100];
+        // Index files
+        storage
+            .put("rpm/repo/repodata/repomd.xml", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/main/binary-amd64/Packages", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/Release", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/InRelease", &payload)
+            .await
+            .unwrap();
+        // One real proxy package
+        storage
+            .put("rpm/repo/Packages/evictme-1.0.rpm", &payload)
+            .await
+            .unwrap();
+
+        // Cap = 1 → aggressive, but index files must be immune
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 1, false).await;
+        assert_eq!(
+            result.evicted_files, 1,
+            "only the non-index proxy file evicted"
+        );
+        assert!(storage.get("rpm/repo/repodata/repomd.xml").await.is_ok());
+        assert!(storage
+            .get("deb/repo/dists/stable/main/binary-amd64/Packages")
+            .await
+            .is_ok());
+        assert!(storage.get("deb/repo/dists/stable/Release").await.is_ok());
+        assert!(storage.get("deb/repo/dists/stable/InRelease").await.is_ok());
+    }
+
+    /// Both rpm/ and deb/ proxy files count toward the same cap.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_mixed_rpm_deb() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+
+        let payload = vec![0u8; 100];
+        // 2 rpm + 2 deb = 400 bytes total
+        for (i, prefix) in ["rpm", "deb", "rpm", "deb"].iter().enumerate() {
+            let key = format!("{}/repo/Packages/pkg{}-1.0.pkg", prefix, i);
+            storage.put(&key, &payload).await.unwrap();
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i as u64 * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        // Cap = 200 → evict 2 oldest (200 bytes freed)
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 200, false).await;
+        assert_eq!(result.total_bytes, 400);
+        assert_eq!(result.evicted_files, 2);
+        assert_eq!(result.bytes_freed, 200);
     }
 }
