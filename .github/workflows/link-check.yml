@@ -1,0 +1,54 @@
+name: Link Check
+
+on:
+  push:
+    branches: [main]
+    paths: ["**.md", "llms.txt"]
+  pull_request:
+    branches: [main]
+    paths: ["**.md", "llms.txt"]
+  schedule:
+    # Weekly external-link rot check (Sunday 06:00 UTC)
+    - cron: "0 6 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  link-check:
+    name: Check Markdown Links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Restore lychee cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .lycheecache
+          key: lychee-${{ github.sha }}
+          restore-keys: lychee-
+
+      - name: Run lychee link checker
+        uses: lycheeverse/lychee-action@f613a0156d062e3ecbf2dfa68ab1abcbcae85654 # v2.4.1
+        with:
+          args: >-
+            --cache
+            --max-cache-age 7d
+            --exclude-path CHANGELOG.md
+            --exclude-path mutants.out
+            --exclude 'localhost'
+            --exclude '127\.0\.0\.1'
+            --exclude '0\.0\.0\.0'
+            --exclude 'example\.com'
+            --exclude 'nora\.example\.com'
+            --exclude 'registry\.example\.com'
+            --exclude '10\.\d+'
+            --exclude '192\.168\.'
+            --timeout 30
+            --max-retries 3
+            --accept 200,206,429
+            '**/*.md'
+            'llms.txt'
+          fail: ${{ github.event_name != 'schedule' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
