@@ -501,6 +501,12 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
                 let tag_file = &rest[idx + "/manifests/".len()..];
                 if ends_with_ci(tag_file, ".json") && !ends_with_ci(tag_file, ".meta.json") {
                     let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
+                    // Skip digest references (sha256:…, sha512:…) — they are
+                    // stored alongside the tag file by put_manifest and must not
+                    // consume keep_last budget (#932).
+                    if tag.starts_with("sha256:") || tag.starts_with("sha512:") {
+                        continue;
+                    }
                     repos
                         .entry(repo.to_string())
                         .or_default()
@@ -944,6 +950,7 @@ fn find_matching_rule<'a>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
     use std::sync::Arc;
 
     fn test_publish_locks() -> PublishLocks {
@@ -1579,6 +1586,133 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert!(plans[0].reason.contains("keep_last"));
         assert!(plans[0].reason.contains("older than"));
+    }
+
+    // -- #932: Docker retention must count tags only, not digest references --
+
+    /// collect_docker_versions must skip sha256:/sha512: digest files so that
+    /// keep_last counts real OCI tags, not tag+digest pairs.
+    #[tokio::test]
+    async fn test_collect_docker_versions_skips_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // 4 tags + 4 digest copies (as put_manifest stores them)
+        for tag in ["v1", "v2", "v3", "v4"] {
+            let manifest = serde_json::json!({"tag": tag});
+            let body = serde_json::to_vec(&manifest).unwrap();
+            let digest = format!(
+                "sha256:{}",
+                hex::encode(sha2::Digest::finalize(sha2::Sha256::new_with_prefix(&body)))
+            );
+            storage
+                .put(&format!("docker/myapp/manifests/{}.json", tag), &body)
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/myapp/manifests/{}.json", digest), &body)
+                .await
+                .unwrap();
+        }
+
+        let groups = super::collect_docker_versions(&storage).await;
+        let myapp = groups
+            .iter()
+            .find(|(g, _)| g == "docker:myapp")
+            .expect("group exists");
+        assert_eq!(myapp.1.len(), 4, "exactly 4 tag entries, no digests");
+        for entry in &myapp.1 {
+            assert!(
+                !entry.name.starts_with("sha256:"),
+                "digest leaked: {}",
+                entry.name
+            );
+        }
+    }
+
+    /// With digests filtered, keep_last=3 on 4 tags correctly deletes 1 tag.
+    /// Before fix: 4 tags + 4 digests = 8 entries, keep_last=3 → 5 deleted
+    /// (only ceil(3/2) = 2 tags survived).
+    #[tokio::test]
+    async fn test_docker_keep_last_correct_with_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for (i, tag) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
+            let manifest = serde_json::json!({"tag": tag, "i": i});
+            let body = serde_json::to_vec(&manifest).unwrap();
+            let digest = format!(
+                "sha256:{}",
+                hex::encode(sha2::Digest::finalize(sha2::Sha256::new_with_prefix(&body)))
+            );
+            storage
+                .put(&format!("docker/img/manifests/{}.json", tag), &body)
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/img/manifests/{}.json", digest), &body)
+                .await
+                .unwrap();
+        }
+
+        let rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(3),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
+        assert_eq!(
+            result.planned, 1,
+            "exactly 1 tag should be planned for deletion"
+        );
+    }
+
+    /// 4 tags pointing at the same manifest (1 shared digest) — keep_last=3
+    /// must still count 4 tags and delete 1, not be confused by the shared digest.
+    #[tokio::test]
+    async fn test_docker_tag_aliasing_keep_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let body = b"{\"shared\": true}";
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Digest::finalize(sha2::Sha256::new_with_prefix(body)))
+        );
+        // 4 tags all pointing at the same manifest
+        for tag in ["latest", "stable", "v1.0", "v0.9"] {
+            storage
+                .put(&format!("docker/lib/manifests/{}.json", tag), body)
+                .await
+                .unwrap();
+        }
+        // 1 shared digest file
+        storage
+            .put(&format!("docker/lib/manifests/{}.json", digest), body)
+            .await
+            .unwrap();
+
+        let groups = super::collect_docker_versions(&storage).await;
+        let lib = groups
+            .iter()
+            .find(|(g, _)| g == "docker:lib")
+            .expect("group exists");
+        assert_eq!(lib.1.len(), 4, "4 tags, 0 digests");
+
+        let rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(3),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
+        assert_eq!(result.planned, 1, "1 of 4 tags deleted with keep_last=3");
     }
 
     // -- Integration tests with storage --
