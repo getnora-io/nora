@@ -1113,10 +1113,15 @@ async fn merge_and_cache_proxy_metadata(
         Bytes::copy_from_slice(upstream)
     };
 
-    if let Err(error) = state.storage.put(&key, &data).await {
-        tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
-    } else {
-        compute_and_store_checksums(&state.storage, &key, &data).await;
+    // Skip the write when the merged document is byte-identical to the cached
+    // version — avoids 5 no-op storage writes (1 doc + 4 checksums) on every
+    // revalidation under low/zero metadata_ttl (#888).
+    if cached.as_deref() != Some(data.as_ref()) {
+        if let Err(error) = state.storage.put(&key, &data).await {
+            tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
+        } else {
+            compute_and_store_checksums(&state.storage, &key, &data).await;
+        }
     }
 
     data
