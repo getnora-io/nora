@@ -332,6 +332,63 @@ struct DetectionResult {
     orphans: Vec<String>,
 }
 
+/// Extract config.digest + layers[].digest into `referenced`, and
+/// manifests[].digest (manifest list entries) into `sub_manifests`.
+fn collect_manifest_refs(
+    json: &serde_json::Value,
+    referenced: &mut HashSet<String>,
+    sub_manifests: &mut HashSet<String>,
+) {
+    // config digest
+    if let Some(digest) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+    {
+        referenced.insert(digest.to_string());
+    }
+    // layer digests
+    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                referenced.insert(digest.to_string());
+            }
+        }
+    }
+    // manifest list / image index: sub-manifest digests
+    if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
+        for m in manifests {
+            if let Some(digest) = m.get("digest").and_then(|v| v.as_str()) {
+                sub_manifests.insert(digest.to_string());
+            }
+        }
+    }
+}
+
+/// Extract config.digest + layers[].digest into `referenced` (blob refs only,
+/// no sub-manifest traversal).
+fn collect_blob_refs(json: &serde_json::Value, referenced: &mut HashSet<String>) {
+    if let Some(digest) = json
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+    {
+        referenced.insert(digest.to_string());
+    }
+    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                referenced.insert(digest.to_string());
+            }
+        }
+    }
+}
+
+/// True if `ref_name` is a digest reference (sha256:… or sha512:…), not a tag.
+fn is_digest_ref(ref_name: &str) -> bool {
+    ref_name.starts_with("sha256:") || ref_name.starts_with("sha512:")
+}
+
 async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     let keys = storage.list("docker/").await.unwrap_or_else(|e| {
         tracing::error!("GC: storage.list(docker/) failed: {}", e);
@@ -339,55 +396,71 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     });
 
     let mut blobs: Vec<String> = Vec::new();
-    let mut referenced = HashSet::new();
+    let mut all_manifest_keys: Vec<String> = Vec::new();
 
     for key in &keys {
         if key.contains("/blobs/") {
             blobs.push(key.clone());
+        } else if key.contains("/manifests/")
+            && ends_with_ci(key, ".json")
+            && !ends_with_ci(key, ".meta.json")
+        {
+            all_manifest_keys.push(key.clone());
         }
     }
 
-    // Parse manifests for referenced digests
-    for key in &keys {
-        if !key.contains("/manifests/")
-            || !ends_with_ci(key, ".json")
-            || ends_with_ci(key, ".meta.json")
-        {
-            continue;
-        }
+    // Step 1: Identify tag manifests (filename does NOT start with sha256:/sha512:)
+    let tag_manifests: Vec<&String> = all_manifest_keys
+        .iter()
+        .filter(|k| {
+            let filename = k.rsplit('/').next().unwrap_or("");
+            let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+            !is_digest_ref(ref_name)
+        })
+        .collect();
 
+    // Step 2: Read tag manifests, collect referenced blob digests.
+    // For manifest lists, also collect sub-manifest digests to resolve in step 3.
+    let mut referenced = HashSet::new();
+    let mut sub_manifest_digests: HashSet<String> = HashSet::new();
+
+    for key in &tag_manifests {
         if let Ok(data) = storage.get(key).await {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                // config digest
-                if let Some(digest) = json
-                    .get("config")
-                    .and_then(|c| c.get("digest"))
-                    .and_then(|v| v.as_str())
-                {
-                    referenced.insert(digest.to_string());
-                }
-                // layer digests
-                if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
-                    for layer in layers {
-                        if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
-                            referenced.insert(digest.to_string());
-                        }
-                    }
-                }
-                // manifest list digests
-                if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
-                    for m in manifests {
-                        if let Some(digest) = m.get("digest").and_then(|v| v.as_str()) {
-                            referenced.insert(digest.to_string());
-                        }
-                    }
+                collect_manifest_refs(&json, &mut referenced, &mut sub_manifest_digests);
+            }
+        }
+    }
+
+    // Step 3: Resolve sub-manifests (manifest list entries) — these are
+    // digest-keyed but reachable from a tag, so their blobs must be kept.
+    for key in &all_manifest_keys {
+        let filename = key.rsplit('/').next().unwrap_or("");
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if sub_manifest_digests.contains(ref_name) {
+            if let Ok(data) = storage.get(key).await {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    // Only collect blob refs, not further sub-manifests (2 levels deep enough)
+                    collect_blob_refs(&json, &mut referenced);
                 }
             }
         }
     }
 
+    // Step 4: Detect orphaned digest manifests — digest-keyed manifests not
+    // reachable from any tag (neither directly tagged nor a sub-manifest of a
+    // tagged manifest list).
+    let mut orphan_digest_manifests: Vec<String> = Vec::new();
+    for key in &all_manifest_keys {
+        let filename = key.rsplit('/').next().unwrap_or("");
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if is_digest_ref(ref_name) && !sub_manifest_digests.contains(ref_name) {
+            orphan_digest_manifests.push(key.clone());
+        }
+    }
+
     let total = blobs.len();
-    let orphans: Vec<String> = blobs
+    let mut orphans: Vec<String> = blobs
         .into_iter()
         .filter(|key| {
             key.rsplit('/')
@@ -396,6 +469,10 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
                 .unwrap_or(false)
         })
         .collect();
+
+    // Append orphaned digest manifests — they will be sorted after blobs by
+    // the caller (run_gc's #305 invariant: blobs before manifests).
+    orphans.extend(orphan_digest_manifests);
 
     DetectionResult { total, orphans }
 }
@@ -1470,16 +1547,27 @@ mod tests {
             .is_ok());
     }
 
+    /// Manifest list (image index) tag transitively protects sub-manifest blobs.
     #[tokio::test]
     async fn test_gc_manifest_list_references() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
+        // Manifest list (image index) references two sub-manifests by digest.
         let manifest = serde_json::json!({
             "manifests": [
                 {"digest": "sha256:platformA", "size": 100},
                 {"digest": "sha256:platformB", "size": 200}
             ]
+        });
+        // Sub-manifests (stored as digest-keyed files) reference actual blobs.
+        let sub_a = serde_json::json!({
+            "config": {"digest": "sha256:cfg_a"},
+            "layers": [{"digest": "sha256:layer_a", "size": 50}]
+        });
+        let sub_b = serde_json::json!({
+            "config": {"digest": "sha256:cfg_b"},
+            "layers": [{"digest": "sha256:layer_b", "size": 60}]
         });
         storage
             .put(
@@ -1489,16 +1577,354 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put("docker/multi/blobs/sha256:platformA", b"arch-a")
+            .put(
+                "docker/multi/manifests/sha256:platformA.json",
+                sub_a.to_string().as_bytes(),
+            )
             .await
             .unwrap();
         storage
-            .put("docker/multi/blobs/sha256:platformB", b"arch-b")
+            .put(
+                "docker/multi/manifests/sha256:platformB.json",
+                sub_b.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_a", b"cfg-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_a", b"layer-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_b", b"cfg-b")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_b", b"layer-b")
             .await
             .unwrap();
 
         let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 0);
+    }
+
+    // -- #655: Tag-rooted Docker GC tests --
+
+    /// #655 (part 2): Two tags with different blobs — all blobs are tag-reachable,
+    /// no orphans detected.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_no_orphans_for_tagged_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let manifest_a = serde_json::json!({
+            "config": {"digest": "sha256:cfg_a"},
+            "layers": [{"digest": "sha256:layer_a", "size": 100}]
+        });
+        let manifest_b = serde_json::json!({
+            "config": {"digest": "sha256:cfg_b"},
+            "layers": [{"digest": "sha256:layer_b", "size": 200}]
+        });
+        storage
+            .put(
+                "docker/repo/manifests/v1.json",
+                manifest_a.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/repo/manifests/v2.json",
+                manifest_b.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:cfg_a", b"config-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:layer_a", b"layer-a")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:cfg_b", b"config-b")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:layer_b", b"layer-b")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+        assert_eq!(result.orphans.len(), 0, "all blobs are tag-referenced");
+    }
+
+    /// #655 (part 2): Re-pushing a tag with new content makes the OLD digest
+    /// manifest and its exclusive blobs orphaned.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_repush_orphans_old_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Simulate: tag "latest" was pushed with content A, then re-pushed with B.
+        // After re-push, the tag manifest points to B's content. The old digest
+        // manifest (sha256:old_digest) still exists alongside B.
+
+        let old_manifest = serde_json::json!({
+            "config": {"digest": "sha256:old_config"},
+            "layers": [{"digest": "sha256:old_layer", "size": 100}]
+        });
+        let new_manifest = serde_json::json!({
+            "config": {"digest": "sha256:new_config"},
+            "layers": [{"digest": "sha256:new_layer", "size": 200}]
+        });
+
+        // Current tag points to new content
+        storage
+            .put(
+                "docker/repo/manifests/latest.json",
+                new_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Old digest manifest lingers from previous push
+        storage
+            .put(
+                "docker/repo/manifests/sha256:old_digest.json",
+                old_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // New digest manifest (current)
+        storage
+            .put(
+                "docker/repo/manifests/sha256:new_digest.json",
+                new_manifest.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Blobs for both versions
+        storage
+            .put("docker/repo/blobs/sha256:old_config", b"old-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:old_layer", b"old-layer")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:new_config", b"new-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:new_layer", b"new-layer")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+
+        // Old blobs (old_config, old_layer) are orphaned because only the tag
+        // manifest (latest.json) is consulted, and it references new_* blobs.
+        let orphan_blobs: Vec<&String> = result
+            .orphans
+            .iter()
+            .filter(|k| k.contains("/blobs/"))
+            .collect();
+        assert_eq!(orphan_blobs.len(), 2, "old config + old layer are orphaned");
+        assert!(
+            orphan_blobs.iter().any(|k| k.contains("old_config")),
+            "old config blob must be orphaned"
+        );
+        assert!(
+            orphan_blobs.iter().any(|k| k.contains("old_layer")),
+            "old layer blob must be orphaned"
+        );
+
+        // New blobs must NOT be orphaned
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("new_config")),
+            "new config blob must be kept"
+        );
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("new_layer")),
+            "new layer blob must be kept"
+        );
+
+        // The old digest manifest itself should be detected as orphaned
+        let orphan_manifests: Vec<&String> = result
+            .orphans
+            .iter()
+            .filter(|k| k.contains("/manifests/"))
+            .collect();
+        assert_eq!(
+            orphan_manifests.len(),
+            2,
+            "both orphan digest manifests (old + new, new is not tag-reachable as sub-manifest)"
+        );
+        assert!(
+            orphan_manifests
+                .iter()
+                .any(|k| k.contains("sha256:old_digest")),
+            "old digest manifest must be orphaned"
+        );
+    }
+
+    /// #655 (part 2): A manifest list tag transitively protects sub-manifests'
+    /// blobs. Digest-keyed sub-manifests referenced by the index are resolved
+    /// in step 3 and their blobs kept.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_manifest_list_transitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        // Tag "latest" is a manifest list (image index)
+        let index = serde_json::json!({
+            "manifests": [
+                {"digest": "sha256:sub_amd64", "size": 100, "platform": {"architecture": "amd64"}},
+                {"digest": "sha256:sub_arm64", "size": 100, "platform": {"architecture": "arm64"}}
+            ]
+        });
+        // Sub-manifest for amd64
+        let sub_amd64 = serde_json::json!({
+            "config": {"digest": "sha256:cfg_amd64"},
+            "layers": [{"digest": "sha256:layer_amd64", "size": 500}]
+        });
+        // Sub-manifest for arm64
+        let sub_arm64 = serde_json::json!({
+            "config": {"digest": "sha256:cfg_arm64"},
+            "layers": [{"digest": "sha256:layer_arm64", "size": 600}]
+        });
+
+        storage
+            .put(
+                "docker/multi/manifests/latest.json",
+                index.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/multi/manifests/sha256:sub_amd64.json",
+                sub_amd64.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/multi/manifests/sha256:sub_arm64.json",
+                sub_arm64.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_amd64", b"cfg-amd64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_amd64", b"layer-amd64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:cfg_arm64", b"cfg-arm64")
+            .await
+            .unwrap();
+        storage
+            .put("docker/multi/blobs/sha256:layer_arm64", b"layer-arm64")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+        assert_eq!(
+            result.orphans.len(),
+            0,
+            "all blobs and sub-manifests are transitively reachable from the tag"
+        );
+    }
+
+    /// #655 (part 2): A digest manifest with no tag pointing to it (and not a
+    /// sub-manifest of any tagged manifest list) is detected as an orphan.
+    #[tokio::test]
+    async fn test_gc_tag_rooted_orphan_digest_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let tagged = serde_json::json!({
+            "config": {"digest": "sha256:live_cfg"},
+            "layers": [{"digest": "sha256:live_layer", "size": 100}]
+        });
+        let orphan = serde_json::json!({
+            "config": {"digest": "sha256:dead_cfg"},
+            "layers": [{"digest": "sha256:dead_layer", "size": 200}]
+        });
+
+        // A proper tagged manifest
+        storage
+            .put(
+                "docker/repo/manifests/v1.json",
+                tagged.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        // A digest-only manifest — no tag points to it
+        storage
+            .put(
+                "docker/repo/manifests/sha256:orphan_digest.json",
+                orphan.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Blobs for both
+        storage
+            .put("docker/repo/blobs/sha256:live_cfg", b"cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:live_layer", b"layer")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:dead_cfg", b"dead-cfg")
+            .await
+            .unwrap();
+        storage
+            .put("docker/repo/blobs/sha256:dead_layer", b"dead-layer")
+            .await
+            .unwrap();
+
+        let result = detect_docker_orphans(&storage).await;
+
+        // The orphan digest manifest itself
+        assert!(
+            result
+                .orphans
+                .iter()
+                .any(|k| k.contains("sha256:orphan_digest")),
+            "digest manifest with no tag must be orphaned"
+        );
+        // Its exclusive blobs
+        assert!(
+            result.orphans.iter().any(|k| k.contains("dead_cfg")),
+            "blob only referenced by orphaned digest manifest must be orphaned"
+        );
+        assert!(
+            result.orphans.iter().any(|k| k.contains("dead_layer")),
+            "blob only referenced by orphaned digest manifest must be orphaned"
+        );
+        // Live blobs must NOT be orphaned
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("live_cfg")),
+            "tag-referenced blob must be kept"
+        );
+        assert!(
+            !result.orphans.iter().any(|k| k.contains("live_layer")),
+            "tag-referenced blob must be kept"
+        );
     }
 
     #[tokio::test]
