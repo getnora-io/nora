@@ -2630,7 +2630,12 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
                 .and_then(|t| t.strip_suffix(".json"))
                 .map(String::from)
         })
-        .filter(|t| !ends_with_ci(t, ".meta") && !t.contains(".meta."))
+        .filter(|t| {
+            !t.starts_with("sha256:")
+                && !t.starts_with("sha512:")
+                && !ends_with_ci(t, ".meta")
+                && !t.contains(".meta.")
+        })
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
 }
@@ -4134,6 +4139,59 @@ mod integration_tests {
         assert_eq!(json["name"], "alpine");
         let tags = json["tags"].as_array().unwrap();
         assert!(tags.contains(&serde_json::json!("latest")));
+    }
+
+    /// #932: tags/list must not include digest references (sha256:…).
+    /// put_manifest stores both {tag}.json and {digest}.json — only tags
+    /// belong in the OCI tags API response.
+    #[tokio::test]
+    async fn test_list_tags_excludes_digests() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "nginx").await;
+        // Push two tags — each also stores a digest copy
+        for tag in ["stable", "mainline"] {
+            send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/v2/nginx/manifests/{}", tag),
+                Body::from(serde_json::to_vec(&manifest).unwrap()),
+            )
+            .await;
+        }
+
+        let resp = send(&ctx.app, Method::GET, "/v2/nginx/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tags = json["tags"].as_array().unwrap();
+        // Must contain the real tags
+        assert!(
+            tags.iter().any(|t| t.as_str() == Some("stable")),
+            "{tags:?}"
+        );
+        assert!(
+            tags.iter().any(|t| t.as_str() == Some("mainline")),
+            "{tags:?}"
+        );
+        // Must NOT contain any digest reference
+        for tag in tags {
+            let t = tag.as_str().unwrap_or("");
+            assert!(
+                !t.starts_with("sha256:") && !t.starts_with("sha512:"),
+                "digest leaked into tags list: {}",
+                t
+            );
+        }
     }
 
     #[tokio::test]
