@@ -68,6 +68,22 @@ pub static GC_METADATA_PHANTOMS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_metadata_phantoms metric")
 });
 
+pub static GC_PROXY_CACHE_EVICTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_proxy_cache_evicted_total",
+        "Total proxy-cached files evicted by size-based GC"
+    )
+    .expect("gc_proxy_cache_evicted metric")
+});
+
+pub static GC_PROXY_CACHE_BYTES_FREED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_proxy_cache_bytes_freed_total",
+        "Total bytes freed by proxy-cache eviction"
+    )
+    .expect("gc_proxy_cache_bytes_freed metric")
+});
+
 pub static GC_STAT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "nora_gc_stat_failures_total",
@@ -99,6 +115,8 @@ pub struct GcResult {
     /// silently). Tracked separately from `skipped_recent` and metered via
     /// `nora_gc_stat_failures_total` so it can be alerted on.
     pub stat_failures: usize,
+    /// Proxy-cache eviction result (#866).
+    pub proxy_cache_eviction: ProxyCacheEviction,
 }
 
 // ============================================================================
@@ -121,6 +139,7 @@ pub async fn run_gc(
     dry_run: bool,
     grace_secs: u64,
     npm_is_proxy: bool,
+    proxy_cache_max_bytes: u64,
 ) -> GcResult {
     let start = Instant::now();
     info!(
@@ -248,6 +267,11 @@ pub async fn run_gc(
         );
     }
 
+    // Proxy-cache eviction (#866): size-based LRU for rpm/deb proxy-cached
+    // files that have no sidecar and are not indexes.
+    let proxy_cache_eviction =
+        evict_proxy_cache(storage, publish_locks, proxy_cache_max_bytes, dry_run).await;
+
     // Detect registries with data but no GC coverage
     // Raw has no version model and no reference graph — nothing to GC by design
     // Terraform/Pub/Ansible/NuGet store only cached metadata — no orphan graph,
@@ -295,6 +319,7 @@ pub async fn run_gc(
         metadata_phantoms_removed,
         skipped_recent,
         stat_failures,
+        proxy_cache_eviction,
     }
 }
 
@@ -828,6 +853,159 @@ async fn clean_pypi_metadata(
 }
 
 // ============================================================================
+// Proxy-cache eviction (#866)
+// ============================================================================
+
+/// Result of proxy-cache eviction.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyCacheEviction {
+    /// Total proxy-cached bytes before eviction.
+    pub total_bytes: u64,
+    /// Number of files evicted.
+    pub evicted_files: usize,
+    /// Bytes freed by eviction.
+    pub bytes_freed: u64,
+}
+
+/// Index files that must never be evicted — they are regenerated indexes,
+/// not proxy-cached packages.
+fn is_index_file(key: &str) -> bool {
+    // rpm: repodata/
+    if key.contains("/repodata/") {
+        return true;
+    }
+    // deb: Packages, Packages.gz, Release, InRelease, etc.
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    matches!(
+        filename,
+        "Packages"
+            | "Packages.gz"
+            | "Packages.bz2"
+            | "Packages.xz"
+            | "Release"
+            | "Release.gpg"
+            | "InRelease"
+    )
+}
+
+/// Evict proxy-cached artifacts (rpm/deb) when total size exceeds `max_bytes`.
+///
+/// Proxy-cached files = files under `rpm/` or `deb/` that:
+/// - have NO corresponding `.nora-meta/` sidecar (hosted packages have one)
+/// - are NOT themselves under `.nora-meta/`
+/// - are NOT index files (repodata/, Packages, Release, etc.)
+///
+/// Eviction order: oldest by mtime first (LRU approximation; immutable files
+/// are never re-written, so mtime ≈ "least recently cached").
+async fn evict_proxy_cache(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    max_bytes: u64,
+    dry_run: bool,
+) -> ProxyCacheEviction {
+    if max_bytes == 0 {
+        return ProxyCacheEviction::default();
+    }
+
+    let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
+    let mut sidecar_covered: HashSet<String> = HashSet::new();
+
+    for prefix in ["rpm/", "deb/"] {
+        let entries = match storage.list_with_meta(prefix).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("GC proxy-cache: list_with_meta({prefix}) failed: {e}");
+                continue;
+            }
+        };
+
+        // First pass: collect sidecar-covered paths
+        for (key, _meta) in &entries {
+            // {registry}/{repo}/.nora-meta/{path}.json → covers {registry}/{repo}/{path}
+            if let Some(rest) = key.strip_prefix(prefix) {
+                if let Some((repo, meta_rest)) = rest.split_once("/.nora-meta/") {
+                    if let Some(pkg_path) = meta_rest.strip_suffix(".json") {
+                        let covered = format!("{prefix}{repo}/{pkg_path}");
+                        sidecar_covered.insert(covered);
+                    }
+                }
+            }
+        }
+
+        // Second pass: identify proxy-only files
+        for (key, meta) in &entries {
+            // Skip .nora-meta/ entries themselves
+            if key.contains("/.nora-meta/") {
+                continue;
+            }
+            // Skip index files
+            if is_index_file(key) {
+                continue;
+            }
+            // Skip hosted files (have sidecar)
+            if sidecar_covered.contains(key) {
+                continue;
+            }
+            proxy_files.push((key.clone(), meta.size, meta.modified));
+        }
+    }
+
+    let total_bytes: u64 = proxy_files.iter().map(|(_, s, _)| s).sum();
+
+    if total_bytes <= max_bytes {
+        return ProxyCacheEviction {
+            total_bytes,
+            evicted_files: 0,
+            bytes_freed: 0,
+        };
+    }
+
+    // Sort by mtime ascending (oldest first) for LRU eviction
+    proxy_files.sort_by_key(|&(_, _, mtime)| mtime);
+
+    let mut bytes_freed = 0u64;
+    let mut evicted = 0usize;
+    let bytes_to_free = total_bytes - max_bytes;
+
+    for (key, size, _mtime) in &proxy_files {
+        if bytes_freed >= bytes_to_free {
+            break;
+        }
+        if dry_run {
+            info!("[dry-run] proxy-cache evict: {} ({} bytes)", key, size);
+        } else {
+            let lock = crate::acquire_publish_lock(publish_locks, key);
+            let _guard = lock.lock().await;
+            if storage.delete(key).await.is_ok() {
+                info!("proxy-cache evicted: {} ({} bytes)", key, size);
+            }
+        }
+        bytes_freed += size;
+        evicted += 1;
+    }
+
+    if !dry_run && evicted > 0 {
+        GC_PROXY_CACHE_EVICTED.inc_by(evicted as u64);
+        GC_PROXY_CACHE_BYTES_FREED.inc_by(bytes_freed);
+    }
+
+    info!(
+        "Proxy-cache eviction{}: {} files, {} bytes freed (was {} / cap {})",
+        if dry_run { " (dry-run)" } else { "" },
+        evicted,
+        bytes_freed,
+        total_bytes,
+        max_bytes
+    );
+
+    ProxyCacheEviction {
+        total_bytes,
+        evicted_files: evicted,
+        bytes_freed,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -854,6 +1032,7 @@ mod tests {
             metadata_phantoms_removed: 0,
             skipped_recent: 0,
             stat_failures: 0,
+            proxy_cache_eviction: ProxyCacheEviction::default(),
         };
         assert_eq!(result.total_candidates, 0);
         assert!(result.orphan_keys.is_empty());
@@ -885,7 +1064,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.total_candidates, 0);
         assert_eq!(result.orphaned, 0);
         assert_eq!(result.deleted, 0);
@@ -916,7 +1095,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -949,7 +1128,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 0);
         assert!(result.orphan_keys[0].contains("orphan999"));
@@ -978,7 +1157,7 @@ mod tests {
             .unwrap();
 
         // Generous grace: the orphan is detected but must NOT be deleted.
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
         assert_eq!(result.orphaned, 1, "orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -995,7 +1174,7 @@ mod tests {
 
         // Dry-run honors grace too, so the preview matches `--apply`: a
         // protected orphan is reported as skipped, not as "would delete".
-        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false).await;
+        let preview = run_gc(&storage, &test_publish_locks(), true, 3600, false, 0).await;
         assert_eq!(preview.skipped_recent, 1);
         assert_eq!(
             preview.bytes_freed, 0,
@@ -1003,7 +1182,7 @@ mod tests {
         );
 
         // grace=0 (no concurrent writes): the same orphan is now collected.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.deleted, 1, "grace=0 deletes the orphan");
         assert!(storage
             .get("docker/test/blobs/sha256:fresh000")
@@ -1035,7 +1214,7 @@ mod tests {
 
         // A short grace: a normal old orphan would be deleted, but a future
         // mtime must still be treated as "too young" and kept.
-        let result = run_gc(&storage, &test_publish_locks(), false, 60, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 60, false, 0).await;
         assert_eq!(
             result.skipped_recent, 1,
             "future-mtime orphan must be protected (saturating_sub)"
@@ -1056,7 +1235,7 @@ mod tests {
         let key = "maven/com/example/1.0/old.jar.sha256";
         storage.put(key, b"deadbeef").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 3600, false, 0).await;
         assert_eq!(result.orphaned, 1, "checksum orphan should be detected");
         assert_eq!(
             result.deleted, 0,
@@ -1138,7 +1317,7 @@ mod tests {
 
         // grace=0 would collect any normal orphan; the un-stattable one must
         // still survive because its age is unknown.
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
 
         assert_eq!(result.orphaned, 1, "the blob is detected as an orphan");
         assert_eq!(
@@ -1190,7 +1369,7 @@ mod tests {
             }
         };
 
-        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false), writer);
+        let (_gc, ()) = tokio::join!(run_gc(&storage, &locks, false, 0, false, 0), writer);
 
         // Every key is either reaped by GC or present with exactly one of the two
         // intended bodies — atomic writes guarantee no partial/torn content.
@@ -1235,7 +1414,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert!(result.deleted >= 1);
 
         assert!(
@@ -1277,7 +1456,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -1318,7 +1497,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 0);
     }
 
@@ -1340,7 +1519,7 @@ mod tests {
         // Raw: no GC coverage
         storage.put("raw/some-file.txt", b"raw-data").await.unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         // Cargo crate without index entry = 1 orphan
         // Go .zip without .info = 1 orphan (incomplete version)
         assert_eq!(result.orphaned, 2);
@@ -1369,7 +1548,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "complete Go version should have no orphans"
@@ -1387,7 +1566,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
@@ -1406,7 +1585,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             result.orphaned, 0,
             "cargo with matching index should have no orphans"
@@ -1424,7 +1603,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert!(result.orphan_keys[0].contains("index"));
     }
@@ -1455,7 +1634,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 2);
         assert_eq!(result.deleted, 2);
         // Non-orphan checksum still exists
@@ -1486,7 +1665,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
         assert!(storage
@@ -1514,7 +1693,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1);
         assert_eq!(result.deleted, 1);
     }
@@ -1551,7 +1730,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 2); // 1 docker blob + 1 maven checksum
         assert_eq!(result.deleted, 2);
     }
@@ -1582,7 +1761,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         // 4 checksums scanned, 0 orphans
         assert_eq!(result.total_candidates, 4);
         assert_eq!(result.orphaned, 0);
@@ -1610,7 +1789,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.deleted, 1);
         assert_eq!(result.bytes_freed, 5); // "12345" = 5 bytes
     }
@@ -1639,7 +1818,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1671,7 +1850,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Dry run: metadata should be unchanged
@@ -1707,7 +1886,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1741,7 +1920,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 0);
     }
 
@@ -1769,7 +1948,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.metadata_phantoms_removed, 1);
 
         // Verify phantom was removed
@@ -1822,7 +2001,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_gc(&storage, &test_publish_locks(), false, 0, false).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
         assert_eq!(result.orphaned, 1); // docker blob
         assert_eq!(result.deleted, 1);
         assert_eq!(result.metadata_phantoms_removed, 1); // npm phantom
@@ -1855,17 +2034,185 @@ mod tests {
             .unwrap();
 
         // Hosted mode: phantom is cleaned
-        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false).await;
+        let hosted = run_gc(&storage, &test_publish_locks(), true, 0, false, 0).await;
         assert_eq!(
             hosted.metadata_phantoms_removed, 1,
             "hosted: phantom detected"
         );
 
         // Proxy mode: phantom cleanup is skipped entirely
-        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true).await;
+        let proxy = run_gc(&storage, &test_publish_locks(), true, 0, true, 0).await;
         assert_eq!(
             proxy.metadata_phantoms_removed, 0,
             "proxy: npm phantom cleanup must be skipped"
         );
+    }
+
+    // -- #866: Proxy-cache eviction tests --
+
+    /// Basic eviction: 5 proxy files at 100 bytes each = 500 bytes total.
+    /// Cap = 300 → 2 oldest files evicted (freeing 200 bytes → 300 remaining).
+    #[tokio::test]
+    async fn test_evict_proxy_cache_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+
+        // Create 5 proxy files with staggered mtime
+        let payload = vec![0u8; 100];
+        for i in 0..5u32 {
+            let key = format!("rpm/repo/Packages/{}-1.0.rpm", i);
+            storage.put(&key, &payload).await.unwrap();
+            // Set mtime: file 0 is oldest, file 4 is newest
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + u64::from(i) * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 300, false).await;
+        assert_eq!(result.total_bytes, 500);
+        assert_eq!(result.evicted_files, 2, "2 oldest files evicted");
+        assert_eq!(result.bytes_freed, 200);
+
+        // Files 0 and 1 (oldest) should be gone
+        assert!(storage.get("rpm/repo/Packages/0-1.0.rpm").await.is_err());
+        assert!(storage.get("rpm/repo/Packages/1-1.0.rpm").await.is_err());
+        // Files 2-4 still present
+        assert!(storage.get("rpm/repo/Packages/2-1.0.rpm").await.is_ok());
+        assert!(storage.get("rpm/repo/Packages/3-1.0.rpm").await.is_ok());
+        assert!(storage.get("rpm/repo/Packages/4-1.0.rpm").await.is_ok());
+    }
+
+    /// Files WITH .nora-meta/ sidecars (hosted packages) must never be evicted.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_skips_hosted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let payload = vec![0u8; 200];
+        // Hosted package (has sidecar)
+        storage
+            .put("rpm/myrepo/Packages/hosted-1.0.rpm", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("rpm/myrepo/.nora-meta/Packages/hosted-1.0.rpm.json", b"{}")
+            .await
+            .unwrap();
+        // Proxy package (no sidecar)
+        storage
+            .put("rpm/myrepo/Packages/proxy-1.0.rpm", &payload)
+            .await
+            .unwrap();
+
+        // Cap = 100 → only proxy file can be evicted
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 100, false).await;
+        assert_eq!(result.evicted_files, 1);
+        // Hosted file must survive
+        assert!(storage
+            .get("rpm/myrepo/Packages/hosted-1.0.rpm")
+            .await
+            .is_ok());
+        // Proxy file evicted
+        assert!(storage
+            .get("rpm/myrepo/Packages/proxy-1.0.rpm")
+            .await
+            .is_err());
+    }
+
+    /// cap=0 means eviction is disabled — nothing evicted regardless of size.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        storage
+            .put("rpm/repo/Packages/big-1.0.rpm", &vec![0u8; 1000])
+            .await
+            .unwrap();
+
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 0, false).await;
+        assert_eq!(result.evicted_files, 0);
+        assert_eq!(result.total_bytes, 0); // disabled returns immediately
+        assert!(storage.get("rpm/repo/Packages/big-1.0.rpm").await.is_ok());
+    }
+
+    /// Index files (repodata/repomd.xml, Packages, Release) must never be evicted.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_skips_index_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let payload = vec![0u8; 100];
+        // Index files
+        storage
+            .put("rpm/repo/repodata/repomd.xml", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/main/binary-amd64/Packages", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/Release", &payload)
+            .await
+            .unwrap();
+        storage
+            .put("deb/repo/dists/stable/InRelease", &payload)
+            .await
+            .unwrap();
+        // One real proxy package
+        storage
+            .put("rpm/repo/Packages/evictme-1.0.rpm", &payload)
+            .await
+            .unwrap();
+
+        // Cap = 1 → aggressive, but index files must be immune
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 1, false).await;
+        assert_eq!(
+            result.evicted_files, 1,
+            "only the non-index proxy file evicted"
+        );
+        assert!(storage.get("rpm/repo/repodata/repomd.xml").await.is_ok());
+        assert!(storage
+            .get("deb/repo/dists/stable/main/binary-amd64/Packages")
+            .await
+            .is_ok());
+        assert!(storage.get("deb/repo/dists/stable/Release").await.is_ok());
+        assert!(storage.get("deb/repo/dists/stable/InRelease").await.is_ok());
+    }
+
+    /// Both rpm/ and deb/ proxy files count toward the same cap.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_mixed_rpm_deb() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+
+        let payload = vec![0u8; 100];
+        // 2 rpm + 2 deb = 400 bytes total
+        for (i, prefix) in ["rpm", "deb", "rpm", "deb"].iter().enumerate() {
+            let key = format!("{}/repo/Packages/pkg{}-1.0.pkg", prefix, i);
+            storage.put(&key, &payload).await.unwrap();
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i as u64 * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        // Cap = 200 → evict 2 oldest (200 bytes freed)
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 200, false).await;
+        assert_eq!(result.total_bytes, 400);
+        assert_eq!(result.evicted_files, 2);
+        assert_eq!(result.bytes_freed, 200);
     }
 }
