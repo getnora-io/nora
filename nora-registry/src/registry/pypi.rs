@@ -456,7 +456,7 @@ async fn download_file(
         };
 
         // The file may live on a later upstream — keep walking the list.
-        let Some(file_url) = find_file_url(&html, &filename) else {
+        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
             continue;
         };
 
@@ -967,7 +967,10 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
 }
 
 /// Find the download URL for a specific file in the HTML.
-fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
+///
+/// `page_url` is the simple-index page URL used to resolve relative hrefs
+/// returned by some mirrors (Tsinghua, USTC, Aliyun) (#877).
+fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<String> {
     let mut remaining = html;
 
     while let Some(href_start) = remaining.find("href=\"") {
@@ -983,7 +986,16 @@ fn find_file_url(html: &str, target_filename: &str) -> Option<String> {
                 // unchanged — it must stay encoded to fetch from the upstream (#664).
                 let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
                 if decoded.as_ref() == target_filename {
-                    return Some(url.split('#').next().unwrap_or(url).to_string());
+                    let raw = url.split('#').next().unwrap_or(url).to_string();
+                    // Resolve relative URLs against the page URL (#877).
+                    if raw.starts_with("http://") || raw.starts_with("https://") {
+                        return Some(raw);
+                    }
+                    return reqwest::Url::parse(page_url)
+                        .ok()
+                        .and_then(|base| base.join(&raw).ok())
+                        .map(|u| u.to_string())
+                        .or(Some(raw));
                 }
             }
 
@@ -1071,7 +1083,7 @@ mod tests {
             r#"torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl</a>"#,
         );
         assert_eq!(
-            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl").as_deref(),
+            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").as_deref(),
             Some(
                 "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl"
             )
@@ -1079,7 +1091,12 @@ mod tests {
         // A plain filename (no encoding) still matches.
         let plain = r#"<a href="https://x/torch-0.1.10-cp36-cp36m-macosx.whl">x</a>"#;
         assert_eq!(
-            find_file_url(plain, "torch-0.1.10-cp36-cp36m-macosx.whl").as_deref(),
+            find_file_url(
+                plain,
+                "torch-0.1.10-cp36-cp36m-macosx.whl",
+                "https://pypi.org/simple/torch/"
+            )
+            .as_deref(),
             Some("https://x/torch-0.1.10-cp36-cp36m-macosx.whl")
         );
     }
@@ -1174,7 +1191,7 @@ mod tests {
     #[test]
     fn test_find_file_url_found() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz".to_string())
@@ -1184,15 +1201,58 @@ mod tests {
     #[test]
     fn test_find_file_url_not_found() {
         let html = r#"<a href="https://example.com/other-1.0.tar.gz">other</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_find_file_url_strips_hash() {
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
-        let result = find_file_url(html, "pkg-1.0.whl");
+        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/");
         assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
+    }
+
+    // -- #877: relative URL resolution --
+
+    #[test]
+    fn test_find_file_url_relative() {
+        let html = r#"<a href="../../packages/torch-2.4.0.whl#sha256=abc">torch-2.4.0.whl</a>"#;
+        let result = find_file_url(
+            html,
+            "torch-2.4.0.whl",
+            "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/torch/",
+        );
+        assert_eq!(
+            result,
+            Some(
+                "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/torch-2.4.0.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_file_url_absolute_unchanged() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/ab/cd/pkg-1.0.whl">pkg-1.0.whl</a>"#;
+        let result = find_file_url(
+            html,
+            "pkg-1.0.whl",
+            "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/pkg/",
+        );
+        assert_eq!(
+            result,
+            Some("https://files.pythonhosted.org/packages/ab/cd/pkg-1.0.whl".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_file_url_path_only() {
+        let html = r#"<a href="/packages/pkg-1.0.whl#sha256=ff">pkg-1.0.whl</a>"#;
+        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/");
+        assert_eq!(
+            result,
+            Some("https://pypi.example.com/packages/pkg-1.0.whl".to_string())
+        );
     }
 
     #[test]
