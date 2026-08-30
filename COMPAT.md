@@ -381,7 +381,7 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Authentication (Bearer/Basic) | Full | Per-request token validation |
+| Authentication (Bearer/Basic) | Full | Per-request token validation; see OIDC note below |
 | Anonymous read | Full | `NORA_AUTH_ANONYMOUS_READ=true` |
 | Rate limiting (429 + Retry-After) | Full | `tower_governor`, per-IP, documented in OpenAPI |
 | 405 Method Not Allowed + Allow | Full | RFC 9110 §15.5.6, multi-method routes return Allow header |
@@ -394,6 +394,17 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | Activity log | Full | Recent push/pull in dashboard |
 | Backup/restore | Full | CLI commands |
 | Mirror CLI | Full | `nora mirror` for npm/pip/cargo/maven/docker/rpm/deb |
+
+### OIDC authentication transport
+
+OIDC JWT tokens are validated only on the **Bearer** authentication path.
+Docker, twine, and Maven clients transmit credentials via HTTP Basic, and the
+Basic-auth handler recognises htpasswd passwords and opaque API tokens (`nra_…`)
+but does **not** attempt OIDC JWT validation on the password field. To use OIDC
+workload identity from CI, send the JWT as a `Bearer` token (e.g.
+`Authorization: Bearer <jwt>`) rather than as a `docker login` password. For
+`docker login` specifically, use an opaque API token created via the UI or
+`/api/tokens`. (#853)
 
 ### Storage backend notes
 
