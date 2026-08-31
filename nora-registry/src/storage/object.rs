@@ -7,7 +7,10 @@ use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use object_store::{
+    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
+};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -162,6 +165,27 @@ impl ObjectStorage {
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
         }
     }
+
+    /// In-process object store for tests: same code path as S3/GCS, including
+    /// user-metadata round-trips and store-side copy.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self {
+            store: Box::new(object_store::memory::InMemory::new()),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only handle on the raw store, for writing objects NORA itself would
+    /// never write (e.g. one with no pin metadata).
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &dyn ObjectStore {
+        self.store.as_ref()
+    }
 }
 
 /// Encode `@` in object keys to `%40` for SeaweedFS compatibility (shared by
@@ -203,6 +227,30 @@ fn decode_object_key(key: &str) -> String {
     key.replace("%2540", "@").replace("%40", "@")
 }
 
+/// User-defined object metadata carrying the SHA-256 integrity pin — written
+/// atomically with the object and returned with every GET/HEAD, so the pin
+/// travels with the bytes (`x-amz-meta-sha256` / `x-goog-meta-sha256`).
+const PIN_METADATA_KEY: &str = "sha256";
+
+fn pin_attribute() -> Attribute {
+    Attribute::Metadata(PIN_METADATA_KEY.into())
+}
+
+fn pin_attributes(sha256: &str) -> Attributes {
+    [(
+        pin_attribute(),
+        AttributeValue::from(sha256.to_ascii_lowercase()),
+    )]
+    .into_iter()
+    .collect()
+}
+
+fn read_pin(attributes: &Attributes) -> Option<String> {
+    attributes
+        .get(&pin_attribute())
+        .map(|v| v.as_ref().to_string())
+}
+
 /// Map object_store errors to StorageError.
 fn map_err(e: object_store::Error) -> StorageError {
     match e {
@@ -213,32 +261,55 @@ fn map_err(e: object_store::Error) -> StorageError {
 
 #[async_trait]
 impl StorageBackend for ObjectStorage {
-    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
-        self.store.put(&path, payload).await.map_err(map_err)?;
+        let opts = PutOptions {
+            attributes: pin_attributes(sha256),
+            ..Default::default()
+        };
+        self.store
+            .put_opts(&path, payload, opts)
+            .await
+            .map_err(map_err)?;
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Bytes> {
+    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(map_err)?;
-                Ok(bytes)
-            }
+        let result = match self.store.get(&path).await {
+            Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 // Only needed when key contains @, since otherwise both schemes produce the same output.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                let result = self.store.get(&legacy_path).await.map_err(map_err)?;
-                let bytes = result.bytes().await.map_err(map_err)?;
-                Ok(bytes)
+                self.store.get(&legacy_path).await.map_err(map_err)?
             }
-            Err(e) => Err(map_err(e)),
-        }
+            Err(e) => return Err(map_err(e)),
+        };
+        let pin = read_pin(&result.attributes);
+        let bytes = result.bytes().await.map_err(map_err)?;
+        Ok((bytes, pin))
+    }
+
+    async fn pin(&self, key: &str) -> Option<String> {
+        let head = || GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        let path = Path::from(encode_object_key(key));
+        let result = match self.store.get_opts(&path, head()).await {
+            Ok(r) => r,
+            Err(_) if key.contains('@') => {
+                // Fallback: try legacy _at_ encoding for pre-#534 data.
+                let legacy_path = Path::from(encode_object_key_legacy(key));
+                self.store.get_opts(&legacy_path, head()).await.ok()?
+            }
+            Err(_) => return None,
+        };
+        read_pin(&result.attributes)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -369,7 +440,12 @@ impl StorageBackend for ObjectStorage {
         }
     }
 
-    async fn put_from_path(&self, key: &str, src: &std::path::Path) -> Result<()> {
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: Option<&str>,
+    ) -> Result<()> {
         let encoded = encode_object_key(key);
         let s3_path = Path::from(encoded);
 
@@ -384,7 +460,17 @@ impl StorageBackend for ObjectStorage {
         // No partial objects are visible to readers (upload never completed).
         // finish() calls abort() on its own errors; cancellation (future
         // dropped) relies on lifecycle policy only.
-        let upload = self.store.put_multipart(&s3_path).await.map_err(map_err)?;
+        // The pin rides on the multipart init, so it lands with the object or
+        // not at all — no window where the bytes exist unpinned.
+        let opts = PutMultipartOptions {
+            attributes: sha256.map(pin_attributes).unwrap_or_default(),
+            ..Default::default()
+        };
+        let upload = self
+            .store
+            .put_multipart_opts(&s3_path, opts)
+            .await
+            .map_err(map_err)?;
         let mut writer = WriteMultipart::new(upload);
 
         let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB read buffer
@@ -401,15 +487,19 @@ impl StorageBackend for ObjectStorage {
         Ok(())
     }
 
-    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+    async fn copy(&self, src: &str, dst: &str, _sha256: Option<&str>) -> Result<()> {
         // Store-side copy (S3 CopyObject / GCS rewrite) — no bytes cross the
-        // network through this process.
+        // network through this process. A store-side copy carries the source's
+        // user metadata, so `dst` inherits the pin without re-writing it.
         let from_path = Path::from(encode_object_key(src));
         let to_path = Path::from(encode_object_key(dst));
         self.store.copy(&from_path, &to_path).await.map_err(map_err)
     }
 
-    async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let result = match self.store.get(&path).await {
@@ -421,9 +511,10 @@ impl StorageBackend for ObjectStorage {
             Err(e) => return Err(map_err(e)),
         };
         let size = result.meta.size;
+        let pin = read_pin(&result.attributes);
         let stream = result.into_stream().map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
-        Ok((size as u64, Box::pin(reader)))
+        Ok((size as u64, pin, Box::pin(reader)))
     }
 
     async fn get_range(
@@ -432,7 +523,7 @@ impl StorageBackend for ObjectStorage {
         start: u64,
         end: u64,
     ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
-        let make_opts = || object_store::GetOptions {
+        let make_opts = || GetOptions {
             range: Some(object_store::GetRange::Bounded(start..(end + 1))),
             ..Default::default()
         };
@@ -458,6 +549,7 @@ impl StorageBackend for ObjectStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
 
     #[test]
     fn test_backend_name() {
@@ -531,21 +623,16 @@ mod tests {
     /// packument (`npm install` -> ENOVERSIONS).
     #[tokio::test]
     async fn scoped_key_lists_and_gets_through_path_encoding() {
-        let storage = ObjectStorage {
-            store: Box::new(object_store::memory::InMemory::new()),
-            name: "s3",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
-            cached_reachable: std::sync::atomic::AtomicBool::new(true),
-            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
-        };
+        let storage = ObjectStorage::in_memory();
 
+        let body = br#"{"version":"1.0.0"}"#;
+        let hash = hex::encode(sha2::Sha256::digest(body));
         let key = "npm/@scope/pkg/versions/1.0.0.json";
-        storage.put(key, br#"{"version":"1.0.0"}"#).await.unwrap();
+        storage.put(key, body, &hash).await.unwrap();
 
         // Control: a non-scoped key (no `@`, no `%`) is unaffected.
         let plain = "npm/plainpkg/versions/1.0.0.json";
-        storage.put(plain, br#"{"version":"1.0.0"}"#).await.unwrap();
+        storage.put(plain, body, &hash).await.unwrap();
 
         // list() must return the ORIGINAL logical key (with `@`), not the `%2540` form.
         let listed = storage.list("npm/@scope/pkg/versions/").await.unwrap();
@@ -557,11 +644,12 @@ mod tests {
 
         // The listed key must be directly get-able — the exact scan-regenerate step that
         // silently dropped scoped versions before the fix.
-        let got = storage
+        let (got, pin) = storage
             .get(&listed[0])
             .await
             .expect("get on the listed key must succeed");
-        assert_eq!(&got[..], br#"{"version":"1.0.0"}"#);
+        assert_eq!(&got[..], body);
+        assert_eq!(pin.as_deref(), Some(hash.as_str()));
 
         let listed_plain = storage.list("npm/plainpkg/versions/").await.unwrap();
         assert_eq!(listed_plain, vec![plain.to_string()]);

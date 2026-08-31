@@ -37,7 +37,7 @@ All endpoints require authentication. Anonymous read is opt-in via `anonymous_re
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
 | PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
 | Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
-| Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT` (ETag/`If-Match` — local backend only; `If-None-Match: *` works on any backend) |
+| Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT`/`GET` (ETag, `If-Match`, `If-None-Match`) on every backend |
 | RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented in NORA v1.1.0 |
 | Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
 | Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |

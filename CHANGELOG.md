@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **Hash pins on S3/GCS via object metadata** — the SHA-256 integrity pin is no longer a local-filesystem-only feature. On object-store backends it is written as the user-defined `sha256` object metadata, atomically with the object, and read back on GET/HEAD, so buffered reads verify at rest and raw files get `ETag`, `If-None-Match` (304) and `If-Match` conditional overwrite on every backend. Pins are now a backend concern: the local backend keeps its NDJSON sidecar (same path and format, no migration), the object-store backend keeps object metadata, and the storage wrapper only validates keys and runs the fail-closed verify gate. Objects written before the upgrade carry no metadata and stay open-world until they are rewritten; `nora re-pin` rewrites the object on an object store, since object metadata cannot be changed in place.
+
 ## [1.2.0] - 2026-08-23
 
 ### Added

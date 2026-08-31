@@ -261,11 +261,10 @@ pub static UPSTREAM_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| 
 });
 
 /// Wall-clock time of the integrity-verify step on a buffered `Storage::get()`
-/// — the `spawn_blocking(pins.verify(..))` call. Includes blocking-pool queue
-/// time, so a rising p99 under read load signals pool saturation, not just hash
-/// cost. Recorded whenever a pin store is configured (Local backend); a key
-/// with no pin returns early inside `verify()` and contributes a near-zero
-/// sample. Quantifies the #602 perf question before any change is made (#602).
+/// — the `spawn_blocking` re-hash. Includes blocking-pool queue time, so a
+/// rising p99 under read load signals pool saturation, not just hash cost.
+/// Recorded only for a pinned key; an unpinned one skips the gate and observes
+/// nothing. Quantifies the #602 perf question before any change is made (#602).
 pub static STORAGE_VERIFY_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "nora_storage_verify_duration_seconds",

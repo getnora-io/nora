@@ -31,9 +31,6 @@
 //!   `import-key-format-equals-handler-key-format`.
 //! - **SSRF guard** on the source URL and every redirect hop (DNS-pinned) —
 //!   review R2, contract `import-ssrf-per-redirect-hop`.
-//! - **at-rest integrity degrades on S3** (the sha256 pin is local-only): a loud
-//!   WARN is emitted — review R6, accepted contract
-//!   `import-s3-integrity-at-rest-degraded`.
 
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -206,7 +203,7 @@ pub async fn run(
     config: &crate::config::Config,
 ) -> Result<()> {
     match cmd {
-        ImportCommand::Assess(args) => assess(args, storage, config).await,
+        ImportCommand::Assess(args) => assess(args, config).await,
         ImportCommand::Run(args) => run_import(args, storage, config).await,
     }
 }
@@ -221,11 +218,7 @@ fn read_auth() -> Option<String> {
 
 /// `nora import assess` — read-only per-repo compatibility table plus a
 /// connectivity/SSRF/auth smoke test. Writes nothing, sets no markers.
-async fn assess(
-    args: AssessArgs,
-    storage: &crate::storage::Storage,
-    config: &crate::config::Config,
-) -> Result<()> {
+async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> {
     // Default-deny SSRF on the operator URL (assess has no opt-out flag).
     http::precheck_url(&args.url, false)?;
     let client = http::build_import_client(&config.tls, CONNECT_TIMEOUT, READ_TIMEOUT, false)?;
@@ -281,14 +274,6 @@ async fn assess(
         repos.len()
     );
 
-    // R6: on S3 the at-rest hash pin is unavailable — say so loudly.
-    if storage.backend_name() == "s3" {
-        println!(
-            "\nWARNING: target storage is S3 — at-rest hash pin is UNAVAILABLE. \
-             verify-before-commit closes TRANSFER integrity only; imported artifacts \
-             are unpinned at rest (accepted: import-s3-integrity-at-rest-degraded)."
-        );
-    }
     // R3: permission import is Artifactory-only — flag Nexus before a run.
     if matches!(args.source, SourceKind::Nexus) {
         println!("\nNOTE: --with-permissions is unsupported for Nexus (no permission API).");
@@ -318,13 +303,6 @@ async fn run_import(
     let auth = read_auth();
 
     let on_s3 = storage.backend_name() == "s3";
-    if on_s3 {
-        tracing::warn!(
-            "S3 target: at-rest hash pin unavailable — verify-before-commit closes TRANSFER \
-             integrity only; imported artifacts are UNPINNED at rest \
-             (accepted: import-s3-integrity-at-rest-degraded)"
-        );
-    }
 
     let curation = crate::build_curation_engine(config)?;
     let source = source::build_source(
@@ -789,7 +767,7 @@ mod integration_tests {
         );
         assert_eq!(h.storage.get(MAVEN_KEY).await.unwrap().as_ref(), body);
         assert_eq!(
-            h.storage.get_pin_hash(MAVEN_KEY).as_deref(),
+            h.storage.pin(MAVEN_KEY).await.as_deref(),
             Some(sha.as_str())
         );
         // Repo marked done; rerun is idempotent (resume skip, no re-download).

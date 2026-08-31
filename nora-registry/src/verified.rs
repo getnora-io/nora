@@ -7,7 +7,7 @@
 //! [`Storage::get`](crate::storage::Storage::get) gate hash-pin-verifies bytes
 //! before returning them (`#582`/`#604`), the streaming docker path
 //! tamper-detects at EOF, and `put` couples the body write with a hash-pin
-//! record on the local backend. This module pushes those guarantees one step
+//! record on every backend. This module pushes those guarantees one step
 //! **left** — into the type system — and, just as importantly, makes the
 //! *known holes* impossible to hide.
 //!
@@ -22,7 +22,7 @@
 //!   no privileged constructor, no cross-crate seal to trust. What `expected`
 //!   *means* is the caller's to state: for a hash-pinned cache read it is the
 //!   digest NORA recorded at store time (tamper-evidence against on-disk
-//!   corruption — `src/storage/mod.rs:260`), and for a content-addressed
+//!   corruption — `src/storage/mod.rs`), and for a content-addressed
 //!   artifact (a docker blob, whose key *is* its digest) it is the canonical
 //!   upstream digest.
 //!
@@ -41,8 +41,8 @@
 //! A serve sink that demands `Blob<Verified>` (see [`verified_body`]) *cannot*
 //! be handed raw or merely-tamper-evident bytes — that is a compile error, not
 //! a runtime check that a future refactor might skip. And the open-world hole
-//! (an unpinned key, or the S3 backend which has no pin store at all) is forced
-//! into the open by [`GateOutcome`]: a caller of
+//! (an object stored with no pin) is forced into the open by [`GateOutcome`]:
+//! a caller of
 //! [`Storage::get_verified`](crate::storage::Storage::get_verified) must
 //! `match` and decide what to do with [`GateOutcome::Unpinned`] — it can never
 //! be mistaken for a cryptographically verified read.
@@ -215,15 +215,14 @@ pub enum IntegrityError {
 /// A caller cannot get bytes out without `match`ing, so the open-world hole is
 /// impossible to ignore: either the bytes matched a recorded pin
 /// ([`Verified`](GateOutcome::Verified)), or no pin existed for the key and they
-/// were served without a cryptographic check ([`Unpinned`](GateOutcome::Unpinned))
-/// — the latter covers both genuinely-unpinned keys and the S3 backend, which
-/// has no pin store at all.
+/// were served without a cryptographic check
+/// ([`Unpinned`](GateOutcome::Unpinned)).
 #[derive(Debug)]
 pub enum GateOutcome<T = axum::body::Bytes> {
     /// A pin existed and the bytes matched it: cryptographically [`Verified`].
     Verified(Blob<Verified, T>),
     /// No pin existed for this key — served open-world (no cryptographic
-    /// guarantee). The honest name for the gate's no-pin / S3 branch.
+    /// guarantee). The honest name for the gate's no-pin branch.
     Unpinned(Blob<Unverified, T>),
 }
 
@@ -304,14 +303,12 @@ pub trait Durability: sealed::Sealed {
     const TIER: &'static str;
 }
 
-/// Body **and** hash-pin both landed durably — the local-backend store path.
-/// Uninhabited.
+/// Body **and** hash-pin both landed durably. Uninhabited.
 #[derive(Debug)]
 pub enum Pinned {}
 
-/// Stored on a backend with no pin store (S3): integrity cannot be recorded, so
-/// the artifact is served open-world. Names the documented S3 limitation in the
-/// type system. Uninhabited.
+/// Stored without a digest, so no pin was recorded and the artifact is served
+/// open-world. Names that hole in the type system. Uninhabited.
 #[derive(Debug)]
 pub enum Unpinnable {}
 
@@ -347,7 +344,7 @@ impl<P: Durability> StoreReceipt<P> {
 
 impl StoreReceipt<Pinned> {
     /// Mint a [`Pinned`] receipt — call only after both the body and the
-    /// hash-pin have durably landed (the local-backend `put` path).
+    /// hash-pin have durably landed.
     #[must_use]
     pub fn pinned(key: impl Into<String>) -> Self {
         Self {
@@ -358,7 +355,7 @@ impl StoreReceipt<Pinned> {
 }
 
 impl StoreReceipt<Unpinnable> {
-    /// Mint an [`Unpinnable`] receipt — the backend has no pin store (S3).
+    /// Mint an [`Unpinnable`] receipt — the store recorded no pin.
     #[must_use]
     pub fn unpinnable(key: impl Into<String>) -> Self {
         Self {
@@ -370,8 +367,8 @@ impl StoreReceipt<Unpinnable> {
 
 /// An operation that requires a durable integrity pin (e.g. an immutable
 /// publish that must be re-verifiable). Accepts **only** a
-/// [`StoreReceipt<Pinned>`] — passing an [`StoreReceipt<Unpinnable>`] (an S3
-/// store) is a compile error, so the S3 hole cannot be silently relied upon.
+/// [`StoreReceipt<Pinned>`] — passing an [`StoreReceipt<Unpinnable>`] is a
+/// compile error, so the open-world hole cannot be silently relied upon.
 ///
 /// # A pinned store type-checks
 ///
@@ -381,12 +378,12 @@ impl StoreReceipt<Unpinnable> {
 /// assert_eq!(require_pinned(local), "raw/x");
 /// ```
 ///
-/// # An unpinnable (S3) store does NOT compile here
+/// # An unpinnable store does NOT compile here
 ///
 /// ```compile_fail
 /// use nora_registry::verified::{require_pinned, StoreReceipt};
-/// let s3 = StoreReceipt::unpinnable("raw/x");
-/// let _ = require_pinned(s3); // expected StoreReceipt<Pinned>, found <Unpinnable>
+/// let unpinned = StoreReceipt::unpinnable("raw/x");
+/// let _ = require_pinned(unpinned); // expected StoreReceipt<Pinned>, found <Unpinnable>
 /// ```
 pub fn require_pinned(receipt: StoreReceipt<Pinned>) -> String {
     receipt.key

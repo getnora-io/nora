@@ -933,9 +933,6 @@ async fn main() {
                 std::process::exit(2);
             }
             match storage.repin(&key, &expected, yes).await {
-                Ok(storage::RepinOutcome::NoPinStore) => {
-                    println!("Backend has no pin store (S3) — nothing to re-pin.");
-                }
                 Ok(storage::RepinOutcome::DiskMismatch { disk, expected }) => {
                     error!(
                         key = %key,
