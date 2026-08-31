@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **GC: tag-rooted mark walk kept a tag manifest's children but swept the digest-named copy of the manifest itself**, so pull-by-digest of a tagged image 404'd after the first GC run while pull-by-tag kept working. The walk now marks `manifests/sha256:<sha256(bytes)>.json` for every tag manifest — the digest alias the OCI distribution spec requires to stay pullable. Orphaned digest manifests now also take their `.meta.json` sidecar with them instead of leaking it. (#949)
+
 ## [1.2.0] - 2026-08-23
 
 ### Added
