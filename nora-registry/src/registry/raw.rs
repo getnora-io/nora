@@ -281,6 +281,56 @@ fn verify_while_streaming(
     }
 }
 
+/// Verify an RFC 9530 `Repr-Digest` header against the server-computed sha-256.
+///
+/// The header gates the commit but never sets the pin, so the stored pin is
+/// always the hash of the bytes the server received. A header without a
+/// sha-256 entry is rejected rather than ignored: a client that asked for
+/// verification must not get a silent skip.
+fn verify_repr_digest(headers: &axum::http::HeaderMap, computed: &str) -> Option<Response> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let value = headers.get("repr-digest").and_then(|v| v.to_str().ok())?;
+    // Last sha-256 entry wins, per structured-field dictionary semantics.
+    let Some(b64) = value
+        .split(',')
+        .filter_map(|e| e.trim().strip_prefix("sha-256=:")?.strip_suffix(':'))
+        .next_back()
+    else {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                "Repr-Digest must carry a sha-256 entry: sha-256=:BASE64:",
+            )
+                .into_response(),
+        );
+    };
+    let declared = match STANDARD.decode(b64) {
+        Ok(bytes) => hex::encode(bytes),
+        Err(_) => {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Repr-Digest sha-256 value is not valid base64",
+                )
+                    .into_response(),
+            )
+        }
+    };
+    if declared != computed {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Repr-Digest mismatch: declared sha-256 {declared}, body hashes to {computed}"
+                ),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -361,6 +411,10 @@ async fn upload(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    if let Some(resp) = verify_repr_digest(&headers, &sha256) {
+        return resp;
+    }
 
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
@@ -1442,6 +1496,71 @@ mod integration_tests {
             &body_bytes(send(&ctx.app, Method::GET, "/raw/obj.txt", "").await).await[..],
             b"v2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_repr_digest() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+        let ctx = create_test_context();
+        let good = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"hello")));
+        let wrong = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"other")));
+
+        // Matching digest commits.
+        let ok = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-ok.txt",
+            vec![("repr-digest", good.as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::CREATED);
+
+        // Mismatch is rejected before anything is stored.
+        let bad = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-bad.txt",
+            vec![("repr-digest", wrong.as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.state.storage.get("raw/rd-bad.txt").await.is_err());
+
+        // Unsupported-algorithm-only header fails closed.
+        let sha512_only = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-512.txt",
+            vec![("repr-digest", "sha-512=:AAAA:")],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(sha512_only.status(), StatusCode::BAD_REQUEST);
+
+        // Malformed base64 is rejected.
+        let malformed = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-mal.txt",
+            vec![("repr-digest", "sha-256=:not base64!:")],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        // Multi-algorithm dictionary: the sha-256 member is the one verified.
+        let multi = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-multi.txt",
+            vec![("repr-digest", format!("sha-512=:AAAA:, {good}").as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(multi.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
