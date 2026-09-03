@@ -1015,11 +1015,17 @@ mod tests {
                     .cloned()
                     .collect())
             }
-            async fn put(&self, _k: &str, _d: &[u8]) -> crate::storage::Result<()> {
+            async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
                 Ok(())
             }
-            async fn get(&self, _k: &str) -> crate::storage::Result<axum::body::Bytes> {
+            async fn get(
+                &self,
+                _k: &str,
+            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
                 Err(crate::storage::StorageError::NotFound)
+            }
+            async fn pin(&self, _k: &str) -> Option<String> {
+                None
             }
             async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
                 Ok(())
@@ -1037,6 +1043,7 @@ mod tests {
                 &self,
                 _k: &str,
                 _s: &std::path::Path,
+                _sha256: Option<&str>,
             ) -> crate::storage::Result<()> {
                 Ok(())
             }
@@ -1045,11 +1052,17 @@ mod tests {
                 _k: &str,
             ) -> crate::storage::Result<(
                 u64,
+                Option<String>,
                 std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
             )> {
                 Err(crate::storage::StorageError::NotFound)
             }
-            async fn copy(&self, _src: &str, _dst: &str) -> crate::storage::Result<()> {
+            async fn copy(
+                &self,
+                _src: &str,
+                _dst: &str,
+                _sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
                 Err(crate::storage::StorageError::NotFound)
             }
         }
