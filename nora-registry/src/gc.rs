@@ -423,9 +423,18 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     // For manifest lists, also collect sub-manifest digests to resolve in step 3.
     let mut referenced = HashSet::new();
     let mut sub_manifest_digests: HashSet<String> = HashSet::new();
+    // The digest-named aliases of the tag manifests themselves: the OCI
+    // distribution spec keeps content pullable by digest whenever it is
+    // pullable by tag, so these files are roots too (#949).
+    let mut tag_manifest_digests: HashSet<String> = HashSet::new();
 
     for key in &tag_manifests {
         if let Ok(data) = storage.get(key).await {
+            use sha2::Digest;
+            tag_manifest_digests.insert(format!(
+                "sha256:{}",
+                hex::encode(sha2::Sha256::digest(&data))
+            ));
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
                 collect_manifest_refs(&json, &mut referenced, &mut sub_manifest_digests);
             }
@@ -450,12 +459,27 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
     // Step 4: Detect orphaned digest manifests — digest-keyed manifests not
     // reachable from any tag (neither directly tagged nor a sub-manifest of a
     // tagged manifest list).
+    let meta_sidecars: HashSet<&String> = keys
+        .iter()
+        .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".meta.json"))
+        .collect();
     let mut orphan_digest_manifests: Vec<String> = Vec::new();
     for key in &all_manifest_keys {
         let filename = key.rsplit('/').next().unwrap_or("");
         let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-        if is_digest_ref(ref_name) && !sub_manifest_digests.contains(ref_name) {
+        if is_digest_ref(ref_name)
+            && !sub_manifest_digests.contains(ref_name)
+            && !tag_manifest_digests.contains(ref_name)
+        {
             orphan_digest_manifests.push(key.clone());
+            // Reap the .meta.json sidecar with its manifest (#949): it is
+            // invisible to detection on its own, so it would leak forever.
+            if let Some(stem) = key.strip_suffix(".json") {
+                let sidecar = format!("{stem}.meta.json");
+                if meta_sidecars.contains(&sidecar) {
+                    orphan_digest_manifests.push(sidecar);
+                }
+            }
         }
     }
 
@@ -1545,6 +1569,62 @@ mod tests {
             .get("docker/test/blobs/sha256:configabc")
             .await
             .is_ok());
+    }
+
+    /// The digest-named alias of a tag manifest is a root: pull-by-digest must
+    /// keep working after GC (#949). Orphaned digest manifests take their
+    /// .meta.json sidecar with them instead of leaking it.
+    #[tokio::test]
+    async fn test_gc_keeps_tag_manifest_digest_alias_and_reaps_sidecars() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        let manifest = serde_json::json!({
+            "config": {"digest": "sha256:cfg"},
+            "layers": []
+        })
+        .to_string();
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(manifest.as_bytes()))
+        );
+        let alias_key = format!("docker/test/manifests/{digest}.json");
+        let alias_meta_key = format!("docker/test/manifests/{digest}.meta.json");
+
+        storage
+            .put("docker/test/manifests/latest.json", manifest.as_bytes())
+            .await
+            .unwrap();
+        storage.put(&alias_key, manifest.as_bytes()).await.unwrap();
+        storage.put(&alias_meta_key, b"{}").await.unwrap();
+        storage
+            .put("docker/test/blobs/sha256:cfg", b"cfg")
+            .await
+            .unwrap();
+
+        // Untagged digest manifest: orphan, and its sidecar must go with it.
+        storage
+            .put("docker/test/manifests/sha256:dead.json", b"{}")
+            .await
+            .unwrap();
+        storage
+            .put("docker/test/manifests/sha256:dead.meta.json", b"{}")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(result.deleted, 2);
+        assert!(storage.get(&alias_key).await.is_ok());
+        assert!(storage.get(&alias_meta_key).await.is_ok());
+        assert!(storage
+            .get("docker/test/manifests/sha256:dead.json")
+            .await
+            .is_err());
+        assert!(storage
+            .get("docker/test/manifests/sha256:dead.meta.json")
+            .await
+            .is_err());
     }
 
     /// Manifest list (image index) tag transitively protects sub-manifest blobs.
