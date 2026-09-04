@@ -7,13 +7,12 @@ mod object;
 pub use local::LocalStorage;
 pub use object::ObjectStorage;
 
-use crate::hash_pin_store::HashPinStore;
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
@@ -65,6 +64,10 @@ fn registry_label(key: &str) -> &str {
     }
 }
 
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
 /// Outcome of [`Storage::repin`] — an operator integrity-recovery action (#601).
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepinOutcome {
@@ -79,15 +82,24 @@ pub enum RepinOutcome {
     /// is genuinely corrupt/tampered — re-pin cannot heal it; restore from
     /// backup. The pin is left unchanged.
     DiskMismatch { disk: String, expected: String },
-    /// This backend has no pin store (S3) — there is nothing to re-pin.
-    NoPinStore,
 }
 
-/// Storage backend trait
+/// Storage backend trait.
+///
+/// Every backend owns the SHA-256 integrity pin of the artifacts it stores and
+/// keeps it beside the bytes — an NDJSON sidecar on the local filesystem,
+/// user-defined object metadata on an object store. `sha256` arguments are
+/// lowercase hex (64 chars).
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    async fn put(&self, key: &str, data: &[u8]) -> Result<()>;
-    async fn get(&self, key: &str) -> Result<Bytes>;
+    /// Store `data` under `key`, pinned to `sha256`. Fails closed: a body whose
+    /// pin cannot be recorded is reported as a failed write (#582/#604).
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()>;
+    /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
+    /// the object carries no pin (open-world).
+    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
+    /// The recorded pin for `key` without reading the bytes.
+    async fn pin(&self, key: &str) -> Option<String>;
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
@@ -114,28 +126,36 @@ pub trait StorageBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     /// Refresh any cached size data. No-op for backends without caching.
     async fn refresh_total_size(&self) {}
-    /// Move or copy a file from `src` into storage under `key`.
+    /// Move or copy a file from `src` into storage under `key`, pinned to
+    /// `sha256` when the caller computed one (streaming paths do; legacy
+    /// callers that verified integrity separately pass `None`, leaving the
+    /// object open-world).
     ///
     /// Local backend: atomic `rename`, with streaming copy fallback on EXDEV.
-    /// S3 backend: multipart upload from file.
+    /// Object store: multipart upload from file.
     /// The caller is responsible for deleting `src` on error.
-    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()>;
+    async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()>;
 
     /// Server-side copy of `src` to `dst` inside the backend — the bytes never
-    /// transit this process.
+    /// transit this process. `sha256` is the digest of the copied bytes when the
+    /// caller knows it; otherwise `dst` inherits the pin of `src`.
     ///
     /// Returns [`StorageError::NotFound`] when `src` does not exist; an existing
     /// `dst` is overwritten.
-    async fn copy(&self, src: &str, dst: &str) -> Result<()>;
+    async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()>;
 
     /// Open an artifact for streaming read without loading it into memory (#580).
     ///
-    /// Returns `(size_bytes, reader)`. The caller converts the reader to a
-    /// streaming HTTP response via `ReaderStream` + `Body::from_stream()`.
+    /// Returns `(size_bytes, pin, reader)`. The caller converts the reader to a
+    /// streaming HTTP response via `ReaderStream` + `Body::from_stream()`, and
+    /// checks the pin as it streams.
     ///
     /// Local backend: `tokio::fs::File::open` + metadata.
-    /// S3 backend: `object_store::get` → byte-stream wrapped in `StreamReader`.
-    async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
+    /// Object store: `object_store::get` → byte-stream wrapped in `StreamReader`.
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
 
     /// Stream the inclusive byte range `[start, end]` of an object, returning the object's
     /// total size and a reader over exactly those bytes. The default reads from the start and
@@ -147,7 +167,7 @@ pub trait StorageBackend: Send + Sync {
         end: u64,
     ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::AsyncReadExt;
-        let (size, mut reader) = self.get_reader(key).await?;
+        let (size, _, mut reader) = self.get_reader(key).await?;
         let mut to_skip = start;
         let mut buf = [0u8; 64 * 1024];
         while to_skip > 0 {
@@ -164,18 +184,18 @@ pub trait StorageBackend: Send + Sync {
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
+///
+/// Owns key validation, metrics and the fail-closed verify gate; the pin itself
+/// belongs to the backend, which stores it beside the bytes.
 #[derive(Clone)]
 pub struct Storage {
     inner: Arc<dyn StorageBackend>,
-    pin_store: Option<Arc<HashPinStore>>,
 }
 
 impl Storage {
     pub fn new_local(path: &str) -> Self {
-        let pin_path = PathBuf::from(path).join(".nora-pins.ndjson");
         Self {
             inner: Arc::new(LocalStorage::new(path)),
-            pin_store: Some(Arc::new(HashPinStore::new(pin_path))),
         }
     }
 
@@ -187,9 +207,6 @@ impl Storage {
         secret_key: Option<&str>,
         virtual_hosted: bool,
     ) -> Self {
-        tracing::warn!(
-            "Hash pin store disabled for S3 backend — integrity verification unavailable"
-        );
         Self {
             inner: Arc::new(ObjectStorage::new(
                 s3_url,
@@ -199,7 +216,6 @@ impl Storage {
                 secret_key,
                 virtual_hosted,
             )),
-            pin_store: None,
         }
     }
 
@@ -208,93 +224,45 @@ impl Storage {
         service_account_path: Option<&str>,
         base_url: Option<&str>,
     ) -> Self {
-        tracing::warn!(
-            "Hash pin store disabled for GCS backend — integrity verification unavailable"
-        );
         Self {
             inner: Arc::new(ObjectStorage::new_gcs(
                 bucket,
                 service_account_path,
                 base_url,
             )),
-            pin_store: None,
         }
     }
 
     /// Test-only: wrap an arbitrary backend so unit tests can inject behaviour
     /// the real backends can't easily produce — e.g. a `stat`-failing backend
     /// driving GC's fail-closed "age unknown → keep and count" branch (#610).
-    /// No pin store.
     #[cfg(test)]
     pub(crate) fn from_backend(inner: Arc<dyn StorageBackend>) -> Self {
-        Self {
-            inner,
-            pin_store: None,
-        }
+        Self { inner }
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         validate_storage_key(key)?;
-        match self.inner.put(key, data).await {
+        // A buffered body can be large; hashing it inline would stall the tokio
+        // worker for the hash duration, so the digest is computed on the
+        // blocking pool. The backend records it together with the bytes, so a
+        // completed `put()` is never readable-but-unpinned (#604).
+        let buffered = data.to_vec();
+        let hash = match tokio::task::spawn_blocking(move || sha256_hex(&buffered)).await {
+            Ok(h) => h,
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put", "error"])
+                    .inc();
+                tracing::error!(error = %e, key = %key, "hash task for put failed");
+                return Err(StorageError::Io(std::io::Error::other(format!(
+                    "hash task failed: {e}"
+                ))));
+            }
+        };
+        match self.inner.put(key, data, &hash).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
-                if let Some(ref pins) = self.pin_store {
-                    let pins = Arc::clone(pins);
-                    let key_owned = key.to_string();
-                    let data_owned = data.to_vec();
-                    // Await the pin record (SHA-256 + ndjson append, offloaded
-                    // from the tokio worker) so `put()` does not return until the
-                    // pin is durable. Previously this was fire-and-forget, which
-                    // left a window where the artifact was readable but unpinned —
-                    // a `get()` after a completed `put()` could serve it
-                    // unverified (#604) — and silently dropped the pin if the task
-                    // panicked. Fail-closed (mirroring `get()`): if integrity
-                    // cannot be recorded, the write reports failure rather than
-                    // leaving an unverifiable artifact.
-                    //
-                    // NOTE: a `get()` racing *during* an in-flight `put()` (between
-                    // the inner write and this record) can still briefly observe
-                    // the artifact unpinned. Fully closing that requires
-                    // serializing get/put per key; it is benign (it serves NORA's
-                    // own just-written bytes) and out of scope here.
-                    // `record` now returns its I/O result: handle the inner
-                    // failure (ENOSPC/EACCES/EIO/read-only FS) the same way as a
-                    // panicked task — fail closed. Previously that error was
-                    // swallowed inside `record`, so `put()` returned Ok while the
-                    // pin never reached disk, silently downgrading the key to
-                    // open-world after the next restart (the #582/#604 bypass).
-                    //
-                    // NOTE (immutable registries): `self.inner.put` already
-                    // succeeded, so on an immutable registry the client's retry
-                    // hits the immutability guard (409) and never re-runs this pin
-                    // write — the orphaned body stays unpinned until an operator
-                    // `repin`s it. That is still strictly better than the prior
-                    // silent success and is the documented recovery path;
-                    // auto-cleanup of the orphan body is a separate follow-up.
-                    match tokio::task::spawn_blocking(move || pins.record(&key_owned, &data_owned))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["put", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                        Err(e) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["put", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                    }
-                }
                 Ok(())
             }
             Err(e) => {
@@ -306,80 +274,84 @@ impl Storage {
         }
     }
 
-    pub async fn get(&self, key: &str) -> Result<Bytes> {
+    /// Buffered read through the fail-closed integrity gate, returning the bytes
+    /// and the pin they were checked against (`None` = open-world key).
+    async fn get_pinned(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         validate_storage_key(key)?;
-        match self.inner.get(key).await {
-            Ok(data) => {
-                STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
-                let label = registry_label(key);
-                STORAGE_GET_BYTES
-                    .with_label_values(&[label])
-                    .observe(data.len() as f64);
-                if let Some(ref pins) = self.pin_store {
-                    let pins = Arc::clone(pins);
-                    let key_owned = key.to_string();
-                    let data_ref = data.clone();
-                    // SHA-256 verification — offloaded from the tokio worker.
-                    // A buffered `get()` may hold a large artifact in memory;
-                    // hashing it inline would stall the async worker for the
-                    // hash duration, so we keep the blocking pool. The panic
-                    // path is handled fail-closed below — see #582.
-                    //
-                    // INVARIANT (#582): a *positive* verify result is NEVER
-                    // cached — the hash is recomputed on every read. Caching
-                    // "verified" by mtime/size would re-open the bypass #582
-                    // closed (bit-rot does not bump mtime; an on-disk tamperer
-                    // can forge it via `utimes`). The recompute is the
-                    // deliberate cost of fail-closed delivery; #602 instruments
-                    // that cost via STORAGE_VERIFY_DURATION_SECONDS rather than
-                    // weakening the guarantee.
-                    let verify_start = std::time::Instant::now();
-                    let outcome =
-                        tokio::task::spawn_blocking(move || pins.verify(&key_owned, &data_ref))
-                            .await;
-                    STORAGE_VERIFY_DURATION_SECONDS
-                        .with_label_values(&[label])
-                        .observe(verify_start.elapsed().as_secs_f64());
-                    match outcome {
-                        // Genuine hash mismatch — tampering or on-disk corruption.
-                        // Fail-closed: never serve the tampered bytes (#582).
-                        Ok(false) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["get", "integrity_fail"])
-                                .inc();
-                            tracing::error!(
-                                key = %key,
-                                "integrity violation: refusing to serve tampered artifact"
-                            );
-                            return Err(StorageError::IntegrityViolation);
-                        }
-                        // Verification task itself panicked. We cannot prove the
-                        // bytes are intact, so fail-closed too — a crashed
-                        // verifier must not become an integrity bypass (#582).
-                        Err(e) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["get", "verify_error"])
-                                .inc();
-                            tracing::error!(
-                                error = %e,
-                                key = %key,
-                                "hash verification task failed: refusing to serve unverified artifact"
-                            );
-                            return Err(StorageError::IntegrityViolation);
-                        }
-                        // Hash matched, or no pin exists for this key (open-world).
-                        Ok(true) => {}
-                    }
-                }
-                Ok(data)
-            }
+        let (data, pin) = match self.inner.get(key).await {
+            Ok(v) => v,
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["get", "error"])
                     .inc();
-                Err(e)
+                return Err(e);
+            }
+        };
+        STORAGE_OPERATIONS.with_label_values(&["get", "ok"]).inc();
+        let label = registry_label(key);
+        STORAGE_GET_BYTES
+            .with_label_values(&[label])
+            .observe(data.len() as f64);
+
+        let Some(expected) = pin else {
+            return Ok((data, None));
+        };
+
+        // SHA-256 verification — offloaded from the tokio worker for the same
+        // reason as `put`. The panic path is handled fail-closed below (#582).
+        //
+        // INVARIANT (#582): a *positive* verify result is NEVER cached — the
+        // hash is recomputed on every read. Caching "verified" by mtime/size
+        // would re-open the bypass #582 closed (bit-rot does not bump mtime; an
+        // at-rest tamperer can forge it via `utimes`). The recompute is the
+        // deliberate cost of fail-closed delivery; #602 instruments that cost
+        // via STORAGE_VERIFY_DURATION_SECONDS rather than weakening the
+        // guarantee.
+        let bytes = data.clone();
+        let verify_start = std::time::Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || sha256_hex(&bytes)).await;
+        STORAGE_VERIFY_DURATION_SECONDS
+            .with_label_values(&[label])
+            .observe(verify_start.elapsed().as_secs_f64());
+        match outcome {
+            Ok(actual) if actual == expected => Ok((data, Some(expected))),
+            // Genuine hash mismatch — tampering or at-rest corruption.
+            // Fail-closed: never serve the tampered bytes (#582).
+            Ok(actual) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get", "integrity_fail"])
+                    .inc();
+                tracing::error!(
+                    key = %key,
+                    expected = %expected,
+                    actual = %actual,
+                    "INTEGRITY VIOLATION: refusing to serve tampered artifact"
+                );
+                Err(StorageError::IntegrityViolation)
+            }
+            // Verification task itself panicked. We cannot prove the bytes are
+            // intact, so fail closed too — a crashed verifier must not become an
+            // integrity bypass (#582).
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get", "verify_error"])
+                    .inc();
+                tracing::error!(
+                    error = %e,
+                    key = %key,
+                    "hash verification task failed: refusing to serve unverified artifact"
+                );
+                Err(StorageError::IntegrityViolation)
             }
         }
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Bytes> {
+        // Validate locally as the first act, like every Storage wrapper method: a choke point
+        // that does not depend on the transitive get_pinned() validation below surviving a future
+        // refactor (trust-boundary invariant — mirrors get_verified).
+        validate_storage_key(key)?;
+        self.get_pinned(key).await.map(|(data, _)| data)
     }
 
     /// Buffered, integrity-gated read returning a compile-time integrity
@@ -392,9 +364,9 @@ impl Storage {
     /// - a pin existed and the bytes matched it → [`GateOutcome::Verified`]
     ///   carrying a `Blob<Verified>` (a proof the bytes hash to the recorded
     ///   pin);
-    /// - no pin existed for the key, or this backend has no pin store (S3) →
-    ///   [`GateOutcome::Unpinned`], so a caller cannot mistake the open-world
-    ///   case for a verified read.
+    /// - the object carries no pin (written before pins, or stored without a
+    ///   digest) → [`GateOutcome::Unpinned`], so a caller cannot mistake the
+    ///   open-world case for a verified read.
     ///
     /// [`GateOutcome::Verified`]: nora_registry::verified::GateOutcome::Verified
     /// [`GateOutcome::Unpinned`]: nora_registry::verified::GateOutcome::Unpinned
@@ -411,15 +383,15 @@ impl Storage {
         // below surviving a future refactor (trust-boundary invariant).
         validate_storage_key(key)?;
         use nora_registry::verified::{Blob, GateOutcome};
-        // Reuse the fail-closed gate: get() returns Ok only after a digest
-        // match (Ok(true)) or the open-world / no-pin branch.
-        let data = self.get(key).await?;
-        match self.get_pin_hash(key) {
+        // Reuse the fail-closed gate: it returns Ok only after a digest match or
+        // on the open-world / no-pin branch.
+        let (data, pin) = self.get_pinned(key).await?;
+        match pin {
             Some(pin) => match Blob::verify(data, &pin) {
                 Ok(blob) => Ok(GateOutcome::Verified(blob)),
-                // get() already verified these bytes against the same in-memory
-                // pin, so a mismatch here is unreachable in practice; treat it
-                // as a tamper signal and fail closed rather than downgrade.
+                // The gate already verified these bytes against the same pin, so
+                // a mismatch here is unreachable in practice; treat it as a
+                // tamper signal and fail closed rather than downgrade.
                 Err(_) => Err(StorageError::IntegrityViolation),
             },
             None => Ok(GateOutcome::Unpinned(Blob::raw(data))),
@@ -433,34 +405,6 @@ impl Storage {
                 STORAGE_OPERATIONS
                     .with_label_values(&["delete", "ok"])
                     .inc();
-                if let Some(ref pins) = self.pin_store {
-                    let pins = Arc::clone(pins);
-                    let key_owned = key.to_string();
-                    // Await the tombstone write so a failure is observable rather
-                    // than fire-and-forget. A lost tombstone is fail-safe (a stale
-                    // pin at worst yields a future IntegrityViolation, healable via
-                    // `repin`), so `delete()` still reports success — the
-                    // authoritative action (byte removal) already succeeded.
-                    match tokio::task::spawn_blocking(move || pins.remove(&key_owned)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["delete", "pin_error"])
-                                .inc();
-                            tracing::warn!(
-                                error = %e,
-                                key = %key,
-                                "hash-pin tombstone write failed; stale pin left (repin to heal)"
-                            );
-                        }
-                        Err(e) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["delete", "pin_error"])
-                                .inc();
-                            tracing::warn!(error = %e, key = %key, "hash-pin tombstone task panicked");
-                        }
-                    }
-                }
                 Ok(())
             }
             Err(e) => {
@@ -517,16 +461,20 @@ impl Storage {
         self.inner.backend_name()
     }
 
-    /// Look up the pinned SHA-256 hash for a storage key (None if pin store is disabled or key is unknown).
-    pub fn get_pin_hash(&self, key: &str) -> Option<String> {
-        self.pin_store.as_ref().and_then(|p| p.get(key))
+    /// The recorded SHA-256 pin for a storage key, or `None` when the object
+    /// carries no pin (written before pins, or stored without a digest).
+    pub async fn pin(&self, key: &str) -> Option<String> {
+        if validate_storage_key(key).is_err() {
+            return None;
+        }
+        self.inner.pin(key).await
     }
 
     /// Operator recovery for an artifact whose hash pin no longer matches its
     /// stored bytes (#601). Reads the raw bytes *bypassing* verification — the
     /// whole point, since [`Storage::get`] fails closed on the very mismatch we
     /// are recovering from — and updates the pin to `expected` **only if the
-    /// on-disk bytes already hash to `expected`**.
+    /// stored bytes already hash to `expected`**.
     ///
     /// `expected` is the SHA-256 the operator independently knows to be
     /// canonical for this key (from a CI manifest, upstream checksum, lockfile,
@@ -534,46 +482,36 @@ impl Storage {
     /// integrity bypass: a plain "recompute the hash from disk" would let
     /// corrupted or tampered bytes silently re-bless themselves, re-opening the
     /// hole #582 closed. By demanding `disk == expected`, re-pin can only ever
-    /// set the pin to a hash the disk *already* has **and** the operator has
-    /// vouched for. If the disk is genuinely corrupt (`disk != expected`) it
-    /// refuses — re-pin cannot heal corruption; the operator must restore from
-    /// backup first.
+    /// set the pin to a hash the stored bytes *already* have **and** the
+    /// operator has vouched for. If the bytes are genuinely corrupt
+    /// (`disk != expected`) it refuses — re-pin cannot heal corruption; the
+    /// operator must restore from backup first.
     ///
     /// `apply == false` is a dry run (computes and compares, writes nothing).
-    /// Local backend only — S3 has no pin store.
+    /// A pin travels with the bytes, and object metadata cannot be changed
+    /// without re-writing the object, so applying a re-pin rewrites the
+    /// artifact: the file and its sidecar entry on the local backend, the whole
+    /// object on an object store.
     pub async fn repin(&self, key: &str, expected: &str, apply: bool) -> Result<RepinOutcome> {
         validate_storage_key(key)?;
-        let Some(ref pins) = self.pin_store else {
-            return Ok(RepinOutcome::NoPinStore);
-        };
         let expected = expected.to_ascii_lowercase();
         // Raw read — deliberately bypasses `Storage::get()`'s verification,
         // which would fail closed on the mismatch we are recovering from.
-        let data = self.inner.get(key).await?;
-        let disk = hex::encode(Sha256::digest(&data));
+        let (data, old) = self.inner.get(key).await?;
+        let disk = sha256_hex(&data);
         if disk != expected {
-            // The bytes on disk are not the ones the operator vouched for —
+            // The stored bytes are not the ones the operator vouched for —
             // genuine corruption/tampering. Re-pin must NOT bless them.
             return Ok(RepinOutcome::DiskMismatch { disk, expected });
         }
-        let old = pins.get(key);
         if old.as_deref() == Some(expected.as_str()) {
             return Ok(RepinOutcome::AlreadyPinned { hash: expected });
         }
         if !apply {
             return Ok(RepinOutcome::WouldUpdate { old, new: expected });
         }
-        pins.record_hash(key, &expected).map_err(|e| {
-            StorageError::Io(std::io::Error::other(format!(
-                "hash-pin record failed: {e}"
-            )))
-        })?;
+        self.inner.put(key, &data, &expected).await?;
         Ok(RepinOutcome::Updated { old, new: expected })
-    }
-
-    /// Number of pinned hashes (0 if pin store is disabled).
-    pub fn pinned_count(&self) -> usize {
-        self.pin_store.as_ref().map_or(0, |p| p.len())
     }
 
     /// Refresh cached total_size. No-op for local storage, computes for S3.
@@ -583,49 +521,17 @@ impl Storage {
 
     /// Move or copy a file from `src` into storage under `key`.
     ///
-    /// When `sha256` is `Some`, the hash is recorded in the pin store without
-    /// re-reading the file — used by streaming download paths where the hash
-    /// was already computed incrementally (#580).
-    ///
-    /// When `sha256` is `None`, the pin store is not updated (legacy behavior
-    /// for callers that have already verified integrity separately).
+    /// When `sha256` is `Some`, the backend pins the object to that digest
+    /// without re-reading the file — used by streaming paths where the hash was
+    /// computed incrementally (#580). When it is `None` the object is stored
+    /// unpinned (legacy behaviour for callers that verified integrity
+    /// separately).
     pub async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
         validate_storage_key(key)?;
-        match self.inner.put_from_path(key, src).await {
+        let sha256 = sha256.map(str::to_ascii_lowercase);
+        match self.inner.put_from_path(key, src, sha256.as_deref()).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
-                if let (Some(hash), Some(ref pins)) = (sha256, &self.pin_store) {
-                    let pins = Arc::clone(pins);
-                    let key_owned = key.to_string();
-                    let hash = hash.to_string();
-                    // Await the pin record so it is durable before this returns —
-                    // the streaming write counterpart of the `put()` fix (#604).
-                    // `record_hash` uses the pre-computed digest (no re-hash), so
-                    // the await is near-free. Fail-closed on a panicking task.
-                    match tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["put", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                        Err(e) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["put", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                    }
-                }
                 Ok(())
             }
             Err(e) => {
@@ -640,47 +546,16 @@ impl Storage {
     /// Server-side copy of `src` to `dst` (see [`StorageBackend::copy`]).
     ///
     /// `sha256` is the lowercase hex digest of the copied bytes; when present it
-    /// is pinned for `dst` without reading the object back. When it is `None`,
-    /// `dst` inherits the pin of `src` if `src` carries one, and otherwise stays
+    /// pins `dst` without reading the object back. When it is `None`, `dst`
+    /// inherits the pin of `src` if `src` carries one, and otherwise stays
     /// open-world — as [`put_from_path`](Self::put_from_path) does.
     pub async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
         validate_storage_key(src)?;
         validate_storage_key(dst)?;
-        match self.inner.copy(src, dst).await {
+        let sha256 = sha256.map(str::to_ascii_lowercase);
+        match self.inner.copy(src, dst, sha256.as_deref()).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["copy", "ok"]).inc();
-                let hash = sha256
-                    .map(str::to_ascii_lowercase)
-                    .or_else(|| self.get_pin_hash(src));
-                if let (Some(hash), Some(ref pins)) = (hash, &self.pin_store) {
-                    let pins = Arc::clone(pins);
-                    let key_owned = dst.to_string();
-                    // Fail closed like `put`/`put_from_path`: a copied-but-unpinned
-                    // blob would be served without verification (#582/#604).
-                    match tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["copy", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %dst, "hash-pin record failed");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                        Err(e) => {
-                            STORAGE_OPERATIONS
-                                .with_label_values(&["copy", "pin_error"])
-                                .inc();
-                            tracing::error!(error = %e, key = %dst, "hash-pin record task panicked");
-                            return Err(StorageError::Io(std::io::Error::other(format!(
-                                "hash-pin record failed: {e}"
-                            ))));
-                        }
-                    }
-                }
                 Ok(())
             }
             Err(e) => {
@@ -692,16 +567,16 @@ impl Storage {
         }
     }
 
-    /// Open an artifact for streaming read without loading into memory (#580).
+    /// Open an artifact for streaming read without loading it into memory (#580).
     ///
-    /// Returns `(size_bytes, reader)`. Pin-store integrity is NOT checked here
-    /// because streaming prevents full-data hashing. Callers that need integrity
-    /// verification should use `verify_integrity_by_hash` with the content digest
-    /// (available from the URL for Docker blobs).
+    /// Returns `(size_bytes, pin, reader)`. The bytes are NOT verified here —
+    /// streaming prevents a full-body hash before the first frame — so callers
+    /// hash the stream and check it against `pin` at EOF (see raw's
+    /// `verify_while_streaming`), or rely on a content-addressed digest.
     pub async fn get_reader(
         &self,
         key: &str,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
         match self.inner.get_reader(key).await {
             Ok(reader) => {
@@ -751,20 +626,18 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    /// The GCS wrapper constructs without credentials or network and disables
-    /// the pin store, matching the S3 wrapper's at-rest posture.
+    /// The GCS wrapper constructs without credentials or network.
     #[test]
     fn test_new_gcs_wrapper() {
         let storage = Storage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
         assert_eq!(storage.backend_name(), "gcs");
-        assert!(storage.get_pin_hash("any/key").is_none());
     }
 
     /// Wait until the pin record from `put()` is visible. Since #604 `put()`
     /// awaits the pin, so this returns on the first poll; kept for robustness.
     async fn await_pin(storage: &Storage, key: &str) {
         for _ in 0..200 {
-            if storage.get_pin_hash(key).is_some() {
+            if storage.pin(key).await.is_some() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -772,10 +645,16 @@ mod tests {
         panic!("pin for {key} was never recorded");
     }
 
+    fn object_storage() -> (Arc<ObjectStorage>, Storage) {
+        let backend = Arc::new(ObjectStorage::in_memory());
+        let storage = Storage::from_backend(backend.clone());
+        (backend, storage)
+    }
+
     /// Regression for #604: `put()` must record the hash-pin BEFORE it returns,
     /// so there is no window where a completed put leaves the artifact readable
     /// but unpinned (which a later `get()` would serve unverified). Exercises
-    /// the real call path `Storage::put()` → `get_pin_hash()` — the pin is
+    /// the real call path `Storage::put()` → `pin()` — the pin is
     /// observable synchronously, with no polling.
     #[tokio::test]
     async fn put_records_pin_before_returning() {
@@ -785,7 +664,7 @@ mod tests {
         storage.put("raw/x/app.bin", b"payload").await.unwrap();
 
         assert!(
-            storage.get_pin_hash("raw/x/app.bin").is_some(),
+            storage.pin("raw/x/app.bin").await.is_some(),
             "put() must record the hash-pin before returning (#604)"
         );
         // And the recorded pin must match the bytes (a subsequent get verifies).
@@ -813,7 +692,7 @@ mod tests {
             b"layer"
         );
         assert_eq!(
-            storage.get_pin_hash("docker/dst/blobs/x").as_deref(),
+            storage.pin("docker/dst/blobs/x").await.as_deref(),
             Some(hash.as_str())
         );
         assert!(matches!(
@@ -894,9 +773,10 @@ mod tests {
         );
     }
 
-    /// Regression for #604: the streaming write path `put_from_path()` must also
-    /// record its pin BEFORE returning (same fire-and-forget gap as `put()`,
-    /// on the path that handles Docker blobs). Exercises the real call path.
+    /// Regression for #604: the streaming write path `put_from_path()` — the one
+    /// that handles Docker blobs — must record its pin BEFORE returning, so the
+    /// pin is observable the moment the call completes. Exercises the real call
+    /// path.
     #[tokio::test]
     async fn put_from_path_records_pin_before_returning() {
         use sha2::{Digest, Sha256};
@@ -911,7 +791,7 @@ mod tests {
         storage.put_from_path(key, &src, Some(&sha)).await.unwrap();
 
         assert_eq!(
-            storage.get_pin_hash(key).as_deref(),
+            storage.pin(key).await.as_deref(),
             Some(sha.as_str()),
             "put_from_path must record the hash-pin before returning (#604)"
         );
@@ -1087,7 +967,7 @@ mod tests {
             storage.get(key).await,
             Err(StorageError::IntegrityViolation)
         ));
-        assert_eq!(storage.get_pin_hash(key).as_deref(), Some(genuine.as_str()));
+        assert_eq!(storage.pin(key).await.as_deref(), Some(genuine.as_str()));
     }
 
     /// Re-pinning a key whose pin already equals `expected` is a no-op.
@@ -1125,7 +1005,7 @@ mod tests {
         std::fs::write(&src, b"orphan-bytes").unwrap();
         storage.put_from_path(key, &src, None).await.unwrap();
         assert_eq!(
-            storage.get_pin_hash(key),
+            storage.pin(key).await,
             None,
             "precondition: the orphaned body must be stored without a pin"
         );
@@ -1140,10 +1020,161 @@ mod tests {
                 new: expected.clone(),
             }
         );
+        assert_eq!(storage.pin(key).await.as_deref(), Some(expected.as_str()));
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"orphan-bytes");
+    }
+
+    // --- Object-store backend: the pin is user-defined object metadata ---
+
+    /// A pinned object round-trips its pin through the store's metadata, so the
+    /// gate verifies it exactly as it does on the local backend.
+    #[tokio::test]
+    async fn object_put_pins_and_verifies() {
+        use nora_registry::verified::GateOutcome;
+        let (_, storage) = object_storage();
+        let key = "raw/obj/app.bin";
+
+        storage.put(key, b"object-bytes").await.unwrap();
+
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"object-bytes");
         assert_eq!(
-            storage.get_pin_hash(key).as_deref(),
-            Some(expected.as_str())
+            storage.pin(key).await.as_deref(),
+            Some(sha_hex(b"object-bytes").as_str())
         );
+        assert!(matches!(
+            storage.get_verified(key).await.unwrap(),
+            GateOutcome::Verified(_)
+        ));
+    }
+
+    /// The streaming write path pins when the caller computed a digest, and
+    /// leaves the object open-world when it did not.
+    #[tokio::test]
+    async fn object_put_from_path_pins_only_with_a_digest() {
+        use nora_registry::verified::GateOutcome;
+        let (_, storage) = object_storage();
+        let dir = TempDir::new().unwrap();
+
+        let src = dir.path().join("pinned.bin");
+        std::fs::write(&src, b"streamed").unwrap();
+        let sha = sha_hex(b"streamed");
+        storage
+            .put_from_path("raw/obj/pinned.bin", &src, Some(&sha))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.pin("raw/obj/pinned.bin").await.as_deref(),
+            Some(sha.as_str())
+        );
+
+        let src = dir.path().join("unpinned.bin");
+        std::fs::write(&src, b"streamed").unwrap();
+        storage
+            .put_from_path("raw/obj/unpinned.bin", &src, None)
+            .await
+            .unwrap();
+        assert_eq!(storage.pin("raw/obj/unpinned.bin").await, None);
+        assert!(matches!(
+            storage.get_verified("raw/obj/unpinned.bin").await.unwrap(),
+            GateOutcome::Unpinned(_)
+        ));
+    }
+
+    /// A store-side copy carries the source's user metadata, so the destination
+    /// inherits the pin without the wrapper re-writing it.
+    #[tokio::test]
+    async fn object_copy_inherits_the_source_pin() {
+        let (_, storage) = object_storage();
+        storage.put("docker/src/blobs/x", b"layer").await.unwrap();
+
+        storage
+            .copy("docker/src/blobs/x", "docker/dst/blobs/x", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.pin("docker/dst/blobs/x").await.as_deref(),
+            Some(sha_hex(b"layer").as_str())
+        );
+        assert_eq!(
+            &storage.get("docker/dst/blobs/x").await.unwrap()[..],
+            b"layer"
+        );
+    }
+
+    /// Regression for #582 on an object store: bytes replaced under an unchanged
+    /// pin must not be served. Writes through the backend directly, bypassing
+    /// the wrapper — exactly the out-of-band tamper the pin exists to catch.
+    #[tokio::test]
+    async fn object_get_fails_closed_on_integrity_mismatch() {
+        let (backend, storage) = object_storage();
+        let key = "raw/obj/tampered.bin";
+
+        storage.put(key, b"genuine-bytes").await.unwrap();
+        backend
+            .put(key, b"TAMPERED", &sha_hex(b"genuine-bytes"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.get(key).await,
+            Err(StorageError::IntegrityViolation)
+        ));
+    }
+
+    /// Objects written before pins existed carry no metadata: they stay
+    /// readable and open-world, with no migration.
+    #[tokio::test]
+    async fn object_without_metadata_is_open_world() {
+        use object_store::{ObjectStoreExt, PutPayload};
+        let (backend, storage) = object_storage();
+        let key = "raw/obj/legacy.bin";
+
+        backend
+            .store()
+            .put(
+                &object_store::path::Path::from(key),
+                PutPayload::from_static(b"pre-existing"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"pre-existing");
+        assert_eq!(storage.pin(key).await, None);
+    }
+
+    /// #601 on an object store: re-pin still refuses bytes the operator did not
+    /// vouch for, and applying it rewrites the object with the new pin.
+    #[tokio::test]
+    async fn object_repin_refuses_mismatch_and_pins_on_match() {
+        let (_, storage) = object_storage();
+        let dir = TempDir::new().unwrap();
+        let key = "raw/obj/repin.bin";
+
+        // An unpinned object (streamed in without a digest) is the recoverable
+        // orphan case.
+        let src = dir.path().join("orphan.bin");
+        std::fs::write(&src, b"orphan-bytes").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+
+        let wrong = sha_hex(b"something-else");
+        assert_eq!(
+            storage.repin(key, &wrong, true).await.unwrap(),
+            RepinOutcome::DiskMismatch {
+                disk: sha_hex(b"orphan-bytes"),
+                expected: wrong,
+            }
+        );
+
+        let expected = sha_hex(b"orphan-bytes");
+        assert_eq!(
+            storage.repin(key, &expected, true).await.unwrap(),
+            RepinOutcome::Updated {
+                old: None,
+                new: expected.clone(),
+            }
+        );
+        assert_eq!(storage.pin(key).await.as_deref(), Some(expected.as_str()));
         assert_eq!(&storage.get(key).await.unwrap()[..], b"orphan-bytes");
     }
 }

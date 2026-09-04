@@ -244,6 +244,9 @@ async fn storage_get_reader_with_fallback(
         }
         other => other,
     }
+    // Docker blobs are content-addressed: the URL digest is the integrity
+    // check, so the stored pin is not needed here.
+    .map(|(size, _pin, reader)| (size, reader))
 }
 
 /// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
@@ -1370,7 +1373,7 @@ async fn download_blob(
                     if fetched._guard.path.is_none() {
                         // Successfully stored — stream from storage
                         match state.storage.get_reader(&key).await {
-                            Ok((size, reader)) => {
+                            Ok((size, _pin, reader)) => {
                                 let stream =
                                     ReaderStream::new(VerifyingReader::new(reader, &digest));
                                 return Response::builder()
@@ -5762,14 +5765,20 @@ mod integration_tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for FailingPrefixBackend {
-        async fn put(&self, key: &str, data: &[u8]) -> crate::storage::Result<()> {
-            self.inner.put(key, data).await
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
         }
-        async fn get(&self, key: &str) -> crate::storage::Result<axum::body::Bytes> {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
             if key.starts_with(&self.fail_prefix) {
                 return Err(crate::storage::StorageError::Network("injected".into()));
             }
             self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
         }
         async fn delete(&self, key: &str) -> crate::storage::Result<()> {
             self.inner.delete(key).await
@@ -5789,21 +5798,28 @@ mod integration_tests {
         fn backend_name(&self) -> &'static str {
             "failing-prefix-test"
         }
-        async fn copy(&self, src: &str, dst: &str) -> crate::storage::Result<()> {
-            self.inner.copy(src, dst).await
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
         }
         async fn put_from_path(
             &self,
             key: &str,
             src: &std::path::Path,
+            sha256: Option<&str>,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(key, src).await
+            self.inner.put_from_path(key, src, sha256).await
         }
         async fn get_reader(
             &self,
             key: &str,
         ) -> crate::storage::Result<(
             u64,
+            Option<String>,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             if key.starts_with(&self.fail_prefix) {

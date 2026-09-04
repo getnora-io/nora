@@ -24,6 +24,15 @@ skip() {
     SKIPPED=$((SKIPPED + 1))
 }
 
+# SHA-256 of stdin, hex digest only.
+sha256_hex() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
+
 # Wait for a NORA instance to be healthy (up to 30s)
 wait_healthy() {
     local url="$1"
@@ -68,6 +77,26 @@ test_backend() {
         pass "${name}: raw download (simple key)"
     else
         fail "${name}: raw download (simple key) mismatch"
+    fi
+
+    # 2b. ETag + conditional GET. The hash pin is stored as `sha256` object
+    # metadata, so the ETag is the object's digest on every S3 implementation.
+    local expected_etag etag
+    expected_etag="\"$(printf '%s\n' "$payload" | sha256_hex)\""
+    etag=$(curl -sf --head "${base}/raw/s3test/simple.txt" 2>/dev/null \
+        | tr -d '\r' | awk 'tolower($1) == "etag:" {print $2}')
+    if [ "$etag" = "$expected_etag" ]; then
+        pass "${name}: HEAD returns sha256 ETag"
+    else
+        fail "${name}: HEAD ETag ${etag:-<none>} != ${expected_etag}"
+    fi
+
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "If-None-Match: ${etag}" "${base}/raw/s3test/simple.txt")
+    if [ "$http_code" = "304" ]; then
+        pass "${name}: If-None-Match returns 304"
+    else
+        fail "${name}: If-None-Match returned ${http_code}, expected 304"
     fi
 
     # 3. Raw upload/download — key with @ (scoped package path)

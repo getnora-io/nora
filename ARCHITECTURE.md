@@ -99,6 +99,13 @@ matched the bytes, or `Unpinned` for an open-world key with no pin. Callers must
 verified one. A pin mismatch returns `IntegrityViolation` rather than the bytes,
 so the gate fails closed.
 
+The pin itself belongs to the backend, which keeps it with the bytes: an NDJSON
+sidecar (`.nora-pins.ndjson`) on the local filesystem, and the user-defined
+`sha256` object metadata on S3/GCS, written atomically with the object and read
+back on GET/HEAD. The wrapper only validates keys and runs the gate; an object
+stored without a digest (or written before pins existed) simply has none and
+stays open-world.
+
 The curation layer is a second trust boundary for proxy traffic. When mode is
 `enforce`, a package must pass all filters (blocklist, allowlist, namespace,
 integrity) before reaching storage. When mode is `audit`, blocked packages
@@ -149,9 +156,9 @@ nora/
 │   │   └── mod.rs           #   Re-exports: docker_routes(), maven_routes(), ...
 │   │
 │   ├── storage/
-│   │   ├── mod.rs           #   StorageBackend trait + Storage wrapper (validate + pin gate)
-│   │   ├── local.rs         #   Local filesystem implementation
-│   │   └── object.rs        #   Object-store implementation (S3-compatible + GCS)
+│   │   ├── mod.rs           #   StorageBackend trait + Storage wrapper (validate + verify gate)
+│   │   ├── local.rs         #   Local filesystem implementation (pins in an NDJSON sidecar)
+│   │   └── object.rs        #   Object-store implementation, S3-compatible + GCS (pins in object metadata)
 │   │
 │   ├── auth/               # Authentication (middleware + providers)
 │   │   ├── mod.rs           #   auth_middleware, provider dispatch
@@ -165,7 +172,7 @@ nora/
 │   ├── validation.rs        # Input validation: storage keys, package names, null bytes
 │   │
 │   ├── verified.rs          # Compile-time integrity witnesses (GateOutcome typestate)
-│   ├── hash_pin_store.rs    # SHA-256 pins recorded on put(), verified on get()
+│   ├── hash_pin_store.rs    # SHA-256 pin sidecar for the local backend (NDJSON)
 │   ├── digest_quarantine.rs # First-seen tracking for proxy-fetched digests
 │   ├── circuit_breaker.rs   # Per-registry circuit breaker for upstream proxy calls
 │   ├── proxy_coalesce.rs    # Single-flight coalescing on the proxy cache-miss path

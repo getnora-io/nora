@@ -615,7 +615,7 @@ mod tests {
             o => panic!("expected Imported, got {o:?}"),
         }
         assert_eq!(storage.get(KEY).await.unwrap().as_ref(), body);
-        assert_eq!(storage.get_pin_hash(KEY).as_deref(), Some(sha.as_str()));
+        assert_eq!(storage.pin(KEY).await.as_deref(), Some(sha.as_str()));
     }
 
     #[tokio::test]

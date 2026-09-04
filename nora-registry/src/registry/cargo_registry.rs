@@ -1076,12 +1076,15 @@ mod tests {
                     "cargo/index-entries/fa/il/failcrate/0.2.0.json".to_string(),
                 ])
             }
-            async fn get(&self, _key: &str) -> StorageResult<Bytes> {
+            async fn get(&self, _key: &str) -> StorageResult<(Bytes, Option<String>)> {
                 Err(StorageError::Io(std::io::Error::other(
                     "injected transient read error",
                 )))
             }
-            async fn put(&self, _key: &str, _data: &[u8]) -> StorageResult<()> {
+            async fn pin(&self, _key: &str) -> Option<String> {
+                None
+            }
+            async fn put(&self, _key: &str, _data: &[u8], _sha256: &str) -> StorageResult<()> {
                 panic!("regenerate must abort before writing a truncated index");
             }
             async fn delete(&self, _key: &str) -> StorageResult<()> {
@@ -1099,16 +1102,27 @@ mod tests {
             fn backend_name(&self) -> &'static str {
                 "failing-get-test"
             }
-            async fn put_from_path(&self, _key: &str, _src: &Path) -> StorageResult<()> {
+            async fn put_from_path(
+                &self,
+                _key: &str,
+                _src: &Path,
+                _sha256: Option<&str>,
+            ) -> StorageResult<()> {
                 Ok(())
             }
             async fn get_reader(
                 &self,
                 _key: &str,
-            ) -> StorageResult<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+            ) -> StorageResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
+            {
                 Err(StorageError::NotFound)
             }
-            async fn copy(&self, _src: &str, _dst: &str) -> StorageResult<()> {
+            async fn copy(
+                &self,
+                _src: &str,
+                _dst: &str,
+                _sha256: Option<&str>,
+            ) -> StorageResult<()> {
                 Err(StorageError::NotFound)
             }
         }
