@@ -1,8 +1,9 @@
 # Changelog
 ## [Unreleased]
 
-### Fixed
-- **GC: tag-rooted mark walk kept a tag manifest's children but swept the digest-named copy of the manifest itself**, so pull-by-digest of a tagged image 404'd after the first GC run while pull-by-tag kept working. The walk now marks `manifests/sha256:<sha256(bytes)>.json` for every tag manifest — the digest alias the OCI distribution spec requires to stay pullable. Orphaned digest manifests now also take their `.meta.json` sidecar with them instead of leaking it. (#949)
+### Added
+- **Hash pins on S3/GCS via object metadata** — the SHA-256 integrity pin is no longer a local-filesystem-only feature. On object-store backends it is written as the user-defined `sha256` object metadata, atomically with the object, and read back on GET/HEAD, so buffered reads verify at rest and raw files get `ETag`, `If-None-Match` (304) and `If-Match` conditional overwrite on every backend. Pins are now a backend concern: the local backend keeps its NDJSON sidecar (same path and format, no migration), the object-store backend keeps object metadata, and the storage wrapper only validates keys and runs the fail-closed verify gate. Objects written before the upgrade carry no metadata and stay open-world until they are rewritten; `nora re-pin` rewrites the object on an object store, since object metadata cannot be changed in place.
+- **Raw upload integrity via `Repr-Digest` (RFC 9530)** — a raw `PUT` may declare `Repr-Digest: sha-256=:BASE64:`; NORA verifies the received body against it before committing, so a corrupted or truncated upload is rejected with `400` instead of being pinned. The pin itself is always the server-computed hash; the header only gates the commit. A `Repr-Digest` without a sha-256 entry is rejected rather than silently skipped.
 
 ## [1.2.0] - 2026-08-23
 

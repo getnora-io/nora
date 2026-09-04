@@ -88,31 +88,32 @@ async fn download(
         }
     }
 
-    // Conditional GET — If-None-Match
-    if let Some(inm) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(stored_hash) = state.storage.get_pin_hash(&key) {
-            let etag_val = format!("\"{}\"", stored_hash);
-            if inm.trim() == etag_val || inm.trim() == "*" {
-                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag_val)]).into_response();
-            }
-        }
-    }
-
     // Streamed serve with STREAMING integrity verification. The buffered
     // `get_verified` gate would hold the whole object in memory — unusable for
     // multi-GB artifacts — so raw hashes the stream as it is served and
     // compares against the recorded pin at EOF. On a mismatch the body is
     // aborted BEFORE its final frame: the client observes a connection error /
     // Content-Length shortfall instead of a completed corrupt download —
-    // fail-closed, in streaming form. A key with no pin (object-store backend)
-    // is served without a cryptographic check, exactly like the buffered
-    // gate's `Unpinned` arm.
-    let pin = state.storage.get_pin_hash(&key);
+    // fail-closed, in streaming form. A key with no pin is served without a
+    // cryptographic check, exactly like the buffered gate's `Unpinned` arm.
+    //
+    // The pin comes back with the reader, so bytes and pin are one object
+    // version and one backend round-trip.
     match state.storage.get_reader(&key).await {
-        Ok((len, reader)) => {
+        Ok((len, pin, reader)) => {
+            // Conditional GET — If-None-Match
+            if let (Some(inm), Some(stored_hash)) = (
+                headers
+                    .get(header::IF_NONE_MATCH)
+                    .and_then(|v| v.to_str().ok()),
+                pin.as_deref(),
+            ) {
+                let etag_val = format!("\"{}\"", stored_hash);
+                if inm.trim() == etag_val || inm.trim() == "*" {
+                    return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag_val)]).into_response();
+                }
+            }
+
             let content_type = guess_content_type(&key);
             let etag = pin.as_ref().map(|h| format!("\"{}\"", h));
 
@@ -280,6 +281,56 @@ fn verify_while_streaming(
     }
 }
 
+/// Verify an RFC 9530 `Repr-Digest` header against the server-computed sha-256.
+///
+/// The header gates the commit but never sets the pin, so the stored pin is
+/// always the hash of the bytes the server received. A header without a
+/// sha-256 entry is rejected rather than ignored: a client that asked for
+/// verification must not get a silent skip.
+fn verify_repr_digest(headers: &axum::http::HeaderMap, computed: &str) -> Option<Response> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let value = headers.get("repr-digest").and_then(|v| v.to_str().ok())?;
+    // Last sha-256 entry wins, per structured-field dictionary semantics.
+    let Some(b64) = value
+        .split(',')
+        .filter_map(|e| e.trim().strip_prefix("sha-256=:")?.strip_suffix(':'))
+        .next_back()
+    else {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                "Repr-Digest must carry a sha-256 entry: sha-256=:BASE64:",
+            )
+                .into_response(),
+        );
+    };
+    let declared = match STANDARD.decode(b64) {
+        Ok(bytes) => hex::encode(bytes),
+        Err(_) => {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Repr-Digest sha-256 value is not valid base64",
+                )
+                    .into_response(),
+            )
+        }
+    };
+    if declared != computed {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Repr-Digest mismatch: declared sha-256 {declared}, body hashes to {computed}"
+                ),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -361,6 +412,10 @@ async fn upload(
         }
     };
 
+    if let Some(resp) = verify_repr_digest(&headers, &sha256) {
+        return resp;
+    }
+
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -418,8 +473,7 @@ async fn upload(
 
         // If-Match: "<etag>" → update only if ETag matches
         (true, _, Some(etag)) => {
-            let stored_hash = state.storage.get_pin_hash(&key);
-            match stored_hash {
+            match state.storage.pin(&key).await {
                 Some(hash) => {
                     let expected = format!("\"{}\"", hash);
                     if etag == expected {
@@ -436,7 +490,7 @@ async fn upload(
                     return (StatusCode::PRECONDITION_FAILED, "ETag mismatch").into_response();
                 }
                 None => {
-                    // No pin hash available (e.g. S3 backend) — cannot verify
+                    // Stored before pins existed — nothing to compare against.
                     return (
                         StatusCode::PRECONDITION_FAILED,
                         "ETag not available for this resource",
@@ -566,7 +620,7 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
                 .header(header::CONTENT_TYPE, guess_content_type(&key))
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
-            if let Some(hash) = state.storage.get_pin_hash(&key) {
+            if let Some(hash) = state.storage.pin(&key).await {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
             if meta.modified > 0 {
@@ -1045,17 +1099,6 @@ mod integration_tests {
         let ctx = create_test_context();
         send(&ctx.app, Method::PUT, "/raw/etag.txt", b"hello".to_vec()).await;
 
-        // The ETag is the hash-pin, recorded fire-and-forget after PUT. Wait for
-        // it to land so HEAD deterministically sees the ETag — otherwise the
-        // pin task can be starved under a full parallel suite and the header is
-        // absent (#603). Polls (fast path = immediate), no fixed sleep.
-        for _ in 0..200 {
-            if ctx.state.storage.get_pin_hash("raw/etag.txt").is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
         let head = send(&ctx.app, Method::HEAD, "/raw/etag.txt", "").await;
         assert_eq!(head.status(), StatusCode::OK);
         let etag = head.headers().get("etag").expect("HEAD must return ETag");
@@ -1346,13 +1389,6 @@ mod integration_tests {
             b"0123456789".to_vec(),
         )
         .await;
-        // The ETag is the hash-pin, recorded fire-and-forget after PUT (#603).
-        for _ in 0..200 {
-            if ctx.state.storage.get_pin_hash("raw/ifr.bin").is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         let head = send(&ctx.app, Method::HEAD, "/raw/ifr.bin", "").await;
         let etag = head
             .headers()
@@ -1390,6 +1426,141 @@ mod integration_tests {
         assert_eq!(fresh.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(fresh.headers().get("etag").unwrap().to_str().unwrap(), etag);
         assert_eq!(&body_bytes(fresh).await[..], b"2345");
+    }
+
+    /// The ETag flows are backend-agnostic since the pin became object
+    /// metadata: HEAD advertises it, a matching `If-None-Match` is a 304, and a
+    /// conditional overwrite matches on it — all on an object store.
+    #[tokio::test]
+    async fn test_raw_conditional_requests_on_object_backend() {
+        use crate::storage::ObjectStorage;
+        use sha2::{Digest, Sha256};
+
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(ObjectStorage::in_memory()),
+        ));
+
+        let put = send(&ctx.app, Method::PUT, "/raw/obj.txt", b"v1".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let head = send(&ctx.app, Method::HEAD, "/raw/obj.txt", "").await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let etag = head
+            .headers()
+            .get("etag")
+            .expect("object metadata must carry the pin")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(etag, format!("\"{}\"", hex::encode(Sha256::digest(b"v1"))));
+
+        let cached = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/obj.txt",
+            vec![("if-none-match", &etag)],
+            "",
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+
+        let stale = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/obj.txt",
+            vec![(
+                "if-match",
+                "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+            )],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+        let overwrite = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/obj.txt",
+            vec![("if-match", &etag)],
+            b"v2".to_vec(),
+        )
+        .await;
+        assert_eq!(overwrite.status(), StatusCode::OK);
+
+        let head = send(&ctx.app, Method::HEAD, "/raw/obj.txt", "").await;
+        assert_eq!(
+            head.headers().get("etag").unwrap().to_str().unwrap(),
+            format!("\"{}\"", hex::encode(Sha256::digest(b"v2")))
+        );
+        assert_eq!(
+            &body_bytes(send(&ctx.app, Method::GET, "/raw/obj.txt", "").await).await[..],
+            b"v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raw_put_repr_digest() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+        let ctx = create_test_context();
+        let good = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"hello")));
+        let wrong = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"other")));
+
+        // Matching digest commits.
+        let ok = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-ok.txt",
+            vec![("repr-digest", good.as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::CREATED);
+
+        // Mismatch is rejected before anything is stored.
+        let bad = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-bad.txt",
+            vec![("repr-digest", wrong.as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.state.storage.get("raw/rd-bad.txt").await.is_err());
+
+        // Unsupported-algorithm-only header fails closed.
+        let sha512_only = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-512.txt",
+            vec![("repr-digest", "sha-512=:AAAA:")],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(sha512_only.status(), StatusCode::BAD_REQUEST);
+
+        // Malformed base64 is rejected.
+        let malformed = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-mal.txt",
+            vec![("repr-digest", "sha-256=:not base64!:")],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        // Multi-algorithm dictionary: the sha-256 member is the one verified.
+        let multi = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/rd-multi.txt",
+            vec![("repr-digest", format!("sha-512=:AAAA:, {good}").as_str())],
+            b"hello".to_vec(),
+        )
+        .await;
+        assert_eq!(multi.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

@@ -73,6 +73,12 @@ pub fn create_test_context_with_raw_disabled() -> TestContext {
     build_context(false, &[], false, |cfg| cfg.raw.enabled = false)
 }
 
+/// Build a test context over a caller-supplied backend, so handler tests can
+/// run against an object store instead of the local filesystem.
+pub fn create_test_context_with_storage(storage: Storage) -> TestContext {
+    build_context_with(false, &[], false, |_| {}, Some(storage))
+}
+
 /// Build a test context with custom config tweaks.
 pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> TestContext {
     build_context(false, &[], false, customize)
@@ -91,6 +97,16 @@ fn build_context(
     users: &[(&str, &str)],
     anonymous_read: bool,
     customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context_with(auth_enabled, users, anonymous_read, customize, None)
+}
+
+fn build_context_with(
+    auth_enabled: bool,
+    users: &[(&str, &str)],
+    anonymous_read: bool,
+    customize: impl FnOnce(&mut Config),
+    storage: Option<Storage>,
 ) -> TestContext {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let storage_path = tempdir.path().to_str().unwrap().to_string();
@@ -218,7 +234,7 @@ fn build_context(
     // Apply any custom config tweaks
     customize(&mut config);
 
-    let storage = Storage::new_local(&storage_path);
+    let storage = storage.unwrap_or_else(|| Storage::new_local(&storage_path));
 
     let auth = if auth_enabled && !users.is_empty() {
         let htpasswd_path = tempdir.path().join("users.htpasswd");
