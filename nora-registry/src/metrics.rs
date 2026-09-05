@@ -352,6 +352,18 @@ pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create METADATA_CORRUPT_TOTAL metric at startup")
 });
 
+/// Packuments rebuilt from per-version keys because the derived
+/// `metadata.json` was absent (#956). A non-zero rate points at storage that
+/// was written or restored outside NORA.
+pub static PACKUMENT_REBUILT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_packument_rebuilt_total",
+        "Packuments reassembled from per-version keys after a missing derived packument",
+        &["registry"]
+    )
+    .expect("failed to create PACKUMENT_REBUILT_TOTAL metric at startup")
+});
+
 /// Leak detection scans skipped (#517)
 static LEAK_DETECTION_SKIPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
