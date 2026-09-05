@@ -17,6 +17,7 @@ use crate::validation::ends_with_ci;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use subtle::ConstantTimeEq;
 
@@ -790,10 +791,42 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// No match → `Decision::Skip` (defer to next filter).
 #[derive(Debug)]
 pub struct BlocklistFilter {
+    /// Every rule, in file order. Both collections below index into this, so
+    /// first-match-wins is decided by original position, not by which structure
+    /// happened to answer.
     rules: Vec<BlocklistRule>,
+    /// Rules with a literal `name`, bucketed for an O(1) probe. A generated
+    /// blocklist is almost entirely these.
+    by_name: HashMap<String, Vec<usize>>,
+    /// Rules whose `name` is a pattern. Scanned in order; at generated scale
+    /// this stays in the tens while `by_name` holds the rest.
+    globs: Vec<usize>,
 }
 
 impl BlocklistFilter {
+    /// Build the lookup index. The allowlist next door has always been an O(1)
+    /// map; the blocklist walked every rule and ran three `glob_match` calls on
+    /// each, which is free at a hand-written scale and is not once the file is
+    /// machine-generated.
+    pub fn new(rules: Vec<BlocklistRule>) -> Self {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut globs = Vec::new();
+        for (index, rule) in rules.iter().enumerate() {
+            // `glob_match` treats every pattern form through `*` — `*`, `foo*`,
+            // `*foo`, `foo.**`, `foo/**` — so a name without one is literal.
+            if rule.name.contains('*') {
+                globs.push(index);
+            } else {
+                by_name.entry(rule.name.clone()).or_default().push(index);
+            }
+        }
+        Self {
+            rules,
+            by_name,
+            globs,
+        }
+    }
+
     /// Load and validate a blocklist from a JSON file.
     pub fn from_file(path: &str) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
@@ -809,12 +842,19 @@ impl BlocklistFilter {
             ));
         }
 
-        Ok(Self { rules: file.rules })
+        Ok(Self::new(file.rules))
     }
 
     /// Number of rules loaded.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Does this rule cover the request, given a name that already matched?
+    fn covers(&self, index: usize, registry: &str, version: &str) -> bool {
+        let rule = &self.rules[index];
+        glob_match(&rule.registry, registry)
+            && (rule.version == "*" || glob_match(&rule.version, version))
     }
 }
 
@@ -827,20 +867,40 @@ impl ProxyFilter for BlocklistFilter {
         let registry_str = request.registry.to_string();
         let version_str = request.version.as_deref().unwrap_or("");
 
-        for rule in &self.rules {
-            let registry_match = glob_match(&rule.registry, &registry_str);
-            let name_match = glob_match(&rule.name, &request.name);
-            let version_match = rule.version == "*" || glob_match(&rule.version, version_str);
+        // First match in file order wins, and that choice is visible: it decides
+        // which rule's `reason` the client reads in the 403. So the two
+        // collections are merged by original index rather than probed one after
+        // the other.
+        let mut winner: Option<usize> = None;
 
-            if registry_match && name_match && version_match {
-                return Decision::Block {
-                    rule: "blocklist".to_string(),
-                    reason: rule.reason.clone(),
-                };
+        if let Some(bucket) = self.by_name.get(request.name.as_str()) {
+            winner = bucket
+                .iter()
+                .copied()
+                .find(|&index| self.covers(index, &registry_str, version_str));
+        }
+
+        for &index in &self.globs {
+            // `globs` is ascending: once an earlier exact rule has won, no later
+            // pattern can displace it.
+            if winner.is_some_and(|w| index > w) {
+                break;
+            }
+            if glob_match(&self.rules[index].name, &request.name)
+                && self.covers(index, &registry_str, version_str)
+            {
+                winner = Some(index);
+                break;
             }
         }
 
-        Decision::Skip
+        match winner {
+            Some(index) => Decision::Block {
+                rule: "blocklist".to_string(),
+                reason: self.rules[index].reason.clone(),
+            },
+            None => Decision::Skip,
+        }
     }
 }
 
@@ -1714,7 +1774,7 @@ mod tests {
     // ---- BlocklistFilter::evaluate ----
 
     fn make_blocklist(rules: Vec<BlocklistRule>) -> BlocklistFilter {
-        BlocklistFilter { rules }
+        BlocklistFilter::new(rules)
     }
 
     fn make_request_with_registry(
@@ -1731,6 +1791,157 @@ mod tests {
             bypass: false,
             publish_date: None,
         }
+    }
+
+    fn br(registry: &str, name: &str, version: &str, reason: &str) -> BlocklistRule {
+        BlocklistRule {
+            registry: registry.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The naive scan this filter replaced. The indexed implementation must
+    /// agree with it on every input, including which rule wins.
+    fn naive_decision(rules: &[BlocklistRule], request: &FilterRequest) -> Option<String> {
+        let registry_str = request.registry.to_string();
+        let version_str = request.version.as_deref().unwrap_or("");
+        rules
+            .iter()
+            .find(|rule| {
+                glob_match(&rule.registry, &registry_str)
+                    && glob_match(&rule.name, &request.name)
+                    && (rule.version == "*" || glob_match(&rule.version, version_str))
+            })
+            .map(|rule| rule.reason.clone())
+    }
+
+    fn reason_of(decision: &Decision) -> Option<String> {
+        match decision {
+            Decision::Block { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    /// #953: the index must not change any decision, and must not change *which*
+    /// rule decides — the winning rule's `reason` is what a client reads in the
+    /// 403, so a reordering would be visible in production and invisible to a
+    /// test that only asserts Block vs Skip.
+    #[test]
+    fn test_blocklist_index_agrees_with_naive_scan() {
+        // Deliberately overlapping: literal and pattern rules that match the
+        // same names, interleaved so file order and structure order disagree.
+        let rules = vec![
+            br("npm", "left-pad", "*", "first-literal"),
+            br("*", "left-*", "*", "second-glob"),
+            br("npm", "lodash", "4.17.20", "third-literal-pinned"),
+            br("npm", "lo*", "*", "fourth-glob"),
+            br("*", "*", "9.9.9", "fifth-catch-all-version"),
+            br("pypi", "left-pad", "*", "sixth-other-registry"),
+            br("npm", "@scope/pkg", "*", "seventh-scoped"),
+            br("npm", "*-stream", "*", "eighth-suffix-glob"),
+        ];
+        let filter = make_blocklist(rules.clone());
+
+        let names = [
+            "left-pad",
+            "lodash",
+            "loose",
+            "event-stream",
+            "@scope/pkg",
+            "unrelated",
+            "left-hand",
+        ];
+        let versions = [None, Some("1.0.0"), Some("4.17.20"), Some("9.9.9")];
+        let registries = [RegistryType::Npm, RegistryType::PyPI, RegistryType::Cargo];
+
+        let mut checked = 0;
+        for registry in registries {
+            for name in names {
+                for version in versions {
+                    let req = make_request_with_registry(registry, name, version);
+                    let expected = naive_decision(&rules, &req);
+                    let actual = reason_of(&filter.evaluate(&req));
+                    assert_eq!(
+                        actual, expected,
+                        "indexed lookup disagreed with the naive scan for {:?} {}@{:?}",
+                        registry, name, version
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 84, "the matrix must actually run");
+    }
+
+    /// An earlier pattern rule outranks a later literal one, and swapping the
+    /// file order swaps the winner. This is the ordering property in isolation.
+    #[test]
+    fn test_blocklist_earlier_rule_wins_regardless_of_shape() {
+        let glob_first = make_blocklist(vec![
+            br("npm", "ev*", "*", "glob-wins"),
+            br("npm", "event-stream", "*", "literal-loses"),
+        ]);
+        let literal_first = make_blocklist(vec![
+            br("npm", "event-stream", "*", "literal-wins"),
+            br("npm", "ev*", "*", "glob-loses"),
+        ]);
+        let req = make_request_with_registry(RegistryType::Npm, "event-stream", Some("1.0.0"));
+
+        assert_eq!(
+            reason_of(&glob_first.evaluate(&req)),
+            Some("glob-wins".to_string())
+        );
+        assert_eq!(
+            reason_of(&literal_first.evaluate(&req)),
+            Some("literal-wins".to_string())
+        );
+    }
+
+    /// A literal name lands in the map, but registry and version still narrow it.
+    #[test]
+    fn test_blocklist_indexed_rule_still_checks_registry_and_version() {
+        let filter = make_blocklist(vec![br("npm", "lodash", "4.17.20", "pinned")]);
+
+        let wrong_registry =
+            make_request_with_registry(RegistryType::PyPI, "lodash", Some("4.17.20"));
+        assert!(matches!(filter.evaluate(&wrong_registry), Decision::Skip));
+
+        let wrong_version =
+            make_request_with_registry(RegistryType::Npm, "lodash", Some("4.17.21"));
+        assert!(matches!(filter.evaluate(&wrong_version), Decision::Skip));
+
+        let hit = make_request_with_registry(RegistryType::Npm, "lodash", Some("4.17.20"));
+        assert_eq!(
+            reason_of(&filter.evaluate(&hit)),
+            Some("pinned".to_string())
+        );
+    }
+
+    /// Duplicate literal names share a bucket; the first one still wins.
+    #[test]
+    fn test_blocklist_duplicate_names_keep_file_order() {
+        let filter = make_blocklist(vec![
+            br("npm", "dup", "1.0.0", "narrow-first"),
+            br("npm", "dup", "*", "broad-second"),
+        ]);
+        assert_eq!(
+            reason_of(&filter.evaluate(&make_request_with_registry(
+                RegistryType::Npm,
+                "dup",
+                Some("1.0.0")
+            ))),
+            Some("narrow-first".to_string())
+        );
+        assert_eq!(
+            reason_of(&filter.evaluate(&make_request_with_registry(
+                RegistryType::Npm,
+                "dup",
+                Some("2.0.0")
+            ))),
+            Some("broad-second".to_string())
+        );
     }
 
     #[test]
