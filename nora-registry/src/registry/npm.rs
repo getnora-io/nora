@@ -435,7 +435,7 @@ async fn handle_request(
                         crate::curation::RegistryType::Npm,
                         &package_name,
                     ) {
-                        return with_content_type(false, data).into_response();
+                        return packument_response(&headers, data);
                     }
                     // Single-flight: when a popular packument expires and a CI
                     // fleet stampedes the same key, one request revalidates
@@ -453,7 +453,7 @@ async fn handle_request(
                         refetch_metadata(&state, &path, &key).await.map(Bytes::from)
                     };
                     if let Some(fresh) = fresh {
-                        return with_content_type(false, fresh).into_response();
+                        return packument_response(&headers, fresh);
                     }
                     // Upstream failed — serve stale if configured, otherwise 502
                     if state.config.npm.serve_stale {
@@ -462,13 +462,17 @@ async fn handle_request(
                             path = %path,
                             "npm upstream unavailable, serving stale metadata"
                         );
+                        // Degraded, but still the representation that was asked
+                        // for: body and Content-Type must agree here too.
+                        let (stale_body, stale_type) = packument_body(&headers, data);
                         return (
                             StatusCode::OK,
                             [
                                 (
                                     header::CONTENT_TYPE,
-                                    axum::http::HeaderValue::from_static("application/json"),
+                                    axum::http::HeaderValue::from_static(stale_type),
                                 ),
+                                (header::VARY, axum::http::HeaderValue::from_static("Accept")),
                                 (
                                     header::CACHE_CONTROL,
                                     axum::http::HeaderValue::from_static(
@@ -480,14 +484,14 @@ async fn handle_request(
                                     axum::http::HeaderValue::from_static("true"),
                                 ),
                             ],
-                            data.to_vec(),
+                            stale_body.to_vec(),
                         )
                             .into_response();
                     }
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
             }
-            return with_content_type(false, data).into_response();
+            return packument_response(&headers, data);
         }
 
         // Tarball: integrity check if hash exists
@@ -597,7 +601,7 @@ async fn handle_request(
                     "Rebuilt packument from per-version keys"
                 );
                 state.metrics.record_cache_hit("npm");
-                return with_content_type(false, data).into_response();
+                return packument_response(&headers, data);
             }
         }
     }
@@ -713,7 +717,10 @@ async fn handle_request(
                         return resp;
                     }
                 }
-                return with_content_type(is_tarball, data_to_serve.into()).into_response();
+                if is_tarball {
+                    return with_content_type(true, data_to_serve.into()).into_response();
+                }
+                return packument_response(&headers, data_to_serve.into());
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
@@ -1323,6 +1330,118 @@ async fn extract_npm_publish_date(
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
     let date_str = json.get("time")?.get(version)?.as_str()?;
     crate::curation::parse_iso8601_to_unix(date_str)
+}
+
+/// npm's abbreviated packument — `application/vnd.npm.install-v1+json`, the
+/// document an installer actually reads. Everything else (readme, maintainers,
+/// repository, per-version `description`, `scripts`, `gitHead`) is dropped, and
+/// on a package with many versions that is most of the bytes.
+const NPM_INSTALL_V1: &str = "application/vnd.npm.install-v1+json";
+
+/// The per-version fields npm keeps in the abbreviated form. This is an
+/// allowlist on purpose: dropping a field an installer consults — `os`, `cpu`,
+/// `engines`, `peerDependenciesMeta` — silently changes what gets resolved and
+/// installed, so a field is added here, once, rather than at a call site.
+const INSTALL_V1_VERSION_FIELDS: &[&str] = &[
+    "name",
+    "version",
+    "dependencies",
+    "optionalDependencies",
+    "devDependencies",
+    "bundleDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "acceptDependencies",
+    "bin",
+    "directories",
+    "dist",
+    "engines",
+    "os",
+    "cpu",
+    "libc",
+    "funding",
+    "deprecated",
+    "hasInstallScript",
+    "_hasShrinkwrap",
+];
+
+/// Top-level fields kept alongside `versions`.
+const INSTALL_V1_TOP_FIELDS: &[&str] = &["name", "dist-tags", "modified"];
+
+/// True when the client asked for the abbreviated packument.
+fn wants_install_v1(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains(NPM_INSTALL_V1))
+}
+
+/// Project a full packument down to the abbreviated form. `None` when the body
+/// is not a packument we can parse — the caller then serves it unchanged.
+fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
+    let doc: serde_json::Value = serde_json::from_slice(full).ok()?;
+    let obj = doc.as_object()?;
+
+    let mut out = serde_json::Map::new();
+    for field in INSTALL_V1_TOP_FIELDS {
+        if let Some(value) = obj.get(*field) {
+            out.insert((*field).to_string(), value.clone());
+        }
+    }
+
+    let mut versions = serde_json::Map::new();
+    if let Some(source) = obj.get("versions").and_then(|v| v.as_object()) {
+        for (version, manifest) in source {
+            let Some(manifest) = manifest.as_object() else {
+                continue;
+            };
+            let mut kept = serde_json::Map::new();
+            for field in INSTALL_V1_VERSION_FIELDS {
+                if let Some(value) = manifest.get(*field) {
+                    kept.insert((*field).to_string(), value.clone());
+                }
+            }
+            versions.insert(version.clone(), serde_json::Value::Object(kept));
+        }
+    }
+    out.insert("versions".to_string(), serde_json::Value::Object(versions));
+
+    serde_json::to_vec(&serde_json::Value::Object(out)).ok()
+}
+
+/// Serve a packument, honouring the abbreviated form when the client asks for it.
+///
+/// `Vary: Accept` is not decoration here: the body depends on a request header
+/// and NORA marks metadata `Cache-Control: public`, so without it a shared cache
+/// can hand the abbreviated document to a client that asked for the full one.
+fn packument_body(headers: &HeaderMap, data: Bytes) -> (Bytes, &'static str) {
+    if !wants_install_v1(headers) {
+        return (data, "application/json");
+    }
+    match abbreviate_packument(&data) {
+        Some(short) => (Bytes::from(short), NPM_INSTALL_V1),
+        // Unparsable body: serve it unchanged. The client asked for a
+        // projection of this document, not for an error.
+        None => (data, "application/json"),
+    }
+}
+
+fn packument_response(headers: &HeaderMap, data: Bytes) -> Response {
+    let (body, content_type) = packument_body(headers, data);
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60, must-revalidate"),
+            ),
+            (header::VARY, HeaderValue::from_static("Accept")),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn with_content_type(
@@ -3428,5 +3547,230 @@ mod spec_conformance_tests {
             bodies.windows(2).all(|pair| pair[0] == pair[1]),
             "concurrent rebuilds of the same package must agree"
         );
+    }
+    /// #957: `npm install` asks for the abbreviated packument. Serving the full
+    /// document instead is correct but wasteful — and the fields it carries are
+    /// exactly the ones an installer never reads.
+    #[tokio::test]
+    async fn test_npm_packument_abbreviated_on_install_v1_accept() {
+        use crate::test_helpers::{body_bytes, create_test_context, send_with_headers};
+        use axum::http::{header, Method, StatusCode};
+
+        let ctx = create_test_context();
+        let full = serde_json::json!({
+            "name": "corgi",
+            "dist-tags": { "latest": "1.0.0" },
+            "readme": "a very long readme that no installer reads",
+            "maintainers": [{ "name": "someone" }],
+            "versions": {
+                "1.0.0": {
+                    "name": "corgi",
+                    "version": "1.0.0",
+                    "dist": { "tarball": "http://example/corgi-1.0.0.tgz" },
+                    "dependencies": { "left-pad": "^1.0.0" },
+                    "engines": { "node": ">=18" },
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "peerDependenciesMeta": { "react": { "optional": true } },
+                    "deprecated": "use corgi2",
+                    "description": "dropped",
+                    "scripts": { "test": "dropped" },
+                    "gitHead": "dropped"
+                }
+            }
+        });
+        ctx.state
+            .storage
+            .put(
+                "npm/corgi/metadata.json",
+                &serde_json::to_vec(&full).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/corgi",
+            vec![("accept", "application/vnd.npm.install-v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.npm.install-v1+json")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Accept"),
+            "the body varies by Accept and metadata is cacheable — a shared cache \
+             must not serve the abbreviated document to a client that wanted the full one"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["name"], "corgi");
+        assert_eq!(json["dist-tags"]["latest"], "1.0.0");
+        assert!(json.get("readme").is_none(), "readme must be dropped");
+        assert!(
+            json.get("maintainers").is_none(),
+            "maintainers must be dropped"
+        );
+
+        let manifest = &json["versions"]["1.0.0"];
+        // Everything an installer consults survives — losing any of these
+        // silently changes what gets resolved and installed.
+        assert_eq!(manifest["version"], "1.0.0");
+        assert_eq!(manifest["dependencies"]["left-pad"], "^1.0.0");
+        assert_eq!(manifest["engines"]["node"], ">=18");
+        assert_eq!(manifest["os"][0], "linux");
+        assert_eq!(manifest["cpu"][0], "x64");
+        assert_eq!(manifest["peerDependenciesMeta"]["react"]["optional"], true);
+        assert_eq!(manifest["deprecated"], "use corgi2");
+        assert!(manifest["dist"]["tarball"].is_string());
+        // ...and what it never reads does not.
+        assert!(manifest.get("description").is_none());
+        assert!(manifest.get("scripts").is_none());
+        assert!(manifest.get("gitHead").is_none());
+    }
+
+    /// Without the header the full document is served, unchanged.
+    #[tokio::test]
+    async fn test_npm_packument_full_without_install_v1_accept() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+        use axum::http::{header, Method, StatusCode};
+
+        let ctx = create_test_context();
+        let full = serde_json::json!({
+            "name": "corgi",
+            "dist-tags": { "latest": "1.0.0" },
+            "readme": "kept",
+            "versions": {
+                "1.0.0": { "name": "corgi", "version": "1.0.0", "description": "kept", "dist": {} }
+            }
+        });
+        ctx.state
+            .storage
+            .put(
+                "npm/corgi/metadata.json",
+                &serde_json::to_vec(&full).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/npm/corgi", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["readme"], "kept", "the full document must be intact");
+        assert_eq!(json["versions"]["1.0.0"]["description"], "kept");
+    }
+
+    /// A body that is not a packument is served unchanged rather than failing:
+    /// the client asked for a projection of this document, not for an error.
+    #[tokio::test]
+    async fn test_npm_packument_unparsable_body_served_unchanged() {
+        use crate::test_helpers::{body_bytes, create_test_context, send_with_headers};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("npm/broken/metadata.json", b"not json at all")
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/broken",
+            vec![("accept", "application/vnd.npm.install-v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(response).await[..], b"not json at all");
+    }
+    /// The degraded path is still a representation: when the packument is stale
+    /// and upstream is gone, an install-v1 client must get the abbreviated body
+    /// *and* the matching Content-Type. Serving the short body under
+    /// `application/json` is the bug this guards.
+    #[tokio::test]
+    async fn test_npm_packument_stale_serve_honours_install_v1() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+        use axum::http::{header, Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = None; // no upstream to revalidate against
+            cfg.npm.metadata_ttl = 0; // always stale
+            cfg.npm.serve_stale = true;
+        });
+
+        let full = serde_json::json!({
+            "name": "stale-corgi",
+            "dist-tags": { "latest": "1.0.0" },
+            "readme": "dropped in the abbreviated form",
+            "versions": {
+                "1.0.0": { "name": "stale-corgi", "version": "1.0.0", "dist": {}, "scripts": {} }
+            }
+        });
+        ctx.state
+            .storage
+            .put(
+                "npm/stale-corgi/metadata.json",
+                &serde_json::to_vec(&full).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/stale-corgi",
+            vec![("accept", "application/vnd.npm.install-v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-nora-stale")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "precondition: this test must exercise the stale path"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.npm.install-v1+json"),
+            "the stale path abbreviated the body — the Content-Type must say so"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Accept")
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(json.get("readme").is_none());
+        assert!(json["versions"]["1.0.0"].get("scripts").is_none());
     }
 }
