@@ -476,6 +476,9 @@ external tools (Grafana dashboards, git-based rule management).
   deploy them.
 - **Not a vulnerability scanner.** Curation blocks known-bad packages.
   For CVE scanning of your own artifacts, use Trivy, Grype, or similar.
+  NORA keeps no advisory database (ADR-2); to drive the blocklist from
+  advisory data, [Dozor](https://github.com/getnora-io/dozor) compiles the OSV
+  feed and a registry inventory into a blocklist file NORA reads as-is.
 - **Not a package builder.** NORA does not compile source code into
   packages. Use `cargo publish`, `npm publish`, `mvn deploy` to create
   artifacts, then push them to NORA.

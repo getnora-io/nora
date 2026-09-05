@@ -186,6 +186,14 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 Full documentation: **https://getnora.dev**
 
+## Companion
+
+[**Dozor**](https://github.com/getnora-io/dozor) writes NORA's curation
+blocklist. It compiles the OSV advisory feed together with an inventory of what
+your registry actually holds into a `blocklist.json`, and NORA enforces it — no
+NORA configuration beyond `curation.blocklist_path`, and no changes to NORA
+itself. Separate binary, separate repository, MIT.
+
 ## Author
 
 Created and maintained by [Pavel Volkov](https://github.com/devitway)
