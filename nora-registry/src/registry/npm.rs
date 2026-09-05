@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
-use crate::metrics::METADATA_CORRUPT_TOTAL;
+use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
     proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
@@ -545,6 +545,61 @@ async fn handle_request(
             .headers_mut()
             .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         return response;
+    }
+
+    // --- Hosted packument rebuild (#956) ---
+    // The packument is derived state: `versions/{v}.json` are the immutable
+    // originals and `metadata.json` is only their assembled form. When the
+    // assembled form is absent — direct-storage import, a migration, an operator
+    // deleting a derived object — the package is still fully described by the keys
+    // that remain, and `regenerate_packument` already knows how to reassemble it.
+    // Rebuild here rather than falling through to the proxy, which would answer
+    // 404 for a package that exists only in this registry.
+    //
+    // Runs before the namespace guard on purpose: serving locally-owned bytes is
+    // always allowed, and the guard exists to stop the *upstream* fetch below.
+    if !is_tarball {
+        let versions_prefix = format!("npm/{}/versions/", package_name);
+        let has_versions = !state
+            .storage
+            .list(&versions_prefix)
+            .await
+            .unwrap_or_default()
+            .is_empty();
+
+        if has_versions {
+            // Same lock the publish path takes: a CI fleet stampeding one package
+            // rebuilds it once, not once per request.
+            let lock = state.publish_lock(&key);
+            let _guard = lock.lock().await;
+
+            // A concurrent request may have rebuilt it while this one waited.
+            let data = match state.storage.get(&key).await {
+                Ok(data) => Some(data),
+                Err(_) => match regenerate_packument(&state, &package_name).await {
+                    Ok(()) => state.storage.get(&key).await.ok(),
+                    Err(()) => {
+                        tracing::warn!(
+                            registry = "npm",
+                            package = %package_name,
+                            "packument rebuild failed; falling through"
+                        );
+                        None
+                    }
+                },
+            };
+
+            if let Some(data) = data {
+                PACKUMENT_REBUILT_TOTAL.with_label_values(&["npm"]).inc();
+                tracing::info!(
+                    registry = "npm",
+                    package = %package_name,
+                    "Rebuilt packument from per-version keys"
+                );
+                state.metrics.record_cache_hit("npm");
+                return with_content_type(false, data).into_response();
+            }
+        }
     }
 
     // --- Namespace isolation: prevent proxying internal namespaces ---
@@ -3240,6 +3295,138 @@ mod spec_conformance_tests {
         assert!(
             read_validators(&ctx.state.storage, key).await.is_none(),
             "#867: validators must be cleared after 304 body-miss to break the infinite loop"
+        );
+    }
+    /// #956: a hosted package whose derived packument is gone is still fully
+    /// described by its per-version keys. Answering 404 loses data that is
+    /// sitting in storage; the reassembly already exists and must be reached.
+    #[tokio::test]
+    async fn test_npm_packument_rebuilt_when_metadata_missing() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+
+        // Seed the immutable originals directly — what a direct-storage import
+        // or a restore that skipped derived objects leaves behind.
+        for ver in ["1.0.0", "2.0.0"] {
+            let doc = serde_json::json!({ "name": "imported", "version": ver, "dist": {} });
+            ctx.state
+                .storage
+                .put(
+                    &format!("npm/imported/versions/{}.json", ver),
+                    &serde_json::to_vec(&doc).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state
+            .storage
+            .put(
+                "npm/imported/pkg.json",
+                &serde_json::to_vec(&serde_json::json!({ "description": "seeded" })).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ctx.state
+                .storage
+                .get("npm/imported/metadata.json")
+                .await
+                .is_err(),
+            "precondition: the derived packument is absent"
+        );
+
+        let response = send(&ctx.app, Method::GET, "/npm/imported", "").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "every version is in storage — a 404 here loses the package"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["name"], "imported");
+        let versions = json["versions"].as_object().unwrap();
+        assert!(versions.contains_key("1.0.0"), "1.0.0 missing from rebuild");
+        assert!(versions.contains_key("2.0.0"), "2.0.0 missing from rebuild");
+        assert_eq!(
+            json["dist-tags"]["latest"], "2.0.0",
+            "latest must be derived from the version keys"
+        );
+        assert_eq!(
+            json["description"], "seeded",
+            "package-level fields must survive the rebuild"
+        );
+
+        assert!(
+            ctx.state
+                .storage
+                .get("npm/imported/metadata.json")
+                .await
+                .is_ok(),
+            "the rebuild must persist, or every request pays for it again"
+        );
+    }
+
+    /// The rebuild must not invent a package out of an empty prefix.
+    #[tokio::test]
+    async fn test_npm_packument_absent_package_still_404() {
+        use crate::test_helpers::{create_test_context, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+
+        let response = send(&ctx.app, Method::GET, "/npm/never-published", "").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            ctx.state
+                .storage
+                .get("npm/never-published/metadata.json")
+                .await
+                .is_err(),
+            "a 404 must not leave a derived object behind"
+        );
+    }
+
+    /// Concurrent readers of a package with a missing packument must all get the
+    /// same correct answer — the rebuild is serialized on the publish lock.
+    #[tokio::test]
+    async fn test_npm_packument_rebuild_is_serialized() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        for ver in ["1.0.0", "1.1.0", "2.0.0"] {
+            let doc = serde_json::json!({ "name": "stampede", "version": ver, "dist": {} });
+            ctx.state
+                .storage
+                .put(
+                    &format!("npm/stampede/versions/{}.json", ver),
+                    &serde_json::to_vec(&doc).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let app = ctx.app.clone();
+            handles.push(tokio::spawn(async move {
+                let response = send(&app, Method::GET, "/npm/stampede", "").await;
+                let status = response.status();
+                (status, body_bytes(response).await)
+            }));
+        }
+
+        let mut bodies = Vec::new();
+        for handle in handles {
+            let (status, body) = handle.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            bodies.push(body);
+        }
+        assert!(
+            bodies.windows(2).all(|pair| pair[0] == pair[1]),
+            "concurrent rebuilds of the same package must agree"
         );
     }
 }
