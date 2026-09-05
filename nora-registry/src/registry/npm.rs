@@ -580,7 +580,7 @@ async fn handle_request(
             // A concurrent request may have rebuilt it while this one waited.
             let data = match state.storage.get(&key).await {
                 Ok(data) => Some(data),
-                Err(_) => match regenerate_packument(&state, &package_name).await {
+                Err(_) => match regenerate_packument(&state.storage, &package_name).await {
                     Ok(()) => state.storage.get(&key).await.ok(),
                     Err(()) => {
                         tracing::warn!(
@@ -1075,7 +1075,10 @@ async fn handle_publish(
     }
 
     // Regenerate the packument (metadata.json) by listing the immutable per-version keys.
-    if regenerate_packument(&state, &package_name).await.is_err() {
+    if regenerate_packument(&state.storage, &package_name)
+        .await
+        .is_err()
+    {
         tracing::error!(package = %package_name, "npm publish: failed to regenerate packument");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -1132,18 +1135,17 @@ async fn handle_publish(
 /// them all, so no version is permanently lost (the maven scan-regenerate guarantee, #39). Old
 /// embedded-packument packages are migrated to per-version keys by `migrate_embedded_packument`
 /// in the publish handler BEFORE the new version is written, so this stays a pure list-derive.
-async fn regenerate_packument(state: &AppState, package_name: &str) -> Result<(), ()> {
+pub(crate) async fn regenerate_packument(
+    storage: &crate::storage::Storage,
+    package_name: &str,
+) -> Result<(), ()> {
     let versions_prefix = format!("npm/{}/versions/", package_name);
-    let version_keys = state
-        .storage
-        .list(&versions_prefix)
-        .await
-        .unwrap_or_default();
+    let version_keys = storage.list(&versions_prefix).await.unwrap_or_default();
 
     // versions map, keyed by the filename (version) without the .json suffix.
     let mut versions = serde_json::Map::new();
     for key in &version_keys {
-        let Ok(data) = state.storage.get(key).await else {
+        let Ok(data) = storage.get(key).await else {
             continue;
         };
         let Ok(vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
@@ -1157,8 +1159,8 @@ async fn regenerate_packument(state: &AppState, package_name: &str) -> Result<()
     // dist-tags from the pointer keys (+ derive `latest` if publish left it unset).
     let dt_prefix = format!("npm/{}/dist-tags/", package_name);
     let mut dist_tags = serde_json::Map::new();
-    for key in state.storage.list(&dt_prefix).await.unwrap_or_default() {
-        if let Ok(data) = state.storage.get(&key).await {
+    for key in storage.list(&dt_prefix).await.unwrap_or_default() {
+        if let Ok(data) = storage.get(&key).await {
             if let (Some(tag), Ok(ver)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec()))
             {
                 dist_tags.insert(tag.to_string(), serde_json::Value::String(ver));
@@ -1172,11 +1174,7 @@ async fn regenerate_packument(state: &AppState, package_name: &str) -> Result<()
     }
 
     // Package-level fields + the assembled maps -> the packument.
-    let mut packument = match state
-        .storage
-        .get(&format!("npm/{}/pkg.json", package_name))
-        .await
-    {
+    let mut packument = match storage.get(&format!("npm/{}/pkg.json", package_name)).await {
         Ok(d) => serde_json::from_slice(&d).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     };
@@ -1192,8 +1190,7 @@ async fn regenerate_packument(state: &AppState, package_name: &str) -> Result<()
     obj.insert("versions".to_string(), serde_json::Value::Object(versions));
 
     let bytes = serde_json::to_vec(&packument).map_err(|_| ())?;
-    state
-        .storage
+    storage
         .put(&format!("npm/{}/metadata.json", package_name), &bytes)
         .await
         .map_err(|_| ())

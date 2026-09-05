@@ -571,11 +571,20 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         for key in tarball_keys {
             let filename = key.rsplit('/').next().unwrap_or("");
             let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
-            // Include associated .sha256
+            // A version is its whole key set, not just the payload: the
+            // `.sha256` sidecar and the per-version document describe the same
+            // artifact, and leaving either behind makes the registry advertise
+            // a version it can no longer serve (#961).
             let mut keys = vec![key.clone()];
             let hash_key = format!("{}.sha256", key);
             if storage.stat(&hash_key).await.is_some() {
                 keys.push(hash_key);
+            }
+            if let Some(version) = crate::curation::parse_npm_tarball_version(pkg, filename) {
+                let version_key = format!("npm/{}/versions/{}.json", pkg, version);
+                if storage.stat(&version_key).await.is_some() {
+                    keys.push(version_key);
+                }
             }
             entries.push(VersionEntry {
                 name: filename.to_string(),
@@ -803,6 +812,7 @@ pub async fn run_retention(
     let mut total_bytes = 0u64;
     // rpm/deb repos whose packages were deleted — their indexes must be
     // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
+    let mut npm_regen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut regen: std::collections::BTreeSet<(&'static str, String)> =
         std::collections::BTreeSet::new();
 
@@ -822,6 +832,9 @@ pub async fn run_retention(
         total_planned += plans.len();
 
         if !dry_run {
+            if let Some(package) = group_name.strip_prefix("npm:") {
+                npm_regen.insert(package.to_string());
+            }
             if let Some(repo) = group_name
                 .strip_prefix("rpm:")
                 .map(|n| ("rpm", n))
@@ -869,6 +882,46 @@ pub async fn run_retention(
         }
 
         all_plans.push((group_name, plans));
+    }
+
+    // Regenerate the packument of every npm package retention touched, for the
+    // same reason the rpm/deb rebuild below exists: the index is derived, and
+    // leaving it describing deleted artifacts makes the registry promise
+    // versions it can no longer serve (#961). A dangling dist-tag pointer is
+    // dropped first, so the regenerated `latest` is derived from what survives
+    // rather than pointing at a retired version.
+    //
+    // Fail-open per package: a failed regeneration logs and the next publish or
+    // read heals it (a read rebuilds a *missing* packument, #956); the
+    // deletions themselves are already durable.
+    for package in &npm_regen {
+        let lock_key = format!("npm/{package}/metadata.json");
+        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+        let _guard = lock.lock().await;
+
+        let dist_tags_prefix = format!("npm/{package}/dist-tags/");
+        for tag_key in storage.list(&dist_tags_prefix).await.unwrap_or_default() {
+            let Ok(data) = storage.get(&tag_key).await else {
+                continue;
+            };
+            let Ok(version) = String::from_utf8(data.to_vec()) else {
+                continue;
+            };
+            let version_key = format!("npm/{package}/versions/{}.json", version.trim());
+            if storage.stat(&version_key).await.is_none() && storage.delete(&tag_key).await.is_ok()
+            {
+                info!(package = %package, tag = %tag_key, version = %version.trim(),
+                    "retention: dropped dist-tag pointing at a retired version");
+            }
+        }
+
+        match crate::registry::npm::regenerate_packument(storage, package).await {
+            Ok(()) => {
+                info!(registry = "npm", package = %package, "retention: packument regenerated")
+            }
+            Err(()) => tracing::error!(registry = "npm", package = %package,
+                "retention: packument regeneration failed — the next publish or read heals it"),
+        }
     }
 
     // Rebuild + re-sign the indexes of every rpm/deb repo retention touched,
@@ -2104,6 +2157,204 @@ mod format_retention_tests {
     }
 
     /// `keep_last` counts per architecture: each `binary-{arch}/Packages` is
+    async fn publish_npm(ctx: &crate::test_helpers::TestContext, package: &str, version: &str) {
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "name": package,
+            "versions": { version: { "name": package, "version": version, "dist": {} } },
+            "_attachments": {
+                format!("{package}-{version}.tgz"): {
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"fake-tarball"),
+                }
+            }
+        });
+        let response = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/npm/{package}"),
+            axum::body::Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "publish {version}");
+    }
+
+    /// Versions present in the packument, from the registry's own answer.
+    async fn packument_versions(
+        ctx: &crate::test_helpers::TestContext,
+        package: &str,
+    ) -> Vec<String> {
+        let response = send(&ctx.app, Method::GET, &format!("/npm/{package}"), "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let mut versions: Vec<String> = json["versions"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        versions.sort();
+        versions
+    }
+
+    /// Versions whose tarball still exists in storage.
+    async fn stored_versions(storage: &Storage, package: &str) -> Vec<String> {
+        let mut versions: Vec<String> = storage
+            .list(&format!("npm/{package}/tarballs/"))
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|key| !key.ends_with(".sha256"))
+            .filter_map(|key| {
+                let filename = key.rsplit('/').next()?;
+                crate::curation::parse_npm_tarball_version(package, filename)
+            })
+            .collect();
+        versions.sort();
+        versions
+    }
+
+    /// #961: retention deleted the tarball and left the packument advertising
+    /// the version. The invariant is stated without naming which versions
+    /// survive, because that depends on mtime ordering — what must hold is that
+    /// the registry never promises an artifact it does not have.
+    #[tokio::test]
+    async fn test_npm_retention_packument_matches_storage() {
+        let ctx = create_test_context();
+        for version in ["1.0.1", "1.0.2", "1.0.3", "1.0.4"] {
+            publish_npm(&ctx, "rettest", version).await;
+        }
+        assert_eq!(packument_versions(&ctx, "rettest").await.len(), 4);
+
+        let rules = vec![rule("npm", None, Some(2), None)];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "keep_last=2 of four versions");
+
+        let advertised = packument_versions(&ctx, "rettest").await;
+        let stored = stored_versions(&ctx.state.storage, "rettest").await;
+        assert_eq!(
+            advertised, stored,
+            "the packument must advertise exactly what storage can serve"
+        );
+        assert_eq!(advertised.len(), 2);
+
+        // The per-version documents go with their tarballs.
+        for version in &advertised {
+            assert!(
+                ctx.state
+                    .storage
+                    .get(&format!("npm/rettest/versions/{version}.json"))
+                    .await
+                    .is_ok(),
+                "surviving version {version} lost its document"
+            );
+        }
+        let retired: Vec<String> = ["1.0.1", "1.0.2", "1.0.3", "1.0.4"]
+            .iter()
+            .map(|v| v.to_string())
+            .filter(|v| !advertised.contains(v))
+            .collect();
+        for version in &retired {
+            assert!(
+                ctx.state
+                    .storage
+                    .get(&format!("npm/rettest/versions/{version}.json"))
+                    .await
+                    .is_err(),
+                "retired version {version} kept its document"
+            );
+        }
+    }
+
+    /// A dist-tag must never point at a version that retention removed.
+    #[tokio::test]
+    async fn test_npm_retention_drops_dangling_dist_tag() {
+        let ctx = create_test_context();
+        for version in ["1.0.1", "1.0.2", "1.0.3"] {
+            publish_npm(&ctx, "tagtest", version).await;
+        }
+        // Pin `latest` at the oldest version, which keep_last=1 will retire.
+        ctx.state
+            .storage
+            .put("npm/tagtest/dist-tags/latest", b"1.0.1")
+            .await
+            .unwrap();
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+
+        let advertised = packument_versions(&ctx, "tagtest").await;
+
+        // Compare the pointer against storage, not against the advertised list:
+        // on a stale packument the advertised list still contains the retired
+        // version, so that comparison would pass without the fix.
+        let stored = stored_versions(&ctx.state.storage, "tagtest").await;
+        if let Ok(pointer) = ctx.state.storage.get("npm/tagtest/dist-tags/latest").await {
+            let pointer = String::from_utf8(pointer.to_vec()).unwrap_or_default();
+            assert!(
+                stored.iter().any(|v| *v == pointer.trim()),
+                "dist-tags/latest points at {pointer:?}, whose artifact is gone; storage has {stored:?}"
+            );
+        }
+
+        let response = send(&ctx.app, Method::GET, "/npm/tagtest", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let latest = json["dist-tags"]["latest"].as_str().unwrap_or_default();
+        assert!(
+            advertised.iter().any(|v| v == latest),
+            "dist-tags.latest={latest} is not among the surviving versions {advertised:?}"
+        );
+    }
+
+    /// A package retention did not touch keeps its packument exactly as it was.
+    /// A guard against over-reach rather than a witness for the fix: it passes
+    /// with or without the regeneration, and would fail if it regenerated too
+    /// much.
+    #[tokio::test]
+    async fn test_npm_retention_leaves_untouched_package_alone() {
+        let ctx = create_test_context();
+        for version in ["1.0.1", "1.0.2", "1.0.3"] {
+            publish_npm(&ctx, "busy", version).await;
+        }
+        publish_npm(&ctx, "quiet", "2.0.0").await;
+        let before = ctx
+            .state
+            .storage
+            .get("npm/quiet/metadata.json")
+            .await
+            .unwrap();
+
+        let rules = vec![rule("npm", Some("busy"), Some(1), None)];
+        run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+
+        let after = ctx
+            .state
+            .storage
+            .get("npm/quiet/metadata.json")
+            .await
+            .unwrap();
+        assert_eq!(before, after, "an untouched package must not be rewritten");
+        assert_eq!(packument_versions(&ctx, "quiet").await, vec!["2.0.0"]);
+    }
+
     /// an independent APT index, so two architectures of the same
     /// package/version/distribution must not share one `keep_last` budget —
     /// pooling them always evicts an arch once `keep_last < arch count`.

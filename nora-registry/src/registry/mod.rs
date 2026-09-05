@@ -10,7 +10,7 @@ pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
 mod maven;
-mod npm;
+pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pub_dart;
 mod pypi;
