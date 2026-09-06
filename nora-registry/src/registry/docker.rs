@@ -32,7 +32,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio_util::io::ReaderStream;
 
 // ============================================================================
 // Namespaced key builders (issue #323)
@@ -278,6 +277,18 @@ impl<R> VerifyingReader<R> {
             finished: false,
         }
     }
+}
+
+// #849: `VerifyingReader` verifies the blob digest at EOF, so it may be served through the
+// `reader_stream_body` sole-sink. A raw reader carries neither impl, so it cannot be handed
+// to it — a compile-time serve-integrity witness on the streaming path.
+impl<R: tokio::io::AsyncRead + Send + Unpin + 'static>
+    nora_registry::verified::stream_sealed::Sealed for VerifyingReader<R>
+{
+}
+impl<R: tokio::io::AsyncRead + Send + Unpin + 'static> nora_registry::verified::VerifiedByteReader
+    for VerifyingReader<R>
+{
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VerifyingReader<R> {
@@ -1247,7 +1258,7 @@ async fn download_blob(
             crate::registry_type::RegistryType::Docker,
             "LOCAL",
         ));
-        let stream = ReaderStream::new(VerifyingReader::new(reader, &digest));
+        let stream = VerifyingReader::new(reader, &digest);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1255,7 +1266,7 @@ async fn download_blob(
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .header("docker-content-digest", &digest)
-            .body(Body::from_stream(stream))
+            .body(nora_registry::verified::reader_stream_body(stream))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
@@ -1374,8 +1385,7 @@ async fn download_blob(
                         // Successfully stored — stream from storage
                         match state.storage.get_reader(&key).await {
                             Ok((size, _pin, reader)) => {
-                                let stream =
-                                    ReaderStream::new(VerifyingReader::new(reader, &digest));
+                                let stream = VerifyingReader::new(reader, &digest);
                                 return Response::builder()
                                     .status(StatusCode::OK)
                                     .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1385,7 +1395,7 @@ async fn download_blob(
                                         "public, max-age=31536000, immutable",
                                     )
                                     .header("docker-content-digest", &digest)
-                                    .body(Body::from_stream(stream))
+                                    .body(nora_registry::verified::reader_stream_body(stream))
                                     .unwrap_or_else(|_| {
                                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
                                     });
@@ -1399,13 +1409,13 @@ async fn download_blob(
                         // put_from_path failed — stream from temp file directly
                         match tokio::fs::File::open(&fetched.path).await {
                             Ok(file) => {
-                                let stream = ReaderStream::new(VerifyingReader::new(file, &digest));
+                                let stream = VerifyingReader::new(file, &digest);
                                 return Response::builder()
                                     .status(StatusCode::OK)
                                     .header(header::CONTENT_TYPE, "application/octet-stream")
                                     .header(header::CONTENT_LENGTH, file_size)
                                     .header("docker-content-digest", &digest)
-                                    .body(Body::from_stream(stream))
+                                    .body(nora_registry::verified::reader_stream_body(stream))
                                     .unwrap_or_else(|_| {
                                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
                                     });

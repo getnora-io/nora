@@ -177,7 +177,9 @@ pub(crate) async fn range_response(
     }
     Some(
         response
-            .body(Body::from_stream(ReaderStream::new(reader?)))
+            .body(nora_registry::verified::open_world_stream_body(
+                ReaderStream::new(reader?),
+            ))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
 }

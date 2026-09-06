@@ -176,11 +176,9 @@ async fn download(
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
             builder
-                .body(axum::body::Body::from_stream(verify_while_streaming(
-                    reader,
-                    pin,
-                    key.clone(),
-                )))
+                .body(nora_registry::verified::stream_body(
+                    verify_while_streaming(reader, pin, key.clone()),
+                ))
                 .expect("valid response")
                 .into_response()
         }
@@ -280,6 +278,12 @@ fn verify_while_streaming(
         done: false,
     }
 }
+
+// #849: `VerifyingStream` is an EOF-verifying stream, so it may be served through the
+// `stream_body` sole-sink. A raw `ReaderStream` (no digest check) does not carry these
+// impls, so it cannot be handed to `stream_body` — a compile-time serve-integrity witness.
+impl nora_registry::verified::stream_sealed::Sealed for VerifyingStream {}
+impl nora_registry::verified::VerifiedByteStream for VerifyingStream {}
 
 /// Verify an RFC 9530 `Repr-Digest` header against the server-computed sha-256.
 ///
