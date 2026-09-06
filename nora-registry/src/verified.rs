@@ -294,6 +294,94 @@ pub fn verified_body<T>(blob: Blob<Verified, T>) -> T {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming serve sink: the type-level witness on the STREAMING path (#849).
+//
+// The buffered path above discharges a compile-time witness (`verified_body`
+// takes only `Blob<Verified>`). Streaming can't carry a whole-`Blob` value, so
+// the guarantee is restored one level up: only a stream that was wired through an
+// EOF-verifying wrapper implements `VerifiedByteStream`, and `stream_body` — the
+// single verified `Body::from_stream` site — accepts only that. Handing a raw
+// reader stream to it is a compile error, exactly like `verified_body(raw)`.
+// ---------------------------------------------------------------------------
+
+/// Seal for [`VerifiedByteStream`]. NORA's own EOF-verifying stream types attest it where
+/// they are defined (raw `VerifyingStream`, docker `ReaderStream<VerifyingReader<_>>`).
+/// `pub` (but doc-hidden) only because those types live in the `nora` binary crate while
+/// this trait lives in the `nora_registry` library — the handlers must be able to impl it.
+/// The guarantee that matters holds regardless: a *new* NORA stream does not fit
+/// [`stream_body`] without a deliberate, visible `impl` (a raw reader stream is a compile
+/// error), and the single `Body::from_stream` serve site is [`stream_body`].
+#[doc(hidden)]
+pub mod stream_sealed {
+    /// The seal.
+    pub trait Sealed {}
+}
+
+/// A byte stream whose bytes flow through an EOF-verifying wrapper — it hashes while
+/// streaming and aborts the body on a digest mismatch (tamper-evident). The streaming
+/// analogue of holding a [`Blob<Verified>`], and, like it, unforgeable outside NORA:
+/// [`stream_body`] accepts only this type, so serving a raw reader stream on an
+/// integrity path is a **compile error**.
+pub trait VerifiedByteStream:
+    futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
+    + Send
+    + 'static
+    + stream_sealed::Sealed
+{
+}
+
+/// The sole streaming serve sink for integrity-checked bytes — the compile-time
+/// counterpart of [`verified_body`]. A raw reader stream does not implement
+/// [`VerifiedByteStream`], so it cannot be turned into a response body here.
+///
+/// # A raw stream does NOT compile on the verified streaming path
+///
+/// ```compile_fail
+/// use nora_registry::verified::stream_body;
+/// // a plain ReaderStream (no EOF digest check) is not a VerifiedByteStream
+/// let raw = tokio_util::io::ReaderStream::new(tokio::io::empty());
+/// let _ = stream_body(raw); // the trait bound `VerifiedByteStream` is not satisfied
+/// ```
+pub fn stream_body<S: VerifiedByteStream>(stream: S) -> axum::body::Body {
+    axum::body::Body::from_stream(stream)
+}
+
+/// An `AsyncRead` that verifies its content digest at EOF — docker's `VerifyingReader`,
+/// which recomputes SHA-256 as bytes flow and errors the read on mismatch. The reader
+/// analogue of [`VerifiedByteStream`]; accepted only by [`reader_stream_body`].
+pub trait VerifiedByteReader:
+    tokio::io::AsyncRead + Send + Unpin + 'static + stream_sealed::Sealed
+{
+}
+
+/// The docker-blob streaming sink: frames a [`VerifiedByteReader`] into a response body.
+/// Like [`stream_body`], a raw reader (no EOF digest check) does not implement the trait,
+/// so serving it here is a **compile error**. This is where the single `Body::from_stream`
+/// for the reader path lives.
+///
+/// # A raw reader does NOT compile on the verified streaming path
+///
+/// ```compile_fail
+/// use nora_registry::verified::reader_stream_body;
+/// // a plain AsyncRead (no EOF digest check) is not a VerifiedByteReader
+/// let _ = reader_stream_body(tokio::io::empty()); // trait bound `VerifiedByteReader` unmet
+/// ```
+pub fn reader_stream_body<R: VerifiedByteReader>(reader: R) -> axum::body::Body {
+    axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader))
+}
+
+/// The explicit open-world streaming arm: partial-content / byte-range serves, where a
+/// partial range has no whole-file digest to check against. Named — never silent — the
+/// streaming counterpart of [`GateOutcome::Unpinned`]: the call site states that these
+/// bytes are served without a NORA-side cryptographic check.
+pub fn open_world_stream_body<S>(stream: S) -> axum::body::Body
+where
+    S: futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static,
+{
+    axum::body::Body::from_stream(stream)
+}
+
+// ---------------------------------------------------------------------------
 // Write-side witness: "store unpinned" — the S3 hole, named in the type.
 // ---------------------------------------------------------------------------
 
