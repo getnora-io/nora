@@ -929,15 +929,21 @@ pub async fn run_retention(
     // repo: a failed rebuild logs loudly and the next publish/reindex heals
     // it; the deletions themselves are already durable.
     for (fmt, repo) in &regen {
-        let lock_key = match *fmt {
-            "rpm" => format!("rpm/{repo}/repodata/repomd.xml"),
-            _ => format!("deb/{repo}/Release"),
+        let is_rpm = matches!(
+            crate::registry_type::RegistryType::from_str_opt(fmt),
+            Some(crate::registry_type::RegistryType::Rpm)
+        );
+        let lock_key = if is_rpm {
+            format!("rpm/{repo}/repodata/repomd.xml")
+        } else {
+            format!("deb/{repo}/Release")
         };
         let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
         let _guard = lock.lock().await;
-        let result = match *fmt {
-            "rpm" => crate::registry::rpm::regenerate_repodata(storage, signer, repo).await,
-            _ => crate::registry::deb::regenerate_indexes(storage, signer, repo).await,
+        let result = if is_rpm {
+            crate::registry::rpm::regenerate_repodata(storage, signer, repo).await
+        } else {
+            crate::registry::deb::regenerate_indexes(storage, signer, repo).await
         };
         if let Err(e) = result {
             tracing::error!(registry = %fmt, repo = %repo, error = %e, "retention: index regeneration failed — run -/reindex to heal");

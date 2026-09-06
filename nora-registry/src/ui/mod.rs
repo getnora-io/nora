@@ -682,15 +682,15 @@ async fn generic_registry_list(
 
     // Extract registry type from URI path: /ui/{type}
     let registry_key = uri.path().strip_prefix("/ui/").unwrap_or("raw");
-    let title = match registry_key {
-        "gems" => "RubyGems",
-        "terraform" => "Terraform Registry",
-        "ansible" => "Ansible Galaxy",
-        "nuget" => "NuGet Gallery",
-        "pub" => "Pub (Dart/Flutter)",
-        "conan" => "Conan (C/C++)",
-        "rpm" => "RPM (yum/dnf)",
-        "deb" => "Debian (APT)",
+    let title = match crate::registry_type::RegistryType::from_str_opt(registry_key) {
+        Some(crate::registry_type::RegistryType::Gems) => "RubyGems",
+        Some(crate::registry_type::RegistryType::Terraform) => "Terraform Registry",
+        Some(crate::registry_type::RegistryType::Ansible) => "Ansible Galaxy",
+        Some(crate::registry_type::RegistryType::Nuget) => "NuGet Gallery",
+        Some(crate::registry_type::RegistryType::PubDart) => "Pub (Dart/Flutter)",
+        Some(crate::registry_type::RegistryType::Conan) => "Conan (C/C++)",
+        Some(crate::registry_type::RegistryType::Rpm) => "RPM (yum/dnf)",
+        Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
         _ => registry_key,
     };
 

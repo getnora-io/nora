@@ -543,23 +543,43 @@ impl Config {
 
         // NuGet extra search/autocomplete URLs
         if let Some(host) = extract_host(&self.nuget.search_service) {
-            result.push(("nuget".to_string(), host));
+            result.push((
+                crate::registry_type::RegistryType::Nuget
+                    .as_str()
+                    .to_string(),
+                host,
+            ));
         }
         if let Some(host) = extract_host(&self.nuget.autocomplete) {
-            result.push(("nuget".to_string(), host));
+            result.push((
+                crate::registry_type::RegistryType::Nuget
+                    .as_str()
+                    .to_string(),
+                host,
+            ));
         }
 
         // Docker upstreams: Vec<DockerUpstream>
         for upstream in &self.docker.upstreams {
             if let Some(host) = extract_host(&upstream.url) {
-                result.push(("docker".to_string(), host));
+                result.push((
+                    crate::registry_type::RegistryType::Docker
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
             }
         }
 
         // Maven proxies: Vec<MavenProxyEntry>
         for proxy in &self.maven.proxies {
             if let Some(host) = extract_host(proxy.url()) {
-                result.push(("maven".to_string(), host));
+                result.push((
+                    crate::registry_type::RegistryType::Maven
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
             }
         }
 
@@ -578,7 +598,12 @@ impl Config {
         // mirror with embedded credentials) would be invisible to leak scanning.
         for up in self.pypi.upstreams() {
             if let Some(host) = extract_host(up.url()) {
-                result.push(("pypi".to_string(), host));
+                result.push((
+                    crate::registry_type::RegistryType::PyPI
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
             }
         }
 
