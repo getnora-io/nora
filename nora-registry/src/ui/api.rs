@@ -302,16 +302,16 @@ pub async fn api_detail(
     State(state): State<AppState>,
     Path((registry_type, name)): Path<(String, String)>,
 ) -> Json<serde_json::Value> {
-    match registry_type.as_str() {
-        "docker" => {
+    match RegistryType::from_str_opt(&registry_type) {
+        Some(RegistryType::Docker) => {
             let detail = get_docker_detail(&state, &name).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
-        "npm" => {
+        Some(RegistryType::Npm) => {
             let detail = get_npm_detail(&state.storage, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
-        "cargo" => {
+        Some(RegistryType::Cargo) => {
             let detail = get_cargo_detail(&state.storage, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
@@ -1089,14 +1089,24 @@ pub async fn get_generic_detail(
 ) -> PackageDetail {
     let name_lower = name.to_lowercase();
 
-    match registry {
-        "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "rpm" => get_rpm_detail(storage, name, show_all).await,
-        "deb" => get_deb_detail(storage, name, show_all).await,
-        "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "ansible" => get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await,
+    match RegistryType::from_str_opt(registry) {
+        Some(RegistryType::Nuget) => {
+            get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
+        Some(RegistryType::Conan) => {
+            get_conan_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
+        Some(RegistryType::Rpm) => get_rpm_detail(storage, name, show_all).await,
+        Some(RegistryType::Deb) => get_deb_detail(storage, name, show_all).await,
+        Some(RegistryType::Gems) => {
+            get_gems_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
+        Some(RegistryType::PubDart) => {
+            get_pub_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
+        Some(RegistryType::Ansible) => {
+            get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
         _ => {
             get_storage_scan_detail(storage, registry, &name_lower, show_prerelease, show_all).await
         }

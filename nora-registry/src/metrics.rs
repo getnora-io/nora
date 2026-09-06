@@ -731,39 +731,23 @@ fn is_own_surface(path: &str) -> bool {
         || path == "/metrics"
 }
 
-/// Detect registry type from path
+/// Detect registry type from path, using [`RegistryType::mount_point`] as the single
+/// source of truth: matching the registry whose mount point prefixes the path (adding a
+/// format extends this automatically via `all()`, no new arm here). PyPI has a second
+/// prefix (`/packages`) beyond its mount point; `/ui` and anything else are non-registry.
 fn detect_registry(path: &str) -> String {
-    if path.starts_with("/v2") {
-        "docker".to_string()
-    } else if path.starts_with("/maven2") {
-        "maven".to_string()
-    } else if path.starts_with("/npm") {
-        "npm".to_string()
-    } else if path.starts_with("/cargo") {
-        "cargo".to_string()
-    } else if path.starts_with("/simple") || path.starts_with("/packages") {
-        "pypi".to_string()
-    } else if path.starts_with("/go/") {
-        "go".to_string()
-    } else if path.starts_with("/raw/") {
-        "raw".to_string()
-    } else if path.starts_with("/gems/") {
-        "gems".to_string()
-    } else if path.starts_with("/terraform/") {
-        "terraform".to_string()
-    } else if path.starts_with("/ansible/") {
-        "ansible".to_string()
-    } else if path.starts_with("/nuget/") {
-        "nuget".to_string()
-    } else if path.starts_with("/pub/") {
-        "pub".to_string()
-    } else if path.starts_with("/conan/") {
-        "conan".to_string()
-    } else if path.starts_with("/rpm/") {
-        "rpm".to_string()
-    } else if path.starts_with("/deb/") {
-        "deb".to_string()
-    } else if path.starts_with("/ui") {
+    use crate::registry_type::RegistryType;
+    if path.starts_with("/packages") {
+        return RegistryType::PyPI.as_str().to_string();
+    }
+    for rt in RegistryType::all() {
+        // Match on the full mount point (with trailing slash) so a bare or lookalike
+        // prefix (`/goblin`, `/rawdata`) does not match a registry — matching the original.
+        if path.starts_with(rt.mount_point()) {
+            return rt.as_str().to_string();
+        }
+    }
+    if path.starts_with("/ui") {
         "ui".to_string()
     } else {
         "other".to_string()

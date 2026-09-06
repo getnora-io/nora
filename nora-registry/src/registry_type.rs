@@ -6,103 +6,68 @@
 use serde::Serialize;
 use std::fmt;
 
-/// All supported registry formats.
-///
-/// This is the single source of truth for registry types. Other modules
-/// (curation, config, metrics, UI) reference this enum.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize)]
-pub enum RegistryType {
-    Docker,
-    Maven,
-    Npm,
-    Cargo,
-    #[serde(rename = "pypi")]
-    PyPI,
-    Go,
-    Raw,
-    // New formats (v0.7):
-    #[serde(rename = "gems")]
-    Gems,
-    #[serde(rename = "terraform")]
-    Terraform,
-    #[serde(rename = "ansible")]
-    Ansible,
-    #[serde(rename = "nuget")]
-    Nuget,
-    #[serde(rename = "pub")]
-    PubDart,
-    #[serde(rename = "conan")]
-    Conan,
-    #[serde(rename = "rpm")]
-    Rpm,
-    #[serde(rename = "deb")]
-    Deb,
+/// Declares [`RegistryType`] and its intrinsic string forms from a SINGLE list, so that
+/// adding a format is one line and `all()` can never drift from the enum: the variant,
+/// its `as_str`, `mount_point` and `display_name` are generated together, and each
+/// per-variant method is an exhaustive `match` (a new variant is a compile error until
+/// handled). This is the single source of truth for registry formats (#369).
+macro_rules! registry_types {
+    ( $( $variant:ident => $as_str:literal, $mount:literal, $display:literal );+ $(;)? ) => {
+        /// All supported registry formats.
+        ///
+        /// This is the single source of truth for registry types. Other modules
+        /// (curation, config, metrics, UI) reference this enum. Declared via
+        /// [`registry_types!`], so the enum and [`RegistryType::all`] are generated
+        /// from one list and cannot desync.
+        #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize)]
+        pub enum RegistryType {
+            $( #[serde(rename = $as_str)] $variant ),+
+        }
+
+        impl RegistryType {
+            /// Lowercase string identifier used in storage keys, metrics, and config.
+            pub fn as_str(&self) -> &'static str {
+                match self { $( Self::$variant => $as_str ),+ }
+            }
+
+            /// URL mount point for this registry's routes.
+            pub fn mount_point(&self) -> &'static str {
+                match self { $( Self::$variant => $mount ),+ }
+            }
+
+            /// Display name for UI (capitalized).
+            pub fn display_name(&self) -> &'static str {
+                match self { $( Self::$variant => $display ),+ }
+            }
+
+            /// Every registry type, in declaration order. Generated from the same list
+            /// as the enum itself, so it can never silently omit a variant.
+            pub fn all() -> &'static [RegistryType] {
+                &[ $( Self::$variant ),+ ]
+            }
+        }
+    };
+}
+
+registry_types! {
+    Docker    => "docker",    "/v2/",        "Docker";
+    Maven     => "maven",     "/maven2/",    "Maven";
+    Npm       => "npm",       "/npm/",       "npm";
+    Cargo     => "cargo",     "/cargo/",     "Cargo";
+    PyPI      => "pypi",      "/simple/",    "PyPI";
+    Go        => "go",        "/go/",        "Go";
+    Raw       => "raw",       "/raw/",       "Raw";
+    Gems      => "gems",      "/gems/",      "RubyGems";
+    Terraform => "terraform", "/terraform/", "Terraform";
+    Ansible   => "ansible",   "/ansible/",   "Ansible";
+    Nuget     => "nuget",     "/nuget/",     "NuGet";
+    PubDart   => "pub",       "/pub/",       "Pub (Dart)";
+    Conan     => "conan",     "/conan/",     "Conan";
+    Rpm       => "rpm",       "/rpm/",       "RPM";
+    Deb       => "deb",       "/deb/",       "Debian";
 }
 
 impl RegistryType {
-    /// Lowercase string identifier used in storage keys, metrics, and config.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Docker => "docker",
-            Self::Maven => "maven",
-            Self::Npm => "npm",
-            Self::Cargo => "cargo",
-            Self::PyPI => "pypi",
-            Self::Go => "go",
-            Self::Raw => "raw",
-            Self::Gems => "gems",
-            Self::Terraform => "terraform",
-            Self::Ansible => "ansible",
-            Self::Nuget => "nuget",
-            Self::PubDart => "pub",
-            Self::Conan => "conan",
-            Self::Rpm => "rpm",
-            Self::Deb => "deb",
-        }
-    }
-
-    /// URL mount point for this registry's routes.
-    pub fn mount_point(&self) -> &'static str {
-        match self {
-            Self::Docker => "/v2/",
-            Self::Maven => "/maven2/",
-            Self::Npm => "/npm/",
-            Self::Cargo => "/cargo/",
-            Self::PyPI => "/simple/",
-            Self::Go => "/go/",
-            Self::Raw => "/raw/",
-            Self::Gems => "/gems/",
-            Self::Terraform => "/terraform/",
-            Self::Ansible => "/ansible/",
-            Self::Nuget => "/nuget/",
-            Self::PubDart => "/pub/",
-            Self::Conan => "/conan/",
-            Self::Rpm => "/rpm/",
-            Self::Deb => "/deb/",
-        }
-    }
-
-    /// Display name for UI (capitalized).
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Docker => "Docker",
-            Self::Maven => "Maven",
-            Self::Npm => "npm",
-            Self::Cargo => "Cargo",
-            Self::PyPI => "PyPI",
-            Self::Go => "Go",
-            Self::Raw => "Raw",
-            Self::Gems => "RubyGems",
-            Self::Terraform => "Terraform",
-            Self::Ansible => "Ansible",
-            Self::Nuget => "NuGet",
-            Self::PubDart => "Pub (Dart)",
-            Self::Conan => "Conan",
-            Self::Rpm => "RPM",
-            Self::Deb => "Debian",
-        }
-    }
-
     /// All registry types (original 7).
     pub fn all_v1() -> &'static [RegistryType] {
         &[
@@ -116,28 +81,9 @@ impl RegistryType {
         ]
     }
 
-    /// All registry types including new formats.
-    pub fn all() -> &'static [RegistryType] {
-        &[
-            Self::Docker,
-            Self::Maven,
-            Self::Npm,
-            Self::Cargo,
-            Self::PyPI,
-            Self::Go,
-            Self::Raw,
-            Self::Gems,
-            Self::Terraform,
-            Self::Ansible,
-            Self::Nuget,
-            Self::PubDart,
-            Self::Conan,
-            Self::Rpm,
-            Self::Deb,
-        ]
-    }
-
-    /// Parse from string (case-insensitive).
+    /// Parse from string (case-insensitive), accepting common aliases. Kept hand-written
+    /// because of the aliases; `test_as_str_roundtrip` guards that every variant's
+    /// canonical `as_str` parses back.
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "docker" => Some(Self::Docker),
