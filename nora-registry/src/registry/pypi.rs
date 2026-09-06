@@ -133,6 +133,12 @@ async fn package_versions(
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
+    // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
+    // so the index can surface them. No-op if already cached / internal / no upstream.
+    if wants_json(&headers) {
+        ensure_pypi_dates_cached(&state, &normalized).await;
+    }
+
     // Collect local files with their hashes
     let keys = match state.storage.list(&prefix).await {
         Ok(k) => k,
@@ -211,7 +217,8 @@ async fn package_versions(
         let merged = merge_file_lists(upstream_files, &local_files);
         if !merged.is_empty() {
             return if wants_json(&headers) {
-                versions_json_response(&normalized, &merged, &base_url)
+                let pep700 = collect_pep700_meta(&state, &normalized, &merged).await;
+                versions_json_response(&normalized, &merged, &base_url, &pep700)
             } else {
                 versions_html_response(&normalized, &merged, &base_url)
             };
@@ -221,7 +228,8 @@ async fn package_versions(
     // Local files only — degrade gracefully when upstreams list nothing or are down.
     if !local_files.is_empty() {
         return if wants_json(&headers) {
-            versions_json_response(&normalized, &local_files, &base_url)
+            let pep700 = collect_pep700_meta(&state, &normalized, &local_files).await;
+            versions_json_response(&normalized, &local_files, &base_url, &pep700)
         } else {
             versions_html_response(&normalized, &local_files, &base_url)
         };
@@ -691,6 +699,8 @@ struct FileEntry {
 struct Pep691Response<'a> {
     meta: Pep691Meta,
     name: &'a str,
+    /// PEP 700: sorted, de-duplicated release versions present in `files`.
+    versions: Vec<String>,
     files: Vec<Pep691File>,
 }
 
@@ -701,12 +711,19 @@ struct Pep691Meta {
 }
 
 /// PEP 691 file entry — field `hashes` (NOT `digests`) per spec.
+/// `upload-time` and `size` are PEP 700 (api-version 1.1) additions.
 #[derive(serde::Serialize)]
 struct Pep691File {
     filename: String,
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     hashes: Option<Pep691Hashes>,
+    /// PEP 700 upload-time (RFC3339), when known (from the cached dates.json).
+    #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
+    upload_time: Option<String>,
+    /// PEP 700 file size in bytes, when the artifact is stored locally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -714,23 +731,39 @@ struct Pep691Hashes {
     sha256: String,
 }
 
-fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
+/// Render the PEP 691 + PEP 700 simple JSON. `pep700` maps filename → (size,
+/// upload-time), gathered by [`collect_pep700_meta`] from storage + the cached
+/// dates.json; a missing entry omits those (optional) per-file fields. Pure/sync so
+/// it stays unit-testable without a storage backend.
+fn versions_json_response(
+    normalized: &str,
+    files: &[FileEntry],
+    base_url: &str,
+    pep700: &std::collections::HashMap<String, (Option<u64>, Option<String>)>,
+) -> Response {
     let base = base_url.trim_end_matches('/');
     let pep691_files: Vec<Pep691File> = files
         .iter()
-        .map(|f| Pep691File {
-            filename: f.filename.clone(),
-            url: format!("{}/simple/{}/{}", base, normalized, f.filename),
-            hashes: f
-                .sha256
-                .as_ref()
-                .map(|h| Pep691Hashes { sha256: h.clone() }),
+        .map(|f| {
+            let (size, upload_time) = pep700.get(&f.filename).cloned().unwrap_or((None, None));
+            Pep691File {
+                filename: f.filename.clone(),
+                url: format!("{}/simple/{}/{}", base, normalized, f.filename),
+                hashes: f
+                    .sha256
+                    .as_ref()
+                    .map(|h| Pep691Hashes { sha256: h.clone() }),
+                upload_time,
+                size,
+            }
         })
         .collect();
 
     let body = Pep691Response {
-        meta: Pep691Meta { api_version: "1.0" },
+        // PEP 700 support is signalled by api-version 1.1.
+        meta: Pep691Meta { api_version: "1.1" },
         name: normalized,
+        versions: versions_from_filenames(files),
         files: pep691_files,
     };
 
@@ -740,6 +773,71 @@ fn versions_json_response(normalized: &str, files: &[FileEntry], base_url: &str)
         serde_json::to_string(&body).unwrap_or_default(),
     )
         .into_response()
+}
+
+/// PEP 700 project `versions`: sorted, de-duplicated release versions parsed from
+/// the wheel/sdist filenames in the file list (best-effort).
+fn versions_from_filenames(files: &[FileEntry]) -> Vec<String> {
+    let mut vs: Vec<String> = files
+        .iter()
+        .filter_map(|f| version_from_filename(&f.filename))
+        .collect();
+    vs.sort();
+    vs.dedup();
+    vs
+}
+
+/// Extract the release version from a wheel or sdist filename (best-effort).
+/// wheel: `{distribution}-{version}(-{build})?-{py}-{abi}-{platform}.whl`
+/// sdist: `{name}-{version}.tar.gz|.tar.bz2|.tar.xz|.tgz|.zip`
+fn version_from_filename(filename: &str) -> Option<String> {
+    if let Some(stem) = filename.strip_suffix(".whl") {
+        return stem
+            .split('-')
+            .nth(1)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    for ext in [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip"] {
+        if let Some(stem) = filename.strip_suffix(ext) {
+            return stem
+                .rsplit_once('-')
+                .map(|(_, v)| v.to_string())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
+/// Gather PEP 700 per-file metadata (size from storage, upload-time from the cached
+/// dates.json) keyed by filename. Async because it stats storage; the result is
+/// handed to the pure [`versions_json_response`] formatter.
+async fn collect_pep700_meta(
+    state: &AppState,
+    normalized: &str,
+    files: &[FileEntry],
+) -> std::collections::HashMap<String, (Option<u64>, Option<String>)> {
+    let dates: serde_json::Map<String, serde_json::Value> = state
+        .storage
+        .get(&format!("pypi/{}/dates.json", normalized))
+        .await
+        .ok()
+        .and_then(|d| serde_json::from_slice(&d).ok())
+        .unwrap_or_default();
+    let mut out = std::collections::HashMap::with_capacity(files.len());
+    for f in files {
+        let size = state
+            .storage
+            .stat(&format!("pypi/{}/{}", normalized, f.filename))
+            .await
+            .map(|m| m.size);
+        let upload_time = dates
+            .get(&f.filename)
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        out.insert(f.filename.clone(), (size, upload_time));
+    }
+    out
 }
 
 fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str) -> Response {
@@ -1598,6 +1696,67 @@ mod integration_tests {
         assert_eq!(json["files"][0]["hashes"]["sha256"], "deadbeef");
     }
 
+    /// #896: NORA's simple JSON must also carry PEP 700 fields so clients (e.g. Renovate)
+    /// can compute a minimum release age: `meta.api-version` 1.1, a project-level
+    /// `versions` list, and per-file `upload-time` + `size`. Upload-time is sourced from
+    /// the cached `dates.json` (filename → RFC3339), size from storage.
+    #[tokio::test]
+    async fn test_pypi_versions_json_pep700() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"data")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz.sha256", b"deadbeef")
+            .await
+            .unwrap();
+        // PEP 700 upload-time is read from the cached dates.json (filename → RFC3339).
+        ctx.state
+            .storage
+            .put(
+                "pypi/flask/dates.json",
+                br#"{"flask-2.0.tar.gz":"2021-05-11T13:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/flask/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // PEP 700 signals support via api-version 1.1
+        assert_eq!(
+            json["meta"]["api-version"], "1.1",
+            "PEP 700 requires meta.api-version 1.1"
+        );
+        // project-level versions list (PEP 700)
+        let versions = json["versions"]
+            .as_array()
+            .expect("PEP 700 project versions[] must be present");
+        assert!(
+            versions.iter().any(|v| v == "2.0"),
+            "versions must include 2.0, got {versions:?}"
+        );
+        // per-file upload-time + size (PEP 700)
+        let f = &json["files"][0];
+        assert_eq!(
+            f["upload-time"], "2021-05-11T13:00:00Z",
+            "PEP 700 per-file upload-time from dates.json"
+        );
+        assert_eq!(f["size"], 4, "PEP 700 per-file size = bytes of 'data'");
+    }
+
     #[tokio::test]
     async fn test_pypi_download_local() {
         let ctx = create_test_context();
@@ -1864,7 +2023,8 @@ mod spec_conformance_tests {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abcdef1234567890".into()),
         }];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let body = response.into_body();
         let bytes = futures::executor::block_on(axum::body::to_bytes(body, 1024 * 1024)).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1880,22 +2040,24 @@ mod spec_conformance_tests {
         assert_eq!(json["files"][0]["hashes"]["sha256"], "abcdef1234567890");
     }
 
-    /// PEP 691 requires `meta.api-version` field.
+    /// The simple JSON carries `meta.api-version`. NORA advertises 1.1 (PEP 700,
+    /// still within the `v1` media type) now that it emits upload-time/size/versions.
     #[test]
     fn test_pep691_meta_api_version() {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
         }];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(
-            json["meta"]["api-version"], "1.0",
-            "PEP 691 requires meta.api-version = '1.0'"
+            json["meta"]["api-version"], "1.1",
+            "PEP 700 support is signalled by meta.api-version = '1.1'"
         );
     }
 
@@ -1903,7 +2065,8 @@ mod spec_conformance_tests {
     #[test]
     fn test_pep691_content_type() {
         let files = vec![];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let ct = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -1924,7 +2087,8 @@ mod spec_conformance_tests {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
         }];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -1941,7 +2105,8 @@ mod spec_conformance_tests {
     fn test_pep691_name_is_normalized() {
         let files = vec![];
         let normalized = normalize_name("Flask-RESTful");
-        let response = versions_json_response(&normalized, &files, "http://nora:4000");
+        let response =
+            versions_json_response(&normalized, &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -1963,7 +2128,8 @@ mod spec_conformance_tests {
                 sha256: Some("bbb".into()),
             },
         ];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -2023,7 +2189,8 @@ mod spec_conformance_tests {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abc".into()),
         }];
-        let response = versions_json_response("pkg", &files, "http://nora:4000/");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000/", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -2043,7 +2210,8 @@ mod spec_conformance_tests {
     #[test]
     fn test_pep691_no_files_clean_response() {
         let files: Vec<FileEntry> = vec![];
-        let response = versions_json_response("empty-pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("empty-pkg", &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -2073,7 +2241,8 @@ mod spec_conformance_tests {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abc123".into()),
         }];
-        let response = versions_json_response("pkg", &files, "http://nora:4000");
+        let response =
+            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
