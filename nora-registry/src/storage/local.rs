@@ -83,7 +83,10 @@ impl LocalStorage {
                 if path.is_file() {
                     if let Ok(rel_path) = path.strip_prefix(base) {
                         let key = rel_path.to_string_lossy().replace('\\', "/");
-                        if key != PIN_FILE && (key.starts_with(prefix) || prefix.is_empty()) {
+                        if key != PIN_FILE
+                            && !super::is_reserved_signing_key(&key)
+                            && (key.starts_with(prefix) || prefix.is_empty())
+                        {
                             results.push(key);
                         }
                     }
@@ -113,7 +116,10 @@ impl LocalStorage {
                 if metadata.is_file() {
                     if let Ok(rel_path) = path.strip_prefix(base) {
                         let key = rel_path.to_string_lossy().replace('\\', "/");
-                        if key != PIN_FILE && (key.starts_with(prefix) || prefix.is_empty()) {
+                        if key != PIN_FILE
+                            && !super::is_reserved_signing_key(&key)
+                            && (key.starts_with(prefix) || prefix.is_empty())
+                        {
                             let modified = metadata
                                 .modified()
                                 .ok()
@@ -512,6 +518,48 @@ mod tests {
 
         let all_keys = storage.list("").await.unwrap();
         assert_eq!(all_keys.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_excludes_signing_key() {
+        // The repository signing key lives at `<storage.path>/.signing/nora.key`
+        // (main.rs default) and is persisted owner-only (0600, signing.rs:182). It is
+        // a SECRET, not an artifact: list() must never enumerate it, or backup/migrate/
+        // GC/UI would leak it (0644 tarball / plaintext S3 object) or GC could delete
+        // the signing identity. Regression guard for the #891-class export leak.
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "npm/left-pad/-/left-pad-1.0.0.tgz", b"artifact")
+            .await
+            .unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".signing")).unwrap();
+        std::fs::write(temp_dir.path().join(".signing/nora.key"), b"SECRET-KEY").unwrap();
+
+        let all = storage.list("").await.unwrap();
+        assert!(
+            all.iter().any(|k| k.contains("left-pad")),
+            "real artifact must still be listed: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|k| k.starts_with(".signing/")),
+            "signing key must never be enumerated by list(\"\"): {all:?}"
+        );
+
+        // Even an explicit prefix must not surface it.
+        let signing = storage.list(".signing/").await.unwrap();
+        assert!(
+            signing.is_empty(),
+            "explicit .signing/ prefix must still exclude the key: {signing:?}"
+        );
+
+        // list_with_meta shares the walk — it must exclude it too.
+        let meta = storage.list_with_meta("").await.unwrap();
+        assert!(
+            !meta.iter().any(|(k, _)| k.starts_with(".signing/")),
+            "list_with_meta must exclude the signing key: {:?}",
+            meta.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
