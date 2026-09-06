@@ -18,6 +18,22 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
+/// Reserved storage prefix for the repository signing key
+/// (`<storage.path>/.signing/nora.key`, see `main.rs` / [`crate::config::SigningConfig`]).
+/// The key is a SECRET, persisted owner-only (0600, `signing.rs`), not an artifact:
+/// every [`StorageBackend`] enumeration (`list` / `list_with_meta`) MUST skip it, so
+/// backup (tar), migrate (→ object store), GC, retention and the browse UI can never
+/// leak it (a 0644 tar entry / a plaintext object) or delete the signing identity.
+/// Mirrors how the local pin sidecar is excluded. #891-class guard: key-creation mode
+/// was enforced, the export path was not.
+pub(crate) const SIGNING_KEY_PREFIX: &str = ".signing/";
+
+/// Whether `key` names the repository signing key (anything under `.signing/`), which
+/// storage enumeration must never surface. See [`SIGNING_KEY_PREFIX`].
+pub(crate) fn is_reserved_signing_key(key: &str) -> bool {
+    key.starts_with(SIGNING_KEY_PREFIX)
+}
+
 /// File metadata
 #[derive(Debug, Clone)]
 pub struct FileMeta {

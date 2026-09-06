@@ -339,6 +339,9 @@ impl StorageBackend for ObjectStorage {
         Ok(objects
             .into_iter()
             .map(|meta| decode_object_key(meta.location.as_ref()))
+            // The signing key is a secret, never an artifact — keep it out of
+            // backup/migrate/GC/UI enumeration (see storage::SIGNING_KEY_PREFIX).
+            .filter(|key| !super::is_reserved_signing_key(key))
             .collect())
     }
 
@@ -372,6 +375,7 @@ impl StorageBackend for ObjectStorage {
                     },
                 )
             })
+            .filter(|(key, _)| !super::is_reserved_signing_key(key))
             .collect())
     }
 

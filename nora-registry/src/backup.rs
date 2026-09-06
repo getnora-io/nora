@@ -410,4 +410,53 @@ mod tests {
             .unwrap();
         assert_eq!(&data[..], b"test-content");
     }
+
+    #[tokio::test]
+    async fn test_backup_omits_signing_key() {
+        // A backup tar must never carry the repository signing key: it would ship at
+        // 0644 (mode-widened from the on-disk 0600) and restore/migrate would expose
+        // it (plaintext S3 object on migrate). #891-class: the unit test guarded key
+        // creation mode, not the export path. Regression guard.
+        use flate2::read::GzDecoder;
+        use std::fs::File;
+        use tar::Archive;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let storage = Storage::new_local(root.to_str().unwrap());
+
+        storage
+            .put("maven/com/example/1.0/test.jar", b"artifact")
+            .await
+            .unwrap();
+        // Signing key under the storage root, as main.rs places it by default.
+        std::fs::create_dir_all(root.join(".signing")).unwrap();
+        std::fs::write(root.join(".signing/nora.key"), b"SECRET-SIGNING-KEY").unwrap();
+
+        let output = dir.path().join("backup.tar.gz");
+        let stats = create_backup(&storage, &output).await.unwrap();
+
+        // Only the real artifact is backed up, not the key.
+        assert_eq!(
+            stats.artifact_count, 1,
+            "signing key must not be counted or backed up as an artifact"
+        );
+
+        let f = File::open(&output).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(f));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.path().ok().map(|p| p.to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".signing")),
+            "backup tar must not contain the signing key: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("test.jar")),
+            "backup tar must contain the real artifact: {names:?}"
+        );
+    }
 }
