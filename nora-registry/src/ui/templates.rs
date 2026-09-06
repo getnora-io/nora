@@ -4,6 +4,7 @@
 use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata};
 use super::components::*;
 use super::i18n::{get_translations, Lang};
+use crate::registry_type::RegistryType;
 use crate::repo_index::RepoInfo;
 use crate::tokens::TokenListEntry;
 use std::fmt::Write;
@@ -274,9 +275,9 @@ pub fn render_registry_list_paginated(
             .join("")
     };
 
-    let version_label = match registry_type {
-        "docker" => t.tags,
-        "raw" | "rpm" | "deb" => t.items,
+    let version_label = match RegistryType::from_str_opt(registry_type) {
+        Some(RegistryType::Docker) => t.tags,
+        Some(RegistryType::Raw | RegistryType::Rpm | RegistryType::Deb) => t.items,
         _ => t.versions,
     };
 
@@ -1079,10 +1080,11 @@ pub fn render_package_detail(
     auth_enabled: bool,
 ) -> String {
     let _t = get_translations(lang);
+    let rt = RegistryType::from_str_opt(registry_type);
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
 
-    let file_icon = if registry_type == "raw" {
+    let file_icon = if rt == Some(RegistryType::Raw) {
         r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
     } else {
         ""
@@ -1152,12 +1154,14 @@ pub fn render_package_detail(
         String::new()
     };
 
-    let install_cmd = match registry_type {
-        "npm" => format!("npm install {} --registry {}/npm", name, base_url),
-        "cargo" => format!("cargo add {}", name),
-        "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
-        "go" => format!("GOPROXY={}/go go get {}", base_url, name),
-        "raw" => {
+    let install_cmd = match rt {
+        Some(RegistryType::Npm) => format!("npm install {} --registry {}/npm", name, base_url),
+        Some(RegistryType::Cargo) => format!("cargo add {}", name),
+        Some(RegistryType::PyPI) => {
+            format!("pip install {} --index-url {}/simple", name, base_url)
+        }
+        Some(RegistryType::Go) => format!("GOPROXY={}/go go get {}", base_url, name),
+        Some(RegistryType::Raw) => {
             if detail.versions.len() == 1 && detail.versions[0].version == name {
                 // Root-level file — direct download URL
                 format!("curl -O {}/raw/{}", base_url, name)
@@ -1165,29 +1169,29 @@ pub fn render_package_detail(
                 format!("curl -O {}/raw/{}/<file>", base_url, name)
             }
         }
-        "nuget" => format!(
+        Some(RegistryType::Nuget) => format!(
             "dotnet add package {} --source {}/nuget/v3/index.json",
             name, base_url
         ),
-        "gems" => format!("gem install {} --source {}/gems", name, base_url),
-        "terraform" => format!(
+        Some(RegistryType::Gems) => format!("gem install {} --source {}/gems", name, base_url),
+        Some(RegistryType::Terraform) => format!(
             "# In required_providers block:\n  source = \"{}/terraform/{}\"",
             base_url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://"),
             name
         ),
-        "ansible" => format!("ansible-galaxy collection install {}", name),
-        "pub" => format!(
+        Some(RegistryType::Ansible) => format!("ansible-galaxy collection install {}", name),
+        Some(RegistryType::PubDart) => format!(
             "# pubspec.yaml:\n  hosted: {}/pub\n  # then: dart pub get",
             base_url
         ),
-        "conan" => format!("conan install --requires={}/ -r nora", name),
-        "rpm" => format!(
+        Some(RegistryType::Conan) => format!("conan install --requires={}/ -r nora", name),
+        Some(RegistryType::Rpm) => format!(
             "dnf config-manager --add-repo {}/rpm/{}\n# then set gpgcheck=0 repo_gpgcheck=0 in the .repo file",
             base_url, name
         ),
-        "deb" => format!(
+        Some(RegistryType::Deb) => format!(
             "echo 'deb [trusted=yes] {}/deb/{} ./' | sudo tee /etc/apt/sources.list.d/nora-{}.list && sudo apt-get update",
             base_url, name, name
         ),
@@ -1195,7 +1199,7 @@ pub fn render_package_detail(
     };
 
     // Build breadcrumbs — make each path segment clickable for hierarchical names
-    let breadcrumb_html = if registry_type == "ansible" && name.contains('.') {
+    let breadcrumb_html = if rt == Some(RegistryType::Ansible) && name.contains('.') {
         // Ansible: community.general → Ansible Galaxy / community / general
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         let mut crumbs = format!(
@@ -1255,7 +1259,7 @@ pub fn render_package_detail(
         )
     };
 
-    let detail_title = if registry_type == "raw" && name.contains('/') {
+    let detail_title = if rt == Some(RegistryType::Raw) && name.contains('/') {
         html_escape(name.rsplit('/').next().unwrap_or(name))
     } else {
         html_escape(name)
@@ -1269,7 +1273,7 @@ pub fn render_package_detail(
     };
 
     // JavaScript for per-version install command (NuGet-specific)
-    let version_js = if registry_type == "nuget" {
+    let version_js = if rt == Some(RegistryType::Nuget) {
         format!(
             r##"<script>
 document.querySelectorAll('.version-row').forEach(function(row) {{
@@ -1351,9 +1355,9 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         install_label = _t.install_command,
         cmd = html_escape(&install_cmd),
         metadata_panel = metadata_panel,
-        versions_label = if registry_type == "raw" {
+        versions_label = if rt == Some(RegistryType::Raw) {
             _t.files
-        } else if registry_type == "rpm" || registry_type == "deb" {
+        } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
         } else {
             _t.versions
@@ -1361,9 +1365,9 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         total = display_total,
         total_word = _t.total,
         prerelease = prerelease_toggle,
-        col_version = if registry_type == "raw" {
+        col_version = if rt == Some(RegistryType::Raw) {
             _t.filename
-        } else if registry_type == "rpm" || registry_type == "deb" {
+        } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
         } else {
             _t.versions
@@ -1732,46 +1736,46 @@ fn render_role_badge(role: &crate::tokens::Role) -> String {
 
 /// Returns SVG icon path for the registry type
 fn get_registry_icon(registry_type: &str) -> &'static str {
-    match registry_type {
-        "docker" => icons::DOCKER,
-        "maven" => icons::MAVEN,
-        "npm" => icons::NPM,
-        "cargo" => icons::CARGO,
-        "pypi" => icons::PYPI,
-        "go" => icons::GO,
-        "raw" => icons::RAW,
-        "gems" => icons::GEMS,
-        "terraform" => icons::TERRAFORM,
-        "ansible" => icons::ANSIBLE,
-        "nuget" => icons::NUGET,
-        "pub" => icons::PUB,
-        "conan" => icons::CONAN,
-        "rpm" => icons::RPM,
-        "deb" => icons::DEB,
-        _ => {
+    match RegistryType::from_str_opt(registry_type) {
+        Some(RegistryType::Docker) => icons::DOCKER,
+        Some(RegistryType::Maven) => icons::MAVEN,
+        Some(RegistryType::Npm) => icons::NPM,
+        Some(RegistryType::Cargo) => icons::CARGO,
+        Some(RegistryType::PyPI) => icons::PYPI,
+        Some(RegistryType::Go) => icons::GO,
+        Some(RegistryType::Raw) => icons::RAW,
+        Some(RegistryType::Gems) => icons::GEMS,
+        Some(RegistryType::Terraform) => icons::TERRAFORM,
+        Some(RegistryType::Ansible) => icons::ANSIBLE,
+        Some(RegistryType::Nuget) => icons::NUGET,
+        Some(RegistryType::PubDart) => icons::PUB,
+        Some(RegistryType::Conan) => icons::CONAN,
+        Some(RegistryType::Rpm) => icons::RPM,
+        Some(RegistryType::Deb) => icons::DEB,
+        None => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
     }
 }
 
 fn get_registry_title(registry_type: &str) -> &'static str {
-    match registry_type {
-        "docker" => "Docker Registry",
-        "maven" => "Maven Repository",
-        "npm" => "npm Registry",
-        "cargo" => "Cargo Registry",
-        "pypi" => "PyPI Repository",
-        "go" => "Go Modules",
-        "raw" => "Raw Storage",
-        "gems" => "RubyGems",
-        "terraform" => "Terraform Registry",
-        "ansible" => "Ansible Galaxy",
-        "nuget" => "NuGet Gallery",
-        "pub" => "pub.dev",
-        "conan" => "Conan (C/C++)",
-        "rpm" => "RPM (yum/dnf)",
-        "deb" => "Debian (APT)",
-        _ => "Registry",
+    match RegistryType::from_str_opt(registry_type) {
+        Some(RegistryType::Docker) => "Docker Registry",
+        Some(RegistryType::Maven) => "Maven Repository",
+        Some(RegistryType::Npm) => "npm Registry",
+        Some(RegistryType::Cargo) => "Cargo Registry",
+        Some(RegistryType::PyPI) => "PyPI Repository",
+        Some(RegistryType::Go) => "Go Modules",
+        Some(RegistryType::Raw) => "Raw Storage",
+        Some(RegistryType::Gems) => "RubyGems",
+        Some(RegistryType::Terraform) => "Terraform Registry",
+        Some(RegistryType::Ansible) => "Ansible Galaxy",
+        Some(RegistryType::Nuget) => "NuGet Gallery",
+        Some(RegistryType::PubDart) => "pub.dev",
+        Some(RegistryType::Conan) => "Conan (C/C++)",
+        Some(RegistryType::Rpm) => "RPM (yum/dnf)",
+        Some(RegistryType::Deb) => "Debian (APT)",
+        None => "Registry",
     }
 }
 
