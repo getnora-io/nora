@@ -84,6 +84,15 @@ pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> T
     build_context(false, &[], false, customize)
 }
 
+/// Build a test context over a caller-supplied backend **and** custom config tweaks —
+/// what a proxy-path test needs when it also has to observe backend round-trips.
+pub fn create_test_context_with_storage_and_config(
+    storage: Storage,
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context_with(false, &[], false, customize, Some(storage))
+}
+
 /// Build a test context with auth + anonymous_read + custom config tweaks.
 pub fn create_test_context_with_anonymous_read_and_config(
     users: &[(&str, &str)],
