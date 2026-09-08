@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **`lock-audit` no longer depends on gawk (#971 follow-up)** — Checks 1 and 3 used gawk's three-argument `match()`, which mawk rejects. mawk is the default `awk` on Debian, Ubuntu and the CI images, and an aborted awk prints nothing — so on any machine without gawk the audit reported no findings and looked clean. The awk programs are now POSIX, and `scripts/test-lock-audit.sh` runs the audit under every implementation it finds, asserting they agree *and* that each run still produced the known finding, so "both silent because both aborted" cannot pass.
+
 ### Changed
 - **Every storage round-trip is counted (#969 follow-up)** — `stat`, `pin`, `list` and `list_with_meta` reached the backend without touching `nora_storage_operations_total`, which is why a handler issuing one `stat()` per file (tens of thousands of HEAD requests on a single PyPI index response) moved no metric and could only be found by reading code. All four now increment it; on `stat`/`pin` an absent object or an unpinned one is `status="miss"`, so ordinary misses do not inflate error-rate alerting. Counters only — no behavioural change.
 
