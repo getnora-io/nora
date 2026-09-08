@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Changed
+- **Every storage round-trip is counted (#969 follow-up)** — `stat`, `pin`, `list` and `list_with_meta` reached the backend without touching `nora_storage_operations_total`, which is why a handler issuing one `stat()` per file (tens of thousands of HEAD requests on a single PyPI index response) moved no metric and could only be found by reading code. All four now increment it; on `stat`/`pin` an absent object or an unpinned one is `status="miss"`, so ordinary misses do not inflate error-rate alerting. Counters only — no behavioural change.
+
 ## [1.3.0] - 2026-09-06
 
 ### Added

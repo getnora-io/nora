@@ -49,7 +49,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_storage_bytes` | gauge | registry | Storage size in bytes per registry |
-| `nora_storage_operations_total` | counter | operation, status | Storage operations (put, get, delete). `status="integrity_fail"`/`"verify_error"` on `operation="get"` mean a stored artifact failed hash-pin verification and was refused (fail-closed, #582) — see [Integrity recovery](#integrity-recovery). |
+| `nora_storage_operations_total` | counter | operation, status | Every backend round-trip: `put`, `get`, `get_range`, `get_reader`, `copy`, `delete`, `stat`, `pin`, `list`, `list_with_meta`. On an object store each one is a network request, so the rate of this counter against the request rate is what shows a handler paying a round-trip per file. `status="miss"` on `stat`/`pin` is an absent object or an unpinned one — not an error. `status="integrity_fail"`/`"verify_error"` on `operation="get"` mean a stored artifact failed hash-pin verification and was refused (fail-closed, #582) — see [Integrity recovery](#integrity-recovery). |
 
 ### Circuit Breaker
 
