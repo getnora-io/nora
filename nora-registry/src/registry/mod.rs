@@ -95,6 +95,34 @@ pub(crate) async fn read_json_sidecars<T: serde::de::DeserializeOwned>(
         .await
 }
 
+/// Read every key under `prefix` concurrently, returning the pairs that came back.
+///
+/// [`read_json_sidecars`] drops the key and fails the whole batch on the first bad
+/// entry, which suits an index rebuild that parses records. A packument rebuild needs
+/// neither: the key *is* the version, and one unreadable version must not turn a
+/// partial packument into no packument — the sequential loop this replaces skipped
+/// such a key and carried on. Same concurrency, same reason: on an object store each
+/// read is a network round-trip, and a package with a few thousand versions paid them
+/// one at a time.
+pub(crate) async fn read_keyed_blobs(
+    storage: &crate::storage::Storage,
+    prefix: &str,
+) -> Vec<(String, axum::body::Bytes)> {
+    use futures::StreamExt;
+    let Ok(keys) = storage.list(prefix).await else {
+        return Vec::new();
+    };
+    futures::stream::iter(keys)
+        .map(|key| async move {
+            let data = storage.get(&key).await.ok()?;
+            Some((key, data))
+        })
+        .buffer_unordered(SIDECAR_READ_CONCURRENCY)
+        .filter_map(|pair| async move { pair })
+        .collect()
+        .await
+}
+
 /// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
 /// its content mirrors the upstream; local publish/delete/reindex would
 /// diverge from (and be clobbered by) the next upstream metadata refresh.

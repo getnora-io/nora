@@ -1170,15 +1170,13 @@ pub(crate) async fn regenerate_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
 ) -> Result<(), ()> {
+    // versions map, keyed by the filename (version) without the .json suffix. Read
+    // concurrently: on an object store every version is a round-trip, and this path now
+    // runs on a read (#956), so a package with thousands of versions used to pay them
+    // one after another. An unreadable or unparsable key is skipped, as before.
     let versions_prefix = format!("npm/{}/versions/", package_name);
-    let version_keys = storage.list(&versions_prefix).await.unwrap_or_default();
-
-    // versions map, keyed by the filename (version) without the .json suffix.
     let mut versions = serde_json::Map::new();
-    for key in &version_keys {
-        let Ok(data) = storage.get(key).await else {
-            continue;
-        };
+    for (key, data) in super::read_keyed_blobs(storage, &versions_prefix).await {
         let Ok(vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
             continue;
         };
@@ -1190,12 +1188,9 @@ pub(crate) async fn regenerate_packument(
     // dist-tags from the pointer keys (+ derive `latest` if publish left it unset).
     let dt_prefix = format!("npm/{}/dist-tags/", package_name);
     let mut dist_tags = serde_json::Map::new();
-    for key in storage.list(&dt_prefix).await.unwrap_or_default() {
-        if let Ok(data) = storage.get(&key).await {
-            if let (Some(tag), Ok(ver)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec()))
-            {
-                dist_tags.insert(tag.to_string(), serde_json::Value::String(ver));
-            }
+    for (key, data) in super::read_keyed_blobs(storage, &dt_prefix).await {
+        if let (Some(tag), Ok(ver)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec())) {
+            dist_tags.insert(tag.to_string(), serde_json::Value::String(ver));
         }
     }
     if !dist_tags.contains_key("latest") {
@@ -2838,6 +2833,130 @@ mod integration_tests {
                 .any(|(_, body)| body.contains(UPSTREAM_MARKER)),
             "#975: the upstream packument must never be cached over a key the local versions own — found: {to_packument:?}"
         );
+    }
+
+    /// The packument rebuild reads `versions/` concurrently. It used to walk the keys
+    /// one at a time, which on an object store is a round-trip per version, and #956
+    /// put that walk on a read path — so a package with a few thousand versions paid
+    /// them serially on the first request after the packument went missing. A backend
+    /// that records how many reads are in flight at once proves the fan-out is real; a
+    /// sequential walk never exceeds one.
+    #[tokio::test]
+    async fn npm_packument_rebuild_reads_versions_concurrently() {
+        use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct TracksInFlight {
+            inner: ObjectStorage,
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for TracksInFlight {
+            async fn get(
+                &self,
+                key: &str,
+            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                // Hold the slot briefly so overlapping reads actually overlap.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let out = self.inner.get(key).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                out
+            }
+            async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+                self.inner.put(k, d, sha256).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                self.inner.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+                self.inner.delete(k).await
+            }
+            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+            async fn list_with_meta(
+                &self,
+                prefix: &str,
+            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+                self.inner.list_with_meta(prefix).await
+            }
+            async fn stat(&self, k: &str) -> Option<FileMeta> {
+                self.inner.stat(k).await
+            }
+            async fn health_check(&self) -> bool {
+                self.inner.health_check().await
+            }
+            async fn total_size(&self) -> u64 {
+                self.inner.total_size().await
+            }
+            fn backend_name(&self) -> &'static str {
+                "in-flight-tracking-test"
+            }
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &std::path::Path,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.put_from_path(k, src, sha256).await
+            }
+            async fn copy(
+                &self,
+                src: &str,
+                dst: &str,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.copy(src, dst, sha256).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(
+                u64,
+                Option<String>,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+            )> {
+                self.inner.get_reader(k).await
+            }
+        }
+
+        let backend = Arc::new(TracksInFlight {
+            inner: ObjectStorage::in_memory(),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let storage = Storage::from_backend(Arc::clone(&backend) as Arc<dyn StorageBackend>);
+
+        for i in 1..=8 {
+            storage
+                .put(
+                    &format!("npm/conc/versions/1.0.{i}.json"),
+                    format!(r#"{{"name":"conc","version":"1.0.{i}"}}"#).as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        backend.peak.store(0, Ordering::SeqCst);
+
+        crate::registry::npm::regenerate_packument(&storage, "conc")
+            .await
+            .expect("rebuild succeeds");
+
+        assert!(
+            backend.peak.load(Ordering::SeqCst) > 1,
+            "the rebuild must read versions concurrently — peak in-flight reads was {}",
+            backend.peak.load(Ordering::SeqCst)
+        );
+        // Correctness is unchanged: every version is still in the assembled document.
+        let packument = storage.get("npm/conc/metadata.json").await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&packument).unwrap();
+        let versions = json["versions"].as_object().expect("versions object");
+        assert_eq!(versions.len(), 8, "all versions assembled: {versions:?}");
     }
 }
 

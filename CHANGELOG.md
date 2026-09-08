@@ -2,6 +2,9 @@
 ## [Unreleased]
 
 ### Changed
+- **npm rebuilds a packument concurrently (#956 follow-up)** — `regenerate_packument` walked `versions/` and `dist-tags/` one key at a time. On an object store each key is a round-trip, and #956 put that walk on a read path, so the first request after a packument went missing paid one round-trip per version: 505 reads and 0.77 s for a 500-version package against a loopback S3 store, linear from there. It now reads them through the same buffered fan-out the RPM and Deb index rebuilds use, keeping the lenient behaviour — an unreadable or unparsable version is skipped rather than failing the rebuild.
+
+### Changed
 - **Every storage round-trip is counted (#969 follow-up)** — `stat`, `pin`, `list` and `list_with_meta` reached the backend without touching `nora_storage_operations_total`, which is why a handler issuing one `stat()` per file (tens of thousands of HEAD requests on a single PyPI index response) moved no metric and could only be found by reading code. All four now increment it; on `stat`/`pin` an absent object or an unpinned one is `status="miss"`, so ordinary misses do not inflate error-rate alerting. Counters only — no behavioural change.
 
 ### Fixed
