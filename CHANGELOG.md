@@ -4,6 +4,9 @@
 ### Changed
 - **Every storage round-trip is counted (#969 follow-up)** — `stat`, `pin`, `list` and `list_with_meta` reached the backend without touching `nora_storage_operations_total`, which is why a handler issuing one `stat()` per file (tens of thousands of HEAD requests on a single PyPI index response) moved no metric and could only be found by reading code. All four now increment it; on `stat`/`pin` an absent object or an unpinned one is `status="miss"`, so ordinary misses do not inflate error-rate alerting. Counters only — no behavioural change.
 
+### Fixed
+- **`lock-audit` no longer reports a guard that cannot drop early (#971)** — Check 2 scanned forward from the end of a guarded block to the next column-0 `}` and flagged the first storage write it met, with no notion of branch exclusivity. A `publish_lock` taken under `if !is_tarball` was therefore reported against a write under `if is_tarball`, which no request can reach on the same path. The scan now skips a write whose enclosing `if` chain contains the textual negation of a condition enclosing the guard. Where the reasoning is beyond textual analysis, a `// LOCK-SAFE: <reason>` comment inside the block of the write exempts it, with the reason recorded next to the code; a bare marker with no reason silences nothing, and the function-level markers the repo already carries are deliberately not honoured, because a function-wide exemption would hide a genuine finding elsewhere in the same handler. `scripts/test-lock-audit.sh` pins all four directions.
+
 ## [1.3.0] - 2026-09-06
 
 ### Added
