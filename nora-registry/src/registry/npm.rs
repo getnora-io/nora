@@ -562,6 +562,10 @@ async fn handle_request(
     //
     // Runs before the namespace guard on purpose: serving locally-owned bytes is
     // always allowed, and the guard exists to stop the *upstream* fetch below.
+    // Whether this package has locally published versions. Read once here and kept
+    // for the proxy branch below, which must not cache an upstream packument over a
+    // key that a local rebuild owns (#975).
+    let mut has_local_versions = false;
     if !is_tarball {
         let versions_prefix = format!("npm/{}/versions/", package_name);
         let has_versions = !state
@@ -570,6 +574,7 @@ async fn handle_request(
             .await
             .unwrap_or_default()
             .is_empty();
+        has_local_versions = has_versions;
 
         if has_versions {
             // Same lock the publish path takes: a CI fleet stampeding one package
@@ -679,18 +684,44 @@ async fn handle_request(
                     data_to_serve = rewritten;
                 }
 
-                // Cache in background, invalidate index AFTER write completes
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let invalidate_npm = is_tarball;
-                let repo_index = Arc::clone(&state.repo_index);
-                tokio::spawn(async move {
-                    if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
-                        tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
-                    } else if invalidate_npm {
-                        repo_index.invalidate("npm");
-                    }
-                });
+                // #975: `npm/{name}/metadata.json` belongs to the local rebuild whenever
+                // `versions/` is non-empty — it is the assembled form of keys this
+                // registry owns. Reaching here on the metadata path with local versions
+                // present means the rebuild above fell through (its write failed, or the
+                // read-back missed), and caching the upstream document at that key would
+                // drop every locally published version from the packument. It would also
+                // land unserialized against the `publish_lock` released a few lines above,
+                // so a concurrent publish could be overwritten. The upstream bytes are
+                // still served for this request; only the write is skipped, so the next
+                // request retries the rebuild instead of finding a wrong document cached.
+                let owns_key_locally = !is_tarball && has_local_versions;
+                if owns_key_locally {
+                    tracing::warn!(
+                        registry = "npm",
+                        key = %key,
+                        "serving upstream packument without caching: local versions own this key"
+                    );
+                } else {
+                    // LOCK-SAFE: this write cannot race the `publish_lock` taken above,
+                    // because it only runs when `owns_key_locally` is false — that is,
+                    // `is_tarball` (the `if !is_tarball` block was never entered) or
+                    // `!has_local_versions` (the `if has_versions` block was never
+                    // entered). Either way the guard was never taken on this path, so
+                    // there is nothing for it to have dropped before.
+                    //
+                    // Cache in background, invalidate index AFTER write completes
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let invalidate_npm = is_tarball;
+                    let repo_index = Arc::clone(&state.repo_index);
+                    tokio::spawn(async move {
+                        if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
+                            tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
+                        } else if invalidate_npm {
+                            repo_index.invalidate("npm");
+                        }
+                    });
+                }
 
                 if is_tarball {
                     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -2645,6 +2676,168 @@ mod integration_tests {
             )
             .await
             .unwrap();
+    }
+
+    /// #975: `npm/{name}/metadata.json` is the assembled form of keys this registry
+    /// owns, so the proxy branch must never cache an upstream packument there while
+    /// `versions/` is non-empty. That branch is reached on the metadata path only by
+    /// falling through the rebuild — its write failed, or the read-back missed — and a
+    /// cached upstream document drops every locally published version. It does not
+    /// self-heal either: the read-path rebuild triggers on the key being absent, and
+    /// after such a write it exists with the wrong content.
+    #[tokio::test]
+    async fn npm_proxy_does_not_cache_upstream_packument_over_local_versions() {
+        use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const UPSTREAM_MARKER: &str = "upstream-only-packument";
+        const PACKUMENT_KEY: &str = "npm/hybrid/metadata.json";
+
+        /// Reproduces the fall-through with no timing games: reads of the packument key
+        /// always miss, so the rebuild runs, writes, and the read-back still misses.
+        /// Every write is recorded so the test can assert what reached the key.
+        struct PackumentReadAlwaysMisses {
+            inner: ObjectStorage,
+            writes: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for PackumentReadAlwaysMisses {
+            async fn get(
+                &self,
+                key: &str,
+            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+                if key == PACKUMENT_KEY {
+                    return Err(crate::storage::StorageError::NotFound);
+                }
+                self.inner.get(key).await
+            }
+            async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+                self.writes
+                    .lock()
+                    .expect("writes mutex")
+                    .push((k.to_string(), String::from_utf8_lossy(d).to_string()));
+                self.inner.put(k, d, sha256).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                self.inner.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+                self.inner.delete(k).await
+            }
+            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+            async fn list_with_meta(
+                &self,
+                prefix: &str,
+            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+                self.inner.list_with_meta(prefix).await
+            }
+            async fn stat(&self, k: &str) -> Option<FileMeta> {
+                self.inner.stat(k).await
+            }
+            async fn health_check(&self) -> bool {
+                self.inner.health_check().await
+            }
+            async fn total_size(&self) -> u64 {
+                self.inner.total_size().await
+            }
+            fn backend_name(&self) -> &'static str {
+                "packument-read-misses-test"
+            }
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &std::path::Path,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.put_from_path(k, src, sha256).await
+            }
+            async fn copy(
+                &self,
+                src: &str,
+                dst: &str,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.copy(src, dst, sha256).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(
+                u64,
+                Option<String>,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+            )> {
+                self.inner.get_reader(k).await
+            }
+        }
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hybrid"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                concat!(
+                    r#"{{"name":"hybrid","description":"{}","dist-tags":{{"latest":"9.9.9"}},"#,
+                    r#""versions":{{"9.9.9":{{"name":"hybrid","version":"9.9.9","#,
+                    r#""dist":{{"tarball":"http://up/hybrid/-/hybrid-9.9.9.tgz"}}}}}}}}"#
+                ),
+                UPSTREAM_MARKER
+            )))
+            .mount(&upstream)
+            .await;
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let storage = Storage::from_backend(Arc::new(PackumentReadAlwaysMisses {
+            inner: ObjectStorage::in_memory(),
+            writes: Arc::clone(&writes),
+        }));
+        let ctx =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+            });
+
+        // One locally published version, so `versions/` is non-empty and the packument
+        // key belongs to the local rebuild.
+        ctx.state
+            .storage
+            .put(
+                "npm/hybrid/versions/1.0.0.json",
+                br#"{"name":"hybrid","version":"1.0.0","dist":{"tarball":"http://nora/npm/hybrid/-/hybrid-1.0.0.tgz"}}"#,
+            )
+            .await
+            .unwrap();
+
+        let response = send(&ctx.app, Method::GET, "/npm/hybrid", "").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the request is still served"
+        );
+
+        // The proxy cache write is detached; give it room to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let recorded = writes.lock().expect("writes mutex").clone();
+        let to_packument: Vec<&(String, String)> = recorded
+            .iter()
+            .filter(|(k, _)| k == PACKUMENT_KEY)
+            .collect();
+        // Positive control: the rebuild really ran and wrote the assembled document,
+        // which is what puts this request on the fall-through path in the first place.
+        assert!(
+            to_packument.iter().any(|(_, body)| body.contains("1.0.0")),
+            "the local rebuild must have written the assembled packument: {to_packument:?}"
+        );
+        assert!(
+            !to_packument
+                .iter()
+                .any(|(_, body)| body.contains(UPSTREAM_MARKER)),
+            "#975: the upstream packument must never be cached over a key the local versions own — found: {to_packument:?}"
+        );
     }
 }
 
