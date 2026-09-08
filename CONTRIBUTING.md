@@ -93,6 +93,23 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run fuzz_validation -- -max_total_time=60
 ```
 
+## Changelog entries
+
+Do not edit `## [Unreleased]` in `CHANGELOG.md` directly. Add a fragment instead:
+
+```bash
+cat > changelog.d/<issue-or-pr-number>.<category>.md <<'EOF'
+**Short title (#N)** — what changed, what it was before, and why it matters.
+EOF
+```
+
+`<category>` is one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
+`security`. One file per change means two pull requests never edit the same lines, so
+they cannot conflict on the changelog — which they did three times in a row during
+1.3.1. `scripts/changelog-fragments.sh --check` validates the fragments and
+`--render` shows the assembled section; the maintainer runs `--release <version>` at
+release time. See `changelog.d/README.md`.
+
 ## Before Submitting a PR
 
 ```bash
