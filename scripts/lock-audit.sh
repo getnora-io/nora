@@ -55,6 +55,20 @@ done
 # Bad pattern: publish_lock + _guard inside `if cond { … }` (or for/while/loop),
 # whose closing brace drops the guard BEFORE a later storage.put = unprotected write.
 #
+# A write on a branch that is MUTUALLY EXCLUSIVE with the guarded one is not that
+# pattern: the guard is never taken on the path that reaches the write, so it cannot
+# have dropped before it. The forward scan therefore skips a write whose enclosing
+# `if` chain contains the textual negation of a condition enclosing the guard
+# (`if !is_tarball` guard vs `if is_tarball` write). Without this the check reports
+# any write placed later in the same function after an unrelated guarded block.
+#
+# Where the reasoning is beyond textual analysis, a `// LOCK-SAFE: <reason>` comment
+# inside the write's own block exempts it — with the reason recorded next to the code.
+# The marker must carry text; a bare `// LOCK-SAFE:` does not silence anything. Only a
+# marker local to the write counts: the function-level markers this repo already carries
+# (#518/#520) are deliberately NOT honoured, because a function-wide exemption would
+# have hidden the genuine finding in the same handler (#975).
+#
 # The guard's *enclosing* block is found by a backward brace-walk from the guard
 # line (the first unmatched `{` going up). We flag ONLY when that opener is an
 # if/else/for/while/loop. A guard at function-body scope after early-return guard
@@ -69,6 +83,62 @@ for file in "$REGISTRY_DIR"/*.rs; do
     base=$(basename "$file")
 
     awk -v base="$base" '
+    # Normalized condition of an `if` / `} else if` block opener; "" for anything else.
+    function norm_cond(line,   c) {
+        c = line
+        sub(/^[ \t]*/, "", c)
+        if (c !~ /^(if[ \t(]|\} *else +if[ \t(])/) return ""
+        sub(/^\} *else +if[ \t]*/, "", c)
+        sub(/^if[ \t]*/, "", c)
+        sub(/[ \t]*\{[ \t]*$/, "", c)
+        gsub(/[ \t]+/, " ", c)
+        sub(/^[ \t]+/, "", c); sub(/[ \t]+$/, "", c)
+        return c
+    }
+    # Conditions of every `if` block lexically enclosing line ln, outermost last.
+    function enclosing_conds(ln, out,   i, t, nopen, nclose, depth, n, c) {
+        depth = 0; n = 0
+        for (i = ln - 1; i >= 1; i--) {
+            t = lines[i]; nopen  = gsub(/[{]/, "", t)
+            t = lines[i]; nclose = gsub(/[}]/, "", t)
+            depth += nclose - nopen
+            if (depth < 0) {
+                c = norm_cond(lines[i])
+                if (c != "") { n++; out[n] = c }
+                depth = 0
+            }
+        }
+        return n
+    }
+    function is_negation(a, b) {
+        return (a == "!" b) || (b == "!" a) || (a == "!(" b ")") || (b == "!(" a ")")
+    }
+    # First line of the block lexically enclosing line ln (the unmatched `{` above it).
+    function block_opener(ln,   i, t, nopen, nclose, depth) {
+        depth = 0
+        for (i = ln - 1; i >= 1; i--) {
+            t = lines[i]; nopen  = gsub(/[{]/, "", t)
+            t = lines[i]; nclose = gsub(/[}]/, "", t)
+            depth += nclose - nopen
+            if (depth < 0) return i
+        }
+        return 1
+    }
+    # A `// LOCK-SAFE: <reason>` comment covering the write; reason required.
+    # Two levels are searched: the block of the write and the one around it, because a
+    # cache write is typically `else { LOCK-SAFE ...  tokio::spawn(|| { put }) }` — the
+    # marker belongs with the branch it justifies, not inside the closure. Two levels
+    # keep it local: the function-level markers this repo carries stay unhonoured.
+    function lock_safe_exempt(ln,   i, from, level) {
+        from = ln
+        for (level = 0; level < 2; level++) {
+            from = block_opener(from)
+            for (i = from; i <= ln; i++)
+                if (lines[i] ~ /LOCK-SAFE:[[:space:]]*[^[:space:]]/) return 1
+            if (from <= 1) break
+        }
+        return 0
+    }
     /publish_lock/ { lock_line=NR }
     /let _guard/ && lock_line && (NR - lock_line < 3) {
         # Backward brace-walk: the first unmatched `{` above the guard opened the
@@ -104,9 +174,20 @@ for file in "$REGISTRY_DIR"/*.rs; do
             # function (up to the next column-0 `}`): the guard has already dropped,
             # so that write is unserialized. A guard whose block contains ALL its
             # writes (e.g. a per-key lock inside a `for` loop) is correctly ignored.
+            gn = enclosing_conds(g_guard[k], gconds)
             for (j=close_line+1; j<=NR; j++) {
                 if (lines[j] ~ /^}/) break
                 if (lines[j] ~ /storage\.(put|delete|write|put_from_path|put_multipart)/) {
+                    # Mutually exclusive branch => the guard is not on this path at all.
+                    delete wconds
+                    wn = enclosing_conds(j, wconds)
+                    exclusive = 0
+                    for (x=1; x<=gn; x++)
+                        for (y=1; y<=wn; y++)
+                            if (is_negation(gconds[x], wconds[y])) exclusive = 1
+                    if (exclusive) continue
+                    # Documented exemption, reason recorded at the write site.
+                    if (lock_safe_exempt(j)) continue
                     printf "%s:%d _guard drops (conditional/loop scope) before storage write at line %d\n", base, g_guard[k], j
                     break
                 }
