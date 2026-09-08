@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **`lock-audit` no longer depends on gawk (#971 follow-up)** — Checks 1 and 3 used gawk's three-argument `match()`, which mawk rejects. mawk is the default `awk` on Debian, Ubuntu and the CI images, and an aborted awk prints nothing — so on any machine without gawk the audit reported no findings and looked clean. The awk programs are now POSIX, and `scripts/test-lock-audit.sh` runs the audit under every implementation it finds, asserting they agree *and* that each run still produced the known finding, so "both silent because both aborted" cannot pass.
+
 ### Changed
 - **npm rebuilds a packument concurrently (#956 follow-up)** — `regenerate_packument` walked `versions/` and `dist-tags/` one key at a time. On an object store each key is a round-trip, and #956 put that walk on a read path, so the first request after a packument went missing paid one round-trip per version: 505 reads and 0.77 s for a 500-version package against a loopback S3 store, linear from there. It now reads them through the same buffered fan-out the RPM and Deb index rebuilds use, keeping the lenient behaviour — an unreadable or unparsable version is skipped rather than failing the rebuild.
 

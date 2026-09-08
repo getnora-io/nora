@@ -9,6 +9,13 @@
 # 3. Known RMW patterns: index append, metadata merge
 set -uo pipefail
 
+# The awk programs below stay within POSIX awk. They used to rely on gawk's
+# three-argument `match()`, which mawk — the default `awk` on Debian, Ubuntu and the CI
+# images — rejects; an aborted awk prints nothing, and "no output" reads exactly like
+# "no findings", so the check would have passed vacuously wherever gawk was absent.
+# Verified against both gawk and mawk by scripts/test-lock-audit.sh.
+AWK="${AWK:-awk}"
+
 REGISTRY_DIR="${1:-nora-registry/src/registry}"
 FAIL_FILE=$(mktemp)
 echo 0 > "$FAIL_FILE"
@@ -29,10 +36,12 @@ for file in "$REGISTRY_DIR"/*.rs; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
 
-    awk -v base="$base" '
+    "$AWK" -v base="$base" '
     /^async fn (update_|generate_|rebuild_).*/ {
         fname=$0; has_put=0; has_lock=0; has_doc=0; start=NR; depth=0
-        match(fname, /fn ([a-zA-Z_]+)/, m); fn_name=m[1]
+        fn_name = ""
+        if (match(fname, /fn [a-zA-Z_]+/))
+            fn_name = substr(fname, RSTART + 3, RLENGTH - 3)
     }
     fname!="" && /{/ { depth++ }
     fname!="" && /}/ { depth--
@@ -82,7 +91,7 @@ for file in "$REGISTRY_DIR"/*.rs; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
 
-    awk -v base="$base" '
+    "$AWK" -v base="$base" '
     # Normalized condition of an `if` / `} else if` block opener; "" for anything else.
     function norm_cond(line,   c) {
         c = line
@@ -209,16 +218,24 @@ for file in "$REGISTRY_DIR"/*.rs; do
     base=$(basename "$file")
 
     # Find get+put pairs where data is modified between them
-    awk -v base="$base" '
+    "$AWK" -v base="$base" '
     /storage\.(get|list)\(&/ {
         read_line=NR
-        match($0, /storage\.(get|list)\(&([a-zA-Z_]+)/, m)
-        read_key=m[2]
+        read_key = ""
+        if (match($0, /storage\.(get|list)\(&[a-zA-Z_]+/)) {
+            frag = substr($0, RSTART, RLENGTH)
+            sub(/^.*\(&/, "", frag)
+            read_key = frag
+        }
     }
     read_key && /(extend_from_slice|push|insert|entry\(|\.put\()/ && NR > read_line && (NR - read_line < 30) {
         if (/storage\.put/) {
-            match($0, /storage\.put\(&([a-zA-Z_]+)/, m)
-            put_key=m[1]
+            put_key = ""
+            if (match($0, /storage\.put\(&[a-zA-Z_]+/)) {
+                frag = substr($0, RSTART, RLENGTH)
+                sub(/^.*\(&/, "", frag)
+                put_key = frag
+            }
             if (put_key == read_key || (read_key && put_key)) {
                 # Check if publish_lock exists between read and write
                 has_lock=0

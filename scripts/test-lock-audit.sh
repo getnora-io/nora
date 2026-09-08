@@ -127,6 +127,35 @@ expect_silent   "annotated.rs" "a write with a LOCK-SAFE reason in its block is 
 expect_reported "annotated_no_reason.rs" "a bare LOCK-SAFE marker with no reason does not silence"
 expect_silent   "annotated_outer.rs" "a LOCK-SAFE reason one block out still covers the write"
 
+# The audit must behave the same on whatever awk the machine has: gawk here, mawk on
+# Debian, Ubuntu and the CI images. A gawk-only construct aborts under mawk, and an
+# aborted awk prints nothing — which reads exactly like a clean tree, so this compares
+# the findings AND checks each run actually produced one.
+IMPLS=""
+for impl in gawk mawk; do
+    command -v "$impl" >/dev/null 2>&1 || continue
+    AWK="$impl" bash "$AUDIT" "$TMP" > "$TMP/out.$impl" 2>&1
+    IMPLS="$IMPLS $impl"
+    if grep -q "positive.rs" "$TMP/out.$impl"; then
+        echo "  OK: $impl reports the known finding (the run was not a silent abort)"
+    else
+        echo "FAIL: $impl produced no finding for positive.rs — likely an aborted awk"
+        sed 's/^/      /' "$TMP/out.$impl" | head -5
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+if [ -f "$TMP/out.gawk" ] && [ -f "$TMP/out.mawk" ]; then
+    if diff -q "$TMP/out.gawk" "$TMP/out.mawk" >/dev/null 2>&1; then
+        echo "  OK: gawk and mawk produce identical output"
+    else
+        echo "FAIL: gawk and mawk disagree"
+        diff "$TMP/out.gawk" "$TMP/out.mawk" | sed 's/^/      /' | head -10
+        FAILURES=$((FAILURES + 1))
+    fi
+else
+    echo "  OK: only[$IMPLS ] available, cross-implementation comparison skipped"
+fi
+
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
     echo "lock-audit self-test PASSED"
