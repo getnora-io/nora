@@ -135,12 +135,18 @@ async fn package_versions(
 
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
-    if wants_json(&headers) {
-        ensure_pypi_dates_cached(&state, &normalized).await;
-    }
+    // The map is read ONCE here and threaded through to [`pep700_meta`] — re-reading
+    // `dates.json` per response was a second round-trip on the hot path (#969).
+    let dates = if wants_json(&headers) {
+        ensure_pypi_dates_cached(&state, &normalized).await
+    } else {
+        serde_json::Map::new()
+    };
 
-    // Collect local files with their hashes
-    let keys = match state.storage.list(&prefix).await {
+    // Collect local files with their hashes and sizes. `list_with_meta` carries the
+    // size from the listing itself; a per-key `stat()` is a HEAD per file on S3 and
+    // must never appear on this path (#738, regressed on the JSON index by #969).
+    let keys = match state.storage.list_with_meta(&prefix).await {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = ?e, "pypi: failed to list storage for package versions");
@@ -148,7 +154,9 @@ async fn package_versions(
         }
     };
     let mut local_files: Vec<FileEntry> = Vec::new();
-    for key in &keys {
+    let mut local_sizes: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::with_capacity(keys.len());
+    for (key, meta) in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
             if !filename.is_empty()
                 && !ends_with_ci(filename, ".sha256")
@@ -160,6 +168,7 @@ async fn package_versions(
                     .await
                     .ok()
                     .and_then(|d| String::from_utf8(d.to_vec()).ok());
+                local_sizes.insert(filename.to_string(), meta.size);
                 local_files.push(FileEntry {
                     filename: filename.to_string(),
                     sha256,
@@ -217,7 +226,7 @@ async fn package_versions(
         let merged = merge_file_lists(upstream_files, &local_files);
         if !merged.is_empty() {
             return if wants_json(&headers) {
-                let pep700 = collect_pep700_meta(&state, &normalized, &merged).await;
+                let pep700 = pep700_meta(&merged, &local_sizes, &dates);
                 versions_json_response(&normalized, &merged, &base_url, &pep700)
             } else {
                 versions_html_response(&normalized, &merged, &base_url)
@@ -228,7 +237,7 @@ async fn package_versions(
     // Local files only — degrade gracefully when upstreams list nothing or are down.
     if !local_files.is_empty() {
         return if wants_json(&headers) {
-            let pep700 = collect_pep700_meta(&state, &normalized, &local_files).await;
+            let pep700 = pep700_meta(&local_files, &local_sizes, &dates);
             versions_json_response(&normalized, &local_files, &base_url, &pep700)
         } else {
             versions_html_response(&normalized, &local_files, &base_url)
@@ -286,7 +295,9 @@ async fn download_file(
     // mirror" (#748/#750). Only consulted when upstream dates are trusted.
     let dates_key = format!("pypi/{}/dates.json", normalized);
     if state.config.server.trust_upstream_dates {
-        ensure_pypi_dates_cached(&state, &normalized).await;
+        // The map is re-read from storage by `extract_pypi_publish_date` below (which
+        // also handles the untrusted-dates branch); only the caching side effect matters here.
+        let _ = ensure_pypi_dates_cached(&state, &normalized).await;
     }
     let publish_date = extract_pypi_publish_date(
         &state.storage,
@@ -809,28 +820,24 @@ fn version_from_filename(filename: &str) -> Option<String> {
     None
 }
 
-/// Gather PEP 700 per-file metadata (size from storage, upload-time from the cached
-/// dates.json) keyed by filename. Async because it stats storage; the result is
-/// handed to the pure [`versions_json_response`] formatter.
-async fn collect_pep700_meta(
-    state: &AppState,
-    normalized: &str,
+/// Gather PEP 700 per-file metadata keyed by filename: `size` from the local
+/// listing (`local_sizes`, built from `list_with_meta`) and `upload-time` from the
+/// already-loaded `dates.json` map.
+///
+/// #969: this used to `stat()` every merged file — one HEAD per file on S3, issued
+/// serially, so `/simple/{name}/` cost N round-trips against a proxied index of N
+/// upstream files and uv timed out. Both inputs are now gathered by the single
+/// listing and the single dates read the handler already performs, making this pure
+/// and O(N) in memory only. Upstream-only files have no local size (a `stat()` would
+/// have 404'd on them anyway), so both fields stay `None` and are omitted.
+fn pep700_meta(
     files: &[FileEntry],
+    local_sizes: &std::collections::HashMap<String, u64>,
+    dates: &serde_json::Map<String, serde_json::Value>,
 ) -> std::collections::HashMap<String, (Option<u64>, Option<String>)> {
-    let dates: serde_json::Map<String, serde_json::Value> = state
-        .storage
-        .get(&format!("pypi/{}/dates.json", normalized))
-        .await
-        .ok()
-        .and_then(|d| serde_json::from_slice(&d).ok())
-        .unwrap_or_default();
     let mut out = std::collections::HashMap::with_capacity(files.len());
     for f in files {
-        let size = state
-            .storage
-            .stat(&format!("pypi/{}/{}", normalized, f.filename))
-            .await
-            .map(|m| m.size);
+        let size = local_sizes.get(&f.filename).copied();
         let upload_time = dates
             .get(&f.filename)
             .and_then(|v| v.as_str())
@@ -893,14 +900,25 @@ async fn extract_pypi_publish_date(
 }
 
 /// Cache a `filename → upload-time` map (`pypi/{name}/dates.json`) from the
-/// upstream PEP 691 simple JSON (PEP 700 `upload-time`). No-op if already cached
-/// or no upstream supplies a date. Best-effort: any failure leaves no dates and
-/// the quarantine clock falls back to NORA's own time. The PEP 503 HTML index
-/// NORA fetches for the file *listing* carries no dates, hence this JSON fetch.
-async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
+/// upstream PEP 691 simple JSON (PEP 700 `upload-time`) and return it. No-op if
+/// already cached or no upstream supplies a date. Best-effort: any failure leaves no
+/// dates and the quarantine clock falls back to NORA's own time. The PEP 503 HTML
+/// index NORA fetches for the file *listing* carries no dates, hence this JSON fetch.
+///
+/// #969: an upstream that answers but emits no `upload-time` (any pre-PEP-700 index —
+/// devpi, Artifactory, an older NORA) used to leave nothing cached, so every single
+/// `/simple/{name}/` JSON request re-downloaded the whole upstream JSON index. An
+/// answered-but-dateless upstream is now recorded as an empty map, which reads back
+/// identically for the quarantine clock (no entry for the file either way) and stops
+/// the refetch. A failed/open-breaker fetch still caches nothing, so a transient
+/// outage stays retryable.
+async fn ensure_pypi_dates_cached(
+    state: &AppState,
+    normalized: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let key = format!("pypi/{}/dates.json", normalized);
-    if state.storage.get(&key).await.is_ok() {
-        return;
+    if let Ok(data) = state.storage.get(&key).await {
+        return serde_json::from_slice(&data).unwrap_or_default();
     }
     // #68: never fetch an internal-namespace package's metadata upstream.
     if crate::curation::is_internal_namespace(
@@ -908,9 +926,10 @@ async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
         crate::curation::RegistryType::PyPI,
         normalized,
     ) {
-        return;
+        return serde_json::Map::new();
     }
     let mut map = serde_json::Map::new();
+    let mut upstream_answered = false;
     for up in &state.config.pypi.upstreams() {
         let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
         let Ok(text) = proxy_fetch_text(
@@ -926,6 +945,7 @@ async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
         else {
             continue;
         };
+        upstream_answered = true;
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
@@ -944,11 +964,17 @@ async fn ensure_pypi_dates_cached(state: &AppState, normalized: &str) {
             break; // first upstream that listed dated files wins
         }
     }
-    if !map.is_empty() {
-        if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(map)) {
+    // An empty map is still worth persisting once an upstream has actually answered:
+    // it marks "this index carries no upload-time" and spares every later request the
+    // full upstream JSON download (#969).
+    if !map.is_empty() || upstream_answered {
+        // Serialize from a reference — the map is returned to the caller and can hold
+        // tens of thousands of entries for a large project, so do not clone it.
+        if let Ok(bytes) = serde_json::to_vec(&map) {
             let _ = state.storage.put(&key, &bytes).await;
         }
     }
+    map
 }
 
 /// Normalize package name according to PEP 503.
@@ -2003,6 +2029,510 @@ mod integration_tests {
                 .await
                 .is_err(),
             "dates.json must not be created for internal-namespace packages"
+        );
+    }
+
+    /// #969 A/B: the simple JSON must take each file's PEP 700 `size` from the listing
+    /// (`list_with_meta`) and NEVER `stat()` per file. On S3 a `stat()` is a HEAD
+    /// round-trip, and they were issued serially over the whole merged file list, so
+    /// `/simple/{name}/` cost one HEAD per file — hundreds to tens of thousands for a
+    /// proxied index — and uv timed out. A backend that counts `stat()` proves the JSON
+    /// index now issues ZERO of them while still emitting the correct size.
+    /// Same class as #738 on the Docker index rebuild.
+    #[tokio::test]
+    async fn pypi_simple_json_uses_list_with_meta_not_per_key_stat() {
+        use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Delegates every operation to a real in-memory object store, counting
+        /// `stat()` calls. `list_with_meta` is inherited from the inner store, so the
+        /// listing still carries real sizes.
+        struct StatCounting {
+            inner: ObjectStorage,
+            stat_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for StatCounting {
+            async fn stat(&self, key: &str) -> Option<FileMeta> {
+                self.stat_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.stat(key).await
+            }
+            async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+                self.inner.put(k, d, sha256).await
+            }
+            async fn get(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+                self.inner.get(k).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                self.inner.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+                self.inner.delete(k).await
+            }
+            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+            async fn list_with_meta(
+                &self,
+                prefix: &str,
+            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+                self.inner.list_with_meta(prefix).await
+            }
+            async fn health_check(&self) -> bool {
+                self.inner.health_check().await
+            }
+            async fn total_size(&self) -> u64 {
+                self.inner.total_size().await
+            }
+            fn backend_name(&self) -> &'static str {
+                "stat-counting-test"
+            }
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &std::path::Path,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.put_from_path(k, src, sha256).await
+            }
+            async fn copy(
+                &self,
+                src: &str,
+                dst: &str,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                self.inner.copy(src, dst, sha256).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(
+                u64,
+                Option<String>,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+            )> {
+                self.inner.get_reader(k).await
+            }
+        }
+
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            Arc::new(StatCounting {
+                inner: ObjectStorage::in_memory(),
+                stat_calls: Arc::clone(&stat_calls),
+            }),
+        ));
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"data")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz.sha256", b"deadbeef")
+            .await
+            .unwrap();
+        stat_calls.store(0, Ordering::SeqCst);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/flask/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            0,
+            "#969: the simple JSON must not stat() per file — size comes from list_with_meta"
+        );
+        // Correctness preserved: the size still reaches the response.
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(
+            json["files"][0]["size"], 4,
+            "PEP 700 size must survive the stat-free path"
+        );
+    }
+
+    /// #969: an upstream that answers the PEP 691 JSON but carries no `upload-time`
+    /// (any pre-PEP-700 index) left nothing cached, so EVERY `/simple/{name}/` JSON
+    /// request re-downloaded the whole upstream JSON index. The answered-but-dateless
+    /// result is now cached once; the second request must not fetch it again.
+    #[tokio::test]
+    async fn test_pypi_dateless_upstream_json_is_fetched_once() {
+        use super::PEP691_JSON;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // PEP 691 JSON without any `upload-time` — a pre-PEP-700 upstream.
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .and(header("accept", PEP691_JSON))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":{"api-version":"1.0"},"name":"flask","files":[{"filename":"flask-2.0.tar.gz","url":"https://up/flask-2.0.tar.gz"}]}"#,
+            ))
+            .mount(&upstream)
+            .await;
+        // The PEP 503 HTML listing the index itself merges.
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><a href="https://up/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+
+        for _ in 0..2 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/flask/",
+                vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let json_fetches = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v == PEP691_JSON)
+            })
+            .count();
+        assert_eq!(
+            json_fetches, 1,
+            "#969: a dateless upstream JSON index must be fetched once, not per request"
+        );
+        // The empty map is what got cached — it reads back like "no date for this file",
+        // exactly as an absent dates.json did for the quarantine clock.
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get("pypi/flask/dates.json")
+                .await
+                .unwrap()[..],
+            b"{}",
+            "an answered-but-dateless upstream is recorded as an empty map"
+        );
+    }
+
+    /// #969: a failed upstream fetch must cache nothing, so a transient outage stays
+    /// retryable. Only an upstream that actually answered may record the empty map.
+    #[tokio::test]
+    async fn test_pypi_dates_not_cached_when_upstream_fetch_fails() {
+        use super::PEP691_JSON;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        // The JSON index is down; the HTML listing still answers.
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .and(header("accept", PEP691_JSON))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><a href="https://up/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/flask/",
+            vec![("Accept", PEP691_JSON)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "the index still serves");
+        assert!(
+            ctx.state
+                .storage
+                .get("pypi/flask/dates.json")
+                .await
+                .is_err(),
+            "#969: a failed upstream fetch must cache nothing — the outage must stay retryable"
+        );
+    }
+
+    /// A corrupt `dates.json` (hand-edited, truncated write) must not fail the index:
+    /// the PEP 700 `upload-time` is optional, so it is simply omitted while `size`
+    /// still comes from the listing.
+    #[tokio::test]
+    async fn test_pypi_simple_json_survives_corrupt_dates_json() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"data")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("pypi/flask/dates.json", b"{ this is not json")
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/flask/",
+            vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(
+            json["files"][0]["size"], 4,
+            "size survives a corrupt dates.json"
+        );
+        assert!(
+            json["files"][0].get("upload-time").is_none(),
+            "an unparsable dates.json omits upload-time instead of failing the index"
+        );
+    }
+
+    /// PEP 700 `size` is only knowable for files NORA actually stores. In a merged
+    /// index the local file carries a size and the upstream-only file does not —
+    /// the same outcome the old per-file `stat()` produced (it 404'd on those),
+    /// reached without the round-trip.
+    #[tokio::test]
+    async fn test_pypi_simple_json_size_only_for_local_files() {
+        use super::PEP691_JSON;
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body>
+                   <a href="https://up/flask-2.0.tar.gz">flask-2.0.tar.gz</a>
+                   <a href="https://up/flask-3.0.tar.gz">flask-3.0.tar.gz</a>
+                   </body></html>"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+        // Only 2.0 is cached locally.
+        ctx.state
+            .storage
+            .put("pypi/flask/flask-2.0.tar.gz", b"seven!!")
+            .await
+            .unwrap();
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/flask/",
+            vec![("Accept", PEP691_JSON)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let files = json["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 2, "both files are listed: {files:?}");
+        let by_name = |n: &str| {
+            files
+                .iter()
+                .find(|f| f["filename"] == n)
+                .unwrap_or_else(|| panic!("{n} missing from {files:?}"))
+        };
+        assert_eq!(
+            by_name("flask-2.0.tar.gz")["size"],
+            7,
+            "the locally stored file carries its real size"
+        );
+        assert!(
+            by_name("flask-3.0.tar.gz").get("size").is_none(),
+            "an upstream-only file has no local size and must omit the field"
+        );
+    }
+
+    /// #969 class invariant (the one #738 should have carried): the simple JSON must
+    /// cost the SAME number of storage round-trips whatever the size of the index it
+    /// renders. Rendering a 1-file index and a 100-file index must issue an identical
+    /// op count — anything proportional to the file list is an N+1 by construction,
+    /// and on S3 every op is a network round-trip.
+    #[tokio::test]
+    async fn pypi_simple_json_cost_is_independent_of_index_size() {
+        use super::PEP691_JSON;
+        use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Counts every backend round-trip, delegating to a real in-memory store.
+        struct OpCounting {
+            inner: ObjectStorage,
+            ops: Arc<AtomicUsize>,
+        }
+        macro_rules! count {
+            ($self:ident) => {
+                $self.ops.fetch_add(1, Ordering::SeqCst)
+            };
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for OpCounting {
+            async fn stat(&self, key: &str) -> Option<FileMeta> {
+                count!(self);
+                self.inner.stat(key).await
+            }
+            async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+                count!(self);
+                self.inner.put(k, d, sha256).await
+            }
+            async fn get(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+                count!(self);
+                self.inner.get(k).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                count!(self);
+                self.inner.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+                count!(self);
+                self.inner.delete(k).await
+            }
+            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+                count!(self);
+                self.inner.list(prefix).await
+            }
+            async fn list_with_meta(
+                &self,
+                prefix: &str,
+            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+                count!(self);
+                self.inner.list_with_meta(prefix).await
+            }
+            async fn health_check(&self) -> bool {
+                self.inner.health_check().await
+            }
+            async fn total_size(&self) -> u64 {
+                self.inner.total_size().await
+            }
+            fn backend_name(&self) -> &'static str {
+                "op-counting-test"
+            }
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &std::path::Path,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                count!(self);
+                self.inner.put_from_path(k, src, sha256).await
+            }
+            async fn copy(
+                &self,
+                src: &str,
+                dst: &str,
+                sha256: Option<&str>,
+            ) -> crate::storage::Result<()> {
+                count!(self);
+                self.inner.copy(src, dst, sha256).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> crate::storage::Result<(
+                u64,
+                Option<String>,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+            )> {
+                count!(self);
+                self.inner.get_reader(k).await
+            }
+        }
+
+        /// Serve an upstream index of `n` files and return the storage ops one JSON
+        /// index request costs.
+        async fn ops_for_index(n: usize) -> usize {
+            let links: String = (1..=n)
+                .map(|i| format!("<a href=\"https://up/pkg-{i}.0.tar.gz\">pkg-{i}.0.tar.gz</a>\n"))
+                .collect();
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/pkg/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("<html><body>{links}</body></html>")),
+                )
+                .mount(&upstream)
+                .await;
+
+            let ops = Arc::new(AtomicUsize::new(0));
+            let storage = Storage::from_backend(Arc::new(OpCounting {
+                inner: ObjectStorage::in_memory(),
+                ops: Arc::clone(&ops),
+            }));
+            let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.pypi.proxy = Some(upstream.uri());
+            });
+            ops.store(0, Ordering::SeqCst);
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/pkg/",
+                vec![("Accept", PEP691_JSON)],
+                "",
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "index of {n} files served"
+            );
+            ops.load(Ordering::SeqCst)
+        }
+
+        let small = ops_for_index(1).await;
+        let large = ops_for_index(100).await;
+        assert_eq!(
+            small, large,
+            "#969: rendering the simple JSON must cost the same storage round-trips for a \
+             1-file and a 100-file index — {small} vs {large} means the cost scales with N"
         );
     }
 }
