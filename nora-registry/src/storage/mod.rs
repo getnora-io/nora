@@ -437,7 +437,18 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(prefix)?;
         }
-        let keys = self.inner.list(prefix).await?;
+        let keys = match self.inner.list(prefix).await {
+            Ok(keys) => {
+                STORAGE_OPERATIONS.with_label_values(&["list", "ok"]).inc();
+                keys
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
         Ok(keys
             .into_iter()
             .filter(|k| !k.starts_with(".nora-"))
@@ -451,7 +462,20 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(prefix)?;
         }
-        let entries = self.inner.list_with_meta(prefix).await?;
+        let entries = match self.inner.list_with_meta(prefix).await {
+            Ok(entries) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list_with_meta", "ok"])
+                    .inc();
+                entries
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list_with_meta", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
         Ok(entries
             .into_iter()
             .filter(|(k, _)| !k.starts_with(".nora-"))
@@ -462,7 +486,14 @@ impl Storage {
         if validate_storage_key(key).is_err() {
             return None;
         }
-        self.inner.stat(key).await
+        let meta = self.inner.stat(key).await;
+        // `status` distinguishes a found object from an absent one: the backend
+        // collapses "not there" and "call failed" into `None`, so labelling a miss
+        // as `error` would poison error-rate alerting with ordinary 404s.
+        STORAGE_OPERATIONS
+            .with_label_values(&["stat", if meta.is_some() { "ok" } else { "miss" }])
+            .inc();
+        meta
     }
 
     pub async fn health_check(&self) -> bool {
@@ -483,7 +514,13 @@ impl Storage {
         if validate_storage_key(key).is_err() {
             return None;
         }
-        self.inner.pin(key).await
+        let pin = self.inner.pin(key).await;
+        // `miss` is the open-world case (no pin recorded) as well as an absent key —
+        // the backend cannot tell them apart, and neither is an error.
+        STORAGE_OPERATIONS
+            .with_label_values(&["pin", if pin.is_some() { "ok" } else { "miss" }])
+            .inc();
+        pin
     }
 
     /// Operator recovery for an artifact whose hash pin no longer matches its
@@ -848,6 +885,144 @@ mod tests {
             .with_label_values(&["get", "integrity_fail"])
             .get();
         assert!(after > before, "integrity_fail metric must increment");
+    }
+
+    /// Every backend round-trip must be counted. `stat`, `pin`, `list` and
+    /// `list_with_meta` were the only wrapper methods that reached the backend
+    /// without touching `nora_storage_operations_total`, so a handler issuing one
+    /// of them per file — the shape of #969, tens of thousands of HEADs on a single
+    /// request — produced no metric movement at all and could only be found by
+    /// reading code. A miss is labelled `miss`, not `error`: the backend collapses
+    /// "absent" and "failed" into `None`, and an ordinary 404 must not inflate an
+    /// error-rate alert.
+    #[tokio::test]
+    async fn round_trip_methods_are_counted() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let count =
+            |op: &str, status: &str| STORAGE_OPERATIONS.with_label_values(&[op, status]).get();
+
+        let key = "raw/metered/file.bin";
+        storage.put(key, b"bytes").await.unwrap();
+        await_pin(&storage, key).await;
+
+        // The counters are process-global and the suite runs in parallel, so these are
+        // "moved", not "moved by exactly one". The `error` statuses are the exception:
+        // nothing on these paths ever emits them, so they must stay put.
+        let b_stat_ok = count("stat", "ok");
+        let b_stat_miss = count("stat", "miss");
+        let b_stat_err = count("stat", "error");
+        let b_pin_ok = count("pin", "ok");
+        let b_pin_err = count("pin", "error");
+        let b_list = count("list", "ok");
+        let b_list_meta = count("list_with_meta", "ok");
+
+        assert!(storage.stat(key).await.is_some());
+        assert!(storage.stat("raw/metered/absent.bin").await.is_none());
+        assert!(storage.pin(key).await.is_some());
+        storage.list("raw/").await.unwrap();
+        storage.list_with_meta("raw/").await.unwrap();
+
+        assert!(count("stat", "ok") > b_stat_ok, "a hit counts as stat/ok");
+        assert!(
+            count("stat", "miss") > b_stat_miss,
+            "an absent key counts as stat/miss"
+        );
+        assert!(count("pin", "ok") > b_pin_ok, "pin() is a round-trip too");
+        assert!(count("list", "ok") > b_list, "list() is a round-trip");
+        assert!(
+            count("list_with_meta", "ok") > b_list_meta,
+            "list_with_meta() is a round-trip"
+        );
+        // The load-bearing half: a miss must never be an error, or every ordinary 404
+        // inflates error-rate alerting built on this metric.
+        assert_eq!(
+            count("stat", "error"),
+            b_stat_err,
+            "a stat miss must never be recorded as stat/error"
+        );
+        assert_eq!(
+            count("pin", "error"),
+            b_pin_err,
+            "an unpinned key must never be recorded as pin/error"
+        );
+    }
+
+    /// The failing half of the same contract: a listing that the backend refuses must
+    /// land on `list`/`error`, so an operator can tell "the store is answering with
+    /// nothing" from "the store is not answering".
+    #[tokio::test]
+    async fn failed_listings_are_counted_as_errors() {
+        /// Refuses both listing calls; every other method is unused by this test.
+        struct ListFails;
+
+        #[async_trait]
+        impl StorageBackend for ListFails {
+            async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Err(StorageError::Network("listing refused".into()))
+            }
+            async fn list_with_meta(&self, _prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+                Err(StorageError::Network("listing refused".into()))
+            }
+            async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn get(&self, _k: &str) -> Result<(Bytes, Option<String>)> {
+                Err(StorageError::NotFound)
+            }
+            async fn pin(&self, _k: &str) -> Option<String> {
+                None
+            }
+            async fn delete(&self, _k: &str) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn stat(&self, _k: &str) -> Option<FileMeta> {
+                None
+            }
+            async fn health_check(&self) -> bool {
+                false
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "list-fails-test"
+            }
+            async fn put_from_path(
+                &self,
+                _k: &str,
+                _src: &Path,
+                _sha256: Option<&str>,
+            ) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn copy(&self, _src: &str, _dst: &str, _sha256: Option<&str>) -> Result<()> {
+                Err(StorageError::NotFound)
+            }
+            async fn get_reader(
+                &self,
+                _k: &str,
+            ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        let storage = Storage::from_backend(Arc::new(ListFails));
+        let count =
+            |op: &str, status: &str| STORAGE_OPERATIONS.with_label_values(&[op, status]).get();
+        let before = (count("list", "error"), count("list_with_meta", "error"));
+
+        assert!(storage.list("raw/").await.is_err());
+        assert!(storage.list_with_meta("raw/").await.is_err());
+
+        assert!(
+            count("list", "error") > before.0,
+            "a refused list is an error"
+        );
+        assert!(
+            count("list_with_meta", "error") > before.1,
+            "a refused list_with_meta is an error"
+        );
     }
 
     /// The fix must not break legitimate reads: a matching hash still returns
