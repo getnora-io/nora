@@ -66,6 +66,14 @@ jobs:
         run: ./scripts/test-reland-filechanges.sh
       - name: Diff-coverage helper self-test
         run: bash scripts/test-diff-coverage.sh
+      # The self-test runs first on purpose: lock-audit is a heuristic over source text,
+      # and a broken one prints nothing — indistinguishable from a clean tree. It also
+      # runs the audit under every awk on the image, so a gawk-only construct creeping
+      # back in fails here instead of quietly disabling the check (#979).
+      - name: Lock audit self-test
+        run: bash scripts/test-lock-audit.sh
+      - name: Lock audit — publish_lock consistency
+        run: bash scripts/lock-audit.sh
 
   test:
     name: Test
