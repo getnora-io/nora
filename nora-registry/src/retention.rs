@@ -628,6 +628,24 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
         }
     }
 
+    // Hash markers live outside `pypi/`, one directory per file:
+    // `pypi-sha256/<project>/<filename>/<sha256>`. A retired file takes them with it.
+    let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
+    let marker_keys = storage.list(marker_root).await.unwrap_or_else(|e| {
+        tracing::error!("Failed to list {} keys: {}", marker_root, e);
+        Vec::new()
+    });
+    let mut markers: std::collections::HashMap<&str, Vec<String>> =
+        std::collections::HashMap::new();
+    for marker in &marker_keys {
+        if let Some((file, _)) = marker
+            .strip_prefix(marker_root)
+            .and_then(|rest| rest.rsplit_once('/'))
+        {
+            markers.entry(file).or_default().push(marker.clone());
+        }
+    }
+
     let mut result = Vec::new();
     for (pkg, file_keys) in &packages {
         let mut entries = Vec::new();
@@ -638,6 +656,9 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
             let hash_key = format!("{}.sha256", key);
             if storage.stat(&hash_key).await.is_some() {
                 keys.push(hash_key);
+            }
+            if let Some(file_markers) = markers.get(format!("{pkg}/{filename}").as_str()) {
+                keys.extend(file_markers.iter().cloned());
             }
             entries.push(VersionEntry {
                 name: filename.to_string(),
@@ -2215,6 +2236,71 @@ mod format_retention_tests {
             .collect();
         versions.sort();
         versions
+    }
+
+    /// A retired PyPI file takes its hash markers with it; a surviving file keeps its own.
+    #[tokio::test]
+    async fn test_pypi_retention_deletes_hash_markers_with_files() {
+        use sha2::Digest as _;
+
+        let ctx = crate::test_helpers::create_test_context();
+        let storage = &ctx.state.storage;
+        let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
+        let files: Vec<String> = (1..=4)
+            .map(|i| format!("markpkg-1.0.{i}-py3-none-any.whl"))
+            .collect();
+        for file in &files {
+            let content = format!("wheel {file}");
+            let sha = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+            let key = format!("pypi/markpkg/{file}");
+            storage.put(&key, content.as_bytes()).await.unwrap();
+            storage
+                .put(&format!("{key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            storage
+                .put(&format!("{marker_root}markpkg/{file}/{sha}"), b"")
+                .await
+                .unwrap();
+        }
+
+        let rules = vec![rule("pypi", None, Some(2), None)];
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "keep_last=2 of four files");
+
+        let mut kept = Vec::new();
+        for file in &files {
+            if storage
+                .stat(&format!("pypi/markpkg/{file}"))
+                .await
+                .is_some()
+            {
+                kept.push(file.as_str());
+            }
+        }
+        assert_eq!(kept.len(), 2, "two files survive");
+        let markers = storage
+            .list(&format!("{marker_root}markpkg/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            markers.len(),
+            2,
+            "one marker per surviving file: {markers:?}"
+        );
+        for file in kept {
+            assert!(
+                markers.iter().any(|m| m.contains(&format!("/{file}/"))),
+                "surviving {file} keeps its marker: {markers:?}"
+            );
+        }
     }
 
     /// #961: retention deleted the tarball and left the packument advertising
