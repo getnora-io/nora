@@ -25,12 +25,38 @@
 ### Changed
 - **Compile-time integrity witness on the streaming serve path (#849)** — the streaming artifact serve now routes through a sealed sole-sink whose only constructor takes an EOF-verifying stream, so handing a raw reader to the response body on an integrity path is a compile error — the type-level match of the buffered `verified_body` sink. A blob tampered on disk aborts the body mid-stream (the client gets a broken transfer, never the tampered bytes under a clean `200`) instead of streaming out unverified; explicit partial-content range serves take a separate open-world sink.
 - **Registry dispatch is keyed on the `RegistryType` enum (#369)** — dispatch across config, retention, metrics and the UI is now an exhaustive `match RegistryType` generated from one list, instead of scattered string comparisons. Adding a format is a single line and can no longer silently miss a call site (it becomes a compile error). No behavioral change.
+- **Blocklist rules with a literal name are looked up by name (#953)** — `BlocklistFilter::evaluate` ran three glob matches per rule on every artifact download, which is free for a hand-written file of a few dozen rules and not free once the file is generated. A rule whose `name` is a literal now sits in a hash map and a rule whose name is a pattern stays in a scan; the winner is still the first matching rule in file order, so the `reason` a client reads in the 403 does not change.
 
 ### Security
 - **The repository signing key is never enumerated by storage `list()` (#891)** — the OpenPGP signing key at `<storage.path>/.signing/nora.key` (persisted owner-only, `0600`) was swept into every enumeration-based operation because `list()`/`list_with_meta()` excluded only the pin sidecar: `backup` wrote it into the tar at `0644`, `migrate --to s3` copied it into the bucket as a plaintext object, and GC/retention and the browse UI treated it as an artifact. Both backends now exclude the `.signing/` prefix from enumeration, so the key can neither be exfiltrated (tar / object) nor deleted; it is loaded via direct filesystem I/O and never through `list()`, so there is no runtime impact. Provision the key out-of-band.
 
 ### Fixed
 - **npm rebuilds a missing packument instead of answering 404** — a hosted package whose derived `metadata.json` was absent returned `404` while every published version was still sitting in storage. The reassembly already existed (`regenerate_packument`, which lists `versions/`, `dist-tags/` and `pkg.json`) but only the publish path reached it, so a read fell through to the upstream proxy and 404'd for a package that exists only in this registry. The read path now rebuilds when `versions/` is non-empty, serves the result and re-materializes the packument so the cost is paid once — under the same `publish_lock` as publish, so a fleet stampeding one package rebuilds it once rather than once per request, and before the namespace guard, because serving locally-owned bytes is always allowed while that guard exists to stop the upstream fetch. A name with nothing behind it still returns 404. New `nora_packument_rebuilt_total{registry}`: a non-zero rate means storage was written or restored outside NORA (#956).
+- **Docker GC keeps the digest alias of a tagged manifest (#949)** — since tag-rooted GC shipped in 1.2.2, a GC run deleted `manifests/sha256:<digest>.json` while `manifests/<tag>.json` with the same bytes survived, so pulling a tagged image by digest returned 404 afterwards. The mark phase now roots each tag manifest's digest alias, and an orphaned digest manifest takes its `.meta.json` sidecar with it instead of leaking it forever.
+- **Retention rebuilds the npm packument after deleting versions (#961)** — npm retention deleted a version's tarball and `.sha256` sidecar and nothing else, so the per-version document and the packument entry survived and the registry kept advertising versions it could no longer deliver. The version's key set now includes `npm/<pkg>/versions/<v>.json`, and the packument is regenerated afterwards under the same publish lock, the way retention already rebuilds RPM and Debian indexes.
+
+## [1.2.2] - 2026-08-30
+
+### Added
+- **Size-based eviction for proxy-cached RPM and Debian files (#866)** — `[gc] proxy_cache_max_bytes` (`NORA_GC_PROXY_CACHE_MAX_BYTES`, default `0` = off) makes GC evict the oldest proxy-cached files by mtime until the cache is within the budget. Hosted packages and repository index files (`repodata/`, `Packages`, `Release`) are never evicted. New metrics `nora_gc_proxy_cache_evicted_total` and `nora_gc_proxy_cache_bytes_freed_total`; `nora gc` prints an eviction summary.
+
+### Changed
+- **Docker GC is rooted at tags (#655)** — GC built the referenced-blob set from every stored manifest, so a re-pushed tag left its previous digest manifest behind, and that manifest kept its layers referenced forever. The set is now built from tag manifests only, so digest manifests that no tag reaches, and the layers only they hold, are reclaimed.
+- **Maven proxy metadata is not rewritten when nothing changed (#888)** — under a low or zero `metadata_ttl`, every metadata request wrote the merged `maven-metadata.xml` and its four checksums back to storage even when the merged document was byte-identical to the cached one. Those five writes are now skipped when nothing changed.
+
+### Security
+- **Anonymous dashboard callers no longer see proxy upstreams (#934)** — with `anonymous_read = true` the dashboard API listed every mount point's upstream registries to unauthenticated callers, disclosing the proxy topology. Unauthenticated responses now carry an empty `proxy_upstreams`, and credentials sent to a publicly browsable page are validated so authenticated users still see them.
+
+### Fixed
+- **Docker retention counts only tags toward `keep_last` (#932)** — every push stores a manifest under both its tag and its digest, and retention counted both, so `keep_last = 3` on four tags kept two. Digest references are now skipped by retention and filtered out of the tag list API.
+- **PyPI follows relative links in upstream mirror indexes (#877)** — mirrors that return relative `href`s in the simple index (for example `../../packages/torch-2.4.0.whl`) failed because the raw relative path was rejected as an invalid URL. Links are now resolved against the index page URL.
+
+## [1.2.1] - 2026-08-29
+
+### Fixed
+- **Retention `exclude_tags` no longer uses up the `keep_last` budget (#926)** — excluded versions took positions in the sorted version list without being counted as kept, so when they sat at the top, versions below them were pushed past the `keep_last` threshold and deleted. Only non-excluded versions now count toward `keep_last`.
+- **GC no longer prunes npm metadata in proxy mode (#925)** — tarballs of a proxied package are cached on demand, so a missing local tarball is expected, but GC treated it as an orphan and removed the version from the cached metadata. The npm phantom cleanup is skipped when npm runs as a proxy.
+- **npm revalidation no longer loops on a missing cached body (#867)** — a `304 Not Modified` whose cached body was gone returned nothing but left the `.meta` validators in place, so every TTL cycle sent the same validators, got another 304 and never recovered. The stale validators are now deleted so the next request fetches the document again.
 
 ## [1.2.0] - 2026-08-23
 

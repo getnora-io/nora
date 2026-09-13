@@ -74,7 +74,10 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
 
 Every HTTP request follows this path top-to-bottom. The registry handler is
 selected by URL prefix (`/v2/` = Docker, `/maven2/` = Maven, etc.). Curation
-runs only on proxy downloads — hosted artifacts are trusted at publish time.
+is evaluated on the download path: in most formats the check runs before the
+handler chooses between the stored copy and the upstream, so its rules apply
+to locally published artifacts too. Packages in internal namespaces are
+operator-owned — they skip curation and are never fetched from upstream.
 
 ### Trust Boundaries
 
@@ -267,10 +270,12 @@ that can diverge from the actual files on disk.
 - Token storage uses `tokens.json` — same pattern as htpasswd
 - Docker Distribution serves Docker Hub at scale with pure filesystem storage
 
-### ADR-3: Two Storage Backends (Local + S3)
+### ADR-3: Two Storage Backends (Local + Object Storage)
 
 **Decision:** NORA supports exactly two storage backends: local filesystem
-and S3-compatible object storage. No third backend will be added.
+and object storage. Object storage covers S3-compatible stores and, since
+v1.0.1, Google Cloud Storage natively; both run through one `ObjectStorage`
+implementation over the `object_store` crate. No third backend will be added.
 
 **Context:** The option of using Nexus/Artifactory/GitLab as
 storage backends was considered, effectively making NORA a caching proxy
@@ -278,10 +283,13 @@ in front of other registries.
 
 **Rationale:** Each storage backend is a maintenance surface. S3 covers
 every cloud provider and on-prem S3-compatible stores. Local covers single-node and
-development. A third backend (e.g., GCS-native, Azure Blob) adds testing
-burden without meaningful capability gain — both are S3-compatible. For
-migrating away from other registries, the `nora migrate` CLI copies
-artifacts directly rather than proxying through the old system.
+development. A third storage engine adds testing burden without meaningful
+capability gain. Native GCS is not a third engine: it shares the object-storage
+code path and adds only a constructor and credential handling, so GCS no longer
+has to go through its S3-interoperability layer with static HMAC keys. For
+migrating away from other registries, `nora import` copies artifacts from
+Artifactory and Nexus directly rather than proxying through the old system;
+`nora migrate` moves artifacts between NORA's own storage backends.
 
 ### ADR-4: Explicit Handlers over Plugin Traits
 
