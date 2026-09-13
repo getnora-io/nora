@@ -1082,3 +1082,57 @@ mod integration_tests {
         assert!(resp.headers().get("accept-ranges").is_none());
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod index_cost_tests {
+    //! Serving a cached @v/list must cost the same storage round-trips for 1 and 100 versions.
+    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn version_list_ops(n: usize) -> (usize, String) {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let mut list = String::new();
+        for i in 0..n {
+            let version = format!("v1.0.{i}");
+            let base = format!("go/example.com/costmod/@v/{version}");
+            let info = format!("{{\"Version\":\"{version}\",\"Time\":\"2026-01-01T00:00:00Z\"}}");
+            ctx.state
+                .storage
+                .put(&format!("{base}.info"), info.as_bytes())
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(&format!("{base}.mod"), b"module example.com/costmod\n")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(&format!("{base}.zip"), b"ZIP")
+                .await
+                .unwrap();
+            list.push_str(&format!("{version}\n"));
+        }
+        ctx.state
+            .storage
+            .put("go/example.com/costmod/@v/list", list.as_bytes())
+            .await
+            .unwrap();
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/go/example.com/costmod/@v/list", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "@v/list with {n} versions");
+        (ops.total(), format!("{:?}", ops.snapshot()))
+    }
+
+    #[tokio::test]
+    async fn go_version_list_cost_is_independent_of_version_count() {
+        let (small, small_ops) = version_list_ops(1).await;
+        let (large, large_ops) = version_list_ops(100).await;
+        assert_eq!(
+            small, large,
+            "a cached @v/list must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
+        );
+    }
+}

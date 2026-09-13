@@ -2168,3 +2168,48 @@ mod integration_tests {
         assert_eq!(&body_bytes(resp).await[..], krate);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod index_cost_tests {
+    //! Serving a sparse index file must cost the same storage round-trips for 1 and 100 versions.
+    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn sparse_index_ops(n: usize) -> (usize, String) {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let mut lines = String::new();
+        for i in 0..n {
+            let version = format!("1.0.{i}");
+            let crate_key = format!("cargo/costcrate/{version}/costcrate-{version}.crate");
+            ctx.state.storage.put(&crate_key, b"CRATE").await.unwrap();
+            lines.push_str(&format!(
+                "{{\"name\":\"costcrate\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"abc\",\"features\":{{}},\"yanked\":false}}\n"
+            ));
+        }
+        ctx.state
+            .storage
+            .put("cargo/index/co/st/costcrate", lines.as_bytes())
+            .await
+            .unwrap();
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/co/st/costcrate", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "sparse index with {n} versions"
+        );
+        (ops.total(), format!("{:?}", ops.snapshot()))
+    }
+
+    #[tokio::test]
+    async fn cargo_sparse_index_cost_is_independent_of_version_count() {
+        let (small, small_ops) = sparse_index_ops(1).await;
+        let (large, large_ops) = sparse_index_ops(100).await;
+        assert_eq!(
+            small, large,
+            "a hosted sparse index file must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
+        );
+    }
+}

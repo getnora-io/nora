@@ -17,6 +17,7 @@ use axum::{
 use http_body_util::BodyExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -479,4 +480,189 @@ pub async fn body_bytes(response: axum::http::Response<Body>) -> axum::body::Byt
         .await
         .expect("failed to read body")
         .to_bytes()
+}
+
+// ── Storage round-trip counting ─────────────────────────────────────────────
+
+/// Backend methods an [`OpCountingBackend`] counts, in reporting order.
+const COUNTED_METHODS: [&str; 11] = [
+    "put",
+    "get",
+    "pin",
+    "delete",
+    "list",
+    "stat",
+    "list_with_meta",
+    "put_from_path",
+    "copy",
+    "get_reader",
+    "get_range",
+];
+
+/// Per-method count of backend round-trips observed by an [`OpCountingBackend`].
+///
+/// The counters are atomics: backend methods run in async code, where a blocking
+/// lock does not belong.
+#[derive(Default)]
+pub struct OpCounts {
+    counts: [AtomicUsize; COUNTED_METHODS.len()],
+}
+
+impl OpCounts {
+    fn hit(&self, method: &'static str) {
+        let slot = COUNTED_METHODS
+            .iter()
+            .position(|counted| *counted == method)
+            .expect("every counted backend method is listed in COUNTED_METHODS");
+        self.counts[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Forget everything counted so far. Call it after seeding, right before the
+    /// request under test.
+    pub fn reset(&self) {
+        for count in &self.counts {
+            count.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Round-trips counted since the last [`reset`](Self::reset).
+    pub fn total(&self) -> usize {
+        self.counts
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Per-method counts since the last reset, leaving out methods that were not
+    /// called, for assertion messages.
+    pub fn snapshot(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        COUNTED_METHODS
+            .iter()
+            .zip(&self.counts)
+            .map(|(method, count)| (*method, count.load(Ordering::Relaxed)))
+            .filter(|(_, calls)| *calls > 0)
+            .collect()
+    }
+}
+
+/// Storage backend that counts every round-trip and delegates to an in-memory
+/// object store.
+///
+/// Each counted call is one request on S3/GCS, so the count is what a handler
+/// costs against a real object store. `list_with_meta` and `get_range` forward to
+/// the object store's own implementations (one LIST, one ranged GET) rather than
+/// the trait defaults, so the counts match production.
+pub struct OpCountingBackend {
+    inner: crate::storage::ObjectStorage,
+    counts: Arc<OpCounts>,
+}
+
+/// An in-memory object-store [`Storage`] whose backend round-trips are counted.
+///
+/// Used by the index-cost tests: an index or metadata response must cost the same
+/// number of round-trips whether it lists 1 item or 100.
+pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
+    let counts = Arc::new(OpCounts::default());
+    let backend = OpCountingBackend {
+        inner: crate::storage::ObjectStorage::in_memory(),
+        counts: Arc::clone(&counts),
+    };
+    (Storage::from_backend(Arc::new(backend)), counts)
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for OpCountingBackend {
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+        self.counts.hit("put");
+        self.inner.put(key, data, sha256).await
+    }
+
+    async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        self.counts.hit("get");
+        self.inner.get(key).await
+    }
+
+    async fn pin(&self, key: &str) -> Option<String> {
+        self.counts.hit("pin");
+        self.inner.pin(key).await
+    }
+
+    async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+        self.counts.hit("delete");
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+        self.counts.hit("list");
+        self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+        self.counts.hit("stat");
+        self.inner.stat(key).await
+    }
+
+    async fn list_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
+        self.counts.hit("list_with_meta");
+        self.inner.list_with_meta(prefix).await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
+
+    async fn total_size(&self) -> u64 {
+        self.inner.total_size().await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    async fn refresh_total_size(&self) {
+        self.inner.refresh_total_size().await
+    }
+
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        self.counts.hit("put_from_path");
+        self.inner.put_from_path(key, src, sha256).await
+    }
+
+    async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+        self.counts.hit("copy");
+        self.inner.copy(src, dst, sha256).await
+    }
+
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.counts.hit("get_reader");
+        self.inner.get_reader(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> crate::storage::Result<(
+        u64,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.counts.hit("get_range");
+        self.inner.get_range(key, start, end).await
+    }
 }

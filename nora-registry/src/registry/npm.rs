@@ -4083,3 +4083,57 @@ mod spec_conformance_tests {
         assert!(json["versions"]["1.0.0"].get("scripts").is_none());
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod index_cost_tests {
+    //! Serving a stored packument must cost the same storage round-trips for 1 and 100 versions.
+    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn packument_ops(n: usize) -> (usize, String) {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let mut versions = serde_json::Map::new();
+        for i in 0..n {
+            let version = format!("1.0.{i}");
+            let tarball = format!("costpkg-{version}.tgz");
+            let tarball_key = format!("npm/costpkg/tarballs/{tarball}");
+            ctx.state.storage.put(&tarball_key, b"TGZ").await.unwrap();
+            let doc = serde_json::json!({
+                "name": "costpkg",
+                "version": version,
+                "dist": { "tarball": format!("http://localhost/npm/costpkg/-/{tarball}") }
+            });
+            let doc_key = format!("npm/costpkg/versions/{version}.json");
+            let doc_bytes = serde_json::to_vec(&doc).unwrap();
+            ctx.state.storage.put(&doc_key, &doc_bytes).await.unwrap();
+            versions.insert(version, doc);
+        }
+        let packument = serde_json::json!({
+            "name": "costpkg",
+            "dist-tags": { "latest": format!("1.0.{}", n - 1) },
+            "versions": versions
+        });
+        let packument_bytes = serde_json::to_vec(&packument).unwrap();
+        ctx.state
+            .storage
+            .put("npm/costpkg/metadata.json", &packument_bytes)
+            .await
+            .unwrap();
+        ops.reset();
+        let resp = send(&ctx.app, Method::GET, "/npm/costpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument with {n} versions");
+        (ops.total(), format!("{:?}", ops.snapshot()))
+    }
+
+    #[tokio::test]
+    async fn npm_packument_cost_is_independent_of_version_count() {
+        let (small, small_ops) = packument_ops(1).await;
+        let (large, large_ops) = packument_ops(100).await;
+        assert_eq!(
+            small, large,
+            "a stored packument must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
+        );
+    }
+}

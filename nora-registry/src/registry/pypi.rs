@@ -2392,99 +2392,11 @@ mod integration_tests {
     #[tokio::test]
     async fn pypi_simple_json_cost_is_independent_of_index_size() {
         use super::PEP691_JSON;
-        use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
-        use crate::test_helpers::create_test_context_with_storage_and_config;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage,
+        };
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        /// Counts every backend round-trip, delegating to a real in-memory store.
-        struct OpCounting {
-            inner: ObjectStorage,
-            ops: Arc<AtomicUsize>,
-        }
-        macro_rules! count {
-            ($self:ident) => {
-                $self.ops.fetch_add(1, Ordering::SeqCst)
-            };
-        }
-
-        #[async_trait::async_trait]
-        impl StorageBackend for OpCounting {
-            async fn stat(&self, key: &str) -> Option<FileMeta> {
-                count!(self);
-                self.inner.stat(key).await
-            }
-            async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
-                count!(self);
-                self.inner.put(k, d, sha256).await
-            }
-            async fn get(
-                &self,
-                k: &str,
-            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
-                count!(self);
-                self.inner.get(k).await
-            }
-            async fn pin(&self, k: &str) -> Option<String> {
-                count!(self);
-                self.inner.pin(k).await
-            }
-            async fn delete(&self, k: &str) -> crate::storage::Result<()> {
-                count!(self);
-                self.inner.delete(k).await
-            }
-            async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
-                count!(self);
-                self.inner.list(prefix).await
-            }
-            async fn list_with_meta(
-                &self,
-                prefix: &str,
-            ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
-                count!(self);
-                self.inner.list_with_meta(prefix).await
-            }
-            async fn health_check(&self) -> bool {
-                self.inner.health_check().await
-            }
-            async fn total_size(&self) -> u64 {
-                self.inner.total_size().await
-            }
-            fn backend_name(&self) -> &'static str {
-                "op-counting-test"
-            }
-            async fn put_from_path(
-                &self,
-                k: &str,
-                src: &std::path::Path,
-                sha256: Option<&str>,
-            ) -> crate::storage::Result<()> {
-                count!(self);
-                self.inner.put_from_path(k, src, sha256).await
-            }
-            async fn copy(
-                &self,
-                src: &str,
-                dst: &str,
-                sha256: Option<&str>,
-            ) -> crate::storage::Result<()> {
-                count!(self);
-                self.inner.copy(src, dst, sha256).await
-            }
-            async fn get_reader(
-                &self,
-                k: &str,
-            ) -> crate::storage::Result<(
-                u64,
-                Option<String>,
-                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
-            )> {
-                count!(self);
-                self.inner.get_reader(k).await
-            }
-        }
 
         /// Serve an upstream index of `n` files and return the storage ops one JSON
         /// index request costs.
@@ -2502,15 +2414,11 @@ mod integration_tests {
                 .mount(&upstream)
                 .await;
 
-            let ops = Arc::new(AtomicUsize::new(0));
-            let storage = Storage::from_backend(Arc::new(OpCounting {
-                inner: ObjectStorage::in_memory(),
-                ops: Arc::clone(&ops),
-            }));
+            let (storage, ops) = op_counting_storage();
             let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
                 cfg.pypi.proxy = Some(upstream.uri());
             });
-            ops.store(0, Ordering::SeqCst);
+            ops.reset();
             let response = send_with_headers(
                 &ctx.app,
                 Method::GET,
@@ -2524,7 +2432,7 @@ mod integration_tests {
                 StatusCode::OK,
                 "index of {n} files served"
             );
-            ops.load(Ordering::SeqCst)
+            ops.total()
         }
 
         let small = ops_for_index(1).await;
