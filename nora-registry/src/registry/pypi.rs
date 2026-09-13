@@ -153,6 +153,27 @@ async fn package_versions(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    // Digests come from the hash markers: one listing covers every file, where a sidecar
+    // read per file is a request per file on an object store. A file without exactly one
+    // marker (stored before markers existed, or left with a stale one) is served from its
+    // sidecar and queued for backfill. If the listing fails, the sidecars still serve every
+    // digest, and nothing is queued against a storage that is failing.
+    let marker_prefix = format!("{HASH_MARKER_PREFIX}{normalized}/");
+    let (marker_keys, markers_listed) = match state.storage.list(&marker_prefix).await {
+        Ok(marker_keys) => (marker_keys, true),
+        Err(e) => {
+            tracing::warn!(error = ?e, "pypi: failed to list hash markers, reading sidecars");
+            (Vec::new(), false)
+        }
+    };
+    let mut markers: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (filename, sha256) in marker_keys
+        .iter()
+        .filter_map(|key| parse_hash_marker(&marker_prefix, key))
+    {
+        markers.entry(filename).or_default().push(sha256);
+    }
+    let mut backfill: Vec<String> = Vec::new();
     let mut local_files: Vec<FileEntry> = Vec::new();
     let mut local_sizes: std::collections::HashMap<String, u64> =
         std::collections::HashMap::with_capacity(keys.len());
@@ -162,12 +183,20 @@ async fn package_versions(
                 && !ends_with_ci(filename, ".sha256")
                 && is_valid_pypi_filename(filename)
             {
-                let sha256 = state
-                    .storage
-                    .get(&format!("{}.sha256", key))
-                    .await
-                    .ok()
-                    .and_then(|d| String::from_utf8(d.to_vec()).ok());
+                let sha256 = match markers.get(filename).map(Vec::as_slice) {
+                    Some([sha256]) => Some((*sha256).to_string()),
+                    _ => {
+                        if markers_listed {
+                            backfill.push(filename.to_string());
+                        }
+                        state
+                            .storage
+                            .get(&format!("{}.sha256", key))
+                            .await
+                            .ok()
+                            .and_then(|d| String::from_utf8(d.to_vec()).ok())
+                    }
+                };
                 local_sizes.insert(filename.to_string(), meta.size);
                 local_files.push(FileEntry {
                     filename: filename.to_string(),
@@ -175,6 +204,24 @@ async fn package_versions(
                 });
             }
         }
+    }
+
+    if !backfill.is_empty() {
+        use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+        let storage = state.storage.clone();
+        let publish_locks = state.publish_locks.clone();
+        let project = normalized.clone();
+        let task = async move {
+            for filename in backfill {
+                backfill_hash_marker(&storage, &publish_locks, &project, &filename).await;
+            }
+        };
+        tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
+            if let Err(panic) = done {
+                tracing::error!(panic = ?panic, "pypi: hash marker backfill panicked");
+            }
+        }));
     }
 
     // When proxy is configured, fetch upstream index and merge with local files.
@@ -506,6 +553,8 @@ async fn download_file(
                 let storage = state.storage.clone();
                 let key_clone = key.clone();
                 let data_clone = data.clone();
+                let project = normalized.clone();
+                let file_name = filename.clone();
                 let repo_index = Arc::clone(&state.repo_index);
                 tokio::spawn(async move {
                     if storage.put(&key_clone, &data_clone).await.is_ok() {
@@ -513,6 +562,7 @@ async fn download_file(
                         let _ = storage
                             .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                             .await;
+                        put_hash_marker(&storage, &project, &file_name, &hash).await;
                         repo_index.invalidate("pypi");
                     }
                 });
@@ -679,6 +729,9 @@ async fn upload(
     if let Err(e) = state.storage.put(&hash_key, computed_hash.as_bytes()).await {
         tracing::warn!(key = %hash_key, error = %e, "pypi: failed to store hash sidecar");
     }
+
+    // Hash marker: the simple index reads every digest from one listing.
+    put_hash_marker(&state.storage, &normalized, &filename, &computed_hash).await;
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -999,6 +1052,88 @@ fn pypi_content_type(filename: &str) -> &'static str {
         "application/gzip"
     } else {
         "application/octet-stream"
+    }
+}
+
+/// Storage prefix of the per-file SHA-256 markers: `pypi-sha256/<project>/<filename>/<sha256>`.
+///
+/// A marker is an empty object whose key carries the digest of one stored distribution
+/// file, so one listing of `pypi-sha256/<project>/` yields every digest the simple index
+/// needs instead of one sidecar read per file (a request per file on an object store).
+/// Markers live outside `pypi/`, so listings of `pypi/` never take one for a distribution
+/// file. The `.sha256` sidecar stays authoritative: a file without exactly one marker is
+/// served from its sidecar.
+pub(crate) const HASH_MARKER_PREFIX: &str = "pypi-sha256/";
+
+/// Key of the marker recording `sha256` for `filename` of `project`.
+fn hash_marker_key(project: &str, filename: &str, sha256: &str) -> String {
+    format!("{HASH_MARKER_PREFIX}{project}/{filename}/{sha256}")
+}
+
+/// `(filename, sha256)` of a marker key under `project_prefix` (`pypi-sha256/<project>/`),
+/// or `None` for a key that is not a well-formed marker.
+fn parse_hash_marker<'a>(project_prefix: &str, key: &'a str) -> Option<(&'a str, &'a str)> {
+    let (filename, sha256) = key.strip_prefix(project_prefix)?.split_once('/')?;
+    (!filename.is_empty() && is_sha256_hex(sha256)).then_some((filename, sha256))
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Record `sha256` as the one hash marker of `filename`: delete markers left for it with
+/// another digest (the file was deleted and stored again with other bytes), then write its
+/// own. A failed step is logged; the index serves a file with no marker, or with more than
+/// one, from its sidecar.
+async fn put_hash_marker(
+    storage: &crate::storage::Storage,
+    project: &str,
+    filename: &str,
+    sha256: &str,
+) {
+    let marker = hash_marker_key(project, filename, sha256);
+    let file_prefix = format!("{HASH_MARKER_PREFIX}{project}/{filename}/");
+    match storage.list(&file_prefix).await {
+        Ok(existing) => {
+            for stale in existing.iter().filter(|key| **key != marker) {
+                if let Err(e) = storage.delete(stale).await {
+                    tracing::warn!(key = %stale, error = %e, "pypi: failed to delete stale hash marker");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(prefix = %file_prefix, error = %e, "pypi: failed to list hash markers");
+        }
+    }
+    if let Err(e) = storage.put(&marker, b"").await {
+        tracing::warn!(key = %marker, error = %e, "pypi: failed to store hash marker");
+    }
+}
+
+/// Write the hash marker of a stored file from its `.sha256` sidecar.
+///
+/// The sidecar is read under the file's publish lock, which upload and retention take to
+/// store or delete the file, so the digest cannot belong to an earlier file of the same
+/// name that was deleted and uploaded again after the index request that queued it.
+async fn backfill_hash_marker(
+    storage: &crate::storage::Storage,
+    publish_locks: &crate::PublishLocks,
+    project: &str,
+    filename: &str,
+) {
+    let file_key = format!("pypi/{project}/{filename}");
+    let lock = crate::acquire_publish_lock(publish_locks, &file_key);
+    let _guard = lock.lock().await;
+    if storage.stat(&file_key).await.is_none() {
+        return;
+    }
+    let Ok(data) = storage.get(&format!("{file_key}.sha256")).await else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&data);
+    let sha256 = text.trim();
+    if is_sha256_hex(sha256) {
+        put_hash_marker(storage, project, filename, sha256).await;
     }
 }
 
@@ -2693,5 +2828,376 @@ mod spec_conformance_tests {
 
         // Snapshot the structure
         insta::assert_json_snapshot!("pypi_pep691_response_structure", json);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod local_index_cost_tests {
+    //! The simple index over locally stored files must cost the same storage round-trips
+    //! for 1 and 100 files, in both the HTML and the JSON form.
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage, op_counting_storage, send_with_headers,
+        TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+
+    pub(super) const BOUNDARY: &str = "nora-test-boundary";
+    const JSON: &str = "application/vnd.pypi.simple.v1+json";
+    const HTML: &str = "text/html";
+
+    pub(super) fn upload_body(
+        name: &str,
+        version: &str,
+        filename: &str,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (field, value) in [
+            (":action", "file_upload"),
+            ("name", name),
+            ("version", version),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    async fn upload(ctx: &TestContext, version: &str) {
+        let filename = format!("costpkg-{version}-py3-none-any.whl");
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let body = upload_body(
+            "costpkg",
+            version,
+            &filename,
+            format!("wheel {version}").as_bytes(),
+        );
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "upload {filename}");
+    }
+
+    async fn index_ops(n: usize, accept: &str) -> (usize, String) {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        for i in 0..n {
+            upload(&ctx, &format!("1.0.{i}")).await;
+        }
+        ops.reset();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/costpkg/",
+            vec![("Accept", accept)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "index of {n} local files ({accept})"
+        );
+        let counted = (ops.total(), format!("{:?}", ops.snapshot()));
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            body.matches("sha256").count() >= n,
+            "every one of the {n} local files must carry its sha256 ({accept})"
+        );
+        counted
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_json_cost_is_independent_of_local_file_count() {
+        let (small, small_ops) = index_ops(1, JSON).await;
+        let (large, large_ops) = index_ops(100, JSON).await;
+        assert_eq!(
+            small, large,
+            "the JSON simple index must cost the same storage round-trips for 1 and 100 local files: {small_ops} vs {large_ops}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_html_cost_is_independent_of_local_file_count() {
+        let (small, small_ops) = index_ops(1, HTML).await;
+        let (large, large_ops) = index_ops(100, HTML).await;
+        assert_eq!(
+            small, large,
+            "the HTML simple index must cost the same storage round-trips for 1 and 100 local files: {small_ops} vs {large_ops}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hash_marker_tests {
+    //! The index trusts a file's hash marker only when it has exactly one; every other case
+    //! is served from the `.sha256` sidecar and repaired in the background.
+    use super::local_index_cost_tests::{upload_body, BOUNDARY};
+    use super::{hash_marker_key, parse_hash_marker, HASH_MARKER_PREFIX};
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_storage,
+        create_test_context_with_storage_and_config, op_counting_storage, send, send_with_headers,
+        TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest as _;
+
+    fn digest(content: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(content))
+    }
+
+    async fn html_index(ctx: &TestContext, project: &str) -> String {
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/{project}/"),
+            vec![("Accept", "text/html")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "index of {project}");
+        String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+    }
+
+    /// Wait for the markers under `pypi-sha256/<project>/` to become exactly `expected`.
+    ///
+    /// Markers written by a background task appear some time after the response; the
+    /// deadline only bounds a task that never finishes.
+    async fn wait_for_markers(ctx: &TestContext, project: &str, expected: &[String]) {
+        use std::time::{Duration, Instant};
+
+        let prefix = format!("{HASH_MARKER_PREFIX}{project}/");
+        let mut expected = expected.to_vec();
+        expected.sort();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut markers = ctx.state.storage.list(&prefix).await.unwrap();
+            markers.sort();
+            if markers == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "markers under {prefix}: expected {expected:?}, found {markers:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn parse_hash_marker_reads_filename_and_digest() {
+        let sha = "ab".repeat(32);
+        let prefix = format!("{HASH_MARKER_PREFIX}pkg/");
+        let filename = "pkg-1.0+local@x-py3-none-any.whl";
+        let key = hash_marker_key("pkg", filename, &sha);
+        assert_eq!(
+            parse_hash_marker(&prefix, &key),
+            Some((filename, sha.as_str()))
+        );
+        for (malformed, why) in [
+            (format!("{prefix}pkg-1.0.tar.gz/abc"), "short digest"),
+            (format!("{prefix}pkg-1.0.tar.gz"), "no digest"),
+            (format!("{prefix}/{sha}"), "no filename"),
+            (format!("{prefix}a/b/{sha}"), "nested path"),
+        ] {
+            assert_eq!(parse_hash_marker(&prefix, &malformed), None, "{why}");
+        }
+        assert_eq!(
+            parse_hash_marker(&format!("{HASH_MARKER_PREFIX}other/"), &key),
+            None,
+            "marker of another project"
+        );
+    }
+
+    /// Files stored before markers existed are served from their sidecars, backfilled, and
+    /// then cost no sidecar read.
+    #[tokio::test]
+    async fn legacy_sidecar_digests_are_served_then_backfilled() {
+        let (storage, ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let mut digests = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..3 {
+            let filename = format!("legacypkg-1.0.{i}-py3-none-any.whl");
+            let content = format!("legacy wheel {i}");
+            let sha = digest(content.as_bytes());
+            let key = format!("pypi/legacypkg/{filename}");
+            ctx.state
+                .storage
+                .put(&key, content.as_bytes())
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(&format!("{key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            expected.push(hash_marker_key("legacypkg", &filename, &sha));
+            digests.push(sha);
+        }
+
+        let body = html_index(&ctx, "legacypkg").await;
+        for sha in &digests {
+            assert!(
+                body.contains(sha.as_str()),
+                "sidecar digest {sha} served: {body}"
+            );
+        }
+        wait_for_markers(&ctx, "legacypkg", &expected).await;
+
+        ops.reset();
+        let body = html_index(&ctx, "legacypkg").await;
+        for sha in &digests {
+            assert!(
+                body.contains(sha.as_str()),
+                "marker digest {sha} served: {body}"
+            );
+        }
+        assert!(
+            !ops.snapshot().contains_key("get"),
+            "no sidecar is read once markers exist: {:?}",
+            ops.snapshot()
+        );
+    }
+
+    /// A file left with a stale marker next to its own is served from its sidecar, and the
+    /// stale marker is removed.
+    #[tokio::test]
+    async fn conflicting_markers_fall_back_to_the_sidecar_and_are_repaired() {
+        // In-memory object store: the repair runs in the background, and a local disk
+        // would add fsync latency to what the test waits for.
+        let (backend, _ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage(backend);
+        let filename = "dup-1.0-py3-none-any.whl";
+        let key = format!("pypi/dup/{filename}");
+        let current = digest(b"current bytes");
+        let stale = digest(b"earlier bytes");
+        let storage = &ctx.state.storage;
+        storage.put(&key, b"current bytes").await.unwrap();
+        storage
+            .put(&format!("{key}.sha256"), current.as_bytes())
+            .await
+            .unwrap();
+        for sha in [&current, &stale] {
+            storage
+                .put(&hash_marker_key("dup", filename, sha), b"")
+                .await
+                .unwrap();
+        }
+
+        let body = html_index(&ctx, "dup").await;
+        assert!(
+            body.contains(current.as_str()),
+            "current digest served: {body}"
+        );
+        assert!(
+            !body.contains(stale.as_str()),
+            "stale digest not served: {body}"
+        );
+        wait_for_markers(&ctx, "dup", &[hash_marker_key("dup", filename, &current)]).await;
+    }
+
+    /// Uploading a filename that was deleted and is stored again with other bytes replaces
+    /// the marker left by the earlier file.
+    #[tokio::test]
+    async fn upload_replaces_a_stale_marker_of_the_same_filename() {
+        let ctx = create_test_context();
+        let filename = "reup-1.0-py3-none-any.whl";
+        let stale = digest(b"earlier bytes");
+        ctx.state
+            .storage
+            .put(&hash_marker_key("reup", filename, &stale), b"")
+            .await
+            .unwrap();
+
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            upload_body("reup", "1.0", filename, b"current bytes"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let current = digest(b"current bytes");
+        let markers = ctx
+            .state
+            .storage
+            .list(&format!("{HASH_MARKER_PREFIX}reup/"))
+            .await
+            .unwrap();
+        assert_eq!(markers, vec![hash_marker_key("reup", filename, &current)]);
+        let body = html_index(&ctx, "reup").await;
+        assert!(
+            body.contains(current.as_str()) && !body.contains(stale.as_str()),
+            "{body}"
+        );
+    }
+
+    /// A file cached from the upstream is stored with its hash marker.
+    #[tokio::test]
+    async fn proxied_file_is_cached_with_its_hash_marker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let filename = "proxied-1.0.tar.gz";
+        let content = b"proxied sdist";
+        Mock::given(method("GET"))
+            .and(path("/proxied/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<html><body><a href=\"{}/files/{filename}\">{filename}</a></body></html>",
+                upstream.uri()
+            )))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+            .mount(&upstream)
+            .await;
+        // In-memory object store: the cache write runs in the background, and a local disk
+        // would add fsync latency to what the test waits for.
+        let (backend, _ops) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(backend, |cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/proxied/{filename}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "proxied download served");
+        wait_for_markers(
+            &ctx,
+            "proxied",
+            &[hash_marker_key("proxied", filename, &digest(content))],
+        )
+        .await;
     }
 }
