@@ -251,15 +251,18 @@ else
     fail "Signature bundle not available"
 fi
 
-# Verify GHCR alpine image signature
-if cosign verify \
-    --certificate-identity-regexp "github.com/getnora-io/nora" \
-    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    "${GHCR_REGISTRY}:${VERSION}" >/dev/null 2>&1; then
-    pass "cosign verify GHCR alpine image"
-else
-    fail "cosign verify GHCR alpine image"
-fi
+# Verify GHCR image signatures (alpine, RED OS, Astra)
+for variant in "${VARIANTS[@]}"; do
+    SUFFIX="${variant:+${variant#-}}"
+    if cosign verify \
+        --certificate-identity-regexp "github.com/getnora-io/nora" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "${GHCR_REGISTRY}:${VERSION}${variant}" >/dev/null 2>&1; then
+        pass "cosign verify GHCR ${SUFFIX:-alpine} image"
+    else
+        fail "cosign verify GHCR ${SUFFIX:-alpine} image"
+    fi
+done
 
 echo ""
 

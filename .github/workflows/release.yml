@@ -18,6 +18,14 @@ jobs:
       hash: ${{ steps.hash.outputs.hash }}
       version: ${{ steps.sha.outputs.version }}
       short: ${{ steps.sha.outputs.short }}
+      # Images are staged by digest here; merge-image smoke-tests and promotes them. Tag
+      # names only, without the image path: the runner drops a job output that contains
+      # a masked value, and the path contains the Docker Hub username.
+      amd64_digest: ${{ steps.build-amd64.outputs.digest }}
+      redos_digest: ${{ steps.build-redos.outputs.digest }}
+      redos_tags: ${{ steps.variant-tags.outputs.redos }}
+      astra_digest: ${{ steps.build-astra.outputs.digest }}
+      astra_tags: ${{ steps.variant-tags.outputs.astra }}
     permissions:
       contents: read
       packages: write
@@ -102,8 +110,9 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ── Alpine amd64 — pushed BY DIGEST (no tag); the manifest list is assembled
-      #    in merge-image from the amd64 + arm64 (native runner) digests. ───────────
+      # ── Every image in this job is pushed BY DIGEST (no tag). Public tags move only in
+      #    merge-image, after every release gate has passed (#992). The alpine manifest
+      #    list is assembled there from the amd64 + arm64 (native runner) digests. ────
       - name: Build and push alpine (amd64, by digest)
         id: build-amd64
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
@@ -126,14 +135,12 @@ jobs:
           path: ${{ runner.temp }}/digests/*
           retention-days: 1
 
-      # ── RED OS (amd64 only) ───────────────────────────────────────────────────
+      # ── RED OS (amd64 only) — GHCR tags computed here, promoted in merge-image ────
       - name: Extract metadata (redos)
         id: meta-redos
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/getnora/nora
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-redos,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -141,24 +148,22 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
             type=raw,value=latest
 
-      - name: Build and push (redos)
+      - name: Build and push (redos, by digest)
+        id: build-redos
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           target: redos
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
-      # ── Astra Linux SE (amd64 only) ───────────────────────────────────────────
+      # ── Astra Linux SE (amd64 only) — GHCR tags computed here, promoted in merge-image
       - name: Extract metadata (astra)
         id: meta-astra
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/getnora/nora
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: suffix=-astra,onlatest=true
           tags: |
             type=semver,pattern={{version}}
@@ -166,15 +171,28 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
             type=raw,value=latest
 
-      - name: Build and push (astra)
+      - name: Build and push (astra, by digest)
+        id: build-astra
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           target: astra
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export RED OS + Astra tag names
+        id: variant-tags
+        env:
+          REDOS_TAGS: ${{ steps.meta-redos.outputs.tags }}
+          ASTRA_TAGS: ${{ steps.meta-astra.outputs.tags }}
+        run: |
+          set -euo pipefail
+          names() { local t; for t in $1; do printf '%s ' "${t##*:}"; done; }
+          {
+            echo "redos=$(names "$REDOS_TAGS")"
+            echo "astra=$(names "$ASTRA_TAGS")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Clean up Docker resources
         if: always()
@@ -240,11 +258,15 @@ jobs:
           path: ${{ runner.temp }}/digests/*
           retention-days: 1
 
-  # ── Assemble the multi-arch manifest list (amd64 + arm64) for both registries. ─
+  # ── Promote public tags — the only job that moves one (#992). It waits for every
+  #    release gate (arm64 image, deb/rpm packages, SLSA provenance), so a failure
+  #    upstream leaves alpine, RED OS and Astra on the last complete release. Every
+  #    variant is smoke-tested from its digest before a tag moves; re-running this
+  #    job re-points the same digests. ────────────────────────────────────────────
   merge-image:
-    name: Merge alpine manifest + sign + smoke
+    name: Promote images (alpine + RED OS + Astra) + sign + smoke
     runs-on: [self-hosted, nora]
-    needs: [build, build-image-arm64]
+    needs: [build, build-image-arm64, package, provenance]
     permissions:
       contents: read
       packages: write
@@ -277,6 +299,48 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
+
+      # Nothing is public yet: each variant runs from its staged digest. The runner is
+      # amd64, so alpine is exercised through its amd64 digest here; the assembled
+      # multi-arch tag is started again after promotion.
+      - name: Smoke test — every variant starts and responds (by digest)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          AMD64_DIGEST: ${{ needs.build.outputs.amd64_digest }}
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f nora-smoke-alpine nora-smoke-redos nora-smoke-astra >/dev/null 2>&1 || true' EXIT
+          for v in alpine redos astra; do
+            case "$v" in
+              alpine) ref="$IMAGE@$AMD64_DIGEST"; port=5555 ;;
+              redos)  ref="$IMAGE@$REDOS_DIGEST"; port=5556 ;;
+              astra)  ref="$IMAGE@$ASTRA_DIGEST"; port=5557 ;;
+            esac
+            echo "smoke $v: $ref"
+            docker rm -f "nora-smoke-$v" 2>/dev/null || true
+            docker run --rm -d --name "nora-smoke-$v" -p "$port:4000" -e NORA_HOST=0.0.0.0 -e "NORA_PUBLIC_URL=http://localhost:$port" "$ref"
+            for _ in $(seq 1 10); do
+              curl -sf "http://localhost:$port/health" >/dev/null && break
+              sleep 2
+            done
+            curl -sf "http://localhost:$port/health"
+            docker stop "nora-smoke-$v"
+          done
+
+      - name: Sign RED OS + Astra by digest (keyless Sigstore)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$REDOS_DIGEST"
+          cosign sign --yes "$IMAGE@$ASTRA_DIGEST"
+
       # GHCR-only tags (the arch images were pushed by-digest to GHCR). Docker Hub
       # tags are produced by copying the assembled multi-arch GHCR manifest below.
       - name: Extract metadata (alpine, GHCR)
@@ -305,13 +369,75 @@ jobs:
             docker buildx imagetools create -t "$dh" "$t"
           done
 
+      # RED OS / Astra: point each tag name exported by build at the staged digest in GHCR,
+      # copy it to Docker Hub, and check both refs resolve to that digest. The staged image
+      # is an index (image + attestation), which imagetools copies unchanged;
+      # --prefer-index=false keeps the digest for a bare manifest too.
+      - name: Promote RED OS + Astra tags in GHCR, then copy to Docker Hub
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: docker.io/getnora/nora
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          REDOS_TAGS: ${{ needs.build.outputs.redos_tags }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+          ASTRA_TAGS: ${{ needs.build.outputs.astra_tags }}
+        run: |
+          set -euo pipefail
+          promote() {
+            local digest="$1" names="$2" n ref got
+            if [ -z "$digest" ] || [ -z "${names// /}" ]; then
+              echo "::error::nothing staged to promote (digest='$digest', tags='$names')"
+              return 1
+            fi
+            for n in $names; do
+              echo "promote $IMAGE@$digest -> $IMAGE:$n, $DOCKERHUB_IMAGE:$n"
+              docker buildx imagetools create --prefer-index=false -t "$IMAGE:$n" "$IMAGE@$digest"
+              docker buildx imagetools create --prefer-index=false -t "$DOCKERHUB_IMAGE:$n" "$IMAGE:$n"
+              for ref in "$IMAGE:$n" "$DOCKERHUB_IMAGE:$n"; do
+                got=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)
+                if [ "$got" != "$digest" ]; then
+                  echo "::error::$ref resolves to $got, staged $digest"
+                  return 1
+                fi
+              done
+            done
+          }
+          promote "$REDOS_DIGEST" "$REDOS_TAGS"
+          promote "$ASTRA_DIGEST" "$ASTRA_TAGS"
+
       - name: Inspect manifest
         run: |
           docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}"
           docker buildx imagetools inspect "docker.io/getnora/nora:${{ needs.build.outputs.version }}"
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
+      # The alpine manifest list is assembled from two digests during promotion, so it is
+      # checked afterwards: each Docker Hub tag must resolve to its GHCR tag's digest, and
+      # the promoted version tag must start and respond.
+      - name: Verify promoted alpine tags + smoke test the multi-arch tag
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: docker.io/getnora/nora
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          while read -r t; do
+            dh="$DOCKERHUB_IMAGE:${t##*:}"
+            want=$(docker buildx imagetools inspect "$t" --format '{{json .Manifest}}' | jq -r .digest)
+            got=$(docker buildx imagetools inspect "$dh" --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$dh resolves to $got, $t is $want"
+              exit 1
+            fi
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          trap 'docker rm -f nora-smoke >/dev/null 2>&1 || true' EXIT
+          docker rm -f nora-smoke 2>/dev/null || true
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 -e NORA_PUBLIC_URL=http://localhost:5555 "$IMAGE:$VERSION"
+          for _ in $(seq 1 10); do
+            curl -sf http://localhost:5555/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:5555/health
+          docker stop nora-smoke
 
       - name: Sign Docker images (keyless Sigstore)
         run: |
@@ -320,16 +446,6 @@ jobs:
             [[ "$tag" == *"localhost"* ]] && continue
             cosign sign --yes "$tag"
           done
-
-      - name: Smoke test — verify alpine image starts and responds
-        run: |
-          docker rm -f nora-smoke 2>/dev/null || true
-          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 -e NORA_PUBLIC_URL=http://localhost:5555 ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
-          for i in $(seq 1 10); do
-            curl -sf http://localhost:5555/health && break || sleep 2
-          done
-          curl -sf http://localhost:5555/health
-          docker stop nora-smoke
 
       - name: Clean up Docker resources
         if: always()
