@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::circuit_breaker::CircuitBreakerRegistry;
+use crate::circuit_breaker::{CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::registry::docker_auth::DockerAuth;
 use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
@@ -806,15 +806,23 @@ fn quarantine_cache_serve_gate(state: &AppState, digest: &str) -> Option<Respons
 /// caches the blob before calling this, so a held blob is still cached (the client is
 /// blocked, not the cache) — identical to the manifest behaviour.
 #[must_use = "the returned response blocks a quarantined artifact; dropping it serves it"]
+/// Decide, without recording, whether a proxy-fetched blob is served or held: a digest
+/// this mirror has never seen is treated as freshly quarantined for the decision, and is
+/// recorded by [`quarantine_record_verified`] only once its fetch has verified — a fetch
+/// that fails must not leave a first-seen timestamp behind for the real blob to inherit.
 fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -> Option<Response> {
     let (q_mode, q_secs) = resolve_quarantine(state);
     if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
         return None;
     }
-    // Docker quarantine never trusts an upstream date (digest-addressed) —
-    // always NORA's own clock, preserving the GHSA-4j4m fix.
-    state.digest_store.record("docker", digest, upstream, None);
-    let status = state.digest_store.check("docker", digest, q_secs);
+    let status = match state.digest_store.check("docker", digest, q_secs) {
+        crate::digest_quarantine::QuarantineStatus::New => {
+            crate::digest_quarantine::QuarantineStatus::Pending {
+                remaining_secs: q_secs,
+            }
+        }
+        status => status,
+    };
     if !matches!(status, crate::digest_quarantine::QuarantineStatus::Mature) {
         let outcome = if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Enforce) {
             "blocked"
@@ -837,6 +845,17 @@ fn quarantine_proxy_fetch_gate(state: &AppState, digest: &str, upstream: &str) -
         }
     }
     None
+}
+
+/// Record a verified proxy-fetched blob as first seen now. Docker quarantine never
+/// trusts an upstream date (digest-addressed) — always NORA's own clock, preserving the
+/// GHSA-4j4m fix. Idempotent: an existing record keeps its timestamp.
+fn quarantine_record_verified(state: &AppState, digest: &str, upstream: &str) {
+    let (q_mode, _) = resolve_quarantine(state);
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+        return;
+    }
+    state.digest_store.record("docker", digest, upstream, None);
 }
 
 /// Docker v2 routes.
@@ -1292,47 +1311,47 @@ async fn download_blob(
 
     for try_name in &names_to_try {
         for upstream in &upstreams_to_try {
-            match fetch_blob_from_upstream(
+            // Content-addressed: the URL digest is the hash the spool verifies before
+            // storing, so the curation integrity check runs on it before upstream is
+            // opened — a rejection must not strand a circuit-breaker probe.
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Docker,
+                try_name,
+                Some(&digest),
+                &digest,
+            ) {
+                return response;
+            }
+            // The spool file and its follower exist before upstream answers: once a probe
+            // has been taken, the only exits left are the ones the spool task records.
+            let spool = match SpoolFile::create(&temp_dir).await {
+                Ok(spool) => spool,
+                Err(e) => {
+                    tracing::error!(error = ?e, "Failed to create proxy spool file");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let follower = match spool.follower().await {
+                Ok(follower) => follower,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to open proxy spool file for streaming");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            match open_blob_from_upstream(
                 &state.http_client,
                 &upstream.url,
                 try_name,
                 &digest,
                 &state.docker_auth,
                 state.config.docker.proxy_timeout,
-                state.config.docker.read_timeout,
                 expose_opt(&upstream.auth),
                 &state.circuit_breaker,
-                &temp_dir,
             )
             .await
             {
-                Ok(mut fetched) => {
-                    // Verify SHA-256 against digest from URL (curation fail-closed)
-                    let expected_hash = digest.strip_prefix("sha256:").unwrap_or(&digest);
-                    if fetched.sha256 != expected_hash {
-                        tracing::warn!(
-                            name = %try_name,
-                            digest = %digest,
-                            expected = %expected_hash,
-                            actual = %fetched.sha256,
-                            "Docker blob SHA-256 mismatch from upstream — rejecting"
-                        );
-                        // TempFileGuard drops and cleans up
-                        return StatusCode::BAD_GATEWAY.into_response();
-                    }
-
-                    // Curation integrity check with pre-computed hash (#580)
-                    let hash_with_prefix = format!("sha256:{}", fetched.sha256);
-                    if let Some(response) = crate::curation::verify_integrity_by_hash(
-                        &state.curation().curation_engine,
-                        crate::curation::RegistryType::Docker,
-                        try_name,
-                        Some(&digest),
-                        &hash_with_prefix,
-                    ) {
-                        return response;
-                    }
-
+                Ok(upstream_blob) => {
                     state.metrics.record_download("docker");
                     state.metrics.record_cache_miss("docker");
                     state.activity.push(ActivityEntry::new(
@@ -1341,91 +1360,45 @@ async fn download_blob(
                         crate::registry_type::RegistryType::Docker,
                         "PROXY",
                     ));
-
-                    // Read temp file size for Content-Length (always known — file is complete)
-                    let file_size = tokio::fs::metadata(&fetched.path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-
-                    // Store blob: atomic move temp → storage with SHA-256 pin (#580)
-                    let sha_for_pin = fetched.sha256.clone();
-                    match state
-                        .storage
-                        .put_from_path(&key, &fetched.path, Some(&sha_for_pin))
-                        .await
-                    {
-                        Ok(()) => {
-                            // put_from_path moved/deleted the file — disarm guard
-                            fetched._guard.disarm();
-                            state.repo_index.invalidate("docker");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                key = %key,
-                                "Failed to store proxied blob — serving from upstream anyway"
-                            );
-                            // Guard will clean up temp file on drop
-                        }
-                    }
-
-                    // Quarantine: the blob is cached above; hold it during the cooldown.
-                    // Records the digest as first-seen on the proxy path and 403s in
-                    // enforce until it matures (mirrors the manifest proxy path). Covers
-                    // both serve paths below (stored and temp-file fallback).
+                    let content_length = upstream_blob.content_length;
+                    let (progress, status) = tokio::sync::watch::channel(SpoolStatus::default());
+                    spawn_blob_spool(
+                        state.clone(),
+                        upstream_blob,
+                        spool,
+                        key.clone(),
+                        digest.clone(),
+                        upstream.url.clone(),
+                        progress,
+                    );
+                    // Quarantine: the fill continues in the background and lands in the cache;
+                    // a held digest is answered 403 now (mirrors the manifest proxy path).
                     if let Some(resp) = quarantine_proxy_fetch_gate(&state, &digest, &upstream.url)
                     {
                         return resp;
                     }
-
-                    // Serve response via streaming — never load full blob into RAM (#580).
-                    // Two paths: storage (put succeeded) or temp file (put failed).
-                    if fetched._guard.path.is_none() {
-                        // Successfully stored — stream from storage
-                        match state.storage.get_reader(&key).await {
-                            Ok((size, _pin, reader)) => {
-                                let stream = VerifyingReader::new(reader, &digest);
-                                return Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                                    .header(header::CONTENT_LENGTH, size)
-                                    .header(
-                                        header::CACHE_CONTROL,
-                                        "public, max-age=31536000, immutable",
-                                    )
-                                    .header("docker-content-digest", &digest)
-                                    .body(nora_registry::verified::reader_stream_body(stream))
-                                    .unwrap_or_else(|_| {
-                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                    });
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, key = %key, "Failed to read just-stored blob");
-                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                            }
-                        }
-                    } else {
-                        // put_from_path failed — stream from temp file directly
-                        match tokio::fs::File::open(&fetched.path).await {
-                            Ok(file) => {
-                                let stream = VerifyingReader::new(file, &digest);
-                                return Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                                    .header(header::CONTENT_LENGTH, file_size)
-                                    .header("docker-content-digest", &digest)
-                                    .body(nora_registry::verified::reader_stream_body(stream))
-                                    .unwrap_or_else(|_| {
-                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                    });
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to open temp blob file for streaming");
-                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                            }
-                        }
+                    // Answer as soon as upstream has answered: the body follows the spool file
+                    // as it grows, so a client that caps time-to-first-header (containerd ≥ 2.3
+                    // gives up after 30 s) is never left waiting for a multi-GB fill. The last
+                    // byte is withheld until the spool has verified the digest, so a poisoned
+                    // upstream can never complete a Content-Length body.
+                    let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
+                        follower, status,
+                    )));
+                    let stream = VerifyingReader::new(reader, &digest);
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                        .header("docker-content-digest", &digest);
+                    // A declared zero length would let hyper complete the response from the
+                    // headers alone, before the digest verdict; an empty body goes chunked.
+                    if let Some(len) = content_length.filter(|&len| len > 0) {
+                        builder = builder.header(header::CONTENT_LENGTH, len);
                     }
+                    return builder
+                        .body(nora_registry::verified::reader_stream_body(stream))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
                 Err(e) => {
@@ -2880,35 +2853,219 @@ pub struct FetchedBlob {
     /// SHA-256 hex digest computed incrementally during download (64 chars, lowercase).
     pub sha256: String,
     /// Content-Length from upstream response, if provided (None for chunked responses).
-    /// Used by mirror and future streaming response paths.
     #[allow(dead_code)]
     pub content_length: Option<u64>,
     /// RAII guard — deletes temp file on drop unless disarmed.
     pub _guard: TempFileGuard,
 }
 
-/// Fetch a blob from an upstream Docker registry, streaming to a temp file (#580).
+/// An upstream blob whose response headers have arrived but whose body has not been
+/// read: the point at which `download_blob` can answer the client, before the bytes
+/// are on disk.
+pub struct UpstreamBlob {
+    response: reqwest::Response,
+    /// Content-Length from upstream, None for a chunked response.
+    pub content_length: Option<u64>,
+    cb_key: String,
+    probe: ProbeToken,
+    _download_gauge_guard: ProxyDownloadGuard,
+}
+
+/// Progress of an in-flight spool, published to the response followers reading it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpoolStatus {
+    /// Bytes flushed to the spool file so far.
+    pub written: u64,
+    /// `Some` once the spool has finished: the upstream body is complete and verified
+    /// (`Ok`) or the fetch failed and the file is being discarded (`Err`).
+    pub done: Option<Result<(), String>>,
+}
+
+/// Temp file a spool writes into. Created by the caller so a follower can open its own
+/// handle before the first byte lands and keep reading it after storage moves or the
+/// guard deletes the path.
+pub(crate) struct SpoolFile {
+    path: std::path::PathBuf,
+    file: tokio::fs::File,
+    guard: TempFileGuard,
+}
+
+impl SpoolFile {
+    pub(crate) async fn create(temp_dir: &std::path::Path) -> Result<Self, ProxyError> {
+        let path = temp_dir.join(format!("proxy-{}", uuid::Uuid::new_v4()));
+        let guard = TempFileGuard::new(path.clone());
+        let file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| ProxyError::Network(format!("temp file create: {}", e)))?;
+        Ok(Self { path, file, guard })
+    }
+
+    /// A second, read-only handle on the spool file for a response to follow.
+    pub(crate) async fn follower(&self) -> std::io::Result<tokio::fs::File> {
+        tokio::fs::File::open(&self.path).await
+    }
+}
+
+/// Read a spool file as it is being written, ending when the spool reports completion.
 ///
-/// Streams the upstream response to a temp file in `temp_dir` with incremental
-/// SHA-256 hashing. Never accumulates the full blob in RAM.
+/// Bytes are released only up to what the spool has flushed, less a one-byte holdback
+/// until it reports `done`: with a `Content-Length` body hyper stops reading once the
+/// declared bytes are out, so the digest verdict has to gate the final byte, not EOF. A
+/// failed spool surfaces as a read error, so the response aborts short instead of ending
+/// cleanly. Progress is re-read after every short read, so bytes flushed between a read
+/// and the next status check are never waited on.
+fn spool_follower(
+    file: tokio::fs::File,
+    status: tokio::sync::watch::Receiver<SpoolStatus>,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send {
+    const READ_BUF: usize = 256 * 1024;
+    const HOLDBACK_BYTES: u64 = 1;
+    // Flushed bytes are visible to a second handle at once; a run of empty reads below
+    // the published count means the file is gone or truncated, not still in flight.
+    const MAX_EMPTY_READS: u32 = 1_000;
+    futures::stream::unfold(
+        (file, status, 0u64, 0u32),
+        |(mut file, mut status, mut offset, mut empty_reads)| async move {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let current = status.borrow_and_update().clone();
+                let released = match &current.done {
+                    Some(Ok(())) => current.written,
+                    Some(Err(reason)) => {
+                        let err =
+                            std::io::Error::other(format!("upstream blob fetch failed: {reason}"));
+                        return Some((Err(err), (file, status, offset, empty_reads)));
+                    }
+                    None => current.written.saturating_sub(HOLDBACK_BYTES),
+                };
+                if offset < released {
+                    let want = usize::try_from(released - offset)
+                        .unwrap_or(READ_BUF)
+                        .min(READ_BUF);
+                    let mut buf = vec![0u8; want];
+                    match file.read(&mut buf).await {
+                        Ok(0) => {
+                            empty_reads += 1;
+                            if empty_reads > MAX_EMPTY_READS {
+                                let err = std::io::Error::other(format!(
+                                    "spool published {} bytes but only {} were readable",
+                                    current.written, offset
+                                ));
+                                return Some((Err(err), (file, status, offset, empty_reads)));
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Ok(n) => {
+                            empty_reads = 0;
+                            offset += n as u64;
+                            buf.truncate(n);
+                            return Some((
+                                Ok(Bytes::from(buf)),
+                                (file, status, offset, empty_reads),
+                            ));
+                        }
+                        Err(e) => return Some((Err(e), (file, status, offset, empty_reads))),
+                    }
+                    continue;
+                }
+                if current.done.is_some() {
+                    return None;
+                }
+                if status.changed().await.is_err() {
+                    let err = std::io::Error::other("upstream blob fetch abandoned");
+                    return Some((Err(err), (file, status, offset, empty_reads)));
+                }
+            }
+        },
+    )
+}
+
+/// Spool an upstream blob to disk and store it, detached from the request that started
+/// it: a client that gives up mid-fill (containerd retries a slow pull from scratch) no
+/// longer discards the bytes already fetched, and the next request is a cache hit.
+fn spawn_blob_spool(
+    state: AppState,
+    blob: UpstreamBlob,
+    spool: SpoolFile,
+    key: String,
+    digest: String,
+    upstream: String,
+    progress: tokio::sync::watch::Sender<SpoolStatus>,
+) {
+    let read_timeout = state.config.docker.read_timeout;
+    tokio::spawn(async move {
+        let outcome = spool_upstream_blob(
+            blob,
+            spool,
+            read_timeout,
+            &state.circuit_breaker,
+            Some(&progress),
+        )
+        .await;
+        let mut fetched = match outcome {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                tracing::warn!(error = ?e, key = %key, "Docker blob proxy fetch failed mid-stream");
+                progress.send_modify(|s| s.done = Some(Err(format!("{e:?}"))));
+                return;
+            }
+        };
+        let expected_hash = digest.strip_prefix("sha256:").unwrap_or(&digest);
+        if fetched.sha256 != expected_hash {
+            tracing::warn!(
+                digest = %digest,
+                expected = %expected_hash,
+                actual = %fetched.sha256,
+                "Docker blob SHA-256 mismatch from upstream — not cached"
+            );
+            // TempFileGuard drops and cleans up; the follower's own handle still reads
+            // to the end, and VerifyingReader fails the response there.
+            progress.send_modify(|s| s.done = Some(Err("SHA-256 mismatch".to_string())));
+            return;
+        }
+        // The digest is the verdict the response is waiting on; release the last byte
+        // now rather than after the storage upload, which can take as long again.
+        progress.send_modify(|s| s.done = Some(Ok(())));
+        quarantine_record_verified(&state, &digest, &upstream);
+        let sha_for_pin = fetched.sha256.clone();
+        match state
+            .storage
+            .put_from_path(&key, &fetched.path, Some(&sha_for_pin))
+            .await
+        {
+            Ok(()) => {
+                fetched._guard.disarm();
+                state.repo_index.invalidate("docker");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    key = %key,
+                    "Failed to store proxied blob — the response still completes from the spool"
+                );
+            }
+        }
+    });
+}
+
+/// Open a blob on an upstream Docker registry: request, token auth and status check,
+/// stopping once the response headers are in. The body is read by
+/// [`spool_upstream_blob`].
 ///
-/// Uses per-chunk `read_timeout` instead of a total request timeout so that
-/// large blob downloads (multi-GB images) don't time out on slow connections.
-/// The `timeout` parameter is kept as the connection/header timeout.
+/// `timeout` bounds the whole request from reqwest's side; the body itself is paced by
+/// the per-chunk `read_timeout` of the spool.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_blob_from_upstream(
+pub async fn open_blob_from_upstream(
     client: &reqwest::Client,
     upstream_url: &str,
     name: &str,
     digest: &str,
     docker_auth: &DockerAuth,
     timeout: u64,
-    read_timeout: u64,
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
-    temp_dir: &std::path::Path,
-) -> Result<FetchedBlob, ProxyError> {
-    use crate::metrics::{PROXY_ACTIVE_DOWNLOADS, PROXY_DOWNLOAD_BYTES};
+) -> Result<UpstreamBlob, ProxyError> {
+    use crate::metrics::PROXY_ACTIVE_DOWNLOADS;
 
     // Track active concurrent proxy downloads. ProxyDownloadGuard decrements
     // on drop (success, error, or cancellation — all paths).
@@ -2984,34 +3141,61 @@ pub async fn fetch_blob_from_upstream(
         return Err(ProxyError::Upstream(status));
     }
 
-    // Upstream Content-Length (None if chunked transfer-encoding)
-    let upstream_content_length = response.content_length();
+    Ok(UpstreamBlob {
+        content_length: response.content_length(),
+        response,
+        cb_key,
+        probe,
+        _download_gauge_guard,
+    })
+}
 
-    // Create temp file in storage directory (same filesystem for atomic rename)
-    let temp_path = temp_dir.join(format!("proxy-{}", uuid::Uuid::new_v4()));
-    let guard = TempFileGuard::new(temp_path.clone());
-    let mut file = tokio::fs::File::create(&temp_path)
-        .await
-        .map_err(|e| ProxyError::Network(format!("temp file create: {}", e)))?;
-
-    // Stream body with per-chunk read timeout + incremental SHA-256
+/// Stream an opened upstream blob to its spool file with a per-chunk `read_timeout` and
+/// incremental SHA-256. Never accumulates the blob in RAM. Each chunk is flushed before
+/// `progress` advances, so a follower never reads past what is on disk.
+pub(crate) async fn spool_upstream_blob(
+    blob: UpstreamBlob,
+    spool: SpoolFile,
+    read_timeout: u64,
+    cb: &CircuitBreakerRegistry,
+    progress: Option<&tokio::sync::watch::Sender<SpoolStatus>>,
+) -> Result<FetchedBlob, ProxyError> {
+    use crate::metrics::PROXY_DOWNLOAD_BYTES;
     use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+
+    let UpstreamBlob {
+        response,
+        content_length,
+        cb_key,
+        probe,
+        _download_gauge_guard,
+    } = blob;
+    let SpoolFile {
+        path: temp_path,
+        mut file,
+        guard,
+    } = spool;
     let mut stream = response.bytes_stream();
     let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
     let mut bytes_written: u64 = 0;
-
     loop {
         // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout,
         // TempFileGuard drops and deletes the partial file — no leaked state.
         match tokio::time::timeout(chunk_timeout, stream.next()).await {
             Ok(Some(Ok(chunk))) => {
                 hasher.update(&chunk);
-                use tokio::io::AsyncWriteExt;
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
                 bytes_written += chunk.len() as u64;
+                if let Some(progress) = progress {
+                    file.flush()
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
+                    progress.send_modify(|s| s.written = bytes_written);
+                }
             }
             Ok(Some(Err(e))) => {
                 cb.record_failure(&cb_key, probe);
@@ -3027,33 +3211,56 @@ pub async fn fetch_blob_from_upstream(
             }
         }
     }
-
-    // Flush to disk before returning
-    use tokio::io::AsyncWriteExt;
     file.flush()
         .await
         .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
     drop(file);
-
     let sha256 = hex::encode(sha2::Digest::finalize(hasher));
     cb.record_success(&cb_key, probe);
     PROXY_DOWNLOAD_BYTES.inc_by(bytes_written);
-
     tracing::info!(
         bytes = bytes_written,
-        content_length = ?upstream_content_length,
+        content_length = ?content_length,
         "Proxy blob download complete"
     );
-
-    // Transfer guard ownership to FetchedBlob — caller is responsible for
-    // disarming after successful put_from_path (which moves the temp file).
-    // If caller drops FetchedBlob without disarming, temp file is cleaned up.
     Ok(FetchedBlob {
         path: temp_path,
         sha256,
-        content_length: upstream_content_length,
+        content_length,
         _guard: guard,
     })
+}
+
+/// Fetch a blob from an upstream Docker registry into a temp file (#580): open it,
+/// spool it, return once the complete, hashed blob is on disk. Callers that want to
+/// serve while the spool is still running use [`open_blob_from_upstream`] and
+/// [`spool_upstream_blob`] separately.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_blob_from_upstream(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    name: &str,
+    digest: &str,
+    docker_auth: &DockerAuth,
+    timeout: u64,
+    read_timeout: u64,
+    basic_auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    temp_dir: &std::path::Path,
+) -> Result<FetchedBlob, ProxyError> {
+    let blob = open_blob_from_upstream(
+        client,
+        upstream_url,
+        name,
+        digest,
+        docker_auth,
+        timeout,
+        basic_auth,
+        cb,
+    )
+    .await?;
+    let spool = SpoolFile::create(temp_dir).await?;
+    spool_upstream_blob(blob, spool, read_timeout, cb, None).await
 }
 
 /// Fetch a manifest from an upstream Docker registry
@@ -5623,25 +5830,41 @@ mod integration_tests {
         )
         .await;
 
-        // Mismatch → 502 Bad Gateway (verify-before-serve, no tee to client).
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
+        // The headers go out as soon as upstream answers (the digest is only known at
+        // the end of the spool), so a mismatch cannot be a 502 any more: the body aborts
+        // instead of ending as a clean 200, and the poisoned bytes are never cached.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            body.is_err(),
+            "a poisoned blob must not stream to a clean end"
+        );
         // Poisoned blob must NOT have been cached under the docker blob key
         // (computed via the same canonicalize/blob_key path the handler uses).
         let c = super::canonicalize("library/test", &ctx.state.config.docker);
         let key = super::blob_key(c.namespace.as_deref(), &c.name, &requested_digest);
+        // The spool task finishes after the response; give it a moment to clean up.
+        let proxy_tmp =
+            std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
+        let leftover = || {
+            std::fs::read_dir(&proxy_tmp)
+                .map(|rd| rd.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        };
+        let started = std::time::Instant::now();
+        while leftover() > 0 && started.elapsed() < std::time::Duration::from_secs(5) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
             ctx.state.storage.get(&key).await.is_err(),
             "poisoned blob must not be cached"
         );
-
         // TempFileGuard must have cleaned up — no leftover proxy temp files.
-        let proxy_tmp =
-            std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
-        let leftover = std::fs::read_dir(&proxy_tmp)
-            .map(|rd| rd.filter_map(|e| e.ok()).count())
-            .unwrap_or(0);
-        assert_eq!(leftover, 0, "temp files must be cleaned up after rejection");
+        assert_eq!(
+            leftover(),
+            0,
+            "temp files must be cleaned up after rejection"
+        );
     }
 
     /// #638 regression: a proxied tag whose cached manifest is outdated must be revalidated
@@ -5754,10 +5977,17 @@ mod integration_tests {
             "served body must match upstream"
         );
 
-        // Verified blob is cached synchronously under the docker blob key
-        // (computed via the same canonicalize/blob_key path the handler uses).
+        // The verified blob is cached under the docker blob key (computed via the same
+        // canonicalize/blob_key path the handler uses) once the detached spool stores it,
+        // which completes just after the response body.
         let c = super::canonicalize("library/ok", &ctx.state.config.docker);
         let key = super::blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let started = std::time::Instant::now();
+        while ctx.state.storage.get(&key).await.is_err()
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
             ctx.state.storage.get(&key).await.is_ok(),
             "verified blob must be cached"
@@ -5992,5 +6222,415 @@ mod index_cost_tests {
             small, large,
             "_catalog must cost the same storage round-trips for 1 and 100 repositories: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod stream_spool_tests {
+    //! A proxied blob is served while it is still being spooled from upstream.
+    use super::{blob_key, canonicalize};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, Method, StatusCode};
+    use axum::response::Response;
+    use axum::Router;
+    use futures::StreamExt;
+    use sha2::Digest;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Upstream that answers its headers at once and trickles the body in `chunks`
+    /// pieces `delay` apart, so a test can tell "headers before the body" from
+    /// "headers after the whole blob".
+    async fn slow_blob_upstream(blob: Vec<u8>, chunks: usize, delay: Duration) -> String {
+        slow_blob_upstream_framed(blob, chunks, delay, true).await
+    }
+
+    /// `declare_length = false` answers chunked, with no `Content-Length`.
+    async fn slow_blob_upstream_framed(
+        blob: Vec<u8>,
+        chunks: usize,
+        delay: Duration,
+        declare_length: bool,
+    ) -> String {
+        use axum::routing::get;
+        let blob = Arc::new(blob);
+        let app = Router::new().route(
+            "/v2/{*rest}",
+            get(move || {
+                let blob = blob.clone();
+                async move {
+                    let piece = blob.len().div_ceil(chunks).max(1);
+                    let pieces: Vec<Bytes> =
+                        blob.chunks(piece).map(Bytes::copy_from_slice).collect();
+                    let body = futures::stream::iter(pieces).then(move |p| async move {
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::io::Error>(p)
+                    });
+                    let mut builder = Response::builder().status(StatusCode::OK);
+                    if declare_length {
+                        builder = builder.header(header::CONTENT_LENGTH, blob.len());
+                    }
+                    builder.body(Body::from_stream(body)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn slow_upstream_ctx(upstream: String) -> TestContext {
+        use crate::config::DockerUpstream;
+        create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        })
+    }
+
+    async fn wait_until(
+        deadline: Duration,
+        mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if ready().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn proxy_temp_count(ctx: &TestContext) -> usize {
+        let proxy_tmp =
+            std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
+        std::fs::read_dir(&proxy_tmp)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    /// A cache miss answers with the upstream headers before the blob is on disk and
+    /// streams the body as the spool grows; the blob is cached once the spool ends.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_streams_while_spooling() {
+        let blob: Vec<u8> = (0..(4 * 256 * 1024 + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let delay = Duration::from_millis(250);
+        let upstream = slow_blob_upstream(blob.clone(), 4, delay).await;
+        let ctx = slow_upstream_ctx(upstream);
+
+        let started = std::time::Instant::now();
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+        let headers_after = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH].to_str().unwrap(),
+            blob.len().to_string()
+        );
+        assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
+        // The whole body takes 4 × delay to arrive from upstream; the headers must not.
+        assert!(
+            headers_after < delay * 2,
+            "headers arrived only after {headers_after:?}, i.e. after the spool"
+        );
+
+        let body = body_bytes(response).await;
+        assert_eq!(body.len(), blob.len());
+        assert_eq!(body.as_ref(), &blob[..]);
+        assert!(
+            started.elapsed() >= delay * 4,
+            "the body cannot be complete before upstream sent it"
+        );
+
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let storage = ctx.state.storage.clone();
+        let k = key.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), move || {
+                let storage = storage.clone();
+                let k = k.clone();
+                Box::pin(async move { storage.get(&k).await.is_ok() })
+            })
+            .await,
+            "blob must be cached after the spool completes"
+        );
+        assert_eq!(
+            ctx.state.storage.get(&key).await.unwrap().as_ref(),
+            &blob[..]
+        );
+        assert_eq!(
+            proxy_temp_count(&ctx),
+            0,
+            "spool file must be gone once stored"
+        );
+    }
+
+    /// A client that drops the response mid-fill (containerd retrying a slow pull from
+    /// scratch) must not discard the fill: the spool keeps going and the blob is cached.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_fill_survives_client_disconnect() {
+        let blob: Vec<u8> = (0..(2 * 256 * 1024 + 5)).map(|i| (i % 253) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let upstream = slow_blob_upstream(blob.clone(), 4, Duration::from_millis(150)).await;
+        let ctx = slow_upstream_ctx(upstream);
+
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let storage = ctx.state.storage.clone();
+        let k = key.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), move || {
+                let storage = storage.clone();
+                let k = k.clone();
+                Box::pin(async move { storage.get(&k).await.is_ok() })
+            })
+            .await,
+            "the fill must complete without a client"
+        );
+        assert_eq!(
+            ctx.state.storage.get(&key).await.unwrap().as_ref(),
+            &blob[..]
+        );
+        assert_eq!(proxy_temp_count(&ctx), 0);
+    }
+
+    /// Over real HTTP framing a poisoned upstream must not yield a complete body: hyper
+    /// stops reading a `Content-Length` body once the declared bytes are out, so the last
+    /// byte is withheld until the spool has verified the digest.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_mismatch_aborts_framed_body() {
+        let real = b"the real layer bytes".to_vec();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&real)));
+        let poisoned = b"poisoned bytes of same len".to_vec();
+        assert_ne!(real, poisoned);
+        let upstream = slow_blob_upstream(poisoned, 2, Duration::from_millis(50)).await;
+        let ctx = slow_upstream_ctx(upstream);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v2/library/test/blobs/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response.bytes().await.is_err(),
+            "a poisoned blob must not arrive as a complete body"
+        );
+
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            ctx.state.storage.get(&key).await.is_err(),
+            "poisoned blob must not be cached"
+        );
+        assert_eq!(proxy_temp_count(&ctx), 0);
+    }
+
+    async fn follower_over(
+        bytes: &[u8],
+        status: super::SpoolStatus,
+    ) -> (
+        std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+        tokio::sync::watch::Sender<super::SpoolStatus>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(status);
+        (Box::pin(super::spool_follower(file, rx)), tx, dir)
+    }
+
+    /// The follower withholds the last flushed byte until the spool reports a verified
+    /// end, so a `Content-Length` body can never complete on unverified bytes.
+    #[tokio::test]
+    async fn spool_follower_withholds_last_byte_until_done() {
+        let data = b"0123456789";
+        let pending = super::SpoolStatus {
+            written: data.len() as u64,
+            done: None,
+        };
+        let (mut follower, tx, _dir) = follower_over(data, pending).await;
+
+        let first = follower.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), &data[..data.len() - 1]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), follower.next())
+                .await
+                .is_err(),
+            "the last byte must not be released while the spool is unverified"
+        );
+
+        tx.send_modify(|s| s.done = Some(Ok(())));
+        let last = follower.next().await.unwrap().unwrap();
+        assert_eq!(last.as_ref(), &data[data.len() - 1..]);
+        assert!(
+            follower.next().await.is_none(),
+            "EOF after the verified last byte"
+        );
+    }
+
+    /// A spool that ends in failure turns into a read error before the last byte.
+    #[tokio::test]
+    async fn spool_follower_errors_on_failed_spool() {
+        let data = b"0123456789";
+        let pending = super::SpoolStatus {
+            written: data.len() as u64,
+            done: None,
+        };
+        let (mut follower, tx, _dir) = follower_over(data, pending).await;
+        let first = follower.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), data.len() - 1);
+
+        tx.send_modify(|s| s.done = Some(Err("SHA-256 mismatch".to_string())));
+        let err = follower.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("SHA-256 mismatch"), "{err}");
+    }
+
+    /// Bytes flushed between a short read and the status check are picked up without
+    /// waiting for a further update.
+    #[tokio::test]
+    async fn spool_follower_reads_bytes_published_before_it_waited() {
+        let data = b"abcdef";
+        let empty = super::SpoolStatus {
+            written: 0,
+            done: None,
+        };
+        let (mut follower, tx, _dir) = follower_over(data, empty).await;
+        let pending = tokio::time::timeout(Duration::from_millis(100), follower.next());
+        assert!(
+            pending.await.is_err(),
+            "nothing is released before any flush"
+        );
+        tx.send_modify(|s| s.written = data.len() as u64);
+        let chunk = tokio::time::timeout(Duration::from_secs(1), follower.next())
+            .await
+            .expect("published bytes must be delivered")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.as_ref(), &data[..data.len() - 1]);
+    }
+
+    async fn serve_ctx(ctx: &TestContext) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = ctx.app.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    /// An upstream that answers chunked (no `Content-Length`) streams and caches the same
+    /// way; the response is chunked too and ends only after the verified last byte.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_chunked_upstream_streams_and_caches() {
+        let blob: Vec<u8> = (0..(300 * 1024 + 3)).map(|i| (i % 249) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let upstream =
+            slow_blob_upstream_framed(blob.clone(), 3, Duration::from_millis(100), false).await;
+        let ctx = slow_upstream_ctx(upstream);
+        let addr = serve_ctx(&ctx).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v2/library/test/blobs/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(response.bytes().await.unwrap().as_ref(), &blob[..]);
+
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let storage = ctx.state.storage.clone();
+        let k = key.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), move || {
+                let storage = storage.clone();
+                let k = k.clone();
+                Box::pin(async move { storage.get(&k).await.is_ok() })
+            })
+            .await
+        );
+    }
+
+    /// `Content-Length: 0` from upstream for a non-empty digest must not complete as a
+    /// clean 200: hyper would finish the response from the headers alone, so an empty
+    /// body is never declared and the verdict still gates the end of the body.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_empty_poisoned_body_aborts() {
+        let real = b"not empty".to_vec();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&real)));
+        let upstream = slow_blob_upstream(Vec::new(), 1, Duration::from_millis(20)).await;
+        let ctx = slow_upstream_ctx(upstream);
+        let addr = serve_ctx(&ctx).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v2/library/test/blobs/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response.bytes().await.is_err(),
+            "an empty poisoned body must not complete cleanly"
+        );
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ctx.state.storage.get(&key).await.is_err());
     }
 }
