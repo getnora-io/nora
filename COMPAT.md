@@ -367,6 +367,32 @@ echo "deb [signed-by=/etc/apt/keyrings/nora.asc] http://nora:4000/deb/myrepo jam
 With signing disabled (`signing.enabled = false`), use `[trusted=yes]`
 instead of `[signed-by=...]`.
 
+## CPAN
+
+Caching proxy for www.cpan.org. Distribution tarballs are immutably cached;
+the package index uses TTL-based caching.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Package index (`02packages.details.txt.gz`) | Full | TTL-cached |
+| Module list (`03modlist.data.gz`) | Full | TTL-cached |
+| Author directory (`01mailrc.txt.gz`) | Full | TTL-cached |
+| Distribution download (`authors/id/*`) | Full | Immutable cache |
+| Distribution publish | — | Proxy-only (read) |
+
+The web UI groups cached releases by parsing archive filenames with a local
+adaptation of `CPAN::DistnameInfo`. It supports modern `Dist-1.23` names and
+legacy underscore, dot, and directly-attached version forms. `.meta` and
+`.readme` sidecars are not fetched or parsed for grouping. Consequently, the
+distribution page lists versions already cached by NORA; unparseable archive
+names are omitted from the grouped author view. The exact rules and examples
+are documented in [the CPAN proxy design](docs/design/2026-09-18-cpan-proxy-design.md#distribution-grouping-in-the-ui).
+
+Client:
+```bash
+cpanm --from http://nora:4000/cpan Module::Name
+```
+
 ## Helm OCI
 
 Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm push` and `helm pull` work through the standard `/v2/` API.

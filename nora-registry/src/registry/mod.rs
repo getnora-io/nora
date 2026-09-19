@@ -4,6 +4,7 @@
 pub(crate) mod ansible;
 mod cargo_registry;
 mod conan;
+pub(crate) mod cpan;
 pub(crate) mod deb;
 pub mod docker;
 pub mod docker_auth;
@@ -26,6 +27,7 @@ mod ns_isolation_metadata_tests;
 pub use ansible::routes as ansible_routes;
 pub use cargo_registry::routes as cargo_routes;
 pub use conan::routes as conan_routes;
+pub use cpan::routes as cpan_routes;
 pub use deb::routes as deb_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;

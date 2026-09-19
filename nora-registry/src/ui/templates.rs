@@ -1070,6 +1070,133 @@ pub fn render_ansible_dir(
     )
 }
 
+/// Renders CPAN directory browser with breadcrumbs
+pub fn render_cpan_dir(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+
+    let mut breadcrumbs =
+        r#"<a href="/ui/cpan" class="text-blue-400 hover:text-blue-300">CPAN</a>"#.to_string();
+    if !path.is_empty() {
+        let segments: Vec<&str> = path.split('/').collect();
+        for (i, seg) in segments.iter().enumerate() {
+            let crumb_path = segments[..=i]
+                .iter()
+                .copied()
+                .map(encode_uri_component)
+                .collect::<Vec<_>>()
+                .join("/");
+            if i == segments.len() - 1 {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    html_escape(seg)
+                );
+            } else {
+                let _ = write!(
+                    breadcrumbs,
+                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/cpan/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    crumb_path,
+                    html_escape(seg)
+                );
+            }
+        }
+    }
+
+    let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
+
+    let rows: String = entries
+        .iter()
+        .map(|entry| {
+            let encoded_path = path
+                .split('/')
+                .map(encode_uri_component)
+                .collect::<Vec<_>>()
+                .join("/");
+            let href = if path.is_empty() {
+                format!("/ui/cpan/{}", encode_uri_component(&entry.name))
+            } else {
+                format!(
+                    "/ui/cpan/{}/{}",
+                    encoded_path,
+                    encode_uri_component(&entry.name)
+                )
+            };
+            format!(
+                r##"
+                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
+                    </td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                </tr>
+            "##,
+                href,
+                folder_icon,
+                href,
+                html_escape(&entry.name),
+                entry.versions,
+            )
+        })
+        .collect();
+
+    let title_display = if path.is_empty() {
+        "CPAN".to_string()
+    } else {
+        html_escape(path.rsplit('/').next().unwrap_or(path))
+    };
+
+    let showing = t.showing_all.replace("{count}", &total.to_string());
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_count}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        icon = icons::CPAN,
+        title = title_display,
+        col_name = t.name,
+        col_count = t.items,
+        rows = rows,
+        showing = showing,
+    );
+
+    layout_dark(
+        &format!("CPAN — {}", if path.is_empty() { "Browse" } else { path }),
+        &content,
+        Some("cpan"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders package detail page (npm, cargo, pypi)
 pub fn render_package_detail(
     registry_type: &str,
@@ -1083,6 +1210,14 @@ pub fn render_package_detail(
     let rt = RegistryType::from_str_opt(registry_type);
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
+    let detail_link_name = if rt == Some(RegistryType::Cpan) {
+        name.split('/')
+            .map(encode_uri_component)
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        encode_uri_component(name)
+    };
 
     let file_icon = if rt == Some(RegistryType::Raw) {
         r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
@@ -1134,9 +1269,7 @@ pub fn render_package_detail(
     let prerelease_toggle = if detail.prerelease_count > 0 {
         format!(
             r##"<a href="/ui/{}/{}?prerelease=true" class="text-sm text-blue-400 hover:text-blue-300">+ {} pre-release</a>"##,
-            registry_type,
-            encode_uri_component(name),
-            detail.prerelease_count
+            registry_type, detail_link_name, detail.prerelease_count
         )
     } else {
         String::new()
@@ -1146,9 +1279,7 @@ pub fn render_package_detail(
     let show_all_link = if detail.total_stable > detail.versions.len() {
         format!(
             r##"<a href="/ui/{}/{}?all=true" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700">Show all {} stable versions</a>"##,
-            registry_type,
-            encode_uri_component(name),
-            detail.total_stable
+            registry_type, detail_link_name, detail.total_stable
         )
     } else {
         String::new()
@@ -1195,6 +1326,11 @@ pub fn render_package_detail(
             "echo 'deb [trusted=yes] {}/deb/{} ./' | sudo tee /etc/apt/sources.list.d/nora-{}.list && sudo apt-get update",
             base_url, name, name
         ),
+        Some(RegistryType::Cpan) => {
+            let distribution = name.rsplit('/').next().unwrap_or(name);
+            let package_name = distribution.replace('-', "::");
+            format!("cpanm --from {}/cpan {}", base_url, package_name)
+        }
         _ => String::new(),
     };
 
@@ -1259,11 +1395,12 @@ pub fn render_package_detail(
         )
     };
 
-    let detail_title = if rt == Some(RegistryType::Raw) && name.contains('/') {
-        html_escape(name.rsplit('/').next().unwrap_or(name))
-    } else {
-        html_escape(name)
-    };
+    let detail_title =
+        if matches!(rt, Some(RegistryType::Raw | RegistryType::Cpan)) && name.contains('/') {
+            html_escape(name.rsplit('/').next().unwrap_or(name))
+        } else {
+            html_escape(name)
+        };
 
     // Total versions displayed in header
     let display_total = if detail.total_stable > 0 {
@@ -1752,6 +1889,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         Some(RegistryType::Conan) => icons::CONAN,
         Some(RegistryType::Rpm) => icons::RPM,
         Some(RegistryType::Deb) => icons::DEB,
+        Some(RegistryType::Cpan) => icons::CPAN,
         None => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
         }
@@ -1775,6 +1913,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         Some(RegistryType::Conan) => "Conan (C/C++)",
         Some(RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(RegistryType::Deb) => "Debian (APT)",
+        Some(RegistryType::Cpan) => "CPAN",
         None => "Registry",
     }
 }
@@ -1968,6 +2107,19 @@ mod tests {
         assert!(
             html.contains("https://registry.example.com/raw"),
             "Raw download command must use public_url"
+        );
+
+        let html = render_package_detail(
+            "cpan",
+            "H/HI/HIDEAKIO/Module-Build-XSUtil",
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
+        assert!(
+            html.contains("cpanm --from https://registry.example.com/cpan Module::Build::XSUtil"),
+            "CPAN install command must use public_url and a module name"
         );
     }
 

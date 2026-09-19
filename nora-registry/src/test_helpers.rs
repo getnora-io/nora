@@ -213,6 +213,7 @@ fn build_context_with(
             enabled: true,
             ..crate::config::DebConfig::default()
         },
+        cpan: crate::config::CpanConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
             anonymous_read,
@@ -388,6 +389,9 @@ fn build_context_with(
             }
             crate::registry_type::RegistryType::Deb => {
                 registry_routes = registry_routes.merge(registry::deb_routes());
+            }
+            crate::registry_type::RegistryType::Cpan => {
+                registry_routes = registry_routes.merge(registry::cpan_routes());
             }
         }
     }

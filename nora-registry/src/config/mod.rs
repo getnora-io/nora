@@ -148,6 +148,8 @@ pub struct Config {
     #[serde(default)]
     pub deb: DebConfig,
     #[serde(default)]
+    pub cpan: CpanConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -256,6 +258,7 @@ impl Config {
                 RegistryType::Conan => self.conan.enabled = on,
                 RegistryType::Rpm => self.rpm.enabled = on,
                 RegistryType::Deb => self.deb.enabled = on,
+                RegistryType::Cpan => self.cpan.enabled = on,
             }
         }
     }
@@ -308,6 +311,9 @@ impl Config {
         if self.deb.enabled {
             set.insert(RegistryType::Deb);
         }
+        if self.cpan.enabled {
+            set.insert(RegistryType::Cpan);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -340,6 +346,7 @@ impl Config {
             RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
             RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
+            RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
         }
     }
 
@@ -375,6 +382,7 @@ impl Config {
             // Raw is hosted-only: no curation override, no quarantine gate in
             // its handlers (quarantine gates proxy downloads).
             RegistryType::Raw => return QuarantineMode::Off,
+            RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -532,6 +540,7 @@ impl Config {
             ("nuget", self.nuget.proxy.as_deref()),
             ("pub", self.pub_dart.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
+            ("cpan", self.cpan.proxy.as_deref()),
         ];
         for (name, url) in simple {
             if let Some(url) = url {
@@ -1053,6 +1062,7 @@ impl Config {
         self.conan.apply_env_overrides();
         self.rpm.apply_env_overrides();
         self.deb.apply_env_overrides();
+        self.cpan.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -1146,6 +1156,7 @@ mod tests {
         assert!(!config.auth.enabled);
         assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
         assert_eq!(config.auth.token_storage, "data/tokens");
+        assert!(!config.cpan.enabled, "CPAN defaults to disabled");
     }
 
     #[test]
@@ -1676,6 +1687,7 @@ mod tests {
         assert_serde_default_eq_default::<ConanConfig>("conan");
         assert_serde_default_eq_default::<RpmConfig>("rpm");
         assert_serde_default_eq_default::<DebConfig>("deb");
+        assert_serde_default_eq_default::<CpanConfig>("cpan");
         assert_serde_default_eq_default::<SigningConfig>("signing");
 
         // Whole-Config fallback agrees with deserializing an empty file.
@@ -2551,6 +2563,7 @@ mod tests {
             &mut config.curation.conan,
             &mut config.curation.rpm,
             &mut config.curation.deb,
+            &mut config.curation.cpan,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }

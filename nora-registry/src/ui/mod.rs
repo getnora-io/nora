@@ -149,6 +149,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/rpm/{name}", get(generic_registry_detail))
         .route("/ui/deb", get(generic_registry_list))
         .route("/ui/deb/{name}", get(generic_registry_detail))
+        .route("/ui/cpan", get(cpan_browse_root))
+        .route("/ui/cpan/{*path}", get(cpan_browse))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -691,6 +693,7 @@ async fn generic_registry_list(
         Some(crate::registry_type::RegistryType::Conan) => "Conan (C/C++)",
         Some(crate::registry_type::RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
+        Some(crate::registry_type::RegistryType::Cpan) => "CPAN",
         _ => registry_key,
     };
 
@@ -753,6 +756,102 @@ async fn generic_registry_detail(
         &base_url,
         auth_enabled,
     ))
+}
+
+// CPAN hierarchical browsing (author prefix → author → distribution)
+async fn cpan_browse_root(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+
+    let entries = api::get_cpan_dir_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_cpan_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn cpan_browse(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let auth_enabled = state.auth.is_some();
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match segments.len() {
+        // /ui/cpan/L or /ui/cpan/LC or /ui/cpan/LCONS → list directory contents
+        0..=3 => {
+            let entries = api::get_cpan_dir_listing(&state.storage, &path).await;
+            let total = entries.len();
+            Html(templates::render_cpan_dir(
+                &path,
+                &entries,
+                total,
+                lang,
+                auth_enabled,
+            ))
+            .into_response()
+        }
+        // Preserve old file-shaped links, but make the distribution URL
+        // canonical so all cached releases share one detail page.
+        _ => {
+            let filename = path.rsplit('/').next().unwrap_or(&path);
+            if let Some((distribution, _)) =
+                crate::registry::cpan::parse_dist_archive_filename(filename)
+            {
+                let author_path = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                let encoded_author_path = author_path
+                    .split('/')
+                    .map(templates::encode_uri_component)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let location = format!(
+                    "/ui/cpan/{}/{}",
+                    encoded_author_path,
+                    templates::encode_uri_component(distribution)
+                );
+                return Redirect::permanent(&location).into_response();
+            }
+
+            let base_url = resolve_base_url(&state);
+            let show_prerelease = query.prerelease.unwrap_or(false);
+            let show_all = query.all.unwrap_or(false);
+            let detail =
+                api::get_cpan_detail(&state.storage, &path, show_prerelease, show_all).await;
+            Html(templates::render_package_detail(
+                "cpan",
+                &path,
+                &detail,
+                lang,
+                &base_url,
+                auth_enabled,
+            ))
+            .into_response()
+        }
+    }
 }
 
 // Ansible Galaxy hierarchical browsing (namespace → collection → versions)

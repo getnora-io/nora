@@ -91,6 +91,7 @@ mod repo_proxy_tests {
 mod ansible;
 mod cargo;
 mod conan;
+mod cpan;
 mod deb;
 mod docker;
 mod gems;
@@ -107,6 +108,7 @@ mod terraform;
 pub use self::ansible::AnsibleConfig;
 pub use self::cargo::CargoConfig;
 pub use self::conan::ConanConfig;
+pub use self::cpan::CpanConfig;
 pub use self::deb::DebConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
 #[allow(unused_imports)]

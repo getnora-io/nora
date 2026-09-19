@@ -55,7 +55,7 @@ echo ""
 
 echo "--- Registry List ---"
 # Source of truth: Router mounts in main.rs or lib.rs
-EXPECTED_REGISTRIES="docker maven npm cargo pypi go raw gems terraform ansible nuget pub conan rpm deb"
+EXPECTED_REGISTRIES="docker maven npm cargo pypi go raw gems terraform ansible nuget pub conan rpm deb cpan"
 
 for reg in $EXPECTED_REGISTRIES; do
     # Check README mentions it

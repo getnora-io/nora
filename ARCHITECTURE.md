@@ -4,7 +4,7 @@ This document describes the high-level architecture of NORA, a multi-protocol
 artifact registry. It is intended for contributors who want to understand the
 codebase and for operators evaluating NORA for production use.
 
-NORA is a single Rust binary (~42k lines of production code) that implements up to 13
+NORA is a single Rust binary (~42k lines of production code) that implements up to 16
 registry protocols over one HTTP port. It is a registry — it provides
 protocol-compliant interfaces for package managers (docker, npm, cargo,
 pip, etc.), not a storage system. There is no database, no JVM, no
@@ -55,7 +55,7 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
    │   Docker    │           │     Maven     │   ...    │    Debian     │
-   │  /v2/*      │           │  /maven2/*    │  (x15)   │    /deb/*     │
+   │  /v2/*      │           │  /maven2/*    │  (x16)   │    /deb/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -154,6 +154,7 @@ nora/
 │   │   ├── nuget.rs         #   NuGet v3 (service index)
 │   │   ├── pub_dart.rs      #   Pub (Dart/Flutter)
 │   │   ├── conan.rs         #   Conan v2 (revisions API)
+│   │   ├── cpan.rs          #   CPAN (Perl Archive)
 │   │   ├── rpm.rs           #   RPM hosted repos (server-generated repodata)
 │   │   ├── deb.rs           #   Debian/APT flat repos (server-generated indexes)
 │   │   └── mod.rs           #   Re-exports: docker_routes(), maven_routes(), ...
@@ -237,7 +238,7 @@ is available to handlers.
 
 ### ADR-1: Single Binary
 
-**Decision:** NORA ships as one statically-linked binary. All 15 registry
+**Decision:** NORA ships as one statically-linked binary. All 16 registry
 handlers, the UI, the curation engine, and the CLI tools are compiled into
 a single executable.
 
@@ -373,8 +374,8 @@ Mounting all routes unconditionally wastes memory and widens the attack
 surface.
 
 **Rationale:** The original 7 formats (Docker, Maven, npm, Cargo, PyPI,
-Go, Raw) default to enabled for backward compatibility. The 8 newer
-formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, RPM, Debian)
+Go, Raw) default to enabled for backward compatibility. The 9 newer
+formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, CPAN, RPM, Debian)
 default to disabled. Any combination is valid — you can run NORA with only Docker
 and PyPI by setting `NORA_MAVEN_ENABLED=false`, `NORA_NPM_ENABLED=false`,
 etc. The `RegistryType::all()` iterator and `enabled_registries()` method

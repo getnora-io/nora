@@ -22,7 +22,7 @@ use crate::AppState;
     info(
         title = "Nora",
         version = "1.3.1",
-        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, RPM, and Debian",
+        description = "Multi-protocol package registry supporting Docker, Maven, npm, Cargo, PyPI, Go, Raw, RubyGems, Terraform, Ansible, NuGet, pub.dev, Conan, RPM, Debian, and CPAN",
         license(name = "MIT"),
         contact(name = "The NORA Authors", url = "https://getnora.dev")
     ),
@@ -48,6 +48,7 @@ use crate::AppState;
         (name = "conan", description = "Conan V2 Registry Proxy API (C/C++)"),
         (name = "rpm", description = "RPM (yum/dnf) Hosted & Pull-Through Repository API"),
         (name = "deb", description = "Debian (APT) Hosted & Pull-Through Repository API"),
+        (name = "cpan", description = "CPAN (Perl Archive) Proxy API"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
@@ -128,6 +129,9 @@ use crate::AppState;
         crate::openapi::deb_delete,
         crate::openapi::deb_pubkey,
         crate::openapi::deb_reindex,
+        // CPAN
+        crate::openapi::cpan_index,
+        crate::openapi::cpan_download,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1262,6 +1266,35 @@ pub async fn deb_pubkey() {}
     )
 )]
 pub async fn deb_reindex() {}
+
+// -------------------- CPAN --------------------
+
+/// CPAN package index (02packages.details.txt.gz)
+#[utoipa::path(
+    get,
+    path = "/cpan/modules/02packages.details.txt.gz",
+    tag = "cpan",
+    responses(
+        (status = 200, description = "Package index (gzipped)", content_type = "application/gzip"),
+        (status = 502, description = "Upstream unavailable"),
+    ),
+)]
+pub async fn cpan_index() {}
+
+/// Download CPAN distribution file
+#[utoipa::path(
+    get,
+    path = "/cpan/authors/id/{path}",
+    tag = "cpan",
+    params(
+        ("path" = String, Path, description = "Distribution path"),
+    ),
+    responses(
+        (status = 200, description = "Distribution file", content_type = "application/octet-stream"),
+        (status = 404, description = "Not found"),
+    ),
+)]
+pub async fn cpan_download() {}
 
 // -------------------- Auth / Tokens --------------------
 

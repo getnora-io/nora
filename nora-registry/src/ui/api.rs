@@ -37,6 +37,7 @@ pub struct RegistryStats {
     pub conan: usize,
     pub rpm: usize,
     pub deb: usize,
+    pub cpan: usize,
 }
 
 #[derive(Serialize)]
@@ -178,6 +179,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         conan: get(RegistryType::Conan),
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
+        cpan: get(RegistryType::Cpan),
     })
 }
 
@@ -257,6 +259,7 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
+                RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
             }
         } else {
             vec![]
@@ -1107,6 +1110,9 @@ pub async fn get_generic_detail(
         Some(RegistryType::Ansible) => {
             get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await
         }
+        Some(RegistryType::Cpan) => {
+            get_cpan_detail(storage, &name_lower, show_prerelease, show_all).await
+        }
         _ => {
             get_storage_scan_detail(storage, registry, &name_lower, show_prerelease, show_all).await
         }
@@ -1618,6 +1624,149 @@ async fn get_ansible_detail(
     }
 }
 
+/// List subdirectories/files at a CPAN path level under cpan/authors/id/
+pub async fn get_cpan_dir_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
+    let prefix = if path.is_empty() {
+        "cpan/authors/id/".to_string()
+    } else {
+        format!("cpan/authors/id/{}/", path.trim_end_matches('/'))
+    };
+    let keys = storage.list(&prefix).await.unwrap_or_default();
+    if keys.is_empty() {
+        return vec![];
+    }
+
+    // At the author level, collapse release archives into distributions. CPAN
+    // stores every version in the same directory alongside CHECKSUMS, .meta and
+    // .readme files; those sidecars are not separate artifacts in the UI.
+    if path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+        == 3
+    {
+        let mut distributions: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for key in &keys {
+            let Some(filename) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if filename.contains('/') {
+                continue;
+            }
+            if let Some((distribution, version)) =
+                crate::registry::cpan::parse_dist_archive_filename(filename)
+            {
+                distributions
+                    .entry(distribution.to_string())
+                    .or_default()
+                    .insert(version.to_string());
+            }
+        }
+
+        let mut result: Vec<RepoInfo> = distributions
+            .into_iter()
+            .map(|(name, versions)| RepoInfo {
+                name,
+                versions: versions.len(),
+                ..Default::default()
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        return result;
+    }
+
+    let mut entries: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            let next_segment = rest.split('/').next().unwrap_or(rest);
+            if next_segment.is_empty() {
+                continue;
+            }
+            let entry = entries.entry(next_segment.to_string()).or_insert((0, 0, 0));
+            entry.0 += 1;
+        }
+    }
+
+    let mut result: Vec<RepoInfo> = entries
+        .into_iter()
+        .map(|(name, (count, _, _))| RepoInfo {
+            name,
+            versions: count,
+            ..Default::default()
+        })
+        .collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result
+}
+
+/// CPAN detail: list cached releases for one distribution.
+/// `name` is the full relative path like `L/LC/LCONS/Net-STOMP-Client`.
+pub async fn get_cpan_detail(
+    storage: &Storage,
+    name: &str,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
+    let Some((author_path, distribution)) = name.rsplit_once('/') else {
+        return PackageDetail {
+            versions: vec![],
+            prerelease_count: 0,
+            total_stable: 0,
+            metadata: PackageMetadata::default(),
+        };
+    };
+    let prefix = format!("cpan/authors/id/{author_path}/");
+    let files = storage.list_with_meta(&prefix).await.unwrap_or_default();
+    let mut by_version: HashMap<String, (u64, u64)> = HashMap::new();
+
+    for (key, file_meta) in files {
+        let Some(filename) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if filename.contains('/') {
+            continue;
+        }
+        let Some((candidate, version)) =
+            crate::registry::cpan::parse_dist_archive_filename(filename)
+        else {
+            continue;
+        };
+        if candidate != distribution {
+            continue;
+        }
+
+        // A release can occasionally exist in more than one archive format.
+        // Show one version row and retain the largest archive's size.
+        let entry = by_version
+            .entry(version.to_string())
+            .or_insert((file_meta.size, file_meta.modified));
+        if file_meta.size > entry.0 {
+            entry.0 = file_meta.size;
+        }
+        entry.1 = entry.1.max(file_meta.modified);
+    }
+
+    let mut versions: Vec<VersionInfo> = by_version
+        .into_iter()
+        .map(|(version, (size, modified))| VersionInfo {
+            version,
+            size,
+            published: format_timestamp(modified),
+            cached: true,
+        })
+        .collect();
+    versions.sort_by(|a, b| b.version.cmp(&a.version));
+    let (versions, prerelease_count, total_stable) =
+        apply_cpan_release_filter(versions, show_prerelease, show_all);
+    PackageDetail {
+        versions,
+        prerelease_count,
+        total_stable,
+        metadata: PackageMetadata::default(),
+    }
+}
+
 /// Fallback: scan storage for files matching {registry}/{name}/*
 async fn get_storage_scan_detail(
     storage: &Storage,
@@ -1735,6 +1884,63 @@ fn apply_prerelease_filter(
         versions.truncate(20);
     }
 
+    (versions, prerelease_count, total_stable)
+}
+
+/// CPAN developer releases follow different rules from semver prereleases.
+/// This mirrors the general cases in CPAN::DistnameInfo: `-TRIAL` and a
+/// developer underscore after a dotted/nonnumeric separator. Plain historical
+/// versions such as `0_06` and release labels such as `1.30-OpenSource` remain
+/// ordinary releases.
+fn is_cpan_developer_version(version: &str) -> bool {
+    if version.contains("-TRIAL") {
+        return true;
+    }
+
+    let bytes = version.as_bytes();
+    for start in 0..bytes.len() {
+        if !bytes[start].is_ascii_digit() || start + 3 >= bytes.len() {
+            continue;
+        }
+        let mut cursor = start + 1;
+        if bytes[cursor].is_ascii_digit() {
+            continue;
+        }
+        cursor += 1;
+        let digits_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits_start
+            && cursor + 1 < bytes.len()
+            && bytes[cursor] == b'_'
+            && bytes[cursor + 1].is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn apply_cpan_release_filter(
+    mut versions: Vec<VersionInfo>,
+    show_prerelease: bool,
+    show_all: bool,
+) -> (Vec<VersionInfo>, usize, usize) {
+    let prerelease_count = versions
+        .iter()
+        .filter(|v| is_cpan_developer_version(&v.version))
+        .count();
+    if !show_prerelease {
+        versions.retain(|v| !is_cpan_developer_version(&v.version));
+    }
+    let total_stable = versions
+        .iter()
+        .filter(|v| !is_cpan_developer_version(&v.version))
+        .count();
+    if !show_prerelease && !show_all && versions.len() > 20 {
+        versions.truncate(20);
+    }
     (versions, prerelease_count, total_stable)
 }
 
