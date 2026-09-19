@@ -460,7 +460,7 @@ async fn download_tarball(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "ansible", ""));
 
             state.spawn_cache_immutable("ansible", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -626,7 +626,7 @@ async fn proxy_json(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "ansible", ""));
 
             // Cache raw response (before URL rewriting) for serve-stale; the
             // validator sidecar is written AFTER the body so it never advertises

@@ -42,6 +42,17 @@ use std::time::Instant;
 
 use crate::AppState;
 
+/// Resolve the audit actor for a request-driven event (#985): the authenticated
+/// username, or `anonymous` when the request carries no identity. Write handlers
+/// take `user: Option<axum::Extension<AuthenticatedUser>>` (which never fails to
+/// extract) and pass this to `AuditEntry::new` instead of a hardcoded actor.
+pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
+    match user {
+        Some(axum::Extension(AuthenticatedUser(name))) => name,
+        None => "anonymous",
+    }
+}
+
 /// Tracks failed authentication attempts per IP for brute-force protection.
 ///
 /// After `max_failures` consecutive failures, the IP is locked out with
@@ -649,6 +660,21 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_actor_resolves_user_or_anonymous() {
+        // #985 — the audit actor is the authenticated username (whatever auth
+        // transport set AuthenticatedUser: API token or Basic-auth), or
+        // `anonymous` when the request carries no identity.
+        let token_user = Some(axum::Extension(AuthenticatedUser("ci-bot".to_string())));
+        assert_eq!(audit_actor(&token_user), "ci-bot");
+
+        let basic_user = Some(axum::Extension(AuthenticatedUser("alice".to_string())));
+        assert_eq!(audit_actor(&basic_user), "alice");
+
+        let anonymous: Option<axum::Extension<AuthenticatedUser>> = None;
+        assert_eq!(audit_actor(&anonymous), "anonymous");
+    }
 
     #[test]
     fn test_public_path_classification() {

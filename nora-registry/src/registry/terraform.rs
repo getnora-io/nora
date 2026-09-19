@@ -204,7 +204,7 @@ async fn provider_versions(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
             state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())
@@ -339,7 +339,7 @@ async fn provider_download_meta(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
             state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
             with_json(strip_nora_internal_fields(rewritten.as_bytes()))
@@ -473,7 +473,7 @@ async fn provider_download_binary(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
             // Immutable cache
             state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
@@ -594,7 +594,7 @@ async fn module_versions(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "terraform", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "terraform", ""));
 
             state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
             with_json(text.into_bytes())

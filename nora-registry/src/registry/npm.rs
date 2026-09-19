@@ -135,7 +135,7 @@ async fn handle_npm_post(
         Ok((code, resp_body, resp_ct)) => {
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "npm", "audit"));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", "audit"));
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
             let ct = resp_ct
                 .as_deref()
@@ -532,7 +532,7 @@ async fn handle_request(
         ));
         state
             .audit
-            .log(AuditEntry::new("cache_hit", "api", "", "npm", ""));
+            .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "npm",
@@ -662,7 +662,7 @@ async fn handle_request(
                     ));
                     state
                         .audit
-                        .log(AuditEntry::new("proxy_fetch", "api", "", "npm", ""));
+                        .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", ""));
 
                     data_to_cache = data.clone();
                     data_to_serve = data;
@@ -891,6 +891,7 @@ async fn handle_publish(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
     let package_name = path;
@@ -1142,9 +1143,13 @@ async fn handle_publish(
     }
 
     state.metrics.record_upload("npm");
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", &package_name, "npm", ""));
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &package_name,
+        "npm",
+        "",
+    ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         package_name,
@@ -1834,6 +1839,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("@other/pkg".to_string()),
             Extension(scoped.clone()),
+            None,
             Bytes::from_static(b"{}"),
         )
         .await;
@@ -1844,6 +1850,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("@myorg/pkg".to_string()),
             Extension(scoped),
+            None,
             Bytes::from_static(b"{}"),
         )
         .await;
@@ -2149,6 +2156,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("@scope/mypkg".to_string()),
             Extension(NamespaceAuthority::Unrestricted),
+            None,
             Bytes::from(body_bytes),
         )
         .await;

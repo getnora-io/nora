@@ -643,6 +643,7 @@ async fn upload(
     Path((repo, path)): Path<(String, String)>,
     Query(query): Query<PublishQuery>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
     if !state.config.deb.enabled {
@@ -721,9 +722,13 @@ async fn upload(
 
     let nva = format!("{}_{}_{}", record.package, record.version, record.arch);
     state.metrics.record_upload("deb");
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", &nva, "deb", ""));
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &nva,
+        "deb",
+        "",
+    ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         format!("{repo}/{nva}"),
@@ -885,6 +890,7 @@ async fn delete_package(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
     if !state.config.deb.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -928,9 +934,13 @@ async fn delete_package(
             .into_response();
     }
 
-    state
-        .audit
-        .log(AuditEntry::new("delete", "api", &path, "deb", ""));
+    state.audit.log(AuditEntry::new(
+        "delete",
+        crate::auth::audit_actor(&user),
+        &path,
+        "deb",
+        "",
+    ));
     state.repo_index.invalidate("deb");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -947,6 +957,7 @@ async fn reindex(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
     if !state.config.deb.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -1041,9 +1052,13 @@ async fn reindex(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    state
-        .audit
-        .log(AuditEntry::new("reindex", "api", &repo, "deb", ""));
+    state.audit.log(AuditEntry::new(
+        "reindex",
+        crate::auth::audit_actor(&user),
+        &repo,
+        "deb",
+        "",
+    ));
     state.repo_index.invalidate("deb");
 
     (
@@ -1592,6 +1607,7 @@ mod integration_tests {
             axum::extract::Path(("otherrepo".to_string(), "x.deb".to_string())),
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::body::Bytes::from(build_test_deb("x", "1.0")),
         )
         .await;
@@ -1603,6 +1619,7 @@ mod integration_tests {
             axum::extract::Path(("myrepo".to_string(), "x.deb".to_string())),
             axum::extract::Query(super::PublishQuery::default()),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::body::Bytes::from(build_test_deb("x", "1.0")),
         )
         .await;
@@ -1612,6 +1629,7 @@ mod integration_tests {
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("otherrepo".to_string(), "x.deb".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);

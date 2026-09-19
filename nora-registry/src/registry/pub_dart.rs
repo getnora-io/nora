@@ -580,7 +580,7 @@ async fn download_archive(
         ));
         state
             .audit
-            .log(AuditEntry::new("pull", "api", "", "pub", ""));
+            .log(AuditEntry::new("pull", "proxy", "", "pub", ""));
         return archive_response(data.to_vec());
     }
 
@@ -641,7 +641,7 @@ async fn download_archive(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "pub", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "pub", ""));
 
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
                 state.config.curation.pub_dart.quarantine.as_ref().or(state

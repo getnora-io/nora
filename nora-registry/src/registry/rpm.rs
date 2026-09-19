@@ -688,6 +688,7 @@ async fn upload(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
     if !state.config.rpm.enabled {
@@ -785,9 +786,13 @@ async fn upload(
         record.name, record.version, record.release, record.arch
     );
     state.metrics.record_upload("rpm");
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", &nevra, "rpm", ""));
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &nevra,
+        "rpm",
+        "",
+    ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         format!("{repo}/{nevra}"),
@@ -947,6 +952,7 @@ async fn delete_package(
     State(state): State<AppState>,
     Path((repo, path)): Path<(String, String)>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -990,9 +996,13 @@ async fn delete_package(
             .into_response();
     }
 
-    state
-        .audit
-        .log(AuditEntry::new("delete", "api", &path, "rpm", ""));
+    state.audit.log(AuditEntry::new(
+        "delete",
+        crate::auth::audit_actor(&user),
+        &path,
+        "rpm",
+        "",
+    ));
     state.repo_index.invalidate("rpm");
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1007,6 +1017,7 @@ async fn reindex(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
     if !state.config.rpm.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -1124,9 +1135,13 @@ async fn reindex(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    state
-        .audit
-        .log(AuditEntry::new("reindex", "api", &repo, "rpm", ""));
+    state.audit.log(AuditEntry::new(
+        "reindex",
+        crate::auth::audit_actor(&user),
+        &repo,
+        "rpm",
+        "",
+    ));
     state.repo_index.invalidate("rpm");
 
     (
@@ -1676,6 +1691,7 @@ mod integration_tests {
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("otherrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::body::Bytes::from(build_test_rpm("x", "1.0")),
         )
         .await;
@@ -1687,6 +1703,7 @@ mod integration_tests {
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("myrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::body::Bytes::from(build_test_rpm("x", "1.0")),
         )
         .await;
@@ -1697,6 +1714,7 @@ mod integration_tests {
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path(("otherrepo".to_string(), "x.rpm".to_string())),
             axum::Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2050,6 +2068,7 @@ mod reindex_tests {
             axum::extract::State(ctx.state.clone()),
             axum::extract::Path("myrepo".to_string()),
             axum::Extension(scoped),
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);

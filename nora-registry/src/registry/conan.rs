@@ -524,7 +524,7 @@ async fn recipe_file_download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
@@ -957,7 +957,7 @@ async fn package_file_download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
 
             // Immutable cache
             state.spawn_cache_immutable("conan", storage_key, Bytes::from(bytes.clone()));
@@ -1070,7 +1070,7 @@ async fn fetch_and_cache_json(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
 
             let raw = Bytes::from(body);
             let storage = state.storage.clone();
@@ -1157,7 +1157,7 @@ async fn fetch_and_cache_immutable_json(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "conan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "conan", ""));
 
             state.spawn_cache_immutable(
                 "conan",

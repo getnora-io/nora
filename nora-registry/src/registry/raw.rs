@@ -164,7 +164,7 @@ async fn download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("pull", "api", "", "raw", ""));
+                .log(AuditEntry::new("pull", "proxy", "", "raw", ""));
 
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
@@ -339,6 +339,7 @@ async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
@@ -469,7 +470,16 @@ async fn upload(
 
         // If-Match: * → update only if resource exists
         (true, _, Some("*")) => {
-            return do_overwrite(&state, &key, &path, &temp_path, &sha256, &mut temp_guard).await;
+            return do_overwrite(
+                &state,
+                &key,
+                &path,
+                &temp_path,
+                &sha256,
+                &mut temp_guard,
+                crate::auth::audit_actor(&user),
+            )
+            .await;
         }
         (false, _, Some("*")) => {
             return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
@@ -488,6 +498,7 @@ async fn upload(
                             &temp_path,
                             &sha256,
                             &mut temp_guard,
+                            crate::auth::audit_actor(&user),
                         )
                         .await;
                     }
@@ -517,9 +528,13 @@ async fn upload(
         Ok(()) => {
             temp_guard.disarm();
             state.metrics.record_upload("raw");
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", &path, "raw", ""));
+            state.audit.log(AuditEntry::new(
+                "push",
+                crate::auth::audit_actor(&user),
+                &path,
+                "raw",
+                "",
+            ));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 path,
@@ -544,6 +559,7 @@ async fn do_overwrite(
     temp_path: &std::path::Path,
     sha256: &str,
     temp_guard: &mut TempFileGuard,
+    actor: &str,
 ) -> Response {
     // put_from_path overwrites in place on both backends, avoiding the 404
     // window that delete-then-put created for concurrent readers.
@@ -563,7 +579,7 @@ async fn do_overwrite(
             ));
             state
                 .audit
-                .log(AuditEntry::new("overwrite", "api", path, "raw", ""));
+                .log(AuditEntry::new("overwrite", actor, path, "raw", ""));
             state.repo_index.invalidate("raw");
             StatusCode::OK.into_response()
         }
@@ -578,6 +594,7 @@ async fn delete_file(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
 ) -> Response {
     if !state.config.raw.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -594,9 +611,13 @@ async fn delete_file(
     }
     match state.storage.delete(&key).await {
         Ok(()) => {
-            state
-                .audit
-                .log(AuditEntry::new("delete", "api", &path, "raw", ""));
+            state.audit.log(AuditEntry::new(
+                "delete",
+                crate::auth::audit_actor(&user),
+                &path,
+                "raw",
+                "",
+            ));
             state.repo_index.invalidate("raw");
             StatusCode::NO_CONTENT.into_response()
         }
@@ -808,6 +829,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("other/secret.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::http::HeaderMap::new(),
             Body::from(&b"x"[..]),
         )
@@ -820,6 +842,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("myorg/app/file.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
             axum::http::HeaderMap::new(),
             Body::from(&b"x"[..]),
         )
@@ -831,6 +854,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("other/secret.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Enforce)),
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -840,6 +864,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("elsewhere/a.txt".to_string()),
             Extension(scoped(ScopeEnforcement::Audit)),
+            None,
             axum::http::HeaderMap::new(),
             Body::from(&b"x"[..]),
         )

@@ -107,7 +107,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "cpan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "cpan", ""));
             state.spawn_cache("cpan", storage_key, Bytes::from(bytes.clone()));
             with_index_response(bytes)
         }
@@ -222,7 +222,7 @@ async fn distribution_proxy(
         ));
         state
             .audit
-            .log(AuditEntry::new("cache_hit", "api", "", "cpan", ""));
+            .log(AuditEntry::new("cache_hit", "proxy", "", "cpan", ""));
         if let Some(resp) = crate::digest_quarantine::proxy_gate(
             &state.digest_store,
             "cpan",
@@ -274,7 +274,7 @@ async fn distribution_proxy(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "cpan", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "cpan", ""));
             state.spawn_cache_immutable("cpan", storage_key, Bytes::from(bytes.clone()));
             if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,

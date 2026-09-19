@@ -321,7 +321,7 @@ async fn handle(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "go", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "go", ""));
 
             // Background cache: immutable = put_if_absent, mutable = always overwrite
             if is_immutable {
