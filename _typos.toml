@@ -10,6 +10,8 @@ registr = "registr"
 NLY = "NLY"
 # intentional typo in test_audit_mode_rejects_invalid (audit.rs)
 flie = "flie"
+# "unparseable" is a valid English spelling (alongside "unparsable")
+unparseable = "unparseable"
 
 [files]
 extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]
