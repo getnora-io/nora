@@ -408,11 +408,79 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     true
 }
 
+/// Classify a [`OidcValidator::validate_token`] rejection string into a bounded
+/// reason label for metrics/logs (#994). The caller still logs the full string;
+/// this only buckets it so `nora_auth_oidc_rejected_total{reason}` stays
+/// low-cardinality (no issuer/subject/provider in the label).
+pub fn classify_rejection(reason: &str) -> &'static str {
+    if reason.starts_with("OIDC not enabled") {
+        "disabled"
+    } else if reason.starts_with("No matching OIDC provider") {
+        "no_provider"
+    } else if reason.starts_with("Token lifetime") {
+        "lifetime_exceeded"
+    } else if reason.starts_with("No role rule matches") {
+        "no_role_rule"
+    } else if reason.starts_with("Symmetric algorithms") || reason.starts_with("Algorithm ") {
+        "algorithm"
+    } else if reason.contains("JWK") {
+        // JWKS fetch/endpoint/key errors ("...JWK...", "JWKS ..."); checked
+        // before jwt_invalid because none of those strings contain "JWK".
+        "jwks"
+    } else if reason.starts_with("Invalid JWT header")
+        || reason.starts_with("Cannot decode claims")
+        || reason.starts_with("JWT validation failed")
+    {
+        "jwt_invalid"
+    } else {
+        "other"
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::config::{OidcProvider, OidcRoleRule};
+
+    #[test]
+    fn classify_rejection_buckets_each_real_reason() {
+        // #994 — the exact strings validate_token returns must each map to a
+        // distinct, bounded reason, not collapse to "other".
+        assert_eq!(classify_rejection("OIDC not enabled"), "disabled");
+        assert_eq!(
+            classify_rejection("No matching OIDC provider for issuer: https://gitlab.example/"),
+            "no_provider",
+        );
+        assert_eq!(
+            classify_rejection("Token lifetime 3600 exceeds max 900 for provider gitlab"),
+            "lifetime_exceeded",
+        );
+        assert_eq!(
+            classify_rejection(
+                "No role rule matches sub='project_path:acme/app' for provider gitlab"
+            ),
+            "no_role_rule",
+        );
+        assert_eq!(
+            classify_rejection("Symmetric algorithms not allowed for OIDC"),
+            "algorithm",
+        );
+        assert_eq!(
+            classify_rejection("Algorithm HS256 not in provider whitelist: [\"RS256\"]"),
+            "algorithm",
+        );
+        assert_eq!(
+            classify_rejection("JWT validation failed: InvalidAudience"),
+            "jwt_invalid",
+        );
+        assert_eq!(classify_rejection("Cannot build key from JWK: bad"), "jwks");
+        assert_eq!(
+            classify_rejection("JWKS fetch failed for gitlab: timeout"),
+            "jwks",
+        );
+        assert_eq!(classify_rejection("an unmapped failure"), "other");
+    }
 
     #[test]
     fn test_glob_match_exact() {

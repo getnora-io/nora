@@ -498,8 +498,15 @@ pub async fn auth_middleware(
                             .insert(AuthenticatedRole(identity.role));
                         return next.run(request).await;
                     }
-                    Err(_) => {
-                        // OIDC also failed
+                    Err(reason) => {
+                        // #994 — surface *why* OIDC rejected the token: a bounded
+                        // metric bucket for alerting plus the full reason in a warn
+                        // log (never the token). Without this a lifetime ceiling, a
+                        // wrong audience and a missing role rule are indistinguishable.
+                        crate::metrics::record_oidc_rejection(
+                            crate::auth::oidc::classify_rejection(&reason),
+                        );
+                        tracing::warn!(reason = %reason, "OIDC authentication rejected");
                     }
                 }
             }
