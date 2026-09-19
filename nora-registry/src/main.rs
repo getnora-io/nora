@@ -1387,6 +1387,16 @@ async fn run_server(mut config: Config, storage: Storage) {
                 info!(users = auth.list_users().len(), "Auth enabled");
                 Some(auth)
             }
+            None if config.auth.oidc.is_active() => {
+                // #996 — OIDC-only is the intended setup; a missing htpasswd is
+                // not a misconfiguration, so log at info rather than a warning
+                // that trains operators to ignore auth warnings.
+                info!(
+                    oidc_providers = config.auth.oidc.providers.len(),
+                    "Basic auth disabled (no htpasswd); OIDC is the write path"
+                );
+                None
+            }
             None => {
                 warn!(file = %config.auth.htpasswd_file, "Auth enabled but htpasswd file not found or empty");
                 None

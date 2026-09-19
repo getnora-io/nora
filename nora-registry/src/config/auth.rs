@@ -289,6 +289,15 @@ impl Default for OidcConfig {
     }
 }
 
+impl OidcConfig {
+    /// OIDC is a usable write path: enabled with at least one provider. When
+    /// true, a missing htpasswd is the intended (OIDC-only) setup, not a
+    /// misconfiguration to warn about (#996).
+    pub fn is_active(&self) -> bool {
+        self.enabled && !self.providers.is_empty()
+    }
+}
+
 /// A single OIDC identity provider (e.g., GitHub Actions, GitLab CI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcProvider {
@@ -455,5 +464,33 @@ impl AuthConfig {
         if let Ok(val) = env::var("NORA_AUTH_TOKEN_STORAGE") {
             self.token_storage = val;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oidc_config_is_active_only_with_enabled_and_a_provider() {
+        // #996 — is_active decides whether a missing htpasswd is the intended
+        // OIDC-only setup (info) or a misconfiguration (warn).
+        let mut cfg = OidcConfig::default();
+        assert!(!cfg.is_active(), "default (disabled) must not be active");
+
+        cfg.enabled = true;
+        assert!(
+            !cfg.is_active(),
+            "enabled without a provider must not be active"
+        );
+
+        let with_provider: OidcConfig = toml::from_str(
+            "enabled = true\n[[providers]]\nname = \"ci\"\nissuer = \"https://issuer.example/\"",
+        )
+        .expect("valid oidc config");
+        assert!(
+            with_provider.is_active(),
+            "enabled with a provider must be active"
+        );
     }
 }
