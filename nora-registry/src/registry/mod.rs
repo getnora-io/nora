@@ -431,7 +431,7 @@ pub(crate) async fn repo_proxy_download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("cache_hit", "api", "", registry, ""));
+                .log(AuditEntry::new("cache_hit", "proxy", "", registry, ""));
             // Quarantine only immutable packages — metadata is rewritten
             // upstream on every sync and its digest would change forever.
             if immutable {
@@ -473,7 +473,7 @@ pub(crate) async fn repo_proxy_download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", registry, ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", registry, ""));
             if immutable {
                 state.spawn_cache_immutable(registry, key, data.clone());
                 if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(

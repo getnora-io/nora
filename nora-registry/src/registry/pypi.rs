@@ -455,7 +455,7 @@ async fn download_file(
         ));
         state
             .audit
-            .log(AuditEntry::new("cache_hit", "api", "", "pypi", ""));
+            .log(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
 
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
@@ -547,7 +547,7 @@ async fn download_file(
                 ));
                 state
                     .audit
-                    .log(AuditEntry::new("proxy_fetch", "api", "", "pypi", ""));
+                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "pypi", ""));
 
                 // Cache in background + compute hash, invalidate AFTER write
                 let storage = state.storage.clone();
@@ -620,6 +620,7 @@ async fn download_file(
 async fn upload(
     State(state): State<AppState>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     mut multipart: Multipart,
 ) -> Response {
     let mut action = String::new();
@@ -735,9 +736,13 @@ async fn upload(
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", &artifact, "pypi", ""));
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &artifact,
+        "pypi",
+        "",
+    ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         artifact,

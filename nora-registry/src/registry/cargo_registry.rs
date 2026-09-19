@@ -231,7 +231,7 @@ async fn sparse_index(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "cargo", ""));
 
             // Cache in background
             state.spawn_cache("cargo", index_key, Bytes::from(data.clone()));
@@ -471,7 +471,7 @@ async fn download(
         ));
         state
             .audit
-            .log(AuditEntry::new("pull", "api", "", "cargo", ""));
+            .log(AuditEntry::new("pull", "proxy", "", "cargo", ""));
         let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
@@ -567,7 +567,7 @@ async fn download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "cargo", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "cargo", ""));
             let (q_mode, q_secs) = resolve_cargo_quarantine_config(&state);
             if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                 &state.digest_store,
@@ -619,6 +619,7 @@ async fn download(
 async fn publish(
     State(state): State<AppState>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
     if body.len() < 8 {
@@ -803,9 +804,13 @@ async fn publish(
 
     state.metrics.record_upload("cargo");
     let artifact = format!("{}@{}", name, vers);
-    state
-        .audit
-        .log(AuditEntry::new("push", "api", &artifact, "cargo", ""));
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &artifact,
+        "cargo",
+        "",
+    ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
         artifact,
@@ -1167,6 +1172,7 @@ mod integration_tests {
         let resp = super::publish(
             State(ctx.state.clone()),
             Extension(scoped.clone()),
+            None,
             Bytes::from(payload),
         )
         .await;
@@ -1178,6 +1184,7 @@ mod integration_tests {
         let resp = super::publish(
             State(ctx.state.clone()),
             Extension(scoped),
+            None,
             Bytes::from(payload),
         )
         .await;

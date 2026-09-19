@@ -550,7 +550,7 @@ async fn registration_index(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
             let raw = Bytes::from(body);
             let storage = state.storage.clone();
@@ -821,7 +821,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
             let raw = Bytes::from(body);
             let storage = state.storage.clone();
@@ -1063,7 +1063,7 @@ async fn flatcontainer_download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "nuget", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
             state.spawn_cache_immutable("nuget", storage_key, Bytes::from(bytes.clone()));
 

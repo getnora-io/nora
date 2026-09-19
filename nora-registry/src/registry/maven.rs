@@ -471,7 +471,7 @@ async fn download(
             ));
             state
                 .audit
-                .log(AuditEntry::new("cache_hit", "api", "", "maven", ""));
+                .log(AuditEntry::new("cache_hit", "proxy", "", "maven", ""));
             // Quarantine only real version artifacts (.jar/.pom/.sha1, immutable
             // per version). maven-metadata.xml is mutable (curation_coords=None) —
             // never quarantine it or its digest would change forever.
@@ -590,7 +590,7 @@ async fn download(
                 ));
                 state
                     .audit
-                    .log(AuditEntry::new("proxy_fetch", "api", "", "maven", ""));
+                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "maven", ""));
 
                 let response_data =
                     if let Some((group_path, artifact_id, document_path, requested_checksum)) =
@@ -710,6 +710,7 @@ async fn upload(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
@@ -808,9 +809,13 @@ async fn upload(
             update_artifact_metadata(&state, &coords.group_path, &coords.artifact_id).await;
 
             state.metrics.record_upload("maven");
-            state
-                .audit
-                .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
+            state.audit.log(AuditEntry::new(
+                "push",
+                crate::auth::audit_actor(&user),
+                &artifact_name,
+                "maven",
+                "",
+            ));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
                 artifact_name,
@@ -864,9 +869,13 @@ async fn upload(
         MavenPathKind::Opaque => match state.storage.put(&key, &body).await {
             Ok(()) => {
                 state.metrics.record_upload("maven");
-                state
-                    .audit
-                    .log(AuditEntry::new("push", "api", &artifact_name, "maven", ""));
+                state.audit.log(AuditEntry::new(
+                    "push",
+                    crate::auth::audit_actor(&user),
+                    &artifact_name,
+                    "maven",
+                    "",
+                ));
                 state.activity.push(ActivityEntry::new(
                     ActionType::Push,
                     artifact_name,
@@ -1694,6 +1703,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("com/other/lib/1.0/lib-1.0.jar".to_string()),
             Extension(scoped.clone()),
+            None,
             Bytes::from_static(b"x"),
         )
         .await;
@@ -1704,6 +1714,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("foo".to_string()),
             Extension(scoped.clone()),
+            None,
             Bytes::from_static(b"x"),
         )
         .await;
@@ -1714,6 +1725,7 @@ mod integration_tests {
             State(ctx.state.clone()),
             Path("com/myorg/lib/1.0/lib-1.0.jar".to_string()),
             Extension(scoped),
+            None,
             Bytes::from_static(b"x"),
         )
         .await;

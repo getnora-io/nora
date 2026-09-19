@@ -111,7 +111,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             // Cache in background (overwrite — mutable content)
             state.spawn_cache("gems", storage_key, Bytes::from(bytes.clone()));
@@ -289,7 +289,7 @@ async fn compact_index(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             let raw = Bytes::from(body);
             let storage = state.storage.clone();
@@ -576,7 +576,7 @@ async fn download_gem(
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             // Immutable cache: put_if_absent
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
@@ -726,7 +726,7 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
             ));
             state
                 .audit
-                .log(AuditEntry::new("proxy_fetch", "api", "", "gems", ""));
+                .log(AuditEntry::new("proxy_fetch", "proxy", "", "gems", ""));
 
             state.spawn_cache_immutable("gems", storage_key, Bytes::from(bytes.clone()));
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
