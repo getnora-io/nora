@@ -67,6 +67,26 @@ pub fn record_namespace_isolation_refused(registry: &str) {
         .inc();
 }
 
+/// OIDC token-validation rejections, by bounded reason (#994). The full reason
+/// is logged; this counter keeps a low-cardinality, alertable breakdown so a
+/// lifetime ceiling, a wrong audience and a missing role rule are
+/// distinguishable. No issuer/subject/provider is ever put in the label.
+pub static AUTH_OIDC_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_auth_oidc_rejected_total",
+        "OIDC token validation rejections, by reason",
+        &["reason"]
+    )
+    .expect("failed to create AUTH_OIDC_REJECTED_TOTAL metric at startup")
+});
+
+/// Record one OIDC token rejection under its bounded `reason` bucket (#994).
+/// `reason` ∈ {disabled, no_provider, lifetime_exceeded, no_role_rule,
+/// algorithm, jwt_invalid, jwks, other}.
+pub fn record_oidc_rejection(reason: &'static str) {
+    AUTH_OIDC_REJECTED_TOTAL.with_label_values(&[reason]).inc();
+}
+
 /// Proxy artifacts held by the digest quarantine, by registry and outcome
 /// (`blocked` = enforce returned 403; `observed` = observe served but recorded).
 /// Gives the operator an alertable/graphable signal — the quarantine was
