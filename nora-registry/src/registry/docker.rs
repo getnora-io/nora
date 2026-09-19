@@ -2983,6 +2983,10 @@ fn spool_follower(
 /// Spool an upstream blob to disk and store it, detached from the request that started
 /// it: a client that gives up mid-fill (containerd retries a slow pull from scratch) no
 /// longer discards the bytes already fetched, and the next request is a cache hit.
+///
+/// A panic inside the fill is caught like the other detached tasks (`spawn_cache`, the
+/// PyPI backfill): it is logged, counted, and published to the follower as a failed
+/// spool, so the response aborts instead of hanging on a dropped sender.
 fn spawn_blob_spool(
     state: AppState,
     blob: UpstreamBlob,
@@ -2992,14 +2996,20 @@ fn spawn_blob_spool(
     upstream: String,
     progress: tokio::sync::watch::Sender<SpoolStatus>,
 ) {
+    use futures::FutureExt as _;
+    use std::panic::AssertUnwindSafe;
+
     let read_timeout = state.config.docker.read_timeout;
-    tokio::spawn(async move {
+    let progress = Arc::new(progress);
+    let on_panic = Arc::clone(&progress);
+    let panic_key = key.clone();
+    let task = async move {
         let outcome = spool_upstream_blob(
             blob,
             spool,
             read_timeout,
             &state.circuit_breaker,
-            Some(&progress),
+            Some(progress.as_ref()),
         )
         .await;
         let mut fetched = match outcome {
@@ -3038,6 +3048,9 @@ fn spawn_blob_spool(
                 state.repo_index.invalidate("docker");
             }
             Err(e) => {
+                crate::metrics::CACHE_WRITE_ERRORS
+                    .with_label_values(&["docker", "proxy_blob_store"])
+                    .inc();
                 tracing::error!(
                     error = %e,
                     key = %key,
@@ -3045,7 +3058,20 @@ fn spawn_blob_spool(
                 );
             }
         }
-    });
+    };
+    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(move |done| {
+        if let Err(panic) = done {
+            crate::metrics::CACHE_WRITE_ERRORS
+                .with_label_values(&["docker", "proxy_blob_spool_panic"])
+                .inc();
+            tracing::error!(panic = ?panic, key = %panic_key, "Docker blob spool task panicked");
+            on_panic.send_modify(|s| {
+                if s.done.is_none() {
+                    s.done = Some(Err("spool task panicked".to_string()));
+                }
+            });
+        }
+    }));
 }
 
 /// Open a blob on an upstream Docker registry: request, token auth and status check,
@@ -6632,5 +6658,73 @@ mod stream_spool_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(ctx.state.storage.get(&key).await.is_err());
+    }
+
+    /// Quarantine in enforce mode still holds a digest this mirror has never seen: the
+    /// streaming path answers 403 before any byte, and the fill still completes and lands
+    /// in the cache with the digest recorded, so the hold expires on schedule.
+    #[tokio::test]
+    async fn test_docker_proxy_blob_new_digest_held_on_streaming_path() {
+        use crate::config::DockerUpstream;
+        use crate::digest_quarantine::{QuarantineMode, QuarantineStatus};
+        let blob: Vec<u8> = (0..(64 * 1024 + 9)).map(|i| (i % 247) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        let upstream = slow_blob_upstream(blob.clone(), 2, Duration::from_millis(50)).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("1h".to_string());
+        });
+
+        let response = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a new digest is held"
+        );
+
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let storage = ctx.state.storage.clone();
+        let k = key.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), move || {
+                let storage = storage.clone();
+                let k = k.clone();
+                Box::pin(async move { storage.get(&k).await.is_ok() })
+            })
+            .await,
+            "the held fill still completes into the cache"
+        );
+        assert!(
+            matches!(
+                ctx.state.digest_store.check("docker", &digest, 3600),
+                QuarantineStatus::Pending { .. }
+            ),
+            "first-seen is recorded once the fetch verified"
+        );
+        let again = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            again.status(),
+            StatusCode::FORBIDDEN,
+            "still held from the cache"
+        );
     }
 }
