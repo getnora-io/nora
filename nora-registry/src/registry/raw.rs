@@ -680,6 +680,7 @@ fn guess_content_type(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
         "wasm" => "application/wasm",
+        "apk" => "application/vnd.android.package-archive",
         _ => "application/octet-stream",
     }
 }
@@ -756,6 +757,14 @@ mod tests {
     fn test_guess_content_type_special() {
         assert_eq!(guess_content_type("doc.pdf"), "application/pdf");
         assert_eq!(guess_content_type("module.wasm"), "application/wasm");
+        assert_eq!(
+            guess_content_type("release.apk"),
+            "application/vnd.android.package-archive"
+        );
+        assert_eq!(
+            guess_content_type("release.aab"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
