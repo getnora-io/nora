@@ -143,7 +143,6 @@ use crate::AppState;
         schemas(
             HealthResponse,
             StorageHealth,
-            RegistriesHealth,
             UpstreamHealthSchema,
             DashboardResponse,
             GlobalStats,
@@ -178,8 +177,10 @@ pub struct HealthResponse {
     pub uptime_seconds: u64,
     /// Storage backend health
     pub storage: StorageHealth,
-    /// Registry health status
-    pub registries: RegistriesHealth,
+    /// Health of each *enabled* registry, keyed by registry name. The set of
+    /// keys is a subset of `RegistryType::all()` (only enabled formats appear),
+    /// so this is an open string map, not a fixed set of fields (#987).
+    pub registries: std::collections::HashMap<String, String>,
     /// Per-upstream circuit-breaker state, keyed by registry name. Read from
     /// cached state — `/health` never performs a live upstream probe.
     pub upstreams: std::collections::HashMap<String, UpstreamHealthSchema>,
@@ -197,17 +198,6 @@ pub struct UpstreamHealthSchema {
     /// Seconds since the most recent recorded failure, or `null` if the
     /// upstream has not failed since startup.
     pub last_failure_seconds_ago: Option<u64>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct RegistriesHealth {
-    pub docker: String,
-    pub maven: String,
-    pub npm: String,
-    pub cargo: String,
-    pub pypi: String,
-    pub go: String,
-    pub raw: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1377,4 +1367,38 @@ pub async fn admin_reindex() {}
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    /// #987 — the OpenAPI `/health` `registries` field must be documented as a
+    /// string-keyed map, matching the runtime `HealthStatus.registries:
+    /// HashMap<String, String>` of the *enabled* registries. The old
+    /// `RegistriesHealth` struct froze `docker,maven,npm,cargo,pypi,go,raw`
+    /// while 9+ formats existed, so clients generated from the document got the
+    /// wrong shape and every new registry drifted the doc. RED before the fix
+    /// (`registries` `$ref`s a fixed struct); GREEN once it is an open map.
+    #[test]
+    fn openapi_health_registries_is_open_map() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize openapi");
+        let schemas = &doc["components"]["schemas"];
+
+        assert!(
+            schemas.get("RegistriesHealth").is_none(),
+            "RegistriesHealth (fixed 7-field struct) must be gone — `registries` is an open map",
+        );
+
+        let registries = &schemas["HealthResponse"]["properties"]["registries"];
+        assert!(
+            registries.get("$ref").is_none(),
+            "`registries` must not $ref a fixed struct: {registries}",
+        );
+        assert!(
+            registries["additionalProperties"].is_object(),
+            "`registries` must be an open string map (additionalProperties): {registries}",
+        );
+    }
 }
