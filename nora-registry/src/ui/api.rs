@@ -382,25 +382,29 @@ pub async fn api_search(
 }
 
 pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
-    // Search for manifests under both the bare name and all namespace-prefixed variants.
-    // E.g. for "library/nginx", find keys in docker/library/nginx/manifests/
-    // AND docker/docker.io/library/nginx/manifests/, docker/ghcr.io/library/nginx/manifests/, etc.
-    let prefix = format!("docker/{}/manifests/", name);
-    let mut keys = state.storage.list(&prefix).await.unwrap_or_default();
+    // List the bare-name manifests plus, for each configured upstream namespace,
+    // this image's namespaced copy (docker/{ns}/{name}/manifests/). That is a
+    // bounded number of listings — one per upstream — instead of scanning every
+    // key under docker/, whose cost grew with the whole registry, not the
+    // repository being viewed (#986).
+    let mut keys = state
+        .storage
+        .list(&format!("docker/{}/manifests/", name))
+        .await
+        .unwrap_or_default();
 
-    // Also collect namespaced keys by scanning all docker/ keys for this image name
-    let all_docker_keys = state.storage.list("docker/").await.unwrap_or_default();
-    for key in &all_docker_keys {
-        if let Some(rest) = key.strip_prefix("docker/") {
-            if let Some(idx) = rest.find("/manifests/") {
-                let raw_name = &rest[..idx];
-                if crate::registry::docker::strip_docker_namespace(raw_name) == name
-                    && raw_name != name
-                {
-                    keys.push(key.clone());
-                }
-            }
+    for upstream in &state.config.docker.upstreams {
+        let ns = upstream.resolved_namespace();
+        if ns.is_empty() {
+            continue;
         }
+        keys.extend(
+            state
+                .storage
+                .list(&format!("docker/{}/{}/manifests/", ns, name))
+                .await
+                .unwrap_or_default(),
+        );
     }
     keys.sort();
     keys.dedup();
@@ -415,14 +419,11 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
             continue;
         }
 
-        // Extract tag name: find /manifests/{tag}.json regardless of namespace prefix
+        // The tag is the segment after `/manifests/`, whatever the namespace
+        // prefix (docker/{name}/... or docker/{ns}/{name}/...).
         let tag_name = key
-            .strip_prefix(&prefix)
-            .or_else(|| {
-                // For namespaced keys: docker/{ns}/{name}/manifests/{tag}.json
-                key.find("/manifests/")
-                    .map(|idx| &key[idx + "/manifests/".len()..])
-            })
+            .find("/manifests/")
+            .map(|idx| &key[idx + "/manifests/".len()..])
             .and_then(|s| s.strip_suffix(".json"));
 
         if let Some(tag_name) = tag_name {
