@@ -660,15 +660,24 @@ jobs:
             --bundle nora-linux-arm64.bundle \
             ./nora-linux-arm64
 
-      - name: Generate changelog with git-cliff
-        id: changelog
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
-        with:
-          config: cliff.toml
-          args: --latest --strip header
-        env:
-          OUTPUT: CHANGES.md
-          GITHUB_REPO: ${{ github.repository }}
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          version="${{ steps.ver.outputs.tag }}"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { p = 1; print; next }
+            p && /^## \[/ { exit }
+            p { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section — refusing to publish empty release notes"
+            exit 1
+          fi
+          {
+            echo "content<<RELEASE_NOTES_EOF"
+            cat RELEASE_NOTES.md
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
@@ -692,7 +701,7 @@ jobs:
             packages/nora-arm64.deb
             packages/nora-arm64.rpm
           body: |
-            ${{ steps.changelog.outputs.content }}
+            ${{ steps.notes.outputs.content }}
 
             ## Install
 
