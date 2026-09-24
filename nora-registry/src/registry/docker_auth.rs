@@ -4,6 +4,7 @@
 use crate::config::basic_auth_header;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Cached Docker registry token
@@ -14,8 +15,10 @@ struct CachedToken {
 
 /// Docker registry authentication handler
 /// Manages Bearer token acquisition and caching for upstream registries
+#[derive(Clone)]
 pub struct DockerAuth {
-    tokens: RwLock<HashMap<String, CachedToken>>,
+    /// Shared by every clone, so a spool resuming a blob reuses the token that opened it.
+    tokens: Arc<RwLock<HashMap<String, CachedToken>>>,
     client: reqwest::Client,
     timeout: Duration,
 }
@@ -27,7 +30,7 @@ impl DockerAuth {
     /// (e.g. custom CA certificates). The timeout is applied per-request.
     pub fn new(client: reqwest::Client, timeout: u64) -> Self {
         Self {
-            tokens: RwLock::new(HashMap::new()),
+            tokens: Arc::new(RwLock::new(HashMap::new())),
             client,
             timeout: Duration::from_secs(timeout),
         }

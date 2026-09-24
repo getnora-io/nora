@@ -1379,26 +1379,9 @@ async fn download_blob(
                     }
                     // Answer as soon as upstream has answered: the body follows the spool file
                     // as it grows, so a client that caps time-to-first-header (containerd ≥ 2.3
-                    // gives up after 30 s) is never left waiting for a multi-GB fill. The last
-                    // byte is withheld until the spool has verified the digest, so a poisoned
-                    // upstream can never complete a Content-Length body.
-                    let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                        follower, status,
-                    )));
-                    let stream = VerifyingReader::new(reader, &digest);
-                    let mut builder = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .header("docker-content-digest", &digest);
-                    // A declared zero length would let hyper complete the response from the
-                    // headers alone, before the digest verdict; an empty body goes chunked.
-                    if let Some(len) = content_length.filter(|&len| len > 0) {
-                        builder = builder.header(header::CONTENT_LENGTH, len);
-                    }
-                    return builder
-                        .body(nora_registry::verified::reader_stream_body(stream))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    // gives up after 30 s) is never left waiting for a multi-GB fill.
+                    return spool_response(follower, status, content_length, &digest, &headers)
+                        .await;
                 }
                 Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
                 Err(e) => {
@@ -2866,6 +2849,8 @@ pub struct UpstreamBlob {
     response: reqwest::Response,
     /// Content-Length from upstream, None for a chunked response.
     pub content_length: Option<u64>,
+    /// Where to ask for the rest if the body breaks off.
+    source: BlobSource,
     cb_key: String,
     probe: ProbeToken,
     _download_gauge_guard: ProxyDownloadGuard,
@@ -2914,9 +2899,13 @@ impl SpoolFile {
 /// failed spool surfaces as a read error, so the response aborts short instead of ending
 /// cleanly. Progress is re-read after every short read, so bytes flushed between a read
 /// and the next status check are never waited on.
+///
+/// `file` is positioned at byte `start` of the blob: a ranged response follows the
+/// spool from there.
 fn spool_follower(
     file: tokio::fs::File,
     status: tokio::sync::watch::Receiver<SpoolStatus>,
+    start: u64,
 ) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send {
     const READ_BUF: usize = 256 * 1024;
     const HOLDBACK_BYTES: u64 = 1;
@@ -2924,7 +2913,7 @@ fn spool_follower(
     // the published count means the file is gone or truncated, not still in flight.
     const MAX_EMPTY_READS: u32 = 1_000;
     futures::stream::unfold(
-        (file, status, 0u64, 0u32),
+        (file, status, start, 0u32),
         |(mut file, mut status, mut offset, mut empty_reads)| async move {
             use tokio::io::AsyncReadExt;
             loop {
@@ -2978,6 +2967,84 @@ fn spool_follower(
             }
         },
     )
+}
+
+/// Answer a blob cache miss from the spool as it fills.
+///
+/// The last byte is withheld until the spool has verified the digest, so a poisoned
+/// upstream can never complete a `Content-Length` body. A `Range` against a blob whose
+/// length upstream declared is served 206 from that offset, or 416 past the end, the
+/// way the cache-hit path does: a client resuming a broken pull (containerd sends
+/// `bytes=N-`) gets the tail, not the blob again from byte zero, which it would have to
+/// read and discard up to N. A ranged body is partial, so it has no whole-blob digest to
+/// verify (as on the cache-hit path). Without a declared length, or for a range that
+/// does not parse, the whole blob goes out as 200.
+async fn spool_response(
+    mut follower: tokio::fs::File,
+    status: tokio::sync::watch::Receiver<SpoolStatus>,
+    content_length: Option<u64>,
+    digest: &str,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    use crate::registry::range::{parse_byte_range, ParsedRange};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    // A declared zero length would let hyper complete the response from the headers
+    // alone, before the digest verdict; an empty body goes chunked.
+    let len = content_length.filter(|&len| len > 0);
+    let range = match (
+        len,
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+    ) {
+        (Some(len), Some(value)) => parse_byte_range(value, len),
+        _ => ParsedRange::None,
+    };
+    let builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header("docker-content-digest", digest);
+    let response = match (range, len) {
+        (ParsedRange::Unsatisfiable, Some(len)) => builder
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+            .body(Body::empty()),
+        (ParsedRange::Satisfiable(start, end), Some(len)) => {
+            debug_assert!(
+                start <= end && end < len,
+                "parse_byte_range clamps to the blob"
+            );
+            if let Err(e) = follower.seek(std::io::SeekFrom::Start(start)).await {
+                tracing::error!(error = %e, "Failed to position proxy spool follower");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let wanted = end - start + 1;
+            let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
+                follower, status, start,
+            )))
+            .take(wanted);
+            builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                .header(header::CONTENT_LENGTH, wanted)
+                .body(nora_registry::verified::open_world_stream_body(
+                    tokio_util::io::ReaderStream::new(reader),
+                ))
+        }
+        _ => {
+            let reader =
+                tokio_util::io::StreamReader::new(Box::pin(spool_follower(follower, status, 0)));
+            let stream = VerifyingReader::new(reader, digest);
+            let mut builder = builder.status(StatusCode::OK);
+            if let Some(len) = len {
+                builder = builder
+                    .header(header::CONTENT_LENGTH, len)
+                    .header(header::ACCEPT_RANGES, "bytes");
+            }
+            builder.body(nora_registry::verified::reader_stream_body(stream))
+        }
+    };
+    response.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Spool an upstream blob to disk and store it, detached from the request that started
@@ -3074,13 +3141,171 @@ fn spawn_blob_spool(
     }));
 }
 
+/// How to ask upstream for a blob again: kept with an opened blob so a spool that loses
+/// the connection mid-body can request the missing tail instead of failing the fill.
+struct BlobSource {
+    client: reqwest::Client,
+    upstream_url: String,
+    name: String,
+    url: String,
+    docker_auth: DockerAuth,
+    basic_auth: Option<String>,
+    /// Seconds to wait for the response headers of each request.
+    timeout: u64,
+}
+
+/// Why a blob request produced no response.
+enum BlobRequestError {
+    /// Connection, TLS or header timeout: counts against the upstream's breaker.
+    Network(String),
+    /// Upstream challenged for a token and the token server gave none.
+    Token,
+}
+
+impl From<BlobRequestError> for ProxyError {
+    fn from(e: BlobRequestError) -> Self {
+        match e {
+            BlobRequestError::Network(reason) => ProxyError::Network(reason),
+            BlobRequestError::Token => ProxyError::Network("token fetch failed".into()),
+        }
+    }
+}
+
+impl BlobSource {
+    /// One blob GET, answering a 401 challenge with a bearer token. `range_from` asks for
+    /// the tail from that byte and reuses the cached bearer token that opened the blob.
+    async fn send(&self, range_from: Option<u64>) -> Result<reqwest::Response, BlobRequestError> {
+        let cached_bearer = match range_from {
+            Some(_) => self
+                .docker_auth
+                .get_token(
+                    &self.upstream_url,
+                    &self.name,
+                    None,
+                    self.basic_auth.as_deref(),
+                )
+                .await
+                .map(|token| format!("Bearer {token}")),
+            None => None,
+        };
+        let first_auth =
+            cached_bearer.or_else(|| self.basic_auth.as_deref().map(basic_auth_header));
+        let response = self.send_once(first_auth, range_from).await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let www_auth = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let token = self
+            .docker_auth
+            .get_token(
+                &self.upstream_url,
+                &self.name,
+                www_auth.as_deref(),
+                self.basic_auth.as_deref(),
+            )
+            .await
+            .ok_or(BlobRequestError::Token)?;
+        self.send_once(Some(format!("Bearer {token}")), range_from)
+            .await
+    }
+
+    /// `timeout` bounds the wait for the response headers only. The body of a multi-GB
+    /// layer is paced by the spool's per-chunk `read_timeout`: reqwest's
+    /// `RequestBuilder::timeout` is a total deadline that would cut the body instead.
+    async fn send_once(
+        &self,
+        authorization: Option<String>,
+        range_from: Option<u64>,
+    ) -> Result<reqwest::Response, BlobRequestError> {
+        let mut request = self.client.get(&self.url);
+        if let Some(value) = authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        if let Some(from) = range_from {
+            request = request.header(reqwest::header::RANGE, format!("bytes={from}-"));
+        }
+        // CANCEL-SAFETY: `send` resolves once the response headers are in; dropping it on
+        // timeout drops the connection attempt before any body byte reaches the spool.
+        match tokio::time::timeout(Duration::from_secs(self.timeout), request.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(BlobRequestError::Network(e.to_string())),
+            Err(_) => Err(BlobRequestError::Network(format!(
+                "no response headers within {}s",
+                self.timeout
+            ))),
+        }
+    }
+
+    /// Ask for the rest of a blob from byte `offset`. Returns the response and how many
+    /// leading body bytes to drop: none for a 206 that starts at `offset`, `offset` for an
+    /// upstream that ignores `Range` and sends the whole blob again with 200.
+    async fn resume(
+        &self,
+        offset: u64,
+        total: Option<u64>,
+    ) -> Result<(reqwest::Response, u64), ProxyError> {
+        let response = self.send(Some(offset)).await?;
+        match response.status() {
+            reqwest::StatusCode::PARTIAL_CONTENT => {
+                let range = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range);
+                match range {
+                    Some((start, size))
+                        if start == offset && (total.is_none() || size == total) =>
+                    {
+                        Ok((response, 0))
+                    }
+                    other => Err(ProxyError::Network(format!(
+                        "resume from byte {offset}: upstream answered range {other:?}"
+                    ))),
+                }
+            }
+            reqwest::StatusCode::OK => match (total, response.content_length()) {
+                (Some(want), Some(got)) if want != got => Err(ProxyError::Network(format!(
+                    "resume from byte {offset}: upstream now sends {got} bytes, not {want}"
+                ))),
+                _ => Ok((response, offset)),
+            },
+            status => Err(ProxyError::Upstream(status.as_u16())),
+        }
+    }
+}
+
+/// `Content-Range: bytes <start>-<end>/<size>` → `(start, size)`; `size` is `None` for `*`.
+fn parse_content_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let (span, size) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = span.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    if end < start {
+        return None;
+    }
+    let size = match size.trim() {
+        "*" => None,
+        n => {
+            let size: u64 = n.parse().ok()?;
+            if end >= size {
+                return None;
+            }
+            Some(size)
+        }
+    };
+    Some((start, size))
+}
+
 /// Open a blob on an upstream Docker registry: request, token auth and status check,
 /// stopping once the response headers are in. The body is read by
 /// [`spool_upstream_blob`].
 ///
 /// `timeout` bounds the wait for the response headers; the body itself is paced by the
-/// per-chunk `read_timeout` of the spool. reqwest's `RequestBuilder::timeout` is a total
-/// deadline that runs until the body ends, so it would cut a multi-GB layer mid-body.
+/// per-chunk `read_timeout` of the spool, which also resumes a cut body.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_blob_from_upstream(
     client: &reqwest::Client,
@@ -3109,46 +3334,28 @@ pub async fn open_blob_from_upstream(
     let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
     let probe = cb.check(&cb_key)?;
 
-    let url = format!(
-        "{}/v2/{}/blobs/{}",
-        upstream_url.trim_end_matches('/'),
-        name,
-        digest
-    );
-
-    let headers_timeout = Duration::from_secs(timeout);
-    let mut request = client.get(&url);
-    if let Some(credentials) = basic_auth {
-        request = request.header("Authorization", basic_auth_header(credentials));
-    }
-    let response = send_for_headers(request, headers_timeout)
-        .await
-        .inspect_err(|_| cb.record_failure(&cb_key, probe))?;
-
-    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        // Get Www-Authenticate header and fetch token
-        let www_auth = response
-            .headers()
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        if let Some(token) = docker_auth
-            .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
-            .await
-        {
-            let request = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", token));
-            send_for_headers(request, headers_timeout)
-                .await
-                .inspect_err(|_| cb.record_failure(&cb_key, probe))?
-        } else {
-            // Auth issue (token fetch failed), not upstream down
-            return Err(ProxyError::Network("token fetch failed".into()));
+    let source = BlobSource {
+        client: client.clone(),
+        upstream_url: upstream_url.to_string(),
+        name: name.to_string(),
+        url: format!(
+            "{}/v2/{}/blobs/{}",
+            upstream_url.trim_end_matches('/'),
+            name,
+            digest
+        ),
+        docker_auth: docker_auth.clone(),
+        basic_auth: basic_auth.map(String::from),
+        timeout,
+    };
+    let response = match source.send(None).await {
+        Ok(response) => response,
+        Err(BlobRequestError::Network(reason)) => {
+            cb.record_failure(&cb_key, probe);
+            return Err(ProxyError::Network(reason));
         }
-    } else {
-        response
+        // Auth issue (token fetch failed), not upstream down
+        Err(e @ BlobRequestError::Token) => return Err(e.into()),
     };
 
     if !response.status().is_success() {
@@ -3167,33 +3374,25 @@ pub async fn open_blob_from_upstream(
     Ok(UpstreamBlob {
         content_length: response.content_length(),
         response,
+        source,
         cb_key,
         probe,
         _download_gauge_guard,
     })
 }
 
-/// Send a blob request, waiting at most `timeout` for the response headers. The body is
-/// not covered: the spool reads it with a per-chunk timeout.
-async fn send_for_headers(
-    request: reqwest::RequestBuilder,
-    timeout: Duration,
-) -> Result<reqwest::Response, ProxyError> {
-    // CANCEL-SAFETY: `send` resolves once the response headers are in; dropping it on
-    // timeout drops the connection attempt before any body byte reaches the spool.
-    match tokio::time::timeout(timeout, request.send()).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(e)) => Err(ProxyError::Network(e.to_string())),
-        Err(_) => Err(ProxyError::Network(format!(
-            "no response headers within {}s",
-            timeout.as_secs()
-        ))),
-    }
-}
+/// Resume attempts a spool makes in a row, without receiving a byte, before it fails.
+const UPSTREAM_RESUME_ATTEMPTS: u32 = 5;
+/// Pause before resume attempt `n` is `n` times this.
+const UPSTREAM_RESUME_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Stream an opened upstream blob to its spool file with a per-chunk `read_timeout` and
 /// incremental SHA-256. Never accumulates the blob in RAM. Each chunk is flushed before
 /// `progress` advances, so a follower never reads past what is on disk.
+///
+/// A body that breaks off (connection reset, stalled chunk, short body) is resumed with
+/// `Range: bytes=<written>-`, up to [`UPSTREAM_RESUME_ATTEMPTS`] times in a row without
+/// progress; the digest is still computed over every byte in order.
 pub(crate) async fn spool_upstream_blob(
     blob: UpstreamBlob,
     spool: SpoolFile,
@@ -3206,8 +3405,9 @@ pub(crate) async fn spool_upstream_blob(
     use tokio::io::AsyncWriteExt;
 
     let UpstreamBlob {
-        response,
+        mut response,
         content_length,
+        source,
         cb_key,
         probe,
         _download_gauge_guard,
@@ -3217,41 +3417,84 @@ pub(crate) async fn spool_upstream_blob(
         mut file,
         guard,
     } = spool;
-    let mut stream = response.bytes_stream();
     let mut hasher = sha2::Sha256::new();
     let chunk_timeout = Duration::from_secs(read_timeout);
     let mut bytes_written: u64 = 0;
-    loop {
-        // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout,
-        // TempFileGuard drops and deletes the partial file — no leaked state.
-        match tokio::time::timeout(chunk_timeout, stream.next()).await {
-            Ok(Some(Ok(chunk))) => {
-                hasher.update(&chunk);
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
-                bytes_written += chunk.len() as u64;
-                if let Some(progress) = progress {
-                    file.flush()
+    // Leading bytes of the current response that are already on disk (a resume that
+    // upstream answered with the whole blob).
+    let mut skip: u64 = 0;
+    let mut stalls: u32 = 0;
+    'fill: loop {
+        let mut stream = response.bytes_stream();
+        let failure = loop {
+            // CANCEL-SAFETY: timeout wraps a single stream.next() call. On timeout the
+            // spool resumes or fails, and TempFileGuard deletes the partial file.
+            match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                Ok(Some(Ok(mut chunk))) => {
+                    if skip > 0 {
+                        let dropped = usize::try_from(skip).unwrap_or(usize::MAX).min(chunk.len());
+                        chunk = chunk.slice(dropped..);
+                        skip -= dropped as u64;
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                    }
+                    stalls = 0;
+                    hasher.update(&chunk);
+                    file.write_all(&chunk)
                         .await
-                        .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
-                    progress.send_modify(|s| s.written = bytes_written);
+                        .map_err(|e| ProxyError::Network(format!("temp file write: {}", e)))?;
+                    bytes_written += chunk.len() as u64;
+                    if let Some(progress) = progress {
+                        file.flush()
+                            .await
+                            .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
+                        progress.send_modify(|s| s.written = bytes_written);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    break ProxyError::Network(format!("chunk read error: {}", e));
+                }
+                Ok(None) => {
+                    let short = skip > 0 || content_length.is_some_and(|len| bytes_written < len);
+                    if !short {
+                        break 'fill;
+                    }
+                    break ProxyError::Network(format!(
+                        "upstream body ended at byte {} of {:?}",
+                        bytes_written, content_length
+                    ));
+                }
+                Err(_) => {
+                    break ProxyError::Network(format!(
+                        "read timeout ({}s per chunk)",
+                        read_timeout
+                    ));
                 }
             }
-            Ok(Some(Err(e))) => {
+        };
+        let mut last = failure;
+        (response, skip) = loop {
+            stalls += 1;
+            if stalls > UPSTREAM_RESUME_ATTEMPTS {
                 cb.record_failure(&cb_key, probe);
-                return Err(ProxyError::Network(format!("chunk read error: {}", e)));
+                return Err(last);
             }
-            Ok(None) => break, // stream finished
-            Err(_) => {
-                cb.record_failure(&cb_key, probe);
-                return Err(ProxyError::Network(format!(
-                    "read timeout ({}s per chunk)",
-                    read_timeout
-                )));
+            tracing::warn!(
+                error = ?last,
+                offset = bytes_written,
+                attempt = stalls,
+                upstream = %source.upstream_url,
+                "Proxy blob body interrupted, resuming from upstream"
+            );
+            tokio::time::sleep(UPSTREAM_RESUME_BACKOFF * stalls).await;
+            match source.resume(bytes_written, content_length).await {
+                Ok(next) => break next,
+                Err(e) => last = e,
             }
-        }
+        };
     }
+    debug_assert_eq!(skip, 0, "a finished fill has no bytes left to skip");
     file.flush()
         .await
         .map_err(|e| ProxyError::Network(format!("temp file flush: {}", e)))?;
@@ -6523,7 +6766,7 @@ mod stream_spool_tests {
         tokio::fs::write(&path, bytes).await.unwrap();
         let file = tokio::fs::File::open(&path).await.unwrap();
         let (tx, rx) = tokio::sync::watch::channel(status);
-        (Box::pin(super::spool_follower(file, rx)), tx, dir)
+        (Box::pin(super::spool_follower(file, rx, 0)), tx, dir)
     }
 
     /// The follower withholds the last flushed byte until the spool reports a verified
@@ -6747,10 +6990,13 @@ mod stream_spool_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod upstream_resume_tests {
-    //! A multi-GB layer must survive a slow upstream link: `proxy_timeout` bounds the wait
-    //! for upstream headers, not the body.
+    //! A multi-GB layer must survive a slow or flaky upstream link: `proxy_timeout` bounds
+    //! the wait for upstream headers, not the body, and a body cut mid-stream is resumed
+    //! with `Range` instead of being fetched again from byte zero.
     use super::{blob_key, canonicalize};
-    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers, TestContext,
+    };
     use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Method, StatusCode};
     use axum::response::Response;
@@ -6785,15 +7031,29 @@ mod upstream_resume_tests {
                 header_delay: Duration::ZERO,
             }
         }
+        fn cut(after: usize) -> Self {
+            Plan {
+                cut_after: Some(after),
+                ..Plan::fast()
+            }
+        }
     }
 
     /// Upstream that answers blob GETs by `plans[hit]` (the last plan repeats) and records
-    /// how many it answered. With `bearer = Some(t)` a blob GET without
+    /// the `Range` header of every request. With `bearer = Some(t)` a blob GET without
     /// `Authorization: Bearer t` gets a 401 challenge pointing at its own `/token`.
     struct ScriptedUpstream {
         url: String,
         hits: Arc<AtomicUsize>,
+        ranges: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
         server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedUpstream {
+        /// `Range` headers of the blob GETs so far, in arrival order.
+        fn ranges(&mut self) -> Vec<Option<String>> {
+            std::iter::from_fn(|| self.ranges.try_recv().ok()).collect()
+        }
     }
 
     impl Drop for ScriptedUpstream {
@@ -6810,11 +7070,12 @@ mod upstream_resume_tests {
         use axum::routing::get;
         let blob = Arc::new(blob);
         let hits = Arc::new(AtomicUsize::new(0));
+        let (ranges_tx, ranges) = tokio::sync::mpsc::unbounded_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
         let realm = format!("{url}/token");
-        let h = hits.clone();
+        let (h, r) = (hits.clone(), ranges_tx);
         let app = Router::new()
             .route(
                 "/token",
@@ -6825,8 +7086,13 @@ mod upstream_resume_tests {
             .route(
                 "/v2/{*rest}",
                 get(move |headers: HeaderMap| {
-                    let (blob, plans, hits, realm) =
-                        (blob.clone(), plans.clone(), h.clone(), realm.clone());
+                    let (blob, plans, hits, ranges, realm) = (
+                        blob.clone(),
+                        plans.clone(),
+                        h.clone(),
+                        r.clone(),
+                        realm.clone(),
+                    );
                     async move {
                         if let Some(token) = bearer {
                             let auth = headers
@@ -6849,6 +7115,7 @@ mod upstream_resume_tests {
                             .get(header::RANGE)
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
+                        let _ = ranges.send(range.clone());
                         tokio::time::sleep(plan.header_delay).await;
                         let from = range
                             .as_deref()
@@ -6895,7 +7162,12 @@ mod upstream_resume_tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        ScriptedUpstream { url, hits, server }
+        ScriptedUpstream {
+            url,
+            hits,
+            ranges,
+            server,
+        }
     }
 
     fn ctx_for(upstream: &ScriptedUpstream, proxy_timeout: u64) -> TestContext {
@@ -6930,6 +7202,14 @@ mod upstream_resume_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    fn proxy_temp_count(ctx: &TestContext) -> usize {
+        let proxy_tmp =
+            std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
+        std::fs::read_dir(&proxy_tmp)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
     }
 
     async fn pull(ctx: &TestContext, digest: &str) -> Response<Body> {
@@ -6995,6 +7275,190 @@ mod upstream_resume_tests {
             started.elapsed() < Duration::from_secs(4),
             "headers wait took {:?}, proxy_timeout is 1s",
             started.elapsed()
+        );
+    }
+
+    /// A body cut mid-stream is resumed from the byte already on disk with
+    /// `Range: bytes=N-`: the client sees one clean body, upstream sends each byte once.
+    #[tokio::test]
+    async fn cut_body_resumes_with_range() {
+        let (blob, digest) = layer(256 * 1024 + 7);
+        let half = blob.len() / 2;
+        let mut upstream =
+            scripted_upstream(blob.clone(), vec![Plan::cut(half), Plan::fast()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(
+            body.expect("a resumed fill must stream to a clean end")
+                .as_ref(),
+            &blob[..]
+        );
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 2);
+        let ranges = upstream.ranges();
+        assert_eq!(ranges[0], None, "first GET is a plain GET");
+        assert_eq!(
+            ranges[1].as_deref(),
+            Some(format!("bytes={half}-").as_str()),
+            "resume asks only for the missing tail"
+        );
+        assert!(cached(&ctx, &digest).await, "resumed blob must be cached");
+        assert_eq!(proxy_temp_count(&ctx), 0);
+    }
+
+    /// An upstream that ignores `Range` on the resume and answers 200 with the whole
+    /// blob: the bytes already on disk are skipped, the result is still exact.
+    #[tokio::test]
+    async fn resume_skips_prefix_when_upstream_ignores_range() {
+        let (blob, digest) = layer(256 * 1024 + 3);
+        let half = blob.len() / 2;
+        let whole = Plan {
+            honor_range: false,
+            ..Plan::fast()
+        };
+        let upstream = scripted_upstream(blob.clone(), vec![Plan::cut(half), whole], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(body.expect("clean end").as_ref(), &blob[..]);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 2);
+        assert!(cached(&ctx, &digest).await);
+    }
+
+    /// Docker Hub's bearer tokens outlive neither every layer nor every resume: the
+    /// resume request carries the (cached or re-fetched) bearer token, not bare auth.
+    #[tokio::test]
+    async fn resume_carries_bearer_token() {
+        let (blob, digest) = layer(128 * 1024 + 1);
+        let upstream = scripted_upstream(
+            blob.clone(),
+            vec![Plan::cut(blob.len() / 3), Plan::fast()],
+            Some("tok"),
+        )
+        .await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(body.expect("clean end").as_ref(), &blob[..]);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// An upstream that keeps dropping the connection without progress exhausts the
+    /// resume budget: the response aborts, nothing is cached, the spool is removed.
+    #[tokio::test]
+    async fn resume_gives_up_without_progress() {
+        let (blob, digest) = layer(64 * 1024);
+        let upstream =
+            scripted_upstream(blob.clone(), vec![Plan::cut(1024), Plan::cut(0)], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            body.is_err(),
+            "a fill that never completes must not end clean"
+        );
+        let hits = upstream.hits.load(Ordering::SeqCst);
+        assert!(
+            hits >= 2,
+            "a cut body is resumed at least once (hits = {hits})"
+        );
+        assert!(hits <= 10, "the resume budget is bounded (hits = {hits})");
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(proxy_temp_count(&ctx), 0, "spool removed");
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        assert!(ctx.state.storage.get(&key).await.is_err(), "not cached");
+    }
+
+    /// containerd resumes a broken pull with `Range: bytes=N-`. On a cache miss that
+    /// range is answered 206 from the spool, not 200 from byte zero (which ends in
+    /// "failed to discard to offset").
+    #[tokio::test]
+    async fn client_range_on_cache_miss_is_partial_content() {
+        let (blob, digest) = layer(200 * 1024 + 9);
+        let upstream = scripted_upstream(blob.clone(), vec![Plan::fast()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+        let from = 70_000usize;
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            vec![("range", &format!("bytes={from}-"))],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE].to_str().unwrap(),
+            format!("bytes {from}-{}/{}", blob.len() - 1, blob.len())
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH].to_str().unwrap(),
+            (blob.len() - from).to_string()
+        );
+        let body = body_bytes(response).await;
+        assert_eq!(body.as_ref(), &blob[from..]);
+        assert!(
+            cached(&ctx, &digest).await,
+            "the whole blob is still cached"
+        );
+    }
+
+    /// A resume only continues from a 206 whose `Content-Range` names the byte asked for;
+    /// anything malformed is refused rather than spliced in at the wrong offset.
+    #[test]
+    fn parse_content_range_accepts_only_well_formed_spans() {
+        use super::parse_content_range;
+        assert_eq!(
+            parse_content_range("bytes 100-199/200"),
+            Some((100, Some(200)))
+        );
+        assert_eq!(parse_content_range("bytes 0-0/1"), Some((0, Some(1))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, None)));
+        assert_eq!(parse_content_range("bytes 10-5/20"), None, "inverted span");
+        assert_eq!(
+            parse_content_range("bytes 0-200/200"),
+            None,
+            "end past size"
+        );
+        assert_eq!(parse_content_range("bytes */200"), None, "unsatisfied form");
+        assert_eq!(parse_content_range("items 0-1/2"), None, "not bytes");
+        assert_eq!(parse_content_range("bytes x-1/2"), None);
+        assert_eq!(parse_content_range(""), None);
+    }
+
+    /// A range that starts past the end of a blob known only from upstream headers is
+    /// a 416, like the cache-hit path.
+    #[tokio::test]
+    async fn client_range_past_end_on_cache_miss_is_416() {
+        let (blob, digest) = layer(4096);
+        let upstream = scripted_upstream(blob.clone(), vec![Plan::fast()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            vec![("range", &format!("bytes={}-", blob.len()))],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE].to_str().unwrap(),
+            format!("bytes */{}", blob.len())
         );
     }
 }
