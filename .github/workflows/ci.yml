@@ -130,7 +130,9 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+        # Pinned: 0.37.4 aborts the run with "Timed out waiting for test response"
+        # on an unchanged main; 0.37.2 passes. Unpin once a newer release does.
+        run: cargo install --locked --version 0.37.2 cargo-tarpaulin
 
       - name: Run coverage
         # No pipe: tarpaulin's exit code (non-zero when coverage < fail-under)
@@ -181,7 +183,9 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+        # Pinned: 0.37.4 aborts the run with "Timed out waiting for test response"
+        # on an unchanged main; 0.37.2 passes. Unpin once a newer release does.
+        run: cargo install --locked --version 0.37.2 cargo-tarpaulin
 
       - name: Run coverage
         run: cargo tarpaulin --config tarpaulin.toml --fail-under 0
