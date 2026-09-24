@@ -3171,6 +3171,28 @@ impl From<BlobRequestError> for ProxyError {
     }
 }
 
+/// Why a blob fill stopped, split the way the circuit breaker needs it.
+enum FillFailure {
+    /// The upstream failed us: connection, stalled or short body, 5xx, bad range.
+    Unavailable(ProxyError),
+    /// The upstream answered but refused (4xx, no token): alive, not down.
+    Refused(ProxyError),
+}
+
+impl FillFailure {
+    fn as_proxy_error(&self) -> &ProxyError {
+        match self {
+            FillFailure::Unavailable(e) | FillFailure::Refused(e) => e,
+        }
+    }
+
+    fn into_proxy_error(self) -> ProxyError {
+        match self {
+            FillFailure::Unavailable(e) | FillFailure::Refused(e) => e,
+        }
+    }
+}
+
 impl BlobSource {
     /// One blob GET, answering a 401 challenge with a bearer token. `range_from` asks for
     /// the tail from that byte and reuses the cached bearer token that opened the blob.
@@ -3247,8 +3269,14 @@ impl BlobSource {
         &self,
         offset: u64,
         total: Option<u64>,
-    ) -> Result<(reqwest::Response, u64), ProxyError> {
-        let response = self.send(Some(offset)).await?;
+    ) -> Result<(reqwest::Response, u64), FillFailure> {
+        let response = match self.send(Some(offset)).await {
+            Ok(response) => response,
+            Err(BlobRequestError::Network(reason)) => {
+                return Err(FillFailure::Unavailable(ProxyError::Network(reason)))
+            }
+            Err(e @ BlobRequestError::Token) => return Err(FillFailure::Refused(e.into())),
+        };
         match response.status() {
             reqwest::StatusCode::PARTIAL_CONTENT => {
                 let range = response
@@ -3262,18 +3290,26 @@ impl BlobSource {
                     {
                         Ok((response, 0))
                     }
-                    other => Err(ProxyError::Network(format!(
+                    other => Err(FillFailure::Unavailable(ProxyError::Network(format!(
                         "resume from byte {offset}: upstream answered range {other:?}"
-                    ))),
+                    )))),
                 }
             }
             reqwest::StatusCode::OK => match (total, response.content_length()) {
-                (Some(want), Some(got)) if want != got => Err(ProxyError::Network(format!(
-                    "resume from byte {offset}: upstream now sends {got} bytes, not {want}"
-                ))),
+                (Some(want), Some(got)) if want != got => {
+                    Err(FillFailure::Unavailable(ProxyError::Network(format!(
+                        "resume from byte {offset}: upstream now sends {got} bytes, not {want}"
+                    ))))
+                }
                 _ => Ok((response, offset)),
             },
-            status => Err(ProxyError::Upstream(status.as_u16())),
+            // 4xx: upstream is alive and answered (a rejected token, say), as on open (#606)
+            status if status.is_client_error() => {
+                Err(FillFailure::Refused(ProxyError::Upstream(status.as_u16())))
+            }
+            status => Err(FillFailure::Unavailable(ProxyError::Upstream(
+                status.as_u16(),
+            ))),
         }
     }
 }
@@ -3473,15 +3509,18 @@ pub(crate) async fn spool_upstream_blob(
                 }
             }
         };
-        let mut last = failure;
+        let mut last = FillFailure::Unavailable(failure);
         (response, skip) = loop {
             stalls += 1;
             if stalls > UPSTREAM_RESUME_ATTEMPTS {
-                cb.record_failure(&cb_key, probe);
-                return Err(last);
+                match last {
+                    FillFailure::Unavailable(_) => cb.record_failure(&cb_key, probe),
+                    FillFailure::Refused(_) => cb.record_alive(&cb_key, probe),
+                }
+                return Err(last.into_proxy_error());
             }
             tracing::warn!(
-                error = ?last,
+                error = ?last.as_proxy_error(),
                 offset = bytes_written,
                 attempt = stalls,
                 upstream = %source.upstream_url,
@@ -6999,7 +7038,7 @@ mod upstream_resume_tests {
     };
     use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Method, StatusCode};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
     use axum::Router;
     use futures::StreamExt;
     use sha2::Digest;
@@ -7379,6 +7418,114 @@ mod upstream_resume_tests {
         let c = canonicalize("library/test", &ctx.state.config.docker);
         let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
         assert!(ctx.state.storage.get(&key).await.is_err(), "not cached");
+    }
+
+    /// A resume that upstream refuses (its token is no longer accepted, and the token
+    /// server is down) is an auth problem, not the registry being down: exhausting the
+    /// resume budget on it must not open the registry's circuit breaker, the way a 4xx
+    /// or a failed token fetch on the initial open does not (#606).
+    #[tokio::test]
+    async fn refused_resume_does_not_trip_breaker() {
+        use crate::config::DockerUpstream;
+        use axum::routing::get;
+        let (blob, digest) = layer(96 * 1024);
+        let blob = Arc::new(blob);
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let blob_hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let realm = format!("{url}/token");
+        let tc = token_calls.clone();
+        let (b, h) = (blob.clone(), blob_hits.clone());
+        // One token, once; the blob GET accepts it once and sends a third of the blob.
+        // Every later GET is challenged again, and the token server is down by then.
+        let app = Router::new()
+            .route(
+                "/token",
+                get(move || {
+                    let tc = tc.clone();
+                    async move {
+                        if tc.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::Json(serde_json::json!({ "token": "t1" })).into_response()
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v2/{*rest}",
+                get(move |headers: HeaderMap| {
+                    let (blob, hits, realm) = (b.clone(), h.clone(), realm.clone());
+                    async move {
+                        let authed = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            == Some("Bearer t1");
+                        if !authed || hits.fetch_add(1, Ordering::SeqCst) > 0 {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(
+                                    header::WWW_AUTHENTICATE,
+                                    format!("Bearer realm=\"{realm}\",service=\"test\""),
+                                )
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                        let third = blob.len() / 3;
+                        let pieces: Vec<std::io::Result<Bytes>> = vec![
+                            Ok(Bytes::copy_from_slice(&blob[..third])),
+                            Err(std::io::Error::other("connection cut")),
+                        ];
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_LENGTH, blob.len())
+                            .body(Body::from_stream(futures::stream::iter(pieces).then(
+                                |p| async move {
+                                    // headers must reach the client before the cut
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    p
+                                },
+                            )))
+                            .unwrap()
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream_url = url.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.docker.proxy_timeout = 5;
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: upstream_url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(body.is_err(), "the fill cannot complete without a token");
+        assert!(
+            blob_hits.load(Ordering::SeqCst) >= 2,
+            "the cut body must have been resumed"
+        );
+        // The spool records its outcome after the body aborts; wait for it to finish.
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cb_key = format!("docker:{url}");
+        assert!(
+            ctx.state.circuit_breaker.check(&cb_key).is_ok(),
+            "a refused resume must not open the registry's breaker"
+        );
+        server.abort();
     }
 
     /// containerd resumes a broken pull with `Range: bytes=N-`. On a cache miss that
