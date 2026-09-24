@@ -3078,8 +3078,9 @@ fn spawn_blob_spool(
 /// stopping once the response headers are in. The body is read by
 /// [`spool_upstream_blob`].
 ///
-/// `timeout` bounds the whole request from reqwest's side; the body itself is paced by
-/// the per-chunk `read_timeout` of the spool.
+/// `timeout` bounds the wait for the response headers; the body itself is paced by the
+/// per-chunk `read_timeout` of the spool. reqwest's `RequestBuilder::timeout` is a total
+/// deadline that runs until the body ends, so it would cut a multi-GB layer mid-body.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_blob_from_upstream(
     client: &reqwest::Client,
@@ -3115,15 +3116,14 @@ pub async fn open_blob_from_upstream(
         digest
     );
 
-    // Connection timeout only — body is read with per-chunk timeout below
-    let mut request = client.get(&url).timeout(Duration::from_secs(timeout));
+    let headers_timeout = Duration::from_secs(timeout);
+    let mut request = client.get(&url);
     if let Some(credentials) = basic_auth {
         request = request.header("Authorization", basic_auth_header(credentials));
     }
-    let response = request.send().await.map_err(|e| {
-        cb.record_failure(&cb_key, probe);
-        ProxyError::Network(e.to_string())
-    })?;
+    let response = send_for_headers(request, headers_timeout)
+        .await
+        .inspect_err(|_| cb.record_failure(&cb_key, probe))?;
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Get Www-Authenticate header and fetch token
@@ -3137,15 +3137,12 @@ pub async fn open_blob_from_upstream(
             .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
             .await
         {
-            client
+            let request = client
                 .get(&url)
-                .header("Authorization", format!("Bearer {}", token))
-                .send()
+                .header("Authorization", format!("Bearer {}", token));
+            send_for_headers(request, headers_timeout)
                 .await
-                .map_err(|e| {
-                    cb.record_failure(&cb_key, probe);
-                    ProxyError::Network(e.to_string())
-                })?
+                .inspect_err(|_| cb.record_failure(&cb_key, probe))?
         } else {
             // Auth issue (token fetch failed), not upstream down
             return Err(ProxyError::Network("token fetch failed".into()));
@@ -3174,6 +3171,24 @@ pub async fn open_blob_from_upstream(
         probe,
         _download_gauge_guard,
     })
+}
+
+/// Send a blob request, waiting at most `timeout` for the response headers. The body is
+/// not covered: the spool reads it with a per-chunk timeout.
+async fn send_for_headers(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, ProxyError> {
+    // CANCEL-SAFETY: `send` resolves once the response headers are in; dropping it on
+    // timeout drops the connection attempt before any body byte reaches the spool.
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(ProxyError::Network(e.to_string())),
+        Err(_) => Err(ProxyError::Network(format!(
+            "no response headers within {}s",
+            timeout.as_secs()
+        ))),
+    }
 }
 
 /// Stream an opened upstream blob to its spool file with a per-chunk `read_timeout` and
@@ -6725,6 +6740,261 @@ mod stream_spool_tests {
             again.status(),
             StatusCode::FORBIDDEN,
             "still held from the cache"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upstream_resume_tests {
+    //! A multi-GB layer must survive a slow upstream link: `proxy_timeout` bounds the wait
+    //! for upstream headers, not the body.
+    use super::{blob_key, canonicalize};
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, HeaderMap, Method, StatusCode};
+    use axum::response::Response;
+    use axum::Router;
+    use futures::StreamExt;
+    use sha2::Digest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// How the scripted upstream answers one blob GET.
+    #[derive(Clone, Copy)]
+    struct Plan {
+        /// Answer `Range: bytes=N-` with 206; `false` ignores it and sends the whole blob.
+        honor_range: bool,
+        /// Drop the connection after this many body bytes of this response.
+        cut_after: Option<usize>,
+        /// Body piece size and the pause before each piece.
+        piece: usize,
+        delay: Duration,
+        /// Pause before the response headers.
+        header_delay: Duration,
+    }
+
+    impl Plan {
+        fn fast() -> Self {
+            Plan {
+                honor_range: true,
+                cut_after: None,
+                piece: 64 * 1024,
+                delay: Duration::ZERO,
+                header_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Upstream that answers blob GETs by `plans[hit]` (the last plan repeats) and records
+    /// how many it answered. With `bearer = Some(t)` a blob GET without
+    /// `Authorization: Bearer t` gets a 401 challenge pointing at its own `/token`.
+    struct ScriptedUpstream {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ScriptedUpstream {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn scripted_upstream(
+        blob: Vec<u8>,
+        plans: Vec<Plan>,
+        bearer: Option<&'static str>,
+    ) -> ScriptedUpstream {
+        use axum::routing::get;
+        let blob = Arc::new(blob);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let realm = format!("{url}/token");
+        let h = hits.clone();
+        let app = Router::new()
+            .route(
+                "/token",
+                get(move || async move {
+                    axum::Json(serde_json::json!({ "token": bearer.unwrap_or("") }))
+                }),
+            )
+            .route(
+                "/v2/{*rest}",
+                get(move |headers: HeaderMap| {
+                    let (blob, plans, hits, realm) =
+                        (blob.clone(), plans.clone(), h.clone(), realm.clone());
+                    async move {
+                        if let Some(token) = bearer {
+                            let auth = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok());
+                            if auth != Some(format!("Bearer {token}").as_str()) {
+                                return Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header(
+                                        header::WWW_AUTHENTICATE,
+                                        format!("Bearer realm=\"{realm}\",service=\"test\""),
+                                    )
+                                    .body(Body::empty())
+                                    .unwrap();
+                            }
+                        }
+                        let hit = hits.fetch_add(1, Ordering::SeqCst);
+                        let plan = plans[hit.min(plans.len() - 1)];
+                        let range = headers
+                            .get(header::RANGE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from);
+                        tokio::time::sleep(plan.header_delay).await;
+                        let from = range
+                            .as_deref()
+                            .filter(|_| plan.honor_range)
+                            .and_then(|r| r.strip_prefix("bytes="))
+                            .and_then(|r| r.strip_suffix('-'))
+                            .and_then(|n| n.parse::<usize>().ok());
+                        let len = blob.len();
+                        let mut builder = Response::builder();
+                        let start = match from {
+                            Some(n) => {
+                                builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+                                    header::CONTENT_RANGE,
+                                    format!("bytes {n}-{}/{len}", len - 1),
+                                );
+                                n
+                            }
+                            None => {
+                                builder = builder.status(StatusCode::OK);
+                                0
+                            }
+                        };
+                        let body = blob[start..].to_vec();
+                        let send_len = plan.cut_after.map_or(body.len(), |c| c.min(body.len()));
+                        let mut pieces: Vec<std::io::Result<Bytes>> = body[..send_len]
+                            .chunks(plan.piece.max(1))
+                            .map(|p| Ok(Bytes::copy_from_slice(p)))
+                            .collect();
+                        if plan.cut_after.is_some() {
+                            pieces.push(Err(std::io::Error::other("connection cut")));
+                        }
+                        let delay = plan.delay;
+                        let stream = futures::stream::iter(pieces).then(move |p| async move {
+                            tokio::time::sleep(delay).await;
+                            p
+                        });
+                        builder
+                            .header(header::CONTENT_LENGTH, len - start)
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ScriptedUpstream { url, hits, server }
+    }
+
+    fn ctx_for(upstream: &ScriptedUpstream, proxy_timeout: u64) -> TestContext {
+        use crate::config::DockerUpstream;
+        let url = upstream.url.clone();
+        create_test_context_with_config(move |cfg| {
+            cfg.docker.proxy_timeout = proxy_timeout;
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        })
+    }
+
+    fn layer(len: usize) -> (Vec<u8>, String) {
+        let blob: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+        (blob, digest)
+    }
+
+    /// Waits (bounded) for the spool task to store the blob; `true` once it is cached.
+    async fn cached(ctx: &TestContext, digest: &str) -> bool {
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, digest);
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            if ctx.state.storage.get(&key).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn pull(ctx: &TestContext, digest: &str) -> Response<Body> {
+        send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await
+    }
+
+    /// Maxim's 3.5 GB ollama layer, scaled down: the body takes longer than
+    /// `proxy_timeout`, but it keeps flowing, so it must arrive whole in one upstream
+    /// request — the per-chunk `read_timeout` is what guards a stalled body.
+    #[tokio::test]
+    async fn slow_body_is_not_cut_by_proxy_timeout() {
+        let (blob, digest) = layer(8 * 16 * 1024);
+        let upstream = scripted_upstream(
+            blob.clone(),
+            vec![Plan {
+                piece: 16 * 1024,
+                delay: Duration::from_millis(250),
+                ..Plan::fast()
+            }],
+            None,
+        )
+        .await;
+        let ctx = ctx_for(&upstream, 1);
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(
+            body.expect("a body that outlives proxy_timeout must still complete")
+                .as_ref(),
+            &blob[..]
+        );
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 1, "one upstream GET");
+        assert!(cached(&ctx, &digest).await, "blob must be cached");
+    }
+
+    /// Headers that never come are still bounded by `proxy_timeout` (not worse than
+    /// before): the pull fails over instead of hanging.
+    #[tokio::test]
+    async fn missing_headers_are_bounded_by_proxy_timeout() {
+        let (blob, digest) = layer(1024);
+        let upstream = scripted_upstream(
+            blob,
+            vec![Plan {
+                header_delay: Duration::from_secs(5),
+                ..Plan::fast()
+            }],
+            None,
+        )
+        .await;
+        let ctx = ctx_for(&upstream, 1);
+
+        let started = std::time::Instant::now();
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "headers wait took {:?}, proxy_timeout is 1s",
+            started.elapsed()
         );
     }
 }
