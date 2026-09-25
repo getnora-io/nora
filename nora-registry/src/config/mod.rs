@@ -987,9 +987,15 @@ impl Config {
     /// A configuration NORA cannot start with is an error, for the caller to report and
     /// exit on with [`EXIT_CONFIG`].
     pub fn load() -> Result<Self, ConfigLoadError> {
+        Self::load_from(env::var("NORA_CONFIG_PATH").ok())
+    }
+
+    /// [`Config::load`] with the `NORA_CONFIG_PATH` value passed in, so tests can drive
+    /// it without setting a process-wide variable that `validate` also reads.
+    fn load_from(config_path: Option<String>) -> Result<Self, ConfigLoadError> {
         // 1. Start with defaults
         // 2. Override with config file if exists
-        let mut config: Config = if let Ok(config_path) = env::var("NORA_CONFIG_PATH") {
+        let mut config: Config = if let Some(config_path) = config_path {
             let content =
                 fs::read_to_string(&config_path).map_err(|source| ConfigLoadError::Unreadable {
                     path: config_path.clone(),
@@ -1834,6 +1840,35 @@ mod tests {
         let wanted = format!("RestartPreventExitStatus={EXIT_CONFIG}");
         assert!(unit.contains(&wanted), "dist/nora.service lacks {wanted}");
         assert!(script.contains(&wanted), "install.sh's unit lacks {wanted}");
+    }
+
+    /// Every fatal case of loading comes back as its own typed error, never a panic:
+    /// an unreadable config file, invalid TOML, and a configuration validation rejects.
+    #[test]
+    fn load_reports_each_fatal_case_as_a_typed_error() {
+        // load() applies NORA_* overrides; other tests set invalid ones under this lock.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+        let missing = Config::load_from(Some(path("absent.toml"))).expect_err("missing file");
+        assert!(
+            matches!(missing, ConfigLoadError::Unreadable { .. }),
+            "{missing}"
+        );
+
+        std::fs::write(path("broken.toml"), "[server\nport = ").unwrap();
+        let broken = Config::load_from(Some(path("broken.toml"))).expect_err("invalid TOML");
+        assert!(
+            matches!(broken, ConfigLoadError::InvalidToml { .. }),
+            "{broken}"
+        );
+
+        // An error no test's temporary NORA_* variables can mask.
+        std::fs::write(path("empty-path.toml"), "[storage]\npath = \"\"\n").unwrap();
+        let invalid = Config::load_from(Some(path("empty-path.toml"))).expect_err("validation");
+        assert!(matches!(invalid, ConfigLoadError::Invalid(_)), "{invalid}");
+        assert!(invalid.to_string().contains("storage.path"), "{invalid}");
     }
 
     /// A fatal configuration error is a typed error for `main` to exit on with
