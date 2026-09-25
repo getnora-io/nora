@@ -703,7 +703,16 @@ async fn main() {
         std::process::exit(run_healthcheck(*timeout_secs).await);
     }
 
-    let config = Config::load();
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            // A clean, non-retried stop: the units list EXIT_CONFIG in
+            // RestartPreventExitStatus= (#1025).
+            error!(error = %e, "Cannot start with this configuration");
+            eprintln!("nora: {e}");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    };
 
     // Initialize storage based on mode
     let storage = match config.storage.mode {

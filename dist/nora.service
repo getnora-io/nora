@@ -12,6 +12,8 @@ ExecStart=/usr/bin/nora serve
 WorkingDirectory=/etc/nora
 Restart=on-failure
 RestartSec=5
+# A configuration error (EX_CONFIG) stops the service instead of restarting into it
+RestartPreventExitStatus=78
 LimitNOFILE=65535
 
 # Security hardening
