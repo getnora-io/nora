@@ -19,6 +19,15 @@ const PIN_FILE: &str = ".nora-pins.ndjson";
 /// Monotonic counter for unique temp file names (atomic — no collisions).
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A temp path next to `path` that no other write in this or any other process uses:
+/// PID + monotonic counter. Concurrent writers of one key each stage their own copy
+/// and only the final `rename` publishes it, so a reader never sees a partial file.
+/// Relaxed ordering: the counter only makes names unique, it orders nothing.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
+}
+
 /// fsync the parent directory of `path` so the directory entry written by a
 /// just-completed `rename` is durable across power-loss. The file's own data is
 /// fsync'd (`sync_all`) before the rename; the rename only becomes crash-durable
@@ -155,11 +164,7 @@ impl StorageBackend for LocalStorage {
 
         // Atomic write: create temp file in same directory, write, rename.
         // This prevents readers from seeing partial/truncated data during write.
-        // Temp file uses PID + monotonic counter to guarantee uniqueness.
-        // Relaxed ordering: counter is only used for name uniqueness, not
-        // for happens-before relationships between threads.
-        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+        let tmp = unique_tmp_path(&path);
         let write_result: Result<()> = async {
             let mut file = fs::File::create(&tmp).await?;
             file.write_all(data).await?;
@@ -347,7 +352,9 @@ impl StorageBackend for LocalStorage {
             }
             Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
                 let mut reader = fs::File::open(src).await?;
-                let tmp = dest.with_extension("tmp");
+                // Each writer stages its own copy: two fills of one blob must not share
+                // (and truncate, and rename away) one temp file.
+                let tmp = unique_tmp_path(&dest);
                 let mut writer = fs::File::create(&tmp).await?;
                 let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
                 let copy_result: Result<()> = async {
@@ -482,6 +489,73 @@ mod tests {
 
     async fn get(storage: &LocalStorage, key: &str) -> Result<Bytes> {
         storage.get(key).await.map(|(data, _pin)| data)
+    }
+
+    /// `put_from_path` across filesystems (EXDEV: the spool on tmpfs, storage on disk)
+    /// copies through a temp file. Concurrent writes of one key — two proxy fills of the
+    /// same blob — must each succeed, never publish a torn blob to a reader, and leave
+    /// no temp file behind. Skipped where no second filesystem is available.
+    #[tokio::test]
+    async fn concurrent_cross_device_put_from_path_is_atomic() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(src_dir) = TempDir::new_in("/dev/shm") else {
+            eprintln!("skip: /dev/shm unavailable, cannot force EXDEV");
+            return;
+        };
+        let store_dir = TempDir::new().unwrap();
+        let (a, b) = (
+            std::fs::metadata(src_dir.path()).unwrap().dev(),
+            std::fs::metadata(store_dir.path()).unwrap().dev(),
+        );
+        if a == b {
+            eprintln!("skip: /dev/shm and the temp dir share a filesystem, no EXDEV");
+            return;
+        }
+        let storage = Arc::new(LocalStorage::new(store_dir.path().to_str().unwrap()));
+        let data: Arc<Vec<u8>> =
+            Arc::new((0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let key = "docker/library/test/blobs/sha256:same";
+        let dest = storage.key_to_path(key);
+
+        let (reader_dest, reader_data) = (dest.clone(), Arc::clone(&data));
+        let reader = tokio::spawn({
+            let (dest, data) = (reader_dest, reader_data);
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(seen) = tokio::fs::read(&dest).await {
+                        assert_eq!(seen.len(), data.len(), "a reader saw a torn blob");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let mut writers = Vec::new();
+        for i in 0..8 {
+            let src = src_dir.path().join(format!("spool-{i}"));
+            std::fs::write(&src, data.as_slice()).unwrap();
+            let storage = Arc::clone(&storage);
+            let handle = tokio::spawn(async move { storage.put_from_path(key, &src, None).await });
+            writers.push(handle);
+        }
+        for writer in writers {
+            writer
+                .await
+                .unwrap()
+                .expect("every concurrent write succeeds");
+        }
+        reader.await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), *data);
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[tokio::test]
