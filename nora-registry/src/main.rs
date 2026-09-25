@@ -558,6 +558,119 @@ fn bind_v6_dual_stack(addr: std::net::SocketAddr) -> std::io::Result<tokio::net:
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shutdown_drain_tests {
+    //! Graceful shutdown drains in-flight requests for at most the shutdown timeout
+    //! (#1016): a client that stops reading can no longer hold the process past it.
+    use super::{serve_with_drain, ServeEnd};
+    use axum::body::{Body, Bytes};
+    use axum::routing::get;
+    use axum::Router;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A body that never ends, in 64 KiB pieces.
+    async fn endless() -> Body {
+        let piece = Bytes::from(vec![7u8; 64 * 1024]);
+        Body::from_stream(futures::stream::repeat_with(move || {
+            Ok::<_, std::io::Error>(piece.clone())
+        }))
+    }
+
+    /// Three pieces 100 ms apart: a download that finishes on its own.
+    async fn short() -> Body {
+        use futures::StreamExt;
+        Body::from_stream(futures::stream::iter(0..3u8).then(|i| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, std::io::Error>(Bytes::from(vec![i; 1024]))
+        }))
+    }
+
+    async fn start(
+        drain: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<ServeEnd>>,
+    ) {
+        let app = Router::new()
+            .route("/endless", get(endless))
+            .route("/short", get(short));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_drain(
+            listener,
+            app,
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+        (addr, tx, server)
+    }
+
+    /// A client reads the start of an endless body and then stops reading, keeping the
+    /// connection open (dockerd after a failed layer). After the signal, serving ends
+    /// at the deadline instead of waiting on that connection forever.
+    #[tokio::test]
+    async fn stalled_client_cannot_hold_shutdown_past_the_deadline() {
+        let drain = Duration::from_millis(300);
+        let (addr, stop, server) = start(drain).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /endless HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 4096];
+        let _ = client.read(&mut head).await.unwrap(); // started, then never read again
+
+        let signalled = Instant::now();
+        stop.send(()).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serving must end at the drain deadline, not wait on the stalled client")
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, ServeEnd::DeadlinePassed);
+        assert!(
+            signalled.elapsed() >= drain,
+            "in-flight requests get the whole drain window"
+        );
+        drop(client);
+    }
+
+    /// A download already in flight when the signal comes, and short enough to finish
+    /// within the deadline, completes whole; serving ends as drained.
+    #[tokio::test]
+    async fn in_flight_download_finishes_within_the_deadline() {
+        let (addr, stop, server) = start(Duration::from_secs(5)).await;
+        let download = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"GET /short HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut all = Vec::new();
+            client.read_to_end(&mut all).await.unwrap();
+            all
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(()).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, ServeEnd::Drained);
+        let response = download.await.unwrap();
+        let body_bytes = response.iter().filter(|b| matches!(b, 0..=2)).count();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(body_bytes >= 3 * 1024, "the whole body arrived");
+    }
+}
+
+#[cfg(test)]
 mod bind_tests {
     use super::bind_listener;
 
@@ -1928,14 +2041,18 @@ async fn run_server(mut config: Config, storage: Storage) {
         });
     }
 
-    // Graceful shutdown on SIGTERM/SIGINT
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .expect("Server error");
+    // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
+    let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
+    match serve_with_drain(listener, app, shutdown_signal(), drain)
+        .await
+        .expect("Server error")
+    {
+        ServeEnd::Drained => {}
+        ServeEnd::DeadlinePassed => warn!(
+            shutdown_timeout_secs = state.config.server.shutdown_timeout,
+            "Connections still open after the shutdown timeout are closed; finishing shutdown"
+        ),
+    }
 
     // Signal background schedulers to stop and wait for them (#306)
     cancel_token.cancel();
@@ -1965,6 +2082,64 @@ async fn run_server(mut config: Config, storage: Storage) {
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
     );
+}
+
+/// How serving ended after the shutdown signal.
+#[derive(Debug, PartialEq, Eq)]
+enum ServeEnd {
+    /// Every in-flight request finished within the drain window.
+    Drained,
+    /// The drain window passed with connections still open.
+    DeadlinePassed,
+}
+
+/// Serve `app` until `shutdown` resolves, then give in-flight requests `drain` to finish.
+///
+/// axum's graceful shutdown stops accepting at once but then waits for every open
+/// connection with no limit, so a client that stops reading a response holds it
+/// forever. Connections still open when the window passes are not awaited any more:
+/// their tasks end when the runtime shuts down at process exit, after the shutdown
+/// steps (schedulers, audit drain, token flush) have run.
+async fn serve_with_drain<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+    drain: std::time::Duration,
+) -> std::io::Result<ServeEnd>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&signalled);
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        // A stored permit: the wait below sees it even if it starts afterwards.
+        notify.notify_one();
+    });
+    let server = std::future::IntoFuture::into_future(server);
+    tokio::pin!(server);
+    // CANCEL-SAFETY: both arms only poll; the server future stays pinned here and is
+    // polled again below, `notified()` holds nothing.
+    tokio::select! {
+        served = &mut server => {
+            served?;
+            return Ok(ServeEnd::Drained);
+        }
+        () = signalled.notified() => {}
+    }
+    // CANCEL-SAFETY: on timeout the server future is dropped; that only stops waiting
+    // for the open connections, whose tasks are owned by the runtime.
+    match tokio::time::timeout(drain, &mut server).await {
+        Ok(served) => {
+            served?;
+            Ok(ServeEnd::Drained)
+        }
+        Err(_) => Ok(ServeEnd::DeadlinePassed),
+    }
 }
 
 /// Wait for shutdown signal (SIGTERM or SIGINT)

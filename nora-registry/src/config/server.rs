@@ -35,6 +35,13 @@ pub struct ServerConfig {
     /// package just cached will be quarantined for `min_release_age`.
     #[serde(default = "default_trust_upstream_dates")]
     pub trust_upstream_dates: bool,
+    /// Seconds in-flight requests get to finish after SIGTERM/SIGINT before the
+    /// connections still open are closed and shutdown continues (#1016). A client that
+    /// stops reading could otherwise hold the process until the orchestrator kills it,
+    /// losing the audit drain and the token flush. Default 15: with the scheduler wait
+    /// (up to 10 s) it fits Kubernetes' default 30 s grace period.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout: u64,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -57,6 +64,10 @@ pub(super) fn default_trust_upstream_dates() -> bool {
     false
 }
 
+pub(super) fn default_shutdown_timeout() -> u64 {
+    15
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -73,6 +84,7 @@ impl Default for ServerConfig {
             public_url: None,
             body_limit_mb: default_body_limit_mb(),
             proxy_coalesce: default_proxy_coalesce(),
+            shutdown_timeout: default_shutdown_timeout(),
             trust_upstream_dates: default_trust_upstream_dates(),
         }
     }
@@ -161,6 +173,9 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
             super::parse_env_warn("NORA_BODY_LIMIT_MB", &val, &mut self.body_limit_mb);
         }
+        if let Ok(val) = env::var("NORA_SHUTDOWN_TIMEOUT") {
+            super::parse_env_warn("NORA_SHUTDOWN_TIMEOUT", &val, &mut self.shutdown_timeout);
+        }
         if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
             super::parse_env_warn(
                 "NORA_TRUST_UPSTREAM_DATES",
@@ -175,6 +190,18 @@ impl ServerConfig {
 mod tests {
     use super::*;
 
+    /// The drain window defaults to 15 s (fits Kubernetes' default 30 s grace period
+    /// together with the scheduler wait and the audit drain) and follows the env.
+    #[test]
+    fn shutdown_timeout_default_and_env_override() {
+        assert_eq!(ServerConfig::default().shutdown_timeout, 15);
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_SHUTDOWN_TIMEOUT", "4");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_SHUTDOWN_TIMEOUT");
+        assert_eq!(config.shutdown_timeout, 4);
+    }
+
     fn server(host: &str, port: u16) -> ServerConfig {
         ServerConfig {
             host: host.to_string(),
@@ -183,6 +210,7 @@ mod tests {
             body_limit_mb: 2048,
             proxy_coalesce: true,
             trust_upstream_dates: false,
+            shutdown_timeout: 15,
         }
     }
 
