@@ -258,6 +258,8 @@ pub struct AppState {
     /// thundering herd of concurrent requests for the same key into one
     /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
+    /// Docker blob fills in flight, shared by every request for the blob (#1003).
+    pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
@@ -1626,6 +1628,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         oidc: oidc_validator.map(Arc::new),
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
+        blob_flights: proxy_coalesce::InflightMap::new(),
         digest_store,
         signer,
         leak_finders,

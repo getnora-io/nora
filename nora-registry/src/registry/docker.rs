@@ -6,6 +6,7 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::{CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
+use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::DockerAuth;
 use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
 use crate::registry::{
@@ -1170,6 +1171,93 @@ async fn check_blob(
     }
 }
 
+/// Serve a blob already in storage (`key`, or the pre-namespace `legacy_key`): curation
+/// integrity, the quarantine cooldown, `Range` (206/416), else the whole blob through the
+/// streaming digest check. `None` when storage has neither key.
+async fn serve_local_blob(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    name: &str,
+    digest: &str,
+    key: &str,
+    legacy_key: &str,
+) -> Option<Response> {
+    let (size, reader) = storage_get_reader_with_fallback(&state.storage, key, legacy_key)
+        .await
+        .ok()?;
+    // Curation integrity check using digest from URL (no full-data rehash).
+    // Docker blobs are content-addressed: the URL digest IS the integrity.
+    if let Some(response) = crate::curation::verify_integrity_by_hash(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Docker,
+        name,
+        Some(digest),
+        digest,
+    ) {
+        return Some(response);
+    }
+
+    // Quarantine: a proxy-cached blob still within its cooldown window is held.
+    // A blob with no proxy record (a local push, or an entry pruned past 90d)
+    // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
+    // the 206 range serve and the 200 full serve below.
+    if let Some(resp) = quarantine_cache_serve_gate(state, digest) {
+        return Some(resp);
+    }
+
+    // Range request: 206 Partial Content, or 416 when the client asks past the end
+    // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
+    // only) does not apply — a ranged serve relies on the content-addressed storage
+    // key plus the client's own content-digest check, as Docker/Harbor do. An
+    // absent/malformed range falls through to the full 200 below.
+    if let Some(response) = crate::registry::range::range_response(
+        &state.storage,
+        &[key, legacy_key],
+        headers,
+        size,
+        "application/octet-stream",
+        &[
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            ),
+            (
+                HeaderName::from_static("docker-content-digest"),
+                digest.to_string(),
+            ),
+        ],
+    )
+    .await
+    {
+        if response.status() == StatusCode::PARTIAL_CONTENT {
+            state.metrics.record_download("docker");
+            state.metrics.record_cache_hit("docker");
+        }
+        return Some(response);
+    }
+
+    state.metrics.record_download("docker");
+    state.metrics.record_cache_hit("docker");
+    state.activity.push(ActivityEntry::new(
+        ActionType::Pull,
+        format!("{}@{}", name, &digest[..19.min(digest.len())]),
+        crate::registry_type::RegistryType::Docker,
+        "LOCAL",
+    ));
+    let stream = VerifyingReader::new(reader, digest);
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, size)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header("docker-content-digest", digest)
+            .body(nora_registry::verified::reader_stream_body(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
 async fn download_blob(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1215,78 +1303,10 @@ async fn download_blob(
     let legacy_key = blob_key(None, &name, &digest);
 
     // Try local storage first — streaming read, never loads full blob into RAM (#580)
-    if let Ok((size, reader)) =
-        storage_get_reader_with_fallback(&state.storage, &key, &legacy_key).await
+    if let Some(response) =
+        serve_local_blob(&state, &headers, &name, &digest, &key, &legacy_key).await
     {
-        // Curation integrity check using digest from URL (no full-data rehash).
-        // Docker blobs are content-addressed: the URL digest IS the integrity.
-        if let Some(response) = crate::curation::verify_integrity_by_hash(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Docker,
-            &name,
-            Some(&digest),
-            &digest,
-        ) {
-            return response;
-        }
-
-        // Quarantine: a proxy-cached blob still within its cooldown window is held.
-        // A blob with no proxy record (a local push, or an entry pruned past 90d)
-        // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
-        // the 206 range serve and the 200 full serve below.
-        if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
-            return resp;
-        }
-
-        // Range request: 206 Partial Content, or 416 when the client asks past the end
-        // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
-        // only) does not apply — a ranged serve relies on the content-addressed storage
-        // key plus the client's own content-digest check, as Docker/Harbor do. An
-        // absent/malformed range falls through to the full 200 below.
-        if let Some(response) = crate::registry::range::range_response(
-            &state.storage,
-            &[&key, &legacy_key],
-            &headers,
-            size,
-            "application/octet-stream",
-            &[
-                (
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable".to_string(),
-                ),
-                (
-                    HeaderName::from_static("docker-content-digest"),
-                    digest.clone(),
-                ),
-            ],
-        )
-        .await
-        {
-            if response.status() == StatusCode::PARTIAL_CONTENT {
-                state.metrics.record_download("docker");
-                state.metrics.record_cache_hit("docker");
-            }
-            return response;
-        }
-
-        state.metrics.record_download("docker");
-        state.metrics.record_cache_hit("docker");
-        state.activity.push(ActivityEntry::new(
-            ActionType::Pull,
-            format!("{}@{}", name, &digest[..19.min(digest.len())]),
-            crate::registry_type::RegistryType::Docker,
-            "LOCAL",
-        ));
-        let stream = VerifyingReader::new(reader, &digest);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, size)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-            .header("docker-content-digest", &digest)
-            .body(nora_registry::verified::reader_stream_body(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return response;
     }
 
     // #733/#821: an internal-namespace image's blob with no local copy is never proxied
@@ -1323,70 +1343,67 @@ async fn download_blob(
             ) {
                 return response;
             }
-            // The spool file and its follower exist before upstream answers: once a probe
-            // has been taken, the only exits left are the ones the spool task records.
-            let spool = match SpoolFile::create(&temp_dir).await {
-                Ok(spool) => spool,
-                Err(e) => {
-                    tracing::error!(error = ?e, "Failed to create proxy spool file");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            let follower = match spool.follower().await {
-                Ok(follower) => follower,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open proxy spool file for streaming");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            match open_blob_from_upstream(
-                &state.http_client,
-                &upstream.url,
-                try_name,
-                &digest,
-                &state.docker_auth,
-                state.config.docker.proxy_timeout,
-                expose_opt(&upstream.auth),
-                &state.circuit_breaker,
-            )
-            .await
-            {
-                Ok(upstream_blob) => {
-                    state.metrics.record_download("docker");
-                    state.metrics.record_cache_miss("docker");
-                    state.activity.push(ActivityEntry::new(
-                        ActionType::ProxyFetch,
-                        format!("{}@{}", try_name, &digest[..19.min(digest.len())]),
-                        crate::registry_type::RegistryType::Docker,
-                        "PROXY",
-                    ));
-                    let content_length = upstream_blob.content_length;
-                    let (progress, status) = tokio::sync::watch::channel(SpoolStatus::default());
-                    spawn_blob_spool(
-                        state.clone(),
-                        upstream_blob,
-                        spool,
-                        key.clone(),
-                        digest.clone(),
-                        upstream.url.clone(),
-                        progress,
-                    );
-                    // Quarantine: the fill continues in the background and lands in the cache;
-                    // a held digest is answered 403 now (mirrors the manifest proxy path).
-                    if let Some(resp) = quarantine_proxy_fetch_gate(&state, &digest, &upstream.url)
-                    {
-                        return resp;
+            // One upstream fetch per blob, shared by every request that asks while it fills
+            // (#1003). The key is the storage key plus the name and upstream this request
+            // resolved to, so a request only ever joins a fill it could have started itself;
+            // it joins here, after every check above ran on its own request.
+            let flight_key = format!("{key}\n{try_name}\n{}", upstream.url);
+            for _attempt in 0..2 {
+                let mut failure = None;
+                let flight = state
+                    .blob_flights
+                    .leased(
+                        &flight_key,
+                        "docker",
+                        crate::proxy_coalesce::follower_budget(state.config.docker.proxy_timeout),
+                        || {
+                            start_fill(
+                                &state,
+                                &upstream.url,
+                                expose_opt(&upstream.auth),
+                                try_name,
+                                &digest,
+                                &temp_dir,
+                                &mut failure,
+                            )
+                        },
+                    )
+                    .await;
+                let target = BlobTarget {
+                    name: &name,
+                    upstream_name: try_name,
+                    digest: &digest,
+                    key: &key,
+                    legacy_key: &legacy_key,
+                    upstream_url: &upstream.url,
+                };
+                match flight {
+                    Some(Flight::Leader { value, own, lease }) => {
+                        return lead_fill(&state, value, own, Some(lease), &target, &headers).await;
                     }
-                    // Answer as soon as upstream has answered: the body follows the spool file
-                    // as it grows, so a client that caps time-to-first-header (containerd ≥ 2.3
-                    // gives up after 30 s) is never left waiting for a multi-GB fill.
-                    return spool_response(follower, status, content_length, &digest, &headers)
-                        .await;
-                }
-                Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-                Err(e) => {
-                    tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
-                    continue;
+                    Some(Flight::Alone { value, own }) => {
+                        return lead_fill(&state, value, own, None, &target, &headers).await;
+                    }
+                    Some(Flight::Follower(share)) => {
+                        if let Some(response) = follow_fill(&state, share, &target, &headers).await
+                        {
+                            return response;
+                        }
+                        // The fill failed and its slot is released: take another turn.
+                    }
+                    None => match failure {
+                        Some(FillStartError::Spool) => {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                        Some(FillStartError::Upstream(ProxyError::CircuitOpen(reg))) => {
+                            return circuit_open_response(&reg)
+                        }
+                        Some(FillStartError::Upstream(e)) => {
+                            tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
+                            break;
+                        }
+                        None => break,
+                    },
                 }
             }
         }
@@ -2901,11 +2918,12 @@ impl SpoolFile {
 /// and the next status check are never waited on.
 ///
 /// `file` is positioned at byte `start` of the blob: a ranged response follows the
-/// spool from there.
+/// spool from there. A spool that reports nothing for `stall` fails the read.
 fn spool_follower(
     file: tokio::fs::File,
     status: tokio::sync::watch::Receiver<SpoolStatus>,
     start: u64,
+    stall: Duration,
 ) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send {
     const READ_BUF: usize = 256 * 1024;
     const HOLDBACK_BYTES: u64 = 1;
@@ -2914,7 +2932,7 @@ fn spool_follower(
     const MAX_EMPTY_READS: u32 = 1_000;
     futures::stream::unfold(
         (file, status, start, 0u32),
-        |(mut file, mut status, mut offset, mut empty_reads)| async move {
+        move |(mut file, mut status, mut offset, mut empty_reads)| async move {
             use tokio::io::AsyncReadExt;
             loop {
                 let current = status.borrow_and_update().clone();
@@ -2960,9 +2978,20 @@ fn spool_follower(
                 if current.done.is_some() {
                     return None;
                 }
-                if status.changed().await.is_err() {
-                    let err = std::io::Error::other("upstream blob fetch abandoned");
-                    return Some((Err(err), (file, status, offset, empty_reads)));
+                // CANCEL-SAFETY: `changed()` only borrows the receiver; a timeout drops the
+                // wait and the stream ends with an error, the file handle goes with it.
+                match tokio::time::timeout(stall, status.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        let err = std::io::Error::other("upstream blob fetch abandoned");
+                        return Some((Err(err), (file, status, offset, empty_reads)));
+                    }
+                    Err(_) => {
+                        let err = std::io::Error::other(format!(
+                            "upstream blob fill reported nothing for {stall:?}"
+                        ));
+                        return Some((Err(err), (file, status, offset, empty_reads)));
+                    }
                 }
             }
         },
@@ -2985,6 +3014,7 @@ async fn spool_response(
     content_length: Option<u64>,
     digest: &str,
     headers: &axum::http::HeaderMap,
+    stall: Duration,
 ) -> Response {
     use crate::registry::range::{parse_byte_range, ParsedRange};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -3019,7 +3049,7 @@ async fn spool_response(
             }
             let wanted = end - start + 1;
             let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
-                follower, status, start,
+                follower, status, start, stall,
             )))
             .take(wanted);
             builder
@@ -3032,8 +3062,9 @@ async fn spool_response(
                 ))
         }
         _ => {
-            let reader =
-                tokio_util::io::StreamReader::new(Box::pin(spool_follower(follower, status, 0)));
+            let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
+                follower, status, 0, stall,
+            )));
             let stream = VerifyingReader::new(reader, digest);
             let mut builder = builder.status(StatusCode::OK);
             if let Some(len) = len {
@@ -3047,6 +3078,222 @@ async fn spool_response(
     response.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// What a request joining a running blob fill needs — the value a fill's leader publishes
+/// through `blob_flights` (#1003): the spool file to open its own read handle on, the fill's
+/// progress, and upstream's declared length for `Range`.
+#[derive(Clone)]
+pub(crate) struct SpoolShare {
+    path: std::path::PathBuf,
+    status: tokio::sync::watch::Receiver<SpoolStatus>,
+    content_length: Option<u64>,
+}
+
+/// The leader's own part of a fill, never shared: what the spool task consumes and the
+/// read handle the leader's response follows.
+struct LeaderFill {
+    blob: UpstreamBlob,
+    spool: SpoolFile,
+    follower: tokio::fs::File,
+    progress: tokio::sync::watch::Sender<SpoolStatus>,
+}
+
+/// Why [`start_fill`] could not open a fill.
+enum FillStartError {
+    /// The local spool file could not be created or reopened.
+    Spool,
+    /// Upstream refused or failed before answering headers.
+    Upstream(ProxyError),
+}
+
+/// Open a fill: the spool file and its first read handle, then the upstream request. The
+/// spool exists before upstream answers, so once a circuit-breaker probe is taken the
+/// only exits left are the ones the spool task records.
+async fn start_fill(
+    state: &AppState,
+    upstream_url: &str,
+    upstream_auth: Option<&str>,
+    name: &str,
+    digest: &str,
+    temp_dir: &std::path::Path,
+    failure: &mut Option<FillStartError>,
+) -> Option<(SpoolShare, LeaderFill)> {
+    let spool = match SpoolFile::create(temp_dir).await {
+        Ok(spool) => spool,
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to create proxy spool file");
+            *failure = Some(FillStartError::Spool);
+            return None;
+        }
+    };
+    let follower = match spool.follower().await {
+        Ok(follower) => follower,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open proxy spool file for streaming");
+            *failure = Some(FillStartError::Spool);
+            return None;
+        }
+    };
+    match open_blob_from_upstream(
+        &state.http_client,
+        upstream_url,
+        name,
+        digest,
+        &state.docker_auth,
+        state.config.docker.proxy_timeout,
+        upstream_auth,
+        &state.circuit_breaker,
+    )
+    .await
+    {
+        Ok(blob) => {
+            let (progress, status) = tokio::sync::watch::channel(SpoolStatus::default());
+            let share = SpoolShare {
+                path: spool.path.clone(),
+                status,
+                content_length: blob.content_length,
+            };
+            Some((
+                share,
+                LeaderFill {
+                    blob,
+                    spool,
+                    follower,
+                    progress,
+                },
+            ))
+        }
+        Err(e) => {
+            *failure = Some(FillStartError::Upstream(e));
+            None
+        }
+    }
+}
+
+/// Run a fill this request leads: start the detached spool task (it holds `lease`, so
+/// requests arriving until the blob is stored join this fill) and answer from the spool.
+async fn lead_fill(
+    state: &AppState,
+    share: SpoolShare,
+    own: LeaderFill,
+    lease: Option<crate::proxy_coalesce::Lease<SpoolShare>>,
+    blob: &BlobTarget<'_>,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    let (name, digest, upstream_url) = (blob.upstream_name, blob.digest, blob.upstream_url);
+    state.metrics.record_download("docker");
+    state.metrics.record_cache_miss("docker");
+    state.activity.push(ActivityEntry::new(
+        ActionType::ProxyFetch,
+        format!("{}@{}", name, &digest[..19.min(digest.len())]),
+        crate::registry_type::RegistryType::Docker,
+        "PROXY",
+    ));
+    spawn_blob_spool(
+        state.clone(),
+        own.blob,
+        own.spool,
+        blob,
+        own.progress,
+        lease,
+    );
+    // Quarantine: the fill continues in the background and lands in the cache;
+    // a held digest is answered 403 now (mirrors the manifest proxy path).
+    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url) {
+        return resp;
+    }
+    // Answer as soon as upstream has answered: the body follows the spool file
+    // as it grows, so a client that caps time-to-first-header (containerd ≥ 2.3
+    // gives up after 30 s) is never left waiting for a multi-GB fill.
+    spool_response(
+        own.follower,
+        share.status,
+        share.content_length,
+        digest,
+        headers,
+        fill_stall_ceiling(state.config.docker.read_timeout),
+    )
+    .await
+}
+
+/// Follow a fill another request leads, from the joiner's own read handle on the spool.
+/// `None` when the fill can no longer be joined — it failed, or it finished and its spool
+/// has already moved into storage — so the caller looks in storage or leads a new fill.
+async fn join_fill(
+    state: &AppState,
+    share: SpoolShare,
+    digest: &str,
+    upstream_url: &str,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    if matches!(share.status.borrow().done, Some(Err(_))) {
+        return None;
+    }
+    // An open handle survives the spool's later rename into storage or its removal.
+    let follower = tokio::fs::File::open(&share.path).await.ok()?;
+    state.metrics.record_download("docker");
+    if let Some(resp) = quarantine_proxy_fetch_gate(state, digest, upstream_url) {
+        return Some(resp);
+    }
+    Some(
+        spool_response(
+            follower,
+            share.status,
+            share.content_length,
+            digest,
+            headers,
+            fill_stall_ceiling(state.config.docker.read_timeout),
+        )
+        .await,
+    )
+}
+
+/// The blob a request asked for, as its own request resolved it: the canonical name and
+/// storage keys, and the upstream (with the name it goes by there) it is fetched from.
+struct BlobTarget<'a> {
+    name: &'a str,
+    upstream_name: &'a str,
+    digest: &'a str,
+    key: &'a str,
+    legacy_key: &'a str,
+    upstream_url: &'a str,
+}
+
+/// Serve a follower of a running fill: join it, or — when the fill is gone because its
+/// spool already moved into storage — serve the stored blob. `None` only when the fill
+/// failed and nothing is stored, so the caller leads a new fill.
+async fn follow_fill(
+    state: &AppState,
+    share: SpoolShare,
+    blob: &BlobTarget<'_>,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    if let Some(response) = join_fill(state, share, blob.digest, blob.upstream_url, headers).await {
+        return Some(response);
+    }
+    serve_local_blob(
+        state,
+        headers,
+        blob.name,
+        blob.digest,
+        blob.key,
+        blob.legacy_key,
+    )
+    .await
+}
+
+/// Longest a response may wait on a fill that reports nothing: past the fill's own worst
+/// case — a stalled chunk (`read_timeout`) on every resume attempt, plus their back-off —
+/// with a margin. The fill always ends in bytes or a verdict before that; the ceiling only
+/// guards against a fill that never reports at all.
+fn fill_stall_ceiling(read_timeout: u64) -> Duration {
+    let backoff: Duration = (1..=UPSTREAM_RESUME_ATTEMPTS)
+        .map(|attempt| UPSTREAM_RESUME_BACKOFF * attempt)
+        .sum();
+    Duration::from_secs(read_timeout * (u64::from(UPSTREAM_RESUME_ATTEMPTS) + 1))
+        + backoff
+        + Duration::from_secs(30)
+}
+
 /// Spool an upstream blob to disk and store it, detached from the request that started
 /// it: a client that gives up mid-fill (containerd retries a slow pull from scratch) no
 /// longer discards the bytes already fetched, and the next request is a cache hit.
@@ -3058,13 +3305,18 @@ fn spawn_blob_spool(
     state: AppState,
     blob: UpstreamBlob,
     spool: SpoolFile,
-    key: String,
-    digest: String,
-    upstream: String,
+    target: &BlobTarget<'_>,
     progress: tokio::sync::watch::Sender<SpoolStatus>,
+    lease: Option<crate::proxy_coalesce::Lease<SpoolShare>>,
 ) {
     use futures::FutureExt as _;
     use std::panic::AssertUnwindSafe;
+
+    let (key, digest, upstream) = (
+        target.key.to_string(),
+        target.digest.to_string(),
+        target.upstream_url.to_string(),
+    );
 
     let read_timeout = state.config.docker.read_timeout;
     let progress = Arc::new(progress);
@@ -3083,6 +3335,9 @@ fn spawn_blob_spool(
             Ok(fetched) => fetched,
             Err(e) => {
                 tracing::warn!(error = ?e, key = %key, "Docker blob proxy fetch failed mid-stream");
+                // Release the flight before announcing the failure, so a request that sees
+                // it can only start a fresh fill, never join this dead one.
+                drop(lease);
                 progress.send_modify(|s| s.done = Some(Err(format!("{e:?}"))));
                 return;
             }
@@ -3097,6 +3352,7 @@ fn spawn_blob_spool(
             );
             // TempFileGuard drops and cleans up; the follower's own handle still reads
             // to the end, and VerifyingReader fails the response there.
+            drop(lease);
             progress.send_modify(|s| s.done = Some(Err("SHA-256 mismatch".to_string())));
             return;
         }
@@ -3125,6 +3381,9 @@ fn spawn_blob_spool(
                 );
             }
         }
+        // Held until the blob is in storage (an S3 upload can take as long as the fill),
+        // so a request arriving in between still joins instead of refetching.
+        drop(lease);
     };
     tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(move |done| {
         if let Err(panic) = done {
@@ -6805,7 +7064,43 @@ mod stream_spool_tests {
         tokio::fs::write(&path, bytes).await.unwrap();
         let file = tokio::fs::File::open(&path).await.unwrap();
         let (tx, rx) = tokio::sync::watch::channel(status);
-        (Box::pin(super::spool_follower(file, rx, 0)), tx, dir)
+        (
+            Box::pin(super::spool_follower(file, rx, 0, Duration::from_secs(60))),
+            tx,
+            dir,
+        )
+    }
+
+    /// A spool that reports nothing past the stall ceiling fails the read instead of
+    /// holding the response forever.
+    #[tokio::test]
+    async fn spool_follower_fails_past_the_stall_ceiling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        tokio::fs::write(&path, b"abc").await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(super::SpoolStatus {
+            written: 3,
+            done: None,
+        });
+        let mut follower = Box::pin(super::spool_follower(
+            file,
+            rx,
+            0,
+            Duration::from_millis(100),
+        ));
+        // Two bytes are released (one held back), then nothing more ever comes.
+        let first = tokio::time::timeout(Duration::from_secs(1), follower.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), b"ab");
+        let stalled = tokio::time::timeout(Duration::from_secs(2), follower.next())
+            .await
+            .expect("the ceiling ends the wait")
+            .expect("an item, not a clean end");
+        assert!(stalled.is_err(), "a silent spool must fail the read");
     }
 
     /// The follower withholds the last flushed byte until the spool reports a verified
@@ -7048,20 +7343,20 @@ mod upstream_resume_tests {
 
     /// How the scripted upstream answers one blob GET.
     #[derive(Clone, Copy)]
-    struct Plan {
+    pub(super) struct Plan {
         /// Answer `Range: bytes=N-` with 206; `false` ignores it and sends the whole blob.
-        honor_range: bool,
+        pub(super) honor_range: bool,
         /// Drop the connection after this many body bytes of this response.
-        cut_after: Option<usize>,
+        pub(super) cut_after: Option<usize>,
         /// Body piece size and the pause before each piece.
-        piece: usize,
-        delay: Duration,
+        pub(super) piece: usize,
+        pub(super) delay: Duration,
         /// Pause before the response headers.
-        header_delay: Duration,
+        pub(super) header_delay: Duration,
     }
 
     impl Plan {
-        fn fast() -> Self {
+        pub(super) fn fast() -> Self {
             Plan {
                 honor_range: true,
                 cut_after: None,
@@ -7070,7 +7365,7 @@ mod upstream_resume_tests {
                 header_delay: Duration::ZERO,
             }
         }
-        fn cut(after: usize) -> Self {
+        pub(super) fn cut(after: usize) -> Self {
             Plan {
                 cut_after: Some(after),
                 ..Plan::fast()
@@ -7081,9 +7376,9 @@ mod upstream_resume_tests {
     /// Upstream that answers blob GETs by `plans[hit]` (the last plan repeats) and records
     /// the `Range` header of every request. With `bearer = Some(t)` a blob GET without
     /// `Authorization: Bearer t` gets a 401 challenge pointing at its own `/token`.
-    struct ScriptedUpstream {
-        url: String,
-        hits: Arc<AtomicUsize>,
+    pub(super) struct ScriptedUpstream {
+        pub(super) url: String,
+        pub(super) hits: Arc<AtomicUsize>,
         ranges: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
         server: tokio::task::JoinHandle<()>,
     }
@@ -7101,7 +7396,7 @@ mod upstream_resume_tests {
         }
     }
 
-    async fn scripted_upstream(
+    pub(super) async fn scripted_upstream(
         blob: Vec<u8>,
         plans: Vec<Plan>,
         bearer: Option<&'static str>,
@@ -7209,7 +7504,7 @@ mod upstream_resume_tests {
         }
     }
 
-    fn ctx_for(upstream: &ScriptedUpstream, proxy_timeout: u64) -> TestContext {
+    pub(super) fn ctx_for(upstream: &ScriptedUpstream, proxy_timeout: u64) -> TestContext {
         use crate::config::DockerUpstream;
         let url = upstream.url.clone();
         create_test_context_with_config(move |cfg| {
@@ -7223,14 +7518,14 @@ mod upstream_resume_tests {
         })
     }
 
-    fn layer(len: usize) -> (Vec<u8>, String) {
+    pub(super) fn layer(len: usize) -> (Vec<u8>, String) {
         let blob: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
         (blob, digest)
     }
 
     /// Waits (bounded) for the spool task to store the blob; `true` once it is cached.
-    async fn cached(ctx: &TestContext, digest: &str) -> bool {
+    pub(super) async fn cached(ctx: &TestContext, digest: &str) -> bool {
         let c = canonicalize("library/test", &ctx.state.config.docker);
         let key = blob_key(c.namespace.as_deref(), &c.name, digest);
         let started = std::time::Instant::now();
@@ -7243,7 +7538,7 @@ mod upstream_resume_tests {
         false
     }
 
-    fn proxy_temp_count(ctx: &TestContext) -> usize {
+    pub(super) fn proxy_temp_count(ctx: &TestContext) -> usize {
         let proxy_tmp =
             std::path::Path::new(&ctx.state.config.storage.path).join("tmp/docker-proxy");
         std::fs::read_dir(&proxy_tmp)
@@ -7251,7 +7546,7 @@ mod upstream_resume_tests {
             .unwrap_or(0)
     }
 
-    async fn pull(ctx: &TestContext, digest: &str) -> Response<Body> {
+    pub(super) async fn pull(ctx: &TestContext, digest: &str) -> Response<Body> {
         send(
             &ctx.app,
             Method::GET,
@@ -7607,5 +7902,338 @@ mod upstream_resume_tests {
             response.headers()[header::CONTENT_RANGE].to_str().unwrap(),
             format!("bytes */{}", blob.len())
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod blob_single_flight_tests {
+    //! One upstream fetch per cold blob, shared by every client that asks while it fills
+    //! (#1003): concurrent pulls, a client that arrives mid-fill, a ranged resume. A failed
+    //! or poisoned fill never strands a client, and joining a fill never skips the joiner's
+    //! own per-request checks.
+    use super::upstream_resume_tests::{
+        cached, ctx_for, layer, proxy_temp_count, pull, scripted_upstream, Plan,
+    };
+    use super::{blob_key, canonicalize};
+    use crate::test_helpers::send_with_headers;
+    use axum::body::Body;
+    use axum::http::{header, Method, StatusCode};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A body that takes ~1.6 s to arrive, long enough for later clients to find it filling.
+    fn slow() -> Plan {
+        Plan {
+            piece: 16 * 1024,
+            delay: Duration::from_millis(100),
+            ..Plan::fast()
+        }
+    }
+
+    async fn body_of(response: axum::response::Response) -> Result<Vec<u8>, axum::Error> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|b| b.to_vec())
+    }
+
+    /// N cold pulls of one layer at once → one upstream GET, every client gets the blob.
+    #[tokio::test]
+    async fn concurrent_cold_pulls_share_one_upstream_fetch() {
+        let (blob, digest) = layer(256 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![slow()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+        let joined_before = crate::metrics::PROXY_COALESCED_TOTAL
+            .with_label_values(&["docker"])
+            .get();
+
+        let pulls: Vec<_> = (0..8)
+            .map(|_| {
+                let app = ctx.app.clone();
+                let digest = digest.clone();
+                let handle = tokio::spawn(async move {
+                    let response = crate::test_helpers::send(
+                        &app,
+                        Method::GET,
+                        &format!("/v2/library/test/blobs/{digest}"),
+                        Body::empty(),
+                    )
+                    .await;
+                    (response.status(), body_of(response).await)
+                });
+                handle
+            })
+            .collect();
+        for pull in pulls {
+            let (status, body) = pull.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.expect("clean body"), blob);
+        }
+        assert_eq!(
+            upstream.hits.load(Ordering::SeqCst),
+            1,
+            "8 concurrent pulls of one cold layer must cost one upstream fetch"
+        );
+        assert!(
+            crate::metrics::PROXY_COALESCED_TOTAL
+                .with_label_values(&["docker"])
+                .get()
+                >= joined_before + 7,
+            "the 7 clients that joined are counted"
+        );
+        assert!(cached(&ctx, &digest).await);
+    }
+
+    /// A client that asks after the first one already has its headers (a containerd
+    /// retry, a second node) joins the running fill instead of starting another one.
+    #[tokio::test]
+    async fn late_client_joins_running_fill() {
+        let (blob, digest) = layer(256 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![slow()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let first = pull(&ctx, &digest).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = tokio::spawn(body_of(first));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let second = pull(&ctx, &digest).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(body_of(second).await.expect("clean body"), blob);
+        assert_eq!(first.await.unwrap().expect("clean body"), blob);
+        assert_eq!(
+            upstream.hits.load(Ordering::SeqCst),
+            1,
+            "joined, not refetched"
+        );
+    }
+
+    /// containerd resuming a broken pull mid-fill: its `Range` is served 206 from the
+    /// shared fill, still without a second upstream fetch.
+    #[tokio::test]
+    async fn late_ranged_client_gets_206_from_shared_fill() {
+        let (blob, digest) = layer(256 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![slow()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let first = pull(&ctx, &digest).await;
+        let first = tokio::spawn(body_of(first));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let from = 100_000usize;
+        let ranged = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/library/test/blobs/{digest}"),
+            vec![("range", &format!("bytes={from}-"))],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            ranged.headers()[header::CONTENT_RANGE].to_str().unwrap(),
+            format!("bytes {from}-{}/{}", blob.len() - 1, blob.len())
+        );
+        assert_eq!(body_of(ranged).await.expect("clean body"), &blob[from..]);
+        assert_eq!(first.await.unwrap().expect("clean body"), blob);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A poisoned upstream shared by three clients: one upstream fetch, every client's
+    /// body aborts (the last byte waits for the digest verdict), nothing is cached.
+    #[tokio::test]
+    async fn poisoned_fill_aborts_every_joined_client() {
+        let (_, digest) = layer(128 * 1024);
+        let (poison, _) = layer(128 * 1024 + 1);
+        let upstream = scripted_upstream(poison, vec![slow()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        let first = tokio::spawn(body_of(pull(&ctx, &digest).await));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second = tokio::spawn(body_of(pull(&ctx, &digest).await));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let third = body_of(pull(&ctx, &digest).await).await;
+        assert!(third.is_err(), "a poisoned fill must not end clean");
+        assert!(second.await.unwrap().is_err());
+        assert!(first.await.unwrap().is_err());
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        assert!(ctx.state.storage.get(&key).await.is_err(), "not cached");
+    }
+
+    /// A fill that fails releases its slot: the next pull starts a fresh fetch and
+    /// succeeds (fail-open — no client waits on a dead fill).
+    #[tokio::test]
+    async fn failed_fill_releases_slot_for_the_next_pull() {
+        let (blob, digest) = layer(64 * 1024);
+        // hit 0 cuts, hits 1..=5 are the resume budget, hit 6 serves
+        let mut plans = vec![Plan::cut(1024)];
+        plans.extend(std::iter::repeat_n(Plan::cut(0), 5));
+        plans.push(Plan::fast());
+        let upstream = scripted_upstream(blob.clone(), plans, None).await;
+        let ctx = ctx_for(&upstream, 5);
+
+        assert!(body_of(pull(&ctx, &digest).await).await.is_err());
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let again = pull(&ctx, &digest).await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(body_of(again).await.expect("clean body"), blob);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 7);
+    }
+
+    /// Joining a fill never skips the joiner's own curation: with the name blocked, a
+    /// client carrying the bypass token starts the fill and a client without it is still
+    /// refused while that fill runs.
+    #[tokio::test]
+    async fn joiner_is_curated_on_its_own_request() {
+        use crate::config::{CurationMode, DockerUpstream};
+        use crate::secrets::ProtectedString;
+        let (blob, digest) = layer(256 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![slow()], None).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "docker", "name": "library/test", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let (bl, url) = (
+            blocklist.to_str().unwrap().to_string(),
+            upstream.url.clone(),
+        );
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl);
+            cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+        let path = format!("/v2/library/test/blobs/{digest}");
+
+        let leader = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            &path,
+            vec![("x-nora-bypass-token", "let-me-in")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(leader.status(), StatusCode::OK);
+        let leader = tokio::spawn(body_of(leader));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let joiner = pull(&ctx, &digest).await;
+        assert_eq!(
+            joiner.status(),
+            StatusCode::FORBIDDEN,
+            "a running fill must not serve a client its own curation refuses"
+        );
+        assert_eq!(leader.await.unwrap().expect("clean body"), blob);
+    }
+
+    /// Clients trickling in across the whole fill — the shape of a node pool rolling one
+    /// image — still cost a single upstream fetch.
+    #[tokio::test]
+    async fn staggered_clients_share_one_upstream_fetch() {
+        let (blob, digest) = layer(256 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![slow()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+        let mut pulls = Vec::new();
+        for _ in 0..20 {
+            let (app, digest) = (ctx.app.clone(), digest.clone());
+            let handle = tokio::spawn(async move {
+                let response = crate::test_helpers::send(
+                    &app,
+                    Method::GET,
+                    &format!("/v2/library/test/blobs/{digest}"),
+                    Body::empty(),
+                )
+                .await;
+                body_of(response).await
+            });
+            pulls.push(handle);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        for pull in pulls {
+            assert_eq!(pull.await.unwrap().expect("clean body"), blob);
+        }
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A request can land on a fill whose spool has already moved into storage (the
+    /// lease is released just after the move): it is served from storage, not failed and
+    /// not refetched. A failed fill with nothing stored hands back to the caller (`None`).
+    #[tokio::test]
+    async fn follower_of_a_moved_spool_is_served_from_storage() {
+        let (blob, digest) = layer(32 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![Plan::fast()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+        let c = canonicalize("library/test", &ctx.state.config.docker);
+        let key = blob_key(c.namespace.as_deref(), &c.name, &digest);
+        let legacy_key = blob_key(None, &c.name, &digest);
+        let share = |ok: bool| {
+            let done = if ok {
+                Ok(())
+            } else {
+                Err("fill failed".to_string())
+            };
+            let (tx, status) = tokio::sync::watch::channel(super::SpoolStatus {
+                written: blob.len() as u64,
+                done: Some(done),
+            });
+            std::mem::forget(tx);
+            super::SpoolShare {
+                path: std::path::PathBuf::from("/nonexistent/spool-moved-into-storage"),
+                status,
+                content_length: Some(blob.len() as u64),
+            }
+        };
+        let target = super::BlobTarget {
+            name: &c.name,
+            upstream_name: "library/test",
+            digest: &digest,
+            key: &key,
+            legacy_key: &legacy_key,
+            upstream_url: &upstream.url,
+        };
+        let headers = axum::http::HeaderMap::new();
+
+        let failed = super::follow_fill(&ctx.state, share(false), &target, &headers).await;
+        assert!(
+            failed.is_none(),
+            "a failed fill with nothing stored hands back"
+        );
+
+        ctx.state.storage.put(&key, &blob).await.unwrap();
+        let response = super::follow_fill(&ctx.state, share(true), &target, &headers)
+            .await
+            .expect("served from storage");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await.unwrap(), blob);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 0, "no refetch");
+    }
+
+    /// Once the fill is stored, a later pull is a plain cache hit.
+    #[tokio::test]
+    async fn pull_after_store_is_a_cache_hit() {
+        let (blob, digest) = layer(64 * 1024);
+        let upstream = scripted_upstream(blob.clone(), vec![Plan::fast()], None).await;
+        let ctx = ctx_for(&upstream, 5);
+        assert_eq!(body_of(pull(&ctx, &digest).await).await.unwrap(), blob);
+        assert!(cached(&ctx, &digest).await);
+        assert_eq!(body_of(pull(&ctx, &digest).await).await.unwrap(), blob);
+        assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
     }
 }
