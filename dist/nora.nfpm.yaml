@@ -17,7 +17,7 @@ contents:
       mode: 0755
 
   - src: dist/nora.service
-    dst: /lib/systemd/system/nora.service
+    dst: /usr/lib/systemd/system/nora.service
 
   - src: dist/nora.env.example
     dst: /etc/nora/nora.env
