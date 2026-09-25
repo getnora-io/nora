@@ -66,6 +66,18 @@ impl<T> Slot<T> {
     }
 }
 
+impl<T: Clone> Slot<T> {
+    /// The leader's published value, if any. The lock is held only for the clone.
+    fn value(&self) -> Option<T> {
+        self.result.lock().clone()
+    }
+
+    /// Publish the leader's value for followers to clone.
+    fn publish(&self, value: T) {
+        *self.result.lock() = Some(value);
+    }
+}
+
 type SlotMap<T> = Arc<Mutex<HashMap<String, Arc<Slot<T>>>>>;
 
 /// Per-key single-flight coordinator. Cheap to clone (shares one map).
@@ -150,6 +162,20 @@ where
     ///
     /// `registry` is the metric label for the in-flight gauge and coalesced
     /// counter.
+    /// Leader election: one decision under the map lock, zero awaits. The first caller
+    /// for `key` inserts the slot and leads; the rest follow the slot already there.
+    fn elect(&self, key: &str) -> Role<T> {
+        let mut map = self.map.lock();
+        match map.entry(key.to_string()) {
+            Entry::Vacant(v) => {
+                let slot = Arc::new(Slot::new());
+                v.insert(Arc::clone(&slot));
+                Role::Leader(slot)
+            }
+            Entry::Occupied(o) => Role::Follower(Arc::clone(o.get())),
+        }
+    } // map lock dropped here — before any `.await`
+
     pub async fn coalesced<F, Fut>(
         &self,
         key: &str,
@@ -164,20 +190,7 @@ where
         // --- PRECONDITIONS ---
         debug_assert!(!key.is_empty(), "coalesce key must not be empty");
 
-        // Leader election: one decision under the lock, zero awaits.
-        let role = {
-            let mut map = self.map.lock();
-            match map.entry(key.to_string()) {
-                Entry::Vacant(v) => {
-                    let slot = Arc::new(Slot::new());
-                    v.insert(Arc::clone(&slot));
-                    Role::Leader(slot)
-                }
-                Entry::Occupied(o) => Role::Follower(Arc::clone(o.get())),
-            }
-        }; // map lock dropped here — before any `.await`
-
-        match role {
+        match self.elect(key) {
             Role::Leader(slot) => {
                 crate::metrics::PROXY_INFLIGHT
                     .with_label_values(&[registry])
@@ -196,7 +209,7 @@ where
                 // Publish BEFORE the guard drops so a follower woken by the
                 // guard's `notify_waiters()` always observes the final value.
                 if let Some(ref value) = out {
-                    *slot.result.lock() = Some(value.clone());
+                    slot.publish(value.clone());
                 }
                 out
                 // `_guard` drops here: removes key (ptr_eq) + notify_waiters.
@@ -209,13 +222,13 @@ where
                 let notified = slot.ready.notified();
                 tokio::pin!(notified);
 
-                if let Some(value) = slot.result.lock().clone() {
+                if let Some(value) = slot.value() {
                     return Some(Self::record_follower(registry, value));
                 }
 
                 let reason = match tokio::time::timeout(budget, &mut notified).await {
                     Ok(()) => {
-                        if let Some(value) = slot.result.lock().clone() {
+                        if let Some(value) = slot.value() {
                             return Some(Self::record_follower(registry, value));
                         }
                         // Leader resolved without a value (failure/cancel) —
@@ -237,6 +250,93 @@ where
         }
     }
 
+    /// Single-flight whose shared value outlives the fetch: the leader gets a [`Lease`],
+    /// and until it is dropped the slot stays in the map, so a caller arriving later gets
+    /// the leader's value instead of fetching again. Built for a result that is still being
+    /// produced after `fetch` returns (a blob spool: headers now, bytes as they land), where
+    /// the callers that matter are the ones that come seconds later — a client retry,
+    /// another node — not only the ones racing the leader's first await.
+    ///
+    /// `fetch` yields the value to share plus a part only the leader keeps. Fail-open like
+    /// [`coalesced`](Self::coalesced): if the leader fails before publishing, the callers
+    /// waiting on it elect one new leader among themselves (not one fetch each); a caller
+    /// whose wait exceeds `budget` fetches alone ([`Flight::Alone`]).
+    pub async fn leased<F, Fut, X>(
+        &self,
+        key: &str,
+        registry: &'static str,
+        budget: Duration,
+        fetch: F,
+    ) -> Option<Flight<T, X>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<(T, X)>>,
+    {
+        // --- PRECONDITIONS ---
+        debug_assert!(!key.is_empty(), "coalesce key must not be empty");
+
+        let mut fetch = Some(fetch);
+        loop {
+            match self.elect(key) {
+                Role::Leader(slot) => {
+                    let fetch = fetch.take()?;
+                    crate::metrics::PROXY_INFLIGHT
+                        .with_label_values(&[registry])
+                        .inc();
+                    // CANCEL-SAFETY: as in `coalesced`, the slot is released by the guard's
+                    // `Drop` if this future is cancelled during `fetch().await`.
+                    let guard = FetchGuard {
+                        map: Arc::clone(&self.map),
+                        key: key.to_string(),
+                        slot: Arc::clone(&slot),
+                        registry,
+                    };
+                    let (value, own) = fetch().await?; // `guard` drops on `None`
+                    slot.publish(value.clone());
+                    // The guard is not dropped here, so wake the waiters now: they must get
+                    // the value when it is published, not when the lease ends.
+                    slot.ready.notify_waiters();
+                    return Some(Flight::Leader {
+                        value,
+                        own,
+                        lease: Lease { _guard: guard },
+                    });
+                }
+                Role::Follower(slot) => {
+                    let notified = slot.ready.notified();
+                    tokio::pin!(notified);
+                    if let Some(value) = slot.value() {
+                        return Some(Flight::Follower(Self::record_follower(registry, value)));
+                    }
+                    // CANCEL-SAFETY: a follower holds nothing but its `Arc<Slot>`; dropping
+                    // this wait leaves the slot and the leader untouched.
+                    match tokio::time::timeout(budget, &mut notified).await {
+                        Ok(()) => {
+                            if let Some(value) = slot.value() {
+                                return Some(Flight::Follower(Self::record_follower(
+                                    registry, value,
+                                )));
+                            }
+                            // The leader failed before publishing and its slot is gone:
+                            // elect again, so the waiters produce one new fetch.
+                            crate::metrics::PROXY_COALESCE_FALLTHROUGH_TOTAL
+                                .with_label_values(&[registry, "leader"])
+                                .inc();
+                        }
+                        Err(_) => {
+                            crate::metrics::PROXY_COALESCE_FALLTHROUGH_TOTAL
+                                .with_label_values(&[registry, "budget"])
+                                .inc();
+                            let fetch = fetch.take()?;
+                            let (value, own) = fetch().await?;
+                            return Some(Flight::Alone { value, own });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn record_follower(registry: &'static str, value: T) -> T {
         crate::metrics::PROXY_COALESCED_TOTAL
             .with_label_values(&[registry])
@@ -248,6 +348,27 @@ where
 enum Role<T> {
     Leader(Arc<Slot<T>>),
     Follower(Arc<Slot<T>>),
+}
+
+/// What [`InflightMap::leased`] handed a caller.
+pub enum Flight<T, X> {
+    /// This caller fetched. `own` is the part of the fetch only it keeps (never
+    /// published); while `lease` lives, later callers for the key still get `value`.
+    Leader { value: T, own: X, lease: Lease<T> },
+    /// Another caller fetched, or still holds its lease: a clone of its value.
+    Follower(T),
+    /// The wait for a leader ran out of budget, so this caller fetched on its own,
+    /// outside the map: nobody shares its value.
+    Alone { value: T, own: X },
+}
+
+/// A leader's hold on its slot past the end of its fetch ([`InflightMap::leased`]).
+///
+/// Dropping it — when the work it covers is done, on an early return, or in a panic
+/// unwind — removes the slot (ABA-safe) and wakes waiters: the same release as the end
+/// of a [`InflightMap::coalesced`] fetch.
+pub struct Lease<T> {
+    _guard: FetchGuard<T>,
 }
 
 /// Follower wait budget for a registry whose upstream timeout is `proxy_timeout`
@@ -446,6 +567,160 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "cancelled leader + one clean refetch"
+        );
+    }
+
+    /// Slots currently in the map (held by a fetch or a lease).
+    fn slots_held<T>(map: &InflightMap<T>) -> usize {
+        map.map.lock().len()
+    }
+
+    fn leader_value(flight: Option<Flight<u64, ()>>) -> (u64, Lease<u64>) {
+        match flight {
+            Some(Flight::Leader { value, lease, .. }) => (value, lease),
+            _ => panic!("expected to lead"),
+        }
+    }
+
+    /// While the leader holds its lease, a caller arriving after the fetch returned still
+    /// gets the leader's value; once the lease drops, the next caller leads a new fetch.
+    #[tokio::test]
+    async fn lease_keeps_the_slot_for_late_callers() {
+        let map: InflightMap<u64> = InflightMap::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = |n: u64| {
+            let calls = Arc::clone(&calls);
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some((n, ()))
+            }
+        };
+
+        let (value, lease) = leader_value(map.leased("blob", "test", budget(), fetch(7)).await);
+        assert_eq!(value, 7);
+        // Long after the leader's fetch returned, the slot is still there.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match map.leased("blob", "test", budget(), fetch(8)).await {
+            Some(Flight::Follower(v)) => assert_eq!(v, 7, "late caller gets the leader's value"),
+            _ => panic!("a late caller must follow while the lease lives"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(lease);
+        assert!(
+            slots_held(&map) == 0,
+            "dropping the lease releases the slot"
+        );
+        let (value, _lease) = leader_value(map.leased("blob", "test", budget(), fetch(9)).await);
+        assert_eq!(
+            value, 9,
+            "after release the next caller leads a fresh fetch"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Followers waiting on a leader are woken when it publishes, not when its lease ends.
+    #[tokio::test]
+    async fn followers_get_the_value_at_publish_not_at_release() {
+        let map: InflightMap<u64> = InflightMap::new();
+        let leader_map = map.clone();
+        let leader = tokio::spawn({
+            let map = leader_map;
+            async move {
+                let (_, lease) = leader_value(
+                    map.leased("blob", "test", budget(), || async {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Some((1u64, ()))
+                    })
+                    .await,
+                );
+                // Hold the lease far longer than the follower is willing to wait.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(lease);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let got = tokio::time::timeout(
+            Duration::from_secs(2),
+            map.leased("blob", "test", budget(), || async { Some((2u64, ())) }),
+        )
+        .await
+        .expect("follower must not wait for the lease to end");
+        assert!(matches!(got, Some(Flight::Follower(1))));
+        leader.abort();
+    }
+
+    /// A lease dropped by a panic unwind (the spool task's `catch_unwind`) releases the
+    /// slot and the in-flight gauge, so the key is never stranded.
+    #[tokio::test]
+    async fn lease_released_by_panic_unwind() {
+        use futures::FutureExt as _;
+        let map: InflightMap<u64> = InflightMap::new();
+        let gauge = || {
+            crate::metrics::PROXY_INFLIGHT
+                .with_label_values(&["lease-panic"])
+                .get()
+        };
+        let (_, lease) = leader_value(
+            map.leased("blob", "lease-panic", budget(), || async {
+                Some((1u64, ()))
+            })
+            .await,
+        );
+        assert_eq!(gauge(), 1);
+        let task = async move {
+            let _lease = lease;
+            panic!("spool task panicked");
+        };
+        let joined = tokio::spawn(std::panic::AssertUnwindSafe(task).catch_unwind()).await;
+        assert!(joined.unwrap().is_err(), "the task panicked");
+        assert!(slots_held(&map) == 0, "slot released by the unwind");
+        assert_eq!(gauge(), 0, "in-flight gauge back to zero");
+    }
+
+    /// A leader that fails before publishing makes its waiters elect ONE new leader
+    /// among themselves, not one fetch each.
+    #[tokio::test]
+    async fn failed_leader_hands_over_to_one_new_leader() {
+        let map: InflightMap<u64> = InflightMap::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        const M: usize = 8;
+        let gate = Arc::new(Barrier::new(M));
+        let mut handles = Vec::new();
+        for _ in 0..M {
+            let (map, calls, gate) = (map.clone(), Arc::clone(&calls), Arc::clone(&gate));
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                let flight = map
+                    .leased("blob", "test", budget(), || async {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        (n > 0).then_some((42u64, ()))
+                    })
+                    .await;
+                // Keep a won lease until everyone has looked, like a spool in progress.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                flight.map(|f| match f {
+                    Flight::Leader { value, .. } | Flight::Follower(value) => value,
+                    Flight::Alone { value, .. } => value + 1000,
+                })
+            }));
+        }
+        let results: Vec<_> = futures::future::join_all(handles).await;
+        let values: Vec<_> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            values.iter().filter(|v| v.is_none()).count(),
+            1,
+            "only the failed leader gets None"
+        );
+        assert!(
+            values.iter().flatten().all(|v| *v == 42),
+            "everyone else shares the second fetch"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "failed leader + ONE new leader"
         );
     }
 

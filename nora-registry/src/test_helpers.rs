@@ -334,6 +334,7 @@ fn build_context_with(
             cb_config,
         )),
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
+        blob_flights: crate::proxy_coalesce::InflightMap::new(),
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         signer,
         leak_finders,
