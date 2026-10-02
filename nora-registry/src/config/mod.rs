@@ -1135,8 +1135,174 @@ mod tests {
     use crate::secrets::ProtectedString;
     use std::sync::{LazyLock, Mutex};
 
-    /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
+    /// Serializes every test that touches process env.
+    ///
+    /// Env vars are per-process state and `cargo test` runs these tests as threads, so a
+    /// test that skips this lock can read a value another test set — the deliberate typos
+    /// in `test_curation_mode_env_rejects_typo`, or the `NORA_REGISTRIES_ENABLE` of
+    /// `test_env_overrides_toml_registries`. Writers are not the whole set: `validate()`
+    /// and `enabled_registries()` read env themselves, so a test that only calls them is
+    /// exposed too. On f864a9a, 10 of 30 runs of `config::tests` failed this way.
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Takes [`ENV_MUTEX`] for the rest of the test.
+    ///
+    /// Clears poison first: ~80 tests share this lock, so after one panicking test every
+    /// later `lock()` would fail too, turning a single failure into eighty that bury it.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        if ENV_MUTEX.is_poisoned() {
+            ENV_MUTEX.clear_poison();
+        }
+        ENV_MUTEX.lock().unwrap()
+    }
+
+    /// Every env-touching test here holds [`ENV_MUTEX`].
+    ///
+    /// The set of tests that need the lock is not reviewable by eye — it includes every
+    /// test that merely calls `validate()` — so it is derived from this file: the readers
+    /// are the functions of this module whose own body reads env, and a `#[test]` is
+    /// exposed when it writes env or calls one of them. The two fixtures keep the matcher
+    /// honest; a neutered one would pass the real file in silence.
+    ///
+    /// Known limit: the derivation is one hop inside this file. A test that reaches env
+    /// only through a sibling module (`config/server.rs` and friends) would not be seen —
+    /// none does today; the fix would be to derive the reader list from those files too.
+    #[test]
+    fn every_env_touching_test_holds_the_env_mutex() {
+        // Split so this file's own text never reads as code: the fixtures exist only
+        // after `concat!` joins them, which keeps the scan of the real file clean.
+        const UNLOCKED: &str = concat!(
+            "#[",
+            "test]\nfn reads() { let c = Config::default(); c.",
+            "valid",
+            "ate(); }"
+        );
+        const LOCKED: &str = concat!(
+            "#[",
+            "test]\nfn reads() { let _lock = env_lock(); c.",
+            "valid",
+            "ate(); }"
+        );
+        assert_eq!(
+            env_touching_tests_without_lock(UNLOCKED, &["validate".to_string()]),
+            vec!["reads".to_string()],
+            "the matcher stopped seeing an exposed test"
+        );
+        assert!(
+            env_touching_tests_without_lock(LOCKED, &["validate".to_string()]).is_empty(),
+            "the matcher reports a test that does hold the lock"
+        );
+
+        let src = include_str!("mod.rs");
+        let readers = env_reading_fns(src);
+        assert!(
+            readers.contains(&"apply_env_overrides".to_string())
+                && readers.contains(&"enabled_registries".to_string())
+                && readers.contains(&"validate".to_string()),
+            "the reader list lost a known env reader: {readers:?}"
+        );
+        let offenders = env_touching_tests_without_lock(src, &readers);
+        assert!(
+            offenders.is_empty(),
+            "these tests touch process env without holding ENV_MUTEX: {}; \
+             add `let _lock = env_lock();` as the first statement",
+            offenders.join(", ")
+        );
+    }
+
+    /// Functions of this module, outside the test module, whose own body reads process env.
+    fn env_reading_fns(src: &str) -> Vec<String> {
+        let tests_at = src.find("mod tests {").unwrap_or(src.len());
+        fn_bodies(src)
+            .into_iter()
+            .filter(|(_, decl, start, end)| {
+                *decl < tests_at
+                    && (src[*start..=*end].contains(concat!("env::", "var("))
+                        || src[*start..=*end].contains(concat!("env::", "var_os(")))
+            })
+            .map(|(name, _, _, _)| name.to_string())
+            .collect()
+    }
+
+    /// Names of `#[test]` functions in `src` that write env, or call one of `readers`,
+    /// without holding [`ENV_MUTEX`].
+    fn env_touching_tests_without_lock(src: &str, readers: &[String]) -> Vec<String> {
+        let writes = [
+            concat!("env::", "set_var("),
+            concat!("env::", "remove_var("),
+        ];
+        // `load(` must not match `upload(`: a call starts at a name boundary
+        let calls = |body: &str, name: &str| {
+            let needle = format!("{name}(");
+            body.match_indices(&needle).any(|(i, _)| {
+                let prev = if i == 0 {
+                    None
+                } else {
+                    Some(body.as_bytes()[i - 1])
+                };
+                prev.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            })
+        };
+        fn_bodies(src)
+            .into_iter()
+            .filter(|(_, decl, start, end)| {
+                let body = &src[*start..=*end];
+                let is_test = src[..*decl]
+                    .rfind("#[test]")
+                    .is_some_and(|i| !src[i..*decl].contains("fn "));
+                let exposed = writes.iter().any(|w| body.contains(w))
+                    || readers.iter().any(|r| calls(body, r));
+                let holds =
+                    body.contains("env_lock()") || body.contains(concat!("ENV_MUTEX", ".lock("));
+                is_test && exposed && !holds
+            })
+            .map(|(name, _, _, _)| name.to_string())
+            .collect()
+    }
+
+    /// `(name, declaration_offset, body_open_brace, body_close_brace)` for every `fn` in `src`.
+    fn fn_bodies(src: &str) -> Vec<(&str, usize, usize, usize)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(rel) = src[at..].find("fn ") {
+            let kw = at + rel;
+            at = kw + 3;
+            if kw > 0 && (bytes[kw - 1].is_ascii_alphanumeric() || bytes[kw - 1] == b'_') {
+                continue;
+            }
+            let rest = &src[at..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(0);
+            if name_len == 0 {
+                continue;
+            }
+            let name = &rest[..name_len];
+            let Some(open) = src[at + name_len..].find('{').map(|i| at + name_len + i) else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut close = None;
+            for (i, b) in bytes[open..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                out.push((name, kw, open, close));
+            }
+        }
+        out
+    }
 
     #[test]
     fn test_rate_limit_default() {
@@ -1272,6 +1438,7 @@ mod tests {
 
     #[test]
     fn test_env_override_anonymous_read() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
         config.apply_env_overrides().unwrap();
@@ -1323,6 +1490,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_anon_pull() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_DOCKER_ANON_PULL", "true");
         config.apply_env_overrides().unwrap();
@@ -1365,6 +1533,7 @@ mod tests {
 
     #[test]
     fn test_env_override_server() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_HOST", "0.0.0.0");
         std::env::set_var("NORA_PORT", "8080");
@@ -1386,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_env_override_storage() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_STORAGE_MODE", "s3");
         std::env::set_var("NORA_STORAGE_PATH", "/data/nora");
@@ -1408,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_env_override_storage_virtual_hosted_default_off() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         config.apply_env_overrides().unwrap();
         assert!(!config.storage.s3_virtual_hosted);
@@ -1423,7 +1592,7 @@ mod tests {
 
     #[test]
     fn test_env_override_storage_mode_local() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_STORAGE_MODE", "local");
         config.apply_env_overrides().unwrap();
@@ -1433,7 +1602,7 @@ mod tests {
 
     #[test]
     fn test_env_override_storage_mode_case_insensitive() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_STORAGE_MODE", "S3");
         config.apply_env_overrides().unwrap();
@@ -1443,7 +1612,7 @@ mod tests {
 
     #[test]
     fn test_env_override_storage_mode_rejects_unknown() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_STORAGE_MODE", "redis");
         let result = config.apply_env_overrides();
@@ -1475,6 +1644,7 @@ mod tests {
 
     #[test]
     fn test_env_override_auth() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ENABLED", "true");
         std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
@@ -1490,6 +1660,7 @@ mod tests {
 
     #[test]
     fn test_env_override_maven_proxies() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var(
             "NORA_MAVEN_PROXIES",
@@ -1506,6 +1677,7 @@ mod tests {
 
     #[test]
     fn test_env_override_maven_checksum_and_immutable() {
+        let _lock = env_lock();
         let mut config = Config::default();
         assert!(config.maven.checksum_verify); // default true
         assert!(config.maven.immutable_releases); // default true
@@ -1526,6 +1698,7 @@ mod tests {
 
     #[test]
     fn test_env_override_npm() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
         std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
@@ -1550,6 +1723,7 @@ mod tests {
 
     #[test]
     fn test_env_override_raw() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_RAW_ENABLED", "false");
         std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
@@ -1565,6 +1739,7 @@ mod tests {
 
     #[test]
     fn test_env_override_rate_limit() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
         std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
@@ -1816,6 +1991,7 @@ mod tests {
     /// used to crash-loop on its own nora.env (#1025).
     #[test]
     fn shipped_env_defaults_pass_validation() {
+        let _lock = env_lock();
         let deb = include_str!("../../../dist/nora.env.example");
         let script = include_str!("../../../dist/install.sh");
         let heredoc = script
@@ -1847,7 +2023,7 @@ mod tests {
     #[test]
     fn load_reports_each_fatal_case_as_a_typed_error() {
         // load() applies NORA_* overrides; other tests set invalid ones under this lock.
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
 
@@ -1893,6 +2069,7 @@ mod tests {
 
     #[test]
     fn test_validate_default_config_ok() {
+        let _lock = env_lock();
         let config = Config::default();
         let (warnings, errors) = config.validate();
         assert!(
@@ -1924,6 +2101,7 @@ mod tests {
 
     #[test]
     fn test_validate_public_url_loopback_warns() {
+        let _lock = env_lock();
         // public_url explicitly pointing at loopback is broken for remote clients (#590):
         // a warning, not an error, since local-only use is valid. Tested through
         // validate() (not is_loopback_host directly) to cover the real host_str() path,
@@ -1951,6 +2129,7 @@ mod tests {
 
     #[test]
     fn test_validate_port_zero() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.port = 0;
         let (_, errors) = config.validate();
@@ -1960,6 +2139,7 @@ mod tests {
 
     #[test]
     fn test_validate_empty_storage_path_local() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.storage.mode = StorageMode::Local;
         config.storage.path = String::new();
@@ -1970,6 +2150,7 @@ mod tests {
 
     #[test]
     fn test_validate_whitespace_storage_path_local() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.storage.mode = StorageMode::Local;
         config.storage.path = "   ".to_string();
@@ -1980,6 +2161,7 @@ mod tests {
 
     #[test]
     fn test_validate_empty_bucket_s3() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.storage.mode = StorageMode::S3;
         config.storage.bucket = String::new();
@@ -1990,6 +2172,7 @@ mod tests {
 
     #[test]
     fn test_validate_empty_storage_path_s3_ok() {
+        let _lock = env_lock();
         // Empty path is fine when mode is S3
         let mut config = Config::default();
         config.storage.mode = StorageMode::S3;
@@ -2000,6 +2183,7 @@ mod tests {
 
     #[test]
     fn test_validate_rate_limit_zero_rps() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.rate_limit.enabled = true;
         config.rate_limit.auth_rps = 0;
@@ -2011,6 +2195,7 @@ mod tests {
 
     #[test]
     fn test_validate_rate_limit_disabled_zero_ok() {
+        let _lock = env_lock();
         // Zero rate limit values are fine when rate limiting is disabled
         let mut config = Config::default();
         config.rate_limit.enabled = false;
@@ -2023,6 +2208,7 @@ mod tests {
 
     #[test]
     fn test_validate_rate_limit_all_zeros() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.rate_limit.enabled = true;
         config.rate_limit.auth_rps = 0;
@@ -2038,6 +2224,7 @@ mod tests {
 
     #[test]
     fn test_validate_body_limit_zero() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.body_limit_mb = 0;
         let (warnings, errors) = config.validate();
@@ -2048,6 +2235,7 @@ mod tests {
 
     #[test]
     fn test_validate_multiple_errors() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.port = 0;
         config.storage.mode = StorageMode::Local;
@@ -2058,6 +2246,7 @@ mod tests {
 
     #[test]
     fn test_validate_warnings_and_errors_together() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.port = 0;
         config.server.body_limit_mb = 0;
@@ -2069,6 +2258,7 @@ mod tests {
     }
     #[test]
     fn test_validate_gc_enabled_dry_run() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.gc.enabled = true;
         config.gc.dry_run = true;
@@ -2080,6 +2270,7 @@ mod tests {
 
     #[test]
     fn test_validate_gc_enabled_no_dry_run_ok() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.gc.enabled = true;
         config.gc.dry_run = false;
@@ -2090,6 +2281,7 @@ mod tests {
 
     #[test]
     fn test_validate_retention_enabled_empty_rules() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.retention.enabled = true;
         config.retention.rules = Vec::new();
@@ -2101,6 +2293,7 @@ mod tests {
 
     #[test]
     fn test_validate_retention_enabled_with_rules_ok() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.retention.enabled = true;
         config.retention.rules = vec![RetentionRule {
@@ -2117,6 +2310,7 @@ mod tests {
 
     #[test]
     fn test_validate_relative_paths_with_config_path() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.auth.enabled = true;
         // default paths are relative: "data/storage", "data/tokens"
@@ -2134,6 +2328,7 @@ mod tests {
 
     #[test]
     fn test_relative_token_storage_warns_without_config_path() {
+        let _lock = env_lock();
         // #816: env-only (systemd) starts have config_path=None. A relative
         // token_storage with auth enabled must still warn — that is exactly the
         // case that escapes the sandbox and breaks token writes.
@@ -2154,6 +2349,7 @@ mod tests {
 
     #[test]
     fn test_validate_absolute_paths_no_warning() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.storage.path = "/data/storage".to_string();
         config.auth.enabled = true;
@@ -2172,6 +2368,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_proxies_and_backward_compat() {
+        let _lock = env_lock();
         // Test new NORA_DOCKER_PROXIES name
         std::env::remove_var("NORA_DOCKER_UPSTREAMS");
         std::env::set_var(
@@ -2206,6 +2403,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
         config.apply_env_overrides().unwrap();
@@ -2218,6 +2416,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy_auth() {
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
         config.apply_env_overrides().unwrap();
@@ -2237,7 +2436,7 @@ mod tests {
 
     #[test]
     fn test_config_file_sets_s3_mode_without_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         // Regression test for issue #4: config.toml mode="s3" must work
         // without NORA_STORAGE_MODE env var (previously overridden by
         // Dockerfile ENV NORA_STORAGE_MODE=local)
@@ -2352,7 +2551,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_MODE", "enforce");
         config.apply_env_overrides().unwrap();
@@ -2362,7 +2561,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_on_failure() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ON_FAILURE", "open");
         config.apply_env_overrides().unwrap();
@@ -2372,6 +2571,7 @@ mod tests {
 
     #[test]
     fn test_curation_on_failure_open_emits_error() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.curation.on_failure = CurationOnFailure::Open;
         let (_warnings, errors) = config.validate_with_config_path(None);
@@ -2385,7 +2585,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_paths() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_ALLOWLIST_PATH", "/etc/nora/allow.json");
         std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", "/etc/nora/block.json");
@@ -2404,7 +2604,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_bypass_token() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
         config.apply_env_overrides().unwrap();
@@ -2417,7 +2617,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_require_integrity() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_REQUIRE_INTEGRITY", "true");
         config.apply_env_overrides().unwrap();
@@ -2427,7 +2627,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_quarantine() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE", "observe");
         config.apply_env_overrides().unwrap();
@@ -2437,7 +2637,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_quarantine_ttl() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE_TTL", "14d");
         config.apply_env_overrides().unwrap();
@@ -2447,7 +2647,7 @@ mod tests {
 
     #[test]
     fn test_curation_env_override_per_registry_quarantine() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
         std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
@@ -2490,7 +2690,7 @@ mod tests {
 
     #[test]
     fn test_curation_mode_env_rejects_typo() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_MODE", "enforec");
         let result = config.apply_env_overrides();
@@ -2505,7 +2705,7 @@ mod tests {
 
     #[test]
     fn test_quarantine_env_rejects_typo() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let mut config = Config::default();
         std::env::set_var("NORA_CURATION_QUARANTINE", "enfocre");
         let result = config.apply_env_overrides();
@@ -2534,6 +2734,7 @@ mod tests {
 
     #[test]
     fn test_validate_curation_enforce_no_controls() {
+        let _lock = env_lock();
         // Enforce with no control of any kind enforces nothing → error (#740).
         let mut config = Config::default();
         config.curation.mode = CurationMode::Enforce;
@@ -2549,6 +2750,7 @@ mod tests {
 
     #[test]
     fn test_validate_curation_enforce_blocklist_only_ok() {
+        let _lock = env_lock();
         // #740: enforce must NOT require an allowlist — a blocklist alone is a valid
         // control. A deny-list-only (or min-age-only / quarantine-only) policy is legit.
         let mut config = Config::default();
@@ -2566,6 +2768,7 @@ mod tests {
 
     #[test]
     fn test_validate_minage_proxy_without_date_source_or_quarantine_rejected() {
+        let _lock = env_lock();
         // min_release_age on an enabled proxy registry with neither
         // trust_upstream_dates nor an active quarantine = no age control would be
         // active => rejected (curation-minage-real-age-defer, #741).
@@ -2586,6 +2789,7 @@ mod tests {
 
     #[test]
     fn test_validate_minage_proxy_with_quarantine_ok() {
+        let _lock = env_lock();
         // Escape hatch 1: an active quarantine is the unspoofable age control.
         let mut config = Config::default();
         config.npm.enabled = true;
@@ -2604,6 +2808,7 @@ mod tests {
 
     #[test]
     fn test_validate_minage_proxy_trust_alone_still_rejected() {
+        let _lock = env_lock();
         // trust_upstream_dates is NOT a sufficient substitute for the quarantine: it
         // yields a real date only where a registry caches one (npm); for pypi/cargo/
         // nuget/gems/… publish_date stays None and min-age silently does nothing, so
@@ -2718,6 +2923,7 @@ mod tests {
 
     #[test]
     fn test_validate_minage_docker_only_quarantine_ok() {
+        let _lock = env_lock();
         // #765: a docker-only quarantine must SATISFY the #741 min-age guard. The
         // old quarantine_active chain omitted docker and falsely rejected this config.
         let mut config = Config::default();
@@ -2736,6 +2942,7 @@ mod tests {
 
     #[test]
     fn test_validate_curation_enforce_missing_allowlist_file() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.curation.mode = CurationMode::Enforce;
         config.curation.allowlist_path = Some("/nonexistent/allow.json".to_string());
@@ -2748,6 +2955,7 @@ mod tests {
 
     #[test]
     fn test_validate_curation_audit_no_allowlist_warning() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.curation.mode = CurationMode::Audit;
         let (warnings, errors) = config.validate_with_config_path(None);
@@ -2760,6 +2968,7 @@ mod tests {
 
     #[test]
     fn test_validate_curation_off_no_warnings() {
+        let _lock = env_lock();
         let config = Config::default();
         let (warnings, errors) = config.validate_with_config_path(None);
         assert!(errors.is_empty());
@@ -2877,6 +3086,7 @@ mod tests {
 
     #[test]
     fn test_registries_toml_list() {
+        let _lock = env_lock();
         let toml = r#"
             [server]
             host = "127.0.0.1"
@@ -2937,6 +3147,7 @@ mod tests {
 
     #[test]
     fn registries_toml_enable_backpropagates_to_flags() {
+        let _lock = env_lock();
         // #856 at the config layer: `[registries].enable = ["rpm"]` resolves rpm
         // into the set AND (after apply) into `config.rpm.enabled`, so the mounted
         // rpm route no longer 404s in the handler gate.
@@ -2966,6 +3177,7 @@ mod tests {
 
     #[test]
     fn test_registries_toml_string() {
+        let _lock = env_lock();
         let toml = r#"
             [server]
             host = "127.0.0.1"
@@ -2985,6 +3197,7 @@ mod tests {
 
     #[test]
     fn test_registries_toml_absent() {
+        let _lock = env_lock();
         // No [registries] section → legacy mode
         let toml = r#"
             [server]
@@ -3007,6 +3220,7 @@ mod tests {
 
     #[test]
     fn test_registries_toml_empty_section() {
+        let _lock = env_lock();
         // [registries] without enable → legacy mode
         let toml = r#"
             [server]
@@ -3029,6 +3243,7 @@ mod tests {
 
     #[test]
     fn test_env_overrides_toml_registries() {
+        let _lock = env_lock();
         // NORA_REGISTRIES_ENABLE should take precedence over [registries].enable
         let toml = r#"
             [server]
@@ -3089,6 +3304,7 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_registry_in_enable() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.registries = Some(RegistriesSection {
             enable: Some(EnableSpec::List(vec![
@@ -3106,6 +3322,7 @@ mod tests {
 
     #[test]
     fn test_registries_toml_all_minus() {
+        let _lock = env_lock();
         let toml = r#"
             [server]
             host = "127.0.0.1"
@@ -3264,6 +3481,7 @@ mod tests {
 
     #[test]
     fn test_validate_wildcard_host_requires_public_url() {
+        let _lock = env_lock();
         for host in &["0.0.0.0", "::", "0:0:0:0:0:0:0:0"] {
             let mut config = Config::default();
             config.server.host = host.to_string();
@@ -3280,6 +3498,7 @@ mod tests {
 
     #[test]
     fn test_validate_wildcard_host_with_public_url_ok() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.host = "0.0.0.0".to_string();
         config.server.public_url = Some("http://registry.example.com:4000".to_string());
@@ -3293,6 +3512,7 @@ mod tests {
 
     #[test]
     fn test_validate_non_wildcard_host_no_public_url_ok() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.host = "192.168.1.10".to_string();
         config.server.public_url = None;
@@ -3306,6 +3526,7 @@ mod tests {
 
     #[test]
     fn test_validate_public_url_rejects_bad_scheme() {
+        let _lock = env_lock();
         for scheme_url in &["ftp://registry.example.com", "javascript://alert(1)"] {
             let mut config = Config::default();
             config.server.public_url = Some(scheme_url.to_string());
@@ -3323,6 +3544,7 @@ mod tests {
 
     #[test]
     fn test_validate_public_url_rejects_garbage() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.server.public_url = Some("not-a-url".to_string());
         let (_, errors) = config.validate_with_config_path(None);
@@ -3335,6 +3557,7 @@ mod tests {
 
     #[test]
     fn test_validate_public_url_accepts_valid() {
+        let _lock = env_lock();
         for url in &[
             "http://registry:4000",
             "https://nora.example.com",
@@ -3426,6 +3649,7 @@ mod tests {
 
     #[test]
     fn test_validate_warns_on_prefix_zero() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.auth.trusted_proxies = TrustedProxies::parse("0.0.0.0/0");
         let (warnings, _) = config.validate_with_config_path(None);
@@ -3438,6 +3662,7 @@ mod tests {
 
     #[test]
     fn test_validate_no_warn_on_normal_proxies() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.auth.trusted_proxies = TrustedProxies::parse("10.0.0.0/8,192.168.1.0/24");
         let (warnings, _) = config.validate_with_config_path(None);
