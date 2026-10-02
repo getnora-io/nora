@@ -14,3 +14,4 @@ systemctl daemon-reload
 systemctl enable nora >/dev/null 2>&1 || true
 
 echo "NORA installed. Start with: systemctl start nora"
+echo "For clients on other hosts, set NORA_PUBLIC_URL in /etc/nora/nora.env first."

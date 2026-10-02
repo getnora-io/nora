@@ -54,6 +54,36 @@ use std::fs;
 
 use crate::registry_type::RegistryType;
 
+/// Exit status for a configuration NORA cannot start with: EX_CONFIG from sysexits.h.
+/// The unit files name it in `RestartPreventExitStatus=`, so systemd stops the service
+/// on it instead of restarting into the same error every few seconds (#1025).
+pub const EXIT_CONFIG: i32 = 78;
+
+/// Why [`Config::load`] could not produce a configuration to start with.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigLoadError {
+    /// `NORA_CONFIG_PATH` names a file that cannot be read.
+    #[error("NORA_CONFIG_PATH={path} but file cannot be read: {source}")]
+    Unreadable {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// `NORA_CONFIG_PATH` names a file that is not valid TOML.
+    #[error("NORA_CONFIG_PATH={path} contains invalid TOML: {source}")]
+    InvalidToml {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    /// An environment override has a value that cannot be applied.
+    #[error("fatal env override error: {0}")]
+    EnvOverride(String),
+    /// Validation found errors that make the configuration unusable.
+    #[error("fatal configuration errors: {}", .0.join("; "))]
+    Invalid(Vec<String>),
+}
+
 // --- Shared defaults (used by submodules via `super::default_*`) ---
 
 /// Returns `true` — used as serde default for boolean fields that should default to enabled.
@@ -953,22 +983,28 @@ impl Config {
     /// 1. `NORA_CONFIG_PATH` env var (fatal if set but file not found)
     /// 2. `config.toml` in current working directory (optional)
     /// 3. Built-in defaults
-    pub fn load() -> Self {
+    ///
+    /// A configuration NORA cannot start with is an error, for the caller to report and
+    /// exit on with [`EXIT_CONFIG`].
+    pub fn load() -> Result<Self, ConfigLoadError> {
+        Self::load_from(env::var("NORA_CONFIG_PATH").ok())
+    }
+
+    /// [`Config::load`] with the `NORA_CONFIG_PATH` value passed in, so tests can drive
+    /// it without setting a process-wide variable that `validate` also reads.
+    fn load_from(config_path: Option<String>) -> Result<Self, ConfigLoadError> {
         // 1. Start with defaults
         // 2. Override with config file if exists
-        let mut config: Config = if let Ok(config_path) = env::var("NORA_CONFIG_PATH") {
-            let content = fs::read_to_string(&config_path).unwrap_or_else(|e| {
-                panic!(
-                    "NORA_CONFIG_PATH={} but file cannot be read: {}",
-                    config_path, e
-                );
-            });
-            let cfg = toml::from_str(&content).unwrap_or_else(|e| {
-                panic!(
-                    "NORA_CONFIG_PATH={} contains invalid TOML: {}",
-                    config_path, e
-                );
-            });
+        let mut config: Config = if let Some(config_path) = config_path {
+            let content =
+                fs::read_to_string(&config_path).map_err(|source| ConfigLoadError::Unreadable {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            let cfg = toml::from_str(&content).map_err(|source| ConfigLoadError::InvalidToml {
+                path: config_path.clone(),
+                source,
+            })?;
             tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
             cfg
         } else {
@@ -988,12 +1024,17 @@ impl Config {
         };
 
         // 3. Override with ENV vars (highest priority)
-        if let Err(e) = config.apply_env_overrides() {
-            panic!("Fatal env override error: {}", e);
-        }
+        config
+            .apply_env_overrides()
+            .map_err(ConfigLoadError::EnvOverride)?;
 
         // 4. Validate configuration
-        let (warnings, errors) = config.validate();
+        config.checked()
+    }
+
+    /// Validate: warnings are logged, errors reject the configuration.
+    fn checked(self) -> Result<Self, ConfigLoadError> {
+        let (warnings, errors) = self.validate();
         for w in &warnings {
             tracing::warn!("Config validation: {}", w);
         }
@@ -1001,10 +1042,9 @@ impl Config {
             for e in &errors {
                 tracing::error!("Config validation: {}", e);
             }
-            panic!("Fatal configuration errors: {}", errors.join("; "));
+            return Err(ConfigLoadError::Invalid(errors));
         }
-
-        config
+        Ok(self)
     }
 
     /// Non-panicking config reload for SIGHUP handler.
@@ -1746,6 +1786,109 @@ mod tests {
             crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
             Some("user:pass")
         );
+    }
+
+    /// `KEY=VALUE` lines of an env file (comments and blanks skipped).
+    fn env_file(text: &str) -> Vec<(String, String)> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect()
+    }
+
+    /// A default config with the server settings an env file sets (#1025).
+    fn with_env_file(text: &str) -> Config {
+        let mut config = Config::default();
+        for (key, value) in env_file(text) {
+            match key.as_str() {
+                "NORA_HOST" => config.server.host = value,
+                "NORA_PORT" => config.server.port = value.parse().unwrap(),
+                "NORA_PUBLIC_URL" => config.server.public_url = Some(value),
+                _ => {}
+            }
+        }
+        config
+    }
+
+    /// The defaults we ship must start: a fresh package install or `install.sh` run
+    /// used to crash-loop on its own nora.env (#1025).
+    #[test]
+    fn shipped_env_defaults_pass_validation() {
+        let deb = include_str!("../../../dist/nora.env.example");
+        let script = include_str!("../../../dist/install.sh");
+        let heredoc = script
+            .split("cat > /tmp/nora.env << 'ENVEOF'")
+            .nth(1)
+            .and_then(|rest| rest.split("\nENVEOF").next())
+            .expect("install.sh writes a default nora.env");
+        for (name, text) in [("dist/nora.env.example", deb), ("dist/install.sh", heredoc)] {
+            let (_, errors) = with_env_file(text).validate();
+            assert!(
+                errors.is_empty(),
+                "{name} defaults fail validation: {errors:?}"
+            );
+        }
+    }
+
+    /// Both unit files stop instead of restarting on a configuration error.
+    #[test]
+    fn units_do_not_restart_on_a_config_error() {
+        let unit = include_str!("../../../dist/nora.service");
+        let script = include_str!("../../../dist/install.sh");
+        let wanted = format!("RestartPreventExitStatus={EXIT_CONFIG}");
+        assert!(unit.contains(&wanted), "dist/nora.service lacks {wanted}");
+        assert!(script.contains(&wanted), "install.sh's unit lacks {wanted}");
+    }
+
+    /// Every fatal case of loading comes back as its own typed error, never a panic:
+    /// an unreadable config file, invalid TOML, and a configuration validation rejects.
+    #[test]
+    fn load_reports_each_fatal_case_as_a_typed_error() {
+        // load() applies NORA_* overrides; other tests set invalid ones under this lock.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+        let missing = Config::load_from(Some(path("absent.toml"))).expect_err("missing file");
+        assert!(
+            matches!(missing, ConfigLoadError::Unreadable { .. }),
+            "{missing}"
+        );
+
+        std::fs::write(path("broken.toml"), "[server\nport = ").unwrap();
+        let broken = Config::load_from(Some(path("broken.toml"))).expect_err("invalid TOML");
+        assert!(
+            matches!(broken, ConfigLoadError::InvalidToml { .. }),
+            "{broken}"
+        );
+
+        // An error no test's temporary NORA_* variables can mask.
+        std::fs::write(path("empty-path.toml"), "[storage]\npath = \"\"\n").unwrap();
+        let invalid = Config::load_from(Some(path("empty-path.toml"))).expect_err("validation");
+        assert!(matches!(invalid, ConfigLoadError::Invalid(_)), "{invalid}");
+        assert!(invalid.to_string().contains("storage.path"), "{invalid}");
+    }
+
+    /// A fatal configuration error is a typed error for `main` to exit on with
+    /// EX_CONFIG, not a panic (which aborted with SIGABRT and made systemd retry).
+    #[test]
+    fn fatal_validation_is_an_error_not_a_panic() {
+        assert_eq!(EXIT_CONFIG, 78, "EX_CONFIG from sysexits.h");
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.public_url = None;
+        let err = config
+            .checked()
+            .expect_err("wildcard host without public_url");
+        assert!(matches!(err, ConfigLoadError::Invalid(_)));
+        assert!(err.to_string().contains("NORA_PUBLIC_URL"), "{err}");
+
+        let mut ok = Config::default();
+        ok.server.host = "::".to_string();
+        ok.server.public_url = Some("http://localhost:4000".to_string());
+        assert!(ok.checked().is_ok());
     }
 
     #[test]

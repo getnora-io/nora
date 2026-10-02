@@ -72,8 +72,10 @@ sudo chown nora:nora "$DATA_DIR" "$LOG_DIR"
 # Install default config if not exists
 if [ ! -f "$CONFIG_DIR/nora.env" ]; then
     cat > /tmp/nora.env << 'ENVEOF'
-NORA_HOST=0.0.0.0
+NORA_HOST=::
 NORA_PORT=4000
+# Clients on other hosts need your real address here (e.g. https://registry.example.com)
+NORA_PUBLIC_URL=http://localhost:4000
 NORA_STORAGE_PATH=/var/lib/nora
 # Absolute path inside ReadWritePaths — the relative built-in default (data/tokens)
 # resolves outside the ProtectSystem=strict sandbox and breaks token writes (#816).
@@ -102,6 +104,8 @@ ExecStart=/usr/local/bin/nora serve
 WorkingDirectory=/etc/nora
 Restart=on-failure
 RestartSec=5
+# A configuration error (EX_CONFIG) stops the service instead of restarting into it
+RestartPreventExitStatus=78
 LimitNOFILE=65535
 NoNewPrivileges=true
 ProtectSystem=strict
