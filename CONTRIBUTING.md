@@ -9,6 +9,14 @@ Your contribution will be licensed under the [MIT License](LICENSE).
 
 You confirm that you have the right to submit the code and that it does not violate any third-party rights.
 
+## Scope, assignment and incentives
+
+- **Issues are not assigned.** Saying "I'll take this" reserves nothing. Open a pull request, or say in the issue that you have started, and expect that someone else may get there first.
+- **Third-party bounties are not recognised.** Money attached to an issue by someone outside the project does not put it on the roadmap and creates no obligation to merge. Pull requests are judged on their merits, exactly as they would be without it.
+- **Keep payment arrangements off the tracker.** Agree terms with whoever pays you elsewhere; comments about budgets, invoices, payment timing or wallet addresses are off-topic here and will be hidden as such.
+- **Propose a large or unsolicited feature as an issue first.** A substantial pull request for something nobody discussed is likely to be declined on scope no matter how well it is written — a short design issue costs you an hour instead of a week.
+- **Disclose AI-assisted work, and expect it reviewed as code of unverified provenance.** The DCO still applies: you certify that you have the right to submit it. Claims in the description must be measured against the real client or protocol rather than inferred from a similar one, and a `COMPAT.md` entry has to match what the code actually does.
+
 ## Project Governance
 
 NORA uses a **Benevolent Dictator** governance model:
