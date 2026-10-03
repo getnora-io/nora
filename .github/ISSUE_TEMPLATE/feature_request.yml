@@ -2,6 +2,12 @@ name: Feature Request
 description: Suggest a new feature for NORA
 labels: [enhancement]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues here are not assigned, and bounties attached by third parties are not
+        recognised — see [CONTRIBUTING.md](https://github.com/getnora-io/nora/blob/main/CONTRIBUTING.md#scope-assignment-and-incentives).
+        Please keep payment arrangements off the tracker.
   - type: textarea
     id: problem
     attributes:
