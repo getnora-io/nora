@@ -538,6 +538,13 @@ async fn upload(
     }
 
     // Create new file — commit the streamed temp (rename on the local backend).
+    //
+    // Answers 200, not 201 (#1039): `raw` is the surface object-storage clients reach
+    // for, and they read anything but 200 as a failure. Lake 5.0.0 aborts an upload with
+    // `error: failed to upload artifact, error 201` while the object is in fact stored —
+    // the worst shape of a failure. S3's own PutObject answers 200, so one success code
+    // for every raw PUT (create, If-Match overwrite, re-PUT of identical bytes) is both
+    // what such a client expects and simpler to document.
     match state
         .storage
         .put_from_path(&key, &temp_path, Some(&sha256))
@@ -560,7 +567,7 @@ async fn upload(
                 "LOCAL",
             ));
             state.repo_index.invalidate("raw");
-            StatusCode::CREATED.into_response()
+            StatusCode::OK.into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
@@ -865,7 +872,7 @@ mod integration_tests {
             Body::from(&b"x"[..]),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
 
         // DELETE out of scope -> 403.
         let resp = super::delete_file(
@@ -887,14 +894,14 @@ mod integration_tests {
             Body::from(&b"x"[..]),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_raw_put_get_roundtrip() {
         let ctx = create_test_context();
         let put_resp = send(&ctx.app, Method::PUT, "/raw/test.txt", b"hello".to_vec()).await;
-        assert_eq!(put_resp.status(), StatusCode::CREATED);
+        assert_eq!(put_resp.status(), StatusCode::OK);
 
         let get_resp = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(get_resp.status(), StatusCode::OK);
@@ -941,7 +948,7 @@ mod integration_tests {
         // ~3.2MB of non-repeating bytes — crosses many body frames.
         let body: Vec<u8> = (0..800_000u32).flat_map(|i| i.to_le_bytes()).collect();
         let put = send(&ctx.app, Method::PUT, "/raw/big.bin", body.clone()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         let get = send(&ctx.app, Method::GET, "/raw/big.bin", "").await;
         assert_eq!(get.status(), StatusCode::OK);
@@ -982,7 +989,7 @@ mod integration_tests {
         let ctx = create_test_context();
         let body = vec![7u8; 300_000];
         let put = send(&ctx.app, Method::PUT, "/raw/pinned.bin", body.clone()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         // Corrupt the object behind the pin store's back.
         let on_disk = std::path::Path::new(&ctx.state.config.storage.path).join("raw/pinned.bin");
@@ -1040,7 +1047,7 @@ mod integration_tests {
             b"first".to_vec(),
         )
         .await;
-        assert_eq!(put1.status(), StatusCode::CREATED);
+        assert_eq!(put1.status(), StatusCode::OK);
 
         let put2 = send(
             &ctx.app,
@@ -1073,7 +1080,7 @@ mod integration_tests {
             b"same bytes".to_vec(),
         )
         .await;
-        assert_eq!(put1.status(), StatusCode::CREATED);
+        assert_eq!(put1.status(), StatusCode::OK);
 
         let put2 = send(
             &ctx.app,
@@ -1153,7 +1160,7 @@ mod integration_tests {
 
         // Upload a file first (upload is not curated)
         let put = send(&ctx.app, Method::PUT, "/raw/secret.txt", b"data".to_vec()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         // Download should be blocked by curation
         let get = send(&ctx.app, Method::GET, "/raw/secret.txt", "").await;
@@ -1161,7 +1168,7 @@ mod integration_tests {
 
         // Non-matching file should pass
         let put2 = send(&ctx.app, Method::PUT, "/raw/public.txt", b"ok".to_vec()).await;
-        assert_eq!(put2.status(), StatusCode::CREATED);
+        assert_eq!(put2.status(), StatusCode::OK);
         let get2 = send(&ctx.app, Method::GET, "/raw/public.txt", "").await;
         assert_eq!(get2.status(), StatusCode::OK);
     }
@@ -1225,7 +1232,7 @@ mod integration_tests {
             b"content".to_vec(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1323,7 +1330,7 @@ mod integration_tests {
     async fn test_raw_put_no_headers_still_409() {
         let ctx = create_test_context();
         let put1 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v1".to_vec()).await;
-        assert_eq!(put1.status(), StatusCode::CREATED);
+        assert_eq!(put1.status(), StatusCode::OK);
 
         let put2 = send(&ctx.app, Method::PUT, "/raw/compat.txt", b"v2".to_vec()).await;
         assert_eq!(put2.status(), StatusCode::CONFLICT);
@@ -1530,7 +1537,7 @@ mod integration_tests {
         ));
 
         let put = send(&ctx.app, Method::PUT, "/raw/obj.txt", b"v1".to_vec()).await;
-        assert_eq!(put.status(), StatusCode::CREATED);
+        assert_eq!(put.status(), StatusCode::OK);
 
         let head = send(&ctx.app, Method::HEAD, "/raw/obj.txt", "").await;
         assert_eq!(head.status(), StatusCode::OK);
@@ -1604,7 +1611,7 @@ mod integration_tests {
             b"hello".to_vec(),
         )
         .await;
-        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert_eq!(ok.status(), StatusCode::OK);
 
         // Mismatch is rejected before anything is stored.
         let bad = send_with_headers(
@@ -1649,7 +1656,7 @@ mod integration_tests {
             b"hello".to_vec(),
         )
         .await;
-        assert_eq!(multi.status(), StatusCode::CREATED);
+        assert_eq!(multi.status(), StatusCode::OK);
     }
 
     #[tokio::test]
