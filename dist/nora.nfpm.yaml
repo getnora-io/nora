@@ -16,12 +16,24 @@ contents:
     file_info:
       mode: 0755
 
+  # Modes are explicit so the package does not inherit the build machine's umask:
+  # a builder with umask 002 shipped these 0664 (group-writable), which also made any
+  # lintian ratchet depend on who built the artifact.
   - src: dist/nora.service
     dst: /usr/lib/systemd/system/nora.service
+    file_info:
+      mode: 0644
 
+  # 0640 root:nora — operators put tokens and S3 credentials in here, and the
+  # service reads it as an EnvironmentFile (systemd reads it before dropping to the
+  # nora user), so it never needs to be world-readable.
   - src: dist/nora.env.example
     dst: /etc/nora/nora.env
     type: config|noreplace
+    file_info:
+      owner: root
+      group: nora
+      mode: 0640
 
   - dst: /var/lib/nora
     type: dir
@@ -39,6 +51,8 @@ contents:
 
   - src: LICENSE
     dst: /usr/share/doc/nora/copyright
+    file_info:
+      mode: 0644
 
 scripts:
   postinstall: dist/postinst.sh

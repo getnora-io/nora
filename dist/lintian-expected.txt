@@ -1,0 +1,49 @@
+# lintian tags the .deb is allowed to carry — one tag per line, comments start with #.
+#
+# scripts/package-install-check.sh fails on any tag that is NOT listed here, so a new
+# KIND of packaging defect blocks a merge while the known debt below comes down
+# deliberately. It also prints the tags that stopped appearing: that is the signal to
+# ratchet them out of this file rather than leave a ceiling nobody earns.
+#
+# Measured on a release build of 1.3.3, packaged with the pinned nfpm 2.46.3, scanned
+# by lintian from debian:trixie: 14 findings across the 11 tags below. The set is
+# deterministic — file modes are explicit in dist/nora.nfpm.yaml, so it no longer
+# depends on the build machine's umask. A lintian upgrade can legitimately change the
+# set; refresh this file in a commit that says which upgrade did it.
+#
+# Why each one is tolerated today:
+#
+#   binary-has-unneeded-section (.comment) — nfpm ships the binary as cargo produced
+#     it. Stripping would also take the symbol names that make a field panic readable.
+#   description-starts-with-package-name — the description opens with the product name.
+#     Rewording it to satisfy the tag reads worse than the tag.
+#   extended-description-is-empty — the nfpm manifest has no long description yet.
+#     Worth fixing; costs one paragraph.
+#   hardening-no-fortify-functions — Rust does not link glibc's _FORTIFY_SOURCE
+#     wrappers, so the check does not apply to this binary.
+#   maintainer-script-calls-systemctl — the scripts call systemctl directly instead of
+#     deb-systemd-invoke because the same two scripts also ship inside the .rpm
+#     (nfpm declares them once, at manifest top level).
+#   missing-dependency-on-libc — the dependency list is hand-written (`depends:
+#     systemd`). Harmless for a single binary, worth fixing properly.
+#   no-changelog — the package carries no Debian changelog; the upstream CHANGELOG.md
+#     is the one we maintain.
+#   no-manual-page — /usr/bin/nora has no man page. Worth fixing.
+#   non-standard-dir-perm — /var/lib/nora and /var/log/nora are 0750 on purpose: a
+#     registry's data and logs are not world-readable.
+#   non-standard-file-perm — /etc/nora/nora.env is 0640 root:nora on purpose:
+#     operators put tokens and S3 credentials in it, and systemd reads the
+#     EnvironmentFile before dropping to the service user.
+#   synopsis-too-long — the one-line description lists the supported formats, which is
+#     the first thing a reader of `apt show` wants.
+binary-has-unneeded-section
+description-starts-with-package-name
+extended-description-is-empty
+hardening-no-fortify-functions
+maintainer-script-calls-systemctl
+missing-dependency-on-libc
+no-changelog
+no-manual-page
+non-standard-dir-perm
+non-standard-file-perm
+synopsis-too-long
