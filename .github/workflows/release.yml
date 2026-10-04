@@ -56,13 +56,49 @@ jobs:
             exit 1
           fi
 
+      # The two certified-OS variants are built FROM vendor registries whose TLS chain
+      # is signed by a CA that no default trust store carries, and buildkit runs in its
+      # own container: neither the host trust store nor /etc/docker/certs.d reaches it,
+      # so a runner can `docker pull` the base by hand and still fail to build the
+      # variant. The only way in is a buildkit image that carries that root.
+      #
+      # What the runner provides is the *build context* for such an image — a directory
+      # holding a Dockerfile and the certificate — named by the repository variable
+      # BUILDKIT_CONTEXT. The image is built here rather than kept on the runner,
+      # because the first step of this job prunes local images.
+      #
+      # Unset, without a Dockerfile, or failing to build: the stock image is used with
+      # a warning and the certified-OS variants do not build. A release must never fail
+      # over this (#1049). The durable fix is #1050 — mirror the bases and pin them by
+      # digest, after which no runner needs an extra CA at all.
+      - name: Select buildkit image
+        id: buildkit
+        env:
+          BUILDKIT_CONTEXT: ${{ vars.BUILDKIT_CONTEXT }}
+        run: |
+          set -euo pipefail
+          # driver-opts is a newline-separated list (the action parses it with
+          # ignoreComma), so a comma-joined value would arrive as one broken option.
+          opts='network=host'
+          if [ -z "${BUILDKIT_CONTEXT:-}" ]; then
+            echo "BUILDKIT_CONTEXT not set - using the stock buildkit image"
+          elif [ ! -f "${BUILDKIT_CONTEXT}/Dockerfile" ]; then
+            echo "::warning::BUILDKIT_CONTEXT=${BUILDKIT_CONTEXT} has no Dockerfile - using the stock buildkit image; the certified-OS variants will not build"
+          elif docker build -t nora-buildkit:local "$BUILDKIT_CONTEXT"; then
+            echo "built nora-buildkit:local from ${BUILDKIT_CONTEXT}"
+            opts="${opts}"$'\n'"image=nora-buildkit:local"
+          else
+            echo "::warning::could not build a buildkit image from ${BUILDKIT_CONTEXT} - using the stock buildkit image; the certified-OS variants will not build"
+          fi
+          { echo 'opts<<NORA_DRIVER_OPTS'; printf '%s\n' "$opts"; echo 'NORA_DRIVER_OPTS'; } >> "$GITHUB_OUTPUT"
+
       # No QEMU: the arm64 binary is cross-compiled (rust on amd64), and the arm64
       # image is built natively on ubuntu-24.04-arm (see build-image-arm64). Emulated
       # arm64 apk on the self-hosted runner crashes ("Illegal instruction") — #ci.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
         with:
-          driver-opts: network=host
+          driver-opts: ${{ steps.buildkit.outputs.opts }}
 
       - name: Extract binary from multi-stage build (amd64)
         run: |
@@ -587,13 +623,33 @@ jobs:
             suffix: ""
           - name: redos
             suffix: "-redos"
+          - name: astra
+            suffix: "-astra"
 
     steps:
       - name: Set version tag (strip leading v)
         id: ver
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      # A certified-OS variant may legitimately be missing: its vendor base registry
+      # can be unreachable at release time, and #1049 deliberately lets the release
+      # ship without it. The scan is one more consumer that has to skip such a variant
+      # instead of failing on it — 1.3.3 proved that the hard way, with Scan (redos)
+      # red over an image that was never published.
+      - name: Is there an image to scan?
+        id: img
+        run: |
+          set -uo pipefail
+          ref="ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}"
+          if docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${ref} does not exist — the ${{ matrix.name }} image was not published for this release, nothing to scan"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Trivy — image scan (${{ matrix.name }})
+        if: steps.img.outputs.present == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         timeout-minutes: 15
         with:
