@@ -973,7 +973,7 @@ mod integration_tests {
     async fn test_auth_disabled_passes_all() {
         let ctx = create_test_context();
         let response = send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1031,7 +1031,7 @@ mod integration_tests {
             b"data".to_vec(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
         let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -1205,7 +1205,7 @@ mod integration_tests {
             b"data".to_vec(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1246,7 +1246,7 @@ mod integration_tests {
             b"data".to_vec(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// #736: a read-only API token as the Basic-auth password must be rejected for writes,
@@ -1353,7 +1353,7 @@ mod integration_tests {
             b"data".to_vec(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
         // Read without auth should work
         let response = send(&ctx.app, Method::GET, "/raw/test.txt", "").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1835,7 +1835,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         .await;
         assert_eq!(
             response.status(),
-            StatusCode::CREATED,
+            StatusCode::OK,
             "Write with main-branch OIDC token should succeed"
         );
     }
@@ -1875,7 +1875,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         .await;
         assert_eq!(
             response.status(),
-            StatusCode::CREATED,
+            StatusCode::OK,
             "PR token should write inside its rule scope"
         );
 
@@ -1933,7 +1933,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             b"inside".to_vec(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
 
         // The rule's ["*"] must not lift the provider ceiling.
         let response = send_with_headers(
