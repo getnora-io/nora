@@ -436,8 +436,26 @@ async fn upload(
     let file_exists = state.storage.stat(&key).await.is_some();
 
     match (file_exists, if_none_match.as_deref(), if_match.as_deref()) {
-        // No conditional headers, file exists → 409 (backward compat)
+        // No conditional headers, file exists → idempotent success if the
+        // uploaded bytes match what's stored (#1036: object-storage clients
+        // retry uploads after a partial transfer, and a retry of identical
+        // bytes must not be a hard failure); 409 otherwise (backward compat,
+        // immutability preserved for genuinely different content).
         (true, None, None) => {
+            if let Some(hash) = state.storage.pin(&key).await {
+                if hash == sha256 {
+                    return do_overwrite(
+                        &state,
+                        &key,
+                        &path,
+                        &temp_path,
+                        &sha256,
+                        &mut temp_guard,
+                        crate::auth::audit_actor(&user),
+                    )
+                    .await;
+                }
+            }
             return (
                 StatusCode::CONFLICT,
                 format!("File already exists: {}", path),
@@ -1038,6 +1056,39 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], b"first");
+    }
+
+    /// #1036: a re-PUT of the exact same bytes, with no conditional headers,
+    /// must succeed instead of 409 — object-storage clients retry uploads
+    /// after a partial transfer and treat a retry of identical content as
+    /// routine, not a conflict. Different bytes under the same key must
+    /// still be rejected (test_raw_immutable_overwrite_rejected above).
+    #[tokio::test]
+    async fn test_raw_reput_identical_bytes_is_idempotent() {
+        let ctx = create_test_context();
+        let put1 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/idempotent.txt",
+            b"same bytes".to_vec(),
+        )
+        .await;
+        assert_eq!(put1.status(), StatusCode::CREATED);
+
+        let put2 = send(
+            &ctx.app,
+            Method::PUT,
+            "/raw/idempotent.txt",
+            b"same bytes".to_vec(),
+        )
+        .await;
+        assert_eq!(put2.status(), StatusCode::OK);
+
+        // Content is unchanged and still readable.
+        let get = send(&ctx.app, Method::GET, "/raw/idempotent.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = body_bytes(get).await;
+        assert_eq!(&body[..], b"same bytes");
     }
 
     #[tokio::test]
