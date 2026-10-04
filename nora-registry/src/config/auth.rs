@@ -263,6 +263,31 @@ pub struct AuthConfig {
 /// pattern = "repo:myorg/*"
 /// role = "read"
 /// ```
+///
+/// GitLab CI needs a different ceiling. GitLab sets an ID token's `exp` from the
+/// job timeout, whose project default is 60 minutes, so with NORA's default
+/// `max_token_lifetime_secs = 900` a token from a job that does not set a short
+/// `timeout:` is rejected — and until #994 that rejection was a bare 401 with no
+/// reason. Raise the ceiling to cover the job timeout, or pin a short `timeout:`
+/// on the jobs that push:
+///
+/// ```toml
+/// [[auth.oidc.providers]]
+/// name = "gitlab"
+/// # Must equal the `iss` claim, i.e. GitLab's external_url.
+/// issuer = "https://gitlab.example.com"
+/// # Matches `aud` in the job: id_tokens: NORA_ID_TOKEN: aud: nora
+/// audience = "nora"
+/// algorithms = ["RS256"]
+/// # GitLab: token lifetime = job timeout (default 60 min), so 900 would refuse it.
+/// max_token_lifetime_secs = 3600
+/// namespace_scope = ["myorg/**"]
+///
+/// # GitLab's sub is project_path:<group>/<project>:ref_type:<type>:ref:<name>
+/// [[auth.oidc.providers.role_rules]]
+/// pattern = "project_path:mygroup/myproject:ref_type:branch:ref:main"
+/// role = "write"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcConfig {
     #[serde(default)]
@@ -317,6 +342,11 @@ pub struct OidcProvider {
     #[serde(default = "default_oidc_algorithms")]
     pub algorithms: Vec<String>,
     /// Maximum token lifetime in seconds. Tokens with longer exp-iat are rejected.
+    ///
+    /// The default (900) fits GitHub Actions, whose tokens are short-lived. GitLab
+    /// derives the lifetime from the job timeout — 60 minutes by default — so a
+    /// GitLab provider needs a ceiling that covers it (3600) or jobs that set a
+    /// short `timeout:`; otherwise every push is refused with 401.
     #[serde(default = "default_oidc_max_lifetime")]
     pub max_token_lifetime_secs: u64,
     /// Namespace scope — which NORA namespaces this issuer can access.
