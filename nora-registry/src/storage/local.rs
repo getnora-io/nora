@@ -48,13 +48,42 @@ async fn sync_parent_dir(path: &Path) -> Result<()> {
 pub struct LocalStorage {
     base_path: PathBuf,
     pins: Arc<HashPinStore>,
+    /// Per-key commit locks, see [`Self::commit_lock`].
+    commit_locks: crate::PublishLocks,
 }
 
 impl LocalStorage {
     pub fn new(path: &str) -> Self {
         let base_path = PathBuf::from(path);
         let pins = Arc::new(HashPinStore::new(base_path.join(PIN_FILE)));
-        Self { base_path, pins }
+        Self {
+            base_path,
+            pins,
+            commit_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Serialize the two durable steps of a write to one key: publishing the body
+    /// (the `rename`) and recording its hash pin (the NDJSON append).
+    ///
+    /// They are separate artifacts, so without this two writers of one key
+    /// interleave into "body from A, last pin from B", and the next read fails
+    /// hash-pin verification on bytes nobody tampered with — `INTEGRITY VIOLATION:
+    /// refusing to serve tampered artifact` on a healthy object (#1041, surfaced by
+    /// `nora migrate` on a Docker pull-through cache: 1 of 4039 keys). The object
+    /// backends are unaffected, since there the pin travels in the object's own
+    /// metadata, written in the same request as the body.
+    ///
+    /// The lock lives in the backend and not in a caller, so no future writer can
+    /// reintroduce the split by forgetting to take `AppState::publish_lock` — which
+    /// is exactly how the docker proxy-cache fill produced it.
+    ///
+    /// It narrows the crash window rather than closing it: a process that dies
+    /// between the rename and the append still leaves the pair diverged, and an
+    /// operator repairs that by rewriting the key (the body is intact, only the pin
+    /// is stale).
+    fn commit_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        crate::acquire_publish_lock(&self.commit_locks, key)
     }
 
     /// Record `sha256` for `key`, on the blocking pool (the append is
@@ -164,6 +193,9 @@ impl StorageBackend for LocalStorage {
 
         // Atomic write: create temp file in same directory, write, rename.
         // This prevents readers from seeing partial/truncated data during write.
+        // Body and pin are published as one critical section (#1041, see commit_lock).
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
         let tmp = unique_tmp_path(&path);
         let write_result: Result<()> = async {
             let mut file = fs::File::create(&tmp).await?;
@@ -343,6 +375,9 @@ impl StorageBackend for LocalStorage {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
+        // Body and pin are published as one critical section (#1041, see commit_lock).
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
         // Try atomic rename first; fall back to streaming copy on EXDEV
         // (cross-device link — src and dest on different filesystems).
         match fs::rename(src, &dest).await {
@@ -397,6 +432,9 @@ impl StorageBackend for LocalStorage {
         if let Some(parent) = dst_path.parent() {
             fs::create_dir_all(parent).await?;
         }
+        // Body and pin are published as one critical section (#1041, see commit_lock).
+        let lock = self.commit_lock(dst);
+        let _commit = lock.lock().await;
         // Hard link: the two keys share one inode, so a mounted blob costs no
         // extra bytes and cannot drift from its source.
         let linked = match fs::hard_link(&src_path, &dst_path).await {
@@ -489,6 +527,40 @@ mod tests {
 
     async fn get(storage: &LocalStorage, key: &str) -> Result<Bytes> {
         storage.get(key).await.map(|(data, _pin)| data)
+    }
+
+    /// #1041: the body and its hash pin are two separate durable artifacts, so two
+    /// writers of one key must never leave "body from one, last pin from the other"
+    /// behind — the next read then fails hash-pin verification on bytes nobody
+    /// tampered with (`INTEGRITY VIOLATION` on a healthy object, which is how this
+    /// was found: one key out of 4039 during `nora migrate`). The guarantee is
+    /// structural (the per-key commit lock in the backend); this hammers the pair and
+    /// checks after every round that the recorded pin describes the stored body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_never_split_body_from_pin() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let key = "docker/docker.io/library/alpine/manifests/sha256:feedface.meta.json";
+
+        for round in 0..40 {
+            let a = format!(r#"{{"downloads":{round},"writer":"a"}}"#).into_bytes();
+            let b = format!(r#"{{"downloads":{round},"writer":"b","pad":"xx"}}"#).into_bytes();
+            let (sa, sb) = (Arc::clone(&storage), Arc::clone(&storage));
+            let (ka, kb) = (key.to_string(), key.to_string());
+            let wa = tokio::spawn(async move { put(&sa, &ka, &a).await });
+            let wb = tokio::spawn(async move { put(&sb, &kb, &b).await });
+            wa.await.unwrap().unwrap();
+            wb.await.unwrap().unwrap();
+
+            let (body, pin) = storage.get(key).await.unwrap();
+            let stored = hex::encode(Sha256::digest(&body));
+            assert_eq!(
+                pin.as_deref(),
+                Some(stored.as_str()),
+                "round {round}: the recorded pin does not describe the stored body — \
+                 a reader would see INTEGRITY VIOLATION on untampered bytes"
+            );
+        }
     }
 
     /// `put_from_path` across filesystems (EXDEV: the spool on tmpfs, storage on disk)
