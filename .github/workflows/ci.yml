@@ -72,6 +72,13 @@ jobs:
       # back in fails here instead of quietly disabling the check (#979).
       - name: Lock audit self-test
         run: bash scripts/test-lock-audit.sh
+      # The maintainer scripts decide between an upgrade and a removal from an
+      # argument each package format spells differently, and nothing in a build
+      # notices when they get it wrong: #1035 stopped and disabled a running
+      # registry on every upgrade for as long as packaging had existed. The check
+      # runs the real scripts against a stub systemctl — no systemd, no root.
+      - name: Package maintainer scriptlets
+        run: bash scripts/test-package-scriptlets.sh
       - name: Lock audit — publish_lock consistency
         run: bash scripts/lock-audit.sh
 
