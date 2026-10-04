@@ -816,10 +816,9 @@ pub async fn raw_file_get() {}
         ("path" = String, Path, description = "File path")
     ),
     responses(
-        (status = 200, description = "File overwritten (conditional PUT with If-Match)"),
-        (status = 201, description = "File uploaded"),
+        (status = 200, description = "File written (created, overwritten with If-Match, or re-PUT of identical bytes)"),
         (status = 400, description = "Invalid path (non-ASCII characters)"),
-        (status = 409, description = "File already exists (immutable)"),
+        (status = 409, description = "File already exists with different content (immutable)"),
         (status = 412, description = "Precondition failed (ETag mismatch or resource state)"),
         (status = 413, description = "File too large"),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
