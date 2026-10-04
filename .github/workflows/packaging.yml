@@ -1,0 +1,103 @@
+# Put the package on a clean system before a release, not after one.
+#
+# release.yml builds the .deb and .rpm at tag time and uploads them; nothing ever
+# installed one. A change under dist/ therefore passed every check we had and was
+# validated by the first user to run `apt install` (#1031). Two defects shipped that
+# way: the unit file under /lib/systemd/system, forbidden since the /usr merge (four
+# lintian errors, in every release until #1023), and an upgrade that stopped the
+# registry and never started it again (#1035).
+#
+# Path-filtered on purpose: it builds a release binary, which is too slow to run on
+# every pull request, and only dist/ and the check itself can change the answer.
+name: Packaging
+
+on:
+  pull_request:
+    paths:
+      - dist/**
+      - scripts/package-install-check.sh
+      - .github/workflows/packaging.yml
+  push:
+    branches: [main]
+    paths:
+      - dist/**
+      - scripts/package-install-check.sh
+      - .github/workflows/packaging.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: Install (${{ matrix.format }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [deb, rpm]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # A release build, not a debug one: the package that ships carries a release
+      # binary, and the difference is visible to the checks — a debug binary reports
+      # `unstripped-binary-or-object` to lintian and weighs 300 MB, so a baseline
+      # taken from it would not describe the artifact users install.
+      - name: Build the binary
+        run: cargo build --release --package nora-registry
+
+      - name: Stage the binary where nfpm expects it
+        run: |
+          cp target/release/nora ./nora
+          chmod +x ./nora
+
+      - name: Install nfpm
+        run: |
+          set -o pipefail
+          NFPM_VERSION=2.46.3
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 120 \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/nfpm" --version
+
+      - name: Build the ${{ matrix.format }}
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "packaging version $VERSION"
+          VERSION="$VERSION" NFPM_ARCH=amd64 nfpm package \
+            --config dist/nora.nfpm.yaml \
+            --packager ${{ matrix.format }} \
+            --target ./nora-built.${{ matrix.format }}
+
+      # The last released package enables the migration pass. It is optional: a run
+      # without it still checks the install, the self-upgrade and lintian, so a
+      # release-download hiccup degrades the job rather than failing it.
+      - name: Fetch the last released package
+        id: released
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p released
+          gh release download --repo "$GITHUB_REPOSITORY" \
+            --pattern "nora-amd64.${{ matrix.format }}" --dir released --clobber
+          ls -l released
+
+      - name: Install, upgrade and scan
+        run: |
+          OLD=released/nora-amd64.${{ matrix.format }}
+          [ -f "$OLD" ] || OLD=""
+          bash scripts/package-install-check.sh ${{ matrix.format }} ./nora-built.${{ matrix.format }} $OLD
