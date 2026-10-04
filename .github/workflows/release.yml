@@ -148,8 +148,16 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
             type=raw,value=latest
 
+      # continue-on-error: the base image lives in a vendor registry we do not control.
+      # On 2026-10-04 registry.red-soft.ru started serving a chain signed by the Russian
+      # Trusted CA, which the runner does not trust, and the whole 1.3.3 release stopped:
+      # no binaries, no packages, no alpine image, no release notes. A certified-OS
+      # variant is worth having, and worth nothing if it can block everything else.
+      # A variant that does not build leaves its digest output empty, and every consumer
+      # below skips it with a warning instead of failing.
       - name: Build and push (redos, by digest)
         id: build-redos
+        continue-on-error: true
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
@@ -171,8 +179,16 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
             type=raw,value=latest
 
+      # continue-on-error: the base image lives in a vendor registry we do not control.
+      # On 2026-10-04 registry.red-soft.ru started serving a chain signed by the Russian
+      # Trusted CA, which the runner does not trust, and the whole 1.3.3 release stopped:
+      # no binaries, no packages, no alpine image, no release notes. A certified-OS
+      # variant is worth having, and worth nothing if it can block everything else.
+      # A variant that does not build leaves its digest output empty, and every consumer
+      # below skips it with a warning instead of failing.
       - name: Build and push (astra, by digest)
         id: build-astra
+        continue-on-error: true
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
@@ -320,6 +336,12 @@ jobs:
               redos)  ref="$IMAGE@$REDOS_DIGEST"; port=5556 ;;
               astra)  ref="$IMAGE@$ASTRA_DIGEST"; port=5557 ;;
             esac
+            # A variant whose vendor base image was unreachable has no digest: say so
+            # loudly and move on, rather than smoke-test "$IMAGE@".
+            if [ "$ref" = "$IMAGE@" ]; then
+              echo "::warning::$v image was not built (vendor base registry unreachable) — skipping its smoke test"
+              continue
+            fi
             echo "smoke $v: $ref"
             docker rm -f "nora-smoke-$v" 2>/dev/null || true
             docker run --rm -d --name "nora-smoke-$v" -p "$port:4000" -e NORA_HOST=0.0.0.0 -e "NORA_PUBLIC_URL=http://localhost:$port" "$ref"
@@ -338,8 +360,13 @@ jobs:
           ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
         run: |
           set -euo pipefail
-          cosign sign --yes "$IMAGE@$REDOS_DIGEST"
-          cosign sign --yes "$IMAGE@$ASTRA_DIGEST"
+          for d in "$REDOS_DIGEST" "$ASTRA_DIGEST"; do
+            if [ -z "$d" ]; then
+              echo "::warning::a certified-OS variant was not built — nothing to sign for it"
+              continue
+            fi
+            cosign sign --yes "$IMAGE@$d"
+          done
 
       # GHCR-only tags (the arch images were pushed by-digest to GHCR). Docker Hub
       # tags are produced by copying the assembled multi-arch GHCR manifest below.
@@ -385,8 +412,15 @@ jobs:
           set -euo pipefail
           promote() {
             local digest="$1" names="$2" n ref got
-            if [ -z "$digest" ] || [ -z "${names// /}" ]; then
-              echo "::error::nothing staged to promote (digest='$digest', tags='$names')"
+            # An empty digest means the variant was not built at all (its vendor base
+            # registry was unreachable), which is not a promotion failure — there is
+            # simply nothing staged. An empty TAG list with a real digest still is.
+            if [ -z "$digest" ]; then
+              echo "::warning::variant not built — no tags promoted for it"
+              return 0
+            fi
+            if [ -z "${names// /}" ]; then
+              echo "::error::staged digest '$digest' has no tag names to promote"
               return 1
             fi
             for n in $names; do
