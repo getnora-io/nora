@@ -14,6 +14,15 @@ BINARY_PORT="${GATE_PORT:-14100}"
 DOCKER_PORT="$((BINARY_PORT + 100))"
 PASSED=0
 FAILED=0
+SKIPPED=0
+
+# The cosign that signs the release is pinned in release.yml and is v3, which stores a
+# signature as a sigstore bundle attached through the OCI referrers API. cosign v2 only
+# looks for the legacy `sha256-<digest>.sig` tag, so it answers "no signatures found"
+# on an image that is correctly signed. This gate must not turn that into a red release:
+# it verifies with a cosign that can see bundles — the local one when new enough, the
+# pinned container image otherwise.
+COSIGN_PINNED_IMAGE="ghcr.io/sigstore/cosign/cosign:v3.0.5"
 VERSIONS_COLLECTED=()
 WORK_DIR=$(mktemp -d)
 CONTAINER_NAME="post-release-gate-$$"
@@ -32,6 +41,33 @@ pass() {
 fail() {
     echo "  FAIL: $1"
     FAILED=$((FAILED + 1))
+}
+
+skip() {
+    echo "  SKIP: $1"
+    SKIPPED=$((SKIPPED + 1))
+}
+
+# A certified-OS variant may legitimately not exist: its vendor base registry can be
+# unreachable at release time and the release ships without it on purpose (#1049).
+# Absent is then a skip with a reason, not a failure of this release.
+image_exists() {
+    docker manifest inspect "$1" >/dev/null 2>&1
+}
+
+cosign_run() {
+    if [ "$COSIGN_MODE" = local ]; then
+        cosign "$@"
+    else
+        # --user: the work dir comes from `mktemp -d` (0700, owned by the caller), so
+        # the image's own non-root user cannot read the blob or its bundle. HOME points
+        # at the same dir because cosign wants a writable home for its TUF cache.
+        docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME="$WORK_DIR" \
+            -v "$WORK_DIR:$WORK_DIR" -w "$WORK_DIR" \
+            "$COSIGN_PINNED_IMAGE" "$@"
+    fi
 }
 
 check() {
@@ -177,6 +213,11 @@ for registry in "$GHCR_REGISTRY" "$DOCKERHUB_REGISTRY"; do
         SUFFIX="${variant:+${variant#-}}"
         LABEL="${registry##*/}/${SUFFIX:-alpine}"
 
+        if [ -n "$variant" ] && ! image_exists "$IMAGE"; then
+            skip "Pull $IMAGE — variant not published for this release"
+            continue
+        fi
+
         if docker pull "$IMAGE" >/dev/null 2>&1; then
             pass "Pull $IMAGE"
         else
@@ -232,13 +273,25 @@ echo ""
 
 echo "--- Phase D: Signature Verification ---"
 
+COSIGN_MAJOR=$(cosign version 2>/dev/null | awk '/GitVersion/{v=$2; sub(/^v/,"",v); split(v,a,"."); print a[1]; exit}')
+if [ "${COSIGN_MAJOR:-0}" -ge 3 ]; then
+    COSIGN_MODE=local
+    echo "  verifying with local cosign v${COSIGN_MAJOR}.x"
+elif docker info >/dev/null 2>&1; then
+    COSIGN_MODE=container
+    echo "  local cosign is v${COSIGN_MAJOR:-?}.x and cannot read sigstore bundles — verifying with $COSIGN_PINNED_IMAGE"
+else
+    COSIGN_MODE=local
+    echo "  WARNING: local cosign is v${COSIGN_MAJOR:-?}.x and docker is unavailable — signature checks below may report a false negative"
+fi
+
 # Download signature bundle
 gh release download "$TAG" --repo "$REPO" \
     --pattern "nora-linux-amd64.bundle" \
     --dir "$WORK_DIR" --clobber 2>/dev/null || true
 
 if [ -f "$WORK_DIR/nora-linux-amd64.bundle" ]; then
-    if cosign verify-blob \
+    if cosign_run verify-blob \
         --bundle "$WORK_DIR/nora-linux-amd64.bundle" \
         --certificate-identity-regexp "github.com/getnora-io/nora" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -254,10 +307,15 @@ fi
 # Verify GHCR image signatures (alpine, RED OS, Astra)
 for variant in "${VARIANTS[@]}"; do
     SUFFIX="${variant:+${variant#-}}"
-    if cosign verify \
+    REF="${GHCR_REGISTRY}:${VERSION}${variant}"
+    if [ -n "$variant" ] && ! image_exists "$REF"; then
+        skip "cosign verify GHCR ${SUFFIX} image — not published for this release"
+        continue
+    fi
+    if cosign_run verify \
         --certificate-identity-regexp "github.com/getnora-io/nora" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-        "${GHCR_REGISTRY}:${VERSION}${variant}" >/dev/null 2>&1; then
+        "$REF" >/dev/null 2>&1; then
         pass "cosign verify GHCR ${SUFFIX:-alpine} image"
     else
         fail "cosign verify GHCR ${SUFFIX:-alpine} image"
@@ -293,7 +351,7 @@ echo ""
 # --- Summary ---
 
 echo "================================"
-echo "Results: $PASSED passed, $FAILED failed"
+echo "Results: $PASSED passed, $FAILED failed, $SKIPPED skipped"
 echo "================================"
 
 [ "$FAILED" -eq 0 ] && exit 0 || exit 1
