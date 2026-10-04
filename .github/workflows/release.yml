@@ -587,13 +587,33 @@ jobs:
             suffix: ""
           - name: redos
             suffix: "-redos"
+          - name: astra
+            suffix: "-astra"
 
     steps:
       - name: Set version tag (strip leading v)
         id: ver
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      # A certified-OS variant may legitimately be missing: its vendor base registry
+      # can be unreachable at release time, and #1049 deliberately lets the release
+      # ship without it. The scan is one more consumer that has to skip such a variant
+      # instead of failing on it — 1.3.3 proved that the hard way, with Scan (redos)
+      # red over an image that was never published.
+      - name: Is there an image to scan?
+        id: img
+        run: |
+          set -uo pipefail
+          ref="ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}"
+          if docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${ref} does not exist — the ${{ matrix.name }} image was not published for this release, nothing to scan"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Trivy — image scan (${{ matrix.name }})
+        if: steps.img.outputs.present == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         timeout-minutes: 15
         with:
