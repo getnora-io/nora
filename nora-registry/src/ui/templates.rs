@@ -119,10 +119,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     };
     let activity_log = render_activity_log(&activity_rows, t);
 
-    // Format uptime
-    let hours = data.uptime_seconds / 3600;
-    let mins = (data.uptime_seconds % 3600) / 60;
-    let uptime_str = format!("{}h {}m", hours, mins);
+    let uptime_str = format_uptime(data.uptime_seconds);
 
     // Render bragging footer (demo builds only)
     #[cfg(feature = "demo")]

@@ -742,13 +742,16 @@ pub fn render_polling_script() -> String {
                 else sizeStr = bytes + ' B';
                 document.getElementById('stat-storage').textContent = sizeStr;
 
-                // Update uptime
+                // Update uptime (days/hours/minutes; the day part appears only when
+                // there is one, matching the server-rendered value)
                 const uptime = document.getElementById('uptime');
                 if (uptime) {
                     const secs = data.uptime_seconds;
-                    const hours = Math.floor(secs / 3600);
+                    const days = Math.floor(secs / 86400);
+                    const hours = Math.floor((secs % 86400) / 3600);
                     const mins = Math.floor((secs % 3600) / 60);
-                    uptime.textContent = hours + 'h ' + mins + 'm';
+                    uptime.textContent =
+                        (days > 0 ? days + 'd ' : '') + hours + 'h ' + mins + 'm';
                 }
             } catch (e) {
                 console.error('Dashboard poll failed:', e);
@@ -965,6 +968,25 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         deps_label = t.deps_label,
         tagline = t.tagline,
     )
+}
+
+/// Format an uptime in seconds as `Xd Xh Ym`.
+///
+/// The day component is shown only when there is one, so a registry that has been
+/// up for a week reads `7d 3h 12m` instead of `171h 12m`, while a freshly
+/// started one still reads `12m` rather than `0d 0h 12m`.
+///
+/// The polling script in `render_polling_script` mirrors this formatting; keep the
+/// two in step so the server-rendered value and the live one do not disagree.
+pub fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else {
+        format!("{hours}h {mins}m")
+    }
 }
 
 /// Format Unix timestamp as relative time
@@ -1226,6 +1248,19 @@ mod tests {
         assert_eq!(sanitize_href("ftp://example.com"), None);
         assert_eq!(sanitize_href("ssh://git@github.com"), None);
         assert_eq!(sanitize_href("git://github.com/repo"), None);
+    }
+
+    #[test]
+    fn format_uptime_renders_days_hours_minutes() {
+        let cases: [(u64, &str); 4] = [
+            (0, "0h 0m"),        // nothing on the clock yet
+            (60, "0h 1m"),       // the minute rolls, hours stay 0
+            (3660, "1h 1m"),     // an hour and a minute
+            (90060, "1d 1h 1m"), // all three places non-zero: 1 day + 1 hour + 1 minute
+        ];
+        for (secs, expected) in cases {
+            assert_eq!(format_uptime(secs), expected, "uptime_seconds={secs}");
+        }
     }
 
     proptest! {
