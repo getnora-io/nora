@@ -14,8 +14,10 @@ use axum::{
 };
 use std::fmt;
 
-/// Validation errors
+/// Validation errors. Non-exhaustive: a new refusal adds a variant without breaking
+/// code that matches on it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// Path contains traversal sequences (../, etc.)
     PathTraversal,
