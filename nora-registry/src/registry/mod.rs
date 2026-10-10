@@ -51,10 +51,9 @@ pub(crate) use raw::storage_key as raw_storage_key;
 pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
-use crate::circuit_breaker::CircuitBreakerRegistry;
+use crate::circuit_breaker::{BreakerScope, CircuitBreakerRegistry};
 use crate::config::basic_auth_header;
 use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
-use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
@@ -212,14 +211,16 @@ async fn proxy_fetch_core<T, F, Fut>(
     extra_headers: Option<(&str, &str)>,
     extract: F,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
@@ -242,11 +243,11 @@ where
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
-                        cb.record_success(registry_str, probe);
+                        cb.record_success(&cb_key, probe);
                     } else {
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
-                        cb.record_failure(registry_str, probe);
+                        cb.record_failure(&cb_key, probe);
                     }
                     return result;
                 }
@@ -278,7 +279,7 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
@@ -292,7 +293,7 @@ where
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, "5xx"])
                     .observe(elapsed);
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
@@ -306,12 +307,12 @@ where
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -322,7 +323,7 @@ pub(crate) async fn proxy_fetch(
     timeout: Duration,
     auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Vec<u8>, ProxyError> {
     proxy_fetch_core(
         client,
@@ -332,7 +333,7 @@ pub(crate) async fn proxy_fetch(
         None,
         |r| async { r.bytes().await.map(|b| b.to_vec()) },
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -345,7 +346,7 @@ pub(crate) async fn proxy_fetch_text(
     auth: Option<&str>,
     extra_headers: Option<(&str, &str)>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<String, ProxyError> {
     proxy_fetch_core(
         client,
@@ -355,7 +356,7 @@ pub(crate) async fn proxy_fetch_text(
         extra_headers,
         |r| r.text(),
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -544,10 +545,12 @@ pub(crate) async fn proxy_forward_post(
     fwd_headers: &[(&str, &str)],
     body: &[u8],
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.post(url).timeout(timeout).body(body.to_vec());
@@ -574,11 +577,11 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     match response.bytes().await {
                         Ok(b) => {
-                            cb.record_success(registry_str, probe);
+                            cb.record_success(&cb_key, probe);
                             return Ok((code, b.to_vec(), content_type));
                         }
                         Err(e) => {
-                            cb.record_failure(registry_str, probe);
+                            cb.record_failure(&cb_key, probe);
                             return Err(ProxyError::Network(e.to_string()));
                         }
                     }
@@ -589,7 +592,7 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     // Upstream is alive and answered — a 4xx audit response is a real
                     // answer, forward it verbatim (not an availability failure). #606.
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     let b = response
                         .bytes()
                         .await
@@ -605,7 +608,7 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(code));
             }
             Err(e) => {
@@ -619,12 +622,12 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -829,10 +832,10 @@ pub(crate) async fn proxy_fetch_conditional(
     auth: Option<&str>,
     validators: &Validators,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let cb_key = scope.into().key();
+    let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
     if let Some(credentials) = auth {
@@ -849,7 +852,7 @@ pub(crate) async fn proxy_fetch_conditional(
         Ok(response) => {
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(registry_str, probe);
+                cb.record_success(&cb_key, probe);
                 return Ok(Revalidation::NotModified);
             }
             if status.is_success() {
@@ -861,7 +864,7 @@ pub(crate) async fn proxy_fetch_conditional(
                     .bytes()
                     .await
                     .map_err(|e| ProxyError::Network(e.to_string()))?;
-                cb.record_success(registry_str, probe);
+                cb.record_success(&cb_key, probe);
                 return Ok(Revalidation::Modified {
                     body: body.to_vec(),
                     validators: new_validators,
@@ -871,14 +874,14 @@ pub(crate) async fn proxy_fetch_conditional(
             if (400..500).contains(&code) {
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(registry_str, probe);
+                cb.record_alive(&cb_key, probe);
                 return Err(ProxyError::NotFound);
             }
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
         }
         Err(e) => {
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Network(e.to_string()))
         }
     }
@@ -887,6 +890,7 @@ pub(crate) async fn proxy_fetch_conditional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_type::RegistryType;
 
     #[tokio::test]
     async fn test_proxy_fetch_invalid_url() {

@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::circuit_breaker::{CircuitBreakerRegistry, ProbeToken};
+use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::DockerAuth;
@@ -3626,7 +3626,10 @@ pub async fn open_blob_from_upstream(
         "Proxy blob download started"
     );
 
-    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
     let probe = cb.check(&cb_key)?;
 
     let source = BlobSource {
@@ -3858,7 +3861,10 @@ pub async fn fetch_manifest_from_upstream(
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<(Vec<u8>, String), ProxyError> {
-    let cb_key = format!("docker:{}", upstream_url.trim_end_matches('/'));
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
     let probe = cb.check(&cb_key)?;
 
     let url = format!(
@@ -7815,7 +7821,7 @@ mod upstream_resume_tests {
         while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let cb_key = format!("docker:{url}");
+        let cb_key = crate::circuit_breaker::upstream_key("docker", &url);
         assert!(
             ctx.state.circuit_breaker.check(&cb_key).is_ok(),
             "a refused resume must not open the registry's breaker"

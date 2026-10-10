@@ -1757,9 +1757,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         cancel_token: cancel_token.clone(),
     };
 
-    // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
-    let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
-    state.circuit_breaker.init_gauges(&registry_names);
+    // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
+    let breaker_keys = circuit_breaker::initial_gauge_keys(&state.config);
+    let breaker_keys: Vec<&str> = breaker_keys.iter().map(String::as_str).collect();
+    state.circuit_breaker.init_gauges(&breaker_keys);
 
     // Shared lock: nothing that calls storage.delete may run concurrently.
     // The periodic cleanup cycle takes it once per cycle and runs every due
