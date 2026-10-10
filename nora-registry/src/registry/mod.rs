@@ -16,7 +16,7 @@ pub(crate) mod nuget;
 pub(crate) mod pub_dart;
 mod pypi;
 pub(crate) mod range;
-mod raw;
+pub(crate) mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;
 
@@ -61,6 +61,36 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::time::{Duration, Instant};
+
+/// Remove the files directly in `dir` whose last write is at least `max_age` ago.
+///
+/// For the dedicated temp directories of streamed uploads and proxy fetches: a
+/// transfer in progress keeps writing its file, so it never gets that old, while a
+/// file orphaned by a crash (SIGKILL, OOM) or a failed commit stops changing and is
+/// reaped. A missing directory is not an error. Returns how many files were removed.
+pub(crate) fn remove_stale_temp_files(dir: &std::path::Path, max_age: Duration) -> u64 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to read temp directory for cleanup");
+            return 0;
+        }
+    };
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
 
 /// 405 Method Not Allowed with `Allow` header (RFC 9110 §15.5.6).
 pub(crate) fn method_not_allowed(allow: &'static str) -> Response {

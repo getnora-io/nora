@@ -581,26 +581,7 @@ pub fn cleanup_expired_sessions(sessions: &RwLock<HashMap<String, UploadSession>
 /// `SESSION_TTL` age guard keeps in-progress uploads safe under the periodic call.
 pub fn cleanup_upload_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-uploads");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "Failed to read upload temp directory for cleanup");
-            return;
-        }
-    };
-    let mut removed = 0u64;
-    for entry in entries.flatten() {
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= SESSION_TTL);
-        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
+    let removed = super::remove_stale_temp_files(&dir, SESSION_TTL);
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale Docker upload temp files");
     }
@@ -619,26 +600,7 @@ const PROXY_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4
 /// Logs warnings on errors but never panics — cleanup is best-effort.
 pub fn cleanup_proxy_temp_dir(data_dir: &str) {
     let dir = std::path::PathBuf::from(data_dir).join("tmp/docker-proxy");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "Failed to read proxy temp directory for cleanup");
-            return;
-        }
-    };
-    let mut removed = 0u64;
-    for entry in entries.flatten() {
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= PROXY_TEMP_MAX_AGE);
-        if is_stale && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
+    let removed = super::remove_stale_temp_files(&dir, PROXY_TEMP_MAX_AGE);
     if removed > 0 {
         tracing::info!(removed, dir = %dir.display(), "Cleaned up stale proxy temp files");
     }

@@ -1936,6 +1936,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
     }
+    // ...and streamed raw uploads a crash cut off mid-request.
+    if state.config.raw.enabled {
+        registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
+    }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
         .await
@@ -2029,6 +2033,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     // survive on disk until the next boot. Age-guarded by SESSION_TTL,
                     // so in-progress uploads are never reaped.
                     registry::docker::cleanup_upload_temp_dir(&storage_path);
+                    registry::raw::cleanup_upload_temp_dir(&storage_path);
                 });
             }
         }
