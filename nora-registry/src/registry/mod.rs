@@ -51,10 +51,9 @@ pub(crate) use raw::storage_key as raw_storage_key;
 pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
-use crate::circuit_breaker::CircuitBreakerRegistry;
+use crate::circuit_breaker::{BreakerScope, CircuitBreakerRegistry};
 use crate::config::basic_auth_header;
 use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
-use crate::registry_type::RegistryType;
 use crate::AppState;
 use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
@@ -212,14 +211,16 @@ async fn proxy_fetch_core<T, F, Fut>(
     extra_headers: Option<(&str, &str)>,
     extract: F,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
@@ -242,11 +243,11 @@ where
                         .await
                         .map_err(|e| ProxyError::Network(e.to_string()));
                     if result.is_ok() {
-                        cb.record_success(registry_str, probe);
+                        cb.record_success(&cb_key, probe);
                     } else {
                         // 2xx but the body could not be read (e.g. a mid-stream
                         // drop) — treat as a fetch failure for the breaker.
-                        cb.record_failure(registry_str, probe);
+                        cb.record_failure(&cb_key, probe);
                     }
                     return result;
                 }
@@ -278,7 +279,7 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::NotFound);
                 }
                 if attempt == 0 {
@@ -292,7 +293,7 @@ where
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, "5xx"])
                     .observe(elapsed);
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(status));
             }
             Err(e) => {
@@ -306,12 +307,12 @@ where
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -322,7 +323,7 @@ pub(crate) async fn proxy_fetch(
     timeout: Duration,
     auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Vec<u8>, ProxyError> {
     proxy_fetch_core(
         client,
@@ -332,7 +333,7 @@ pub(crate) async fn proxy_fetch(
         None,
         |r| async { r.bytes().await.map(|b| b.to_vec()) },
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -345,7 +346,7 @@ pub(crate) async fn proxy_fetch_text(
     auth: Option<&str>,
     extra_headers: Option<(&str, &str)>,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<String, ProxyError> {
     proxy_fetch_core(
         client,
@@ -355,7 +356,7 @@ pub(crate) async fn proxy_fetch_text(
         extra_headers,
         |r| r.text(),
         cb,
-        registry,
+        scope,
     )
     .await
 }
@@ -544,10 +545,12 @@ pub(crate) async fn proxy_forward_post(
     fwd_headers: &[(&str, &str)],
     body: &[u8],
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let scope = scope.into();
+    let registry_str = scope.registry().as_str();
+    let cb_key = scope.key();
+    let probe = cb.check(&cb_key)?;
 
     for attempt in 0..2 {
         let mut request = client.post(url).timeout(timeout).body(body.to_vec());
@@ -574,11 +577,11 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     match response.bytes().await {
                         Ok(b) => {
-                            cb.record_success(registry_str, probe);
+                            cb.record_success(&cb_key, probe);
                             return Ok((code, b.to_vec(), content_type));
                         }
                         Err(e) => {
-                            cb.record_failure(registry_str, probe);
+                            cb.record_failure(&cb_key, probe);
                             return Err(ProxyError::Network(e.to_string()));
                         }
                     }
@@ -589,7 +592,7 @@ pub(crate) async fn proxy_forward_post(
                         .observe(elapsed);
                     // Upstream is alive and answered — a 4xx audit response is a real
                     // answer, forward it verbatim (not an availability failure). #606.
-                    cb.record_alive(registry_str, probe);
+                    cb.record_alive(&cb_key, probe);
                     let b = response
                         .bytes()
                         .await
@@ -605,7 +608,7 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Upstream(code));
             }
             Err(e) => {
@@ -619,12 +622,12 @@ pub(crate) async fn proxy_forward_post(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                cb.record_failure(registry_str, probe);
+                cb.record_failure(&cb_key, probe);
                 return Err(ProxyError::Network(e.to_string()));
             }
         }
     }
-    cb.record_failure(registry_str, probe);
+    cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
 }
 
@@ -819,9 +822,10 @@ fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) ->
 /// conditional headers, so it always yields `Modified` — that is how the full
 /// fetch path captures validators for the first time.
 ///
-/// Circuit breaker: 304/200 record success; transport/5xx record failure; 4xx
-/// returns `NotFound` (matching `proxy_fetch_core`). No retry — revalidation is
-/// a lightweight check and the caller falls back to a full fetch on error.
+/// Circuit breaker: 304/200 record success; transport/5xx and a 200 whose body
+/// cannot be read record failure; 4xx returns `NotFound` (matching
+/// `proxy_fetch_core`). No retry — revalidation is a lightweight check and the
+/// caller falls back to a full fetch on error.
 pub(crate) async fn proxy_fetch_conditional(
     client: &reqwest::Client,
     url: &str,
@@ -829,10 +833,10 @@ pub(crate) async fn proxy_fetch_conditional(
     auth: Option<&str>,
     validators: &Validators,
     cb: &CircuitBreakerRegistry,
-    registry: RegistryType,
+    scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
-    let registry_str = registry.as_str();
-    let probe = cb.check(registry_str)?;
+    let cb_key = scope.into().key();
+    let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
     if let Some(credentials) = auth {
@@ -849,7 +853,7 @@ pub(crate) async fn proxy_fetch_conditional(
         Ok(response) => {
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(registry_str, probe);
+                cb.record_success(&cb_key, probe);
                 return Ok(Revalidation::NotModified);
             }
             if status.is_success() {
@@ -857,28 +861,36 @@ pub(crate) async fn proxy_fetch_conditional(
                     etag: header_string(&response, header::ETAG),
                     last_modified: header_string(&response, header::LAST_MODIFIED),
                 };
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|e| ProxyError::Network(e.to_string()))?;
-                cb.record_success(registry_str, probe);
-                return Ok(Revalidation::Modified {
-                    body: body.to_vec(),
-                    validators: new_validators,
-                });
+                return match response.bytes().await {
+                    Ok(body) => {
+                        cb.record_success(&cb_key, probe);
+                        Ok(Revalidation::Modified {
+                            body: body.to_vec(),
+                            validators: new_validators,
+                        })
+                    }
+                    Err(e) => {
+                        // 2xx but the body could not be read (e.g. a mid-stream
+                        // drop) — a fetch failure for the breaker, as in
+                        // proxy_fetch_core; unreported, a half-open probe would
+                        // hold its slot until the #585 stall recovery.
+                        cb.record_failure(&cb_key, probe);
+                        Err(ProxyError::Network(e.to_string()))
+                    }
+                };
             }
             let code = status.as_u16();
             if (400..500).contains(&code) {
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(registry_str, probe);
+                cb.record_alive(&cb_key, probe);
                 return Err(ProxyError::NotFound);
             }
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
         }
         Err(e) => {
-            cb.record_failure(registry_str, probe);
+            cb.record_failure(&cb_key, probe);
             Err(ProxyError::Network(e.to_string()))
         }
     }
@@ -887,6 +899,7 @@ pub(crate) async fn proxy_fetch_conditional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_type::RegistryType;
 
     #[tokio::test]
     async fn test_proxy_fetch_invalid_url() {
@@ -1068,6 +1081,106 @@ mod tests {
         .unwrap();
 
         assert!(matches!(out, Revalidation::NotModified));
+    }
+
+    /// Run one half-open probe through `proxy_fetch_conditional` against an
+    /// upstream that answers with a 200 declaring `declared_len` bytes, writes
+    /// `body`, and hangs up — with `declared_len > body.len()` the body breaks off
+    /// mid-stream. The breaker (threshold 1, reset 1 h, so the #585 stall
+    /// recovery cannot release the slot during the test) is tripped and its open
+    /// timer backdated first, so the call IS the probe.
+    async fn conditional_half_open_probe(
+        cb: &CircuitBreakerRegistry,
+        declared_len: usize,
+        body: &[u8],
+    ) -> Result<Revalidation, ProxyError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let serve_once = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+            let _ = sock.shutdown().await;
+        };
+
+        cb.record_failure("npm", crate::circuit_breaker::ProbeToken::BACKGROUND);
+        cb.expire_open_for_test("npm");
+        let client = reqwest::Client::new();
+        let validators = Validators::default();
+        let fetch = proxy_fetch_conditional(
+            &client,
+            &upstream,
+            Duration::from_secs(5),
+            None,
+            &validators,
+            cb,
+            RegistryType::Npm,
+        );
+        let ((), out) = tokio::join!(serve_once, fetch);
+        out
+    }
+
+    fn half_open_test_cb() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 1,
+            reset_timeout: 3600,
+            overrides: std::collections::HashMap::new(),
+        })
+    }
+
+    /// A half-open probe that gets a 200 whose body breaks off must report back
+    /// as a failure, exactly like `proxy_fetch_core` ("2xx but the body could not
+    /// be read"). Unreported, the probe slot stays held, and every request is
+    /// rejected with CircuitOpen until the #585 stall recovery (reset_timeout)
+    /// gives up on it.
+    #[tokio::test]
+    async fn conditional_truncated_200_returns_the_probe_as_a_failure() {
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, 64, b"only-part-of-the-body").await {
+            Err(ProxyError::Network(_)) => {}
+            Err(e) => panic!("a broken-off body is a network error, got {e:?}"),
+            Ok(_) => panic!("a broken-off body must not be returned as a revalidation"),
+        }
+
+        // The breaker counted the failed probe: back to Open, not stuck HalfOpen.
+        let health = cb.health_snapshot("npm").expect("breaker recorded");
+        assert_eq!(
+            health.status, "open",
+            "the failed probe must re-open the breaker"
+        );
+
+        // The probe slot came back: once the open timer runs out, a new probe is
+        // granted. A probe that never reported keeps the slot and this check is
+        // CircuitOpen for the whole reset_timeout.
+        cb.expire_open_for_test("npm");
+        assert!(
+            cb.check("npm").is_ok(),
+            "the probe slot must be released, not held by the lost probe"
+        );
+    }
+
+    /// Control for the harness above: the same raw upstream with a complete body
+    /// is a successful probe that closes the breaker, so the failure above comes
+    /// from the broken-off body and not from the harness.
+    #[tokio::test]
+    async fn conditional_complete_200_closes_the_half_open_breaker() {
+        let body: &[u8] = b"the-whole-body";
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, body.len(), body).await {
+            Ok(Revalidation::Modified { body: got, .. }) => assert_eq!(got, body),
+            Ok(Revalidation::NotModified) => panic!("expected Modified, got NotModified"),
+            Err(e) => panic!("expected Modified, got {e:?}"),
+        }
+        assert_eq!(cb.health_snapshot("npm").unwrap().status, "closed");
     }
 
     /// Validators round-trip through storage (the sidecar lives on disk, so they
