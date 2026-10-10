@@ -28,6 +28,43 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
 }
 
+/// Removes a write's temp file unless the write published it. The removal lives in
+/// `Drop` because a write can stop at any `.await`: a SIGTERM ends `main`, and the
+/// runtime it drops cancels every task still running, proxy-cache writes included.
+/// Cleanup written after an `.await` never runs then, and the temp file stays beside
+/// a real key for good. Removes exactly its own path, nothing that merely looks like
+/// a temp file: a stored key may have that shape too.
+struct TmpFileGuard {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The temp file was renamed into place: nothing left to remove.
+    fn published(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// fsync the parent directory of `path` so the directory entry written by a
 /// just-completed `rename` is durable across power-loss. The file's own data is
 /// fsync'd (`sync_all`) before the rename; the rename only becomes crash-durable
@@ -196,22 +233,17 @@ impl StorageBackend for LocalStorage {
         // Body and pin are published as one critical section (#1041, see commit_lock).
         let lock = self.commit_lock(key);
         let _commit = lock.lock().await;
-        let tmp = unique_tmp_path(&path);
-        let write_result: Result<()> = async {
-            let mut file = fs::File::create(&tmp).await?;
-            file.write_all(data).await?;
-            file.flush().await?;
-            file.sync_all().await?;
-            fs::rename(&tmp, &path).await?;
-            // Durability: make the rename's directory entry survive power-loss.
-            sync_parent_dir(&path).await?;
-            Ok(())
-        }
-        .await;
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp).await;
-        }
-        write_result?;
+        // CANCEL-SAFETY: the guard removes the temp file however the write ends —
+        // error or cancellation at any `.await` below — until the rename publishes it.
+        let tmp = TmpFileGuard::new(unique_tmp_path(&path));
+        let mut file = fs::File::create(tmp.path()).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        fs::rename(tmp.path(), &path).await?;
+        tmp.published();
+        // Durability: make the rename's directory entry survive power-loss.
+        sync_parent_dir(&path).await?;
         self.record_pin(key, sha256).await
     }
 
@@ -389,33 +421,28 @@ impl StorageBackend for LocalStorage {
                 let mut reader = fs::File::open(src).await?;
                 // Each writer stages its own copy: two fills of one blob must not share
                 // (and truncate, and rename away) one temp file.
-                let tmp = unique_tmp_path(&dest);
-                let mut writer = fs::File::create(&tmp).await?;
+                // CANCEL-SAFETY: as in put(), the guard removes the temp file on error
+                // or cancellation until the rename publishes it.
+                let tmp = TmpFileGuard::new(unique_tmp_path(&dest));
+                let mut writer = fs::File::create(tmp.path()).await?;
                 let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
-                let copy_result: Result<()> = async {
-                    loop {
-                        let n = reader.read(&mut buf).await?;
-                        if n == 0 {
-                            break;
-                        }
-                        writer.write_all(&buf[..n]).await?;
+                loop {
+                    let n = reader.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
                     }
-                    writer.flush().await?;
-                    // Durability: fsync the copied data before publishing it.
-                    // flush() only pushes to the OS; sync_all() makes it crash-
-                    // durable, matching the put() path (the direct-rename branch
-                    // relies on the caller having fsync'd src).
-                    writer.sync_all().await?;
-                    fs::rename(&tmp, &dest).await?;
-                    // Durability: make the rename's directory entry durable.
-                    sync_parent_dir(&dest).await?;
-                    Ok(())
+                    writer.write_all(&buf[..n]).await?;
                 }
-                .await;
-                if copy_result.is_err() {
-                    let _ = fs::remove_file(&tmp).await;
-                }
-                copy_result?;
+                writer.flush().await?;
+                // Durability: fsync the copied data before publishing it.
+                // flush() only pushes to the OS; sync_all() makes it crash-
+                // durable, matching the put() path (the direct-rename branch
+                // relies on the caller having fsync'd src).
+                writer.sync_all().await?;
+                fs::rename(tmp.path(), &dest).await?;
+                tmp.published();
+                // Durability: make the rename's directory entry durable.
+                sync_parent_dir(&dest).await?;
                 let _ = fs::remove_file(src).await;
             }
             Err(e) => return Err(StorageError::Io(e)),
@@ -628,6 +655,112 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// Temp files (`<name>.tmp.<pid>.<seq>`) under `dir`, recursively.
+    fn tmp_leftovers(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.to_string_lossy().contains(".tmp.") {
+                    found.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        found
+    }
+
+    /// Spawn four 8 MiB writes on a multi-thread runtime, wait until one of them
+    /// has a temp file on disk, and drop the runtime — what the end of `main` does
+    /// after a SIGTERM. Returns whether a write was caught mid-way. `stored` is the
+    /// number of stored keys under `dir` that already look like temp files.
+    fn drop_runtime_mid_write(
+        storage: &Arc<LocalStorage>,
+        dir: &Path,
+        round: u32,
+        stored: usize,
+    ) -> bool {
+        let data: Arc<Vec<u8>> = Arc::new(vec![0x5a; 8 << 20]);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for i in 0..4 {
+            let (storage, data) = (Arc::clone(storage), Arc::clone(&data));
+            let key = format!("npm/pkg{i}/-/pkg{i}-1.0.{round}.tgz");
+            rt.spawn(async move { put(&storage, &key, &data).await });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tmp_leftovers(dir).len() <= stored && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let caught = tmp_leftovers(dir).len() > stored;
+        drop(rt);
+        caught
+    }
+
+    /// A SIGTERM ends `main`, and the runtime it drops cancels every task still
+    /// running — including the proxy-cache writes spawned after a fetch. A cancelled
+    /// write must not leave its temp file behind: each one is a stray `*.tmp.*`
+    /// beside a real key, and nothing removes it later. A round in which no write
+    /// was caught mid-way does not count, so the test cannot pass without having
+    /// exercised the cancellation.
+    #[test]
+    fn cancelled_put_leaves_no_temp_file() {
+        let mut caught_mid_write = 0;
+        for round in 0..5 {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+            if drop_runtime_mid_write(&storage, dir.path(), round, 0) {
+                caught_mid_write += 1;
+            }
+            let leftovers = tmp_leftovers(dir.path());
+            assert!(
+                leftovers.is_empty(),
+                "round {round}: a cancelled write left its temp file behind: {leftovers:?}"
+            );
+        }
+        assert!(
+            caught_mid_write > 0,
+            "no round caught a write mid-way, so cancellation was never exercised"
+        );
+    }
+
+    /// The other side of the cleanup: a stored key that merely looks like a temp
+    /// file (a raw upload may be named `x.tmp.1.2`) is never removed — not by the
+    /// cancelled writes beside it, and not by opening the storage again.
+    #[test]
+    fn stored_key_shaped_like_a_temp_file_survives_cancelled_writes_and_restart() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let keys: Vec<String> = (0..4)
+            .map(|i| format!("npm/pkg{i}/-/pkg{i}-1.0.0.tmp.1.2"))
+            .chain(["raw/report.tmp.1.2".to_string()])
+            .collect();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for key in &keys {
+            rt.block_on(put(&storage, key, key.as_bytes())).unwrap();
+        }
+        drop(rt);
+
+        assert!(
+            drop_runtime_mid_write(&storage, dir.path(), 0, keys.len()),
+            "the writes must be caught mid-way for this to test anything"
+        );
+
+        let reopened = LocalStorage::new(dir.path().to_str().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for key in &keys {
+            let body = rt
+                .block_on(get(&reopened, key))
+                .unwrap_or_else(|e| panic!("stored key {key} is gone: {e:?}"));
+            assert_eq!(&body[..], key.as_bytes());
+        }
     }
 
     #[tokio::test]
