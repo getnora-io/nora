@@ -42,28 +42,14 @@ pub enum NpmProxyEntry {
     Full(NpmProxy),
 }
 
-/// Not `#[serde(untagged)]` on the way in: untagged swallows the table's own error
-/// and reports only "did not match any variant", so a misspelt key would not be named.
+/// Parsed by the shared `url_or_table`, not `#[serde(untagged)]`: untagged swallows the
+/// table's own error ("did not match any variant") and hides its keys from the
+/// unknown-key tracker. `NpmProxy` additionally denies unknown fields — `npm.proxies` is
+/// new, so no existing config breaks, and a misspelt `scopes` would otherwise turn a
+/// private registry into the default upstream for every package.
 impl<'de> Deserialize<'de> for NpmProxyEntry {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct EntryVisitor;
-        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
-            type Value = NpmProxyEntry;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an upstream URL or a table with `url`")
-            }
-            fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<Self::Value, E> {
-                Ok(NpmProxyEntry::Simple(url.to_string()))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                map: A,
-            ) -> Result<Self::Value, A::Error> {
-                NpmProxy::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-                    .map(NpmProxyEntry::Full)
-            }
-        }
-        deserializer.deserialize_any(EntryVisitor)
+        super::url_or_table(deserializer, Self::Simple, Self::Full)
     }
 }
 

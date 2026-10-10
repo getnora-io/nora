@@ -1366,7 +1366,7 @@ proxies = [
         let path = path.to_string_lossy().into_owned();
 
         std::env::set_var("NORA_TEST_NPM_VENDOR_TOKEN", "tok-from-env");
-        let loaded = Config::load_from(Some(path.clone()));
+        let loaded = Config::load_from(Some(path.clone()), NO_FALLBACK, false).map(|(c, _)| c);
         std::env::remove_var("NORA_TEST_NPM_VENDOR_TOKEN");
         let config = loaded.expect("a set token loads");
         let up = config.npm.route("@vendor/a").unwrap();
@@ -1379,7 +1379,7 @@ proxies = [
             .contains(&("npm".to_string(), "npm.vendor.example".to_string())));
 
         // Unset token: the config is rejected at load, not served with silent 401s.
-        assert!(Config::load_from(Some(path)).is_err());
+        assert!(Config::load_from(Some(path), NO_FALLBACK, false).is_err());
 
         let mut bad = Config::default();
         bad.npm.proxies = vec![
@@ -2260,6 +2260,7 @@ proxies = [
             bypass_token = "t"  # secret
             [npm]
             proxy_auth = "u:p"  # secret
+            proxies = [{ url = "https://npm.example", scopes = ["@x"], auth = "u:p" }]  # secret
             [pypi]
             proxy_auth = "u:p"  # secret
             proxies = [{ url = "https://pypi.example", auth = "u:p" }]  # secret
