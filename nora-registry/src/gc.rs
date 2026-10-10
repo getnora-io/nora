@@ -1580,8 +1580,10 @@ mod tests {
             )
             .await
             .unwrap();
+        // GC scans maven/, npm/ and pypi/ for orphan sidecars: a Maven artifact
+        // literally ending in .origin is the case the npm-only rule protects.
         storage
-            .put("raw/releases/build.origin", b"real-artifact")
+            .put("maven/com/x/1.0/thing.origin", b"real-artifact")
             .await
             .unwrap();
 
@@ -1595,7 +1597,7 @@ mod tests {
             .get("npm/live/tarballs/live-1.0.0.tgz.origin")
             .await
             .is_ok());
-        assert!(storage.get("raw/releases/build.origin").await.is_ok());
+        assert!(storage.get("maven/com/x/1.0/thing.origin").await.is_ok());
     }
 
     #[tokio::test]

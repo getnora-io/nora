@@ -4869,6 +4869,64 @@ mod multi_upstream_tests {
         }
     }
 
+    /// The release date used by min-release-age comes from the owner's packument,
+    /// not from a foreign copy left in the cache: a squatter that advertises an old
+    /// publish time must not let a brand-new owner release past the age gate.
+    #[tokio::test]
+    async fn release_age_reads_the_owners_date_not_a_foreign_copy() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S.000Z")
+            .to_string();
+        let owner_packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+            } } },
+            "time": { "1.0.0": now }
+        });
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(owner_packument.to_string()))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a/-/a-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NEW-TGZ".to_vec()))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        // A foreign packument claiming 1.0.0 is six years old, no provenance.
+        let foreign = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {} } },
+            "time": { "1.0.0": "2020-01-01T00:00:00.000Z" }
+        });
+        ctx.state
+            .storage
+            .put(
+                "npm/@vendor/a/metadata.json",
+                foreign.to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a release the owner dates to today must be held by a 7d age gate"
+        );
+        assert_public_clean(&public.received_requests().await.unwrap());
+    }
+
     /// What the owner delivered is cached and served without asking again; what was
     /// published here is served even with the owner down.
     #[tokio::test]
