@@ -455,6 +455,29 @@ impl Storage {
             .collect())
     }
 
+    /// Internal (`.nora-`) keys under `prefix` — exactly what [`list`](Self::list) hides
+    /// from every registry walk. For walks over internal state such as npm cache
+    /// provenance (#1055).
+    pub async fn list_internal(&self, prefix: &str) -> Result<Vec<String>> {
+        validate_storage_key(prefix)?;
+        let keys = match self.inner.list(prefix).await {
+            Ok(keys) => {
+                STORAGE_OPERATIONS.with_label_values(&["list", "ok"]).inc();
+                keys
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
+        Ok(keys
+            .into_iter()
+            .filter(|k| k.starts_with(".nora-"))
+            .collect())
+    }
+
     /// List keys under `prefix` with their size/mtime, applying the same
     /// `.nora-` internal-file filter as [`list`]. Backends carry the metadata
     /// from the listing itself, avoiding a per-key `stat()` (#738).

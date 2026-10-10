@@ -899,9 +899,25 @@ async fn handle_request(
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// Internal prefix holding npm cache provenance sidecars (#1055).
+pub(crate) const ORIGINS_PREFIX: &str = ".nora-origins/";
+
 /// Provenance sidecar of a cached npm object: which upstream delivered it (#1055).
-fn origin_key(key: &str) -> String {
-    format!("{key}.origin")
+///
+/// `<key>` → `.nora-origins/<key>`: one-to-one, and outside every registry's key space
+/// — every npm key starts with `npm/`, so no request can read or overwrite a sidecar,
+/// and listings hide `.nora-` keys, so no retention, GC, UI or stats walk of this or an
+/// older release counts one. A sidecar next to its tarball made 1.3.3's retention keep
+/// fewer real versions after a rollback (measured: keep_last=2 kept one).
+pub(crate) fn origin_key(key: &str) -> String {
+    format!("{ORIGINS_PREFIX}{key}")
+}
+
+/// The cached object a provenance sidecar describes — the inverse of [`origin_key`].
+pub(crate) fn origin_primary(sidecar: &str) -> Option<&str> {
+    sidecar
+        .strip_prefix(ORIGINS_PREFIX)
+        .filter(|key| key.starts_with("npm/"))
 }
 
 /// The identity recorded in the sidecar — the breaker's canonical upstream key, so
@@ -4364,6 +4380,57 @@ mod index_cost_tests {
     }
 }
 
+#[cfg(test)]
+mod origin_layout_tests {
+    use super::{origin_key, origin_primary};
+
+    /// Sidecars live outside the npm key space: no client key maps onto one, the
+    /// mapping is one-to-one even for package names that look like layout words, and
+    /// `list()` (which every older release's retention and GC walk) never shows one.
+    #[tokio::test]
+    async fn provenance_is_outside_the_npm_key_space_and_round_trips() {
+        let keys = [
+            "npm/a/tarballs/a-1.0.0.tgz",
+            "npm/@vendor/a/tarballs/a-1.0.0.tgz",
+            "npm/@vendor/a/tarballs/@vendor/a-1.0.0.tgz",
+            "npm/a/metadata.json",
+            "npm/@vendor/a/metadata.json",
+            // Package names equal to layout words must not alias anything.
+            "npm/origins/metadata.json",
+            "npm/origins/tarballs/origins-1.0.0.tgz",
+            "npm/@x/origins/metadata.json",
+            "npm/tarballs/tarballs/tarballs-1.0.0.tgz",
+            "npm/x/tarballs/y/tarballs/z.tgz",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for key in keys {
+            let sidecar = origin_key(key);
+            assert!(!sidecar.starts_with("npm/"), "{key} -> {sidecar}");
+            assert!(sidecar.starts_with(".nora-"), "{key} -> {sidecar}");
+            assert_eq!(origin_primary(&sidecar), Some(key), "{sidecar}");
+            assert!(seen.insert(sidecar), "{key}: two keys share a sidecar");
+            // A real npm key is never mistaken for a sidecar.
+            assert_eq!(origin_primary(key), None, "{key}");
+        }
+        assert_eq!(origin_primary(".nora-origins/maven/x.jar"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::Storage::new_local(dir.path().to_str().unwrap());
+        storage.put(keys[0], b"tgz").await.unwrap();
+        storage
+            .put(&origin_key(keys[0]), b"npm:https://r.example")
+            .await
+            .unwrap();
+        assert_eq!(storage.list("").await.unwrap(), vec![keys[0].to_string()]);
+        // ...and the internal walk shows only internal keys.
+        assert_eq!(
+            storage.list_internal(".nora-").await.unwrap(),
+            vec![origin_key(keys[0])]
+        );
+        assert!(storage.list_internal("npm/").await.unwrap().is_empty());
+    }
+}
+
 /// npm multi-upstream with scope routing (#1055), on the real router: a private
 /// upstream that only answers the exact Bearer token, and a public one that answers
 /// anything — so a request that reached the wrong upstream would succeed and only
@@ -4475,7 +4542,7 @@ mod multi_upstream_tests {
             while ctx
                 .state
                 .storage
-                .get("npm/@vendor/a/metadata.json.origin")
+                .get(&super::origin_key("npm/@vendor/a/metadata.json"))
                 .await
                 .is_err()
             {
@@ -4653,11 +4720,12 @@ mod multi_upstream_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.circuit_breaker.reset_timeout = 300;
         });
-        let cached = |key: &'static str| {
+        let cached = |key: &str| {
             let storage = ctx.state.storage.clone();
+            let key = key.to_string();
             async move {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                while storage.get(key).await.is_err() {
+                while storage.get(&key).await.is_err() {
                     if tokio::time::Instant::now() >= deadline {
                         return false;
                     }
@@ -4675,7 +4743,8 @@ mod multi_upstream_tests {
             );
         }
         assert!(cached("npm/lodash/metadata.json").await);
-        assert!(cached("npm/@vendor/a/metadata.json.origin").await);
+        let packument_origin = super::origin_key("npm/@vendor/a/metadata.json");
+        assert!(cached(&packument_origin).await);
 
         // The private registry dies; fail it on the refetch and the self-prime paths.
         private.reset().await;
@@ -4925,7 +4994,7 @@ mod multi_upstream_tests {
             for key in [meta, tgz] {
                 ctx.state
                     .storage
-                    .put(&format!("{key}.origin"), origin.as_bytes())
+                    .put(&super::origin_key(key), origin.as_bytes())
                     .await
                     .unwrap();
             }
@@ -5147,9 +5216,9 @@ mod multi_upstream_tests {
 
         let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
         assert_eq!(&body_bytes(resp).await[..], b"OWNER-TGZ");
-        let origin_key = "npm/@vendor/a/tarballs/a-1.0.0.tgz.origin";
+        let origin_key = super::origin_key("npm/@vendor/a/tarballs/a-1.0.0.tgz");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while ctx.state.storage.get(origin_key).await.is_err() {
+        while ctx.state.storage.get(&origin_key).await.is_err() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "origin never recorded"

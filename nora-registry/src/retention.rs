@@ -552,7 +552,6 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         if let Some(rest) = key.strip_prefix("npm/") {
             if rest.contains("/tarballs/")
                 && !ends_with_ci(key, ".sha256")
-                && !ends_with_ci(key, ".origin")
                 && !ends_with_ci(key, "/metadata.json")
             {
                 let pkg = rest.split("/tarballs/").next().unwrap_or("");
@@ -581,8 +580,9 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             if storage.stat(&hash_key).await.is_some() {
                 keys.push(hash_key);
             }
-            // Provenance sidecar of a proxied tarball (#1055): part of the version too.
-            let origin_key = format!("{}.origin", key);
+            // Provenance sidecar of a proxied tarball (#1055, under an internal prefix
+            // that list() hides): part of the version too.
+            let origin_key = crate::registry::npm::origin_key(key);
             if storage.stat(&origin_key).await.is_some() {
                 keys.push(origin_key);
             }
@@ -2323,7 +2323,7 @@ mod format_retention_tests {
             .unwrap();
         storage
             .put(
-                "npm/a/tarballs/a-1.0.0.tgz.origin",
+                &crate::registry::npm::origin_key("npm/a/tarballs/a-1.0.0.tgz"),
                 b"npm:https://r.example",
             )
             .await
@@ -2335,9 +2335,9 @@ mod format_retention_tests {
             .expect("package a");
         assert_eq!(versions.len(), 1, "the provenance sidecar is not a version");
         assert!(
-            versions[0]
-                .keys
-                .contains(&"npm/a/tarballs/a-1.0.0.tgz.origin".to_string()),
+            versions[0].keys.contains(&crate::registry::npm::origin_key(
+                "npm/a/tarballs/a-1.0.0.tgz"
+            )),
             "…but it is part of the version's key set (#961): {:?}",
             versions[0].keys
         );
