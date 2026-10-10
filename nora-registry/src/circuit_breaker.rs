@@ -10,12 +10,115 @@
 //!
 //! Experimental — disabled by default (`circuit_breaker.enabled = false`).
 
-use crate::config::CircuitBreakerConfig;
+use crate::config::{CircuitBreakerConfig, CircuitBreakerOverride};
 use crate::metrics::{CIRCUIT_BREAKER_REJECTIONS, CIRCUIT_BREAKER_STATE};
 use crate::registry::ProxyError;
+use crate::registry_type::RegistryType;
 use parking_lot::RwLock;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
+
+/// Breaker key of one configured upstream of `registry`:
+/// `"<registry>:<upstream url>"`, trailing `/` trimmed and any `user:pass@`
+/// userinfo dropped (the key is a metric label and a log field).
+///
+/// The URL must be the CONFIGURED upstream, never a URL the upstream returned
+/// (a PyPI file href, a Terraform download_url): those hosts are chosen by the
+/// upstream, and keying on them would let it mint unbounded breaker entries and
+/// `nora_circuit_breaker_state` series. This is the key overrides are written
+/// against (`[circuit_breaker.overrides."docker:https://registry-1.docker.io"]`).
+pub(crate) fn upstream_key(registry: &str, upstream_url: &str) -> String {
+    let url = upstream_url.trim_end_matches('/');
+    let url = match url.find("://") {
+        Some(sep) => {
+            let (scheme, rest) = url.split_at(sep + 3);
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            match rest[..authority_end].rfind('@') {
+                Some(at) => Cow::Owned(format!("{scheme}{}", &rest[at + 1..])),
+                None => Cow::Borrowed(url),
+            }
+        }
+        None => Cow::Borrowed(url),
+    };
+    format!("{registry}:{url}")
+}
+
+/// The format part of a breaker key: `"pypi:https://…"` → `"pypi"`, `"npm"` → `"npm"`.
+fn registry_of(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(registry, _)| registry)
+}
+
+/// Breaker keys whose `nora_circuit_breaker_state` series is exported at
+/// startup (#441): one per configured upstream for the formats keyed per
+/// upstream (Docker, PyPI), the format name for every other format. A format
+/// keyed per upstream gets no format-named series — it would sit at 0 (closed)
+/// forever while the real state moves on the per-upstream series.
+pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
+    let mut keys = Vec::new();
+    for rt in RegistryType::all() {
+        match rt {
+            RegistryType::Docker => keys.extend(
+                config
+                    .docker
+                    .upstreams
+                    .iter()
+                    .map(|up| upstream_key(rt.as_str(), &up.url)),
+            ),
+            RegistryType::PyPI => keys.extend(
+                config
+                    .pypi
+                    .upstreams()
+                    .iter()
+                    .map(|up| upstream_key(rt.as_str(), up.url())),
+            ),
+            _ => keys.push(rt.as_str().to_string()),
+        }
+    }
+    keys
+}
+
+/// Which breaker an upstream call reports to: the format's shared breaker
+/// (`From<RegistryType>`, key = the format name) or the breaker of one
+/// configured upstream of that format ([`BreakerScope::upstream`], key =
+/// [`upstream_key`]). Metrics other than the breaker's own stay per format.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BreakerScope<'a> {
+    registry: RegistryType,
+    upstream: Option<&'a str>,
+}
+
+impl<'a> BreakerScope<'a> {
+    /// The breaker of the configured upstream `upstream_url` of `registry`.
+    pub(crate) fn upstream(registry: RegistryType, upstream_url: &'a str) -> Self {
+        Self {
+            registry,
+            upstream: Some(upstream_url),
+        }
+    }
+
+    /// The format this call belongs to (the label of the per-format metrics).
+    pub(crate) fn registry(&self) -> RegistryType {
+        self.registry
+    }
+
+    /// The breaker key.
+    pub(crate) fn key(&self) -> Cow<'static, str> {
+        match self.upstream {
+            Some(url) => Cow::Owned(upstream_key(self.registry.as_str(), url)),
+            None => Cow::Borrowed(self.registry.as_str()),
+        }
+    }
+}
+
+impl From<RegistryType> for BreakerScope<'_> {
+    fn from(registry: RegistryType) -> Self {
+        Self {
+            registry,
+            upstream: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreakerState {
@@ -25,6 +128,15 @@ enum BreakerState {
 }
 
 impl BreakerState {
+    /// Rank for "worst state" aggregation: open > half_open > closed.
+    fn severity(self) -> u8 {
+        match self {
+            BreakerState::Closed => 0,
+            BreakerState::HalfOpen => 1,
+            BreakerState::Open => 2,
+        }
+    }
+
     fn as_gauge(self) -> i64 {
         match self {
             BreakerState::Closed => 0,
@@ -165,6 +277,11 @@ impl CircuitBreakerRegistry {
 
     /// Read-only health snapshot for `registry` from cached in-memory state.
     ///
+    /// Covers the format's shared breaker (`registry`) and every per-upstream
+    /// breaker of it (`registry:<url>`, see [`upstream_key`]); with several, the
+    /// worst one is reported (open > half_open > closed, then most failures), so
+    /// a sick upstream stays visible even while another one still serves.
+    ///
     /// Never performs a live upstream probe, so it is safe to call from the
     /// `/health` request path. Returns `None` when no breaker has been recorded
     /// for `registry` yet (no proxy traffic since startup), which the caller
@@ -173,7 +290,11 @@ impl CircuitBreakerRegistry {
     /// wall-clock timestamp.
     pub(crate) fn health_snapshot(&self, registry: &str) -> Option<UpstreamHealth> {
         let breakers = self.breakers.read();
-        let breaker = breakers.get(registry)?;
+        let breaker = breakers
+            .iter()
+            .filter(|(key, _)| registry_of(key) == registry)
+            .map(|(_, b)| b)
+            .max_by_key(|b| (b.state.severity(), b.failures))?;
         Some(UpstreamHealth {
             status: breaker.state.as_health_str(),
             failure_count: breaker.failures,
@@ -181,21 +302,51 @@ impl CircuitBreakerRegistry {
         })
     }
 
+    /// Every breaker key recorded so far, sorted. Tests use it to pin the key
+    /// set — one entry per configured upstream, never one per URL an upstream
+    /// pointed at.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.breakers.read().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Backdate `key`'s last failure past any reset timeout, so the next
+    /// `check()` moves an Open breaker to HalfOpen without sleeping.
+    #[cfg(test)]
+    pub(crate) fn expire_open_for_test(&self, key: &str) {
+        if let Some(b) = self.breakers.write().get_mut(key) {
+            b.last_failure = Instant::now().checked_sub(std::time::Duration::from_secs(1 << 20));
+        }
+    }
+
+    /// One override field for a breaker key: the key's own override, else the
+    /// override of its format (so `overrides.pypi` keeps applying to every pypi
+    /// upstream once they are keyed per upstream), else `None`.
+    fn override_for<T>(
+        &self,
+        key: &str,
+        field: impl Fn(&CircuitBreakerOverride) -> Option<T>,
+    ) -> Option<T> {
+        let own = self.config.overrides.get(key).and_then(&field);
+        own.or_else(|| {
+            let registry = registry_of(key);
+            (registry != key)
+                .then(|| self.config.overrides.get(registry).and_then(&field))
+                .flatten()
+        })
+    }
+
     /// Resolve the failure threshold for a given registry key, checking overrides first.
     fn threshold_for(&self, registry: &str) -> u32 {
-        self.config
-            .overrides
-            .get(registry)
-            .and_then(|o| o.failure_threshold)
+        self.override_for(registry, |o| o.failure_threshold)
             .unwrap_or(self.config.failure_threshold)
     }
 
     /// Resolve the reset timeout for a given registry key, checking overrides first.
     fn reset_timeout_for(&self, registry: &str) -> u64 {
-        self.config
-            .overrides
-            .get(registry)
-            .and_then(|o| o.reset_timeout)
+        self.override_for(registry, |o| o.reset_timeout)
             .unwrap_or(self.config.reset_timeout)
     }
 
@@ -707,6 +858,156 @@ mod tests {
         ));
     }
 
+    /// The Docker key is the one Docker always used —
+    /// `docker:<upstream url without trailing />` — now produced by the shared
+    /// helper; operators' `overrides."docker:…"` keep matching.
+    #[test]
+    fn upstream_key_keeps_the_docker_key() {
+        assert_eq!(
+            upstream_key("docker", "https://registry-1.docker.io/"),
+            "docker:https://registry-1.docker.io"
+        );
+        for url in [
+            "https://registry-1.docker.io",
+            "https://registry-1.docker.io/",
+            "http://127.0.0.1:5000//",
+            "https://ghcr.io/v2/",
+            "https://Mirror.Example:8443/prefix",
+        ] {
+            assert_eq!(
+                upstream_key("docker", url),
+                format!("docker:{}", url.trim_end_matches('/')),
+                "{url}"
+            );
+        }
+    }
+
+    /// The key is a metric label and a log field: credentials in the URL's
+    /// userinfo never reach it. An `@` outside the authority is left alone.
+    #[test]
+    fn upstream_key_drops_userinfo_only() {
+        assert_eq!(
+            upstream_key("pypi", "https://user:s3cret@nexus.example/simple/"),
+            "pypi:https://nexus.example/simple"
+        );
+        assert_eq!(
+            upstream_key("pypi", "https://tok@nexus.example"),
+            "pypi:https://nexus.example"
+        );
+        assert_eq!(
+            upstream_key("pypi", "https://nexus.example/a@b/simple"),
+            "pypi:https://nexus.example/a@b/simple"
+        );
+        assert_eq!(
+            upstream_key("pypi", "https://nexus.example?x=a@b"),
+            "pypi:https://nexus.example?x=a@b"
+        );
+    }
+
+    #[test]
+    fn breaker_scope_keys() {
+        let format: BreakerScope = RegistryType::Npm.into();
+        assert_eq!(format.key(), "npm");
+        assert_eq!(format.registry(), RegistryType::Npm);
+        let up = BreakerScope::upstream(RegistryType::PyPI, "https://pypi.org/simple/");
+        assert_eq!(up.key(), "pypi:https://pypi.org/simple");
+        assert_eq!(up.registry(), RegistryType::PyPI);
+    }
+
+    #[test]
+    fn upstreams_of_one_format_trip_independently() {
+        let cb = CircuitBreakerRegistry::new(enabled_config(2, 30));
+        let (a, b) = (
+            upstream_key("pypi", "https://a/simple"),
+            upstream_key("pypi", "https://b/simple"),
+        );
+        cb.record_failure(&a, ProbeToken::BACKGROUND);
+        cb.record_failure(&a, ProbeToken::BACKGROUND);
+        assert!(matches!(cb.check(&a), Err(ProxyError::CircuitOpen(_))));
+        assert!(cb.check(&b).is_ok());
+    }
+
+    /// `overrides.pypi` keeps applying once pypi is keyed per upstream; an
+    /// override of the upstream's own key wins, field by field.
+    #[test]
+    fn override_falls_back_to_the_format() {
+        use crate::config::CircuitBreakerOverride;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "pypi".to_string(),
+            CircuitBreakerOverride {
+                failure_threshold: Some(4),
+                reset_timeout: Some(77),
+            },
+        );
+        overrides.insert(
+            "pypi:https://b/simple".to_string(),
+            CircuitBreakerOverride {
+                failure_threshold: Some(9),
+                reset_timeout: None,
+            },
+        );
+        let cb = CircuitBreakerRegistry::new(CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 2,
+            reset_timeout: 30,
+            overrides,
+        });
+        assert_eq!(cb.threshold_for("pypi:https://a/simple"), 4);
+        assert_eq!(cb.reset_timeout_for("pypi:https://a/simple"), 77);
+        assert_eq!(cb.threshold_for("pypi:https://b/simple"), 9);
+        assert_eq!(cb.reset_timeout_for("pypi:https://b/simple"), 77);
+        assert_eq!(cb.threshold_for("pypi"), 4);
+        assert_eq!(cb.threshold_for("npm"), 2);
+        assert_eq!(
+            cb.threshold_for("pypix:https://a"),
+            2,
+            "format matched whole"
+        );
+    }
+
+    /// `/health` reports a format by its worst upstream, and only that format's.
+    #[test]
+    fn health_snapshot_reports_worst_upstream_of_the_format() {
+        let cb = CircuitBreakerRegistry::new(enabled_config(2, 3600));
+        let (a, b) = (
+            upstream_key("pypi", "https://a/simple"),
+            upstream_key("pypi", "https://b/simple"),
+        );
+        assert!(cb.health_snapshot("pypi").is_none());
+        cb.record_failure(&a, ProbeToken::BACKGROUND);
+        cb.record_failure(&b, ProbeToken::BACKGROUND);
+        cb.record_failure(&b, ProbeToken::BACKGROUND);
+        cb.record_failure("pip", ProbeToken::BACKGROUND);
+        let snap = cb.health_snapshot("pypi").unwrap();
+        assert_eq!(snap.status, "open");
+        assert_eq!(snap.failure_count, 2);
+        assert_eq!(cb.health_snapshot("pip").unwrap().failure_count, 1);
+        assert!(cb.health_snapshot("py").is_none(), "format matched whole");
+    }
+
+    /// Startup series: per configured upstream for Docker and PyPI, the format
+    /// name for the rest — never a format-named series that cannot move.
+    #[test]
+    fn initial_gauge_keys_follow_the_breaker_keys() {
+        let mut config = crate::config::Config::default();
+        config.pypi.proxy = Some("https://pypi.org/simple/".into());
+        config.docker.upstreams = vec![crate::config::DockerUpstream {
+            url: "https://registry-1.docker.io".into(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+        let keys = initial_gauge_keys(&config);
+        assert!(keys.contains(&"pypi:https://pypi.org/simple".to_string()));
+        assert!(keys.contains(&"docker:https://registry-1.docker.io".to_string()));
+        assert!(keys.contains(&"npm".to_string()));
+        assert!(
+            !keys.iter().any(|k| k == "pypi" || k == "docker"),
+            "{keys:?}"
+        );
+    }
+
     /// Regression for the #585 stale-probe race (found by TLA+ model checking of
     /// the probe lifecycle): a probe the breaker has SUPERSEDED (a fresh probe started
     /// after it stalled) must NOT mutate the breaker when it finally reports — its
@@ -810,12 +1111,14 @@ mod integration_tests {
             cfg.pypi.proxy = Some("http://127.0.0.1:1".into());
         });
 
+        // PyPI keys its breaker per configured upstream.
+        let key = super::upstream_key("pypi", "http://127.0.0.1:1");
         ctx.state
             .circuit_breaker
-            .record_failure("pypi", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("pypi", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         let response = send(&ctx.app, Method::GET, "/simple/nonexistent/", "").await;
 
@@ -826,6 +1129,239 @@ mod integration_tests {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok()),
             Some("30")
+        );
+    }
+
+    /// Simple-index page for `demo` listing `files` (absolute hrefs).
+    fn demo_index(files: &[String]) -> String {
+        let links: String = files
+            .iter()
+            .map(|url| {
+                let name = url.rsplit('/').next().unwrap_or(url);
+                format!(r#"<a href="{url}">{name}</a>"#)
+            })
+            .collect();
+        format!("<html><body>{links}</body></html>")
+    }
+
+    /// Contract `pypi-multi-upstream-shared-breaker`: a dead upstream opens ITS
+    /// breaker only. Upstream #1 answers 500; upstream #2 is healthy and lists
+    /// files hosted on a third server (as pypi.org lists files.pythonhosted.org).
+    /// Once #1's breaker is open, #2 keeps serving the index and the files, #1 is
+    /// no longer contacted, and the file host never becomes a breaker key (its
+    /// authority comes from the upstream's HTML, so keying on it would hand the
+    /// upstream control of the `nora_circuit_breaker_state` label set).
+    #[tokio::test]
+    async fn test_dead_pypi_upstream_does_not_open_breaker_of_healthy_one() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dead = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&dead)
+            .await;
+
+        let files = MockServer::start().await;
+        for name in ["demo-1.0.tar.gz", "demo-2.0.tar.gz"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(name.as_bytes()))
+                .mount(&files)
+                .await;
+        }
+
+        let healthy = MockServer::start().await;
+        let listed: Vec<String> = ["demo-1.0.tar.gz", "demo-2.0.tar.gz"]
+            .iter()
+            .map(|name| format!("{}/packages/{name}", files.uri()))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/simple/demo/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(demo_index(&listed)),
+            )
+            .mount(&healthy)
+            .await;
+
+        let dead_url = dead.uri();
+        let healthy_url = format!("{}/simple/", healthy.uri());
+        let (d, h) = (dead_url.clone(), healthy_url.clone());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxy = None;
+            // `PypiProxyEntry` is not re-exported; build the plain-URL form via serde.
+            cfg.pypi.proxies = [d, h]
+                .into_iter()
+                .map(|u| serde_json::from_value(serde_json::Value::String(u)).unwrap())
+                .collect();
+        });
+
+        // First file: #1 fails (and its breaker opens at threshold 1), #2 serves.
+        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the healthy upstream must serve"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"demo-1.0.tar.gz");
+        let dead_hits = dead.received_requests().await.unwrap().len();
+        assert!(dead_hits > 0, "the dead upstream was tried first");
+
+        // #1's breaker is open now: the next file and the index skip #1 without
+        // contacting it, and #2 still answers both.
+        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-2.0.tar.gz", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an open breaker on upstream #1 must not short-circuit upstream #2"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"demo-2.0.tar.gz");
+        let resp = send(&ctx.app, Method::GET, "/simple/demo/", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "index merges what answered");
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("demo-2.0.tar.gz"));
+        assert_eq!(
+            dead.received_requests().await.unwrap().len(),
+            dead_hits,
+            "upstream #1's breaker is open, so it is not contacted again"
+        );
+
+        // One breaker per configured upstream; the file host is not a key.
+        let keys = ctx.state.circuit_breaker.keys();
+        assert_eq!(
+            keys,
+            {
+                let mut want = vec![
+                    format!("pypi:{}", dead_url.trim_end_matches('/')),
+                    format!("pypi:{}", healthy_url.trim_end_matches('/')),
+                ];
+                want.sort();
+                want
+            },
+            "breaker keys are the configured upstreams"
+        );
+        let file_host = files.uri();
+        assert!(
+            keys.iter().all(|k| !k.contains(file_host.as_str())),
+            "a URL the upstream pointed at must not mint a breaker key: {keys:?}"
+        );
+    }
+
+    /// Single pypi upstream: the breaker opens, half-opens and closes on the one
+    /// key of that upstream, exactly as before the per-upstream split, and
+    /// `/health` still reports it under `pypi`.
+    #[tokio::test]
+    async fn test_single_pypi_upstream_breaker_cycle_unchanged() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxy = Some(uri);
+        });
+
+        // Closed → the request reaches upstream, which fails → Open. (Its own
+        // status is not pinned: the dates prefetch already trips threshold 1
+        // before the page fetch, so this request may itself end in 503.)
+        send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        let hits = upstream.received_requests().await.unwrap().len();
+        assert!(hits > 0);
+
+        // Open → 503 + Retry-After without contacting upstream.
+        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+        assert_eq!(upstream.received_requests().await.unwrap().len(), hits);
+        assert_eq!(
+            ctx.state.circuit_breaker.keys().len(),
+            1,
+            "one upstream, one key"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/health", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["upstreams"]["pypi"]["status"], "open");
+        assert_eq!(json["upstreams"]["pypi"]["failure_count"], 1);
+
+        // Upstream recovers; the half-open probe closes the breaker on that key.
+        upstream.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let key = ctx.state.circuit_breaker.keys().remove(0);
+        ctx.state.circuit_breaker.expire_open_for_test(&key);
+        let resp = send(&ctx.app, Method::GET, "/simple/demo/demo-1.0.tar.gz", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "probe reaches upstream"
+        );
+        let resp = send(&ctx.app, Method::GET, "/health", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["upstreams"]["pypi"]["status"], "closed");
+    }
+
+    /// Docker keys its breakers through the shared [`super::upstream_key`]: a
+    /// configured upstream written with userinfo and a trailing `/` is recorded
+    /// under the same key the helper (and `overrides`) produce.
+    #[tokio::test]
+    async fn test_docker_breaker_key_comes_from_shared_helper() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        let configured = upstream.uri().replace("http://", "http://u:p@") + "/";
+        let url = configured.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }];
+        });
+
+        send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/manifests/latest",
+            "",
+        )
+        .await;
+        assert_eq!(
+            ctx.state.circuit_breaker.keys(),
+            vec![super::upstream_key("docker", &configured)]
+        );
+        assert_eq!(
+            ctx.state.circuit_breaker.keys(),
+            vec![format!("docker:{}", upstream.uri())],
+            "no credentials, no trailing slash in the key"
         );
     }
 
@@ -859,6 +1395,7 @@ mod integration_tests {
             cfg.circuit_breaker.enabled = true;
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxy = Some("http://127.0.0.1:1".into());
         });
 
         // Publish a package to local storage
@@ -868,10 +1405,11 @@ mod integration_tests {
             .await
             .unwrap();
 
-        // Trip the breaker
-        ctx.state
-            .circuit_breaker
-            .record_failure("pypi", ProbeToken::BACKGROUND);
+        // Trip the breaker of the configured pypi upstream
+        ctx.state.circuit_breaker.record_failure(
+            &super::upstream_key("pypi", "http://127.0.0.1:1"),
+            ProbeToken::BACKGROUND,
+        );
 
         // Local read should still succeed
         let response = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;

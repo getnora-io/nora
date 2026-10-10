@@ -883,7 +883,7 @@
           "refId": "A"
         },
         {
-          "expr": "increase(nora_circuit_breaker_rejections_total{registry=~\"$registry\"}[5m])",
+          "expr": "increase(nora_circuit_breaker_rejections_total{registry=~\"($registry)(:.*)?\"}[5m])",
           "legendFormat": "CB rejections",
           "refId": "B"
         }
