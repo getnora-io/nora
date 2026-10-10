@@ -14,6 +14,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{circuit_open_response, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -90,7 +91,7 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cpan.proxy_timeout),
-        expose_opt(&state.config.cpan.proxy_auth),
+        expose_opt(&state.config.cpan.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cpan,
     )
@@ -257,7 +258,7 @@ async fn distribution_proxy(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cpan.proxy_timeout),
-        expose_opt(&state.config.cpan.proxy_auth),
+        expose_opt(&state.config.cpan.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cpan,
     )

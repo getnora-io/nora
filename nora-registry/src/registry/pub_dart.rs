@@ -17,6 +17,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::cache_ttl::is_within_ttl;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url as nora_base_url_shared, proxy_fetch,
     proxy_fetch_conditional, read_validators, write_validators, ProxyError, Revalidation,
@@ -220,7 +221,7 @@ async fn package_listing(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        expose_opt(&state.config.pub_dart.proxy_auth),
+        expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::PubDart,
@@ -619,7 +620,7 @@ async fn download_archive(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        expose_opt(&state.config.pub_dart.proxy_auth),
+        expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::PubDart,
     )
@@ -688,7 +689,7 @@ async fn fetch_pub_api(
         &state.http_client,
         url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
-        expose_opt(&state.config.pub_dart.proxy_auth),
+        expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),
         Some(("Accept", PUB_CONTENT_TYPE)),
         |response| async { response.bytes().await.map(|b| b.to_vec()) },
         cb,

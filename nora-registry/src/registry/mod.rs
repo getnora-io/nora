@@ -52,7 +52,7 @@ pub use rpm::routes as rpm_routes;
 pub use terraform::routes as terraform_routes;
 
 use crate::circuit_breaker::{BreakerScope, CircuitBreakerRegistry};
-use crate::config::basic_auth_header;
+use crate::config::UpstreamAuth;
 use crate::metrics::{UPSTREAM_POLICY_BLOCKED_TOTAL, UPSTREAM_REQUEST_DURATION};
 use crate::AppState;
 use axum::body::{Body, Bytes};
@@ -175,6 +175,20 @@ pub(crate) enum ProxyError {
     CircuitOpen(String),
 }
 
+/// The `Authorization` value for an upstream request, built before the breaker is
+/// consulted: a credential that cannot be a header is a configuration fault, not an
+/// upstream outage, so it must neither reach the wire nor count toward opening the
+/// breaker. Config loading rejects such tokens first (#1055); this is the backstop.
+fn upstream_auth_header(
+    auth: Option<UpstreamAuth<'_>>,
+) -> Result<Option<reqwest::header::HeaderValue>, ProxyError> {
+    auth.map(UpstreamAuth::header_value)
+        .transpose()
+        // `InvalidHeaderValue` displays a fixed text, never the header bytes — the
+        // token cannot leak into the error (http 1.5 `header/value.rs`).
+        .map_err(|e| ProxyError::Network(format!("upstream credential rejected: {e}")))
+}
+
 /// 503 response for circuit breaker open state with Retry-After header.
 pub(crate) fn circuit_open_response(registry: &str) -> Response {
     (
@@ -207,7 +221,7 @@ async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     extract: F,
     cb: &CircuitBreakerRegistry,
@@ -217,6 +231,7 @@ where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
+    let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
@@ -224,8 +239,8 @@ where
 
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
-        if let Some(credentials) = auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
+        if let Some(value) = &auth_header {
+            request = request.header(header::AUTHORIZATION, value.clone());
         }
         if let Some((key, val)) = extra_headers {
             request = request.header(key, val);
@@ -321,7 +336,7 @@ pub(crate) async fn proxy_fetch(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Vec<u8>, ProxyError> {
@@ -343,7 +358,7 @@ pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
@@ -376,7 +391,7 @@ pub(crate) async fn repo_proxy_download(
     display: String,
     key: String,
     url: String,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     timeout_secs: u64,
     metadata_ttl: i64,
     immutable: bool,
@@ -533,7 +548,7 @@ pub(crate) async fn repo_proxy_download(
 /// as-is — including a 4xx (a real audit response, upstream is alive) — with only
 /// 5xx / network / circuit-open surfaced as `ProxyError`.
 ///
-/// `auth` is the configured proxy credential (Basic); the caller's own
+/// `auth` is the configured proxy credential (Basic or Bearer); the caller's own
 /// `Authorization` is never forwarded — pass only the intended headers in
 /// `fwd_headers` (allowlist). The body is not inspected or decompressed here.
 #[allow(clippy::too_many_arguments)]
@@ -541,12 +556,13 @@ pub(crate) async fn proxy_forward_post(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     fwd_headers: &[(&str, &str)],
     body: &[u8],
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
+    let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
@@ -554,8 +570,8 @@ pub(crate) async fn proxy_forward_post(
 
     for attempt in 0..2 {
         let mut request = client.post(url).timeout(timeout).body(body.to_vec());
-        if let Some(credentials) = auth {
-            request = request.header("Authorization", basic_auth_header(credentials));
+        if let Some(value) = &auth_header {
+            request = request.header(header::AUTHORIZATION, value.clone());
         }
         for (k, v) in fwd_headers {
             request = request.header(*k, *v);
@@ -830,17 +846,18 @@ pub(crate) async fn proxy_fetch_conditional(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
-    auth: Option<&str>,
+    auth: Option<UpstreamAuth<'_>>,
     validators: &Validators,
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    let auth_header = upstream_auth_header(auth)?;
     let cb_key = scope.into().key();
     let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
-    if let Some(credentials) = auth {
-        request = request.header(header::AUTHORIZATION, basic_auth_header(credentials));
+    if let Some(value) = auth_header {
+        request = request.header(header::AUTHORIZATION, value);
     }
     if let Some(ref etag) = validators.etag {
         request = request.header(header::IF_NONE_MATCH, etag);
@@ -1181,6 +1198,137 @@ mod tests {
             Err(e) => panic!("expected Modified, got {e:?}"),
         }
         assert_eq!(cb.health_snapshot("npm").unwrap().status, "closed");
+    }
+
+    /// Every shared upstream helper sends the credential with its own scheme (#1055).
+    /// The mock answers only when the exact `Authorization` value arrives, so each
+    /// `Ok` proves the header went out as `Bearer <token>` / `Basic <b64>` — a helper
+    /// that dropped the header or forced Basic would get a 404 instead.
+    #[tokio::test]
+    async fn every_upstream_helper_sends_the_configured_scheme() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (auth, expected) in [
+            (UpstreamAuth::Bearer("npm_tok-1"), "Bearer npm_tok-1"),
+            (UpstreamAuth::Basic("user:pass"), "Basic dXNlcjpwYXNz"),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(header("authorization", expected))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(header("authorization", expected))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&upstream)
+                .await;
+            let client = reqwest::Client::new();
+            let cb = noop_cb();
+            let url = upstream.uri();
+            let t = Duration::from_secs(5);
+
+            let bytes = proxy_fetch(&client, &url, t, Some(auth), &cb, RegistryType::Npm).await;
+            assert_eq!(bytes.unwrap(), b"ok", "proxy_fetch with {expected}");
+
+            let text =
+                proxy_fetch_text(&client, &url, t, Some(auth), None, &cb, RegistryType::Npm).await;
+            assert_eq!(text.unwrap(), "ok", "proxy_fetch_text with {expected}");
+
+            let cond = proxy_fetch_conditional(
+                &client,
+                &url,
+                t,
+                Some(auth),
+                &Validators::default(),
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert!(
+                matches!(cond, Ok(Revalidation::Modified { .. })),
+                "proxy_fetch_conditional with {expected}"
+            );
+
+            let post = proxy_forward_post(
+                &client,
+                &url,
+                t,
+                Some(auth),
+                &[],
+                b"{}",
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert_eq!(post.unwrap().0, 200, "proxy_forward_post with {expected}");
+        }
+    }
+
+    /// A credential that cannot be a header never reaches the wire and is not an
+    /// upstream outage: with a breaker that opens on the first failure, repeated
+    /// bad-credential calls leave it closed. Control: one real network failure under
+    /// the same config does open it, so the config is live and the test not vacuous.
+    #[tokio::test]
+    async fn invalid_credential_neither_sent_nor_counted_by_breaker() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let t = Duration::from_secs(5);
+        let strict = || {
+            CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 1,
+                reset_timeout: 300,
+                overrides: Default::default(),
+            })
+        };
+
+        let cb = strict();
+        for _ in 0..3 {
+            let bad = proxy_fetch(
+                &client,
+                &upstream.uri(),
+                t,
+                Some(UpstreamAuth::Bearer("tok\n")),
+                &cb,
+                RegistryType::Npm,
+            )
+            .await;
+            assert!(matches!(bad, Err(ProxyError::Network(_))));
+        }
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "a bad credential must not reach the upstream"
+        );
+        let good = proxy_fetch(&client, &upstream.uri(), t, None, &cb, RegistryType::Npm).await;
+        assert_eq!(good.unwrap(), b"ok", "breaker must still be closed");
+
+        // Control: a genuine transport failure opens the same strict breaker.
+        let cb = strict();
+        let refused = proxy_fetch(
+            &client,
+            "http://127.0.0.1:1/x",
+            t,
+            None,
+            &cb,
+            RegistryType::Npm,
+        )
+        .await;
+        assert!(matches!(refused, Err(ProxyError::Network(_))));
+        let after = proxy_fetch(&client, &upstream.uri(), t, None, &cb, RegistryType::Npm).await;
+        assert!(
+            matches!(after, Err(ProxyError::CircuitOpen(_))),
+            "control: breaker opens"
+        );
     }
 
     /// Validators round-trip through storage (the sidecar lives on disk, so they

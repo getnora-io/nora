@@ -4,6 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
@@ -124,7 +125,7 @@ async fn handle_npm_post(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth),
+        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
         &fwd,
         &forward_body,
         &state.circuit_breaker,
@@ -631,7 +632,7 @@ async fn handle_request(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
-            expose_opt(&state.config.npm.proxy_auth),
+            expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             RegistryType::Npm,
         )
@@ -786,7 +787,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth),
+        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::Npm,
@@ -1313,7 +1314,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth),
+        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Npm,
     )

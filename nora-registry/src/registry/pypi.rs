@@ -13,6 +13,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
 };
@@ -253,7 +254,7 @@ async fn package_versions(
                 &state.http_client,
                 &url,
                 Duration::from_secs(state.config.pypi.proxy_timeout),
-                up.auth(),
+                up.auth().map(UpstreamAuth::Basic),
                 Some(("Accept", "text/html")),
                 &state.circuit_breaker,
                 BreakerScope::upstream(RegistryType::PyPI, up.url()),
@@ -504,7 +505,7 @@ async fn download_file(
             &state.http_client,
             &page_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             Some(("Accept", "text/html")),
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
@@ -531,7 +532,7 @@ async fn download_file(
             &state.http_client,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
@@ -995,7 +996,7 @@ async fn ensure_pypi_dates_cached(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth(),
+            up.auth().map(UpstreamAuth::Basic),
             Some(("Accept", PEP691_JSON)),
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),

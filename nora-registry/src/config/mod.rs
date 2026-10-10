@@ -106,6 +106,53 @@ pub fn basic_auth_header(credentials: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
 
+/// The credential NORA presents to an upstream it proxies, with its scheme (#1055).
+///
+/// Borrowed from the config's protected secret for the length of one request. There is
+/// deliberately no `Debug` impl (guarded below at compile time): a `{:?}` on a request
+/// context must not be able to print a token.
+#[derive(Clone, Copy)]
+pub enum UpstreamAuth<'a> {
+    /// `user:pass`, sent as `Authorization: Basic base64(user:pass)`.
+    Basic(&'a str),
+    /// An opaque token (npm `_authToken`), sent as `Authorization: Bearer <token>`.
+    // Constructed by the npm multi-upstream config in the next commit of #1055;
+    // that commit drops this allow.
+    #[allow(dead_code)]
+    Bearer(&'a str),
+}
+
+impl UpstreamAuth<'_> {
+    /// The `Authorization` header value, marked sensitive so `HeaderValue`'s `Debug`
+    /// prints `Sensitive` instead of the credential.
+    ///
+    /// Fails only for a Bearer token with bytes a header cannot carry (a newline left by
+    /// a secret file, say); Basic is base64 and always valid.
+    pub fn header_value(
+        self,
+    ) -> Result<reqwest::header::HeaderValue, reqwest::header::InvalidHeaderValue> {
+        let raw = match self {
+            UpstreamAuth::Basic(credentials) => basic_auth_header(credentials),
+            UpstreamAuth::Bearer(token) => format!("Bearer {token}"),
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(&raw)?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+// Compile-time guard: `UpstreamAuth` must not implement `Debug`. If it did, both impls
+// below would apply and the type of `_` could not be inferred — a build error, not a
+// review comment.
+const _: fn() = || {
+    trait AmbiguousIfDebug<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+    impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+    let _ = <UpstreamAuth<'static> as AmbiguousIfDebug<_>>::some_item;
+};
+
 /// Path component of a URL (`https://host/prefix/` → `/prefix/`), or `""` when
 /// there is no path. The scheme is optional — a bare path is returned unchanged.
 /// Does not trim a trailing slash (callers that want it trimmed do so). Single
@@ -1177,6 +1224,27 @@ mod tests {
     fn test_basic_auth_header_empty() {
         let header = basic_auth_header("");
         assert!(header.starts_with("Basic "));
+    }
+
+    #[test]
+    fn upstream_auth_header_carries_its_scheme_and_is_sensitive() {
+        let basic = UpstreamAuth::Basic("user:pass").header_value().unwrap();
+        assert_eq!(basic, "Basic dXNlcjpwYXNz");
+        assert!(basic.is_sensitive());
+        assert_eq!(format!("{basic:?}"), "Sensitive");
+
+        let bearer = UpstreamAuth::Bearer("npm_tok-1").header_value().unwrap();
+        assert_eq!(bearer, "Bearer npm_tok-1");
+        assert!(bearer.is_sensitive());
+        assert_eq!(format!("{bearer:?}"), "Sensitive");
+    }
+
+    #[test]
+    fn upstream_auth_bearer_with_newline_is_rejected_not_sent() {
+        assert!(UpstreamAuth::Bearer("tok\n").header_value().is_err());
+        assert!(UpstreamAuth::Bearer("tok\r\nX-Injected: 1")
+            .header_value()
+            .is_err());
     }
 
     #[test]

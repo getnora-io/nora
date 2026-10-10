@@ -21,6 +21,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, read_validators,
     write_validators, ProxyError, Revalidation, Validators,
@@ -443,7 +444,7 @@ async fn download_tarball(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.ansible.proxy_timeout),
-        expose_opt(&state.config.ansible.proxy_auth),
+        expose_opt(&state.config.ansible.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Ansible,
     )
@@ -574,7 +575,7 @@ async fn proxy_json(
         &state.http_client,
         url,
         Duration::from_secs(state.config.ansible.proxy_timeout),
-        expose_opt(&state.config.ansible.proxy_auth),
+        expose_opt(&state.config.ansible.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::Ansible,
