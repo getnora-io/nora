@@ -12,11 +12,60 @@ use serde::{Deserialize, Serialize};
 /// space. One upstream per repo — mirrors of the same distro repo lag each
 /// other, and mixing them within a metadata-TTL window can serve a repomd.xml
 /// whose referenced blobs come from a different sync generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RepoProxyEntry {
     Simple(String),
     Full(RepoProxy),
+}
+
+impl<'de> Deserialize<'de> for RepoProxyEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        url_or_table(deserializer, Self::Simple, Self::Full)
+    }
+}
+
+/// Deserializes a proxy entry written as a URL string or as a table.
+///
+/// Stands in for `#[serde(untagged)]` on the `Deserialize` side: untagged buffers the
+/// value before trying each variant, so a typo inside the table (`auht`) never reached
+/// the unknown-key tracker of `Config` loading. Here the table's own `MapAccess` is
+/// handed to `F`, so its keys are tracked like any other. Serialization stays untagged.
+pub(in crate::config) fn url_or_table<'de, D, T, F>(
+    deserializer: D,
+    simple: fn(String) -> T,
+    full: fn(F) -> T,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    F: Deserialize<'de>,
+{
+    struct UrlOrTable<T, F> {
+        simple: fn(String) -> T,
+        full: fn(F) -> T,
+    }
+
+    impl<'de, T, F: Deserialize<'de>> serde::de::Visitor<'de> for UrlOrTable<T, F> {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an upstream URL string or a table with `url`")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<T, E> {
+            Ok((self.simple)(url.to_string()))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, url: String) -> Result<T, E> {
+            Ok((self.simple)(url))
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            F::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(self.full)
+        }
+    }
+
+    deserializer.deserialize_any(UrlOrTable { simple, full })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

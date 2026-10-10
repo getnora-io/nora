@@ -100,9 +100,6 @@ fn config_strict_from_env() -> bool {
 
 /// Parses a config file into a [`Config`] and the paths of the keys no setting reads,
 /// such as `curation.mdoe` for a typo of `mode`.
-///
-/// Keys inside an untagged entry (`maven.proxies = [{ url, auth }]`) are not seen: serde
-/// buffers those values before trying each variant, so they never reach the tracker.
 fn parse_config(content: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
     let mut unknown = Vec::new();
     let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
@@ -2353,23 +2350,135 @@ mod tests {
         );
     }
 
-    /// Known limit, pinned so a fix shows up here: a typo inside an untagged entry (a proxy
-    /// given as a table instead of a URL) is not listed — serde buffers the entry to try
-    /// each variant, and the buffered copy is not tracked. The entry still loads its `url`.
+    /// A typo inside a proxy entry given as a table is listed with its full path, like any
+    /// other typo — the entry is a URL string or a table, and the table's keys are tracked.
     #[test]
-    fn typo_inside_an_untagged_proxy_entry_is_not_seen() {
-        for content in [
-            "[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n",
-            "[pypi]\nproxies = [{ url = \"https://p.example\", auht = \"u:p\" }]\n",
-            "[rpm.proxies]\nfedora = { url = \"https://r.example\", auht = \"u:p\" }\n",
+    fn typo_inside_a_proxy_entry_is_listed() {
+        let content = r#"
+            [maven]
+            proxies = ["https://m1.example", { url = "https://m2.example", auht = "u:p" }]
+            [pypi]
+            proxies = [{ url = "https://p.example", auht = "u:p" }]
+            [rpm.proxies]
+            fedora = { url = "https://r.example", auht = "u:p" }
+            [deb.proxies]
+            debian = { url = "https://d.example", atuh = "u:p" }
+        "#;
+        assert_eq!(
+            unknown_keys(content),
+            [
+                "deb.proxies.debian.atuh",
+                "maven.proxies.1.auht",
+                "pypi.proxies.0.auht",
+                "rpm.proxies.fedora.auht",
+            ]
+        );
+    }
+
+    /// Proxy entries written before keep loading the same: a URL string, a table with
+    /// `url` and `auth`, both mixed in one list; and what was refused stays refused.
+    #[test]
+    fn proxy_entries_load_as_before() {
+        let (config, keys) = parse_config(
+            r#"
+            [maven]
+            proxies = ["https://m1.example", { url = "https://m2.example", auth = "u:p" }]
+            [pypi]
+            proxies = ["https://p1.example", { url = "https://p2.example", auth = "u:p" }]
+            [rpm.proxies]
+            fedora = "https://r1.example"
+            epel = { url = "https://r2.example", auth = "u:p" }
+            [deb.proxies]
+            debian = "https://d1.example"
+            local = { url = "https://d2.example" }
+            "#,
+        )
+        .unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+        let maven: Vec<_> = config
+            .maven
+            .proxies
+            .iter()
+            .map(|p| (p.url(), p.auth()))
+            .collect();
+        assert_eq!(
+            maven,
+            [
+                ("https://m1.example", None),
+                ("https://m2.example", Some("u:p"))
+            ]
+        );
+        assert!(matches!(
+            config.maven.proxies[0],
+            MavenProxyEntry::Simple(_)
+        ));
+        assert!(matches!(config.maven.proxies[1], MavenProxyEntry::Full(_)));
+        let pypi: Vec<_> = config
+            .pypi
+            .proxies
+            .iter()
+            .map(|p| (p.url(), p.auth()))
+            .collect();
+        assert_eq!(
+            pypi,
+            [
+                ("https://p1.example", None),
+                ("https://p2.example", Some("u:p"))
+            ]
+        );
+        assert_eq!(config.rpm.proxies["fedora"].url(), "https://r1.example");
+        assert_eq!(config.rpm.proxies["fedora"].auth(), None);
+        assert_eq!(config.rpm.proxies["epel"].url(), "https://r2.example");
+        assert_eq!(config.rpm.proxies["epel"].auth(), Some("u:p"));
+        assert_eq!(config.deb.proxies["debian"].url(), "https://d1.example");
+        assert_eq!(config.deb.proxies["local"].url(), "https://d2.example");
+        assert_eq!(config.deb.proxies["local"].auth(), None);
+
+        for refused in [
+            "[maven]\nproxies = [1]\n",
+            "[maven]\nproxies = [{ auth = \"u:p\" }]\n",
+            "[pypi]\nproxies = [true]\n",
+            "[rpm.proxies]\nfedora = 1\n",
+            "[deb.proxies]\ndebian = { auth = \"u:p\" }\n",
         ] {
-            assert_eq!(unknown_keys(content), Vec::<String>::new(), "{content}");
+            assert!(
+                parse_config(refused).is_err(),
+                "must stay refused: {refused}"
+            );
         }
-        let (config, _) =
-            parse_config("[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n")
-                .unwrap();
-        assert_eq!(config.maven.proxies[0].url(), "https://m.example");
-        assert_eq!(config.maven.proxies[0].auth(), None);
+    }
+
+    /// Serialization is unchanged: a string entry stays a string, a table keeps its `url`
+    /// and never writes the secret.
+    #[test]
+    fn proxy_entries_serialize_as_before() {
+        let (config, _) = parse_config(
+            "[maven]\nproxies = [\"https://m1.example\", { url = \"https://m2.example\", auth = \"u:p\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&config.maven.proxies).unwrap(),
+            serde_json::json!(["https://m1.example", { "url": "https://m2.example" }])
+        );
+    }
+
+    /// Strict mode refuses a typo inside a proxy entry like any other.
+    #[test]
+    fn strict_mode_refuses_a_typo_inside_a_proxy_entry() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(
+            &typo,
+            "[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n",
+        )
+        .unwrap();
+        match Config::load_from(Some(typo), NO_FALLBACK, true) {
+            Err(ConfigLoadError::UnknownKeys { keys, .. }) => {
+                assert_eq!(keys, ["maven.proxies.0.auht"])
+            }
+            other => panic!("strict mode must refuse the typo, got {other:?}"),
+        }
     }
 
     /// The config shipped in the image has no unknown keys: strict mode must start on it.
