@@ -600,17 +600,24 @@ pub fn verify_integrity_by_hash(
 
 /// Parse version from an npm tarball filename.
 ///
-/// For scoped packages `@scope/name`, the tarball is `name-VERSION.tgz`.
+/// For scoped packages `@scope/name`, the tarball is `name-VERSION.tgz` on npmjs and
+/// `@scope/name-VERSION.tgz` on GitLab's npm registry; both are accepted.
 /// For regular packages `name`, the tarball is `name-VERSION.tgz`.
+///
+/// `None` makes the allowlist treat the request as metadata and let it through, so a
+/// form this parser misses is a curation bypass, not a cosmetic miss.
 pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
     let filename = filename.strip_suffix(".tgz")?;
-    // For scoped packages like @scope/name, tarball uses just "name" part
+    // For scoped packages like @scope/name, the npmjs tarball uses just the "name" part
     let name_part = if package_name.contains('/') {
         package_name.rsplit('/').next()?
     } else {
         package_name
     };
-    let version = filename.strip_prefix(name_part)?.strip_prefix('-')?;
+    let version = filename
+        .strip_prefix(package_name)
+        .or_else(|| filename.strip_prefix(name_part))?
+        .strip_prefix('-')?;
     if version.is_empty() {
         return None;
     }
@@ -3016,6 +3023,61 @@ mod tests {
         assert_eq!(
             super::parse_npm_tarball_version("@babel/core", "core-7.26.0.tgz"),
             Some("7.26.0".to_string())
+        );
+    }
+
+    /// GitLab's npm registry names a scoped tarball after the full package name:
+    /// `<base>/@vendor/a/-/@vendor/a-1.0.0.tgz` (the npmjs form is `a-1.0.0.tgz`).
+    #[test]
+    fn test_parse_npm_tarball_version_scoped_full_name_filename() {
+        assert_eq!(
+            super::parse_npm_tarball_version("@vendor/a", "@vendor/a-1.0.0.tgz"),
+            Some("1.0.0".to_string())
+        );
+        // The other scope's tarball is not this package's version.
+        assert_eq!(
+            super::parse_npm_tarball_version("@vendor/a", "@other/a-1.0.0.tgz"),
+            None
+        );
+    }
+
+    /// Fail-closed chain: a version the parser cannot read makes the allowlist
+    /// skip the request as if it were metadata. For a GitLab-form scoped tarball
+    /// that let an unlisted package through; it must be blocked.
+    #[test]
+    fn allowlist_blocks_an_unlisted_gitlab_form_scoped_tarball() {
+        let filter = make_allowlist_entries(
+            vec![AllowlistEntry {
+                registry: "npm".to_string(),
+                name: "@vendor/a".to_string(),
+                version: "1.0.0".to_string(),
+                integrity: None,
+                integrity_source: None,
+            }],
+            false,
+        );
+        let request = |filename: &str| FilterRequest {
+            registry: RegistryType::Npm,
+            upstream: None,
+            name: "@vendor/a".to_string(),
+            version: super::parse_npm_tarball_version("@vendor/a", filename),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        assert!(
+            matches!(
+                filter.evaluate(&request("@vendor/a-6.6.6.tgz")),
+                Decision::Block { .. }
+            ),
+            "unlisted version must be blocked"
+        );
+        assert!(
+            !matches!(
+                filter.evaluate(&request("@vendor/a-1.0.0.tgz")),
+                Decision::Block { .. }
+            ),
+            "control: the listed version passes"
         );
     }
 
