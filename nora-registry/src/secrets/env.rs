@@ -81,48 +81,52 @@ impl SecretsProvider for EnvProvider {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
 
-    #[tokio::test]
-    async fn test_get_secret_exists() {
+    #[test]
+    fn test_get_secret_exists() {
+        let _lock = crate::test_env::env_lock();
         env::set_var("TEST_SECRET_123", "secret-value");
         let provider = EnvProvider::new();
-        let secret = provider.get_secret("TEST_SECRET_123").await.unwrap();
+        let secret = block_on(provider.get_secret("TEST_SECRET_123")).unwrap();
         assert_eq!(secret.expose(), "secret-value");
         env::remove_var("TEST_SECRET_123");
     }
 
-    #[tokio::test]
-    async fn test_get_secret_not_found() {
+    #[test]
+    fn test_get_secret_not_found() {
+        let _lock = crate::test_env::env_lock();
         let provider = EnvProvider::new();
-        let result = provider.get_secret("NONEXISTENT_VAR_XYZ").await;
+        let result = block_on(provider.get_secret("NONEXISTENT_VAR_XYZ"));
         assert!(matches!(result, Err(SecretsError::NotFound(_))));
     }
 
-    #[tokio::test]
-    async fn test_get_secret_optional_exists() {
+    #[test]
+    fn test_get_secret_optional_exists() {
+        let _lock = crate::test_env::env_lock();
         env::set_var("TEST_OPTIONAL_123", "optional-value");
         let provider = EnvProvider::new();
-        let secret = provider.get_secret_optional("TEST_OPTIONAL_123").await;
+        let secret = block_on(provider.get_secret_optional("TEST_OPTIONAL_123"));
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().expose(), "optional-value");
         env::remove_var("TEST_OPTIONAL_123");
     }
 
-    #[tokio::test]
-    async fn test_get_secret_optional_not_found() {
+    #[test]
+    fn test_get_secret_optional_not_found() {
+        let _lock = crate::test_env::env_lock();
         let provider = EnvProvider::new();
-        let secret = provider
-            .get_secret_optional("NONEXISTENT_OPTIONAL_XYZ")
-            .await;
+        let secret = block_on(provider.get_secret_optional("NONEXISTENT_OPTIONAL_XYZ"));
         assert!(secret.is_none());
     }
 
-    #[tokio::test]
-    async fn test_clear_after_read() {
+    #[test]
+    fn test_clear_after_read() {
+        let _lock = crate::test_env::env_lock();
         env::set_var("TEST_CLEAR_123", "to-be-cleared");
         let provider = EnvProvider::new().with_clear_after_read();
 
-        let secret = provider.get_secret("TEST_CLEAR_123").await.unwrap();
+        let secret = block_on(provider.get_secret("TEST_CLEAR_123")).unwrap();
         assert_eq!(secret.expose(), "to-be-cleared");
 
         // Variable should be cleared
