@@ -90,16 +90,35 @@ async fn handle_npm_post(
     let owned_scopes: Vec<&str> = state.config.npm.owned_scopes().collect();
     let filter_active =
         crate::curation::namespace_filter_active(engine) || !owned_scopes.is_empty();
-    let content_encoded = headers
+    let encoding = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| !s.eq_ignore_ascii_case("identity"));
+        .map(str::trim)
+        .filter(|s| !s.eq_ignore_ascii_case("identity"));
+    // npm 7+ always gzips the bulk body (measured with real clients, #1055): refusing
+    // every encoded body made `npm audit` report no vulnerabilities whenever a filter
+    // was active. Gzip is decoded under the same cap and checked like plain JSON; any
+    // other encoding, or a body that does not decode, is still refused.
+    let mut decoded = false;
     let forward_body: Vec<u8> = if !filter_active {
         body.to_vec()
-    } else if is_quick || content_encoded {
+    } else if is_quick {
         return npm_empty_audit();
     } else {
-        match strip_internal_bulk(&body, engine, &owned_scopes) {
+        let plain = match encoding {
+            None => body.to_vec(),
+            Some(enc) if enc.eq_ignore_ascii_case("gzip") => {
+                match gunzip_bounded(&body, NPM_AUDIT_BODY_CAP) {
+                    Some(plain) => {
+                        decoded = true;
+                        plain
+                    }
+                    None => return npm_empty_audit(), // corrupt or over the cap → refuse
+                }
+            }
+            Some(_) => return npm_empty_audit(),
+        };
+        match strip_internal_bulk(&plain, engine, &owned_scopes) {
             Some(stripped) => stripped,
             None => return npm_empty_audit(), // unparsable under a filter → refuse
         }
@@ -114,9 +133,11 @@ async fn handle_npm_post(
     {
         fwd.push(("content-type", v));
     }
+    // A body decoded above goes out as the plain JSON it was checked as.
     if let Some(v) = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
+        .filter(|_| !decoded)
     {
         fwd.push(("content-encoding", v));
     }
@@ -174,7 +195,19 @@ fn npm_empty_audit() -> Response {
         .into_response()
 }
 
-/// Strip internal-namespace package keys from an npm7 bulk-advisories body
+/// Gunzip an audit body, refusing output past `cap` bytes: a small gzip can expand
+/// into gigabytes. `None` = not gzip, corrupt, or over the cap.
+fn gunzip_bounded(data: &[u8], cap: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(data)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() <= cap).then_some(out)
+}
+
+/// Strip internal-namespace and private-scope package keys from an npm7 bulk-advisories body
 /// (`{"<pkg>":[…]}`). `Some(bytes)` = the (possibly unchanged) body safe to forward;
 /// `None` = the body is NOT the expected JSON object, so the caller must fail closed
 /// under an active namespace filter (we could not verify no internal name is present).
@@ -4508,6 +4541,114 @@ mod multi_upstream_tests {
             cached("npm/lodash2/metadata.json").await,
             "public self-prime after private died"
         );
+        assert_public_clean(&public.received_requests().await.unwrap());
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// npm 7+ always gzips the bulk audit body (measured, kit npm-client-matrix).
+    /// Refusing every encoded body made `npm audit` report "0 vulnerabilities" as
+    /// soon as a private scope was configured; it must be decoded, stripped and
+    /// forwarded, and the upstream's answer returned.
+    #[tokio::test]
+    async fn a_gzipped_bulk_audit_is_decoded_stripped_and_forwarded() {
+        use crate::test_helpers::send_with_headers;
+        let public = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"lodash":[{"id":1}]}"#))
+            .mount(&public)
+            .await;
+        let private = MockServer::start().await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![
+                ("content-encoding", "gzip"),
+                ("content-type", "application/json"),
+            ],
+            gzip(br#"{"lodash":["4.17.0"],"@vendor/a":["1.0.0"]}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], br#"{"lodash":[{"id":1}]}"#);
+
+        let reqs = public.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].headers.get("content-encoding").is_none(),
+            "the stripped body goes out uncompressed"
+        );
+        assert!(String::from_utf8_lossy(&reqs[0].body).contains("lodash"));
+        assert_public_clean(&reqs);
+    }
+
+    /// A small gzip that expands past the audit cap is refused, not inflated.
+    #[tokio::test]
+    async fn a_gzip_bomb_audit_is_refused() {
+        use crate::test_helpers::send_with_headers;
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        let mut big = b"{\"lodash\":[\"".to_vec();
+        big.extend(std::iter::repeat_n(b'1', super::NPM_AUDIT_BODY_CAP + 1));
+        big.extend(b"\"]}");
+        let bomb = gzip(&big);
+        assert!(
+            bomb.len() < 64 * 1024,
+            "control: the bomb is small on the wire"
+        );
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![("content-encoding", "gzip")],
+            bomb,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert!(public.received_requests().await.unwrap().is_empty());
+    }
+
+    /// GitHub Packages puts scoped tarballs under `/download/@scope/name/…`: the
+    /// scope is not the first segment, and such a path must still go to the owner,
+    /// never to the default upstream (measured leak on the B arm, kit matrix 10.10).
+    #[tokio::test]
+    async fn a_ghp_form_download_path_goes_to_the_owner() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/download/@vendor/a/1.0.0/d113f588ab0b17ddabe8d0db55fa83a741df6871",
+            ))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"VENDOR-TGZ".to_vec()))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/download/@vendor/a/1.0.0/d113f588ab0b17ddabe8d0db55fa83a741df6871",
+            "",
+        )
+        .await;
+        assert_eq!(private.received_requests().await.unwrap().len(), 1);
         assert_public_clean(&public.received_requests().await.unwrap());
     }
 

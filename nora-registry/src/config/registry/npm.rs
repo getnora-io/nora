@@ -35,11 +35,36 @@ pub struct NpmConfig {
 }
 
 /// One npm upstream: a bare URL, or a table with scopes and a credential.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum NpmProxyEntry {
     Simple(String),
     Full(NpmProxy),
+}
+
+/// Not `#[serde(untagged)]` on the way in: untagged swallows the table's own error
+/// and reports only "did not match any variant", so a misspelt key would not be named.
+impl<'de> Deserialize<'de> for NpmProxyEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = NpmProxyEntry;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an upstream URL or a table with `url`")
+            }
+            fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<Self::Value, E> {
+                Ok(NpmProxyEntry::Simple(url.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                NpmProxy::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(NpmProxyEntry::Full)
+            }
+        }
+        deserializer.deserialize_any(EntryVisitor)
+    }
 }
 
 /// An npm upstream with optional scope ownership and credential (#1055).
@@ -100,16 +125,21 @@ impl NpmProxyEntry {
     }
 }
 
-/// The npm scope a request path belongs to: `@vendor` for `@vendor/pkg`,
-/// `@vendor/pkg/-/pkg-1.0.0.tgz` and `-/package/@vendor/pkg/dist-tags`; `None` for
-/// unscoped packages and registry endpoints. The path is the decoded one axum hands
-/// the handler, so `@vendor%2fpkg` arrives here as `@vendor/pkg`.
+/// The npm scope a request path belongs to: the first path segment that starts
+/// with `@` and is followed by a name — `@vendor` for `@vendor/pkg`,
+/// `@vendor/pkg/-/pkg-1.0.0.tgz`, `-/package/@vendor/pkg/dist-tags` and GitHub
+/// Packages' `download/@vendor/pkg/1.0.0/<sha>`; `None` for unscoped packages and
+/// registry endpoints. Any segment, not only the first: a path that names a private
+/// scope anywhere must not be routed to the default upstream. The path is the
+/// decoded one axum hands the handler, so `@vendor%2fpkg` arrives as `@vendor/pkg`.
 pub fn npm_scope_of(path: &str) -> Option<&str> {
-    let name = path.strip_prefix("-/package/").unwrap_or(path);
-    if !name.starts_with('@') {
-        return None;
+    let mut segments = path.split('/');
+    while let Some(segment) = segments.next() {
+        if segment.starts_with('@') {
+            return segments.next().map(|_| segment);
+        }
     }
-    name.split_once('/').map(|(scope, _)| scope)
+    None
 }
 
 /// npm scope syntax: `@` + a lowercase, URL-safe name not starting with `.` or `_`.
@@ -338,6 +368,10 @@ mod tests {
             npm_scope_of("-/package/@vendor/pkg/dist-tags"),
             Some("@vendor")
         );
+        assert_eq!(
+            npm_scope_of("download/@vendor/pkg/1.0.0/d113f588ab0b17ddabe8d0db55fa83a741df6871"),
+            Some("@vendor")
+        );
         assert_eq!(npm_scope_of("lodash"), None);
         assert_eq!(npm_scope_of("lodash/-/lodash-4.17.21.tgz"), None);
         assert_eq!(npm_scope_of("-/v1/search"), None);
@@ -433,7 +467,11 @@ mod tests {
         let err = toml::from_str::<NpmConfig>(
             r#"proxies = ["https://registry.npmjs.org", { url = "https://npm.vendor.example", scope = ["@vendor"] }]"#,
         );
-        assert!(err.is_err());
+        let msg = err.expect_err("unknown key").to_string();
+        assert!(
+            msg.contains("`scope`"),
+            "the error must name the key: {msg}"
+        );
     }
 
     #[test]
