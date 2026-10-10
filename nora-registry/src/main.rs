@@ -56,6 +56,8 @@ mod ui;
 mod validation;
 
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_helpers;
 
 use arc_swap::ArcSwap;

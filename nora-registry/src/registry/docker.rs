@@ -4379,6 +4379,7 @@ mod tests {
 
     #[test]
     fn test_max_upload_sessions_default() {
+        let _lock = crate::test_env::env_lock();
         // Without env var set, should return default
         let max = max_upload_sessions();
         assert!(max > 0);
@@ -4424,53 +4425,63 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn test_upload_session_limit_returns_oci_429() {
+    #[test]
+    fn test_upload_session_limit_returns_oci_429() {
+        // The handler reads the limit from env while the request runs, so the lock is
+        // held across the whole request; a runtime of its own keeps that off an `.await`.
+        let _lock = crate::test_env::env_lock();
         use crate::test_helpers::{body_bytes, create_test_context, send};
 
-        // Pre-fill the session map to the ceiling — no env mutation, so this is
-        // safe under parallel tests.
-        let ctx = create_test_context();
-        {
-            let mut sessions = ctx.state.upload_sessions.write();
-            for i in 0..max_upload_sessions() {
-                sessions.insert(
-                    format!("fill-{i}"),
-                    UploadSession {
-                        temp_path: std::env::temp_dir().join(format!("fill-{i}")),
-                        size: 0,
-                        name: "alpine".to_string(),
-                        created_at: std::time::Instant::now(),
-                    },
-                );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Pre-fill the session map to the ceiling — no env mutation, so this is
+            // safe under parallel tests.
+            let ctx = create_test_context();
+            {
+                let mut sessions = ctx.state.upload_sessions.write();
+                for i in 0..max_upload_sessions() {
+                    sessions.insert(
+                        format!("fill-{i}"),
+                        UploadSession {
+                            temp_path: std::env::temp_dir().join(format!("fill-{i}")),
+                            size: 0,
+                            name: "alpine".to_string(),
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                }
             }
-        }
-        let resp = send(
-            &ctx.app,
-            Method::POST,
-            "/v2/alpine/blobs/uploads/",
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
-            "application/json"
-        );
-        assert!(
-            resp.headers().contains_key(header::RETRY_AFTER),
-            "429 must carry Retry-After so clients back off"
-        );
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
-        assert_eq!(
-            body["errors"][0]["detail"]["limit"],
-            max_upload_sessions() as u64
-        );
+            let resp = send(
+                &ctx.app,
+                Method::POST,
+                "/v2/alpine/blobs/uploads/",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                resp.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+                "application/json"
+            );
+            assert!(
+                resp.headers().contains_key(header::RETRY_AFTER),
+                "429 must carry Retry-After so clients back off"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
+            assert_eq!(
+                body["errors"][0]["detail"]["limit"],
+                max_upload_sessions() as u64
+            );
+        });
     }
 
     #[test]
     fn test_max_session_size_default() {
+        let _lock = crate::test_env::env_lock();
         let max = max_session_size();
         assert_eq!(max, DEFAULT_MAX_SESSION_SIZE_MB * 1024 * 1024);
     }

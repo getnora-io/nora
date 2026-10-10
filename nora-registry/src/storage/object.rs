@@ -678,6 +678,7 @@ mod tests {
     /// as the anonymous S3 construction test above.
     #[test]
     fn test_gcs_storage_creation_emulator() {
+        let _lock = crate::test_env::env_lock();
         let storage = ObjectStorage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
         assert_eq!(storage.backend_name(), "gcs");
     }
@@ -686,6 +687,7 @@ mod tests {
     /// service account) — the ambient-credential ladder must also be lazy.
     #[test]
     fn test_gcs_storage_creation_default_endpoint() {
+        let _lock = crate::test_env::env_lock();
         let storage = ObjectStorage::new_gcs("test-bucket", None, None);
         assert_eq!(storage.backend_name(), "gcs");
     }
