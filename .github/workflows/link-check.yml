@@ -28,6 +28,9 @@ jobs:
           key: lychee-${{ github.sha }}
           restore-keys: lychee-
 
+      # github.com answers 503 to scripted clients on file (blob) pages, so a link to a
+      # file in a repository is checked against raw.githubusercontent.com instead: a
+      # missing file is still a 404 there.
       - name: Run lychee link checker
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
@@ -47,6 +50,7 @@ jobs:
             --timeout 30
             --max-retries 3
             --accept 200,206,429
+            --remap '^https://github\.com/([^/]+)/([^/]+)/blob/([^#?]+) https://raw.githubusercontent.com/$1/$2/$3'
             '**/*.md'
             'llms.txt'
           fail: ${{ github.event_name != 'schedule' }}

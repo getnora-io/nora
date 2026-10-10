@@ -194,6 +194,7 @@ mod tests {
     /// together with the scheduler wait and the audit drain) and follows the env.
     #[test]
     fn shutdown_timeout_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
         assert_eq!(ServerConfig::default().shutdown_timeout, 15);
         let mut config = ServerConfig::default();
         std::env::set_var("NORA_SHUTDOWN_TIMEOUT", "4");
