@@ -58,7 +58,9 @@ async fn handle_npm_post(
 ) -> Response {
     let is_bulk = path == "-/npm/v1/security/advisories/bulk";
     let is_quick = path == "-/npm/v1/security/audits/quick";
-    if !is_bulk && !is_quick {
+    // pnpm posts an npm6 dependency tree here (measured with pnpm 10.17, #1055).
+    let is_full = path == "-/npm/v1/security/audits";
+    if !is_bulk && !is_quick && !is_full {
         // POST is only meaningful on the audit endpoints.
         return method_not_allowed("GET, PUT");
     }
@@ -68,7 +70,12 @@ async fn handle_npm_post(
     // chunked / no-Content-Length client cannot force NORA to buffer gigabytes (#597).
     let body = match axum::body::to_bytes(body, NPM_AUDIT_BODY_CAP).await {
         Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => {
+            return audit_refused(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "audit body is larger than NORA accepts (8 MB)",
+            )
+        }
     };
 
     // Only a remote/proxy repo can answer audits (advisories come from upstream).
@@ -100,27 +107,56 @@ async fn handle_npm_post(
     // was active. Gzip is decoded under the same cap and checked like plain JSON; any
     // other encoding, or a body that does not decode, is still refused.
     let mut decoded = false;
+    // A body that cannot be checked is refused with a 4xx and a JSON `error` — never
+    // `200 {}`, which npm and yarn render as "0 vulnerabilities" (Pavel 10.10). 4xx,
+    // not 5xx: pnpm retries a 5xx for about 70 s before failing anyway, and every
+    // client prints the error text on a 4xx (kit npm-audit-matrix).
     let forward_body: Vec<u8> = if !filter_active {
         body.to_vec()
-    } else if is_quick {
-        return npm_empty_audit();
+    } else if is_quick || is_full {
+        return audit_refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this audit format carries a whole dependency tree that NORA cannot strip of \
+             private or internal package names; use npm 7+ (bulk advisories) or yarn npm audit",
+        );
     } else {
         let plain = match encoding {
             None => body.to_vec(),
             Some(enc) if enc.eq_ignore_ascii_case("gzip") => {
                 match gunzip_bounded(&body, NPM_AUDIT_BODY_CAP) {
-                    Some(plain) => {
+                    Ok(plain) => {
                         decoded = true;
                         plain
                     }
-                    None => return npm_empty_audit(), // corrupt or over the cap → refuse
+                    Err(GunzipError::TooLarge) => {
+                        return audit_refused(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "decompressed audit body is larger than NORA accepts (8 MB)",
+                        )
+                    }
+                    Err(GunzipError::Corrupt) => {
+                        return audit_refused(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "audit body says gzip but does not decompress",
+                        )
+                    }
                 }
             }
-            Some(_) => return npm_empty_audit(),
+            Some(_) => {
+                return audit_refused(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "audit body encoding is not supported; send it plain or gzip",
+                )
+            }
         };
         match strip_internal_bulk(&plain, engine, &owned_scopes) {
             Some(stripped) => stripped,
-            None => return npm_empty_audit(), // unparsable under a filter → refuse
+            None => {
+                return audit_refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "audit body is not the expected JSON object of package versions",
+                )
+            }
         }
     };
 
@@ -195,16 +231,42 @@ fn npm_empty_audit() -> Response {
         .into_response()
 }
 
-/// Gunzip an audit body, refusing output past `cap` bytes: a small gzip can expand
-/// into gigabytes. `None` = not gzip, corrupt, or over the cap.
-fn gunzip_bounded(data: &[u8], cap: usize) -> Option<Vec<u8>> {
+/// Why a gzip audit body was not decoded.
+#[derive(Debug)]
+enum GunzipError {
+    /// Not gzip, or a corrupt stream.
+    Corrupt,
+    /// Expands past the cap (a small gzip can inflate into gigabytes).
+    TooLarge,
+}
+
+/// Gunzip an audit body, refusing output past `cap` bytes.
+fn gunzip_bounded(data: &[u8], cap: usize) -> Result<Vec<u8>, GunzipError> {
     use std::io::Read;
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(data)
         .take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .ok()?;
-    (out.len() <= cap).then_some(out)
+        .map_err(|_| GunzipError::Corrupt)?;
+    if out.len() > cap {
+        return Err(GunzipError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// An audit NORA will not forward: the status and a JSON `error` the clients print
+/// (npm `npm warn audit <code> … - <error>`, pnpm `responded with <code>: …`,
+/// yarn 4 `[Error]: <error>`).
+fn audit_refused(status: StatusCode, reason: &str) -> Response {
+    (
+        status,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::json!({ "error": reason }).to_string(),
+    )
+        .into_response()
 }
 
 /// Strip internal-namespace and private-scope package keys from an npm7 bulk-advisories body
@@ -3641,8 +3703,10 @@ mod spec_conformance_tests {
             "lockfile-payload",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        // Refused explicitly, not "0 vulnerabilities" (Pavel 10.10; client matrix:
+        // every client exits 1 and prints the error text on a 4xx).
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("\"error\""));
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             0,
@@ -3711,8 +3775,10 @@ mod spec_conformance_tests {
             "gzipped-body-not-inspected-because-refused",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        // Refused explicitly, not "0 vulnerabilities" (Pavel 10.10; client matrix:
+        // every client exits 1 and prints the error text on a 4xx).
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("\"error\""));
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             0,
@@ -4695,6 +4761,89 @@ mod multi_upstream_tests {
         assert_public_clean(&reqs);
     }
 
+    /// pnpm posts an npm6 dependency tree to `-/npm/v1/security/audits` (measured,
+    /// kit npm-audit-matrix). Without a filter it is forwarded like bulk; with a
+    /// private scope configured the tree cannot be stripped reliably, so it is
+    /// refused with an error pnpm prints — never a 405 with an empty body.
+    #[tokio::test]
+    async fn pnpm_full_audit_is_forwarded_or_refused_explicitly() {
+        let body = r#"{"dependencies":{".":{"dependencies":{"fixture-pub":{"version":"1.0.0"}}}},"requires":{".":"0.0.0"}}"#;
+
+        // No filter: forwarded verbatim, the upstream's answer returned.
+        let public = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/audits"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"advisories":{},"metadata":{"vulnerabilities":{}}}"#),
+            )
+            .mount(&public)
+            .await;
+        let url = public.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(url));
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/audits",
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("vulnerabilities"));
+        assert_eq!(public.received_requests().await.unwrap().len(), 1);
+
+        // Private scope configured: refused, nothing sent.
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/audits",
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("\"error\""));
+        assert!(public.received_requests().await.unwrap().is_empty());
+    }
+
+    /// An encoding NORA does not decode is a 415, a corrupt gzip a 422 — both with
+    /// a JSON error the clients print.
+    #[tokio::test]
+    async fn unverifiable_audit_bodies_get_explicit_errors() {
+        use crate::test_helpers::send_with_headers;
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+        let bulk = "/npm/-/npm/v1/security/advisories/bulk";
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            bulk,
+            vec![("content-encoding", "br")],
+            "x",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            bulk,
+            vec![("content-encoding", "gzip")],
+            "not-gzip",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let resp = send(&ctx.app, Method::POST, bulk, "[1,2,3]").await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("\"error\""));
+        assert!(public.received_requests().await.unwrap().is_empty());
+    }
+
     /// A small gzip that expands past the audit cap is refused, not inflated.
     #[tokio::test]
     async fn a_gzip_bomb_audit_is_refused() {
@@ -4721,8 +4870,8 @@ mod multi_upstream_tests {
             bomb,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("\"error\""));
         assert!(public.received_requests().await.unwrap().is_empty());
     }
 
@@ -5074,8 +5223,7 @@ mod multi_upstream_tests {
             r#"{"dependencies":{"@vendor/a":{"version":"1.0.0"}}}"#,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let reqs = public.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "only the stripped bulk audit is forwarded");
