@@ -50,10 +50,17 @@ pub async fn migrate(
 
     // List all keys from source
     println!("Scanning source storage...");
-    let keys = from
+    let mut keys = from
         .list("")
         .await
         .map_err(|e| format!("failed to list source: {e}"))?;
+    // npm cache provenance (#1055) sits under an internal prefix that list() hides;
+    // without it the destination refetches every owned-scope object from its owner.
+    keys.extend(
+        from.list_internal(crate::registry::npm::ORIGINS_PREFIX)
+            .await
+            .map_err(|e| format!("failed to list source: {e}"))?,
+    );
 
     if keys.is_empty() {
         println!("No artifacts found in source storage.");
@@ -169,6 +176,32 @@ mod tests {
         // Verify destination has the files
         assert!(dst.get("test/file1").await.is_ok());
         assert!(dst.get("test/file2").await.is_ok());
+    }
+
+    /// npm cache provenance (#1055) is hidden from list() but migrates with its object.
+    #[tokio::test]
+    async fn test_migrate_carries_npm_provenance() {
+        use crate::registry::npm::origin_key;
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        let key = "npm/@vendor/a/metadata.json";
+        src.put(key, b"{}").await.unwrap();
+        src.put(&origin_key(key), b"npm:https://owner.example\nrecord")
+            .await
+            .unwrap();
+
+        let stats = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.migrated, 2);
+        assert_eq!(
+            &dst.get(&origin_key(key)).await.unwrap()[..],
+            b"npm:https://owner.example\nrecord"
+        );
+        assert_eq!(dst.pin(key).await, src.pin(key).await);
     }
 
     #[tokio::test]
