@@ -19,26 +19,219 @@ const PIN_FILE: &str = ".nora-pins.ndjson";
 /// Monotonic counter for unique temp file names (atomic — no collisions).
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A temp path next to `path` that no other write in this or any other process uses:
-/// PID + monotonic counter. Concurrent writers of one key each stage their own copy
-/// and only the final `rename` publishes it, so a reader never sees a partial file.
-/// Relaxed ordering: the counter only makes names unique, it orders nothing.
-fn unique_tmp_path(path: &Path) -> PathBuf {
+/// The next temp-name sequence number, unique in this process. Relaxed ordering: the
+/// counter only makes names unique, it orders nothing.
+fn next_tmp_seq() -> u64 {
     #[cfg(test)]
     if let Some(seq) = tests::NEXT_TMP_SEQ.with(|next| next.replace(None)) {
         tests::NEXT_TMP_SEQ.with(|next| next.set(Some(seq + 1)));
-        return tmp_path_with_seq(path, seq);
+        return seq;
     }
-    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tmp_path_with_seq(path, seq)
+    TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A temp path beside `path`, `<name>.tmp.<pid>.<seq>`: where a write stages when it
+/// cannot use the staging directory.
+fn tmp_path_with_seq(path: &Path, seq: u64) -> PathBuf {
+    path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
 }
 
 /// How many temp names a write tries before giving up: a name is skipped when a file
-/// already has it (see [`create_tmp`]).
+/// already has it (see [`LocalStorage::create_tmp`]).
 const TMP_CREATE_ATTEMPTS: u32 = 8;
 
-fn tmp_path_with_seq(path: &Path, seq: u64) -> PathBuf {
-    path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
+/// The lock file of an instance's staging directory.
+const STAGING_LOCK_FILE: &str = "lock";
+/// Name prefix of a staging directory that is still being created.
+const STAGING_NEW_PREFIX: &str = ".new-";
+/// A staging directory still named `.new-*` after this long was abandoned half-created:
+/// creating one takes a few syscalls.
+const STAGING_NEW_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// `EXDEV`: a rename across filesystems.
+const EXDEV: i32 = 18;
+
+/// Name of a temp file in a staging directory.
+fn staging_tmp_name(seq: u64) -> String {
+    format!("{seq}.tmp")
+}
+
+/// Where a write creates its temp file.
+#[derive(Debug, Clone, Copy)]
+enum TmpPlace {
+    /// This instance's staging directory; beside the key while it is unavailable.
+    Staging,
+    /// Beside the key: the rename out of staging crossed a filesystem.
+    BesideKey,
+}
+
+/// One instance's staging directory, `<root>/.nora-staging/<id>/`.
+///
+/// Writes in progress live here rather than beside their key, where a temp file that
+/// outlived its process (SIGKILL, OOM, a power cut: no `Drop` ran) looks like a key
+/// and nothing ever removes it. The instance holds an exclusive `flock` on the `lock`
+/// file inside for its whole life; the kernel drops that lock with the process's last
+/// file descriptor, however it ends. A starting instance removes every staging
+/// directory whose lock it can take: no live process owns it. A PID could not tell
+/// owners apart — every container's process is PID 1. Two instances on one volume
+/// (a rolling update) each keep their own directory and never remove the other's.
+///
+/// The directory is created as `.new-<id>` with its lock already held and only then
+/// renamed to `<id>`, so a directory under its final name always has a held lock or
+/// a dead owner. A directory without a lock file has a dead owner too (it was being
+/// removed). The staging directory is not a storage key: `validate_storage_key`
+/// refuses it.
+#[derive(Debug)]
+struct Staging {
+    dir: PathBuf,
+    _lock: std::fs::File,
+}
+
+/// Opened on the first write, which also removes dead instances' staging; `None` when
+/// it cannot be opened, and writes then stage beside the key as before.
+type StagingCell = Arc<std::sync::OnceLock<Option<Staging>>>;
+
+/// Take an exclusive `flock` on `file` without waiting: `Ok(false)` when another open
+/// file description holds it, in this process or another.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use rustix::fs::{flock, FlockOperation};
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create this instance's staging directory under `root`, after removing the ones
+/// dead instances left. See [`Staging`].
+#[cfg(unix)]
+fn open_staging(root: &Path) -> std::io::Result<Staging> {
+    let staging_root = root.join(crate::validation::STAGING_DIR);
+    std::fs::create_dir_all(&staging_root)?;
+    remove_dead_staging(&staging_root);
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let new = staging_root.join(format!("{STAGING_NEW_PREFIX}{id}"));
+    std::fs::create_dir(&new)?;
+    let created = (|| {
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(new.join(STAGING_LOCK_FILE))?;
+        if !try_lock_exclusive(&lock)? {
+            return Err(std::io::Error::other("a new staging lock is already held"));
+        }
+        let dir = staging_root.join(&id);
+        std::fs::rename(&new, &dir)?;
+        Ok(Staging { dir, _lock: lock })
+    })();
+    if created.is_err() {
+        let _ = std::fs::remove_dir_all(&new);
+    }
+    created
+}
+
+#[cfg(not(unix))]
+fn open_staging(_root: &Path) -> std::io::Result<Staging> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "staging needs flock",
+    ))
+}
+
+/// Remove the staging directories of dead instances: those whose lock can be taken,
+/// those without a lock file, and `.new-*` ones abandoned half-created. A directory
+/// whose lock is held belongs to a live instance and is left alone, and so is any
+/// entry that is not a directory (a symlink included).
+#[cfg(unix)]
+fn remove_dead_staging(staging_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(staging_root) else {
+        return;
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        // `DirEntry::metadata` does not follow symlinks.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let name = entry.file_name();
+        // Held until the directory is gone, so no other starting instance races us.
+        let mut held = None;
+        let dead = if name.to_string_lossy().starts_with(STAGING_NEW_PREFIX) {
+            meta.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= STAGING_NEW_MAX_AGE)
+        } else {
+            match std::fs::File::open(dir.join(STAGING_LOCK_FILE)) {
+                Ok(lock) => match try_lock_exclusive(&lock) {
+                    Ok(true) => {
+                        held = Some(lock);
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "cannot test a staging lock; leaving it");
+                        false
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            }
+        };
+        if dead && std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+        drop(held);
+    }
+    if removed > 0 {
+        tracing::info!(removed, dir = %staging_root.display(), "Removed the staging directories of dead instances");
+    }
+}
+
+/// This instance's staging directory, opening it on first use.
+fn staging_dir_sync<'a>(
+    cell: &'a std::sync::OnceLock<Option<Staging>>,
+    root: &Path,
+) -> Option<&'a Path> {
+    cell.get_or_init(|| match open_staging(root) {
+        Ok(staging) => Some(staging),
+        Err(e) => {
+            tracing::warn!(root = %root.display(), error = %e, "No staging directory; writes stage their temp file beside the key");
+            None
+        }
+    })
+    .as_ref()
+    .map(|staging| staging.dir.as_path())
+}
+
+/// Whether `path` is the staging directory of the storage root `base`.
+fn is_staging_dir(path: &Path, base: &Path) -> bool {
+    path.parent() == Some(base)
+        && path.file_name() == Some(std::ffi::OsStr::new(crate::validation::STAGING_DIR))
+}
+
+fn create_tmp_sync(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> std::io::Result<(TmpFileGuard, std::fs::File)> {
+    for tmp in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((TmpFileGuard::new(tmp), file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free temp name after {TMP_CREATE_ATTEMPTS} attempts"),
+    ))
 }
 
 /// Removes a write's temp file unless the write published it. The removal lives in
@@ -68,45 +261,6 @@ impl TmpFileGuard {
     fn published(mut self) {
         self.published = true;
     }
-}
-
-/// Create a new temp file for a write of `path`, under a name no file has yet.
-///
-/// The name lives beside the key, where a stored key can have exactly that name (a raw
-/// upload `x.tmp.<pid>.<seq>`). The file is therefore created exclusively (`O_EXCL`):
-/// a name that is taken is skipped for the next candidate, and an existing file is
-/// never opened, truncated or renamed away. The guard is armed only once the file is
-/// ours, so it can never remove somebody else's.
-async fn create_tmp(path: &Path) -> Result<(TmpFileGuard, fs::File)> {
-    let candidates: Vec<PathBuf> = (0..TMP_CREATE_ATTEMPTS)
-        .map(|_| unique_tmp_path(path))
-        .collect();
-    // CANCEL-SAFETY: the file is created and its guard armed inside one blocking task,
-    // and the guard travels in the task's output. If this future is dropped, tokio
-    // drops that output with the JoinHandle or when the task completes, so the guard
-    // still removes the file; a task not yet started at runtime shutdown never runs.
-    let (guard, file) = tokio::task::spawn_blocking(move || create_tmp_sync(candidates))
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))?;
-    Ok((guard, fs::File::from_std(file)))
-}
-
-fn create_tmp_sync(candidates: Vec<PathBuf>) -> std::io::Result<(TmpFileGuard, std::fs::File)> {
-    for tmp in candidates {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => return Ok((TmpFileGuard::new(tmp), file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("no free temp name after {TMP_CREATE_ATTEMPTS} attempts"),
-    ))
 }
 
 impl Drop for TmpFileGuard {
@@ -139,6 +293,8 @@ pub struct LocalStorage {
     pins: Arc<HashPinStore>,
     /// Per-key commit locks, see [`Self::commit_lock`].
     commit_locks: crate::PublishLocks,
+    /// This instance's staging directory, see [`Staging`].
+    staging: StagingCell,
 }
 
 impl LocalStorage {
@@ -149,6 +305,7 @@ impl LocalStorage {
             base_path,
             pins,
             commit_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            staging: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -198,6 +355,91 @@ impl LocalStorage {
             })
     }
 
+    /// Create a new temp file for a write of `dest`, in this instance's staging
+    /// directory (see [`Staging`]).
+    #[cfg(test)]
+    async fn create_tmp(&self, dest: &Path) -> Result<(TmpFileGuard, fs::File)> {
+        self.create_tmp_in(dest, TmpPlace::Staging).await
+    }
+
+    /// Create a new temp file for a write of `dest` at `place`, under a name no file
+    /// has yet.
+    ///
+    /// A name beside the key can be exactly a stored key's name (a raw upload
+    /// `x.tmp.<pid>.<seq>`), and staging can hold anything a crash left. The file is
+    /// therefore created exclusively (`O_EXCL`): a name that is taken is skipped for
+    /// the next candidate, and an existing file is never opened, truncated or renamed
+    /// away. The guard is armed only once the file is ours, so it can never remove
+    /// somebody else's. The candidates' sequence numbers are drawn here, on the
+    /// caller's thread; the staging directory is opened on the blocking pool.
+    async fn create_tmp_in(
+        &self,
+        dest: &Path,
+        place: TmpPlace,
+    ) -> Result<(TmpFileGuard, fs::File)> {
+        let seqs: Vec<u64> = (0..TMP_CREATE_ATTEMPTS).map(|_| next_tmp_seq()).collect();
+        let cell = Arc::clone(&self.staging);
+        let root = self.base_path.clone();
+        let dest = dest.to_path_buf();
+        // CANCEL-SAFETY: the file is created and its guard armed inside one blocking task,
+        // and the guard travels in the task's output. If this future is dropped, tokio
+        // drops that output with the JoinHandle or when the task completes, so the guard
+        // still removes the file; a task not yet started at runtime shutdown never runs.
+        let (guard, file) = tokio::task::spawn_blocking(move || {
+            let staging = match place {
+                TmpPlace::Staging => staging_dir_sync(&cell, &root),
+                TmpPlace::BesideKey => None,
+            };
+            create_tmp_sync(seqs.into_iter().map(|seq| match staging {
+                Some(dir) => dir.join(staging_tmp_name(seq)),
+                None => tmp_path_with_seq(&dest, seq),
+            }))
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))?;
+        Ok((guard, fs::File::from_std(file)))
+    }
+
+    /// Write `data` to a new temp file for `dest` at `place` and make it durable; the
+    /// caller renames it into place.
+    async fn write_tmp(&self, dest: &Path, data: &[u8], place: TmpPlace) -> Result<TmpFileGuard> {
+        let (tmp, mut file) = self.create_tmp_in(dest, place).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(tmp)
+    }
+
+    /// Copy `src` to a new temp file for `dest` at `place` and make it durable; the
+    /// caller renames it into place.
+    async fn copy_to_tmp(&self, src: &Path, dest: &Path, place: TmpPlace) -> Result<TmpFileGuard> {
+        let mut reader = fs::File::open(src).await?;
+        let (tmp, mut writer) = self.create_tmp_in(dest, place).await?;
+        let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n]).await?;
+        }
+        writer.flush().await?;
+        // Durability: fsync the copied data before publishing it. flush() only pushes
+        // to the OS; sync_all() makes it crash-durable, matching the put() path (the
+        // direct-rename branch relies on the caller having fsync'd src).
+        writer.sync_all().await?;
+        Ok(tmp)
+    }
+
+    /// This instance's staging directory, once a write has opened it.
+    #[cfg(test)]
+    fn staging_dir(&self) -> Option<PathBuf> {
+        self.staging
+            .get()
+            .and_then(|staging| staging.as_ref())
+            .map(|staging| staging.dir.clone())
+    }
+
     fn key_to_path(&self, key: &str) -> PathBuf {
         self.base_path.join(key)
     }
@@ -217,7 +459,7 @@ impl LocalStorage {
                             results.push(key);
                         }
                     }
-                } else if path.is_dir() {
+                } else if path.is_dir() && !is_staging_dir(&path, base) {
                     Self::list_files_sync(&path, base, prefix, results);
                 }
             }
@@ -262,7 +504,7 @@ impl LocalStorage {
                             ));
                         }
                     }
-                } else if metadata.is_dir() {
+                } else if metadata.is_dir() && !is_staging_dir(&path, base) {
                     Self::list_files_with_meta_sync(&path, base, prefix, results);
                 }
             }
@@ -280,19 +522,28 @@ impl StorageBackend for LocalStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        // Atomic write: create temp file in same directory, write, rename.
+        // Atomic write: write a temp file in staging, fsync, rename into place.
         // This prevents readers from seeing partial/truncated data during write.
         // Body and pin are published as one critical section (#1041, see commit_lock).
         let lock = self.commit_lock(key);
         let _commit = lock.lock().await;
         // CANCEL-SAFETY: the guard removes the temp file however the write ends —
-        // error or cancellation at any `.await`, `create_tmp` included — until the
+        // error or cancellation at any `.await`, `create_tmp_in` included — until the
         // rename publishes it.
-        let (tmp, mut file) = create_tmp(&path).await?;
-        file.write_all(data).await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        fs::rename(tmp.path(), &path).await?;
+        let tmp = self.write_tmp(&path, data, TmpPlace::Staging).await?;
+        let tmp = match fs::rename(tmp.path(), &path).await {
+            Ok(()) => tmp,
+            // The key's directory is on another filesystem than staging (a registry
+            // directory mounted on its own): redo the write beside the key, where the
+            // rename cannot cross. The staged copy goes with its guard.
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                drop(tmp);
+                let beside = self.write_tmp(&path, data, TmpPlace::BesideKey).await?;
+                fs::rename(beside.path(), &path).await?;
+                beside
+            }
+            Err(e) => return Err(e.into()),
+        };
         tmp.published();
         // Durability: make the rename's directory entry survive power-loss.
         sync_parent_dir(&path).await?;
@@ -438,6 +689,14 @@ impl StorageBackend for LocalStorage {
                             if is_root && path.file_name().is_some_and(|n| n == "tmp") {
                                 continue;
                             }
+                            // Writes in progress, see `Staging`.
+                            if is_root
+                                && path
+                                    .file_name()
+                                    .is_some_and(|n| n == crate::validation::STAGING_DIR)
+                            {
+                                continue;
+                            }
                             total += dir_size(&path, false);
                         }
                     }
@@ -452,6 +711,18 @@ impl StorageBackend for LocalStorage {
 
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    async fn prepare(&self) {
+        let cell = Arc::clone(&self.staging);
+        let root = self.base_path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            staging_dir_sync(&cell, &root);
+        })
+        .await
+        {
+            tracing::warn!(error = %e, "Opening the staging directory failed");
+        }
     }
 
     async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
@@ -469,28 +740,23 @@ impl StorageBackend for LocalStorage {
                 // Durability: make the rename's directory entry survive power-loss.
                 sync_parent_dir(&dest).await?;
             }
-            Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
-                let mut reader = fs::File::open(src).await?;
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
                 // Each writer stages its own copy: two fills of one blob must not share
                 // (and truncate, and rename away) one temp file.
                 // CANCEL-SAFETY: as in put(), the guard removes the temp file on error
                 // or cancellation until the rename publishes it.
-                let (tmp, mut writer) = create_tmp(&dest).await?;
-                let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
-                loop {
-                    let n = reader.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
+                let tmp = self.copy_to_tmp(src, &dest, TmpPlace::Staging).await?;
+                let tmp = match fs::rename(tmp.path(), &dest).await {
+                    Ok(()) => tmp,
+                    // dest is on another filesystem than staging too: copy beside it.
+                    Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                        drop(tmp);
+                        let beside = self.copy_to_tmp(src, &dest, TmpPlace::BesideKey).await?;
+                        fs::rename(beside.path(), &dest).await?;
+                        beside
                     }
-                    writer.write_all(&buf[..n]).await?;
-                }
-                writer.flush().await?;
-                // Durability: fsync the copied data before publishing it.
-                // flush() only pushes to the OS; sync_all() makes it crash-
-                // durable, matching the put() path (the direct-rename branch
-                // relies on the caller having fsync'd src).
-                writer.sync_all().await?;
-                fs::rename(tmp.path(), &dest).await?;
+                    Err(e) => return Err(e.into()),
+                };
                 tmp.published();
                 // Durability: make the rename's directory entry durable.
                 sync_parent_dir(&dest).await?;
@@ -617,6 +883,8 @@ mod tests {
     #[tokio::test]
     async fn put_never_reuses_a_stored_key_named_like_its_temp_file() {
         let dir = TempDir::new().unwrap();
+        // The temp name beside the key is the fallback path (no staging directory).
+        block_staging(dir.path());
         let storage = LocalStorage::new(dir.path().to_str().unwrap());
         let seq = 9_000_000;
         let stored = tmp_key("raw/report", seq);
@@ -637,6 +905,8 @@ mod tests {
     #[tokio::test]
     async fn put_gives_up_after_bounded_temp_name_collisions() {
         let dir = TempDir::new().unwrap();
+        // The temp name beside the key is the fallback path (no staging directory).
+        block_staging(dir.path());
         let storage = LocalStorage::new(dir.path().to_str().unwrap());
         let seq = 9_100_000;
         let stored: Vec<String> = (0..u64::from(TMP_CREATE_ATTEMPTS))
@@ -774,20 +1044,36 @@ mod tests {
     }
 
     /// Temp files (`<name>.tmp.<pid>.<seq>`) under `dir`, recursively.
+    /// Temp files under the storage root `dir`: `<name>.tmp.<pid>.<seq>` beside a
+    /// key, and every file in the staging directory except an instance's lock.
     fn tmp_leftovers(dir: &Path) -> Vec<String> {
+        let staging = dir.join(crate::validation::STAGING_DIR);
         let mut found = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
-            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.to_string_lossy().contains(".tmp.") {
+                } else if path.to_string_lossy().contains(".tmp.")
+                    || (path.starts_with(&staging)
+                        && path != staging
+                        && entry.file_name() != STAGING_LOCK_FILE)
+                {
                     found.push(path.to_string_lossy().into_owned());
                 }
             }
         }
         found
+    }
+
+    /// Make the staging directory impossible to create (a plain file has its name),
+    /// so writes fall back to a temp file beside the key.
+    fn block_staging(dir: &Path) {
+        std::fs::write(dir.join(crate::validation::STAGING_DIR), b"").unwrap();
     }
 
     /// Spawn four 8 MiB writes on a multi-thread runtime, wait until one of them
@@ -799,7 +1085,7 @@ mod tests {
         dir: &Path,
         round: u32,
         stored: usize,
-    ) -> bool {
+    ) -> Vec<String> {
         let data: Arc<Vec<u8>> = Arc::new(vec![0x5a; 8 << 20]);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -815,9 +1101,13 @@ mod tests {
         while tmp_leftovers(dir).len() <= stored && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        let caught = tmp_leftovers(dir).len() > stored;
+        let seen = tmp_leftovers(dir);
         drop(rt);
-        caught
+        if seen.len() > stored {
+            seen
+        } else {
+            Vec::new()
+        }
     }
 
     /// A SIGTERM ends `main`, and the runtime it drops cancels every task still
@@ -832,7 +1122,7 @@ mod tests {
         for round in 0..5 {
             let dir = TempDir::new().unwrap();
             let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
-            if drop_runtime_mid_write(&storage, dir.path(), round, 0) {
+            if !drop_runtime_mid_write(&storage, dir.path(), round, 0).is_empty() {
                 caught_mid_write += 1;
             }
             let leftovers = tmp_leftovers(dir.path());
@@ -865,7 +1155,7 @@ mod tests {
         drop(rt);
 
         assert!(
-            drop_runtime_mid_write(&storage, dir.path(), 0, keys.len()),
+            !drop_runtime_mid_write(&storage, dir.path(), 0, keys.len()).is_empty(),
             "the writes must be caught mid-way for this to test anything"
         );
 
@@ -877,6 +1167,317 @@ mod tests {
                 .unwrap_or_else(|e| panic!("stored key {key} is gone: {e:?}"));
             assert_eq!(&body[..], key.as_bytes());
         }
+    }
+
+    // --- E: staging directory ---
+
+    /// A write in progress lives in this instance's staging directory, never beside
+    /// the key it is writing: after a crash a file beside a key looks like a key.
+    #[test]
+    fn in_flight_write_is_staged_not_beside_its_key() {
+        for round in 0..5 {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+            let seen = drop_runtime_mid_write(&storage, dir.path(), round, 0);
+            if seen.is_empty() {
+                continue;
+            }
+            let staging = dir.path().join(crate::validation::STAGING_DIR);
+            for path in &seen {
+                assert!(
+                    Path::new(path).starts_with(&staging),
+                    "a write in progress outside the staging directory: {path}"
+                );
+            }
+            return;
+        }
+        panic!("no round caught a write mid-way");
+    }
+
+    /// Take a temp file from `storage` as a write would, and keep it: the returned
+    /// path stays on disk until the guard drops.
+    fn take_tmp(rt: &tokio::runtime::Runtime, storage: &LocalStorage) -> TmpFileGuard {
+        let dest = storage.key_to_path("npm/pkg/-/pkg-1.0.0.tgz");
+        let (guard, _file) = rt.block_on(storage.create_tmp(&dest)).unwrap();
+        guard
+    }
+
+    /// SIGKILL, OOM or a power cut: the instance's temp file stays, its guard never
+    /// ran. The instance's lock went with its file descriptors, so the next instance
+    /// to open the staging directory removes what the dead one left.
+    #[test]
+    fn a_new_instance_removes_the_staging_of_a_dead_one() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let dead = LocalStorage::new(root);
+        let orphan = take_tmp(&rt, &dead);
+        let orphan_path = orphan.path().to_path_buf();
+        std::mem::forget(orphan);
+        let dead_dir = dead
+            .staging_dir()
+            .expect("a write opens the staging directory");
+        assert!(orphan_path.starts_with(&dead_dir));
+        drop(dead);
+        assert!(orphan_path.exists(), "nothing removed it yet");
+
+        let next = LocalStorage::new(root);
+        rt.block_on(put(&next, "npm/other/-/other-1.0.0.tgz", b"x"))
+            .unwrap();
+        assert!(
+            !orphan_path.exists(),
+            "the dead instance's temp file is still there"
+        );
+        assert!(
+            !dead_dir.exists(),
+            "the dead instance's staging directory is still there"
+        );
+    }
+
+    /// A staging directory under its final name without a lock file was being removed
+    /// when its remover died: no live instance owns it.
+    #[test]
+    fn a_staging_directory_without_a_lock_is_removed() {
+        let dir = TempDir::new().unwrap();
+        let lockless = dir
+            .path()
+            .join(crate::validation::STAGING_DIR)
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(&lockless).unwrap();
+        std::fs::write(lockless.join("7.tmp"), b"left").unwrap();
+
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(storage.prepare());
+        assert!(!lockless.exists());
+    }
+
+    /// The removal happens at start, not only at the first write after it: a server
+    /// that restarts and only serves reads still clears the dead instance's files.
+    #[test]
+    fn start_removes_the_staging_of_a_dead_instance_without_a_write() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let dead = LocalStorage::new(root);
+        let orphan = take_tmp(&rt, &dead);
+        let orphan_path = orphan.path().to_path_buf();
+        std::mem::forget(orphan);
+        drop(dead);
+
+        let next = LocalStorage::new(root);
+        rt.block_on(next.prepare());
+        assert!(
+            !orphan_path.exists(),
+            "start left the dead instance's temp file"
+        );
+        assert!(
+            next.staging_dir().is_some(),
+            "start opens this instance's staging"
+        );
+    }
+
+    /// The other side: during a rolling update two instances share the volume. The
+    /// new one must leave the old one's write in progress alone, and a stored key
+    /// shaped like a temp file is never staging at all.
+    #[test]
+    fn a_new_instance_keeps_the_staging_of_a_live_one() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let live = LocalStorage::new(root);
+        rt.block_on(put(&live, "raw/report.tmp.1.2", b"stored"))
+            .unwrap();
+        let in_flight = take_tmp(&rt, &live);
+        let live_dir = live.staging_dir().unwrap();
+
+        let next = LocalStorage::new(root);
+        rt.block_on(put(&next, "npm/other/-/other-1.0.0.tgz", b"x"))
+            .unwrap();
+        assert!(
+            in_flight.path().exists(),
+            "the live instance's write was removed"
+        );
+        assert!(live_dir.exists());
+        assert_ne!(next.staging_dir().unwrap(), live_dir);
+        assert_eq!(
+            &rt.block_on(get(&next, "raw/report.tmp.1.2")).unwrap()[..],
+            b"stored"
+        );
+
+        let path = in_flight.path().to_path_buf();
+        drop(in_flight);
+        assert!(
+            !path.exists(),
+            "the guard still removes its own file at once"
+        );
+    }
+
+    /// A staging directory caught half-created (`.new-*`, before its rename) is
+    /// removed once it is old enough that no instance can still be creating it.
+    #[test]
+    fn a_half_created_staging_directory_is_removed_only_when_stale() {
+        let dir = TempDir::new().unwrap();
+        let staging = dir.path().join(crate::validation::STAGING_DIR);
+        let old = staging.join(format!("{STAGING_NEW_PREFIX}old"));
+        let young = staging.join(format!("{STAGING_NEW_PREFIX}young"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&young).unwrap();
+        let long_ago = std::time::SystemTime::now() - STAGING_NEW_MAX_AGE * 2;
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(put(&storage, "raw/a", b"a")).unwrap();
+        assert!(!old.exists(), "a stale half-created directory stays");
+        assert!(
+            young.exists(),
+            "a directory still being created was removed"
+        );
+    }
+
+    /// Staging is storage bookkeeping, not an artifact: it is left out of the size
+    /// gauge and of the backend's own listings, by its directory and not by a name
+    /// pattern.
+    #[tokio::test]
+    async fn staging_is_left_out_of_size_and_listings() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(&storage, "raw/a", b"abc").await.unwrap();
+        let dest = storage.key_to_path("raw/b");
+        let (in_flight, mut file) = storage.create_tmp(&dest).await.unwrap();
+        file.write_all(&[0u8; 1000]).await.unwrap();
+        file.flush().await.unwrap();
+        assert!(in_flight.path().exists());
+
+        assert_eq!(storage.total_size().await, 3);
+        assert_eq!(storage.list("").await.unwrap(), vec!["raw/a".to_string()]);
+        let listed: Vec<String> = storage
+            .list_with_meta("")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(listed, vec!["raw/a".to_string()]);
+    }
+
+    /// A taken name in staging is skipped like one beside a key, the retry is
+    /// bounded, and an existing file there is never touched.
+    #[tokio::test]
+    async fn staging_skips_taken_names_and_gives_up_after_the_bound() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(&storage, "raw/first", b"1").await.unwrap();
+        let staging = storage.staging_dir().unwrap();
+        let seq = 9_200_000;
+        let taken: Vec<PathBuf> = (0..u64::from(TMP_CREATE_ATTEMPTS))
+            .map(|i| staging.join(staging_tmp_name(seq + i)))
+            .collect();
+        for path in &taken {
+            std::fs::write(path, b"someone else's").unwrap();
+        }
+
+        NEXT_TMP_SEQ.with(|next| next.set(Some(seq)));
+        let all_taken = put(&storage, "raw/report", b"new body").await;
+        NEXT_TMP_SEQ.with(|next| next.set(Some(seq + 2)));
+        let some_free = put(&storage, "raw/report", b"new body").await;
+        NEXT_TMP_SEQ.with(|next| next.set(None));
+
+        assert!(
+            all_taken.is_err(),
+            "every staging name is taken: the write must fail"
+        );
+        some_free.expect("a free name after two taken ones");
+        assert_eq!(&get(&storage, "raw/report").await.unwrap()[..], b"new body");
+        for path in &taken {
+            assert_eq!(std::fs::read(path).unwrap(), b"someone else's");
+        }
+    }
+
+    /// When a key's directory sits on another filesystem than the storage root (a
+    /// registry directory mounted separately), the rename out of staging fails with
+    /// EXDEV. The write is redone beside the key and lands; nothing stays in staging.
+    /// Skipped where no second filesystem is available.
+    #[tokio::test]
+    async fn write_across_a_mount_point_falls_back_beside_the_key() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(other_fs) = TempDir::new_in("/dev/shm") else {
+            eprintln!("skip: /dev/shm unavailable, cannot force EXDEV");
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        if std::fs::metadata(other_fs.path()).unwrap().dev()
+            == std::fs::metadata(dir.path()).unwrap().dev()
+        {
+            eprintln!("skip: /dev/shm and the temp dir share a filesystem, no EXDEV");
+            return;
+        }
+        std::os::unix::fs::symlink(other_fs.path(), dir.path().join("npm")).unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let data = vec![7u8; 100_000];
+
+        put(&storage, "npm/pkg/-/pkg-1.0.0.tgz", &data)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get(&storage, "npm/pkg/-/pkg-1.0.0.tgz").await.unwrap(),
+            data
+        );
+        let leftovers = tmp_leftovers(dir.path());
+        let elsewhere = tmp_leftovers(other_fs.path());
+        assert!(
+            leftovers.is_empty() && elsewhere.is_empty(),
+            "{leftovers:?} {elsewhere:?}"
+        );
+    }
+
+    /// `put_from_path` into a key on another filesystem than both the spool and the
+    /// staging directory: the direct rename and the rename out of staging both fail
+    /// with EXDEV, and the copy beside the key lands. Skipped where no second
+    /// filesystem is available.
+    #[tokio::test]
+    async fn put_from_path_across_a_mount_point_lands() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(other_fs) = TempDir::new_in("/dev/shm") else {
+            eprintln!("skip: /dev/shm unavailable, cannot force EXDEV");
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        if std::fs::metadata(other_fs.path()).unwrap().dev()
+            == std::fs::metadata(dir.path()).unwrap().dev()
+        {
+            eprintln!("skip: /dev/shm and the temp dir share a filesystem, no EXDEV");
+            return;
+        }
+        std::os::unix::fs::symlink(other_fs.path(), dir.path().join("docker")).unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let spool = dir.path().join("tmp/docker-proxy/spool-1");
+        std::fs::create_dir_all(spool.parent().unwrap()).unwrap();
+        let data = vec![3u8; 100_000];
+        std::fs::write(&spool, &data).unwrap();
+
+        storage
+            .put_from_path("docker/blobs/sha256-ab", &spool, None)
+            .await
+            .unwrap();
+
+        assert_eq!(get(&storage, "docker/blobs/sha256-ab").await.unwrap(), data);
+        assert!(!spool.exists(), "the spool is consumed");
+        let leftovers = tmp_leftovers(dir.path());
+        let elsewhere = tmp_leftovers(other_fs.path());
+        assert!(
+            leftovers.is_empty() && elsewhere.is_empty(),
+            "{leftovers:?} {elsewhere:?}"
+        );
     }
 
     #[tokio::test]

@@ -1927,6 +1927,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 
+    // Open this instance's staging directory, removing what dead instances (SIGKILL,
+    // OOM, power cut) left in theirs.
+    state.storage.prepare().await;
+
     // Clean up stale Docker temp files from previous runs (#530, #580).
     if state.config.docker.enabled {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);

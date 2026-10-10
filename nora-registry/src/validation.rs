@@ -31,6 +31,8 @@ pub enum ValidationError {
     TooLong { max: usize, actual: usize },
     /// Contains forbidden characters
     ForbiddenCharacter(char),
+    /// Names a path the storage reserves for itself
+    ReservedPath(&'static str),
 }
 
 impl fmt::Display for ValidationError {
@@ -45,6 +47,7 @@ impl fmt::Display for ValidationError {
                 write!(f, "Input exceeds maximum length ({} > {})", actual, max)
             }
             Self::ForbiddenCharacter(c) => write!(f, "Forbidden character: {:?}", c),
+            Self::ReservedPath(p) => write!(f, "Reserved path: {}", p),
         }
     }
 }
@@ -61,6 +64,12 @@ pub fn ends_with_ci(s: &str, suffix: &str) -> bool {
 
 /// Maximum allowed storage key length
 const MAX_KEY_LENGTH: usize = 1024;
+
+/// Service directory under the local storage root where writes in progress are
+/// staged, and where a start removes what dead instances left. Not a storage key:
+/// [`validate_storage_key`] refuses a key whose first segment names it, so no request,
+/// restored archive or migrated bucket can place a key there.
+pub const STAGING_DIR: &str = ".nora-staging";
 
 /// Maximum Docker name length
 const MAX_DOCKER_NAME_LENGTH: usize = 256;
@@ -95,6 +104,16 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     // Check for null bytes
     if key.contains('\0') {
         return Err(ValidationError::ForbiddenCharacter('\0'));
+    }
+
+    // The local backend's staging directory: a start deletes what dead instances
+    // left there, so a key in it would be deleted too.
+    if key
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(STAGING_DIR))
+    {
+        return Err(ValidationError::ReservedPath(STAGING_DIR));
     }
 
     // Check for absolute paths
@@ -526,6 +545,31 @@ mod tests {
             validate_storage_key(""),
             Err(ValidationError::EmptyInput)
         ));
+    }
+
+    /// The local backend stages writes in progress under `<root>/.nora-staging/`,
+    /// and a start removes what dead instances left there. A key in that directory
+    /// (from a restored archive, a migrated bucket, a crafted request) would be
+    /// staging the next start deletes, so no key may name it. Only the first segment
+    /// is reserved.
+    #[test]
+    fn storage_key_refuses_the_staging_directory() {
+        for key in [
+            ".nora-staging",
+            ".nora-staging/",
+            ".nora-staging/0b1c/17.tmp",
+            ".NORA-Staging/x",
+        ] {
+            assert!(validate_storage_key(key).is_err(), "{key} must be refused");
+        }
+        for key in [
+            "raw/.nora-staging/x",
+            ".nora-staging-other/x",
+            ".nora-stagingx",
+            "raw/report.tmp.1.2",
+        ] {
+            assert!(validate_storage_key(key).is_ok(), "{key} must stay valid");
+        }
     }
 
     #[test]

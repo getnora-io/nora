@@ -69,6 +69,11 @@ ruzstd = "0.8"
 pgp = { version = "0.20", default-features = false }
 rand = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+# flock(2) on the local backend's staging lock, without unsafe; already in the tree
+# through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
 rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
