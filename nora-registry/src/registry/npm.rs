@@ -429,7 +429,19 @@ async fn handle_request(
     // sidecar / curation integrity checks can run on it: the range serve stands down
     // while quarantine holds artifacts, and integrity is the client's own lockfile
     // hash, as docker does.
+    // #1055: in a scope owned by a private upstream, only what that owner delivered
+    // (or what was published here) may be served from cache — never a copy cached
+    // from another upstream before the scope had an owner.
+    let cache_trusted = cached_copy_trusted(
+        &state,
+        &path,
+        &key,
+        &package_name,
+        tarball_version.as_deref(),
+    )
+    .await;
     if is_tarball
+        && cache_trusted
         && headers.contains_key(header::RANGE)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
     {
@@ -462,7 +474,12 @@ async fn handle_request(
     // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. The
     // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
     // pins are local-only).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let cached = if cache_trusted {
+        state.storage.get_verified(&key).await.ok()
+    } else {
+        None
+    };
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -763,8 +780,11 @@ async fn handle_request(
                     let key_clone = key.clone();
                     let invalidate_npm = is_tarball;
                     let repo_index = Arc::clone(&state.repo_index);
+                    let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
-                        if let Err(e) = storage.put(&key_clone, &data_to_cache).await {
+                        if let Err(e) =
+                            put_with_origin(&storage, &key_clone, &data_to_cache, &origin).await
+                        {
                             tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
                         } else if invalidate_npm {
                             repo_index.invalidate("npm");
@@ -811,6 +831,79 @@ async fn handle_request(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Provenance sidecar of a cached npm object: which upstream delivered it (#1055).
+fn origin_key(key: &str) -> String {
+    format!("{key}.origin")
+}
+
+/// The identity recorded in the sidecar — the breaker's canonical upstream key, so
+/// userinfo and a trailing slash do not make one upstream look like two.
+fn origin_of(upstream_url: &str) -> String {
+    crate::circuit_breaker::upstream_key("npm", upstream_url)
+}
+
+/// Cache an upstream object, then record where it came from. Data first: a sidecar
+/// that exists always describes bytes already written; a failed sidecar write only
+/// costs a refetch.
+async fn put_with_origin(
+    storage: &crate::Storage,
+    key: &str,
+    data: &[u8],
+    origin: &str,
+) -> Result<(), crate::storage::StorageError> {
+    storage.put(key, data).await?;
+    if let Err(e) = storage.put(&origin_key(key), origin.as_bytes()).await {
+        tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
+    }
+    Ok(())
+}
+
+/// May the cached copy at `key` be served for `path`?
+///
+/// Outside scopes owned by an `npm.proxies` entry: yes, as before. Inside one: only
+/// what that owner delivered (sidecar names it) or what was published here
+/// (`versions/` keys). A copy cached from another upstream — a squatter on the public
+/// registry cached before the scope got an owner, or any cache from before
+/// provenance was recorded — is treated as absent: refetched from the owner, and
+/// never served as a stale fallback when the owner is down.
+async fn cached_copy_trusted(
+    state: &AppState,
+    path: &str,
+    key: &str,
+    package_name: &str,
+    tarball_version: Option<&str>,
+) -> bool {
+    let Some(scope) = npm_scope_of(path) else {
+        return true;
+    };
+    if !state.config.npm.owned_scopes().any(|owned| owned == scope) {
+        return true;
+    }
+    let published_here = match tarball_version {
+        Some(version) => state
+            .storage
+            .stat(&format!("npm/{package_name}/versions/{version}.json"))
+            .await
+            .is_some(),
+        None => !state
+            .storage
+            .list(&format!("npm/{package_name}/versions/"))
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+    };
+    if published_here {
+        return true;
+    }
+    let Some(owner) = state.config.npm.route(path) else {
+        return false;
+    };
+    match state.storage.get(&origin_key(key)).await {
+        Ok(recorded) => recorded.as_ref() == origin_of(owner.url).as_bytes(),
+        Err(_) => false,
+    }
 }
 
 /// Refetch metadata from upstream, rewrite URLs, update cache.
@@ -860,8 +953,9 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     let storage = state.storage.clone();
                     let key_clone = key.to_string();
                     let body = cached.clone();
+                    let origin = origin_of(proxy_url);
                     tokio::spawn(async move {
-                        let _ = storage.put(&key_clone, &body).await;
+                        let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
                     });
                     Some(cached.to_vec())
                 }
@@ -896,10 +990,11 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
             let storage = state.storage.clone();
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
+            let origin = origin_of(proxy_url);
             tokio::spawn(async move {
                 // Body first; the validator sidecar must never advertise
                 // freshness for a body that isn't there (#596).
-                if let Err(e) = storage.put(&key_clone, &cache_data).await {
+                if let Err(e) = put_with_origin(&storage, &key_clone, &cache_data, &origin).await {
                     tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
                     return;
                 }
@@ -1344,7 +1439,9 @@ fn semver_key(v: &str) -> (u64, u64, u64, bool) {
 /// `ensure_pypi_dates_cached`.
 async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     let key = format!("npm/{}/metadata.json", package_name);
-    if state.storage.get(&key).await.is_ok() {
+    if state.storage.get(&key).await.is_ok()
+        && cached_copy_trusted(state, package_name, &key, package_name, None).await
+    {
         return;
     }
     // #68: never fetch an internal-namespace package's metadata upstream.
@@ -1383,7 +1480,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
             let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
             replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
         });
-        let _ = state.storage.put(&key, &rewritten).await;
+        let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
     }
 }
 
@@ -4303,10 +4400,12 @@ mod multi_upstream_tests {
             // The cache write is a background task; wait for it so the next pass
             // deterministically takes the stale-refetch path, not a second cold fetch.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Settled = body AND provenance sidecar written (#1055: an owned scope's
+            // copy is only served once its origin is recorded).
             while ctx
                 .state
                 .storage
-                .get("npm/@vendor/a/metadata.json")
+                .get("npm/@vendor/a/metadata.json.origin")
                 .await
                 .is_err()
             {
@@ -4506,7 +4605,7 @@ mod multi_upstream_tests {
             );
         }
         assert!(cached("npm/lodash/metadata.json").await);
-        assert!(cached("npm/@vendor/a/metadata.json").await);
+        assert!(cached("npm/@vendor/a/metadata.json.origin").await);
 
         // The private registry dies; fail it on the refetch and the self-prime paths.
         private.reset().await;
@@ -4649,6 +4748,204 @@ mod multi_upstream_tests {
         )
         .await;
         assert_eq!(private.received_requests().await.unwrap().len(), 1);
+        assert_public_clean(&public.received_requests().await.unwrap());
+    }
+
+    /// Seed what a public-registry squatter left in the cache before `@vendor` got
+    /// an owner: a packument advertising 1.99.0 and its tarball. `origin` = the
+    /// provenance sidecar value to leave behind (None = a cache from before #1055).
+    async fn seed_squatter(ctx: &crate::test_helpers::TestContext, origin: Option<String>) {
+        let packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.99.0": { "dist": { "tarball": "http://127.0.0.1/npm/@vendor/a/-/a-1.99.0.tgz" } } },
+            "dist-tags": { "latest": "1.99.0" }
+        });
+        let meta = "npm/@vendor/a/metadata.json";
+        let tgz = "npm/@vendor/a/tarballs/a-1.99.0.tgz";
+        ctx.state
+            .storage
+            .put(meta, packument.to_string().as_bytes())
+            .await
+            .unwrap();
+        ctx.state.storage.put(tgz, b"SQUATTER").await.unwrap();
+        if let Some(origin) = origin {
+            for key in [meta, tgz] {
+                ctx.state
+                    .storage
+                    .put(&format!("{key}.origin"), origin.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Once a scope has an owner, a copy cached from anywhere else — a squatter on
+    /// the public registry, or a cache from before the scope was owned — is never
+    /// served: not as a cache hit, not via Range, not as a stale fallback. The
+    /// owner's copy replaces it.
+    #[tokio::test]
+    async fn a_foreign_cached_copy_of_an_owned_scope_is_never_served() {
+        use crate::test_helpers::send_with_headers;
+        for foreign_origin in [None, Some("PUBLIC")] {
+            let public = public_upstream().await;
+            let private = MockServer::start().await;
+            let owner_packument = serde_json::json!({
+                "name": "@vendor/a",
+                "versions": { "1.0.0": { "dist": {
+                    "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+                } } },
+                "dist-tags": { "latest": "1.0.0" }
+            });
+            Mock::given(method("GET"))
+                .and(path("/@vendor/a"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(owner_packument.to_string()),
+                )
+                .mount(&private)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/@vendor/a/-/a-1.99.0.tgz"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&private)
+                .await;
+            let public_identity = crate::circuit_breaker::upstream_key("npm", &public.uri());
+            let proxies = vendor_proxies(&public.uri(), &private.uri());
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxies = proxies;
+                cfg.npm.metadata_ttl = 3600; // fresh: a plain TTL check would serve the squatter
+            });
+            seed_squatter(&ctx, foreign_origin.map(|_| public_identity.clone())).await;
+
+            let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2fa", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+            assert!(
+                body.contains("1.0.0") && !body.contains("1.99.0"),
+                "owner's packument, not the squatter's: {body}"
+            );
+
+            let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.99.0.tgz", "").await;
+            assert_ne!(
+                &body_bytes(resp).await[..],
+                b"SQUATTER",
+                "{foreign_origin:?}"
+            );
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/@vendor/a/-/a-1.99.0.tgz",
+                vec![("range", "bytes=0-3")],
+                "",
+            )
+            .await;
+            assert_ne!(
+                &body_bytes(resp).await[..],
+                b"SQUA",
+                "range must not serve it either"
+            );
+            assert_public_clean(&public.received_requests().await.unwrap());
+        }
+    }
+
+    /// With the owner down, the foreign copy is still not served (no stale fallback).
+    #[tokio::test]
+    async fn a_dead_owner_does_not_resurrect_a_foreign_copy() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.serve_stale = true;
+        });
+        seed_squatter(&ctx, None).await;
+        for uri in ["/npm/@vendor%2fa", "/npm/@vendor/a/-/a-1.99.0.tgz"] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_ne!(resp.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    /// What the owner delivered is cached and served without asking again; what was
+    /// published here is served even with the owner down.
+    #[tokio::test]
+    async fn owner_copies_and_local_publishes_are_served_from_cache() {
+        use axum::body::Body;
+        use base64::Engine as _;
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+            } } }
+        });
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a/-/a-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OWNER-TGZ".to_vec()))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
+        assert_eq!(&body_bytes(resp).await[..], b"OWNER-TGZ");
+        let origin_key = "npm/@vendor/a/tarballs/a-1.0.0.tgz.origin";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx.state.storage.get(origin_key).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "origin never recorded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Owner goes down: its own copy is still served from cache.
+        private.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&private)
+            .await;
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"OWNER-TGZ");
+
+        // A package published here under the owned scope is ours: served.
+        let payload = serde_json::json!({
+            "name": "@vendor/local",
+            "versions": { "1.0.0": { "dist": {} } },
+            "_attachments": { "local-1.0.0.tgz": {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"LOCAL-TGZ")
+            } },
+            "dist-tags": { "latest": "1.0.0" }
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/@vendor%2flocal",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/@vendor/local/-/local-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"LOCAL-TGZ");
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2flocal", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_public_clean(&public.received_requests().await.unwrap());
     }
 

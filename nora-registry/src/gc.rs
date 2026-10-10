@@ -528,15 +528,24 @@ fn is_meta_sidecar(key: &str) -> bool {
     key.starts_with("npm/") && ends_with_ci(key, ".meta")
 }
 
-/// True for any sidecar whose orphan rule is "primary artifact absent".
-fn is_orphanable_sidecar(key: &str) -> bool {
-    is_checksum_sidecar(key) || is_meta_sidecar(key)
+/// Cache provenance sidecars (`<key>.origin`, #1055) — npm-only, for the same
+/// reason as `.meta`: another format may legitimately store a file ending in `.origin`.
+fn is_origin_sidecar(key: &str) -> bool {
+    key.starts_with("npm/") && ends_with_ci(key, ".origin")
 }
 
-/// Primary artifact key a sidecar belongs to (checksum or `.meta`).
+/// True for any sidecar whose orphan rule is "primary artifact absent".
+fn is_orphanable_sidecar(key: &str) -> bool {
+    is_checksum_sidecar(key) || is_meta_sidecar(key) || is_origin_sidecar(key)
+}
+
+/// Primary artifact key a sidecar belongs to (checksum, `.meta` or `.origin`).
 fn primary_key_for_sidecar(key: &str) -> Option<&str> {
     if is_meta_sidecar(key) {
         return key.strip_suffix(".meta");
+    }
+    if is_origin_sidecar(key) {
+        return key.strip_suffix(".origin");
     }
     primary_key_for_checksum(key)
 }
@@ -1544,6 +1553,49 @@ mod tests {
             storage.get("maven/com/x/1.0/thing.meta").await.is_ok(),
             "a Maven .meta artifact must never be treated as a sidecar"
         );
+    }
+
+    /// `.origin` provenance sidecars (#1055) follow the `.meta` rule: an npm one
+    /// whose object is gone is reaped, a live one is kept, and a non-npm artifact
+    /// that happens to end in `.origin` is never treated as a sidecar.
+    #[tokio::test]
+    async fn test_gc_origin_sidecar_orphan_rule_is_npm_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put(
+                "npm/gone/tarballs/gone-1.0.0.tgz.origin",
+                b"npm:https://r.example",
+            )
+            .await
+            .unwrap();
+        storage
+            .put("npm/live/tarballs/live-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "npm/live/tarballs/live-1.0.0.tgz.origin",
+                b"npm:https://r.example",
+            )
+            .await
+            .unwrap();
+        storage
+            .put("raw/releases/build.origin", b"real-artifact")
+            .await
+            .unwrap();
+
+        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+
+        assert!(storage
+            .get("npm/gone/tarballs/gone-1.0.0.tgz.origin")
+            .await
+            .is_err());
+        assert!(storage
+            .get("npm/live/tarballs/live-1.0.0.tgz.origin")
+            .await
+            .is_ok());
+        assert!(storage.get("raw/releases/build.origin").await.is_ok());
     }
 
     #[tokio::test]
