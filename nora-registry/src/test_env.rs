@@ -11,20 +11,50 @@
 //! so `test_unknown_mode_still_fails_closed` failed about once in five full runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 /// Takes the env lock for the rest of the test: `let _lock = env_lock();` as the first
 /// statement of the test body.
 ///
-/// The mutex lives inside this function, so there is no way to lock it that skips the
-/// poison reset: ~90 tests share it, and after one panicking test every later `lock()`
-/// would fail too, turning a single failure into ninety that bury it.
+/// Poison is ignored: ~90 tests share the lock, and a test that panics under it would
+/// otherwise fail every test waiting for it, turning one failure into many that bury it.
+/// The mutex guards no data, so there is nothing a panic could leave half-written. The
+/// mutex lives inside this function, so every caller goes through this.
 pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    if ENV_MUTEX.is_poisoned() {
-        ENV_MUTEX.clear_poison();
-    }
-    ENV_MUTEX.lock().unwrap()
+    ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A test that panics while holding the lock does not fail the tests waiting for it.
+///
+/// The waiter must already be inside `lock()` when the holder panics: a check for poison
+/// before locking cannot help it, only taking the guard out of the `PoisonError` can.
+#[test]
+fn a_panic_under_the_env_lock_does_not_fail_the_waiters() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (held_tx, held_rx) = mpsc::channel();
+    let (panic_tx, panic_rx) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _lock = env_lock();
+        held_tx.send(()).unwrap();
+        panic_rx.recv().unwrap();
+        panic!("a failing test, holding the env lock");
+    });
+    held_rx.recv().unwrap();
+    let waiter = std::thread::spawn(|| drop(env_lock()));
+    // give the waiter time to block inside `lock()` before the holder panics
+    std::thread::sleep(Duration::from_millis(200));
+    panic_tx.send(()).unwrap();
+
+    assert!(holder.join().is_err(), "the holder was meant to panic");
+    assert!(
+        waiter.join().is_ok(),
+        "a test waiting for the env lock failed because another test panicked under it"
+    );
+    // and a test that comes later still gets the lock
+    drop(env_lock());
 }
 
 /// Every env-touching test of the crate holds [`env_lock`].
