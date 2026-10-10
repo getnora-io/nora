@@ -936,10 +936,20 @@ async fn put_with_origin(
     origin: &str,
 ) -> Result<(), crate::storage::StorageError> {
     storage.put(key, data).await?;
-    if let Err(e) = storage.put(&origin_key(key), origin.as_bytes()).await {
+    let record = provenance_record(origin, data);
+    if let Err(e) = storage.put(&origin_key(key), record.as_bytes()).await {
         tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
     }
     Ok(())
+}
+
+/// The provenance record of `data` cached from `origin`: the upstream identity, then
+/// the SHA-256 of exactly these bytes. The digest makes a record vouch only for the
+/// bytes it was written with: whatever replaces the object later — an older release
+/// after a rollback, which knows nothing of these records — changes the object's
+/// pin, and the record no longer matches it.
+fn provenance_record(origin: &str, data: &[u8]) -> String {
+    format!("{origin}\n{}", hex::encode(sha2::Sha256::digest(data)))
 }
 
 /// May the cached copy at `key` be served for `path`?
@@ -947,9 +957,10 @@ async fn put_with_origin(
 /// Outside scopes owned by an `npm.proxies` entry: yes, as before. Inside one: only
 /// what that owner delivered (sidecar names it) or what was published here
 /// (`versions/` keys). A copy cached from another upstream — a squatter on the public
-/// registry cached before the scope got an owner, or any cache from before
-/// provenance was recorded — is treated as absent: refetched from the owner, and
-/// never served as a stale fallback when the owner is down.
+/// registry cached before the scope got an owner, any cache from before provenance
+/// was recorded, or bytes that replaced the owner's after its record was written —
+/// is treated as absent: refetched from the owner, and never served as a stale
+/// fallback when the owner is down.
 async fn cached_copy_trusted(
     state: &AppState,
     path: &str,
@@ -982,10 +993,16 @@ async fn cached_copy_trusted(
     let Some(owner) = state.config.npm.route(path) else {
         return false;
     };
-    match state.storage.get(&origin_key(key)).await {
-        Ok(recorded) => recorded.as_ref() == origin_of(owner.url).as_bytes(),
-        Err(_) => false,
-    }
+    let Ok(recorded) = state.storage.get(&origin_key(key)).await else {
+        return false;
+    };
+    let Some((origin, digest)) = std::str::from_utf8(&recorded)
+        .ok()
+        .and_then(|record| record.split_once('\n'))
+    else {
+        return false;
+    };
+    origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
 }
 
 /// Refetch metadata from upstream, rewrite URLs, update cache.
@@ -4975,8 +4992,13 @@ mod multi_upstream_tests {
 
     /// Seed what a public-registry squatter left in the cache before `@vendor` got
     /// an owner: a packument advertising 1.99.0 and its tarball. `origin` = the
-    /// provenance sidecar value to leave behind (None = a cache from before #1055).
-    async fn seed_squatter(ctx: &crate::test_helpers::TestContext, origin: Option<String>) {
+    /// upstream its provenance record names (None = a cache from before #1055);
+    /// `recorded_for` = the bytes that record was written for (None = these).
+    async fn seed_squatter(
+        ctx: &crate::test_helpers::TestContext,
+        origin: Option<String>,
+        recorded_for: Option<&[u8]>,
+    ) {
         let packument = serde_json::json!({
             "name": "@vendor/a",
             "versions": { "1.99.0": { "dist": { "tarball": "http://127.0.0.1/npm/@vendor/a/-/a-1.99.0.tgz" } } },
@@ -4984,17 +5006,15 @@ mod multi_upstream_tests {
         });
         let meta = "npm/@vendor/a/metadata.json";
         let tgz = "npm/@vendor/a/tarballs/a-1.99.0.tgz";
-        ctx.state
-            .storage
-            .put(meta, packument.to_string().as_bytes())
-            .await
-            .unwrap();
-        ctx.state.storage.put(tgz, b"SQUATTER").await.unwrap();
-        if let Some(origin) = origin {
-            for key in [meta, tgz] {
+        let packument = packument.to_string();
+        let objects: [(&str, &[u8]); 2] = [(meta, packument.as_bytes()), (tgz, b"SQUATTER")];
+        for (key, bytes) in objects {
+            ctx.state.storage.put(key, bytes).await.unwrap();
+            if let Some(origin) = &origin {
+                let record = super::provenance_record(origin, recorded_for.unwrap_or(bytes));
                 ctx.state
                     .storage
-                    .put(&super::origin_key(key), origin.as_bytes())
+                    .put(&super::origin_key(key), record.as_bytes())
                     .await
                     .unwrap();
             }
@@ -5002,13 +5022,14 @@ mod multi_upstream_tests {
     }
 
     /// Once a scope has an owner, a copy cached from anywhere else — a squatter on
-    /// the public registry, or a cache from before the scope was owned — is never
-    /// served: not as a cache hit, not via Range, not as a stale fallback. The
-    /// owner's copy replaces it.
+    /// the public registry, a cache from before the scope was owned, or bytes that
+    /// replaced the owner's copy under its record (an older release after a
+    /// rollback, polygon U9) — is never served: not as a cache hit, not via Range,
+    /// not as a stale fallback. The owner's copy replaces it.
     #[tokio::test]
     async fn a_foreign_cached_copy_of_an_owned_scope_is_never_served() {
         use crate::test_helpers::send_with_headers;
-        for foreign_origin in [None, Some("PUBLIC")] {
+        for foreign_origin in [None, Some("PUBLIC"), Some("OWNER, OTHER BYTES")] {
             let public = public_upstream().await;
             let private = MockServer::start().await;
             let owner_packument = serde_json::json!({
@@ -5031,12 +5052,20 @@ mod multi_upstream_tests {
                 .mount(&private)
                 .await;
             let public_identity = crate::circuit_breaker::upstream_key("npm", &public.uri());
+            let owner_identity = crate::circuit_breaker::upstream_key("npm", &private.uri());
             let proxies = vendor_proxies(&public.uri(), &private.uri());
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.npm.proxies = proxies;
                 cfg.npm.metadata_ttl = 3600; // fresh: a plain TTL check would serve the squatter
             });
-            seed_squatter(&ctx, foreign_origin.map(|_| public_identity.clone())).await;
+            match foreign_origin {
+                None => seed_squatter(&ctx, None, None).await,
+                Some("PUBLIC") => seed_squatter(&ctx, Some(public_identity.clone()), None).await,
+                // The owner's record, left behind when other bytes replaced its copy.
+                Some(_) => {
+                    seed_squatter(&ctx, Some(owner_identity.clone()), Some(b"owner bytes")).await
+                }
+            }
 
             let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2fa", "").await;
             assert_eq!(resp.status(), StatusCode::OK);
@@ -5122,7 +5151,7 @@ mod multi_upstream_tests {
             cfg.npm.metadata_ttl = 0;
             cfg.npm.serve_stale = true;
         });
-        seed_squatter(&ctx, None).await;
+        seed_squatter(&ctx, None, None).await;
         for uri in ["/npm/@vendor%2fa", "/npm/@vendor/a/-/a-1.99.0.tgz"] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_ne!(resp.status(), StatusCode::OK, "{uri}");
