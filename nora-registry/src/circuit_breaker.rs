@@ -51,7 +51,7 @@ fn registry_of(key: &str) -> &str {
 
 /// Breaker keys whose `nora_circuit_breaker_state` series is exported at
 /// startup (#441): one per configured upstream for the formats keyed per
-/// upstream (Docker, PyPI), the format name for every other format. A format
+/// upstream (Docker, PyPI, npm), the format name for every other format. A format
 /// keyed per upstream gets no format-named series — it would sit at 0 (closed)
 /// forever while the real state moves on the per-upstream series.
 pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
@@ -71,6 +71,13 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .upstreams()
                     .iter()
                     .map(|up| upstream_key(rt.as_str(), up.url())),
+            ),
+            RegistryType::Npm => keys.extend(
+                config
+                    .npm
+                    .upstream_urls()
+                    .into_iter()
+                    .map(|url| upstream_key(rt.as_str(), url)),
             ),
             _ => keys.push(rt.as_str().to_string()),
         }
@@ -986,7 +993,7 @@ mod tests {
         assert!(cb.health_snapshot("py").is_none(), "format matched whole");
     }
 
-    /// Startup series: per configured upstream for Docker and PyPI, the format
+    /// Startup series: per configured upstream for Docker, PyPI and npm, the format
     /// name for the rest — never a format-named series that cannot move.
     #[test]
     fn initial_gauge_keys_follow_the_breaker_keys() {
@@ -1001,9 +1008,15 @@ mod tests {
         let keys = initial_gauge_keys(&config);
         assert!(keys.contains(&"pypi:https://pypi.org/simple".to_string()));
         assert!(keys.contains(&"docker:https://registry-1.docker.io".to_string()));
-        assert!(keys.contains(&"npm".to_string()));
+        assert!(keys.contains(&"npm:https://registry.npmjs.org".to_string()));
         assert!(
-            !keys.iter().any(|k| k == "pypi" || k == "docker"),
+            keys.contains(&"cargo".to_string()),
+            "formats without per-upstream keys"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k == "pypi" || k == "docker" || k == "npm"),
             "{keys:?}"
         );
     }
@@ -1078,13 +1091,14 @@ mod integration_tests {
             cfg.npm.proxy = Some("http://127.0.0.1:1".into());
         });
 
-        // Trip the breaker
+        // npm keys its breaker per configured upstream (#1055), like PyPI.
+        let key = super::upstream_key("npm", "http://127.0.0.1:1");
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         // Request a package NOT in local storage → proxy path → cb.check() → 503
         let response = send(&ctx.app, Method::GET, "/npm/nonexistent-pkg", "").await;
@@ -1374,11 +1388,12 @@ mod integration_tests {
             cfg.npm.proxy = Some("http://127.0.0.1:1".into());
         });
 
-        // Flood failures — should be ignored
+        // Flood failures on the key the npm handler checks — should be ignored
+        let key = super::upstream_key("npm", "http://127.0.0.1:1");
         for _ in 0..100 {
             ctx.state
                 .circuit_breaker
-                .record_failure("npm", ProbeToken::BACKGROUND);
+                .record_failure(&key, ProbeToken::BACKGROUND);
         }
 
         let response = send(&ctx.app, Method::GET, "/npm/nonexistent-pkg", "").await;
@@ -1442,13 +1457,14 @@ mod integration_tests {
             cfg.npm.proxy = Some(upstream.uri());
         });
 
-        // Trip the breaker into Open.
+        // Trip the breaker the npm handler checks (one per configured upstream) into Open.
+        let key = super::upstream_key("npm", &upstream.uri());
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         // Request now: Open + reset_timeout 0 → HalfOpen probe → upstream answers
         // 404 → record_success → breaker closes. The probe must reach upstream,
@@ -1464,7 +1480,7 @@ mod integration_tests {
         // the probe was 'lost' (no record), so the breaker stayed half-open and
         // this check would return CircuitOpen.
         assert!(
-            ctx.state.circuit_breaker.check("npm").is_ok(),
+            ctx.state.circuit_breaker.check(&key).is_ok(),
             "a 4xx upstream response must close the breaker (#606)"
         );
     }

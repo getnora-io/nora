@@ -49,10 +49,19 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
 
     // List all keys
     println!("Scanning storage...");
-    let keys = storage
+    let mut keys = storage
         .list("")
         .await
         .map_err(|e| format!("storage list failed: {}", e))?;
+    // npm cache provenance (#1055) sits under an internal prefix that list() hides.
+    // Without it a restored owned scope is not trusted: refetched from its owner, and
+    // served by no one while that owner is down.
+    keys.extend(
+        storage
+            .list_internal(crate::registry::npm::ORIGINS_PREFIX)
+            .await
+            .map_err(|e| format!("storage list failed: {}", e))?,
+    );
 
     if keys.is_empty() {
         println!("No artifacts found in storage. Creating empty backup.");
@@ -409,6 +418,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&data[..], b"test-content");
+    }
+
+    /// npm cache provenance (#1055) is hidden from list() but must survive a backup,
+    /// with the restored object's pin still equal to the one the record was bound to.
+    #[tokio::test]
+    async fn test_backup_restore_carries_npm_provenance() {
+        use crate::registry::npm::origin_key;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let key = "npm/@vendor/a/tarballs/a-1.0.0.tgz";
+        storage.put(key, b"owner-tgz").await.unwrap();
+        storage
+            .put(&origin_key(key), b"npm:https://owner.example\nrecord")
+            .await
+            .unwrap();
+
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file).await.unwrap();
+        let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        restore_backup(&restored, &backup_file).await.unwrap();
+
+        assert_eq!(
+            &restored.get(&origin_key(key)).await.unwrap()[..],
+            b"npm:https://owner.example\nrecord"
+        );
+        assert_eq!(restored.pin(key).await, storage.pin(key).await);
+        assert!(restored.pin(key).await.is_some());
     }
 
     #[tokio::test]

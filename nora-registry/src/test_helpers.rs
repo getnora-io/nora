@@ -158,6 +158,7 @@ fn build_context_with(
             enabled: true,
             proxy: None,
             proxy_auth: None,
+            proxies: Vec::new(),
             proxy_timeout: 5,
             metadata_ttl: -1,
             serve_stale: true,
@@ -289,6 +290,16 @@ fn build_context_with(
         let ns_filter =
             crate::curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
         curation_engine.set_namespace_filter(Box::new(ns_filter));
+    }
+    // main.rs installs min-release-age too; without it every age test through this
+    // context checked nothing (found by #1055: a positive control passed a release
+    // dated today through a 7d gate).
+    if let Some(ref age_str) = config.curation.min_release_age {
+        if let Ok(secs) = crate::curation::parse_duration(age_str) {
+            let mut filter = crate::curation::MinReleaseAgeFilter::new(secs, age_str);
+            crate::load_registry_overrides(&mut filter, &config.curation);
+            curation_engine.add_filter(Box::new(filter));
+        }
     }
 
     let enabled_registries = config.enabled_registries();

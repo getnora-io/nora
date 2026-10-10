@@ -302,15 +302,19 @@ mod tests {
             cfg.circuit_breaker.enabled = true;
             cfg.circuit_breaker.failure_threshold = 2;
             cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.npm.proxy = Some("http://127.0.0.1:1".into());
         });
 
-        // Trip the npm breaker into Open via the cached state directly.
+        // Trip the breaker of the configured npm upstream into Open via the cached
+        // state directly: npm keys its breaker per upstream, and `/health` reports
+        // the worst one under the format name.
+        let key = crate::circuit_breaker::upstream_key("npm", "http://127.0.0.1:1");
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("npm", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         let body = body_bytes(response).await;

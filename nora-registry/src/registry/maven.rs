@@ -11,6 +11,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
@@ -573,7 +574,7 @@ async fn download(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.maven.proxy_timeout),
-            proxy.auth(),
+            proxy.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             RegistryType::Maven,
         )

@@ -15,6 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text,
     read_validators, write_validators, ProxyError, Revalidation, Validators,
@@ -497,7 +498,7 @@ async fn registration_index(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::Nuget,
@@ -658,7 +659,7 @@ async fn registration_page(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Nuget,
@@ -777,7 +778,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::Nuget,
@@ -1046,7 +1047,7 @@ async fn flatcontainer_download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.nuget.proxy_timeout),
-        expose_opt(&state.config.nuget.proxy_auth),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Nuget,
     )
@@ -1084,7 +1085,7 @@ async fn flatcontainer_download(
                             &state2.http_client,
                             &url,
                             Duration::from_secs(state2.config.nuget.proxy_timeout),
-                            expose_opt(&state2.config.nuget.proxy_auth),
+                            expose_opt(&state2.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
                             None,
                             &state2.circuit_breaker,
                             RegistryType::Nuget,

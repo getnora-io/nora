@@ -27,6 +27,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::registry::{method_not_allowed, proxied_repo_conflict};
 use crate::validation::validate_storage_key;
 use crate::AppState;
@@ -767,7 +768,7 @@ async fn download(
             format!("{repo}/{path}"),
             key,
             url,
-            entry.auth(),
+            entry.auth().map(UpstreamAuth::Basic),
             state.config.deb.proxy_timeout,
             state.config.deb.metadata_ttl,
             immutable,

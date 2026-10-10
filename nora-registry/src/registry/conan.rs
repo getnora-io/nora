@@ -28,6 +28,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text, read_validators,
     write_validators, ProxyError, Revalidation, Validators,
@@ -164,7 +165,7 @@ async fn search(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        expose_opt(&state.config.conan.proxy_auth),
+        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Conan,
@@ -507,7 +508,7 @@ async fn recipe_file_download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        expose_opt(&state.config.conan.proxy_auth),
+        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Conan,
     )
@@ -940,7 +941,7 @@ async fn package_file_download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.conan.proxy_timeout_dl),
-        expose_opt(&state.config.conan.proxy_auth),
+        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Conan,
     )
@@ -1023,7 +1024,7 @@ async fn fetch_and_cache_json(
         &state.http_client,
         url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        expose_opt(&state.config.conan.proxy_auth),
+        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         &validators,
         &state.circuit_breaker,
         RegistryType::Conan,
@@ -1139,7 +1140,7 @@ async fn fetch_and_cache_immutable_json(
         &state.http_client,
         url,
         Duration::from_secs(state.config.conan.proxy_timeout),
-        expose_opt(&state.config.conan.proxy_auth),
+        expose_opt(&state.config.conan.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Conan,

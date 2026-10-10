@@ -12,6 +12,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{circuit_open_response, proxy_fetch, proxy_fetch_text, ProxyError};
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -279,7 +280,7 @@ async fn handle(
             &state.http_client,
             &upstream_url,
             timeout,
-            expose_opt(&state.config.go.proxy_auth),
+            expose_opt(&state.config.go.proxy_auth).map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             RegistryType::Go,
         )
@@ -289,7 +290,7 @@ async fn handle(
             &state.http_client,
             &upstream_url,
             timeout,
-            expose_opt(&state.config.go.proxy_auth),
+            expose_opt(&state.config.go.proxy_auth).map(UpstreamAuth::Basic),
             None,
             &state.circuit_breaker,
             RegistryType::Go,

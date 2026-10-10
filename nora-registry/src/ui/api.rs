@@ -238,7 +238,13 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                     .iter()
                     .map(|p| p.url().to_string())
                     .collect(),
-                RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
+                RegistryType::Npm => state
+                    .config
+                    .npm
+                    .upstream_urls()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
                 RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
                 RegistryType::PyPI => state
                     .config

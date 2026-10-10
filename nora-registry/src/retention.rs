@@ -580,6 +580,12 @@ async fn collect_npm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
             if storage.stat(&hash_key).await.is_some() {
                 keys.push(hash_key);
             }
+            // Provenance sidecar of a proxied tarball (#1055, under an internal prefix
+            // that list() hides): part of the version too.
+            let origin_key = crate::registry::npm::origin_key(key);
+            if storage.stat(&origin_key).await.is_some() {
+                keys.push(origin_key);
+            }
             if let Some(version) = crate::curation::parse_npm_tarball_version(pkg, filename) {
                 let version_key = format!("npm/{}/versions/{}.json", pkg, version);
                 if storage.stat(&version_key).await.is_some() {
@@ -2307,6 +2313,36 @@ mod format_retention_tests {
     /// the version. The invariant is stated without naming which versions
     /// survive, because that depends on mtime ordering — what must hold is that
     /// the registry never promises an artifact it does not have.
+    #[tokio::test]
+    async fn test_npm_origin_sidecar_is_not_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("npm/a/tarballs/a-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        storage
+            .put(
+                &crate::registry::npm::origin_key("npm/a/tarballs/a-1.0.0.tgz"),
+                b"npm:https://r.example",
+            )
+            .await
+            .unwrap();
+        let groups = collect_npm_versions(&storage).await;
+        let (_, versions) = groups
+            .iter()
+            .find(|(p, _)| p == "npm:a")
+            .expect("package a");
+        assert_eq!(versions.len(), 1, "the provenance sidecar is not a version");
+        assert!(
+            versions[0].keys.contains(&crate::registry::npm::origin_key(
+                "npm/a/tarballs/a-1.0.0.tgz"
+            )),
+            "…but it is part of the version's key set (#961): {:?}",
+            versions[0].keys
+        );
+    }
+
     #[tokio::test]
     async fn test_npm_retention_packument_matches_storage() {
         let ctx = create_test_context();

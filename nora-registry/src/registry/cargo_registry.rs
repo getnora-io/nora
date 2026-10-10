@@ -13,6 +13,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
 };
@@ -214,7 +215,7 @@ async fn sparse_index(
         &state.http_client,
         &upstream_index_url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        expose_opt(&state.config.cargo.proxy_auth),
+        expose_opt(&state.config.cargo.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
@@ -310,7 +311,7 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        expose_opt(&state.config.cargo.proxy_auth),
+        expose_opt(&state.config.cargo.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
@@ -366,7 +367,7 @@ async fn ensure_cargo_metadata_cached(state: &AppState, crate_name: &str) {
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        expose_opt(&state.config.cargo.proxy_auth),
+        expose_opt(&state.config.cargo.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )
@@ -549,7 +550,7 @@ async fn download(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.cargo.proxy_timeout),
-        expose_opt(&state.config.cargo.proxy_auth),
+        expose_opt(&state.config.cargo.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Cargo,
     )

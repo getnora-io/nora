@@ -26,6 +26,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
 };
@@ -186,7 +187,7 @@ async fn provider_versions(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -318,7 +319,7 @@ async fn provider_download_meta(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -456,7 +457,7 @@ async fn provider_download_binary(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )
@@ -576,7 +577,7 @@ async fn module_versions(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -794,7 +795,7 @@ async fn module_source_download(
         &state.http_client,
         &upstream_url,
         Duration::from_secs(state.config.terraform.proxy_timeout_dl),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
     )
@@ -1039,7 +1040,7 @@ async fn mirror_fetch_versions(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
-        expose_opt(&state.config.terraform.proxy_auth),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Terraform,
@@ -1107,7 +1108,7 @@ async fn mirror_fetch_archive(
                 &state.http_client,
                 &url,
                 Duration::from_secs(state.config.terraform.proxy_timeout),
-                expose_opt(&state.config.terraform.proxy_auth),
+                expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
                 None,
                 &state.circuit_breaker,
                 RegistryType::Terraform,

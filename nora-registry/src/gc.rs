@@ -160,6 +160,11 @@ pub async fn run_gc(
     total_candidates += checksum_result.total;
     all_orphans.extend(checksum_result.orphans);
 
+    // npm cache provenance sidecars (internal prefix, hidden from list())
+    let origin_result = detect_origin_orphans(storage).await;
+    total_candidates += origin_result.total;
+    all_orphans.extend(origin_result.orphans);
+
     // Go incomplete version detection
     let go_result = detect_go_incomplete_versions(storage).await;
     total_candidates += go_result.total;
@@ -539,6 +544,29 @@ fn primary_key_for_sidecar(key: &str) -> Option<&str> {
         return key.strip_suffix(".meta");
     }
     primary_key_for_checksum(key)
+}
+
+/// npm cache provenance sidecars (#1055) whose cached object is gone. They live under
+/// an internal prefix that `list()` hides, so they are walked separately.
+async fn detect_origin_orphans(storage: &Storage) -> DetectionResult {
+    use crate::registry::npm::{origin_key, origin_primary};
+    let sidecars = storage
+        .list_internal(&origin_key("npm/"))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("GC: listing npm provenance sidecars failed: {}", e);
+            Vec::new()
+        });
+    let total = sidecars.len();
+    let mut orphans = Vec::new();
+    for sidecar in sidecars {
+        if let Some(primary) = origin_primary(&sidecar) {
+            if storage.stat(primary).await.is_none() {
+                orphans.push(sidecar);
+            }
+        }
+    }
+    DetectionResult { total, orphans }
 }
 
 async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
@@ -1544,6 +1572,32 @@ mod tests {
             storage.get("maven/com/x/1.0/thing.meta").await.is_ok(),
             "a Maven .meta artifact must never be treated as a sidecar"
         );
+    }
+
+    /// npm provenance sidecars (#1055) follow the `.meta` rule although `list()` hides
+    /// them: one whose object is gone is reaped, a live one is kept.
+    #[tokio::test]
+    async fn test_gc_reaps_orphan_origin_sidecars() {
+        use crate::registry::npm::origin_key;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let gone = origin_key("npm/gone/tarballs/gone-1.0.0.tgz");
+        let live = origin_key("npm/live/tarballs/live-1.0.0.tgz");
+        storage.put(&gone, b"npm:https://r.example").await.unwrap();
+        storage
+            .put("npm/live/tarballs/live-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        storage.put(&live, b"npm:https://r.example").await.unwrap();
+
+        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+
+        assert!(storage.get(&gone).await.is_err());
+        assert!(storage.get(&live).await.is_ok());
+        assert!(storage
+            .get("npm/live/tarballs/live-1.0.0.tgz")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

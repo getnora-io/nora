@@ -790,7 +790,7 @@ async fn main() {
                 &cli_publish_locks,
                 dry_run,
                 config.gc.grace_secs,
-                config.npm.proxy.is_some(),
+                !config.npm.upstream_urls().is_empty(),
                 config.gc.proxy_cache_max_bytes,
             )
             .await;
@@ -1859,7 +1859,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let publish_locks = state.publish_locks.clone();
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
-        let npm_is_proxy = state.config.npm.proxy.is_some();
+        let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",

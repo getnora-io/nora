@@ -106,6 +106,50 @@ pub fn basic_auth_header(credentials: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
 
+/// The credential NORA presents to an upstream it proxies, with its scheme (#1055).
+///
+/// Borrowed from the config's protected secret for the length of one request. There is
+/// deliberately no `Debug` impl (guarded below at compile time): a `{:?}` on a request
+/// context must not be able to print a token.
+#[derive(Clone, Copy)]
+pub enum UpstreamAuth<'a> {
+    /// `user:pass`, sent as `Authorization: Basic base64(user:pass)`.
+    Basic(&'a str),
+    /// An opaque token (npm `_authToken`), sent as `Authorization: Bearer <token>`.
+    Bearer(&'a str),
+}
+
+impl UpstreamAuth<'_> {
+    /// The `Authorization` header value, marked sensitive so `HeaderValue`'s `Debug`
+    /// prints `Sensitive` instead of the credential.
+    ///
+    /// Fails only for a Bearer token with bytes a header cannot carry (a newline left by
+    /// a secret file, say); Basic is base64 and always valid.
+    pub fn header_value(
+        self,
+    ) -> Result<reqwest::header::HeaderValue, reqwest::header::InvalidHeaderValue> {
+        let raw = match self {
+            UpstreamAuth::Basic(credentials) => basic_auth_header(credentials),
+            UpstreamAuth::Bearer(token) => format!("Bearer {token}"),
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(&raw)?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+// Compile-time guard: `UpstreamAuth` must not implement `Debug`. If it did, both impls
+// below would apply and the type of `_` could not be inferred — a build error, not a
+// review comment.
+const _: fn() = || {
+    trait AmbiguousIfDebug<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+    impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+    let _ = <UpstreamAuth<'static> as AmbiguousIfDebug<_>>::some_item;
+};
+
 /// Path component of a URL (`https://host/prefix/` → `/prefix/`), or `""` when
 /// there is no path. The scheme is optional — a bare path is returned unchanged.
 /// Does not trim a trailing slash (callers that want it trimmed do so). Single
@@ -361,7 +405,7 @@ impl Config {
         match rt {
             RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
             RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
-            RegistryType::Npm => self.npm.enabled && self.npm.proxy.is_some(),
+            RegistryType::Npm => self.npm.enabled && !self.npm.upstream_urls().is_empty(),
             RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
             RegistryType::PyPI => {
                 self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
@@ -497,6 +541,17 @@ impl Config {
         if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
             tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
         }
+        // npm multi-upstream (#1055): Basic `auth` on an entry is plaintext; Bearer is env-only.
+        for proxy in &self.npm.proxies {
+            if let NpmProxyEntry::Full(p) = proxy {
+                if p.auth.is_some() {
+                    tracing::warn!(
+                        url = %p.url,
+                        "npm upstream credentials in config.toml are plaintext — consider auth_bearer_env"
+                    );
+                }
+            }
+        }
         // PyPI
         if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
             tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
@@ -561,7 +616,6 @@ impl Config {
 
         // Simple proxy: Option<String>
         let simple = [
-            ("npm", self.npm.proxy.as_deref()),
             ("cargo", self.cargo.proxy.as_deref()),
             ("go", self.go.proxy.as_deref()),
             ("gems", self.gems.proxy.as_deref()),
@@ -577,6 +631,13 @@ impl Config {
                 if let Some(host) = extract_host(url) {
                     result.push((name.to_string(), host));
                 }
+            }
+        }
+        // npm: every upstream, private ones included (#1055) — a private registry
+        // host in a served packument is exactly the leak this list exists to catch.
+        for url in self.npm.upstream_urls() {
+            if let Some(host) = extract_host(url) {
+                result.push((RegistryType::Npm.as_str().to_string(), host));
             }
         }
 
@@ -965,6 +1026,13 @@ impl Config {
             );
         }
 
+        // 9c. npm multi-upstream (#1055): scope ownership, one default, credentials
+        {
+            let (w, e) = self.npm.proxies_problems();
+            warnings.extend(w);
+            errors.extend(e);
+        }
+
         // 10. [registries].enable validation
         if let Some(ref section) = self.registries {
             if let Some(ref spec) = section.enable {
@@ -1177,6 +1245,75 @@ mod tests {
     fn test_basic_auth_header_empty() {
         let header = basic_auth_header("");
         assert!(header.starts_with("Basic "));
+    }
+
+    /// #1055: the npm `proxies` checks are part of `validate()`, private hosts feed the
+    /// upstream-leak detector, and a Bearer token is read from its env var at load.
+    #[test]
+    fn npm_proxies_are_validated_leak_checked_and_load_their_token() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nora.toml");
+        std::fs::write(
+            &path,
+            r#"
+[npm]
+proxies = [
+  "https://registry.npmjs.org",
+  { url = "https://npm.vendor.example", scopes = ["@vendor"], auth_bearer_env = "NORA_TEST_NPM_VENDOR_TOKEN" },
+]
+"#,
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        std::env::set_var("NORA_TEST_NPM_VENDOR_TOKEN", "tok-from-env");
+        let loaded = Config::load_from(Some(path.clone()));
+        std::env::remove_var("NORA_TEST_NPM_VENDOR_TOKEN");
+        let config = loaded.expect("a set token loads");
+        let up = config.npm.route("@vendor/a").unwrap();
+        assert_eq!(
+            up.auth.unwrap().header_value().unwrap(),
+            "Bearer tok-from-env"
+        );
+        assert!(config
+            .upstream_hostnames()
+            .contains(&("npm".to_string(), "npm.vendor.example".to_string())));
+
+        // Unset token: the config is rejected at load, not served with silent 401s.
+        assert!(Config::load_from(Some(path)).is_err());
+
+        let mut bad = Config::default();
+        bad.npm.proxies = vec![
+            NpmProxyEntry::Simple("https://registry.npmjs.org".into()),
+            NpmProxyEntry::Simple("https://mirror.example".into()),
+        ];
+        let (_, errors) = bad.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("have no scopes")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_auth_header_carries_its_scheme_and_is_sensitive() {
+        let basic = UpstreamAuth::Basic("user:pass").header_value().unwrap();
+        assert_eq!(basic, "Basic dXNlcjpwYXNz");
+        assert!(basic.is_sensitive());
+        assert_eq!(format!("{basic:?}"), "Sensitive");
+
+        let bearer = UpstreamAuth::Bearer("npm_tok-1").header_value().unwrap();
+        assert_eq!(bearer, "Bearer npm_tok-1");
+        assert!(bearer.is_sensitive());
+        assert_eq!(format!("{bearer:?}"), "Sensitive");
+    }
+
+    #[test]
+    fn upstream_auth_bearer_with_newline_is_rejected_not_sent() {
+        assert!(UpstreamAuth::Bearer("tok\n").header_value().is_err());
+        assert!(UpstreamAuth::Bearer("tok\r\nX-Injected: 1")
+            .header_value()
+            .is_err());
     }
 
     #[test]
