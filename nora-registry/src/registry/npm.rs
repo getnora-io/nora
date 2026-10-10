@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
-use crate::config::UpstreamAuth;
+use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
@@ -12,7 +12,6 @@ use crate::registry::{
     Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
-use crate::secrets::expose_opt;
 use crate::AppState;
 use axum::{
     body::Bytes,
@@ -74,18 +73,22 @@ async fn handle_npm_post(
     // Only a remote/proxy repo can answer audits (advisories come from upstream).
     // Hosted-only (no proxy) → npm-compatible empty result so `npm audit` doesn't
     // hard-fail — npm treats a 200 `{}` as "no advisories".
-    let Some(proxy_url) = state.config.npm.proxy.clone() else {
+    let Some(upstream) = state.config.npm.route(&path) else {
         return npm_empty_audit();
     };
 
     // #68/#733 dependency-confusion: never send internal package names upstream.
+    // #1055: the same holds for scopes owned by a private upstream — the audit goes
+    // to the default upstream, which must not learn the private package names.
     // When a namespace filter is configured we must SEE plaintext names to strip
     // them, so ANY body we cannot verify — the quick lockfile, an encoded bulk body,
     // or a bulk body that is not the expected JSON object — is refused (fail CLOSED,
     // symmetric across both paths). With no filter, nothing is internal → forward
     // verbatim.
     let engine = &state.curation().curation_engine;
-    let filter_active = crate::curation::namespace_filter_active(engine);
+    let owned_scopes: Vec<&str> = state.config.npm.owned_scopes().collect();
+    let filter_active =
+        crate::curation::namespace_filter_active(engine) || !owned_scopes.is_empty();
     let content_encoded = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -95,7 +98,7 @@ async fn handle_npm_post(
     } else if is_quick || content_encoded {
         return npm_empty_audit();
     } else {
-        match strip_internal_bulk(&body, engine) {
+        match strip_internal_bulk(&body, engine, &owned_scopes) {
             Some(stripped) => stripped,
             None => return npm_empty_audit(), // unparsable under a filter → refuse
         }
@@ -120,12 +123,12 @@ async fn handle_npm_post(
         fwd.push(("accept", v));
     }
 
-    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
+    let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_forward_post(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
+        upstream.auth,
         &fwd,
         &forward_body,
         &state.circuit_breaker,
@@ -174,12 +177,22 @@ fn npm_empty_audit() -> Response {
 /// (`{"<pkg>":[…]}`). `Some(bytes)` = the (possibly unchanged) body safe to forward;
 /// `None` = the body is NOT the expected JSON object, so the caller must fail closed
 /// under an active namespace filter (we could not verify no internal name is present).
-fn strip_internal_bulk(body: &[u8], engine: &crate::curation::CurationEngine) -> Option<Vec<u8>> {
+fn strip_internal_bulk(
+    body: &[u8],
+    engine: &crate::curation::CurationEngine,
+    owned_scopes: &[&str],
+) -> Option<Vec<u8>> {
     let mut map =
         serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).ok()?;
     let before = map.len();
     map.retain(|k, _| {
-        !crate::curation::is_internal_namespace(engine, crate::curation::RegistryType::Npm, k)
+        let private = npm_scope_of(k).is_some_and(|scope| owned_scopes.contains(&scope));
+        !private
+            && !crate::curation::is_internal_namespace(
+                engine,
+                crate::curation::RegistryType::Npm,
+                k,
+            )
     });
     if map.len() == before {
         Some(body.to_vec())
@@ -625,14 +638,15 @@ async fn handle_request(
     }
 
     // --- Proxy fetch path ---
-    if let Some(proxy_url) = &state.config.npm.proxy {
+    if let Some(upstream) = state.config.npm.route(&path) {
+        let proxy_url = upstream.url;
         let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
         match proxy_fetch(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
-            expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
+            upstream.auth,
             &state.circuit_breaker,
             RegistryType::Npm,
         )
@@ -768,7 +782,8 @@ async fn handle_request(
 /// Refetch metadata from upstream, rewrite URLs, update cache.
 /// Returns None if upstream is unavailable (caller serves stale cache).
 async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec<u8>> {
-    let proxy_url = state.config.npm.proxy.as_ref()?;
+    let upstream = state.config.npm.route(path)?;
+    let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
     // Revalidate with a conditional request when enabled and we have stored
@@ -787,7 +802,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
+        upstream.auth,
         &validators,
         &state.circuit_breaker,
         RegistryType::Npm,
@@ -1306,15 +1321,16 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     ) {
         return;
     }
-    let Some(proxy_url) = state.config.npm.proxy.clone() else {
+    let Some(upstream) = state.config.npm.route(package_name) else {
         return;
     };
+    let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
     if let Ok(data) = proxy_fetch(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&state.config.npm.proxy_auth).map(UpstreamAuth::Basic),
+        upstream.auth,
         &state.circuit_breaker,
         RegistryType::Npm,
     )
@@ -1324,7 +1340,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
         let nora_base = nora_base_url(state);
-        let rewritten = rewrite_tarball_urls(&data, &nora_base, &proxy_url).unwrap_or_else(|()| {
+        let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
             tracing::warn!(
                 package = %package_name,
                 "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
@@ -4144,5 +4160,269 @@ mod index_cost_tests {
             small, large,
             "a stored packument must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+/// npm multi-upstream with scope routing (#1055), on the real router: a private
+/// upstream that only answers the exact Bearer token, and a public one that answers
+/// anything — so a request that reached the wrong upstream would succeed and only
+/// the request log on the public mock can catch it.
+#[cfg(test)]
+mod multi_upstream_tests {
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, header, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    const TOKEN: &str = "vendor-tok";
+
+    fn vendor_proxies(public: &str, private: &str) -> Vec<NpmProxyEntry> {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from(TOKEN));
+        }
+        npm.proxies
+    }
+
+    /// Public upstream: 200 to anything, so only its request log tells.
+    async fn public_upstream() -> MockServer {
+        let public = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"name":"lodash","versions":{}}"#),
+            )
+            .mount(&public)
+            .await;
+        public
+    }
+
+    /// The public upstream must never see a private-scope name or the private token.
+    fn assert_public_clean(reqs: &[Request]) {
+        for r in reqs {
+            let url = r.url.as_str();
+            let body = String::from_utf8_lossy(&r.body);
+            assert!(
+                !url.contains("vendor"),
+                "private scope reached public upstream: {url}"
+            );
+            assert!(
+                !body.contains("@vendor"),
+                "private scope in a body sent to public: {body}"
+            );
+            let auth = r
+                .headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap_or("?").to_string());
+            assert!(
+                auth.is_none(),
+                "public upstream got an Authorization header: {auth:?} on {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_scope_is_fetched_only_from_its_upstream_with_its_token() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+            } } },
+            "time": { "1.0.0": "2020-01-15T10:30:00.000Z" }
+        });
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a"))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a/-/a-1.0.0.tgz"))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"VENDOR-TGZ".to_vec()))
+            .mount(&private)
+            .await;
+
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.npm.metadata_ttl = 0; // always stale → the second pass must refetch
+            cfg.npm.serve_stale = false; // …so a refetch that went elsewhere fails loudly
+        });
+
+        // Packument twice: the second pass goes through the stale-refetch path,
+        // which must route the same way.
+        for pass in 0..2 {
+            let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2fa", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "packument pass {pass}");
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+            assert!(
+                !body.contains(&private.uri()),
+                "private registry host leaked to the client: {body}"
+            );
+            // The cache write is a background task; wait for it so the next pass
+            // deterministically takes the stale-refetch path, not a second cold fetch.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ctx
+                .state
+                .storage
+                .get("npm/@vendor/a/metadata.json")
+                .await
+                .is_err()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "packument never cached"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"VENDOR-TGZ");
+
+        // An unscoped package still goes to the public upstream, without a credential.
+        let resp = send(&ctx.app, Method::GET, "/npm/lodash", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let packument_fetches = private
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/@vendor/a")
+            .count();
+        assert_eq!(
+            packument_fetches, 2,
+            "first fetch and stale refetch both go to the owner"
+        );
+
+        let public_reqs = public.received_requests().await.unwrap();
+        assert!(
+            !public_reqs.is_empty(),
+            "control: lodash must have reached public"
+        );
+        assert_public_clean(&public_reqs);
+    }
+
+    /// A locked install asks for the tarball first; the metadata self-prime that
+    /// resolves the release date (#748) must ask the owning upstream too.
+    #[tokio::test]
+    async fn tarball_first_self_prime_asks_the_owner() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+            } } },
+            "time": { "1.0.0": "2020-01-15T10:30:00.000Z" }
+        });
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a"))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a/-/a-1.0.0.tgz"))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"VENDOR-TGZ".to_vec()))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.trust_upstream_dates = true;
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ctx.state
+                .storage
+                .get("npm/@vendor/a/metadata.json")
+                .await
+                .is_ok(),
+            "the self-prime must have cached the owner's packument"
+        );
+        assert!(public.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_private_upstream_never_falls_back_to_public() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/broken"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&private)
+            .await;
+
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        for uri in [
+            "/npm/@vendor%2fmissing",
+            "/npm/@vendor%2fbroken",
+            "/npm/@vendor/missing/-/missing-1.0.0.tgz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must not be served from public"
+            );
+        }
+        assert!(
+            public.received_requests().await.unwrap().is_empty(),
+            "no fallback to the public upstream for an owned scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_to_the_default_upstream_never_carries_private_names() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            r#"{"lodash":["4.17.0"],"@vendor/a":["1.0.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // npm6 quick audit is a gzipped lockfile — names cannot be stripped, so it is
+        // refused outright while any private scope is configured.
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/audits/quick",
+            r#"{"dependencies":{"@vendor/a":{"version":"1.0.0"}}}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"{}");
+
+        let reqs = public.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "only the stripped bulk audit is forwarded");
+        assert!(String::from_utf8_lossy(&reqs[0].body).contains("lodash"));
+        assert_public_clean(&reqs);
+        assert!(private.received_requests().await.unwrap().is_empty());
     }
 }

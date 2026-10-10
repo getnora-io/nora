@@ -158,6 +158,7 @@ fn build_context_with(
             enabled: true,
             proxy: None,
             proxy_auth: None,
+            proxies: Vec::new(),
             proxy_timeout: 5,
             metadata_ttl: -1,
             serve_stale: true,
