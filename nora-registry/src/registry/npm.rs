@@ -823,11 +823,15 @@ async fn handle_request(
                 return packument_response(&headers, data_to_serve.into());
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
-            Err(e) => {
-                tracing::debug!(error = ?e, path = %path, "npm proxy fetch failed");
+            // The upstream answered "no such package": a real 404.
+            Err(ProxyError::NotFound) => {}
+            // The upstream is down or unreachable: a gateway failure, not a missing
+            // package — npm retries a 502 and reports E502 instead of E404 (#1055).
+            Err(e @ (ProxyError::Upstream(_) | ProxyError::Network(_))) => {
+                tracing::warn!(registry = "npm", path = %path, error = ?e, "npm upstream failed, returning 502");
+                return StatusCode::BAD_GATEWAY.into_response();
             }
         }
-        tracing::warn!(registry = "npm", path = %path, "Proxy failed, returning 404");
     }
 
     StatusCode::NOT_FOUND.into_response()
@@ -4845,6 +4849,44 @@ mod multi_upstream_tests {
             );
             assert_public_clean(&public.received_requests().await.unwrap());
         }
+    }
+
+    /// A dead owner is a gateway failure, not a missing package: 5xx or an
+    /// unreachable upstream → 502 (npm retries and reports E502), a real upstream
+    /// 404 → 404 (npm reports E404). Before, every cold-miss failure was a 404.
+    #[tokio::test]
+    async fn a_dead_upstream_is_502_and_a_missing_package_is_404() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@vendor/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&private)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
+
+        for (uri, want) in [
+            ("/npm/@vendor%2fmissing", StatusCode::NOT_FOUND),
+            ("/npm/@vendor%2fdown", StatusCode::BAD_GATEWAY),
+            (
+                "/npm/@vendor/down/-/down-1.0.0.tgz",
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), want, "{uri}");
+        }
+
+        // Unreachable (connection refused) is a gateway failure too.
+        let unreachable = vendor_proxies(&public.uri(), "http://127.0.0.1:1");
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = unreachable);
+        let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2fdown", "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// With the owner down, the foreign copy is still not served (no stale fallback).
