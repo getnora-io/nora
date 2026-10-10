@@ -153,6 +153,7 @@ mod tests {
 
     #[test]
     fn test_gcs_mode_parses_from_toml_and_env() {
+        let _lock = crate::test_env::env_lock();
         let cfg: StorageConfig = toml::from_str("mode = \"gcs\"\nbucket = \"artifacts\"").unwrap();
         assert_eq!(cfg.mode, StorageMode::Gcs);
         assert_eq!(cfg.bucket, "artifacts");
@@ -160,7 +161,7 @@ mod tests {
         assert_eq!(cfg.gcs_base_url, None);
 
         let mut cfg = StorageConfig::default();
-        // Serialized via a fresh process env in CI would race; set/remove inline.
+        // config/mod.rs tests set NORA_STORAGE_MODE too; the env lock above serializes them.
         std::env::set_var("NORA_STORAGE_MODE", "gcs");
         std::env::set_var("NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH", "/sa.json");
         std::env::set_var("NORA_STORAGE_GCS_BASE_URL", "http://127.0.0.1:4443");
@@ -176,6 +177,7 @@ mod tests {
 
     #[test]
     fn test_unknown_mode_still_fails_closed() {
+        let _lock = crate::test_env::env_lock();
         let mut cfg = StorageConfig::default();
         std::env::set_var("NORA_STORAGE_MODE", "azure");
         let r = cfg.apply_env_overrides();
