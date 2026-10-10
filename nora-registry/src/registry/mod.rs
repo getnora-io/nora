@@ -822,9 +822,10 @@ fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) ->
 /// conditional headers, so it always yields `Modified` — that is how the full
 /// fetch path captures validators for the first time.
 ///
-/// Circuit breaker: 304/200 record success; transport/5xx record failure; 4xx
-/// returns `NotFound` (matching `proxy_fetch_core`). No retry — revalidation is
-/// a lightweight check and the caller falls back to a full fetch on error.
+/// Circuit breaker: 304/200 record success; transport/5xx and a 200 whose body
+/// cannot be read record failure; 4xx returns `NotFound` (matching
+/// `proxy_fetch_core`). No retry — revalidation is a lightweight check and the
+/// caller falls back to a full fetch on error.
 pub(crate) async fn proxy_fetch_conditional(
     client: &reqwest::Client,
     url: &str,
@@ -860,15 +861,23 @@ pub(crate) async fn proxy_fetch_conditional(
                     etag: header_string(&response, header::ETAG),
                     last_modified: header_string(&response, header::LAST_MODIFIED),
                 };
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|e| ProxyError::Network(e.to_string()))?;
-                cb.record_success(&cb_key, probe);
-                return Ok(Revalidation::Modified {
-                    body: body.to_vec(),
-                    validators: new_validators,
-                });
+                return match response.bytes().await {
+                    Ok(body) => {
+                        cb.record_success(&cb_key, probe);
+                        Ok(Revalidation::Modified {
+                            body: body.to_vec(),
+                            validators: new_validators,
+                        })
+                    }
+                    Err(e) => {
+                        // 2xx but the body could not be read (e.g. a mid-stream
+                        // drop) — a fetch failure for the breaker, as in
+                        // proxy_fetch_core; unreported, a half-open probe would
+                        // hold its slot until the #585 stall recovery.
+                        cb.record_failure(&cb_key, probe);
+                        Err(ProxyError::Network(e.to_string()))
+                    }
+                };
             }
             let code = status.as_u16();
             if (400..500).contains(&code) {
@@ -1072,6 +1081,106 @@ mod tests {
         .unwrap();
 
         assert!(matches!(out, Revalidation::NotModified));
+    }
+
+    /// Run one half-open probe through `proxy_fetch_conditional` against an
+    /// upstream that answers with a 200 declaring `declared_len` bytes, writes
+    /// `body`, and hangs up — with `declared_len > body.len()` the body breaks off
+    /// mid-stream. The breaker (threshold 1, reset 1 h, so the #585 stall
+    /// recovery cannot release the slot during the test) is tripped and its open
+    /// timer backdated first, so the call IS the probe.
+    async fn conditional_half_open_probe(
+        cb: &CircuitBreakerRegistry,
+        declared_len: usize,
+        body: &[u8],
+    ) -> Result<Revalidation, ProxyError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let serve_once = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+            let _ = sock.shutdown().await;
+        };
+
+        cb.record_failure("npm", crate::circuit_breaker::ProbeToken::BACKGROUND);
+        cb.expire_open_for_test("npm");
+        let client = reqwest::Client::new();
+        let validators = Validators::default();
+        let fetch = proxy_fetch_conditional(
+            &client,
+            &upstream,
+            Duration::from_secs(5),
+            None,
+            &validators,
+            cb,
+            RegistryType::Npm,
+        );
+        let ((), out) = tokio::join!(serve_once, fetch);
+        out
+    }
+
+    fn half_open_test_cb() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 1,
+            reset_timeout: 3600,
+            overrides: std::collections::HashMap::new(),
+        })
+    }
+
+    /// A half-open probe that gets a 200 whose body breaks off must report back
+    /// as a failure, exactly like `proxy_fetch_core` ("2xx but the body could not
+    /// be read"). Unreported, the probe slot stays held, and every request is
+    /// rejected with CircuitOpen until the #585 stall recovery (reset_timeout)
+    /// gives up on it.
+    #[tokio::test]
+    async fn conditional_truncated_200_returns_the_probe_as_a_failure() {
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, 64, b"only-part-of-the-body").await {
+            Err(ProxyError::Network(_)) => {}
+            Err(e) => panic!("a broken-off body is a network error, got {e:?}"),
+            Ok(_) => panic!("a broken-off body must not be returned as a revalidation"),
+        }
+
+        // The breaker counted the failed probe: back to Open, not stuck HalfOpen.
+        let health = cb.health_snapshot("npm").expect("breaker recorded");
+        assert_eq!(
+            health.status, "open",
+            "the failed probe must re-open the breaker"
+        );
+
+        // The probe slot came back: once the open timer runs out, a new probe is
+        // granted. A probe that never reported keeps the slot and this check is
+        // CircuitOpen for the whole reset_timeout.
+        cb.expire_open_for_test("npm");
+        assert!(
+            cb.check("npm").is_ok(),
+            "the probe slot must be released, not held by the lost probe"
+        );
+    }
+
+    /// Control for the harness above: the same raw upstream with a complete body
+    /// is a successful probe that closes the breaker, so the failure above comes
+    /// from the broken-off body and not from the harness.
+    #[tokio::test]
+    async fn conditional_complete_200_closes_the_half_open_breaker() {
+        let body: &[u8] = b"the-whole-body";
+        let cb = half_open_test_cb();
+
+        match conditional_half_open_probe(&cb, body.len(), body).await {
+            Ok(Revalidation::Modified { body: got, .. }) => assert_eq!(got, body),
+            Ok(Revalidation::NotModified) => panic!("expected Modified, got NotModified"),
+            Err(e) => panic!("expected Modified, got {e:?}"),
+        }
+        assert_eq!(cb.health_snapshot("npm").unwrap().status, "closed");
     }
 
     /// Validators round-trip through storage (the sidecar lives on disk, so they
