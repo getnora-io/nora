@@ -134,11 +134,12 @@ async fn handle_npm_post(
                             "decompressed audit body is larger than NORA accepts (8 MB)",
                         )
                     }
-                    Err(GunzipError::Corrupt) => {
+                    Err(GunzipError::Corrupt(e)) => {
+                        tracing::debug!(error = %e, "npm audit: gzip body does not decompress");
                         return audit_refused(
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "audit body says gzip but does not decompress",
-                        )
+                        );
                     }
                 }
             }
@@ -235,7 +236,7 @@ fn npm_empty_audit() -> Response {
 #[derive(Debug)]
 enum GunzipError {
     /// Not gzip, or a corrupt stream.
-    Corrupt,
+    Corrupt(std::io::Error),
     /// Expands past the cap (a small gzip can inflate into gigabytes).
     TooLarge,
 }
@@ -247,7 +248,7 @@ fn gunzip_bounded(data: &[u8], cap: usize) -> Result<Vec<u8>, GunzipError> {
     flate2::read::GzDecoder::new(data)
         .take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|_| GunzipError::Corrupt)?;
+        .map_err(GunzipError::Corrupt)?;
     if out.len() > cap {
         return Err(GunzipError::TooLarge);
     }
