@@ -142,6 +142,10 @@ pub trait StorageBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     /// Refresh any cached size data. No-op for backends without caching.
     async fn refresh_total_size(&self) {}
+    /// Housekeeping at server start, before serving. The local backend opens this
+    /// instance's staging directory and removes what dead instances left there; a
+    /// no-op for backends without local staging.
+    async fn prepare(&self) {}
     /// Move or copy a file from `src` into storage under `key`, pinned to
     /// `sha256` when the caller computed one (streaming paths do; legacy
     /// callers that verified integrity separately pass `None`, leaving the
@@ -494,6 +498,11 @@ impl Storage {
             .with_label_values(&["stat", if meta.is_some() { "ok" } else { "miss" }])
             .inc();
         meta
+    }
+
+    /// Startup housekeeping, see [`StorageBackend::prepare`].
+    pub async fn prepare(&self) {
+        self.inner.prepare().await
     }
 
     pub async fn health_check(&self) -> bool {

@@ -376,6 +376,38 @@ mod tests {
         assert!(stats.output_size > 0); // at least metadata.json
     }
 
+    /// A backup archive is outside input: an entry naming the local staging
+    /// directory must not be restored into it, where the next start would delete it
+    /// as a dead instance's write. The key is refused up front, by validation.
+    #[tokio::test]
+    async fn restore_refuses_an_entry_in_the_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("crafted.tar.gz");
+        {
+            let gz = GzEncoder::new(File::create(&archive_path).unwrap(), Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let body = b"planted";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, ".nora-staging/0b1c/17.tmp", &body[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let root = dir.path().join("data");
+        let storage = Storage::new_local(root.to_str().unwrap());
+
+        let err = restore_backup(&storage, &archive_path)
+            .await
+            .expect_err("an entry in the staging directory must be refused");
+        assert!(
+            err.contains("Reserved path"),
+            "refused for another reason: {err}"
+        );
+        assert!(!root.join(".nora-staging/0b1c/17.tmp").exists());
+    }
+
     #[tokio::test]
     async fn test_backup_restore_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
