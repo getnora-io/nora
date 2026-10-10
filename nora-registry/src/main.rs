@@ -36,6 +36,7 @@ mod gc;
 mod hash_pin_store;
 mod health;
 mod import;
+mod log_redact;
 mod metrics;
 mod migrate;
 mod mirror;
@@ -60,6 +61,7 @@ mod test_helpers;
 use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
+use log_redact::RedactUserinfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1406,12 +1408,17 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().json().with_target(true))
                 .with(
                     fmt::layer()
                         .json()
                         .with_target(true)
-                        .with_writer(non_blocking)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(RedactUserinfo(non_blocking))
                         .with_filter(file_filter),
                 )
                 .init();
@@ -1420,7 +1427,12 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         (true, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().json().with_target(true))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
                 .init();
             None
         }
@@ -1429,11 +1441,15 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().with_target(false))
                 .with(
                     fmt::layer()
                         .with_target(false)
-                        .with_writer(non_blocking)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_writer(RedactUserinfo(non_blocking))
                         .with_filter(file_filter),
                 )
                 .init();
@@ -1442,7 +1458,11 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         (false, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt::layer().with_target(false))
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_writer(RedactUserinfo(std::io::stdout)),
+                )
                 .init();
             None
         }
