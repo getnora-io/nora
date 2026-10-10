@@ -4,6 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
+use crate::circuit_breaker::BreakerScope;
 use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
@@ -132,7 +133,7 @@ async fn handle_npm_post(
         &fwd,
         &forward_body,
         &state.circuit_breaker,
-        RegistryType::Npm,
+        BreakerScope::upstream(RegistryType::Npm, upstream.url),
     )
     .await
     {
@@ -648,7 +649,7 @@ async fn handle_request(
             Duration::from_secs(state.config.npm.proxy_timeout),
             upstream.auth,
             &state.circuit_breaker,
-            RegistryType::Npm,
+            BreakerScope::upstream(RegistryType::Npm, upstream.url),
         )
         .await
         {
@@ -805,7 +806,7 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
         upstream.auth,
         &validators,
         &state.circuit_breaker,
-        RegistryType::Npm,
+        BreakerScope::upstream(RegistryType::Npm, upstream.url),
     )
     .await
     {
@@ -1332,7 +1333,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
         &state.circuit_breaker,
-        RegistryType::Npm,
+        BreakerScope::upstream(RegistryType::Npm, upstream.url),
     )
     .await
     {
@@ -4389,6 +4390,125 @@ mod multi_upstream_tests {
             public.received_requests().await.unwrap().is_empty(),
             "no fallback to the public upstream for an owned scope"
         );
+    }
+
+    /// A dead private registry opens its own breaker only: public packages keep
+    /// being served (decision Б.3 of #1055 — breaker per upstream).
+    #[tokio::test]
+    async fn a_dead_private_upstream_does_not_open_the_public_breaker() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 300;
+        });
+
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, "/npm/@vendor%2fdown", "").await;
+            assert_ne!(resp.status(), StatusCode::OK);
+        }
+        let resp = send(&ctx.app, Method::GET, "/npm/lodash", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the public upstream must keep serving while the private one is down"
+        );
+        assert_public_clean(&public.received_requests().await.unwrap());
+    }
+
+    /// The second entry points — stale refetch and the tarball-first metadata
+    /// self-prime — report to the per-upstream breaker too: after the private
+    /// registry dies on both paths, the public one still refetches and self-primes.
+    #[tokio::test]
+    async fn refetch_and_self_prime_use_the_per_upstream_breaker() {
+        let public = public_upstream().await;
+        let private = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "@vendor/a",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/@vendor/a/-/a-1.0.0.tgz", private.uri())
+            } } }
+        });
+        Mock::given(method("GET"))
+            .and(path("/@vendor/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&private)
+            .await;
+        let proxies = vendor_proxies(&public.uri(), &private.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.serve_stale = false;
+            cfg.server.trust_upstream_dates = true;
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 300;
+        });
+        let cached = |key: &'static str| {
+            let storage = ctx.state.storage.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while storage.get(key).await.is_err() {
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                true
+            }
+        };
+
+        // Both packuments cached while everything is up.
+        for uri in ["/npm/lodash", "/npm/@vendor%2fa"] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                StatusCode::OK
+            );
+        }
+        assert!(cached("npm/lodash/metadata.json").await);
+        assert!(cached("npm/@vendor/a/metadata.json").await);
+
+        // The private registry dies; fail it on the refetch and the self-prime paths.
+        private.reset().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&private)
+            .await;
+        let r = send(&ctx.app, Method::GET, "/npm/@vendor%2fa", "").await;
+        assert_ne!(r.status(), StatusCode::OK, "stale private refetch fails");
+        let r = send(&ctx.app, Method::GET, "/npm/@vendor/b/-/b-1.0.0.tgz", "").await;
+        assert_ne!(
+            r.status(),
+            StatusCode::OK,
+            "private self-prime + fetch fail"
+        );
+
+        // Public: stale refetch and tarball-first self-prime still work.
+        let r = send(&ctx.app, Method::GET, "/npm/lodash", "").await;
+        assert_eq!(
+            r.status(),
+            StatusCode::OK,
+            "public refetch after private died"
+        );
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/lodash2/-/lodash2-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert!(
+            cached("npm/lodash2/metadata.json").await,
+            "public self-prime after private died"
+        );
+        assert_public_clean(&public.received_requests().await.unwrap());
     }
 
     #[tokio::test]
