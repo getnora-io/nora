@@ -2302,6 +2302,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rpm",
+ "rustix",
  "ruzstd",
  "serde",
  "serde_ignored",
