@@ -58,6 +58,11 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | `nora_circuit_breaker_state` | gauge | registry | 0 = closed, 1 = open, 2 = half_open |
 | `nora_circuit_breaker_rejections_total` | counter | registry | Requests rejected by open circuit breaker |
 
+`registry` on both is the breaker key: the format name (`cargo`, `go`, …), or
+`<format>:<upstream URL>` for formats with a breaker per configured upstream (Docker
+and PyPI), credentials stripped — e.g. `pypi:https://pypi.org/simple`. Match a format
+with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
+
 ### Security
 
 | Metric | Type | Labels | Description |
