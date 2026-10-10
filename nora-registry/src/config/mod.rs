@@ -82,6 +82,83 @@ pub enum ConfigLoadError {
     /// Validation found errors that make the configuration unusable.
     #[error("fatal configuration errors: {}", .0.join("; "))]
     Invalid(Vec<String>),
+    /// The config file has keys no setting reads, and `NORA_CONFIG_STRICT` refuses them.
+    #[error(
+        "{path} has unknown keys: {} (NORA_CONFIG_STRICT is on)",
+        .keys.join(", ")
+    )]
+    UnknownKeys { path: String, keys: Vec<String> },
+}
+
+/// The config file read from the working directory when `NORA_CONFIG_PATH` is unset.
+const DEFAULT_CONFIG_FILE: &str = "config.toml";
+
+/// Whether `NORA_CONFIG_STRICT` asks to refuse a config file with unknown keys.
+fn config_strict_from_env() -> bool {
+    env::var("NORA_CONFIG_STRICT").is_ok_and(|val| val.to_lowercase() == "true" || val == "1")
+}
+
+/// Parses a config file into a [`Config`] and the paths of the keys no setting reads,
+/// such as `curation.mdoe` for a typo of `mode`.
+///
+/// Keys inside an untagged entry (`maven.proxies = [{ url, auth }]`) are not seen: serde
+/// buffers those values before trying each variant, so they never reach the tracker.
+fn parse_config(content: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let mut unknown = Vec::new();
+    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+        unknown.push(key_path(&path))
+    })?;
+    Ok((config, unknown))
+}
+
+/// `curation.mdoe`, `docker.upstreams.0.auht`: map keys and sequence indices joined by
+/// dots. `serde_ignored` prints `Option` layers as `?`; they are not part of the file.
+fn key_path(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    let mut segments = Vec::new();
+    let mut at = path;
+    loop {
+        at = match at {
+            Path::Root => break,
+            Path::Seq { parent, index } => {
+                segments.push(index.to_string());
+                parent
+            }
+            Path::Map { parent, key } => {
+                segments.push(key.clone());
+                parent
+            }
+            Path::Some { parent }
+            | Path::NewtypeStruct { parent }
+            | Path::NewtypeVariant { parent } => parent,
+        };
+    }
+    segments.reverse();
+    segments.join(".")
+}
+
+/// Reports the unknown keys of the config file at `path`: one warning listing them all,
+/// or, when `strict`, an error. Returns them for the caller.
+fn surface_unknown_keys(
+    path: &str,
+    keys: Vec<String>,
+    strict: bool,
+) -> Result<Vec<String>, ConfigLoadError> {
+    if keys.is_empty() {
+        return Ok(keys);
+    }
+    if strict {
+        return Err(ConfigLoadError::UnknownKeys {
+            path: path.to_string(),
+            keys,
+        });
+    }
+    tracing::warn!(
+        path = %path,
+        keys = %keys.join(", "),
+        "Config has unknown keys, ignored; NORA_CONFIG_STRICT=true refuses them"
+    );
+    Ok(keys)
 }
 
 // --- Shared defaults (used by submodules via `super::default_*`) ---
@@ -987,12 +1064,24 @@ impl Config {
     /// A configuration NORA cannot start with is an error, for the caller to report and
     /// exit on with [`EXIT_CONFIG`].
     pub fn load() -> Result<Self, ConfigLoadError> {
-        Self::load_from(env::var("NORA_CONFIG_PATH").ok())
+        let (config, _unknown_keys) = Self::load_from(
+            env::var("NORA_CONFIG_PATH").ok(),
+            DEFAULT_CONFIG_FILE,
+            config_strict_from_env(),
+        )?;
+        Ok(config)
     }
 
-    /// [`Config::load`] with the `NORA_CONFIG_PATH` value passed in, so tests can drive
-    /// it without setting a process-wide variable that `validate` also reads.
-    fn load_from(config_path: Option<String>) -> Result<Self, ConfigLoadError> {
+    /// [`Config::load`] with `NORA_CONFIG_PATH`, the fallback file and `NORA_CONFIG_STRICT`
+    /// passed in, so tests can drive it without setting process-wide state that `validate`
+    /// also reads. Also returns the unknown keys of the file it read: logged once, or
+    /// refused in strict mode.
+    fn load_from(
+        config_path: Option<String>,
+        fallback: &str,
+        strict: bool,
+    ) -> Result<(Self, Vec<String>), ConfigLoadError> {
+        let mut unknown_keys = Vec::new();
         // 1. Start with defaults
         // 2. Override with config file if exists
         let mut config: Config = if let Some(config_path) = config_path {
@@ -1001,21 +1090,24 @@ impl Config {
                     path: config_path.clone(),
                     source,
                 })?;
-            let cfg = toml::from_str(&content).map_err(|source| ConfigLoadError::InvalidToml {
-                path: config_path.clone(),
-                source,
-            })?;
+            let (cfg, unknown) =
+                parse_config(&content).map_err(|source| ConfigLoadError::InvalidToml {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            unknown_keys = surface_unknown_keys(&config_path, unknown, strict)?;
             tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
             cfg
         } else {
-            match fs::read_to_string("config.toml") {
-                Ok(content) => match toml::from_str(&content) {
-                    Ok(cfg) => {
-                        tracing::info!("Loaded config from config.toml");
+            match fs::read_to_string(fallback) {
+                Ok(content) => match parse_config(&content) {
+                    Ok((cfg, unknown)) => {
+                        unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
+                        tracing::info!(path = %fallback, "Loaded config");
                         cfg
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "config.toml exists but contains invalid TOML, using defaults");
+                        tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
                         Config::default()
                     }
                 },
@@ -1029,7 +1121,7 @@ impl Config {
             .map_err(ConfigLoadError::EnvOverride)?;
 
         // 4. Validate configuration
-        config.checked()
+        Ok((config.checked()?, unknown_keys))
     }
 
     /// Validate: warnings are logged, errors reject the configuration.
@@ -1050,17 +1142,26 @@ impl Config {
     /// Non-panicking config reload for SIGHUP handler.
     /// Returns Err on invalid file/TOML/validation instead of panicking.
     pub fn try_load() -> Result<Self, String> {
-        let mut config: Config = if let Ok(config_path) = env::var("NORA_CONFIG_PATH") {
-            let content = fs::read_to_string(&config_path)
-                .map_err(|e| format!("Cannot read {}: {}", config_path, e))?;
-            toml::from_str(&content)
-                .map_err(|e| format!("Invalid TOML in {}: {}", config_path, e))?
-        } else {
-            match fs::read_to_string("config.toml") {
-                Ok(content) => toml::from_str(&content)
-                    .map_err(|e| format!("Invalid TOML in config.toml: {}", e))?,
-                Err(_) => Config::default(),
+        let file = match env::var("NORA_CONFIG_PATH") {
+            Ok(path) => {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+                Some((path, content))
             }
+            Err(_) => fs::read_to_string(DEFAULT_CONFIG_FILE)
+                .ok()
+                .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
+        };
+        // one path for both sources, so neither can skip the unknown-key check
+        let mut config: Config = match file {
+            Some((path, content)) => {
+                let (config, unknown) = parse_config(&content)
+                    .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+                surface_unknown_keys(&path, unknown, config_strict_from_env())
+                    .map_err(|e| format!("Reload refused: {}", e))?;
+                config
+            }
+            None => Config::default(),
         };
         config.apply_env_overrides()?;
         let (_, errors) = config.validate();
@@ -2027,14 +2128,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
 
-        let missing = Config::load_from(Some(path("absent.toml"))).expect_err("missing file");
+        let missing = Config::load_from(Some(path("absent.toml")), NO_FALLBACK, false)
+            .expect_err("missing file");
         assert!(
             matches!(missing, ConfigLoadError::Unreadable { .. }),
             "{missing}"
         );
 
         std::fs::write(path("broken.toml"), "[server\nport = ").unwrap();
-        let broken = Config::load_from(Some(path("broken.toml"))).expect_err("invalid TOML");
+        let broken = Config::load_from(Some(path("broken.toml")), NO_FALLBACK, false)
+            .expect_err("invalid TOML");
         assert!(
             matches!(broken, ConfigLoadError::InvalidToml { .. }),
             "{broken}"
@@ -2042,9 +2145,356 @@ mod tests {
 
         // An error no test's temporary NORA_* variables can mask.
         std::fs::write(path("empty-path.toml"), "[storage]\npath = \"\"\n").unwrap();
-        let invalid = Config::load_from(Some(path("empty-path.toml"))).expect_err("validation");
+        let invalid = Config::load_from(Some(path("empty-path.toml")), NO_FALLBACK, false)
+            .expect_err("validation");
         assert!(matches!(invalid, ConfigLoadError::Invalid(_)), "{invalid}");
         assert!(invalid.to_string().contains("storage.path"), "{invalid}");
+    }
+
+    /// Paths of the unknown keys of `content`, sorted; panics if it does not parse.
+    fn unknown_keys(content: &str) -> Vec<String> {
+        let (_, mut keys) = parse_config(content).unwrap_or_else(|e| panic!("{e}\n{content}"));
+        keys.sort();
+        keys
+    }
+
+    /// A typo is reported with the full path to it, at every depth: top level, a section,
+    /// an array of tables, a whole unknown section (reported once, not key by key).
+    #[test]
+    fn unknown_keys_are_listed_with_their_full_path() {
+        let content = r#"
+            typo_top = 1
+
+            [curation]
+            mdoe = "enforce"
+
+            [[docker.upstreams]]
+            url = "https://registry-1.docker.io"
+            auht = "user:pass"
+
+            [unknwon_section]
+            a = 1
+            b = 2
+        "#;
+        assert_eq!(
+            unknown_keys(content),
+            [
+                "curation.mdoe",
+                "docker.upstreams.0.auht",
+                "typo_top",
+                "unknwon_section"
+            ]
+        );
+        // the hazard the list exists for: the typo leaves curation at its default
+        let (config, _) = parse_config(content).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::default());
+    }
+
+    /// A typo in any table of the config is listed — derived from the serialized default
+    /// config, so a new section or nested table is covered without editing this test.
+    /// Tables whose keys are names (maps) cannot hold an unknown key; they are pinned
+    /// below, so a struct table cannot hide among them.
+    #[test]
+    fn a_typo_in_any_table_is_listed() {
+        fn strip_nulls(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.retain(|_, x| !x.is_null());
+                    m.values_mut().for_each(strip_nulls);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(strip_nulls),
+                _ => {}
+            }
+        }
+        fn tables(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    out.push(path.clone());
+                    for (k, x) in m {
+                        path.push(k.clone());
+                        tables(x, path, out);
+                        path.pop();
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        path.push(i.to_string());
+                        tables(x, path, out);
+                        path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn insert_typo(v: &mut serde_json::Value, path: &[String]) {
+            let target = path.iter().fold(v, |v, seg| match v {
+                serde_json::Value::Array(a) => &mut a[seg.parse::<usize>().unwrap()],
+                other => &mut other[seg.as_str()],
+            });
+            target["zz_typo"] = serde_json::json!(1);
+        }
+
+        let mut default = serde_json::to_value(Config::default()).unwrap();
+        strip_nulls(&mut default);
+        let mut all = Vec::new();
+        tables(&default, &mut Vec::new(), &mut all);
+        assert!(all.len() > 25, "the walk stopped seeing tables: {all:?}");
+
+        let mut maps = Vec::new();
+        for table in &all {
+            let mut doc = default.clone();
+            insert_typo(&mut doc, table);
+            let content = toml::to_string(&doc).unwrap();
+            let dotted = table.join(".");
+            match parse_config(&content) {
+                Ok((_, keys)) => {
+                    let want = if dotted.is_empty() {
+                        "zz_typo".to_string()
+                    } else {
+                        format!("{dotted}.zz_typo")
+                    };
+                    assert_eq!(keys, [want], "typo in [{dotted}]");
+                }
+                Err(_) => maps.push(dotted),
+            }
+        }
+        assert_eq!(
+            maps,
+            ["circuit_breaker.overrides", "deb.proxies", "rpm.proxies"],
+            "only name-keyed maps may refuse a typo key; a struct here hides its typos"
+        );
+    }
+
+    /// Every key the config reads is not listed: an empty file, the full default config,
+    /// and every secret — secrets are `skip_serializing`, so the round trip cannot see them.
+    #[test]
+    fn known_keys_are_not_listed() {
+        assert!(unknown_keys("").is_empty());
+        let default = toml::to_string(&{
+            let mut v = serde_json::to_value(Config::default()).unwrap();
+            fn strip(v: &mut serde_json::Value) {
+                if let serde_json::Value::Object(m) = v {
+                    m.retain(|_, x| !x.is_null());
+                    m.values_mut().for_each(strip);
+                } else if let serde_json::Value::Array(a) = v {
+                    a.iter_mut().for_each(strip);
+                }
+            }
+            strip(&mut v);
+            v
+        })
+        .unwrap();
+        assert!(unknown_keys(&default).is_empty(), "{default}");
+
+        // one `# secret` line per `skip_serializing` field of the config structs
+        const SECRETS: &str = r#"
+            [storage]
+            s3_access_key = "ak"  # secret
+            s3_secret_key = "sk"  # secret
+            [curation]
+            bypass_token = "t"  # secret
+            [npm]
+            proxy_auth = "u:p"  # secret
+            [pypi]
+            proxy_auth = "u:p"  # secret
+            proxies = [{ url = "https://pypi.example", auth = "u:p" }]  # secret
+            [maven]
+            proxies = [{ url = "https://maven.example", auth = "u:p" }]  # secret
+            [[docker.upstreams]]
+            url = "https://docker.example"
+            auth = "u:p"  # secret
+            [go]
+            proxy_auth = "u:p"  # secret
+            [cargo]
+            proxy_auth = "u:p"  # secret
+            [gems]
+            proxy_auth = "u:p"  # secret
+            [terraform]
+            proxy_auth = "u:p"  # secret
+            [ansible]
+            proxy_auth = "u:p"  # secret
+            [nuget]
+            proxy_auth = "u:p"  # secret
+            [pub_dart]
+            proxy_auth = "u:p"  # secret
+            [conan]
+            proxy_auth = "u:p"  # secret
+            [cpan]
+            proxy_auth = "u:p"  # secret
+            [rpm.proxies]
+            fedora = { url = "https://rpm.example", auth = "u:p" }  # secret
+        "#;
+        assert!(unknown_keys(SECRETS).is_empty());
+
+        let mut in_source = 0;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/config");
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let src = std::fs::read_to_string(&p).unwrap();
+                    in_source += src
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with("#[serde("))
+                        .filter(|l| {
+                            l.contains("skip_serializing)") || l.contains("skip_serializing,")
+                        })
+                        .count();
+                }
+            }
+        }
+        assert_eq!(
+            SECRETS.matches("# secret").count(),
+            in_source,
+            "a secret field was added or removed: list it in SECRETS"
+        );
+    }
+
+    /// Known limit, pinned so a fix shows up here: a typo inside an untagged entry (a proxy
+    /// given as a table instead of a URL) is not listed — serde buffers the entry to try
+    /// each variant, and the buffered copy is not tracked. The entry still loads its `url`.
+    #[test]
+    fn typo_inside_an_untagged_proxy_entry_is_not_seen() {
+        for content in [
+            "[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n",
+            "[pypi]\nproxies = [{ url = \"https://p.example\", auht = \"u:p\" }]\n",
+            "[rpm.proxies]\nfedora = { url = \"https://r.example\", auht = \"u:p\" }\n",
+        ] {
+            assert_eq!(unknown_keys(content), Vec::<String>::new(), "{content}");
+        }
+        let (config, _) =
+            parse_config("[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n")
+                .unwrap();
+        assert_eq!(config.maven.proxies[0].url(), "https://m.example");
+        assert_eq!(config.maven.proxies[0].auth(), None);
+    }
+
+    /// The config shipped in the image has no unknown keys: strict mode must start on it.
+    #[test]
+    fn shipped_docker_config_has_no_unknown_keys() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/config.docker.toml");
+        assert!(unknown_keys(&std::fs::read_to_string(path).unwrap()).is_empty());
+    }
+
+    /// Without strict mode the server starts and the keys come back for the warning;
+    /// with it, loading fails with a typed error that names every key.
+    #[test]
+    fn strict_mode_refuses_unknown_keys_and_default_mode_lists_them() {
+        // load_from applies NORA_* overrides; other tests set invalid ones under this lock.
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(
+            &typo,
+            "[curation]\nmdoe = \"enforce\"\n[gc]\nenabeld = true\n",
+        )
+        .unwrap();
+
+        let (_, keys) =
+            Config::load_from(Some(typo.clone()), NO_FALLBACK, false).expect("default mode starts");
+        assert_eq!(keys, ["curation.mdoe", "gc.enabeld"]);
+
+        match Config::load_from(Some(typo.clone()), NO_FALLBACK, true) {
+            Err(ConfigLoadError::UnknownKeys { path, keys }) => {
+                assert_eq!(path, typo);
+                assert_eq!(keys, ["curation.mdoe", "gc.enabeld"]);
+            }
+            other => panic!("strict mode must refuse unknown keys, got {other:?}"),
+        }
+
+        let valid = dir.path().join("valid.toml").to_string_lossy().into_owned();
+        std::fs::write(&valid, "[curation]\nmode = \"off\"\n").unwrap();
+        let (_, keys) =
+            Config::load_from(Some(valid), NO_FALLBACK, true).expect("strict starts on valid");
+        assert!(keys.is_empty());
+    }
+
+    /// A fallback path no test creates, for tests that pass `NORA_CONFIG_PATH`.
+    const NO_FALLBACK: &str = "/nonexistent/nora-test/config.toml";
+
+    /// The working-directory `config.toml` (no `NORA_CONFIG_PATH`) is held to the same
+    /// rule at start. (On reload both sources share one code path; see the reload test.)
+    #[test]
+    fn fallback_config_file_is_held_to_the_same_rule() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+
+        let (_, keys) = Config::load_from(None, &typo, false).expect("default mode starts");
+        assert_eq!(keys, ["curation.mdoe"]);
+        assert!(matches!(
+            Config::load_from(None, &typo, true),
+            Err(ConfigLoadError::UnknownKeys { .. })
+        ));
+    }
+
+    /// `NORA_CONFIG_STRICT` follows the other boolean switches: `true` (any case) or `1`.
+    #[test]
+    fn config_strict_reads_its_env_switch() {
+        let _lock = env_lock();
+        let read = |v: Option<&str>| {
+            match v {
+                Some(v) => std::env::set_var("NORA_CONFIG_STRICT", v),
+                None => std::env::remove_var("NORA_CONFIG_STRICT"),
+            }
+            let on = config_strict_from_env();
+            std::env::remove_var("NORA_CONFIG_STRICT");
+            on
+        };
+        assert!(!read(None));
+        assert!(read(Some("true")));
+        assert!(read(Some("TRUE")));
+        assert!(read(Some("1")));
+        assert!(!read(Some("false")));
+        assert!(!read(Some("0")));
+    }
+
+    /// `Config::load` itself reads `NORA_CONFIG_STRICT`: the switch reaches the start path,
+    /// not only the helper the other tests drive.
+    #[test]
+    fn load_reads_the_strict_switch_from_env() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &typo);
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let strict = Config::load();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let lenient = Config::load();
+        std::env::remove_var("NORA_CONFIG_PATH");
+        assert!(
+            matches!(&strict, Err(ConfigLoadError::UnknownKeys { keys, .. }) if keys == &["curation.mdoe"]),
+            "{strict:?}"
+        );
+        assert!(lenient.is_ok(), "{:?}", lenient.err());
+    }
+
+    /// SIGHUP reload honours strict mode too: a reload with a typo is refused, so the
+    /// running configuration stays.
+    #[test]
+    fn reload_refuses_unknown_keys_in_strict_mode() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &typo);
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let strict = Config::try_load();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let lenient = Config::try_load();
+        std::env::remove_var("NORA_CONFIG_PATH");
+        let err = strict.expect_err("strict reload must refuse unknown keys");
+        assert!(err.contains("curation.mdoe"), "{err}");
+        assert!(lenient.is_ok(), "{:?}", lenient.err());
     }
 
     /// A fatal configuration error is a typed error for `main` to exit on with
