@@ -24,7 +24,20 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// and only the final `rename` publishes it, so a reader never sees a partial file.
 /// Relaxed ordering: the counter only makes names unique, it orders nothing.
 fn unique_tmp_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    if let Some(seq) = tests::NEXT_TMP_SEQ.with(|next| next.replace(None)) {
+        tests::NEXT_TMP_SEQ.with(|next| next.set(Some(seq + 1)));
+        return tmp_path_with_seq(path, seq);
+    }
     let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tmp_path_with_seq(path, seq)
+}
+
+/// How many temp names a write tries before giving up: a name is skipped when a file
+/// already has it (see [`create_tmp`]).
+const TMP_CREATE_ATTEMPTS: u32 = 8;
+
+fn tmp_path_with_seq(path: &Path, seq: u64) -> PathBuf {
     path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
 }
 
@@ -55,6 +68,45 @@ impl TmpFileGuard {
     fn published(mut self) {
         self.published = true;
     }
+}
+
+/// Create a new temp file for a write of `path`, under a name no file has yet.
+///
+/// The name lives beside the key, where a stored key can have exactly that name (a raw
+/// upload `x.tmp.<pid>.<seq>`). The file is therefore created exclusively (`O_EXCL`):
+/// a name that is taken is skipped for the next candidate, and an existing file is
+/// never opened, truncated or renamed away. The guard is armed only once the file is
+/// ours, so it can never remove somebody else's.
+async fn create_tmp(path: &Path) -> Result<(TmpFileGuard, fs::File)> {
+    let candidates: Vec<PathBuf> = (0..TMP_CREATE_ATTEMPTS)
+        .map(|_| unique_tmp_path(path))
+        .collect();
+    // CANCEL-SAFETY: the file is created and its guard armed inside one blocking task,
+    // and the guard travels in the task's output. If this future is dropped, tokio
+    // drops that output with the JoinHandle or when the task completes, so the guard
+    // still removes the file; a task not yet started at runtime shutdown never runs.
+    let (guard, file) = tokio::task::spawn_blocking(move || create_tmp_sync(candidates))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))?;
+    Ok((guard, fs::File::from_std(file)))
+}
+
+fn create_tmp_sync(candidates: Vec<PathBuf>) -> std::io::Result<(TmpFileGuard, std::fs::File)> {
+    for tmp in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((TmpFileGuard::new(tmp), file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free temp name after {TMP_CREATE_ATTEMPTS} attempts"),
+    ))
 }
 
 impl Drop for TmpFileGuard {
@@ -234,9 +286,9 @@ impl StorageBackend for LocalStorage {
         let lock = self.commit_lock(key);
         let _commit = lock.lock().await;
         // CANCEL-SAFETY: the guard removes the temp file however the write ends —
-        // error or cancellation at any `.await` below — until the rename publishes it.
-        let tmp = TmpFileGuard::new(unique_tmp_path(&path));
-        let mut file = fs::File::create(tmp.path()).await?;
+        // error or cancellation at any `.await`, `create_tmp` included — until the
+        // rename publishes it.
+        let (tmp, mut file) = create_tmp(&path).await?;
         file.write_all(data).await?;
         file.flush().await?;
         file.sync_all().await?;
@@ -423,8 +475,7 @@ impl StorageBackend for LocalStorage {
                 // (and truncate, and rename away) one temp file.
                 // CANCEL-SAFETY: as in put(), the guard removes the temp file on error
                 // or cancellation until the rename publishes it.
-                let tmp = TmpFileGuard::new(unique_tmp_path(&dest));
-                let mut writer = fs::File::create(tmp.path()).await?;
+                let (tmp, mut writer) = create_tmp(&dest).await?;
                 let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
                 loop {
                     let n = reader.read(&mut buf).await?;
@@ -543,6 +594,71 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    thread_local! {
+        /// Pins the sequence numbers of the next temp names taken on this thread, so a
+        /// test can know a write's temp name in advance. Tests on other threads keep
+        /// the shared counter.
+        pub(super) static NEXT_TMP_SEQ: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The temp name of `key`'s write with sequence number `seq`, as a storage key.
+    fn tmp_key(key: &str, seq: u64) -> String {
+        let (dir, name) = key.rsplit_once('/').unwrap();
+        let tmp = tmp_path_with_seq(Path::new(name), seq);
+        format!("{dir}/{}", tmp.to_string_lossy())
+    }
+
+    /// A stored key may be named exactly like the temp file a later write of another
+    /// key picks (`raw/report.tmp.<pid>.<seq>` is a valid raw upload). The write must
+    /// take the next free name and leave the stored key as it was — neither truncated
+    /// and renamed over the new key, nor removed by the temp-file guard.
+    #[tokio::test]
+    async fn put_never_reuses_a_stored_key_named_like_its_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let seq = 9_000_000;
+        let stored = tmp_key("raw/report", seq);
+        put(&storage, &stored, b"stored bytes").await.unwrap();
+
+        NEXT_TMP_SEQ.with(|next| next.set(Some(seq)));
+        put(&storage, "raw/report", b"new body").await.unwrap();
+        NEXT_TMP_SEQ.with(|next| next.set(None));
+
+        assert_eq!(&get(&storage, &stored).await.unwrap()[..], b"stored bytes");
+        assert_eq!(&get(&storage, "raw/report").await.unwrap()[..], b"new body");
+        let leftovers = tmp_leftovers(dir.path());
+        assert_eq!(leftovers.len(), 1, "only the stored key: {leftovers:?}");
+    }
+
+    /// The retry is bounded: when every candidate name is taken, the write fails and
+    /// every stored key is untouched.
+    #[tokio::test]
+    async fn put_gives_up_after_bounded_temp_name_collisions() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let seq = 9_100_000;
+        let stored: Vec<String> = (0..u64::from(TMP_CREATE_ATTEMPTS))
+            .map(|i| tmp_key("raw/report", seq + i))
+            .collect();
+        for key in &stored {
+            put(&storage, key, key.as_bytes()).await.unwrap();
+        }
+
+        NEXT_TMP_SEQ.with(|next| next.set(Some(seq)));
+        let result = put(&storage, "raw/report", b"new body").await;
+        NEXT_TMP_SEQ.with(|next| next.set(None));
+
+        assert!(
+            result.is_err(),
+            "every temp name is taken: the write must fail"
+        );
+        assert!(get(&storage, "raw/report").await.is_err());
+        for key in &stored {
+            assert_eq!(&get(&storage, key).await.unwrap()[..], key.as_bytes());
+        }
+    }
 
     /// The backend pins what it stores, so every test write carries the digest
     /// of its own bytes.
