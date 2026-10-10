@@ -36,6 +36,8 @@ hex.workspace = true
 object_store = { version = "0.13", features = ["aws", "gcp"] }
 futures = "0.3"
 toml = "1.1"
+# Lists config keys no field reads, so a typo is reported instead of ignored.
+serde_ignored = "0.1"
 uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.19"
 base64 = "0.22"
