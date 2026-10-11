@@ -12,6 +12,10 @@ NLY = "NLY"
 flie = "flie"
 # "unparseable" is a valid English spelling (alongside "unparsable")
 unparseable = "unparseable"
+# intentional typos: unknown config keys in config tests and the changelog example
+mdoe = "mdoe"
+enabeld = "enabeld"
+unknwon = "unknwon"
 
 [files]
 extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]

@@ -25,11 +25,17 @@ pub struct PypiConfig {
 }
 
 /// PyPI upstream proxy configuration (mirrors `MavenProxyEntry`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum PypiProxyEntry {
     Simple(String),
     Full(PypiProxy),
+}
+
+impl<'de> Deserialize<'de> for PypiProxyEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::url_or_table(deserializer, Self::Simple, Self::Full)
+    }
 }
 
 /// PyPI upstream proxy with optional auth.

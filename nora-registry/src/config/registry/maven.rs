@@ -26,11 +26,17 @@ pub struct MavenConfig {
 }
 
 /// Maven upstream proxy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum MavenProxyEntry {
     Simple(String),
     Full(MavenProxy),
+}
+
+impl<'de> Deserialize<'de> for MavenProxyEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::url_or_table(deserializer, Self::Simple, Self::Full)
+    }
 }
 
 /// Maven upstream proxy with optional auth
