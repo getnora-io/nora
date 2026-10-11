@@ -301,6 +301,32 @@ fn strip_internal_bulk(
     }
 }
 
+/// GitHub Packages' tarball path, `download/<@scope/name>/<version>/<sha1>`: the package
+/// name and version, or `None` for any other path. It has no `/-/`, so without this it
+/// would be taken for the packument of a package named `download/…` and skip every
+/// tarball check, curation included.
+fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("download/")?;
+    let mut segments = rest.split('/');
+    let (scope, name, version, sha) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    if segments.next().is_some()
+        || scope.len() < 2
+        || !scope.starts_with('@')
+        || name.is_empty()
+        || version.is_empty()
+        || sha.is_empty()
+        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((&rest[..scope.len() + 1 + name.len()], version))
+}
+
 /// Rewrite tarball URLs in npm metadata to point to NORA.
 ///
 /// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
@@ -393,9 +419,14 @@ async fn handle_request(
         return handle_whoami(&user).await;
     }
 
-    let is_tarball = path.contains("/-/");
+    let github_packages = github_packages_tarball(&path);
+    let is_tarball = github_packages.is_some() || path.contains("/-/");
 
-    let key = if is_tarball {
+    let key = if let Some((name, version)) = github_packages {
+        // Stored under the npmjs file name of that version, like any other tarball.
+        let bare = name.rsplit('/').next().unwrap_or(name);
+        format!("npm/{name}/tarballs/{bare}-{version}.tgz")
+    } else if is_tarball {
         let parts: Vec<&str> = path.splitn(2, "/-/").collect();
         if parts.len() == 2 {
             format!("npm/{}/tarballs/{}", parts[0], parts[1])
@@ -406,14 +437,18 @@ async fn handle_request(
         format!("npm/{}/metadata.json", path)
     };
 
-    let package_name = if is_tarball {
+    let package_name = if let Some((name, _)) = github_packages {
+        name.to_string()
+    } else if is_tarball {
         path.split("/-/").next().unwrap_or(&path).to_string()
     } else {
         path.clone()
     };
 
     // Parse tarball version (used for both pre-download and integrity checks)
-    let tarball_version = if is_tarball {
+    let tarball_version = if let Some((_, version)) = github_packages {
+        Some(version.to_string())
+    } else if is_tarball {
         let filename = path.split("/-/").nth(1).unwrap_or("");
         crate::curation::parse_npm_tarball_version(&package_name, filename)
     } else {
@@ -1997,6 +2032,37 @@ mod tests {
         );
     }
 
+    /// GitHub Packages' tarball path, as public lockfiles record it
+    /// (`https://npm.pkg.github.com/download/@microsoft/…/1.11.0/<sha1>`).
+    #[test]
+    fn github_packages_tarball_path_is_recognised() {
+        assert_eq!(
+            github_packages_tarball(
+                "download/@microsoft/security-devops-actions-toolkit/1.11.0/04fef883382f5a7c9b9ac2015dcc419009e2a858"
+            ),
+            Some(("@microsoft/security-devops-actions-toolkit", "1.11.0"))
+        );
+        assert_eq!(
+            github_packages_tarball(
+                "download/@CookieMonsterTeam/cookiemonsterframework/0.2.3/46a211d57dac557c86fc55f1622a6cccdf7dd25f"
+            ),
+            Some(("@CookieMonsterTeam/cookiemonsterframework", "0.2.3"))
+        );
+        // The npm package named `download`, its tarball and anything else.
+        for path in [
+            "download",
+            "download/-/download-8.0.0.tgz",
+            "download/@vendor/a/1.0.0",
+            "download/@vendor/a/1.0.0/not-hex",
+            "download/@vendor/a//04fef883382f5a7c9b9ac2015dcc419009e2a858",
+            "download/@vendor/a/1.0.0/04fef883382f5a7c9b9ac2015dcc419009e2a858/x",
+            "download/vendor/a/1.0.0/04fef883382f5a7c9b9ac2015dcc419009e2a858",
+            "@vendor/a/-/a-1.0.0.tgz",
+        ] {
+            assert_eq!(github_packages_tarball(path), None, "{path}");
+        }
+    }
+
     #[test]
     fn test_rewrite_tarball_urls_preserves_non_upstream_urls() {
         // homepage and repository.url should NOT be mangled
@@ -2801,6 +2867,89 @@ mod integration_tests {
     /// The allowlist matches name and version. A tarball whose version cannot be
     /// read from its path is refused rather than passed on as a metadata request —
     /// including a version directory that names another version than the file.
+    /// GitHub Packages serves tarballs at `download/<@scope/name>/<version>/<sha1>`, with
+    /// no `/-/`. That is a tarball download: curation sees its version, and the object is
+    /// stored as that version's tarball with its hash sidecar and served as one.
+    #[tokio::test]
+    async fn a_github_packages_tarball_is_a_download() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{header, Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let upstream = MockServer::start().await;
+        for version in ["0.9.0", "1.0.0"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/@vendor/a/{version}/{SHA}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(format!("TGZ {version}").into_bytes()),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            r#"{"version": 1, "entries": [{"registry": "npm", "name": "@vendor/a", "version": "0.9.0"}]}"#,
+        )
+        .unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/1.0.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unlisted version");
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .all(|r| !r.url.path().starts_with("/download/")),
+            "a refused tarball is not fetched"
+        );
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/0.9.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "control: the listed version");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ 0.9.0");
+        let storage = &ctx.state.storage;
+        // The cache write runs in the background: wait for it, with a deadline.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        for key in [
+            "npm/@vendor/a/tarballs/a-0.9.0.tgz",
+            "npm/@vendor/a/tarballs/a-0.9.0.tgz.sha256",
+        ] {
+            while storage.stat(key).await.is_none() {
+                assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        assert!(
+            storage.list("npm/download/").await.unwrap().is_empty(),
+            "no tarball stored as a packument"
+        );
+    }
+
     #[tokio::test]
     async fn allowlist_refuses_a_tarball_whose_version_it_cannot_read() {
         use crate::test_helpers::{create_test_context_with_config, send};
@@ -5133,7 +5282,25 @@ mod multi_upstream_tests {
             "",
         )
         .await;
-        assert_eq!(private.received_requests().await.unwrap().len(), 1);
+        // The tarball goes to the owner once; as for any tarball, so does the
+        // packument read for the release date.
+        let to_owner: Vec<String> = private
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        let tarball = "/download/@vendor/a/1.0.0/d113f588ab0b17ddabe8d0db55fa83a741df6871";
+        assert_eq!(
+            to_owner.iter().filter(|p| *p == tarball).count(),
+            1,
+            "{to_owner:?}"
+        );
+        assert!(
+            to_owner.iter().all(|p| p == tarball || p == "/@vendor/a"),
+            "{to_owner:?}"
+        );
         assert_public_clean(&public.received_requests().await.unwrap());
     }
 
