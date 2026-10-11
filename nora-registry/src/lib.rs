@@ -287,14 +287,26 @@ pub mod maven_fuzz {
 pub mod version_fuzz {
     use crate::validation::ends_with_ci;
 
+    /// The same forms as `curation::parse_npm_tarball_version` in the server.
     pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
+        if let Some(version) = parse_npm_tarball_file(package_name, filename) {
+            return Some(version);
+        }
+        let (dir, file) = filename.split_once('/')?;
+        parse_npm_tarball_file(package_name, file).filter(|version| version == dir)
+    }
+
+    fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> {
         let filename = filename.strip_suffix(".tgz")?;
         let name_part = if package_name.contains('/') {
             package_name.rsplit('/').next()?
         } else {
             package_name
         };
-        let version = filename.strip_prefix(name_part)?.strip_prefix('-')?;
+        let version = filename
+            .strip_prefix(package_name)
+            .or_else(|| filename.strip_prefix(name_part))?
+            .strip_prefix('-')?;
         if version.is_empty() {
             return None;
         }

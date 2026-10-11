@@ -2478,6 +2478,78 @@ mod integration_tests {
         );
     }
 
+    /// Font Awesome's registry serves tarballs at `<name>/-/<version>/<file>.tgz`.
+    /// The allowlist must read the version from that form too: without it the
+    /// request carries no version and passes as a metadata request.
+    #[tokio::test]
+    async fn allowlist_checks_a_tarball_under_a_version_directory() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        for version in ["0.9.0", "1.0.0"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/@fortawesome/pro-test/-/{version}/pro-test-{version}.tgz"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(format!("TGZ {version}").into_bytes()),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            r#"{"version": 1, "entries": [
+                {"registry": "npm", "name": "@fortawesome/pro-test", "version": "0.9.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+        });
+        let tarball_requests = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.url.path().ends_with(".tgz"))
+                .count()
+        };
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/@fortawesome/pro-test/-/1.0.0/pro-test-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unlisted version");
+        assert_eq!(
+            tarball_requests().await,
+            0,
+            "a blocked tarball is not fetched"
+        );
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/@fortawesome/pro-test/-/0.9.0/pro-test-0.9.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "control: the listed version");
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ 0.9.0");
+    }
+
     /// Internal-namespace package: ensure_npm_metadata_cached must never fetch
     /// the packument upstream (#68 dependency confusion).
     #[tokio::test]
