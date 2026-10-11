@@ -310,6 +310,10 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           package: nora-registry
+          # Judge the change this PR makes, not everything since the last published
+          # crate: a break accepted in an earlier PR would otherwise fail every PR
+          # until the next release.
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
 
   integration:
     name: Integration
