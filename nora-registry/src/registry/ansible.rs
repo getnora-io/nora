@@ -213,7 +213,7 @@ async fn version_detail(
             &headers,
             crate::curation::RegistryType::Ansible,
             &format!("{}.{}", ns, name),
-            Some(&ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             None,
         ) {
             return response;
@@ -337,7 +337,7 @@ async fn download_tarball(
             &headers,
             crate::curation::RegistryType::Ansible,
             &format!("{}.{}", ns, name),
-            Some(ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return response;

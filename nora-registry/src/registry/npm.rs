@@ -463,7 +463,7 @@ async fn handle_request(
                 &headers,
                 crate::curation::RegistryType::Npm,
                 &package_name,
-                tarball_version.as_deref(),
+                crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
                 publish_date,
             ) {
                 return response;
@@ -2796,6 +2796,80 @@ mod integration_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "control: the listed version");
         assert_eq!(&body_bytes(resp).await[..], b"TGZ 0.9.0");
+    }
+
+    /// The allowlist matches name and version. A tarball whose version cannot be
+    /// read from its path is refused rather than passed on as a metadata request —
+    /// including a version directory that names another version than the file.
+    #[tokio::test]
+    async fn allowlist_refuses_a_tarball_whose_version_it_cannot_read() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"name":"pkg","versions":{}}"#),
+            )
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, r#"{"version": 1, "entries": [{"registry": "npm", "name": "pkg", "version": "1.0.0"}]}"#).unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for path in ["/npm/pkg/-/pkg.tgz", "/npm/pkg/-/9.9.9/pkg-1.0.0.tgz"] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched.iter().all(|r| !r.url.path().ends_with(".tgz")),
+            "a refused tarball is not fetched: {:?}",
+            fetched
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "control: the packument passes"
+        );
+    }
+
+    /// In audit mode the same tarball is logged, not refused.
+    #[tokio::test]
+    async fn audit_mode_lets_a_tarball_with_an_unread_version_through() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, r#"{"version": 1, "entries": [{"registry": "npm", "name": "pkg", "version": "1.0.0"}]}"#).unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.mode = crate::config::CurationMode::Audit;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg.tgz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Internal-namespace package: ensure_npm_metadata_cached must never fetch

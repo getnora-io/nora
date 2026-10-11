@@ -1254,7 +1254,7 @@ async fn download_blob(
             &headers,
             crate::curation::RegistryType::Docker,
             &name,
-            Some(&digest),
+            crate::curation::RequestVersion::Known(digest.to_string()),
             None,
         ) {
             return response;
@@ -2169,7 +2169,7 @@ async fn get_manifest(
             &headers,
             crate::curation::RegistryType::Docker,
             &name,
-            Some(&reference),
+            crate::curation::RequestVersion::Known(reference.to_string()),
             publish_date,
         ) {
             return response;

@@ -257,7 +257,7 @@ async fn provider_download_meta(
             &headers,
             crate::curation::RegistryType::Terraform,
             &format!("{}/{}", ns, ptype),
-            Some(&ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return response;
@@ -946,7 +946,7 @@ async fn mirror_provider_version(
             &headers,
             crate::curation::RegistryType::Terraform,
             &format!("{}/{}", ns, ptype),
-            Some(ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return resp;

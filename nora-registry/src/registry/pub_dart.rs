@@ -164,7 +164,7 @@ async fn package_listing(
             &headers,
             crate::curation::RegistryType::PubDart,
             &package,
-            None,
+            crate::curation::RequestVersion::Unspecified,
             None,
         ) {
             return response;
@@ -487,7 +487,7 @@ async fn download_archive(
             &headers,
             crate::curation::RegistryType::PubDart,
             &package,
-            Some(version),
+            crate::curation::RequestVersion::Known(version.to_string()),
             publish_date,
         ) {
             return response;

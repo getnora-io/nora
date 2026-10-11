@@ -371,7 +371,7 @@ async fn download(
                 &headers,
                 crate::curation::RegistryType::Maven,
                 maven_name,
-                Some(maven_version),
+                crate::curation::RequestVersion::Known(maven_version.to_string()),
                 publish_date,
             ) {
                 return response;

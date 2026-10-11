@@ -432,7 +432,7 @@ async fn registration_index(
             &headers,
             crate::curation::RegistryType::Nuget,
             &id_lower,
-            None,
+            crate::curation::RequestVersion::Unspecified,
             None,
         ) {
             return response;
@@ -900,7 +900,7 @@ async fn flatcontainer_download(
             &headers,
             crate::curation::RegistryType::Nuget,
             &id_lower,
-            Some(ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return response;

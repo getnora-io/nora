@@ -81,7 +81,7 @@ async fn download(
             &headers,
             crate::curation::RegistryType::Raw,
             &path,
-            None,
+            crate::curation::RequestVersion::Unspecified,
             publish_date,
         ) {
             return response;

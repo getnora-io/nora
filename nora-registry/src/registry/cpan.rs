@@ -170,13 +170,22 @@ async fn distribution_proxy(
 
     // Curation check — extract name and optional version from dist filename
     let (dist_name, dist_version) = parse_dist_filename(filename);
+    // A distribution archive carries its version in its name; `.meta`, `.readme`
+    // and other files name none.
+    let request_version = match dist_version {
+        Some(v) => crate::curation::RequestVersion::Known(v.to_string()),
+        None if cpan_archive_stem(filename).is_some() => {
+            crate::curation::RequestVersion::Unrecognised
+        }
+        None => crate::curation::RequestVersion::Unspecified,
+    };
     if let Some(response) = crate::curation::check_download(
         &state.curation().curation_engine,
         state.bypass_token().as_deref(),
         &headers,
         crate::curation::RegistryType::Cpan,
         dist_name,
-        dist_version,
+        request_version,
         None,
     ) {
         return response;
@@ -803,5 +812,47 @@ mod integration_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A distribution archive whose version cannot be read from its name is refused
+    /// by the allowlist; a `.meta` file names no version and passes.
+    #[tokio::test]
+    async fn allowlist_refuses_an_archive_whose_version_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, r#"{"version": 1, "entries": [{"registry": "cpan", "name": "Foo-Bar", "version": "1.0"}]}"#).unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cpan.enabled = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for key in ["Foo-Bar.tar.gz", "Foo-Bar-1.0.meta"] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/A/AU/AUTHOR/{key}"), b"x")
+                .await
+                .unwrap();
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.0.meta",
+            "",
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "control: .meta passes"
+        );
     }
 }

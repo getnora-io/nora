@@ -40,14 +40,48 @@ pub struct FilterRequest {
     pub upstream: Option<String>,
     /// Package/artifact name (e.g., "lodash", "com.google.guava:guava").
     pub name: String,
-    /// Version string (e.g., "4.17.21", "33.0.0-jre").
-    pub version: Option<String>,
+    /// The version the request fetches, if it names one.
+    pub version: RequestVersion,
     /// Integrity hash provided by the client (e.g., sha256 checksum).
     pub integrity: Option<String>,
     /// Whether the request carries a valid bypass token.
     pub bypass: bool,
     /// Publish date as Unix timestamp (seconds). None = unknown.
     pub publish_date: Option<i64>,
+}
+
+/// What a request says about the version it fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestVersion {
+    /// The request names no version: a package-level request (metadata, an index),
+    /// a file of a format without versions (raw), or an import whose source gives none.
+    Unspecified,
+    /// The version read from the request (e.g., "4.17.21", "33.0.0-jre").
+    Known(String),
+    /// An artifact download whose version could not be read from the request: its
+    /// file name is in a form the handler does not parse. The allowlist cannot match
+    /// it and refuses it; rules that need no version still apply.
+    Unrecognised,
+}
+
+impl RequestVersion {
+    /// The version of an artifact download, `Unrecognised` when none could be read.
+    pub fn of_artifact(version: Option<&str>) -> Self {
+        version.map_or(Self::Unrecognised, |v| Self::Known(v.to_string()))
+    }
+
+    /// The version a request names, `Unspecified` when it names none.
+    pub fn named(version: Option<&str>) -> Self {
+        version.map_or(Self::Unspecified, |v| Self::Known(v.to_string()))
+    }
+
+    /// The version, when one was read from the request.
+    pub fn known(&self) -> Option<&str> {
+        match self {
+            Self::Known(v) => Some(v),
+            Self::Unspecified | Self::Unrecognised => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -274,7 +308,7 @@ pub fn check_download(
     headers: &axum::http::HeaderMap,
     registry: RegistryType,
     name: &str,
-    version: Option<&str>,
+    version: RequestVersion,
     publish_date: Option<i64>,
 ) -> Option<Response> {
     let bypass = match bypass_token {
@@ -293,7 +327,7 @@ pub fn check_download(
         registry,
         upstream: None,
         name: name.to_string(),
-        version: version.map(|v| v.to_string()),
+        version: version.clone(),
         integrity: None,
         bypass,
         publish_date,
@@ -307,7 +341,7 @@ pub fn check_download(
                 tracing::info!(
                     registry = %registry,
                     package = %name,
-                    version = version.unwrap_or("*"),
+                    version = version.known().unwrap_or("*"),
                     rule = %rule,
                     reason = %reason,
                     "[AUDIT] Download would be blocked"
@@ -320,7 +354,7 @@ pub fn check_download(
                         reason: reason.clone(),
                         registry: registry.to_string(),
                         package: name.to_string(),
-                        version: version.map(|v| v.to_string()),
+                        version: version.known().map(|v| v.to_string()),
                     }
                     .into_response(),
                 )
@@ -347,7 +381,7 @@ pub fn check_namespace_isolation(
         registry,
         upstream: None,
         name: name.to_string(),
-        version: None,
+        version: RequestVersion::Unspecified,
         integrity: None,
         bypass: false,
         publish_date: None,
@@ -390,7 +424,7 @@ pub fn is_internal_namespace(engine: &CurationEngine, registry: RegistryType, na
         registry,
         upstream: None,
         name: name.to_string(),
-        version: None,
+        version: RequestVersion::Unspecified,
         integrity: None,
         bypass: false,
         publish_date: None,
@@ -482,7 +516,7 @@ pub fn verify_integrity(
         registry,
         upstream: None,
         name: name.to_string(),
-        version: version.map(|v| v.to_string()),
+        version: RequestVersion::named(version),
         integrity: Some(integrity),
         bypass: false, // bypass already checked in pre-download phase
         publish_date: None,
@@ -554,7 +588,7 @@ pub fn verify_integrity_by_hash(
         registry,
         upstream: None,
         name: name.to_string(),
-        version: version.map(|v| v.to_string()),
+        version: RequestVersion::named(version),
         integrity: Some(hash.to_string()),
         bypass: false,
         publish_date: None,
@@ -883,7 +917,7 @@ impl ProxyFilter for BlocklistFilter {
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
         let registry_str = request.registry.to_string();
-        let version_str = request.version.as_deref().unwrap_or("");
+        let version_str = request.version.known().unwrap_or("");
 
         // First match in file order wins, and that choice is visible: it decides
         // which rule's `reason` the client reads in the 403. So the two
@@ -1008,10 +1042,22 @@ impl ProxyFilter for AllowlistFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
-        // Metadata requests (no version) — skip, let through
         let version = match &request.version {
-            Some(v) => v,
-            None => return Decision::Skip,
+            RequestVersion::Known(v) => v,
+            // A package-level request names no version: nothing to match here.
+            RequestVersion::Unspecified => return Decision::Skip,
+            // An artifact whose version is unknown cannot be matched against an entry,
+            // and passing it as metadata would serve versions nobody listed.
+            RequestVersion::Unrecognised => {
+                return Decision::Block {
+                    rule: "allowlist".to_string(),
+                    reason: format!(
+                        "Package '{}' ({}): version not recognised in the request, so it \
+                         cannot be matched against the allowlist",
+                        request.name, request.registry
+                    ),
+                }
+            }
         };
 
         let key = (
@@ -1323,7 +1369,7 @@ mod tests {
             registry: RegistryType::Npm,
             upstream: Some("https://registry.npmjs.org".to_string()),
             name: name.to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: Some("sha256-abc123".to_string()),
             bypass: false,
             publish_date: None,
@@ -1335,7 +1381,7 @@ mod tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: name.to_string(),
-            version: None,
+            version: RequestVersion::Unspecified,
             integrity: None,
             bypass: false,
             publish_date: None,
@@ -1347,7 +1393,7 @@ mod tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: name.to_string(),
-            version: None,
+            version: RequestVersion::Unspecified,
             integrity: None,
             bypass: true,
             publish_date: None,
@@ -1804,7 +1850,7 @@ mod tests {
             registry,
             upstream: None,
             name: name.to_string(),
-            version: version.map(|v| v.to_string()),
+            version: RequestVersion::named(version),
             integrity: None,
             bypass: false,
             publish_date: None,
@@ -1824,7 +1870,7 @@ mod tests {
     /// agree with it on every input, including which rule wins.
     fn naive_decision(rules: &[BlocklistRule], request: &FilterRequest) -> Option<String> {
         let registry_str = request.registry.to_string();
-        let version_str = request.version.as_deref().unwrap_or("");
+        let version_str = request.version.known().unwrap_or("");
         rules
             .iter()
             .find(|rule| {
@@ -2551,6 +2597,83 @@ mod tests {
         assert_eq!(filter.evaluate(&req), Decision::Skip);
     }
 
+    /// A package-level request names no version and passes; an artifact whose
+    /// version could not be read is refused, with a reason that says so.
+    #[test]
+    fn allowlist_refuses_an_artifact_with_an_unrecognised_version() {
+        let filter = make_allowlist_entries(vec![], false);
+        let mut req = make_request_with_registry(RegistryType::Npm, "lodash", None);
+        assert_eq!(req.version, RequestVersion::Unspecified);
+        assert_eq!(filter.evaluate(&req), Decision::Skip);
+        req.version = RequestVersion::Unrecognised;
+        match filter.evaluate(&req) {
+            Decision::Block { rule, reason } => {
+                assert_eq!(rule, "allowlist");
+                assert!(reason.contains("version not recognised"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// Package-level requests name no version, so the allowlist lets them through:
+    /// an index or listing is not a download, and a raw file has no version to list.
+    /// Marking them `Unrecognised` would refuse every install under an allowlist.
+    #[tokio::test]
+    async fn package_level_requests_pass_the_allowlist() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write_allowlist(
+            dir.path(),
+            r#"{"version": 1, "entries": [{"registry": "npm", "name": "x", "version": "1"}]}"#,
+        );
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+            let dead = Some("http://127.0.0.1:1".to_string());
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = dead.clone();
+            cfg.nuget.proxy_timeout = 1;
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = dead.clone();
+            cfg.gems.proxy_timeout = 1;
+            cfg.pub_dart.enabled = true;
+            cfg.pub_dart.proxy = dead;
+            cfg.pub_dart.proxy_timeout = 1;
+            cfg.raw.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put("raw/docs/readme.txt", b"hello")
+            .await
+            .unwrap();
+        for path in [
+            "/nuget/v3/registration/pkg/index.json",
+            "/gems/info/pkg",
+            "/pub/api/packages/pkg",
+            "/raw/docs/readme.txt",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[test]
+    fn request_version_constructors() {
+        assert_eq!(
+            RequestVersion::of_artifact(None),
+            RequestVersion::Unrecognised
+        );
+        assert_eq!(RequestVersion::named(None), RequestVersion::Unspecified);
+        assert_eq!(
+            RequestVersion::of_artifact(Some("1.0")),
+            RequestVersion::Known("1.0".to_string())
+        );
+        assert_eq!(RequestVersion::named(Some("1.0")).known(), Some("1.0"));
+        assert_eq!(RequestVersion::Unrecognised.known(), None);
+    }
+
     #[test]
     fn test_allowlist_registry_mismatch_blocks() {
         let filter = make_allowlist_entries(
@@ -2680,7 +2803,7 @@ mod tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "lodash".to_string(),
-            version: Some("4.17.21".to_string()),
+            version: RequestVersion::Known("4.17.21".to_string()),
             integrity: Some("sha256:abc123".to_string()),
             bypass: false,
             publish_date: None,
@@ -2840,7 +2963,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_none());
@@ -2860,7 +2983,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_some());
@@ -2879,7 +3002,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_none());
@@ -2899,7 +3022,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_none());
@@ -2919,7 +3042,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_some());
@@ -2939,7 +3062,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_some());
@@ -2956,7 +3079,7 @@ mod tests {
             &headers,
             RegistryType::Npm,
             "lodash",
-            None,
+            RequestVersion::Unspecified,
             None,
         );
         assert!(result.is_none());
@@ -2972,7 +3095,7 @@ mod tests {
             &headers,
             RegistryType::Cargo,
             "serde",
-            Some("1.0.0"),
+            RequestVersion::Known("1.0.0".to_string()),
             None,
         );
         assert!(result.is_none());
@@ -3071,7 +3194,9 @@ mod tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "@vendor/a".to_string(),
-            version: super::parse_npm_tarball_version("@vendor/a", filename),
+            version: RequestVersion::of_artifact(
+                super::parse_npm_tarball_version("@vendor/a", filename).as_deref(),
+            ),
             integrity: None,
             bypass: false,
             publish_date: None,
@@ -3330,7 +3455,7 @@ mod tests {
             registry: super::RegistryType::Cargo,
             upstream: None,
             name: "my-crate".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None, // pre-download: no integrity
             bypass: false,
             publish_date: None,
@@ -3432,7 +3557,7 @@ mod tests {
             registry: super::RegistryType::Cargo,
             upstream: None,
             name: "my-crate".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: Some("sha256:abc123".to_string()), // post-download: has integrity
             bypass: false,
             publish_date: None,
@@ -3504,7 +3629,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "fresh-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: Some(now - 86400), // 1 day ago
@@ -3523,7 +3648,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "stable-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: Some(now - 864000), // 10 days ago
@@ -3544,7 +3669,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "unknown-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: None,
@@ -3562,7 +3687,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "unknown-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: None,
@@ -3582,7 +3707,7 @@ mod min_release_age_tests {
             registry: RegistryType::Cargo,
             upstream: None,
             name: "boundary-pkg".to_string(),
-            version: Some("2.0.0".to_string()),
+            version: RequestVersion::Known("2.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: Some(now - 86400),
@@ -3608,7 +3733,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "young-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: Some(now - 3600), // 1 hour ago
@@ -3622,7 +3747,7 @@ mod min_release_age_tests {
             registry: RegistryType::Npm,
             upstream: None,
             name: "old-pkg".to_string(),
-            version: Some("1.0.0".to_string()),
+            version: RequestVersion::Known("1.0.0".to_string()),
             integrity: None,
             bypass: false,
             publish_date: Some(now - 864000), // 10 days

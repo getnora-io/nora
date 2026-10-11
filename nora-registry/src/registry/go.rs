@@ -106,7 +106,7 @@ async fn handle(
                 &headers,
                 crate::curation::RegistryType::Go,
                 module_name,
-                version.as_deref(),
+                crate::curation::RequestVersion::of_artifact(version.as_deref()),
                 publish_date,
             ) {
                 return response;

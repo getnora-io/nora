@@ -1366,7 +1366,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         registry,
         upstream: None,
         name: name.clone(),
-        version: version.clone(),
+        version: curation::RequestVersion::named(version.as_deref()),
         integrity: None,
         bypass: false,
         publish_date: None,

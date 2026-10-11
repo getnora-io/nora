@@ -181,7 +181,7 @@ async fn compact_index(
             &headers,
             crate::curation::RegistryType::Gems,
             &name,
-            None,
+            crate::curation::RequestVersion::Unspecified,
             None,
         ) {
             return response;
@@ -445,7 +445,7 @@ async fn download_gem(
             &headers,
             crate::curation::RegistryType::Gems,
             &name,
-            Some(&version),
+            crate::curation::RequestVersion::Known(version.to_string()),
             publish_date,
         ) {
             return response;

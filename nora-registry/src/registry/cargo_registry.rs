@@ -425,7 +425,7 @@ async fn download(
             &headers,
             crate::curation::RegistryType::Cargo,
             &crate_name,
-            Some(&version),
+            crate::curation::RequestVersion::Known(version.to_string()),
             publish_date,
         ) {
             return response;

@@ -400,7 +400,7 @@ async fn recipe_file_download(
             &headers,
             crate::curation::RegistryType::Conan,
             &name,
-            Some(&ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return response;
@@ -828,7 +828,7 @@ async fn package_file_download(
             &headers,
             crate::curation::RegistryType::Conan,
             &name,
-            Some(&ver),
+            crate::curation::RequestVersion::Known(ver.to_string()),
             publish_date,
         ) {
             return response;

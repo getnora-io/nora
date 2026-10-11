@@ -370,7 +370,7 @@ async fn download_file(
             &headers,
             crate::curation::RegistryType::PyPI,
             &normalized,
-            version.as_deref(),
+            crate::curation::RequestVersion::of_artifact(version.as_deref()),
             publish_date,
         ) {
             return response;
@@ -2106,6 +2106,34 @@ mod integration_tests {
 
     /// Regression test for #905: `ensure_pypi_dates_cached` must never fetch
     /// an internal-namespace package's metadata upstream (#68 dependency
+    /// A file whose version cannot be read from its name is refused by the
+    /// allowlist, not passed on as a metadata request.
+    #[tokio::test]
+    async fn allowlist_refuses_a_file_whose_version_it_cannot_read() {
+        use crate::test_helpers::create_test_context_with_config;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(&allowlist, r#"{"version": 1, "entries": [{"registry": "pypi", "name": "pkg", "version": "1.0.0"}]}"#).unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state
+            .storage
+            .put("pypi/pkg/weird.tar.gz", b"sdist")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, "/simple/pkg/weird.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(&ctx.app, Method::GET, "/simple/pkg/", "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "control: the index passes"
+        );
+    }
+
     /// confusion). Verify that a tarball download for an internal-namespace
     /// package does not trigger any upstream requests for the dates endpoint.
     #[tokio::test]

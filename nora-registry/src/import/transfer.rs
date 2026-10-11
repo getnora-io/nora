@@ -198,7 +198,7 @@ pub async fn transfer_artifact(
         // date/version-keyed rules may no-op on some sources (Kelsey #4, an
         // accepted, documented asymmetry — not silent Allow-by-omission for the
         // integrity/namespace/blocklist rules, which DO run).
-        version: None,
+        version: crate::curation::RequestVersion::Unspecified,
         integrity: Some(format!("sha256:{sha256}")),
         bypass: false,
         publish_date: None,
