@@ -1950,10 +1950,18 @@ async fn run_server(mut config: Config, storage: Storage) {
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 
+    // Open this instance's staging directory, removing what dead instances (SIGKILL,
+    // OOM, power cut) left in theirs.
+    state.storage.prepare().await;
+
     // Clean up stale Docker temp files from previous runs (#530, #580).
     if state.config.docker.enabled {
         registry::docker::cleanup_upload_temp_dir(&state.config.storage.path);
         registry::docker::cleanup_proxy_temp_dir(&state.config.storage.path);
+    }
+    // ...and streamed raw uploads a crash cut off mid-request.
+    if state.config.raw.enabled {
+        registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
     }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
@@ -2048,6 +2056,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     // survive on disk until the next boot. Age-guarded by SESSION_TTL,
                     // so in-progress uploads are never reaped.
                     registry::docker::cleanup_upload_temp_dir(&storage_path);
+                    registry::raw::cleanup_upload_temp_dir(&storage_path);
                 });
             }
         }

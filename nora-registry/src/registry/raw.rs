@@ -685,10 +685,29 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
     }
 }
 
+/// Where streamed raw uploads are written before commit, under the storage path.
+const RAW_UPLOAD_TEMP_SUBDIR: &str = "tmp/raw-uploads";
+
+/// Idle age after which a streamed raw upload's temp file is an orphan: the same
+/// bound as Docker proxy temp files (#580).
+const RAW_UPLOAD_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+
+/// Remove streamed raw upload temp files orphaned by a crash mid-upload (SIGKILL,
+/// OOM) or a failed commit — nothing else ever removes them. Called at startup and
+/// every 5 minutes; an upload in progress keeps writing its file, so it is never
+/// this old.
+pub fn cleanup_upload_temp_dir(data_dir: &str) {
+    let dir = std::path::PathBuf::from(data_dir).join(RAW_UPLOAD_TEMP_SUBDIR);
+    let removed = super::remove_stale_temp_files(&dir, RAW_UPLOAD_TEMP_MAX_AGE);
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale raw upload temp files");
+    }
+}
+
 /// Temp directory for streamed raw uploads, created on demand. Lives inside
 /// the storage path so the local backend's commit is a same-filesystem rename.
 fn raw_upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(data_dir).join("tmp/raw-uploads");
+    let dir = std::path::PathBuf::from(data_dir).join(RAW_UPLOAD_TEMP_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::error!(path = %dir.display(), error = %e, "failed to create raw upload temp directory");
     }
@@ -734,6 +753,34 @@ fn guess_content_type(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A streamed upload orphaned by a crash is reaped once idle past the bound; a
+    /// file still being written is kept (#1055 polygon: SIGKILL mid-PUT left them
+    /// forever).
+    #[test]
+    fn test_cleanup_upload_temp_dir_reaps_only_idle_files() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().to_str().unwrap();
+        let dir = raw_upload_temp_dir(root);
+        let orphan = dir.join("orphan");
+        let live = dir.join("live");
+        std::fs::write(&orphan, b"partial").unwrap();
+        std::fs::write(&live, b"partial").unwrap();
+        let idle = std::time::SystemTime::now()
+            - RAW_UPLOAD_TEMP_MAX_AGE
+            - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(idle))
+            .unwrap();
+
+        cleanup_upload_temp_dir(root);
+
+        assert!(!orphan.exists(), "an idle orphan must be reaped");
+        assert!(live.exists(), "a file still being written must be kept");
+    }
 
     #[test]
     fn test_guess_content_type_json() {
