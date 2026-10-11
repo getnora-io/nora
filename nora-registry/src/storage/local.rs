@@ -208,6 +208,25 @@ fn staging_dir_sync<'a>(
     .map(|staging| staging.dir.as_path())
 }
 
+/// The directory a listing for `prefix` can start from: the one its last `/` names, so
+/// `npm/pkg/versions/` walks that directory and not the whole store. `None` for a prefix
+/// inside the staging area, which a listing never returns. A prefix with a `.` or `..`
+/// component starts from the root, as every listing did before.
+fn list_root(base: &Path, prefix: &str) -> Option<PathBuf> {
+    let dir = prefix.rfind('/').map_or("", |i| &prefix[..i]);
+    if dir.is_empty()
+        || dir
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Some(base.to_path_buf());
+    }
+    if dir.split('/').next() == Some(crate::validation::STAGING_DIR) {
+        return None;
+    }
+    Some(base.join(dir))
+}
+
 /// Whether `path` is the staging directory of the storage root `base`.
 fn is_staging_dir(path: &Path, base: &Path) -> bool {
     path.parent() == Some(base)
@@ -608,8 +627,8 @@ impl StorageBackend for LocalStorage {
         // Use blocking task for filesystem traversal
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if base.exists() {
-                Self::list_files_sync(&base, &base, &prefix, &mut results);
+            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+                Self::list_files_sync(&root, &base, &prefix, &mut results);
             }
             results.sort();
             results
@@ -624,8 +643,8 @@ impl StorageBackend for LocalStorage {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if base.exists() {
-                Self::list_files_with_meta_sync(&base, &base, &prefix, &mut results);
+            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+                Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
             results
@@ -857,6 +876,94 @@ impl StorageBackend for LocalStorage {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn a_listing_starts_at_the_directory_its_prefix_names() {
+        let base = std::path::Path::new("/s");
+        let root = |p: &str| super::list_root(base, p);
+        assert_eq!(root(""), Some(base.to_path_buf()));
+        assert_eq!(root("raw"), Some(base.to_path_buf()));
+        assert_eq!(root("npm/"), Some(base.join("npm")));
+        assert_eq!(root("npm/pkg"), Some(base.join("npm")));
+        assert_eq!(
+            root("npm/pkg/versions/"),
+            Some(base.join("npm/pkg/versions"))
+        );
+        assert_eq!(
+            root("npm/@s/pkg/versions/"),
+            Some(base.join("npm/@s/pkg/versions"))
+        );
+        assert_eq!(root(".nora-staging/x/"), None);
+        assert_eq!(root("npm/../raw/"), Some(base.to_path_buf()));
+        assert_eq!(root("npm//x"), Some(base.to_path_buf()));
+    }
+
+    /// Starting the walk at the prefix's directory returns exactly what the full walk did.
+    #[tokio::test]
+    async fn a_prefix_listing_returns_what_the_full_walk_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        for key in [
+            "npm/pkg/versions/1.0.0.json",
+            "npm/pkg/versions/2.0.0.json",
+            "npm/pkg/metadata.json",
+            "npm/pkgx/versions/1.0.0.json",
+            "npm/@s/pkg/versions/1.0.0.json",
+            "raw/a/b.txt",
+            "rawx/c.txt",
+        ] {
+            use sha2::Digest as _;
+            let sha = hex::encode(sha2::Sha256::digest(b"x"));
+            storage.put(key, b"x", &sha).await.unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join(crate::validation::STAGING_DIR).join("i")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::validation::STAGING_DIR).join("i/t"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(super::PIN_FILE), b"{}").unwrap();
+        let full = |prefix: &str| {
+            let mut out = Vec::new();
+            LocalStorage::list_files_sync(
+                &dir.path().to_path_buf(),
+                &dir.path().to_path_buf(),
+                prefix,
+                &mut out,
+            );
+            out.sort();
+            out
+        };
+        for prefix in [
+            "",
+            "npm/",
+            "npm/pkg",
+            "npm/pkg/",
+            "npm/pkg/versions/",
+            "npm/@s/pkg/versions/",
+            "raw",
+            "raw/",
+            "raw/a/b.txt",
+            "missing/",
+            ".nora-staging/",
+            ".nora-staging/i/",
+            "npm/../raw/",
+        ] {
+            assert_eq!(
+                storage.list(prefix).await.unwrap(),
+                full(prefix),
+                "list {prefix:?}"
+            );
+            let with_meta: Vec<String> = storage
+                .list_with_meta(prefix)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(with_meta, full(prefix), "list_with_meta {prefix:?}");
+        }
+    }
+
     use super::*;
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
@@ -1820,5 +1927,166 @@ mod tests {
             get(&storage, "del/key").await,
             Err(crate::storage::StorageError::NotFound)
         ));
+    }
+
+    async fn put_key(storage: &LocalStorage, key: &str) {
+        use sha2::Digest as _;
+        let sha = hex::encode(sha2::Sha256::digest(b"x"));
+        storage.put(key, b"x", &sha).await.unwrap();
+    }
+
+    /// Keys of `list` and `list_with_meta` for `prefix`, or `None` if either has not
+    /// returned within `secs` (the walk runs on its own thread so a runaway walk
+    /// fails the probe instead of hanging the test binary).
+    fn list_both_within(
+        root: &Path,
+        prefix: &str,
+        secs: u64,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (root, prefix) = (root.to_str().unwrap().to_string(), prefix.to_string());
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let storage = LocalStorage::new(&root);
+            let listed = rt.block_on(storage.list(&prefix)).unwrap();
+            let meta = rt
+                .block_on(storage.list_with_meta(&prefix))
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            let _ = tx.send((listed, meta));
+            rt.shutdown_background();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+
+    /// Two self-loops at `dir`: a walk that enters `dir` never finishes
+    /// (2 branches per level, until ELOOP at ~40 levels).
+    fn plant_loops(dir: &Path) {
+        std::os::unix::fs::symlink(".", dir.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink(".", dir.join("loop_b")).unwrap();
+    }
+
+    /// The walk for a prefix starts in the directory its last `/` names and in no directory
+    /// above it: loops planted at the root and at every level between the root and that
+    /// directory make a walk from any of them never return. Same keys are not enough — the
+    /// point of starting at the prefix is not reading the rest of the store.
+    #[tokio::test]
+    async fn a_prefix_listing_walks_no_directory_above_the_one_it_names() {
+        let keys = [
+            "npm/pkg/versions/1.0.0.json",
+            "npm/pkg/versions/1.1.0.json",
+            "npm/pkg/versions-old/0.9.0.json",
+            "npm/pkg/pkg-1.0.0.tgz",
+            "npm/pkgx/versions/2.0.0.json",
+            "raw/a",
+        ];
+        for prefix in [
+            "npm/pkg/versions/",
+            "npm/pkg/versions/1.",
+            "npm/pkg/",
+            "npm/pkg",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = LocalStorage::new(dir.path().to_str().unwrap());
+            for key in keys {
+                put_key(&storage, key).await;
+            }
+            let mut want: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| k.to_string())
+                .collect();
+            want.sort();
+            // The root, then `npm`, `npm/pkg`, ... down to (not including) the named directory.
+            let named = &prefix[..prefix.rfind('/').unwrap()];
+            plant_loops(dir.path());
+            for (i, _) in named.match_indices('/') {
+                plant_loops(&dir.path().join(&named[..i]));
+            }
+            let got = list_both_within(dir.path(), prefix, 20)
+                .unwrap_or_else(|| panic!("listing {prefix:?} walked above {named:?}"));
+            assert_eq!(got, (want.clone(), want), "{prefix:?}");
+        }
+    }
+
+    /// An absolute prefix has an empty first component: the walk starts at the storage root,
+    /// never at the absolute directory the prefix names outside the store.
+    #[tokio::test]
+    async fn an_absolute_prefix_never_walks_outside_the_store() {
+        let top = tempfile::tempdir().unwrap();
+        let store = top.path().join("store");
+        let outside = top.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let storage = LocalStorage::new(store.to_str().unwrap());
+        put_key(&storage, "raw/a").await;
+        plant_loops(&outside);
+        assert_eq!(list_root(&store, "/etc/"), Some(store.clone()));
+        let prefix = format!("{}/", outside.to_str().unwrap());
+        let got = list_both_within(&store, &prefix, 20)
+            .expect("an absolute prefix walked a directory outside the store");
+        assert_eq!(got, (vec![], vec![]));
+    }
+
+    /// `npm/./pkg/` names no key (no key has a `.` component); a walk started at `npm/.`
+    /// would report keys spelled `npm/./pkg/...`.
+    #[tokio::test]
+    async fn a_prefix_with_a_dot_component_lists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put_key(&storage, "npm/pkg/versions/1.0.0.json").await;
+        for prefix in ["npm/./pkg/", "npm/./", "./npm/pkg/"] {
+            assert_eq!(
+                storage.list(prefix).await.unwrap(),
+                Vec::<String>::new(),
+                "{prefix:?}"
+            );
+            assert!(
+                storage.list_with_meta(prefix).await.unwrap().is_empty(),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// Only the staging directory itself, at the root and spelled exactly, is left out; a key
+    /// whose path merely contains or starts with that name is listed as the full walk lists it.
+    #[tokio::test]
+    async fn only_the_staging_directory_at_the_root_is_left_out_of_a_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        // Valid keys (validate_storage_key checks only the first segment).
+        for key in ["raw/g/.nora-staging/f", ".nora-stagingx/a/f"] {
+            crate::validation::validate_storage_key(key).unwrap();
+            put_key(&storage, key).await;
+        }
+        // Not writable through the API, but on disk the full walk lists it (case-sensitive fs).
+        std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
+        std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
+        for (prefix, key) in [
+            ("raw/g/.nora-staging/", "raw/g/.nora-staging/f"),
+            (".nora-stagingx/a/", ".nora-stagingx/a/f"),
+            (".NORA-STAGING/x/", ".NORA-STAGING/x/f"),
+        ] {
+            let mut full = Vec::new();
+            LocalStorage::list_files_sync(
+                &dir.path().to_path_buf(),
+                &dir.path().to_path_buf(),
+                prefix,
+                &mut full,
+            );
+            assert_eq!(full, vec![key.to_string()], "oracle {prefix:?}");
+            assert_eq!(storage.list(prefix).await.unwrap(), full, "list {prefix:?}");
+            let meta: Vec<String> = storage
+                .list_with_meta(prefix)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(meta, full, "list_with_meta {prefix:?}");
+        }
     }
 }
