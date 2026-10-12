@@ -384,6 +384,11 @@ async fn download(
     if validate_storage_key(&crate_name).is_err() || validate_storage_key(&version).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // The upstream path keeps the name as cargo sent it (the published name, from the index):
+    // static.crates.io stores `Inflector` under its capitals and refuses `inflector`. It is
+    // built before the name is lowercased, so every decision below — cache key, curation,
+    // isolation, publish date, integrity — sees only the lowercase name.
+    let upstream_path = format!("api/v1/crates/{}/{}/download", crate_name, version);
     let crate_name = crate_name.to_lowercase();
 
     // Extract publish date from cached Cargo metadata
@@ -537,12 +542,7 @@ async fn download(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let url = format!(
-        "{}/api/v1/crates/{}/{}/download",
-        proxy_url.trim_end_matches('/'),
-        crate_name,
-        version
-    );
+    let url = format!("{}/{}", proxy_url.trim_end_matches('/'), upstream_path);
 
     match proxy_fetch(
         &state.http_client,
@@ -2256,5 +2256,323 @@ mod index_cost_tests {
             small, large,
             "a hosted sparse index file must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+/// A crate whose published name has capitals (`Inflector`) downloads through the proxy: the
+/// upstream path keeps the name as cargo sent it — static.crates.io stores the archive under
+/// the published name and refuses the lowercased one — while the cache key stays lowercase,
+/// so either spelling is served from one cached copy.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod crate_name_case_tests {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_capitalised_crate_downloads_under_its_published_name() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/crates/Inflector/0.11.4/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"CRATE".to_vec()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/Inflector/0.11.4/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CRATE");
+
+        // The copy is cached under the lowercase key: the other spelling is served from it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx
+            .state
+            .storage
+            .stat("cargo/inflector/0.11.4/inflector-0.11.4.crate")
+            .await
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline, "not cached");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/inflector/0.11.4/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CRATE");
+        let downloads: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/download"))
+            .collect();
+        assert_eq!(
+            downloads,
+            vec!["/api/v1/crates/Inflector/0.11.4/download".to_string()],
+            "one archive download, under the published name"
+        );
+    }
+}
+
+/// The request's spelling reaches upstream as sent, while every local
+/// decision (curation, integrity, isolation, publish date) is taken on the lowercase name.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod crate_name_every_decision_on_the_lowercase_name {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn write_json(dir: &tempfile::TempDir, file: &str, json: serde_json::Value) -> String {
+        let p = dir.path().join(file);
+        std::fs::write(&p, json.to_string()).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_blocklisted_crate_is_blocked_in_any_spelling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bl = write_json(
+            &dir,
+            "blocklist.json",
+            serde_json::json!({"version": 1, "rules": [
+                {"registry": "cargo", "name": "evil-crate", "version": "*", "reason": "malware"}
+            ]}),
+        );
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl);
+        });
+        ctx.state
+            .storage
+            .put("cargo/evil-crate/1.0.0/evil-crate-1.0.0.crate", b"evil")
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/Evil-Crate/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_internal_crate_is_isolated_in_any_spelling() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUAT".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+            cfg.cargo.proxy = Some(uri);
+        });
+        // A local internal crate is served whatever the spelling.
+        ctx.state
+            .storage
+            .put("cargo/internal-lib/1.0.0/internal-lib-1.0.0.crate", b"OURS")
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/Internal-Lib/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Without a local copy it is refused, and upstream is never asked.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/Internal-Lib/2.0.0/download",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_publish_date_is_read_under_the_lowercase_name() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+            cfg.server.trust_upstream_dates = true;
+            cfg.cargo.proxy = Some(uri);
+        });
+        // Released an hour ago: the 7-day gate holds it, whatever the spelling.
+        let created = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let meta = serde_json::json!({"versions": [
+            {"num": "0.11.4", "created_at": created}
+        ]});
+        ctx.state
+            .storage
+            .put("cargo/inflector/metadata.json", meta.to_string().as_bytes())
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("cargo/inflector/0.11.4/inflector-0.11.4.crate", b"CRATE")
+            .await
+            .unwrap();
+        for spelling in ["inflector", "Inflector"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{spelling}/0.11.4/download"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{spelling}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_underscored_name_reaches_upstream_as_sent() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/crates/Foo_Bar/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"CRATE".to_vec()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/Foo_Bar/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn integrity_is_verified_under_the_lowercase_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let al = write_json(
+            &dir,
+            "allowlist.json",
+            serde_json::json!({"version": 1, "entries": [{
+                "registry": "cargo", "name": "pinned", "version": "1.0.0",
+                "integrity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "integrity_source": "manual"
+            }]}),
+        );
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(al);
+        });
+        ctx.state
+            .storage
+            .put("cargo/pinned/1.0.0/pinned-1.0.0.crate", b"tampered")
+            .await
+            .unwrap();
+        for spelling in ["pinned", "Pinned"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{spelling}/1.0.0/download"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{spelling}");
+        }
+    }
+}
+
+/// An internal crate is refused alike in every spelling of its name.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod crate_name_isolation_in_any_spelling {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The name as sent is bound once, to build the upstream path, before it is lowercased;
+    // after that the upstream path is used only in the URL. No later decision can see the
+    // published spelling.
+    #[test]
+    fn only_the_upstream_path_keeps_the_name_as_sent() {
+        let src = include_str!("cargo_registry.rs");
+        let body = &src[src.find("async fn download(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let (before, after) = body
+            .split_once("let crate_name = crate_name.to_lowercase();")
+            .unwrap();
+        assert_eq!(before.matches("let ").count(), 1, "{before}");
+        assert!(before.contains("let upstream_path = format!("), "{before}");
+        assert_eq!(after.matches("upstream_path").count(), 1, "{after}");
+        assert!(after.contains(
+            "let url = format!(\"{}/{}\", proxy_url.trim_end_matches('/'), upstream_path);"
+        ));
+    }
+
+    // An internal crate with no local copy is refused the same way whatever the spelling.
+    #[tokio::test]
+    async fn an_internal_crate_without_a_copy_is_refused_alike_in_any_spelling() {
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUAT".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+            cfg.cargo.proxy = Some(uri);
+        });
+        let mut statuses = Vec::new();
+        for spelling in ["internal-lib", "Internal-Lib"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{spelling}/2.0.0/download"),
+                "",
+            )
+            .await;
+            statuses.push(resp.status());
+        }
+        assert_eq!(statuses, vec![StatusCode::FORBIDDEN, StatusCode::FORBIDDEN]);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 }
