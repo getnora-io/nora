@@ -570,10 +570,26 @@ async fn upload(
             StatusCode::OK.into_response()
         }
         Err(e) => {
+            if name_taken(&e) {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("Other files already use the name {path}"),
+                )
+                    .into_response();
+            }
             tracing::error!(error = %e, key = %key, "Failed to store raw artifact");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Whether a raw write failed because the local store already uses the name the other way
+/// round — a directory at the key, or a file at a parent name: that is a taken name (409),
+/// any other failure stays 500. Only the local backend reports it; an object store holds
+/// both names.
+fn name_taken(err: &crate::storage::StorageError) -> bool {
+    matches!(err, crate::storage::StorageError::Io(e)
+        if e.get_ref().is_some_and(|inner| inner.is::<crate::storage::NameTaken>()))
 }
 
 /// Overwrite an existing file (conditional PUT with `If-Match`).
@@ -1569,6 +1585,230 @@ mod integration_tests {
         assert_eq!(fresh.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(fresh.headers().get("etag").unwrap().to_str().unwrap(), etag);
         assert_eq!(&body_bytes(fresh).await[..], b"2345");
+    }
+
+    /// With `dir/f.txt` stored, `/raw/dir` names no file: HEAD, GET, a ranged GET and DELETE
+    /// answer as for a path never stored, on the local store as on an object store. On the
+    /// local store `raw/dir` is a directory, which was answered 200 with the directory's size
+    /// and a body that broke off.
+    #[tokio::test]
+    async fn a_path_that_is_only_a_directory_is_answered_as_missing() {
+        use crate::storage::ObjectStorage;
+
+        let local = create_test_context();
+        let object = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(ObjectStorage::in_memory()),
+        ));
+        for (backend, ctx) in [("local", &local), ("object", &object)] {
+            for (uri, body) in [("/raw/dir/f.txt", "hello"), ("/raw/file.txt", "x")] {
+                let put = send(&ctx.app, Method::PUT, uri, body.as_bytes().to_vec()).await;
+                assert_eq!(put.status(), StatusCode::OK, "{backend} {uri}");
+            }
+            for uri in ["/raw/dir", "/raw/file.txt/x"] {
+                for method in [Method::HEAD, Method::GET, Method::DELETE] {
+                    let named = send(&ctx.app, method.clone(), uri, "").await;
+                    let none = send(&ctx.app, method.clone(), "/raw/none", "").await;
+                    assert_eq!(named.status(), none.status(), "{backend} {method} {uri}");
+                }
+            }
+            let ranged = |uri: &'static str| {
+                send_with_headers(&ctx.app, Method::GET, uri, vec![("range", "bytes=0-9")], "")
+            };
+            assert_eq!(
+                ranged("/raw/dir").await.status(),
+                ranged("/raw/none").await.status(),
+                "{backend} ranged GET"
+            );
+            let get = send(&ctx.app, Method::GET, "/raw/dir/f.txt", "").await;
+            assert_eq!(&body_bytes(get).await[..], b"hello", "{backend}");
+        }
+        // Only an object store can hold a file named like a directory of other files; the
+        // local store refuses it as a taken name, never as a server fault.
+        for uri in ["/raw/dir", "/raw/dir/f.txt/x", "/raw/dir/f.txt/sub/x"] {
+            let put = send(&local.app, Method::PUT, uri, b"x".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::CONFLICT, "local PUT {uri}");
+            let put = send(&object.app, Method::PUT, uri, b"x".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::OK, "object PUT {uri}");
+        }
+        // Deleting a directory's last file leaves the directory on a local store: the name
+        // stays taken there (409, plain or `If-None-Match: *`), and is free on an object store.
+        for (backend, ctx, want) in [
+            ("local", &local, StatusCode::CONFLICT),
+            ("object", &object, StatusCode::OK),
+        ] {
+            for (n, headers) in [("e1", vec![]), ("e2", vec![("if-none-match", "*")])] {
+                let inner = format!("/raw/{n}/f.txt");
+                let put = send(&ctx.app, Method::PUT, &inner, b"x".to_vec()).await;
+                assert_eq!(put.status(), StatusCode::OK, "{backend} {inner}");
+                let del = send(&ctx.app, Method::DELETE, &inner, "").await;
+                assert_eq!(del.status(), StatusCode::NO_CONTENT, "{backend} {inner}");
+                let uri = format!("/raw/{n}");
+                for method in [Method::HEAD, Method::GET] {
+                    let emptied = send(&ctx.app, method.clone(), &uri, "").await;
+                    let none = send(&ctx.app, method.clone(), "/raw/none", "").await;
+                    assert_eq!(emptied.status(), none.status(), "{backend} {method} {uri}");
+                }
+                let put =
+                    send_with_headers(&ctx.app, Method::PUT, &uri, headers, b"x".to_vec()).await;
+                assert_eq!(put.status(), want, "{backend} PUT {uri}");
+            }
+        }
+    }
+
+    /// Makes a directory read-only for a test and gives it back on drop. `None` when this
+    /// user can still write into it (root, CAP_DAC_OVERRIDE): the failure the test needs
+    /// cannot be made here, and the test says so instead of passing on a write that worked.
+    struct ReadOnly(std::path::PathBuf);
+
+    impl ReadOnly {
+        fn new(dir: std::path::PathBuf) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let guard = Self(dir);
+            let probe = guard.0.join(".write-probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                eprintln!("skipped: this user writes into a read-only directory");
+                return None;
+            }
+            Some(guard)
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Only a taken name is 409: a raw write that fails for any other reason (here the
+    /// directory refuses writes) stays a server fault.
+    #[tokio::test]
+    async fn a_write_that_fails_for_another_reason_stays_500() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/a.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(_ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/b.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A delete that fails on a stored file is a fault, not "not found" while the file is
+    /// still there and still served.
+    #[tokio::test]
+    async fn a_delete_that_fails_on_a_stored_file_stays_a_fault() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/a.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let del = send(&ctx.app, Method::DELETE, "/raw/ro/a.txt", "").await;
+        drop(ro);
+        let get = send(&ctx.app, Method::GET, "/raw/ro/a.txt", "").await;
+        assert_eq!(get.status(), StatusCode::OK, "the file is still there");
+        assert_eq!(del.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// a key whose path is a directory is a missing key on delete even when
+    /// unlink(2) refuses it with an errno other than EISDIR (EACCES under a read-only
+    /// parent on Linux; EPERM for any directory on macOS).
+    #[tokio::test]
+    async fn deleting_a_directory_under_a_read_only_parent_is_not_found() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/ro/sub/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let Some(ro) = ReadOnly::new(ctx._tempdir.path().join("raw/ro")) else {
+            return;
+        };
+        let dir = send(&ctx.app, Method::DELETE, "/raw/ro/sub", "").await;
+        let none = send(&ctx.app, Method::DELETE, "/raw/ro/none", "").await;
+        drop(ro);
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+        assert_eq!(dir.status(), none.status(), "DELETE of a directory key");
+    }
+
+    /// a file at any parent name takes the name, however deep the key below it.
+    #[tokio::test]
+    async fn a_file_any_level_up_takes_the_name() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/d/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let put = send(&ctx.app, Method::PUT, "/raw/d/f.txt/a/b/x", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::CONFLICT);
+    }
+
+    /// on an object store a name is never taken, so a write that fails for
+    /// another reason stays 500 even when an object sits at a parent name.
+    #[tokio::test]
+    async fn an_object_store_write_failure_stays_500_under_a_stored_name() {
+        use crate::storage::{FileMeta, ObjectStorage, Result as SResult, StorageBackend};
+        use axum::body::Bytes;
+        use std::path::Path;
+        use std::pin::Pin;
+        use tokio::io::AsyncRead;
+
+        struct FailsUnder(ObjectStorage);
+        #[async_trait::async_trait]
+        impl StorageBackend for FailsUnder {
+            async fn put(&self, k: &str, d: &[u8], s: &str) -> SResult<()> {
+                self.0.put(k, d, s).await
+            }
+            async fn get(&self, k: &str) -> SResult<(Bytes, Option<String>)> {
+                self.0.get(k).await
+            }
+            async fn pin(&self, k: &str) -> Option<String> {
+                self.0.pin(k).await
+            }
+            async fn delete(&self, k: &str) -> SResult<()> {
+                self.0.delete(k).await
+            }
+            async fn list(&self, p: &str) -> SResult<Vec<String>> {
+                self.0.list(p).await
+            }
+            async fn stat(&self, k: &str) -> Option<FileMeta> {
+                self.0.stat(k).await
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "s3"
+            }
+            async fn put_from_path(&self, k: &str, src: &Path, s: Option<&str>) -> SResult<()> {
+                if k.ends_with("/x") {
+                    return Err(StorageError::Io(std::io::Error::other("upstream 503")));
+                }
+                self.0.put_from_path(k, src, s).await
+            }
+            async fn copy(&self, a: &str, b: &str, s: Option<&str>) -> SResult<()> {
+                self.0.copy(a, b, s).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> SResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
+            {
+                self.0.get_reader(k).await
+            }
+        }
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(FailsUnder(ObjectStorage::in_memory())),
+        ));
+        let put = send(&ctx.app, Method::PUT, "/raw/f.txt", b"x".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let put = send(&ctx.app, Method::PUT, "/raw/f.txt/x", b"x".to_vec()).await;
+        assert_eq!(
+            put.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "object store fault"
+        );
     }
 
     /// The ETag flows are backend-agnostic since the pin became object
