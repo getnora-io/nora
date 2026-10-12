@@ -253,6 +253,40 @@ impl AuditLog {
     }
 }
 
+/// Records each download curation refused: a refusal leaves its handler as a
+/// `CurationRefusal` response extension, and this layer — inside auth, so it knows the
+/// caller — writes one `curation_block` entry for it. One layer covers every refusal site
+/// (`check_download`, `check_namespace_isolation`, `verify_integrity`) instead of each
+/// taking the audit log and the caller.
+pub async fn curation_refusal_middleware(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let actor = request
+        .extensions()
+        .get::<crate::auth::AuthenticatedUser>()
+        .map_or_else(|| "anonymous".to_string(), |user| user.0.clone());
+    let response = next.run(request).await;
+    if let Some(refusal) = response
+        .extensions()
+        .get::<crate::curation::CurationRefusal>()
+    {
+        state.audit.log(AuditEntry::new(
+            "curation_block",
+            &actor,
+            &format!(
+                "{}@{}",
+                refusal.package,
+                refusal.version.as_deref().unwrap_or("*")
+            ),
+            &refusal.registry,
+            &format!("{}: {}", refusal.rule, refusal.reason),
+        ));
+    }
+    response
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -372,5 +406,396 @@ mod tests {
         assert_eq!(log.mode(), &AuditMode::Off);
         // Should not panic even when logging to Off mode
         log.log(AuditEntry::new("test", "test", "test", "test", "test"));
+    }
+}
+
+/// A download refused by curation leaves one entry in `audit.jsonl` (who / what /
+/// registry / rule), as push, delete, proxy_fetch, cache_hit and pull do. The test context opts into the file audit log the way an
+/// operator does (`NORA_AUDIT_LOG=file`) and requests go through the whole router,
+/// so the test holds wherever the entry is written — handler or middleware.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod curation_refusal_audit_tests {
+    use super::*;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use tempfile::TempDir;
+
+    const CPAN_AUTHOR: &str = "/cpan/authors/id/A/AU/AUTHOR";
+
+    /// Curation in enforce mode with both refusal kinds: a blocklist rule for raw
+    /// (hosted) and an allowlist for CPAN (proxy). The four files are seeded straight
+    /// into storage, so the audit log starts empty. The policy directory is returned
+    /// to keep it alive.
+    async fn audited_context() -> (TestContext, TempDir) {
+        let policy = TempDir::new().unwrap();
+        let blocklist = policy.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "secret*", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let allowlist = policy.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            r#"{"version": 1, "entries": [{"registry": "cpan", "name": "Foo-Bar", "version": "1.0"}]}"#,
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.audit.mode = AuditMode::File;
+            cfg.cpan.enabled = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for key in [
+            "raw/secret.txt",
+            "raw/public.txt",
+            "cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.0.tar.gz",
+            "cpan/authors/id/A/AU/AUTHOR/Other-Dist-2.0.tar.gz",
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+        }
+        (ctx, policy)
+    }
+
+    /// Drain the writer and parse every line of `audit.jsonl`.
+    async fn written_entries(audit: &AuditLog) -> Vec<serde_json::Value> {
+        let path = audit.path().clone();
+        audit.shutdown().await;
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn blocked_downloads() -> u64 {
+        crate::metrics::CURATION_DECISIONS_TOTAL
+            .with_label_values(&["block"])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_leaves_one_audit_entry() {
+        let (ctx, _policy) = audited_context().await;
+        let blocks_before = blocked_downloads();
+
+        // A blocklisted raw file, and a CPAN distribution the allowlist misses.
+        let refusals = [
+            (
+                "raw",
+                "/raw/secret.txt".to_string(),
+                "secret.txt",
+                "blocklist",
+            ),
+            (
+                "cpan",
+                format!("{CPAN_AUTHOR}/Other-Dist-2.0.tar.gz"),
+                "Other-Dist",
+                "allowlist",
+            ),
+        ];
+        for (_, uri, _, rule) in &refusals {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(resp.headers()["x-nora-decision"], "blocked", "{uri}");
+            assert_eq!(resp.headers()["x-nora-rule"], *rule, "{uri}");
+        }
+        // The block counter moved (other tests only ever add to it) ...
+        assert!(
+            blocked_downloads() >= blocks_before + 2,
+            "nora_curation_decisions_total{{decision=\"block\"}} must count both refusals"
+        );
+
+        // ... and each refusal must be in the audit trail, once.
+        let entries = written_entries(&ctx.state.audit).await;
+        let per_registry: Vec<(&str, usize)> = refusals
+            .iter()
+            .map(|(registry, ..)| {
+                let hits = entries.iter().filter(|e| e["registry"] == *registry);
+                (*registry, hits.count())
+            })
+            .collect();
+        assert_eq!(
+            per_registry,
+            [("raw", 1), ("cpan", 1)],
+            "each download refused by curation must leave one audit entry; \
+             audit.jsonl = {entries:?}"
+        );
+        for (registry, _, artifact, rule) in &refusals {
+            let entry = entries.iter().find(|e| e["registry"] == *registry).unwrap();
+            assert!(
+                !entry["actor"].as_str().unwrap_or("").is_empty(),
+                "who: {entry}"
+            );
+            assert!(
+                entry["artifact"].as_str().unwrap_or("").contains(artifact),
+                "what: {entry}"
+            );
+            assert!(entry.to_string().contains(rule), "rule: {entry}");
+        }
+    }
+
+    /// Each entry names the refusal exactly as the client was told it: action
+    /// `curation_block`, the caller (`anonymous`, or the user who signed in), the
+    /// artifact as `package@version` and the detail as `rule: reason` from the 403 body —
+    /// for a blocklist hit and for a namespace-isolation refusal alike.
+    #[tokio::test]
+    async fn a_refusal_entry_names_the_caller_artifact_and_rule() {
+        let policy = TempDir::new().unwrap();
+        let blocklist = policy.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "secret*", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        // Every request signs in: with `anonymous_read` a read is served as `anonymous`
+        // whatever credentials it carries, so the caller could not be told apart.
+        let ctx = crate::test_helpers::create_test_context_with_auth_and_config(
+            &[("alice", "pw"), ("bob", "pw")],
+            move |cfg| {
+                cfg.audit.mode = AuditMode::File;
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.blocklist_path = Some(blocklist);
+                cfg.curation.internal_namespaces = vec!["internal-*".to_string()];
+            },
+        );
+        ctx.state
+            .storage
+            .put("raw/secret.txt", b"data")
+            .await
+            .unwrap();
+
+        // base64("alice:pw"), base64("bob:pw")
+        let alice = || vec![("authorization", "Basic YWxpY2U6cHc=")];
+        let bob = || vec![("authorization", "Basic Ym9iOnB3")];
+        let mut expected = Vec::new();
+        for (uri, headers, actor) in [
+            ("/raw/secret.txt", alice(), "alice"),
+            ("/raw/secret.txt", bob(), "bob"),
+            ("/simple/internal-secret/", alice(), "alice"),
+        ] {
+            let resp =
+                crate::test_helpers::send_with_headers(&ctx.app, Method::GET, uri, headers, "")
+                    .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&crate::test_helpers::body_bytes(resp).await).unwrap();
+            let c = &body["context"];
+            expected.push(serde_json::json!({
+                "action": "curation_block",
+                "actor": actor,
+                "artifact": format!("{}@{}", c["package"].as_str().unwrap(), c["version"].as_str().unwrap()),
+                "registry": c["registry"],
+                "detail": format!("{}: {}", c["rule"].as_str().unwrap(), c["reason"].as_str().unwrap()),
+            }));
+        }
+        let entries: Vec<serde_json::Value> = written_entries(&ctx.state.audit)
+            .await
+            .into_iter()
+            .filter(|e| e["action"] == "curation_block")
+            .map(|mut e| {
+                e.as_object_mut().unwrap().remove("ts");
+                e
+            })
+            .collect();
+        assert_eq!(entries, expected);
+    }
+
+    /// Control for the test above: the same context and policy, with downloads that
+    /// curation allows — each leaves its one existing audit entry, so the harness
+    /// captures what these routes write.
+    #[tokio::test]
+    async fn allowed_downloads_keep_their_audit_entries() {
+        let (ctx, _policy) = audited_context().await;
+
+        let resp = send(&ctx.app, Method::GET, "/raw/public.txt", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let uri = format!("{CPAN_AUTHOR}/Foo-Bar-1.0.tar.gz");
+        let resp = send(&ctx.app, Method::GET, &uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = written_entries(&ctx.state.audit).await;
+        let actions: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["registry"].as_str().unwrap(),
+                    e["action"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(actions, [("raw", "pull"), ("cpan", "cache_hit")]);
+    }
+}
+
+/// Every refusal kind — an allowlist miss with a known version, an integrity mismatch, a
+/// blocklist hit on a nested raw path with a reason in Cyrillic and with a line break (which
+/// no header can carry) — leaves exactly the entry the 403 body describes.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod curation_refusal_audit_kinds {
+    use super::*;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn each_refusal_kind_is_recorded_as_its_body_says() {
+        let policy = TempDir::new().unwrap();
+        let blocklist = policy.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "dir/secret.txt", "version": "*", "reason": "заблокировано\nполитикой"}]}"#,
+        )
+        .unwrap();
+        let allowlist = policy.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            r#"{"version": 1, "entries": [{"registry": "cpan", "name": "Foo-Bar", "version": "1.0", "integrity": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "integrity_source": "manual"}]}"#,
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.audit.mode = AuditMode::File;
+            cfg.cpan.enabled = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for key in [
+            "raw/dir/secret.txt",
+            "cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.0.tar.gz",
+            "cpan/authors/id/A/AU/AUTHOR/Other-Dist-2.0.tar.gz",
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+        }
+        let mut expected = Vec::new();
+        for uri in [
+            "/raw/dir/secret.txt",
+            "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.0.tar.gz",
+            "/cpan/authors/id/A/AU/AUTHOR/Other-Dist-2.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let c = &body["context"];
+            expected.push(serde_json::json!({
+                "action": "curation_block",
+                "actor": "anonymous",
+                "artifact": format!("{}@{}", c["package"].as_str().unwrap(), c["version"].as_str().unwrap()),
+                "registry": c["registry"],
+                "detail": format!("{}: {}", c["rule"].as_str().unwrap(), c["reason"].as_str().unwrap()),
+            }));
+        }
+        let path = ctx.state.audit.path().clone();
+        ctx.state.audit.shutdown().await;
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["action"] == "curation_block")
+            .map(|mut e| {
+                e.as_object_mut().unwrap().remove("ts");
+                e
+            })
+            .collect();
+        assert_eq!(entries, expected);
+        // The cases must keep covering a known version, a nested path, integrity and non-ASCII.
+        let text = serde_json::to_string(&expected).unwrap();
+        for needle in [
+            "Other-Dist@2.0",
+            "dir/secret.txt@*",
+            "integrity",
+            "заблокировано",
+        ] {
+            assert!(text.contains(needle), "lost {needle}: {text}");
+        }
+    }
+}
+
+/// the docker blob path refuses through two sites the other tests do not
+/// reach — `check_download` in the blob handler and `verify_integrity_by_hash` for a stored
+/// blob. Each refusal must leave exactly the entry its 403 body describes.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod curation_refusal_audit_docker {
+    use super::*;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn docker_blob_refusals_are_recorded() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let policy = TempDir::new().unwrap();
+        let blocklist = policy.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "docker", "name": "blocked*", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let allowlist = policy.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            format!(
+                r#"{{"version": 1, "entries": [{{"registry": "docker", "name": "alpine", "version": "{digest}", "integrity": "sha256:{}", "integrity_source": "manual"}}]}}"#,
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.audit.mode = AuditMode::File;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state
+            .storage
+            .put(&format!("docker/alpine/blobs/{digest}"), b"data")
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        for uri in [
+            format!("/v2/blocked/blobs/{digest}"),
+            format!("/v2/alpine/blobs/{digest}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let c = &body["context"];
+            expected.push(serde_json::json!({
+                "action": "curation_block",
+                "actor": "anonymous",
+                "artifact": format!("{}@{}", c["package"].as_str().unwrap(), c["version"].as_str().unwrap()),
+                "registry": c["registry"],
+                "detail": format!("{}: {}", c["rule"].as_str().unwrap(), c["reason"].as_str().unwrap()),
+            }));
+        }
+        let text = serde_json::to_string(&expected).unwrap();
+        assert!(
+            text.contains("allowlist:integrity"),
+            "integrity case lost: {text}"
+        );
+        let path = ctx.state.audit.path().clone();
+        ctx.state.audit.shutdown().await;
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["action"] == "curation_block")
+            .map(|mut e| {
+                e.as_object_mut().unwrap().remove("ts");
+                e
+            })
+            .collect();
+        assert_eq!(entries, expected);
     }
 }

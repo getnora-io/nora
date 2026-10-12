@@ -482,6 +482,57 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
     }
 }
 
+/// The request layers inside metrics, shared by the server and the test router so the
+/// tests run the order the server runs (#542). Innermost first: curation_refusal (audit)
+/// → request_id → leak_detection → rewrite_ui_base_path → auth. auth runs first of these;
+/// the audit layer sits inside it so it knows who was refused, and request_id runs before
+/// the handler so the ID is available to it.
+pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit::curation_refusal_middleware,
+        ))
+        .layer(middleware::from_fn(request_id::request_id_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::leak_detection_middleware,
+        ))
+        // Prefix the UI's root-absolute self-links + redirects with the public_url
+        // path so the UI works under a sub-path behind a proxy. No-op when unset;
+        // only buffers text/html (UI pages), so blob streams pass through untouched.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ui::rewrite_ui_base_path,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
+}
+
+#[cfg(test)]
+mod middleware_stack_tests {
+    /// The server applies the audit layer once — in `request_layers`, which the test router
+    /// shares, so router tests see where the server runs it. A second copy (say outside
+    /// auth) would record each refusal twice, once as `anonymous`; a missing or commented-out
+    /// layer is caught by the audit tests themselves. Comments are skipped, and the needle is
+    /// built at run time so this test's own text does not count.
+    #[test]
+    fn the_audit_layer_is_applied_once() {
+        let code: String = include_str!("main.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = ["curation_refusal", "_middleware"].concat();
+        assert!(
+            code.matches(&needle).count() <= 1,
+            "{needle} applied more than once"
+        );
+    }
+}
+
 #[cfg(test)]
 mod healthcheck_tests {
     use super::healthcheck_url;
@@ -1920,34 +1971,24 @@ async fn run_server(mut config: Config, storage: Storage) {
             axum::http::header::HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
         ))
-        // Middleware layer order — LOAD-BEARING, do not reorder (#542).
-        //
-        // In axum, last .layer() = outermost (runs first). Execution order:
-        //   reject_null_bytes → metrics → auth → leak_detection → request_id → handler
-        //
-        // reject_null_bytes MUST be outermost to block null-byte path attacks
-        // before any processing occurs.
-        // metrics MUST be next-outermost so it counts ALL responses including
-        // auth rejections (401/403/429) in nora_http_requests_total.
-        // request_id is innermost so the ID is available to handlers.
-        .layer(middleware::from_fn(request_id::request_id_middleware))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            metrics::leak_detection_middleware,
-        ))
-        // Prefix the UI's root-absolute self-links + redirects with the public_url
-        // path so the UI works under a sub-path behind a proxy. No-op when unset;
-        // only buffers text/html (UI pages), so blob streams pass through untouched.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            ui::rewrite_ui_base_path,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::auth_middleware,
-        ))
+        ;
+    // Middleware layer order — LOAD-BEARING, do not reorder (#542).
+    //
+    // In axum, last .layer() = outermost (runs first). Execution order:
+    //   reject_null_bytes → metrics → [request_layers: auth → rewrite_ui_base_path
+    //   → leak_detection → request_id → curation_refusal (audit)] → handler
+    //
+    // reject_null_bytes MUST be outermost to block null-byte path attacks
+    // before any processing occurs.
+    // metrics MUST be next-outermost so it counts ALL responses including
+    // auth rejections (401/403/429) in nora_http_requests_total.
+    // The layers inside metrics are built by `request_layers`, which the test
+    // router uses too, so the tests run the order the server runs.
+    let app = request_layers(app, &state)
         .layer(middleware::from_fn(metrics::metrics_middleware))
-        .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
+        .layer(middleware::from_fn(
+            validation::reject_null_bytes_middleware,
+        ))
         .with_state(state.clone());
 
     // Open this instance's staging directory, removing what dead instances (SIGKILL,
@@ -2477,5 +2518,51 @@ mod curation_reload_tests {
 
         let config = config_with_allowlist(CurationMode::Off, path.to_str().unwrap().into());
         assert!(build_curation_engine(&config).is_ok());
+    }
+}
+
+/// the production stack is `request_layers` plus exactly metrics and
+/// reject_null_bytes outside it (white list), and the test router builds its layers only
+/// through `request_layers`. Needles are built at run time so this text does not match.
+#[cfg(test)]
+mod middleware_stack_whitelist {
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn the_server_stack_is_request_layers_plus_metrics_and_null_bytes() {
+        let code = squash(include_str!("main.rs"));
+        let fn_start = ["async", "fnrun_server("].concat();
+        let body = &code[code.find(&fn_start).expect("run_server")..];
+        let start = ["letapp=request_layers", "(app,&state)"].concat();
+        let at = body
+            .find(&start)
+            .expect("run_server must build its stack with request_layers");
+        let tail = &body[at..];
+        let end = tail.find(".with_state(state.clone());").unwrap();
+        let expected = [
+            "letapp=request_layers(app,&state)",
+            ".layer(middleware::from_fn(metrics::metrics_middleware))",
+            ".layer(middleware::from_fn(validation::reject_null_bytes_middleware,))",
+        ]
+        .concat();
+        assert_eq!(&tail[..end], expected);
+    }
+
+    #[test]
+    fn the_test_router_builds_its_layers_only_through_request_layers() {
+        let code = squash(include_str!("test_helpers.rs"));
+        assert!(code.contains(&["crate::request_layers", "(routes,&state)"].concat()));
+        assert_eq!(code.matches(&["from_fn", ""].concat()).count(), 0);
+        assert_eq!(
+            code.matches(&[".layer", "("].concat()).count(),
+            1,
+            "only DefaultBodyLimit"
+        );
     }
 }

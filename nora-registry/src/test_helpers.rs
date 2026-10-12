@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit},
     http::Request,
-    middleware, Router,
+    Router,
 };
 use http_body_util::BodyExt;
 use std::collections::HashMap;
@@ -95,6 +95,14 @@ pub fn create_test_context_with_storage_and_config(
 }
 
 /// Build a test context with auth + anonymous_read + custom config tweaks.
+/// Auth required for every request (no anonymous read), plus a custom config.
+pub fn create_test_context_with_auth_and_config(
+    users: &[(&str, &str)],
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context(true, users, false, customize)
+}
+
 pub fn create_test_context_with_anonymous_read_and_config(
     users: &[(&str, &str)],
     customize: impl FnOnce(&mut Config),
@@ -239,7 +247,11 @@ fn build_context_with(
         curation: CurationConfig::default(),
         circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         tls: crate::config::TlsConfig::default(),
-        audit: crate::config::AuditConfig::default(),
+        // Off unless a test opts in (`cfg.audit.mode = AuditMode::File`); the state
+        // below builds its audit log from this mode, as main.rs does.
+        audit: crate::config::AuditConfig {
+            mode: crate::audit::AuditMode::Off,
+        },
         registries: None,
         signing: crate::config::SigningConfig::default(),
     };
@@ -304,6 +316,7 @@ fn build_context_with(
 
     let enabled_registries = config.enabled_registries();
     let cb_config = config.circuit_breaker.clone();
+    let audit_mode = config.audit.mode.clone();
 
     let bypass_token = config.curation.bypass_token.clone();
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
@@ -333,7 +346,7 @@ fn build_context_with(
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, crate::audit::AuditMode::Off)),
+        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
@@ -418,21 +431,15 @@ fn build_context_with(
         .merge(crate::ui::routes())
         .merge(registry_routes);
 
-    let app = Router::new()
+    let routes = Router::new()
         .merge(public_routes)
         .merge(app_routes)
         .merge(crate::admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
-        ))
-        .layer(middleware::from_fn(
-            crate::request_id::request_id_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::auth::auth_middleware,
-        ))
-        .with_state(state.clone());
+        ));
+    // The server's own request layers (auth, request id, audit, …), so tests run its order.
+    let app = crate::request_layers(routes, &state).with_state(state.clone());
 
     TestContext {
         state,

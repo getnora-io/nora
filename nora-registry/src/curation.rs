@@ -559,9 +559,6 @@ pub fn verify_integrity(
 
 /// Verify artifact integrity using a pre-computed hash string (#580).
 ///
-/// Not yet called — API preparation for streaming download path (Commit 1).
-#[allow(dead_code)] // TODO(#580): remove when streaming handler calls this
-///
 /// Same logic as [`verify_integrity`] but accepts the hash directly instead
 /// of computing it from raw data. Used by streaming download paths where
 /// SHA-256 was computed incrementally during the download.
@@ -717,8 +714,27 @@ pub struct BlockedResponse {
     pub version: Option<String>,
 }
 
+/// What a refused download carries out of its handler, as a response extension, so the
+/// audit layer can record the refusal without each of the many refusal sites taking the
+/// audit log and the caller.
+#[derive(Clone, Debug)]
+pub struct CurationRefusal {
+    pub rule: String,
+    pub reason: String,
+    pub registry: String,
+    pub package: String,
+    pub version: Option<String>,
+}
+
 impl IntoResponse for BlockedResponse {
     fn into_response(self) -> Response {
+        let refusal = CurationRefusal {
+            rule: self.rule.clone(),
+            reason: self.reason.clone(),
+            registry: self.registry.clone(),
+            package: self.package.clone(),
+            version: self.version.clone(),
+        };
         let version_str = self.version.as_deref().unwrap_or("*");
         let body = serde_json::json!({
             "error": "blocked_by_policy",
@@ -753,6 +769,7 @@ impl IntoResponse for BlockedResponse {
                 .parse()
                 .unwrap_or_else(|_| "unknown".parse().expect("valid header value")),
         );
+        response.extensions_mut().insert(refusal);
         response
     }
 }
