@@ -28,7 +28,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError,
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError, UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -701,7 +701,11 @@ async fn module_download(
                 )
                     .into_response();
             }
-            StatusCode::NOT_FOUND.into_response()
+            // No source header: a 4xx says the module is not there; a 5xx, or a reply that
+            // breaks the protocol by leaving the header out, is a failed upstream.
+            let status = response.status().as_u16();
+            UpstreamMiss::of(&ProxyError::Upstream(status))
+                .response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
         }
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module download error");
@@ -968,15 +972,27 @@ async fn mirror_provider_version(
     .await;
 
     let mut archives = serde_json::Map::new();
+    let mut incomplete = false;
     for (os, arch, res) in results {
-        // Fail-closed (SEC #1): only serve an archive that carries an integrity
-        // hash. `zh:` is Terraform's zip-hash scheme (hex sha256 of the .zip).
-        if let Some((url, Some(shasum))) = res {
-            archives.insert(
-                format!("{}_{}", os, arch),
-                serde_json::json!({ "url": url, "hashes": [format!("zh:{}", shasum)] }),
-            );
+        match res {
+            // Fail-closed (SEC #1): only serve an archive that carries an integrity
+            // hash. `zh:` is Terraform's zip-hash scheme (hex sha256 of the .zip).
+            Ok(Some((url, Some(shasum)))) => {
+                archives.insert(
+                    format!("{}_{}", os, arch),
+                    serde_json::json!({ "url": url, "hashes": [format!("zh:{}", shasum)] }),
+                );
+            }
+            Ok(_) => {}
+            // A platform the upstream failed to describe (not one it answered 4xx for):
+            // the list would be incomplete, and a client on that platform would read
+            // "not supported" from an outage.
+            Err(e) => incomplete |= UpstreamMiss::of(&e).status() == StatusCode::BAD_GATEWAY,
         }
+    }
+    if incomplete {
+        tracing::warn!(registry = "terraform", %ns, %ptype, %ver, "upstream failed for a platform, returning 502");
+        return StatusCode::BAD_GATEWAY.into_response();
     }
     if archives.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
@@ -1072,7 +1088,8 @@ async fn mirror_fetch_versions(
 /// Resolve one platform's NORA download URL + upstream shasum for the archives map.
 /// Reuses the download-metadata cache (NORA-rewritten `download_url` via
 /// `rewrite_download_url` — air-gap safe) or fetches + rewrites + caches upstream.
-/// Returns `(nora_url, shasum?)`; `None` if the platform metadata is unavailable.
+/// Returns `(nora_url, shasum?)`; `None` if the platform metadata is not usable, and the
+/// upstream's error if fetching it failed.
 async fn mirror_fetch_archive(
     state: &AppState,
     base_url: &str,
@@ -1081,9 +1098,9 @@ async fn mirror_fetch_archive(
     ver: &str,
     os: &str,
     arch: &str,
-) -> Option<(String, Option<String>)> {
+) -> Result<Option<(String, Option<String>)>, ProxyError> {
     if !is_valid_name(os) || !is_valid_name(arch) {
-        return None;
+        return Ok(None);
     }
     let storage_key = format!(
         "terraform/providers/{}/{}/{}/{}_{}.json",
@@ -1113,24 +1130,24 @@ async fn mirror_fetch_archive(
                 &state.circuit_breaker,
                 RegistryType::Terraform,
             )
-            .await
-            .ok()?;
+            .await?;
             let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
             state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
             rewritten
         }
     };
 
-    let json: serde_json::Value = serde_json::from_str(&meta_text).ok()?;
-    let url = json
-        .get("download_url")
-        .and_then(|v| v.as_str())?
-        .to_string();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&meta_text) else {
+        return Ok(None);
+    };
+    let Some(url) = json.get("download_url").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
     let shasum = json
         .get("shasum")
         .and_then(|v| v.as_str())
         .map(String::from);
-    Some((url, shasum))
+    Ok(Some((url.to_string(), shasum)))
 }
 
 /// Reshape Registry-Protocol `{"versions":[{"version":"X",..}]}` into the network
@@ -2020,6 +2037,58 @@ mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
 
+    /// A cold miss is "not found" only when the upstream said so: a module download whose
+    /// upstream failed (or answered without the source header) is 502, and a mirror version
+    /// whose platform metadata failed is 502 rather than a list that leaves the platform out.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_the_upstream_said_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+        let upstream = |platform: u16| {
+            let versions = versions.to_string();
+            async move {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v1/providers/hashicorp/null/versions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(versions))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .respond_with(ResponseTemplate::new(platform))
+                    .mount(&server)
+                    .await;
+                server
+            }
+        };
+        let down = upstream(503).await;
+        let missing = upstream(404).await;
+        let module = "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download";
+        let mirror = "/terraform/registry.terraform.io/hashicorp/null/3.2.3.json";
+        for (server, uri, want) in [
+            (&down, module, StatusCode::BAD_GATEWAY),
+            (&missing, module, StatusCode::NOT_FOUND),
+            (&down, mirror, StatusCode::BAD_GATEWAY),
+            (&missing, mirror, StatusCode::NOT_FOUND),
+        ] {
+            let url = server.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.terraform.enabled = true;
+                cfg.terraform.proxy = Some(url);
+            });
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), want, "{uri} {}", server.uri());
+        }
+        let asked = down.received_requests().await.unwrap();
+        assert!(asked
+            .iter()
+            .any(|r| r.url.path().ends_with("/download/linux/amd64")));
+        assert!(asked
+            .iter()
+            .any(|r| r.url.path().ends_with("/0.1.0/download")));
+    }
+
     #[tokio::test]
     async fn test_terraform_disabled_returns_404() {
         let ctx = create_test_context_with_config(|cfg| {
@@ -2603,5 +2672,211 @@ mod integration_tests {
                 .unwrap(),
             "bytes"
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODULE: &str = "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download";
+
+    fn ctx_for(url: String) -> crate::test_helpers::TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+        })
+    }
+
+    /// a module download that answers 2xx without `X-Terraform-Get` broke the protocol
+    /// — a failed upstream, 502.
+    #[tokio::test]
+    async fn module_2xx_without_header_is_502() {
+        for code in [200u16, 204] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(code))
+                .mount(&server)
+                .await;
+            let ctx = ctx_for(server.uri());
+            let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{code}");
+        }
+    }
+
+    /// a module download whose upstream is unreachable is 502.
+    #[tokio::test]
+    async fn module_unreachable_is_502() {
+        let ctx = ctx_for("http://127.0.0.1:9".into());
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// one platform described, another failed — 502, not a list that leaves it out.
+    #[tokio::test]
+    async fn mirror_one_platform_failed_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"},{"os":"darwin","arch":"arm64"}]}]}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/hashicorp/null/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(versions))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/hashicorp/null/3.2.3/download/linux/amd64"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"download_url":"https://releases.example/null_3.2.3_linux_amd64.zip","shasum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let ctx = ctx_for(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/hashicorp/null/3.2.3.json",
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODULE: &str = "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download";
+    const MIRROR: &str = "/terraform/registry.terraform.io/hashicorp/null/3.2.3.json";
+    const OK_META: &str = r#"{"download_url":"https://releases.example/null.zip","shasum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#;
+
+    fn ctx_for(url: String) -> crate::test_helpers::TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.proxy = Some(url);
+        })
+    }
+
+    /// A module download that times out is a failed upstream — 502.
+    #[tokio::test]
+    async fn module_timeout_is_502() {
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(5)))
+            .mount(&slow)
+            .await;
+        let ctx = ctx_for(slow.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A module upstream answering 400 said "not here" — 404.
+    #[tokio::test]
+    async fn module_400_is_404() {
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&bad)
+            .await;
+        let ctx = ctx_for(bad.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A failed platform listed BEFORE a 4xx platform and a described one —
+    /// still 502; a later 4xx must not erase the earlier failure.
+    #[tokio::test]
+    async fn mirror_failed_platform_before_a_4xx_one_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"},{"os":"linux","arch":"arm"},{"os":"darwin","arch":"arm64"}]}]}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/hashicorp/null/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(versions))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/hashicorp/null/3.2.3/download/linux/amd64",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/hashicorp/null/3.2.3/download/linux/arm",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/hashicorp/null/3.2.3/download/darwin/arm64",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(OK_META))
+            .mount(&server)
+            .await;
+        let ctx = ctx_for(server.uri());
+        let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// `versions.json` is cached and fresh, the upstream is now
+    /// unreachable — every platform failed with a network error, which is 502, not a
+    /// 404 "no platforms".
+    #[tokio::test]
+    async fn mirror_platform_unreachable_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+        let ctx = ctx_for("http://127.0.0.1:9".into());
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                versions.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The platform metadata times out — 502.
+    #[tokio::test]
+    async fn mirror_platform_timeout_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/hashicorp/null/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(versions))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(OK_META)
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let ctx = ctx_for(server.uri());
+        let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

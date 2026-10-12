@@ -12,7 +12,9 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::config::UpstreamAuth;
-use crate::registry::{circuit_open_response, method_not_allowed, proxy_fetch, ProxyError};
+use crate::registry::{
+    circuit_open_response, method_not_allowed, proxy_fetch, ProxyError, UpstreamMiss,
+};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
@@ -563,6 +565,7 @@ async fn download(
         _ => None,
     };
 
+    let mut miss = UpstreamMiss::default();
     for proxy in &state.config.maven.proxies {
         let upstream_path = metadata_request
             .as_ref()
@@ -650,7 +653,7 @@ async fn download(
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %proxy.url(), path = %path, "Maven proxy fetch failed, trying next");
-                continue;
+                miss.record(&e);
             }
         }
     }
@@ -697,10 +700,7 @@ async fn download(
         return response;
     }
 
-    if !state.config.maven.proxies.is_empty() {
-        tracing::warn!(registry = "maven", path = %path, "Proxy failed, returning 404");
-    }
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("maven", &path)
 }
 
 // ============================================================================
@@ -2048,6 +2048,54 @@ mod integration_tests {
         assert_eq!(hash.len(), 64);
     }
 
+    /// A cold miss is "not found" only when an upstream said so. When every upstream failed
+    /// (5xx after the retry, refused connection) the answer is 502: Maven records a 404 as
+    /// "this artifact does not exist" and stops asking until its update interval or `-U`.
+    /// One upstream that answers "not found" still decides 404 while another has failed,
+    /// as a group repository skips a member that is down.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
+        use crate::config::MavenProxyEntry;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+
+        for (upstreams, want) in [
+            (vec![down.uri()], StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], StatusCode::BAD_GATEWAY),
+            (vec![down.uri(), refused.clone()], StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], StatusCode::NOT_FOUND),
+            (vec![down.uri(), missing.uri()], StatusCode::NOT_FOUND),
+            (vec![missing.uri(), down.uri()], StatusCode::NOT_FOUND),
+        ] {
+            for path in [
+                "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar",
+                "/maven2/com/example/lib/maven-metadata.xml",
+            ] {
+                let entries = upstreams.clone();
+                let ctx = create_test_context_with_config(move |config| {
+                    config.maven.proxies =
+                        entries.into_iter().map(MavenProxyEntry::Simple).collect();
+                });
+                let resp = send(&ctx.app, Method::GET, path, "").await;
+                assert_eq!(resp.status(), want, "{path} {upstreams:?}");
+            }
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_maven_hosted_proxy_metadata_collision_in_both_orders() {
         use crate::config::MavenProxyEntry;
@@ -2579,5 +2627,84 @@ mod index_cost_tests {
             small, large,
             "hosted maven-metadata.xml must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::config::MavenProxyEntry;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// the metadata checksum path is a maven cold miss too — a failed upstream is 502.
+    #[tokio::test]
+    async fn metadata_checksum_failed_upstream_is_502() {
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let url = down.uri();
+        let ctx = create_test_context_with_config(move |c| {
+            c.maven.proxies = vec![MavenProxyEntry::Simple(url)];
+        });
+        for path in [
+            "/maven2/com/example/lib/maven-metadata.xml.sha1",
+            "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar.sha1",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{path}");
+        }
+    }
+
+    /// an open breaker on a maven upstream is still 503, not 502.
+    #[tokio::test]
+    async fn open_breaker_is_still_503() {
+        let ctx = create_test_context_with_config(|c| {
+            c.circuit_breaker.enabled = true;
+            c.circuit_breaker.failure_threshold = 1;
+            c.circuit_breaker.reset_timeout = 3600;
+            c.maven.proxies = vec![MavenProxyEntry::Simple("http://127.0.0.1:9".into())];
+        });
+        let path = "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar";
+        send(&ctx.app, Method::GET, path, "").await; // trips the breaker
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::config::MavenProxyEntry;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An upstream that never answers within proxy_timeout timed out, it did
+    /// not say "not found" — 502.
+    #[tokio::test]
+    async fn timeout_is_502() {
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&slow)
+            .await;
+        let url = slow.uri();
+        let ctx = create_test_context_with_config(move |c| {
+            c.maven.proxy_timeout = 1;
+            c.maven.proxies = vec![MavenProxyEntry::Simple(url)];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }
