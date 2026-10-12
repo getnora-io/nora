@@ -597,6 +597,25 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
+/// The versions a package's stored tarballs add to the ones its packument names (`listed`,
+/// shown or not): each stored file curation's parser reads as a tarball of `name` — any
+/// layout it reads — once, so one version stored in two layouts is one version, and none
+/// the packument names. `stored` holds file names relative to `npm/<name>/tarballs/`.
+fn stored_only_versions(
+    name: &str,
+    listed: &std::collections::HashSet<String>,
+    stored: impl IntoIterator<Item = (String, crate::storage::FileMeta)>,
+) -> Vec<(String, crate::storage::FileMeta)> {
+    let mut seen = listed.clone();
+    stored
+        .into_iter()
+        .filter_map(|(file, meta)| {
+            let version = crate::curation::parse_npm_tarball_version(name, &file)?;
+            seen.insert(version.clone()).then_some((version, meta))
+        })
+        .collect()
+}
+
 pub async fn get_npm_detail(
     storage: &Storage,
     name: &str,
@@ -607,6 +626,8 @@ pub async fn get_npm_detail(
 
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;
+    // Every version the packument names, shown or not, so a stored tarball adds only the rest.
+    let mut listed = std::collections::HashSet::new();
 
     // Parse metadata.json for version info
     if let Ok(data) = storage.get(&metadata_key).await {
@@ -615,6 +636,7 @@ pub async fn get_npm_detail(
                 let time_obj = metadata.get("time").and_then(|t| t.as_object());
 
                 for (version, info) in versions_obj {
+                    listed.insert(version.clone());
                     let is_prerelease = version.contains('-');
 
                     let meta_size = info
@@ -660,6 +682,30 @@ pub async fn get_npm_detail(
                     });
                 }
             }
+        }
+    }
+
+    // A tarball stored without its packument is a stored version too: a lockfile install
+    // fetches tarballs only, and with release dates off no packument is cached. List every
+    // stored tarball of this package the packument does not name.
+    let tarballs = format!("npm/{}/tarballs/", name);
+    if let Ok(stored) = storage.list_with_meta(&tarballs).await {
+        let files = stored
+            .into_iter()
+            .filter_map(|(key, meta)| Some((key.strip_prefix(&tarballs)?.to_string(), meta)));
+        for (version, meta) in stored_only_versions(name, &listed, files) {
+            if version.contains('-') {
+                prerelease_count += 1;
+                if !show_prerelease {
+                    continue;
+                }
+            }
+            stable_versions.push(VersionInfo {
+                version,
+                size: meta.size,
+                published: format_timestamp(meta.modified),
+                cached: true,
+            });
         }
     }
 
@@ -2078,4 +2124,258 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
 
     (result, true)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod npm_card_tests {
+    use super::get_npm_detail;
+    use crate::Storage;
+    use tempfile::TempDir;
+
+    fn versions(detail: &super::PackageDetail) -> Vec<(String, bool)> {
+        detail
+            .versions
+            .iter()
+            .map(|v| (v.version.clone(), v.cached))
+            .collect()
+    }
+
+    #[test]
+    fn stored_tarballs_add_each_readable_version_once() {
+        use crate::storage::FileMeta;
+        let meta = |size| FileMeta { size, modified: 0 };
+        let versions = |name, listed: &[&str], files: &[&str]| -> Vec<String> {
+            let listed = listed.iter().map(|v| v.to_string()).collect();
+            let stored = files.iter().map(|f| (f.to_string(), meta(1)));
+            super::stored_only_versions(name, &listed, stored)
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect()
+        };
+        // One version in two layouts is one version.
+        assert_eq!(
+            versions("pkg", &[], &["pkg-1.0.0.tgz", "1.0.0/pkg-1.0.0.tgz"]),
+            vec!["1.0.0"]
+        );
+        // A version the packument names is not added again.
+        assert_eq!(
+            versions("pkg", &["1.0.0"], &["pkg-1.0.0.tgz", "pkg-1.1.0.tgz"]),
+            vec!["1.1.0"]
+        );
+        // A file curation does not read as this package's tarball is no version.
+        assert!(versions(
+            "@scope/pkg",
+            &[],
+            &[
+                "@other/pkg-1.0.0.tgz",
+                "9.9.9/pkg-2.0.0.tgz",
+                "other-3.0.0.tgz",
+                "pkg-4.0.0.tgz.part"
+            ]
+        )
+        .is_empty());
+        // Both scoped forms, a version directory, and a pre-release (the caller hides it).
+        assert_eq!(
+            versions(
+                "@scope/pkg",
+                &[],
+                &[
+                    "pkg-1.0.0.tgz",
+                    "@scope/pkg-1.1.0.tgz",
+                    "2.0.0/pkg-2.0.0.tgz",
+                    "pkg-3.0.0-rc.1.tgz"
+                ]
+            ),
+            vec!["1.0.0", "1.1.0", "2.0.0", "3.0.0-rc.1"]
+        );
+    }
+
+    // A package whose tarballs were fetched without its packument (a lockfile install asks
+    // for tarballs only, and with release dates off no packument is cached) lists them all.
+    #[tokio::test]
+    async fn a_package_without_a_packument_lists_its_stored_tarballs() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", b"one")
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.1.0.tgz", b"eleven")
+            .await
+            .unwrap();
+        let detail = get_npm_detail(&storage, "pkg", false, false).await;
+        assert_eq!(
+            versions(&detail),
+            vec![("1.1.0".to_string(), true), ("1.0.0".to_string(), true)]
+        );
+        assert_eq!(detail.versions[0].size, 6);
+        assert_eq!(detail.total_stable, 2);
+    }
+
+    // With a packument, its versions and the stored tarballs it does not list are merged,
+    // each once.
+    #[tokio::test]
+    async fn a_packument_and_the_tarballs_it_misses_are_merged_once() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {}, "2.0.0": {}},
+            "time": {"1.0.0": "2026-01-01T00:00:00Z", "2.0.0": "2026-02-01T00:00:00Z"}
+        });
+        storage
+            .put("npm/pkg/metadata.json", packument.to_string().as_bytes())
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", b"one")
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.1.0.tgz", b"eleven")
+            .await
+            .unwrap();
+        let detail = get_npm_detail(&storage, "pkg", false, false).await;
+        assert_eq!(
+            versions(&detail),
+            vec![
+                ("2.0.0".to_string(), false),
+                ("1.1.0".to_string(), true),
+                ("1.0.0".to_string(), true),
+            ]
+        );
+        assert_eq!(detail.versions[2].published, "2026-01-01");
+    }
+
+    // A stored pre-release counts as one and shows only when asked for; a scoped package's
+    // tarballs carry the unscoped name; a file that is not a tarball of this package is not a
+    // version.
+    #[tokio::test]
+    async fn stored_tarballs_follow_the_prerelease_and_scope_rules() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "npm/@scope/pkg/tarballs/pkg-1.0.0.tgz",
+            "npm/@scope/pkg/tarballs/pkg-2.0.0-beta.1.tgz",
+            "npm/@scope/pkg/tarballs/other-3.0.0.tgz",
+            "npm/@scope/pkg/tarballs/pkg-4.0.0.tgz.part",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let detail = get_npm_detail(&storage, "@scope/pkg", false, false).await;
+        assert_eq!(versions(&detail), vec![("1.0.0".to_string(), true)]);
+        assert_eq!(detail.prerelease_count, 1);
+        let detail = get_npm_detail(&storage, "@scope/pkg", true, false).await;
+        assert_eq!(
+            versions(&detail),
+            vec![
+                ("2.0.0-beta.1".to_string(), true),
+                ("1.0.0".to_string(), true)
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod npm_card_layouts_and_prereleases {
+    use super::get_npm_detail;
+    use crate::Storage;
+    use tempfile::TempDir;
+
+    // A pre-release the packument names and hides is counted once, even when its tarball
+    // is stored too; shown, it is listed once.
+    #[tokio::test]
+    async fn a_hidden_packument_prerelease_with_a_stored_tarball_counts_once() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {}, "2.0.0-beta.1": {}},
+            "time": {"1.0.0": "2026-01-01T00:00:00Z", "2.0.0-beta.1": "2026-02-01T00:00:00Z"}
+        });
+        storage
+            .put("npm/pkg/metadata.json", packument.to_string().as_bytes())
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-2.0.0-beta.1.tgz", b"beta")
+            .await
+            .unwrap();
+        let detail = get_npm_detail(&storage, "pkg", false, false).await;
+        assert_eq!(detail.prerelease_count, 1);
+        let detail = get_npm_detail(&storage, "pkg", true, false).await;
+        assert_eq!(detail.prerelease_count, 1);
+        let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["2.0.0-beta.1", "1.0.0"]);
+    }
+
+    // The stored layouts curation reads are versions here too: a file under its version's
+    // directory (Font Awesome) and a file carrying the full scoped name.
+    #[tokio::test]
+    async fn stored_tarballs_in_every_layout_curation_parses_are_listed() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "npm/@fortawesome/fontawesome-pro/tarballs/6.1.1/fontawesome-pro-6.1.1.tgz",
+                b"fa",
+            )
+            .await
+            .unwrap();
+        let detail = get_npm_detail(&storage, "@fortawesome/fontawesome-pro", false, false).await;
+        let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["6.1.1"]);
+        storage
+            .put("npm/@vendor/a/tarballs/@vendor/a-1.0.0.tgz", b"a")
+            .await
+            .unwrap();
+        let detail = get_npm_detail(&storage, "@vendor/a", false, false).await;
+        let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["1.0.0"]);
+    }
+}
+
+/// One version in two layouts, and files curation does not read, on the npm card.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod npm_card_stored_layouts {
+    use super::get_npm_detail;
+    use crate::Storage;
+    use tempfile::TempDir;
+
+    // One version stored in two layouts curation reads (flat and under its version's
+    // directory) is one version, also without a packument.
+    #[tokio::test]
+    async fn one_version_stored_in_two_layouts_is_listed_once() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "npm/pkg/tarballs/pkg-1.0.0.tgz",
+            "npm/pkg/tarballs/1.0.0/pkg-1.0.0.tgz",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let detail = get_npm_detail(&storage, "pkg", true, true).await;
+        let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, vec!["1.0.0"]);
+        assert_eq!(detail.total_stable, 1);
+    }
+
+    // A stored file curation does not read as this package's tarball is no version:
+    // another scope's tarball, and a tarball under a directory that is not its version.
+    #[tokio::test]
+    async fn a_file_curation_does_not_read_is_not_a_version() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "npm/@scope/pkg/tarballs/@other/pkg-1.0.0.tgz",
+            "npm/@scope/pkg/tarballs/9.9.9/pkg-2.0.0.tgz",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let detail = get_npm_detail(&storage, "@scope/pkg", true, true).await;
+        let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
 }
