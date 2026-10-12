@@ -129,6 +129,23 @@ See [full documentation](https://getnora.dev) for all registries.
 
 NORA works out of the box. For advanced setup — auth, S3, retention, curation — see [getnora.dev/configuration](https://getnora.dev/configuration/settings/).
 
+Retention rules can limit eligible version names with `include_tags`. Empty or
+omitted patterns preserve the existing behavior of considering all names;
+`exclude_tags` still protects matching names. Only eligible, non-excluded names
+consume the `keep_last` budget. For example, this rule keeps the newest ten
+preview tags in each matching repository and only retires older previews after
+14 days, measured from object modification rather than last access:
+
+```toml
+[[retention.rules]]
+registry = "docker"
+name_glob = "myapp*"
+include_tags = ["preview-*"]
+exclude_tags = ["preview-protected"]
+keep_last = 10
+older_than_days = 14
+```
+
 ```bash
 # Auth
 docker run -d -p 4000:4000 \

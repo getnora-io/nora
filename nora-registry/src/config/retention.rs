@@ -23,6 +23,10 @@ pub struct RetentionRule {
     /// Only delete versions older than N days
     #[serde(default)]
     pub older_than_days: Option<u32>,
+    /// Eligible version/tag glob patterns. Empty = all names are eligible.
+    /// Names outside this scope do not consume the keep_last budget.
+    #[serde(default)]
+    pub include_tags: Vec<String>,
     /// Glob patterns that protect versions from deletion
     #[serde(default)]
     pub exclude_tags: Vec<String>,

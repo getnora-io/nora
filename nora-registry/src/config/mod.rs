@@ -2829,6 +2829,7 @@ proxies = [
             name_glob: None,
             keep_last: Some(5),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: Vec::new(),
         }];
         let (warnings, errors) = config.validate();

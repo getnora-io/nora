@@ -89,6 +89,7 @@ pub struct DeletionPlan {
 /// Rules applied as AND:
 /// - `keep_last`: keep the N most recent versions (by modified time)
 /// - `older_than_days`: only delete versions older than X days
+/// - `include_tags`: nonempty glob patterns restrict eligible version names
 /// - `exclude_tags`: glob patterns that protect versions from deletion
 ///
 /// A version is deleted only if ALL conditions agree it should go.
@@ -112,6 +113,11 @@ pub fn plan_deletions(
     let mut non_excluded_pos: usize = 0;
 
     for version in &versions {
+        // An explicit scope protects unknown names, including future releases.
+        // Nonmatching names do not consume the eligible keep_last budget.
+        if !rule.include_tags.is_empty() && !is_excluded(&version.name, &rule.include_tags) {
+            continue;
+        }
         // Check exclusion patterns — excluded versions are invisible to keep_last (#926)
         if is_excluded(&version.name, &rule.exclude_tags) {
             continue;
@@ -1053,6 +1059,7 @@ mod tests {
             name_glob: None,
             keep_last,
             older_than_days,
+            include_tags: Vec::new(),
             exclude_tags: exclude_tags.into_iter().map(String::from).collect(),
         }
     }
@@ -1100,6 +1107,49 @@ mod tests {
     }
 
     // -- plan_deletions --
+
+    #[test]
+    fn test_include_tags_scopes_retention_and_keep_budget() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "docker",
+            "include_tags": ["preview-*"],
+            "keep_last": 1,
+            "older_than_days": 14
+        }))
+        .unwrap();
+        let versions = vec![
+            make_version("future-release-format", NOW - DAY, 100),
+            make_version("v1.0.0", NOW - 60 * DAY, 100),
+            make_version("preview-new", NOW - 30 * DAY, 100),
+            make_version("preview-old", NOW - 60 * DAY, 100),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].version_name, "preview-old");
+    }
+
+    #[test]
+    fn test_include_tags_keeps_excluded_tags_and_nonmatching_names() {
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "docker",
+            "include_tags": ["preview-*", "test-*"],
+            "exclude_tags": ["preview-protected"],
+            "older_than_days": 14
+        }))
+        .unwrap();
+        let versions = vec![
+            make_version("preview-protected", NOW - 60 * DAY, 100),
+            make_version("preview-old", NOW - 60 * DAY, 100),
+            make_version("test-old", NOW - 60 * DAY, 100),
+            make_version("preview-recent", NOW - DAY, 100),
+            make_version("release-old", NOW - 60 * DAY, 100),
+        ];
+        let plan = plan_deletions(versions, &rule, NOW);
+        assert_eq!(plan.len(), 2);
+        assert!(plan
+            .iter()
+            .all(|entry| matches!(entry.version_name.as_str(), "preview-old" | "test-old")));
+    }
 
     #[test]
     fn test_keep_last_basic() {
@@ -1746,6 +1796,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(3),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1794,6 +1845,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(3),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
         let result =
@@ -1827,6 +1879,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1857,6 +1910,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1884,6 +1938,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1910,6 +1965,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1949,6 +2005,7 @@ mod tests {
             name_glob: None,
             keep_last: Some(1),
             older_than_days: None,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }];
 
@@ -1986,6 +2043,7 @@ mod format_retention_tests {
             name_glob: glob.map(String::from),
             keep_last: keep,
             older_than_days: days,
+            include_tags: Vec::new(),
             exclude_tags: vec![],
         }
     }
