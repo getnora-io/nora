@@ -8,7 +8,7 @@ use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::DockerAuth;
-use crate::registry::{circuit_open_response, method_not_allowed, ProxyError};
+use crate::registry::{circuit_open_response, method_not_allowed, ProxyError, UpstreamMiss};
 use crate::registry::{
     content_length, sha256_of_file, stream_body_to_file, StreamOutcome, TempFileGuard,
 };
@@ -1291,8 +1291,13 @@ async fn download_blob(
         vec![name.clone(), format!("library/{}", name)]
     };
 
+    // One record per upstream, across both names it may be asked under.
+    let mut misses: Vec<UpstreamMiss> = upstreams_to_try
+        .iter()
+        .map(|_| UpstreamMiss::default())
+        .collect();
     for try_name in &names_to_try {
-        for upstream in &upstreams_to_try {
+        for (upstream, miss) in upstreams_to_try.iter().zip(misses.iter_mut()) {
             // Content-addressed: the URL digest is the hash the spool verifies before
             // storing, so the curation integrity check runs on it before upstream is
             // opened — a rejection must not strand a circuit-breaker probe.
@@ -1352,6 +1357,7 @@ async fn download_blob(
                             return response;
                         }
                         // The fill failed and its slot is released: take another turn.
+                        miss.record(&ProxyError::Network("shared fill failed".into()));
                     }
                     None => match failure {
                         Some(FillStartError::Spool) => {
@@ -1362,6 +1368,7 @@ async fn download_blob(
                         }
                         Some(FillStartError::Upstream(e)) => {
                             tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
+                            miss.record(&e);
                             break;
                         }
                         None => break,
@@ -1371,10 +1378,11 @@ async fn download_blob(
         }
     }
 
-    if !state.config.docker.upstreams.is_empty() {
-        tracing::warn!(registry = "docker", name = %name, digest = %digest, "Proxy failed, returning 404");
+    let mut miss = UpstreamMiss::default();
+    for asked in &misses {
+        miss.record_upstream(asked);
     }
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("docker", &format!("{name}@{digest}"))
 }
 
 /// 201 for a blob that is now present in `name`, in the shape `upload_blob`
@@ -1954,12 +1962,13 @@ async fn upload_blob(
 async fn try_fetch_and_cache(
     state: &AppState,
     upstreams: &[&crate::config::DockerUpstream],
+    misses: &mut [UpstreamMiss],
     upstream_name: &str,
     name: &str,
     reference: &str,
     cache_key: &str,
 ) -> Option<Response> {
-    for upstream in upstreams {
+    for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
         tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
         match fetch_manifest_from_upstream(
             &state.http_client,
@@ -2096,7 +2105,7 @@ async fn try_fetch_and_cache(
             Err(ProxyError::CircuitOpen(reg)) => return Some(circuit_open_response(&reg)),
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
-                continue;
+                miss.record(&e);
             }
         }
     }
@@ -2264,8 +2273,21 @@ async fn get_manifest(
         upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    if let Some(response) =
-        try_fetch_and_cache(&state, &upstreams_to_try, &name, &name, &reference, &key).await
+    // One record per upstream, across both names it may be asked under (library/ below).
+    let mut misses: Vec<UpstreamMiss> = upstreams_to_try
+        .iter()
+        .map(|_| UpstreamMiss::default())
+        .collect();
+    if let Some(response) = try_fetch_and_cache(
+        &state,
+        &upstreams_to_try,
+        &mut misses,
+        &name,
+        &name,
+        &reference,
+        &key,
+    )
+    .await
     {
         return response;
     }
@@ -2277,6 +2299,7 @@ async fn get_manifest(
         if let Some(response) = try_fetch_and_cache(
             &state,
             &upstreams_to_try,
+            &mut misses,
             &library_name,
             &name,
             &reference,
@@ -2311,10 +2334,11 @@ async fn get_manifest(
         }
     }
 
-    if !state.config.docker.upstreams.is_empty() {
-        tracing::warn!(registry = "docker", name = %name, reference = %reference, "Proxy failed, returning 404");
+    let mut miss = UpstreamMiss::default();
+    for asked in &misses {
+        miss.record_upstream(asked);
     }
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("docker", &format!("{name}:{reference}"))
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -4785,6 +4809,93 @@ mod integration_tests {
         assert_eq!(get_digest, digest_header);
         let body = body_bytes(get_resp).await;
         assert_eq!(body.as_ref(), manifest_bytes.as_slice());
+    }
+
+    /// A cold miss is "not found" only when an upstream said so: a manifest or blob whose
+    /// every upstream failed is 502. One upstream answering "not found" decides 404 while
+    /// another is down. Docker Hub answers a single-segment name (`alpine`) with a 4xx and
+    /// serves it as `library/alpine`, so that 4xx does not make the image missing while
+    /// `library/alpine` failed.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let hub_down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v2/library/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&hub_down)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&hub_down)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest = "/v2/myorg/app/manifests/1.0".to_string();
+        let layer = format!("/v2/myorg/app/blobs/{blob}");
+        let official = "/v2/alpine/manifests/3".to_string();
+        let official_layer = format!("/v2/alpine/blobs/{blob}");
+
+        for (upstreams, uri, want) in [
+            (vec![down.uri()], &manifest, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], &manifest, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &manifest, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), missing.uri()],
+                &manifest,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![down.uri()], &layer, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], &layer, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &layer, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), missing.uri()],
+                &layer,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![hub_down.uri()], &official, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], &official, StatusCode::NOT_FOUND),
+            (
+                vec![hub_down.uri()],
+                &official_layer,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (vec![missing.uri()], &official_layer, StatusCode::NOT_FOUND),
+        ] {
+            let entries = upstreams.clone();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = entries
+                    .into_iter()
+                    .map(|url| DockerUpstream {
+                        url,
+                        auth: None,
+                        namespace: None,
+                        prefix: None,
+                    })
+                    .collect();
+            });
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), want, "{uri} {upstreams:?}");
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+        let hub = hub_down.received_requests().await.unwrap();
+        assert!(hub
+            .iter()
+            .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
@@ -7588,7 +7699,8 @@ mod upstream_resume_tests {
     }
 
     /// Headers that never come are still bounded by `proxy_timeout` (not worse than
-    /// before): the pull fails over instead of hanging.
+    /// before): the pull fails over instead of hanging, with 502 — the upstream failed,
+    /// it did not say the blob is missing.
     #[tokio::test]
     async fn missing_headers_are_bounded_by_proxy_timeout() {
         let (blob, digest) = layer(1024);
@@ -7605,7 +7717,7 @@ mod upstream_resume_tests {
 
         let started = std::time::Instant::now();
         let response = pull(&ctx, &digest).await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "headers wait took {:?}, proxy_timeout is 1s",
@@ -8467,5 +8579,92 @@ mod breaker_probe_tests {
             cb.check(&key).is_ok(),
             "no probe may be held: the next request must be allowed to probe"
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// one upstream asked under `alpine` (fails) and `library/alpine` (4xx): it failed
+    /// under one name, so it did not say "not found" — 502 for manifest and blob.
+    #[tokio::test]
+    async fn failed_under_plain_name_404_under_library_is_502() {
+        let flip = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v2/library/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&flip)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&flip)
+            .await;
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        for uri in [
+            "/v2/alpine/manifests/3".to_string(),
+            format!("/v2/alpine/blobs/{blob}"),
+        ] {
+            let url = flip.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            });
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{uri}");
+        }
+        let asked = flip.received_requests().await.unwrap();
+        assert!(asked
+            .iter()
+            .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::config::DockerUpstream;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Any 4xx is an answer — an upstream answering 400 for a manifest or a
+    /// blob said "not here", so 404, not 502.
+    #[tokio::test]
+    async fn upstream_400_is_404() {
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&bad)
+            .await;
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        for uri in [
+            "/v2/myorg/app/manifests/1.0".to_string(),
+            format!("/v2/myorg/app/blobs/{blob}"),
+        ] {
+            let url = bad.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            });
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

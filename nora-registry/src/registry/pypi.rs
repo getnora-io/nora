@@ -16,6 +16,7 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
+    UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -246,6 +247,7 @@ async fn package_versions(
 
     let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
+    let mut miss = UpstreamMiss::default();
     if !is_internal && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
@@ -261,13 +263,17 @@ async fn package_versions(
             )
             .await
             {
-                Ok(html) => upstream_files.extend(parse_upstream_files(&html)),
+                Ok(html) => {
+                    miss.answered();
+                    upstream_files.extend(parse_upstream_files(&html));
+                }
                 Err(crate::registry::ProxyError::CircuitOpen(_)) => {
                     circuit_open = true;
                     continue;
                 }
                 Err(e) => {
                     tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI upstream index fetch failed, skipping");
+                    miss.record(&e);
                     continue;
                 }
             }
@@ -308,12 +314,12 @@ async fn package_versions(
 
     // No upstream result and no local copy: a tripped breaker means the upstream is
     // temporarily down — return 503 (retryable) rather than 404, which would poison
-    // pip's negative cache.
+    // pip's negative cache; a failed upstream is 502 for the same reason.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("pypi", &normalized)
 }
 
 // ============================================================================
@@ -498,6 +504,7 @@ async fn download_file(
     // serves it, fetched from that same upstream with that upstream's auth. One
     // upstream's failure or open breaker skips to the next rather than failing (#663).
     let mut circuit_open = false;
+    let mut miss = UpstreamMiss::default();
     for up in &state.config.pypi.upstreams() {
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
@@ -519,12 +526,14 @@ async fn download_file(
             }
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
+                miss.record(&e);
                 continue;
             }
         };
 
         // The file may live on a later upstream — keep walking the list.
         let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+            miss.answered();
             continue;
         };
 
@@ -591,18 +600,20 @@ async fn download_file(
             }
             Err(e) => {
                 tracing::debug!(error = ?e, package = %normalized, filename = %filename, upstream = %up.url(), "PyPI file proxy fetch failed, trying next upstream");
+                miss.record(&e);
                 continue;
             }
         }
     }
 
     // A tripped breaker means an upstream is temporarily down — 503 (retryable)
-    // rather than 404, which would poison pip's negative cache.
+    // rather than 404, which would poison pip's negative cache; a failed upstream is
+    // 502 for the same reason.
     if circuit_open {
         return circuit_open_response(RegistryType::PyPI.as_str());
     }
 
-    StatusCode::NOT_FOUND.into_response()
+    miss.response("pypi", &format!("{normalized}/{filename}"))
 }
 
 // ============================================================================
@@ -1729,6 +1740,87 @@ mod tests {
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send, send_with_headers};
     use axum::http::{header, Method, StatusCode};
+
+    /// A cold miss is "not found" only when an upstream said so. The simple index and a file
+    /// whose upstreams all failed (5xx after the retry, unreachable) answer 502, and so does a
+    /// file the index lists on a host that is down. An index that answers without the file,
+    /// or a 404, is still 404 — also while another upstream is down.
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_an_upstream_said_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        // The index answers and lists the file on the host that is down.
+        let lists_down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{}/files/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+                down.uri()
+            )))
+            .mount(&lists_down)
+            .await;
+        // The index answers without the file.
+        let lists_other = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><a href="/files/flask-1.0.tar.gz">flask-1.0.tar.gz</a></body></html>"#,
+            ))
+            .mount(&lists_other)
+            .await;
+        // The index answers with no files at all.
+        let lists_nothing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body></body></html>"))
+            .mount(&lists_nothing)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+        let index = "/simple/flask/";
+        let file = "/simple/flask/flask-2.0.tar.gz";
+        for (upstreams, uri, want) in [
+            (vec![down.uri()], index, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], index, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], index, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), lists_nothing.uri()],
+                index,
+                StatusCode::NOT_FOUND,
+            ),
+            (vec![down.uri()], file, StatusCode::BAD_GATEWAY),
+            (vec![refused.clone()], file, StatusCode::BAD_GATEWAY),
+            (vec![missing.uri()], file, StatusCode::NOT_FOUND),
+            (vec![lists_down.uri()], file, StatusCode::BAD_GATEWAY),
+            (vec![lists_other.uri()], file, StatusCode::NOT_FOUND),
+            (
+                vec![down.uri(), lists_other.uri()],
+                file,
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let urls = upstreams.clone();
+            let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+                // Plain URL entries, as `proxies = ["https://..."]` reads from the config file.
+                cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+            });
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), want, "{uri} {upstreams:?}");
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+        assert!(!lists_down.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_pypi_list_empty() {
@@ -3234,5 +3326,108 @@ mod hash_marker_tests {
             &[hash_marker_key("proxied", filename, &digest(content))],
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_cases {
+    use crate::circuit_breaker::ProbeToken;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// the index lists the file on a host that answers 404 — the upstream said
+    /// "not found", so 404, not 502.
+    #[tokio::test]
+    async fn file_host_answering_404_is_404() {
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let lists_missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{}/files/flask-2.0.tar.gz">flask-2.0.tar.gz</a></body></html>"#,
+                missing.uri()
+            )))
+            .mount(&lists_missing)
+            .await;
+        let urls = vec![lists_missing.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let resp = send(&ctx.app, Method::GET, "/simple/flask/flask-2.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+    }
+
+    /// one upstream's breaker is open, the other failed — the open breaker still
+    /// answers 503 (retryable), as before the change.
+    #[tokio::test]
+    async fn open_breaker_with_failed_peer_is_503() {
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let open = "http://127.0.0.1:1".to_string();
+        let urls = vec![open.clone(), down.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let key = crate::circuit_breaker::upstream_key("pypi", &open);
+        ctx.state
+            .circuit_breaker
+            .record_failure(&key, ProbeToken::BACKGROUND);
+        ctx.state
+            .circuit_breaker
+            .record_failure(&key, ProbeToken::BACKGROUND);
+        for uri in ["/simple/flask/flask-2.0.tar.gz", "/simple/flask/"] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_edge_cases {
+    use crate::circuit_breaker::ProbeToken;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The index alone, one upstream's breaker open and the other failed with
+    /// its own breaker still closed — the open breaker answers 503, as before the change.
+    #[tokio::test]
+    async fn index_open_breaker_with_failed_peer_is_503() {
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let open = "http://127.0.0.1:1".to_string();
+        let urls = vec![open.clone(), down.uri()];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        });
+        let key = crate::circuit_breaker::upstream_key("pypi", &open);
+        for _ in 0..2 {
+            ctx.state
+                .circuit_breaker
+                .record_failure(&key, ProbeToken::BACKGROUND);
+        }
+        let resp = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!down.received_requests().await.unwrap().is_empty());
     }
 }

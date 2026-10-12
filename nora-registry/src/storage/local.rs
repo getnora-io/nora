@@ -227,6 +227,81 @@ fn list_root(base: &Path, prefix: &str) -> Option<PathBuf> {
     Some(base.join(dir))
 }
 
+/// Whether an I/O error on a key's path says there is no object there: the path does not
+/// exist, or runs through a stored file (`raw/f.txt/x` while `raw/f.txt` is stored, ENOTDIR)
+/// — a key an object store reports as missing.
+fn is_missing(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Opens the object stored at `path`, with its metadata. A directory is not an object: a
+/// key whose path is a directory (`raw/a` while `raw/a/b` is stored, or left empty by
+/// deletes) is `NotFound`, as an object store reports it, not an object of the directory's
+/// size whose read then fails.
+async fn open_object(path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
+    let file = fs::File::open(path).await.map_err(|e| {
+        if is_missing(&e) {
+            StorageError::NotFound
+        } else {
+            StorageError::Io(e)
+        }
+    })?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() {
+        return Err(StorageError::NotFound);
+    }
+    Ok((file, meta))
+}
+
+/// Marks the I/O error of a write the local store cannot hold because the name is taken
+/// the other way round (see [`name_taken_on_disk`]). It rides inside `StorageError::Io`,
+/// so callers that care (raw answers 409) can tell it from any other write failure, and
+/// an object store, which holds both names, never produces it.
+#[derive(Debug)]
+pub(crate) struct NameTaken;
+
+impl std::fmt::Display for NameTaken {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("the name is taken by another stored file or directory")
+    }
+}
+
+impl std::error::Error for NameTaken {}
+
+/// Whether the local store already uses the name of `path` (under the storage root `base`)
+/// the other way round: a directory sits at `path` — with files under it or left empty by
+/// deletes — or a file sits at one of its parent names, at any depth.
+async fn name_taken_on_disk(base: &Path, path: &Path) -> bool {
+    if fs::metadata(path).await.is_ok_and(|m| m.is_dir()) {
+        return true;
+    }
+    for parent in path.ancestors().skip(1) {
+        if parent == base || !parent.starts_with(base) {
+            break;
+        }
+        if fs::metadata(parent).await.is_ok_and(|m| m.is_file()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The error of a write to `path` that failed with `e`: [`NameTaken`] when the name is
+/// taken on disk, `e` as it was otherwise.
+async fn write_failure(base: &Path, path: &Path, e: std::io::Error) -> StorageError {
+    if name_taken_on_disk(base, path).await {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            NameTaken,
+        ))
+    } else {
+        StorageError::Io(e)
+    }
+}
+
 /// Whether `path` is the staging directory of the storage root `base`.
 fn is_staging_dir(path: &Path, base: &Path) -> bool {
     path.parent() == Some(base)
@@ -538,7 +613,9 @@ impl StorageBackend for LocalStorage {
 
         // Create parent directories
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
+            if let Err(e) = fs::create_dir_all(parent).await {
+                return Err(write_failure(&self.base_path, &path, e).await);
+            }
         }
 
         // Atomic write: write a temp file in staging, fsync, rename into place.
@@ -558,10 +635,12 @@ impl StorageBackend for LocalStorage {
             Err(e) if e.raw_os_error() == Some(EXDEV) => {
                 drop(tmp);
                 let beside = self.write_tmp(&path, data, TmpPlace::BesideKey).await?;
-                fs::rename(beside.path(), &path).await?;
+                if let Err(e) = fs::rename(beside.path(), &path).await {
+                    return Err(write_failure(&self.base_path, &path, e).await);
+                }
                 beside
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(write_failure(&self.base_path, &path, e).await),
         };
         tmp.published();
         // Durability: make the rename's directory entry survive power-loss.
@@ -572,13 +651,7 @@ impl StorageBackend for LocalStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let path = self.key_to_path(key);
 
-        let mut file = fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
+        let (mut file, _) = open_object(&path).await?;
 
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
@@ -593,13 +666,16 @@ impl StorageBackend for LocalStorage {
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
 
-        fs::remove_file(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        if let Err(e) = fs::remove_file(&path).await {
+            // A directory is not an object; unlink(2) refuses it with EISDIR on Linux and
+            // EPERM on macOS, so ask the path rather than the error.
+            let is_dir = fs::metadata(&path).await.is_ok_and(|m| m.is_dir());
+            return Err(if is_dir || is_missing(&e) {
                 StorageError::NotFound
             } else {
                 StorageError::Io(e)
-            }
-        })?;
+            });
+        }
 
         // A lost tombstone is fail-safe — a stale pin at worst yields a future
         // IntegrityViolation, healable via `repin` — so the delete still
@@ -655,7 +731,7 @@ impl StorageBackend for LocalStorage {
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let path = self.key_to_path(key);
-        let metadata = fs::metadata(&path).await.ok()?;
+        let metadata = fs::metadata(&path).await.ok().filter(|m| m.is_file())?;
         let modified = metadata
             .modified()
             .ok()?
@@ -747,7 +823,9 @@ impl StorageBackend for LocalStorage {
     async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).await?;
+            if let Err(e) = fs::create_dir_all(parent).await {
+                return Err(write_failure(&self.base_path, &dest, e).await);
+            }
         }
         // Body and pin are published as one critical section (#1041, see commit_lock).
         let lock = self.commit_lock(key);
@@ -771,17 +849,19 @@ impl StorageBackend for LocalStorage {
                     Err(e) if e.raw_os_error() == Some(EXDEV) => {
                         drop(tmp);
                         let beside = self.copy_to_tmp(src, &dest, TmpPlace::BesideKey).await?;
-                        fs::rename(beside.path(), &dest).await?;
+                        if let Err(e) = fs::rename(beside.path(), &dest).await {
+                            return Err(write_failure(&self.base_path, &dest, e).await);
+                        }
                         beside
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(write_failure(&self.base_path, &dest, e).await),
                 };
                 tmp.published();
                 // Durability: make the rename's directory entry durable.
                 sync_parent_dir(&dest).await?;
                 let _ = fs::remove_file(src).await;
             }
-            Err(e) => return Err(StorageError::Io(e)),
+            Err(e) => return Err(write_failure(&self.base_path, &dest, e).await),
         }
         match sha256 {
             Some(hash) => self.record_pin(key, hash).await,
@@ -792,6 +872,10 @@ impl StorageBackend for LocalStorage {
     async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
         let src_path = self.key_to_path(src);
         let dst_path = self.key_to_path(dst);
+        // A directory is not an object (see `open_object`).
+        if fs::metadata(&src_path).await.is_ok_and(|m| m.is_dir()) {
+            return Err(StorageError::NotFound);
+        }
         if let Some(parent) = dst_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -809,13 +893,11 @@ impl StorageBackend for LocalStorage {
         };
         match linked {
             Ok(()) => sync_parent_dir(&dst_path).await?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound)
-            }
+            Err(e) if is_missing(&e) => return Err(StorageError::NotFound),
             // Cross-device, or a filesystem without links — copy the bytes.
             Err(_) => {
                 fs::copy(&src_path, &dst_path).await.map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
+                    if is_missing(&e) {
                         StorageError::NotFound
                     } else {
                         StorageError::Io(e)
@@ -838,14 +920,7 @@ impl StorageBackend for LocalStorage {
         key: &str,
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let path = self.key_to_path(key);
-        let file = fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let meta = file.metadata().await?;
+        let (file, meta) = open_object(&path).await?;
         Ok((meta.len(), self.pins.get(key), Box::pin(file)))
     }
 
@@ -857,14 +932,8 @@ impl StorageBackend for LocalStorage {
     ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let path = self.key_to_path(key);
-        let mut file = fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let size = file.metadata().await?.len();
+        let (mut file, meta) = open_object(&path).await?;
+        let size = meta.len();
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start)).await?;
         }
@@ -965,6 +1034,64 @@ mod tests {
     }
 
     use super::*;
+
+    /// Both write paths mark a taken name — a directory at the key, a file at a parent name
+    /// at any depth — and the mark is what tells it from any other write failure.
+    #[tokio::test]
+    async fn both_write_paths_mark_a_taken_name() {
+        let is_marked = |e: &StorageError| matches!(e, StorageError::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<NameTaken>()));
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let sha = hex::encode(Sha256::digest(b"x"));
+        for key in ["raw/dir/f.txt", "raw/file.txt"] {
+            storage.put(key, b"x", &sha).await.unwrap();
+        }
+        for key in ["raw/dir", "raw/file.txt/x", "raw/file.txt/a/b"] {
+            let err = storage.put(key, b"x", &sha).await.unwrap_err();
+            assert!(is_marked(&err), "put {key}: {err}");
+            let src = dir.path().join("upload.tmp");
+            std::fs::write(&src, b"x").unwrap();
+            let err = storage
+                .put_from_path(key, &src, Some(&sha))
+                .await
+                .unwrap_err();
+            assert!(is_marked(&err), "put_from_path {key}: {err}");
+        }
+        // A fresh name is written, unmarked.
+        storage.put("raw/new/f.txt", b"x", &sha).await.unwrap();
+    }
+
+    /// A name is taken by a directory at it — with files under it or emptied by a delete —
+    /// or by a file at any parent name; never by a neighbour sharing its first characters,
+    /// a fresh name, or a name under a directory.
+    #[tokio::test]
+    async fn a_name_is_taken_by_a_directory_at_it_or_a_file_above_it() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let storage = LocalStorage::new(base.to_str().unwrap());
+        for key in ["raw/dir/f.txt", "raw/file.txt", "raw/e/f.txt"] {
+            let sha = hex::encode(Sha256::digest(b"x"));
+            storage.put(key, b"x", &sha).await.unwrap();
+        }
+        storage.delete("raw/e/f.txt").await.unwrap();
+        for (key, taken) in [
+            ("raw/dir", true),
+            ("raw/e", true),
+            ("raw/file.txt/x", true),
+            ("raw/file.txt/a/b/x", true),
+            ("raw/dirx", false),
+            ("raw/file", false),
+            ("raw/file.txt.bak/x", false),
+            ("raw/new/x", false),
+            ("raw/dir/new", false),
+        ] {
+            assert_eq!(
+                name_taken_on_disk(base, &base.join(key)).await,
+                taken,
+                "{key}"
+            );
+        }
+    }
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 

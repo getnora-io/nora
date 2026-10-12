@@ -219,6 +219,74 @@ fn upstream_auth_header(
         .map_err(|e| ProxyError::Network(format!("upstream credential rejected: {e}")))
 }
 
+/// What the upstreams of a cold miss said, to answer it once every upstream was asked. A
+/// miss is "not found" only when an upstream said so; when every upstream failed (5xx after
+/// the retry, unreachable, breaker open) it is a gateway failure: a client that records a
+/// 404 as "this artifact does not exist" (Maven) must not learn that from an outage.
+/// One upstream answering "not found" decides 404 while another failed, as a group
+/// repository skips a member that is down; with no upstream configured it is 404.
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamMiss {
+    not_found: bool,
+    failed: bool,
+}
+
+impl UpstreamMiss {
+    /// The miss of a format with a single upstream, from its one answer.
+    pub(crate) fn of(e: &ProxyError) -> Self {
+        let mut miss = Self::default();
+        miss.record(e);
+        miss
+    }
+
+    /// Record one upstream's answer. Any 4xx is an answer, even where a fetch reports it as
+    /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx, network errors and an
+    /// open breaker are failures.
+    pub(crate) fn record(&mut self, e: &ProxyError) {
+        match e {
+            ProxyError::NotFound => self.not_found = true,
+            ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
+            ProxyError::Upstream(_) | ProxyError::Network(_) | ProxyError::CircuitOpen(_) => {
+                self.failed = true
+            }
+        }
+    }
+
+    /// Record an upstream that answered without the artifact (a listing that does not name it).
+    pub(crate) fn answered(&mut self) {
+        self.not_found = true;
+    }
+
+    /// Fold in one upstream that was asked under several names (Docker's `library/` fallback
+    /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
+    /// under none of them, since a 4xx for one name says nothing about the other.
+    pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
+        if asked.failed {
+            self.failed = true;
+        } else if asked.not_found {
+            self.not_found = true;
+        }
+    }
+
+    /// The status for the miss: 502 when upstreams were asked and every one failed.
+    pub(crate) fn status(&self) -> StatusCode {
+        if self.failed && !self.not_found {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    }
+
+    /// The response for the miss, logging a gateway failure for the operator.
+    pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
+        let status = self.status();
+        if status == StatusCode::BAD_GATEWAY {
+            tracing::warn!(registry, path, "every upstream failed, returning 502");
+        }
+        status.into_response()
+    }
+}
+
 /// 503 response for circuit breaker open state with Retry-After header.
 pub(crate) fn circuit_open_response(registry: &str) -> Response {
     (
@@ -948,6 +1016,65 @@ mod tests {
     use super::*;
     use crate::registry_type::RegistryType;
 
+    /// 404 only when an upstream said "not found"; 502 when upstreams were asked and every
+    /// one failed; 404 with no upstream at all.
+    #[test]
+    fn a_miss_is_not_found_only_when_an_upstream_said_so() {
+        use axum::http::StatusCode;
+        let miss = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m.status()
+        };
+        let down = || ProxyError::Upstream(503);
+        let unreachable = || ProxyError::Network("refused".into());
+        let open = || ProxyError::CircuitOpen("maven".into());
+        assert_eq!(miss(&[]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::NotFound]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(401)]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(499)]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::Upstream(500)]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[ProxyError::Upstream(399)]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[unreachable()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[open()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down(), unreachable()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[down(), ProxyError::NotFound]), StatusCode::NOT_FOUND);
+        assert_eq!(miss(&[ProxyError::NotFound, down()]), StatusCode::NOT_FOUND);
+
+        // One upstream asked under two names: not found under one and failed under the
+        // other is a failed upstream; another upstream's "not found" still decides 404.
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let folded = |upstreams: &[UpstreamMiss]| {
+            let mut m = UpstreamMiss::default();
+            for u in upstreams {
+                m.record_upstream(u);
+            }
+            m.status()
+        };
+        let hub = asked(&[ProxyError::NotFound, down()]);
+        let gone = asked(&[ProxyError::NotFound, ProxyError::NotFound]);
+        assert_eq!(folded(&[]), StatusCode::NOT_FOUND);
+        assert_eq!(folded(&[asked(&[])]), StatusCode::NOT_FOUND);
+        assert_eq!(
+            folded(&[asked(&[ProxyError::NotFound, down()])]),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(folded(&[gone]), StatusCode::NOT_FOUND);
+        assert_eq!(
+            folded(&[hub, asked(&[ProxyError::NotFound])]),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[tokio::test]
     async fn test_proxy_fetch_invalid_url() {
         let client = reqwest::Client::new();
@@ -1394,5 +1521,199 @@ mod tests {
         assert!(read_validators(&storage, "npm/x/metadata.json")
             .await
             .is_none());
+    }
+}
+
+/// The upstream-failure class as one table: every proxied cold-miss path of Maven, Docker,
+/// Cargo, PyPI and Terraform, against every shape an upstream can answer in, alone and mixed
+/// with another upstream. The expected status is the invariant itself: 404 when an upstream
+/// answered 4xx ("not found"), 502 when every upstream failed — 5xx, refused, timed out.
+#[cfg(test)]
+mod upstream_failure_matrix {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::config::{Config, DockerUpstream, MavenProxyEntry};
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// How one upstream answers every request.
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Status(u16),
+        Refused,
+        /// Answers after the 1 s proxy timeout every case configures.
+        Timeout,
+    }
+
+    /// The status a cold miss must get from upstreams answering in `shapes`.
+    fn expected(shapes: &[Shape]) -> StatusCode {
+        if shapes
+            .iter()
+            .any(|s| matches!(s, Shape::Status(code) if (400..500).contains(code)))
+        {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    }
+
+    /// An upstream answering in `shape`; the server is returned so it lives as long as the case.
+    async fn upstream(shape: Shape) -> (String, Option<MockServer>) {
+        let template = match shape {
+            Shape::Refused => return ("http://127.0.0.1:9".to_string(), None),
+            Shape::Status(code) => ResponseTemplate::new(code),
+            Shape::Timeout => ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        (server.uri(), Some(server))
+    }
+
+    const ALONE: &[&[Shape]] = &[
+        &[Shape::Status(503)],
+        &[Shape::Refused],
+        &[Shape::Timeout],
+        &[Shape::Status(400)],
+        &[Shape::Status(404)],
+    ];
+
+    const MIXED: &[&[Shape]] = &[
+        &[Shape::Status(503), Shape::Status(404)],
+        &[Shape::Status(404), Shape::Status(503)],
+        &[Shape::Timeout, Shape::Status(404)],
+        &[Shape::Status(400), Shape::Refused],
+        &[Shape::Status(503), Shape::Refused],
+        &[Shape::Refused, Shape::Timeout],
+    ];
+
+    /// Runs every case for one path; `configure` points the format at the upstream URLs (in
+    /// order) with a 1 s proxy timeout. One test per path, so the timed-out cases run side by side.
+    async fn run(path: &str, configure: fn(&mut Config, Vec<String>), several: bool) {
+        let mut cases: Vec<&[Shape]> = ALONE.to_vec();
+        if several {
+            cases.extend_from_slice(MIXED);
+        }
+        for shapes in cases {
+            let mut urls = Vec::new();
+            let mut servers = Vec::new();
+            for shape in shapes {
+                let (url, server) = upstream(*shape).await;
+                urls.push(url);
+                servers.push(server);
+            }
+            let ctx = create_test_context_with_config(move |cfg| configure(cfg, urls));
+            let resp = send(&ctx.app, Method::GET, path, Body::empty()).await;
+            assert_eq!(resp.status(), expected(shapes), "{path} {shapes:?}");
+            drop(servers);
+        }
+    }
+
+    fn maven(cfg: &mut Config, urls: Vec<String>) {
+        cfg.maven.proxies = urls.into_iter().map(MavenProxyEntry::Simple).collect();
+        cfg.maven.proxy_timeout = 1;
+    }
+
+    fn docker(cfg: &mut Config, urls: Vec<String>) {
+        cfg.docker.upstreams = urls
+            .into_iter()
+            .map(|url| DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+            })
+            .collect();
+        cfg.docker.proxy_timeout = 1;
+    }
+
+    fn cargo(cfg: &mut Config, urls: Vec<String>) {
+        cfg.cargo.proxy = urls.into_iter().next();
+        cfg.cargo.proxy_timeout = 1;
+    }
+
+    fn pypi(cfg: &mut Config, urls: Vec<String>) {
+        // Plain URL entries, as `proxies = ["https://..."]` reads from the config file.
+        cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+        cfg.pypi.proxy_timeout = 1;
+    }
+
+    fn terraform(cfg: &mut Config, urls: Vec<String>) {
+        cfg.terraform.enabled = true;
+        cfg.terraform.proxy = urls.into_iter().next();
+        cfg.terraform.proxy_timeout = 1;
+    }
+
+    #[tokio::test]
+    async fn maven_artifact() {
+        run("/maven2/com/example/lib/1.0.0/lib-1.0.0.jar", maven, true).await;
+    }
+
+    #[tokio::test]
+    async fn maven_metadata() {
+        run("/maven2/com/example/lib/maven-metadata.xml", maven, true).await;
+    }
+
+    #[tokio::test]
+    async fn maven_metadata_checksum() {
+        run(
+            "/maven2/com/example/lib/maven-metadata.xml.sha1",
+            maven,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docker_manifest() {
+        run("/v2/myorg/app/manifests/1.0", docker, true).await;
+    }
+
+    #[tokio::test]
+    async fn docker_blob() {
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        run(&format!("/v2/myorg/app/blobs/{blob}"), docker, true).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_sparse_index() {
+        run("/cargo/index/se/rd/serde", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_crate_metadata() {
+        run("/cargo/api/v1/crates/serde", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn cargo_crate_download() {
+        run("/cargo/api/v1/crates/serde/1.0.0/download", cargo, false).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_index() {
+        run("/simple/flask/", pypi, true).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_file() {
+        run("/simple/flask/flask-2.0.tar.gz", pypi, true).await;
+    }
+
+    #[tokio::test]
+    async fn terraform_module_download() {
+        run(
+            "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download",
+            terraform,
+            false,
+        )
+        .await;
     }
 }

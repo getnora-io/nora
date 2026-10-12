@@ -15,7 +15,7 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError,
+    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, ProxyError, UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -255,14 +255,13 @@ async fn sparse_index(
             }
             match e {
                 ProxyError::CircuitOpen(reg) => circuit_open_response(&reg),
-                ProxyError::NotFound => StatusCode::NOT_FOUND.into_response(),
                 _ => {
                     tracing::debug!(
                         crate_name,
                         error = ?e,
                         "Cargo sparse index upstream error"
                     );
-                    StatusCode::NOT_FOUND.into_response()
+                    UpstreamMiss::of(&e).response("cargo", &crate_name)
                 }
             }
         }
@@ -324,8 +323,7 @@ async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<Stri
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, crate_name = %crate_name, "Cargo metadata proxy fetch failed");
-            tracing::warn!(registry = "cargo", crate_name = %crate_name, "Proxy failed, returning 404");
-            StatusCode::NOT_FOUND.into_response()
+            UpstreamMiss::of(&e).response("cargo", &crate_name)
         }
     }
 }
@@ -600,8 +598,7 @@ async fn download(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, crate_name = %crate_name, version = %version, "Cargo crate proxy fetch failed");
-            tracing::warn!(registry = "cargo", crate_name = %crate_name, version = %version, "Proxy failed, returning 404");
-            StatusCode::NOT_FOUND.into_response()
+            UpstreamMiss::of(&e).response("cargo", &format!("{crate_name}@{version}"))
         }
     }
 }
@@ -1150,6 +1147,46 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context, send};
+
+    /// A cold miss is "not found" only when the upstream said so: the sparse index, the crate
+    /// metadata and a `.crate` download whose upstream failed (5xx after the retry,
+    /// unreachable) answer 502, not the 404 cargo reports as "no matching package".
+    #[tokio::test]
+    async fn a_cold_miss_is_404_only_when_the_upstream_said_not_found() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        for (upstream, want) in [
+            (down.uri(), StatusCode::BAD_GATEWAY),
+            ("http://127.0.0.1:9".to_string(), StatusCode::BAD_GATEWAY),
+            (missing.uri(), StatusCode::NOT_FOUND),
+        ] {
+            for uri in [
+                "/cargo/index/se/rd/serde",
+                "/cargo/api/v1/crates/serde",
+                "/cargo/api/v1/crates/serde/1.0.0/download",
+            ] {
+                let url = upstream.clone();
+                let ctx = crate::test_helpers::create_test_context_with_config(move |c| {
+                    c.cargo.proxy = Some(url);
+                });
+                let resp = send(&ctx.app, axum::http::Method::GET, uri, "").await;
+                assert_eq!(resp.status(), want, "{uri} {upstream}");
+            }
+        }
+        assert!(!down.received_requests().await.unwrap().is_empty());
+        assert!(!missing.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_cargo_namespace_scope_enforced() {
