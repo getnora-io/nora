@@ -31,9 +31,10 @@ use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://www.cpan.org";
 
-/// Prefix under which CPAN distributions are stored, and a suffix filter
-/// (empty — CPAN distributions have multiple extensions: .tar.gz, .tar.bz2,
-/// .zip, .tgz — so we let all through).
+/// Prefix under which CPAN distributions are stored, and an empty suffix: the CPAN index
+/// (`repo_index::build_cpan_index`) reads archives by their file name with
+/// [`parse_dist_archive_filename`], not by a suffix — distributions come as .tar.gz,
+/// .tar.bz2, .tar.xz, .zip and .tgz, beside .meta/.readme files and the author's CHECKSUMS.
 pub const INDEX_PATTERN: (&str, &str) = ("cpan/authors/id/", "");
 
 pub fn routes() -> Router<AppState> {
@@ -854,5 +855,245 @@ mod integration_tests {
             StatusCode::FORBIDDEN,
             "control: .meta passes"
         );
+    }
+
+    /// The dashboard card, `/api/ui/stats` and `nora_artifacts_total{registry="cpan"}` count
+    /// distributions: one author with two, each beside the `.meta` and `.readme` a CPAN
+    /// mirror keeps, plus the author's `CHECKSUMS` — seven files, two distributions.
+    #[tokio::test]
+    async fn every_count_is_the_number_of_stored_distributions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        for file in [
+            "Foo-Bar-1.0.tar.gz",
+            "Foo-Bar-1.0.meta",
+            "Foo-Bar-1.0.readme",
+            "Baz-Qux-2.0.tar.gz",
+            "Baz-Qux-2.0.meta",
+            "Baz-Qux-2.0.readme",
+            "CHECKSUMS",
+        ] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/A/AU/AUTHOR/{file}"), b"x")
+                .await
+                .unwrap();
+        }
+        // The mirror-wide package index lives outside authors/id/ and is no artifact.
+        ctx.state
+            .storage
+            .put("cpan/modules/02packages.details.txt.gz", b"gz")
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_counts(&ctx, "cpan").await,
+            ArtifactCounts {
+                dashboard: 2,
+                stats: 2,
+                metric: 2
+            }
+        );
+    }
+
+    /// Control: one archive, no sidecars — the three numbers agree on 1.
+    #[tokio::test]
+    async fn a_single_archive_counts_once() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        ctx.state
+            .storage
+            .put("cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.0.tar.gz", b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_counts(&ctx, "cpan").await,
+            ArtifactCounts {
+                dashboard: 1,
+                stats: 1,
+                metric: 1
+            }
+        );
+    }
+
+    /// The listing names a distribution by its author path, as its UI page does: two
+    /// releases of one distribution are one package with two versions; the same name from
+    /// another author, or in an author's subdirectory, is another package.
+    #[tokio::test]
+    async fn the_listing_names_each_distribution_by_its_author_path() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        for key in [
+            "A/AU/AUTHOR/Foo-Bar-1.0.tar.gz",
+            "A/AU/AUTHOR/Foo-Bar-1.1.tar.gz",
+            "A/AU/AUTHOR/Foo-Bar-1.1.meta",
+            "A/AU/AUTHOR/sub/Foo-Bar-0.9.zip",
+            "O/OT/OTHER/Foo-Bar-1.0.tar.gz",
+            "O/OT/OTHER/CHECKSUMS",
+        ] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/{key}"), b"x")
+                .await
+                .unwrap();
+        }
+        let resp = send(&ctx.app, Method::GET, "/api/ui/cpan/list", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let mut got: Vec<(String, u64)> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_string(),
+                    r["versions"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("A/AU/AUTHOR/Foo-Bar".to_string(), 2),
+                ("A/AU/AUTHOR/sub/Foo-Bar".to_string(), 1),
+                ("O/OT/OTHER/Foo-Bar".to_string(), 1),
+            ]
+        );
+        // The search links a name to its distribution page, which lists both releases.
+        let resp = send(&ctx.app, Method::GET, "/api/ui/cpan/search?q=foo", "").await;
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        let link = "/ui/cpan/A%2FAU%2FAUTHOR%2FFoo-Bar";
+        assert!(html.contains(link), "{html}");
+        let resp = send(&ctx.app, Method::GET, link, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(page.contains(">1.0<") && page.contains(">1.1<"), "{page}");
+        assert!(
+            !page.contains(">0.9<"),
+            "the subdirectory release is another package"
+        );
+    }
+    /// Every archive form the CPAN parser reads is a release, named as
+    /// the parser names it — `.tar.bz2`, `.tar.xz`, and an old `name_version` upload.
+    #[tokio::test]
+    async fn every_archive_form_the_parser_reads_counts() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        for file in [
+            "Foo-Bar-1.0.tar.bz2",
+            "Baz-Qux-2.0.tar.xz",
+            "finance-quote_0.18.tar.gz",
+        ] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/A/AU/AUTHOR/{file}"), b"x")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            artifact_counts(&ctx, "cpan").await,
+            ArtifactCounts {
+                dashboard: 3,
+                stats: 3,
+                metric: 3
+            }
+        );
+        let resp = send(&ctx.app, Method::GET, "/api/ui/cpan/list", "").await;
+        let list: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let mut names: Vec<String> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "A/AU/AUTHOR/Baz-Qux".to_string(),
+                "A/AU/AUTHOR/Foo-Bar".to_string(),
+                "A/AU/AUTHOR/finance-quote".to_string(),
+            ]
+        );
+    }
+}
+
+/// Archive forms and author subdirectories in the CPAN counts.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cpan_counts_archive_forms {
+    use crate::test_helpers::{
+        artifact_counts, body_bytes, create_test_context_with_config, send, ArtifactCounts,
+    };
+    use axum::http::{Method, StatusCode};
+
+    async fn names(ctx: &crate::test_helpers::TestContext) -> Vec<(String, u64)> {
+        let resp = send(&ctx.app, Method::GET, "/api/ui/cpan/list", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let mut got: Vec<(String, u64)> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_string(),
+                    r["versions"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        got.sort();
+        got
+    }
+
+    // `.tgz` and a top-level `.zip` are archive forms the parser reads: each is a release.
+    #[tokio::test]
+    async fn tgz_and_zip_archives_count() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        for file in ["Foo-Bar-1.0.tgz", "Baz-Qux-2.0.zip"] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/A/AU/AUTHOR/{file}"), b"x")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            artifact_counts(&ctx, "cpan").await,
+            ArtifactCounts {
+                dashboard: 2,
+                stats: 2,
+                metric: 2
+            }
+        );
+    }
+
+    // The parser reads the file name, not the path: an author subdirectory whose name
+    // looks like `name_version` does not swallow the distributions inside it.
+    #[tokio::test]
+    async fn a_subdirectory_name_is_not_parsed_as_a_distribution() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+        });
+        for file in ["old_2019/Foo-Bar-1.0.tar.gz", "old_2019/Baz-Qux-2.0.tar.gz"] {
+            ctx.state
+                .storage
+                .put(&format!("cpan/authors/id/A/AU/AUTHOR/{file}"), b"x")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            names(&ctx).await,
+            vec![
+                ("A/AU/AUTHOR/old_2019/Baz-Qux".to_string(), 1),
+                ("A/AU/AUTHOR/old_2019/Foo-Bar".to_string(), 1),
+            ]
+        );
+        assert_eq!(artifact_counts(&ctx, "cpan").await.stats, 2);
     }
 }

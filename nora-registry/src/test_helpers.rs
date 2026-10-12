@@ -690,3 +690,50 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.get_range(key, start, end).await
     }
 }
+
+// ── Per-registry artifact counts, each read from its real source ────────────
+
+/// The three per-registry artifact counts an operator can read for one store.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactCounts {
+    /// Dashboard card: `/api/ui/dashboard` → `registry_stats[].artifact_count`
+    /// (the HTML dashboard renders the same `build_dashboard_response`).
+    pub dashboard: usize,
+    /// `/api/ui/stats` → the registry's field.
+    pub stats: usize,
+    /// `nora_artifacts_total{registry}`: the 60 s tick in `main.rs` sets the gauge
+    /// verbatim from `repo_index.counts()`, read here after the two endpoints above
+    /// rebuilt the index. Read directly rather than through the process-global
+    /// gauge, which parallel tests would race on.
+    pub metric: usize,
+}
+
+/// Read [`ArtifactCounts`] for `registry` through the router and the shared index.
+pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCounts {
+    use axum::http::{Method, StatusCode};
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let dashboard: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let card = dashboard["registry_stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["name"] == registry)
+        .unwrap_or_else(|| panic!("no dashboard card for {registry}: {dashboard}"));
+    let dashboard = card["artifact_count"].as_u64().unwrap() as usize;
+
+    let resp = send(&ctx.app, Method::GET, "/api/ui/stats", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stats: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let stats = stats[registry].as_u64().unwrap() as usize;
+
+    let rt = crate::registry_type::RegistryType::from_str_opt(registry).unwrap();
+    let metric = ctx.state.repo_index.counts().get(&rt).copied().unwrap_or(0);
+
+    ArtifactCounts {
+        dashboard,
+        stats,
+        metric,
+    }
+}

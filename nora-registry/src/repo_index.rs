@@ -200,10 +200,7 @@ impl RepoIndex {
                     let (p, s) = crate::registry::deb::INDEX_PATTERN;
                     build_generic_index(storage, p, s).await
                 }
-                RegistryType::Cpan => {
-                    let (p, s) = crate::registry::cpan::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
+                RegistryType::Cpan => build_cpan_index(storage).await,
             };
             match data {
                 Some(data) => {
@@ -564,6 +561,41 @@ async fn build_gems_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     Some(to_sorted_vec(packages))
 }
 
+/// CPAN index: keys like cpan/authors/id/A/AU/AUTHOR/[subdir/]Dist-Name-1.0.tar.gz. A
+/// package is one author's distribution, named by its author path as its UI page is
+/// (`A/AU/AUTHOR/Dist-Name`); its versions are the archives `parse_dist_archive_filename`
+/// reads. The `.meta`/`.readme` beside an archive and the author's `CHECKSUMS` are not
+/// artifacts.
+async fn build_cpan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let prefix = crate::registry::cpan::INDEX_PATTERN.0;
+    let keys = list_keys(storage, prefix).await?;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+
+    for (key, meta) in &keys {
+        let Some(package) = key.strip_prefix(prefix).and_then(cpan_package_of) else {
+            continue;
+        };
+        let entry = packages.entry(package).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
+        }
+    }
+
+    Some(to_sorted_vec(packages))
+}
+
+/// The CPAN package a key under `cpan/authors/id/` belongs to: its author path (subdirectories
+/// included) and the distribution `parse_dist_archive_filename` reads from the FILE NAME alone —
+/// the parser never sees a directory, whose name may look like `name_version` — or none for a
+/// file that is no distribution archive (`.meta`, `.readme`, `CHECKSUMS`).
+fn cpan_package_of(rel: &str) -> Option<String> {
+    let (author_path, file) = rel.rsplit_once('/')?;
+    let (distribution, _) = crate::registry::cpan::parse_dist_archive_filename(file)?;
+    Some(format!("{author_path}/{distribution}"))
+}
+
 /// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
 async fn build_conan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "conan/").await?;
@@ -625,6 +657,41 @@ pub fn paginate<T: Clone>(data: &[T], page: usize, limit: usize) -> (Vec<T>, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cpan_key_belongs_to_its_author_paths_distribution() {
+        let of = |rel| cpan_package_of(rel);
+        for (rel, package) in [
+            ("A/AU/AUTHOR/Foo-Bar-1.0.tar.gz", "A/AU/AUTHOR/Foo-Bar"),
+            ("A/AU/AUTHOR/Foo-Bar-1.0.tar.bz2", "A/AU/AUTHOR/Foo-Bar"),
+            ("A/AU/AUTHOR/Foo-Bar-1.0.tar.xz", "A/AU/AUTHOR/Foo-Bar"),
+            ("A/AU/AUTHOR/Foo-Bar-1.0.zip", "A/AU/AUTHOR/Foo-Bar"),
+            ("A/AU/AUTHOR/Foo-Bar-1.0.tgz", "A/AU/AUTHOR/Foo-Bar"),
+            (
+                "A/AU/AUTHOR/finance-quote_0.18.tar.gz",
+                "A/AU/AUTHOR/finance-quote",
+            ),
+            // A subdirectory is part of the author path, never parsed as a distribution.
+            (
+                "A/AU/AUTHOR/old_2019/Foo-Bar-1.0.tar.gz",
+                "A/AU/AUTHOR/old_2019/Foo-Bar",
+            ),
+            (
+                "A/AU/AUTHOR/old_2019/Baz-Qux-2.0.tar.gz",
+                "A/AU/AUTHOR/old_2019/Baz-Qux",
+            ),
+        ] {
+            assert_eq!(of(rel).as_deref(), Some(package), "{rel}");
+        }
+        for rel in [
+            "A/AU/AUTHOR/Foo-Bar-1.0.meta",
+            "A/AU/AUTHOR/Foo-Bar-1.0.readme",
+            "A/AU/AUTHOR/CHECKSUMS",
+            "Foo-Bar-1.0.tar.gz",
+        ] {
+            assert_eq!(of(rel), None, "{rel}");
+        }
+    }
 
     #[test]
     fn try_accept_reindex_first_call_accepted() {
