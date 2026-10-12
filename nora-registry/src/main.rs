@@ -952,6 +952,9 @@ async fn main() {
             println!("  Orphaned:          {}", result.orphaned);
             println!("  Deleted:           {}", result.deleted);
             println!("  Bytes freed:       {}", result.bytes_freed);
+            if result.docker_mark_failed {
+                println!("  Docker sweep:      skipped (manifest graph incomplete; all Docker objects kept)");
+            }
             if result.skipped_recent > 0 {
                 println!(
                     "  Skipped (grace):   {} (younger than {}s — likely in-flight uploads)",
@@ -988,6 +991,9 @@ async fn main() {
                     .map(|(name, count)| format!("{} ({} files)", name, count))
                     .collect();
                 println!("\nNote: GC does not scan: {}", parts.join(", "));
+            }
+            if result.docker_mark_failed {
+                std::process::exit(1);
             }
         }
         Some(Commands::RetentionPlan) => {
