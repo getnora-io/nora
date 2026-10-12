@@ -5,6 +5,7 @@ mod local;
 mod object;
 
 pub use local::LocalStorage;
+pub(crate) use local::NameTaken;
 pub use object::ObjectStorage;
 
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
@@ -734,6 +735,94 @@ mod tests {
         let backend = Arc::new(ObjectStorage::in_memory());
         let storage = Storage::from_backend(backend.clone());
         (backend, storage)
+    }
+
+    /// A key is an object, never a directory: every read, copy and delete of a key that only
+    /// prefixes other keys (`raw/dir`, the registry root `raw`), that a delete left behind as
+    /// an empty directory (`raw/e`), or that runs through a stored file (`raw/file.txt/x`)
+    /// answers as for a key that was never stored, on both backends. On the local backend
+    /// these are directories or ENOTDIR paths on disk, and must not pass for objects.
+    #[tokio::test]
+    async fn a_key_that_is_only_a_directory_is_a_missing_key() {
+        fn outcome<T>(r: &Result<T>) -> String {
+            match r {
+                Ok(_) => "ok".into(),
+                Err(StorageError::NotFound) => "not found".into(),
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let local = Storage::new_local(dir.path().to_str().unwrap());
+        let (_, object) = object_storage();
+        for (backend, storage) in [("local", &local), ("object", &object)] {
+            storage.put("raw/dir/f.txt", b"hello").await.unwrap();
+            storage.put("raw/file.txt", b"x").await.unwrap();
+            storage.put("raw/e/f.txt", b"x").await.unwrap();
+            storage.delete("raw/e/f.txt").await.unwrap();
+            for (key, missing) in [
+                ("raw/dir", "raw/none"),
+                ("raw", "none"),
+                ("raw/e", "raw/none"),
+                ("raw/file.txt/x", "raw/none/x"),
+            ] {
+                let ctx = format!("{backend} {key}");
+                assert!(storage.stat(missing).await.is_none(), "{ctx}");
+                assert!(storage.stat(key).await.is_none(), "{ctx} stat");
+                assert_eq!(
+                    outcome(&storage.get(key).await),
+                    outcome(&storage.get(missing).await),
+                    "{ctx} get"
+                );
+                assert_eq!(
+                    outcome(&storage.get_reader(key).await),
+                    outcome(&storage.get_reader(missing).await),
+                    "{ctx} get_reader"
+                );
+                assert_eq!(
+                    outcome(&storage.get_range(key, 0, 9).await),
+                    outcome(&storage.get_range(missing, 0, 9).await),
+                    "{ctx} get_range"
+                );
+                assert_eq!(
+                    outcome(&storage.copy(key, "raw/copy-a", None).await),
+                    outcome(&storage.copy(missing, "raw/copy-b", None).await),
+                    "{ctx} copy"
+                );
+                assert_eq!(
+                    outcome(&storage.delete(key).await),
+                    outcome(&storage.delete(missing).await),
+                    "{ctx} delete"
+                );
+            }
+            assert_eq!(&storage.get("raw/dir/f.txt").await.unwrap()[..], b"hello");
+            assert_eq!(&storage.get("raw/file.txt").await.unwrap()[..], b"x");
+        }
+    }
+
+    /// a key whose path runs through a stored file is missing at any depth below
+    /// it, not only directly under it.
+    #[tokio::test]
+    async fn a_key_any_depth_under_a_file_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let local = Storage::new_local(dir.path().to_str().unwrap());
+        local.put("raw/file.txt", b"x").await.unwrap();
+        for key in ["raw/file.txt/a/b", "raw/file.txt/a/b/c"] {
+            assert!(
+                matches!(local.get(key).await, Err(StorageError::NotFound)),
+                "{key} get"
+            );
+            assert!(
+                matches!(local.get_reader(key).await, Err(StorageError::NotFound)),
+                "{key} get_reader"
+            );
+            assert!(
+                matches!(
+                    local.get_range(key, 0, 9).await,
+                    Err(StorageError::NotFound)
+                ),
+                "{key} get_range"
+            );
+        }
     }
 
     /// Regression for #604: `put()` must record the hash-pin BEFORE it returns,
