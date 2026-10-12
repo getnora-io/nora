@@ -1561,6 +1561,154 @@ fn open_log_file(
     Some((non_blocking, guard))
 }
 
+/// Auth routes behind the auth and general limiters, registry routes behind the upload limiter,
+/// each limiter built for its quota. Returns the quotas the built limiters enforce, read back
+/// from them, for the startup log.
+fn rate_limited_routes<S: Clone + Send + Sync + 'static>(
+    auth_routes: Router<S>,
+    registry_routes: Router<S>,
+    quotas: &rate_limit::LimiterQuotas,
+    trusted_proxies: config::TrustedProxies,
+) -> (Router<S>, rate_limit::LimiterQuotas) {
+    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies);
+    let (upload_limiter, upload) = rate_limit::upload_rate_limiter(quotas.upload);
+    let (general_limiter, general) = rate_limit::general_rate_limiter(quotas.general);
+
+    // Auth routes: auth_limiter (strict 1rps) + general_limiter
+    let auth_routes = auth_routes.layer(auth_limiter).layer(general_limiter);
+    // Registry routes: upload_limiter only (200rps/500burst)
+    // No general_limiter — avoids double-limiting that causes 429
+    // during cache warming (dotnet restore with many packages)
+    let limited_registry = registry_routes.layer(upload_limiter);
+
+    let enforced = rate_limit::LimiterQuotas {
+        auth,
+        upload,
+        general,
+    };
+    (
+        Router::new().merge(auth_routes).merge(limited_registry),
+        enforced,
+    )
+}
+
+#[cfg(test)]
+mod rate_limited_routes_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    async fn statuses(app: &Router, path: &str, count: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let mut req = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    4000,
+                ))));
+            out.push(app.clone().oneshot(req).await.unwrap().status().as_u16());
+        }
+        out
+    }
+
+    // Registry routes are limited by the upload_* settings and only by
+    // them; auth routes by auth_* and general_*. Bursts differ (auth 1, upload 2, general 3), one
+    // request a second, so the first refusal tells which limiter answered.
+    #[tokio::test]
+    async fn registry_routes_use_the_upload_limiter_only() {
+        let rl = config::RateLimitConfig {
+            enabled: true,
+            auth_rps: 1,
+            auth_burst: 1,
+            upload_rps: 1,
+            upload_burst: 2,
+            general_rps: 1,
+            general_burst: 3,
+        };
+        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
+        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
+        let quotas = rate_limit::limiter_quotas(&rl);
+        let (app, enforced) = rate_limited_routes(
+            auth,
+            registry,
+            &quotas,
+            config::TrustedProxies::default_loopback(),
+        );
+        assert_eq!(enforced, quotas);
+        assert_eq!(
+            statuses(&app, "/v2/", 4).await,
+            vec![200, 200, 429, 429],
+            "registry"
+        );
+        assert_eq!(
+            statuses(&app, "/api/tokens", 2).await,
+            vec![200, 429],
+            "auth"
+        );
+
+        // The general limiter stricter than the upload one must not reach registry routes.
+        let rl = config::RateLimitConfig {
+            auth_burst: 2,
+            upload_burst: 3,
+            general_burst: 1,
+            ..rl
+        };
+        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
+        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
+        let quotas = rate_limit::limiter_quotas(&rl);
+        let (app, enforced) = rate_limited_routes(
+            auth,
+            registry,
+            &quotas,
+            config::TrustedProxies::default_loopback(),
+        );
+        assert_eq!(enforced, quotas);
+        assert_eq!(
+            statuses(&app, "/v2/", 4).await,
+            vec![200, 200, 200, 429],
+            "registry"
+        );
+        assert_eq!(
+            statuses(&app, "/api/tokens", 2).await,
+            vec![200, 429],
+            "auth"
+        );
+    }
+
+    // Whatever the rates, the routes are built with the quotas they are given, each from its
+    // own setting: rates far apart and far above 1000/s, bursts above u16::MAX.
+    #[test]
+    fn the_routes_enforce_the_quotas_they_are_given() {
+        for (auth, upload, general) in [
+            (1_500_000, 5_000_000, 3),
+            ((1 << 32) + 200, 7, u64::MAX),
+            (999, 1_000_001, 600),
+        ] {
+            let rl = config::RateLimitConfig {
+                enabled: true,
+                auth_rps: auth,
+                auth_burst: 70_000,
+                upload_rps: upload,
+                upload_burst: 100_000,
+                general_rps: general,
+                general_burst: 65_536,
+            };
+            let quotas = rate_limit::limiter_quotas(&rl);
+            let (_, enforced) = rate_limited_routes::<()>(
+                Router::new(),
+                Router::new(),
+                &quotas,
+                config::TrustedProxies::default_loopback(),
+            );
+            assert_eq!(enforced, quotas, "{auth} {upload} {general}");
+        }
+    }
+}
+
 async fn run_server(mut config: Config, storage: Storage) {
     let start_time = Instant::now();
 
@@ -1738,22 +1886,24 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(openapi::routes());
 
     let app_routes = if rate_limit_enabled {
-        // Create rate limiters before moving config to state
-        let auth_limiter =
-            rate_limit::auth_rate_limiter(&config.rate_limit, config.auth.trusted_proxies.clone());
-        let upload_limiter = rate_limit::upload_rate_limiter(&config.rate_limit);
-        let general_limiter = rate_limit::general_rate_limiter(&config.rate_limit);
-
-        // Auth routes: auth_limiter (strict 1rps) + general_limiter
-        let auth_routes = auth::token_routes()
-            .layer(auth_limiter)
-            .layer(general_limiter);
-        // Registry routes: upload_limiter only (200rps/500burst)
-        // No general_limiter — avoids double-limiting that causes 429
-        // during cache warming (dotnet restore with many packages)
-        let limited_registry = registry_routes.layer(upload_limiter);
-
-        Router::new().merge(auth_routes).merge(limited_registry)
+        let (routes, enforced) = rate_limited_routes(
+            auth::token_routes(),
+            registry_routes,
+            &rate_limit::limiter_quotas(&config.rate_limit),
+            config.auth.trusted_proxies.clone(),
+        );
+        // What the built limiters enforce, read back from them: any narrowing between the
+        // configuration and the limiters shows here, next to "Rate limiting configured".
+        info!(
+            auth_rps = enforced.auth.per_second(),
+            auth_burst = enforced.auth.burst,
+            upload_rps = enforced.upload.per_second(),
+            upload_burst = enforced.upload.burst,
+            general_rps = enforced.general.per_second(),
+            general_burst = enforced.general.burst,
+            "Rate limits enforced"
+        );
+        routes
     } else {
         info!("Rate limiting DISABLED");
         Router::new()

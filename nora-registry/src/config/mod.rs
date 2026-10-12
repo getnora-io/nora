@@ -1312,6 +1312,64 @@ mod tests {
         assert_eq!(config.general_burst, 200);
     }
 
+    // NORA_RATE_LIMIT_*_RPS/_BURST reach the config unchanged, also far
+    // above 1000/s — a clamp at the source would undo the exact limiter downstream.
+    #[test]
+    fn rate_limit_env_overrides_are_kept_as_given() {
+        let _lock = env_lock();
+        let vars = [
+            ("NORA_RATE_LIMIT_AUTH_RPS", "1500"),
+            ("NORA_RATE_LIMIT_AUTH_BURST", "7"),
+            ("NORA_RATE_LIMIT_UPLOAD_RPS", "5000000"),
+            ("NORA_RATE_LIMIT_UPLOAD_BURST", "4000"),
+            ("NORA_RATE_LIMIT_GENERAL_RPS", "18446744073709551615"),
+            ("NORA_RATE_LIMIT_GENERAL_BURST", "900"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let mut config = RateLimitConfig::default();
+        config.apply_env_overrides();
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        assert_eq!(config.auth_rps, 1500);
+        assert_eq!(config.auth_burst, 7);
+        assert_eq!(config.upload_rps, 5_000_000);
+        assert_eq!(config.upload_burst, 4000);
+        assert_eq!(config.general_rps, u64::MAX);
+        assert_eq!(config.general_burst, 900);
+    }
+
+    // The env overrides reach the *loaded* configuration unchanged: through load_from, which
+    // runs Config::apply_env_overrides and the checks after the rate limit section.
+    #[test]
+    fn rate_limit_env_reaches_the_loaded_config_unchanged() {
+        let _lock = env_lock();
+        let vars = [
+            ("NORA_RATE_LIMIT_AUTH_RPS", "1500"),
+            ("NORA_RATE_LIMIT_AUTH_BURST", "70000"),
+            ("NORA_RATE_LIMIT_UPLOAD_RPS", "5000000"),
+            ("NORA_RATE_LIMIT_UPLOAD_BURST", "4000"),
+            ("NORA_RATE_LIMIT_GENERAL_RPS", "18446744073709551615"),
+            ("NORA_RATE_LIMIT_GENERAL_BURST", "900"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let loaded = Config::load_from(None, NO_FALLBACK, false);
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        let rl = loaded.unwrap().0.rate_limit;
+        assert_eq!(rl.auth_rps, 1500);
+        assert_eq!(rl.auth_burst, 70_000);
+        assert_eq!(rl.upload_rps, 5_000_000);
+        assert_eq!(rl.upload_burst, 4000);
+        assert_eq!(rl.general_rps, u64::MAX);
+        assert_eq!(rl.general_burst, 900);
+    }
+
     #[test]
     fn test_rate_limit_from_toml() {
         let toml = r#"
