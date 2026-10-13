@@ -710,7 +710,9 @@ impl Config {
             ("pub", self.pub_dart.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
             ("cpan", self.cpan.proxy.as_deref()),
-            ("hf", self.hf.proxy.as_deref()),
+            // Not hf: its metadata carries the Hub's host as content (a model card's
+            // `license_link`), so a body scan reports leaks that are not; the URLs NORA
+            // hands an hf client travel in headers, which the handler lists by name.
         ];
         for (name, url) in simple {
             if let Some(url) = url {
@@ -4034,9 +4036,13 @@ proxies = [
             config.hf.proxy.as_deref(),
             Some("https://hf-mirror.example")
         );
-        assert!(config
-            .upstream_hostnames()
-            .contains(&("hf".to_string(), "hf-mirror.example".to_string())));
+        assert!(
+            !config
+                .upstream_hostnames()
+                .iter()
+                .any(|(reg, _)| reg == "hf"),
+            "hf bodies are not scanned for the upstream host"
+        );
     }
 
     /// The keys of `[hf]`, held by the compiler: destructured without `..`, so adding a
@@ -4251,7 +4257,12 @@ proxies = [
             hostnames.contains(&"proxy.golang.org"),
             "go default missing"
         );
-        assert!(hostnames.contains(&"huggingface.co"), "hf default missing");
+        // Hugging Face metadata carries the Hub's host as content (a model card's
+        // `license_link`), and its proxy URLs travel in headers, not bodies.
+        assert!(
+            !hostnames.contains(&"huggingface.co"),
+            "hf bodies are not scanned for the upstream host"
+        );
         // localhost should be excluded
         assert!(!hostnames.contains(&"localhost"));
         assert!(!hostnames.contains(&"127.0.0.1"));

@@ -52,9 +52,11 @@ const UNREADABLE: &str = "The Hugging Face upstream answered with metadata NORA 
 const LINK_LEAVES_NORA: &str =
     "The Hugging Face upstream pointed the next page outside itself; NORA does not follow it.";
 
-/// Keys removed from metadata at any depth: `xetHash` is what makes a client take the Xet
-/// path, and with `lfs` beside it the client skips the HEAD call altogether.
-const XET_BODY_KEYS: [&str; 2] = ["xetHash", "lfs"];
+/// The key removed from metadata at any depth. Without it no client takes the Xet path:
+/// the shortcut that skips the HEAD call needs the Xet hash beside the LFS block, and
+/// `HfFileSystem` reads only the hash. The LFS block stays: it carries the sha256 other
+/// consumers verify with.
+const XET_BODY_KEY: &str = "xetHash";
 
 const MAX_PATH: usize = 2048;
 const MAX_QUERY: usize = 2048;
@@ -249,14 +251,12 @@ fn decode_segment(segment: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
-/// Removes [`XET_BODY_KEYS`] from every object at any depth. Shape-independent on purpose:
-/// the keys are dropped wherever the Hub puts them, today or after a change of shape.
+/// Removes [`XET_BODY_KEY`] from every object at any depth. Shape-independent on purpose:
+/// the key is dropped wherever the Hub puts it, today or after a change of shape.
 fn strip_xet_metadata(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            for key in XET_BODY_KEYS {
-                map.remove(key);
-            }
+            map.remove(XET_BODY_KEY);
             for v in map.values_mut() {
                 strip_xet_metadata(v);
             }
@@ -405,7 +405,7 @@ mod tests {
     }
 
     /// A listing in the live Hub's shape: a regular file, and an LFS file of a Xet-backed
-    /// repo carrying both `lfs` and `xetHash`.
+    /// repo carrying both `lfs` and `xetHash`; only the Xet hash is removed on the way through.
     fn live_tree() -> Value {
         json!([
             {"type": "file", "oid": "cce185ba30383db0a5a2a2483cd3dedfb1abe46d", "size": 44, "path": "config.json"},
@@ -601,13 +601,14 @@ mod tests {
             json_of(resp).await,
             json!([
                 {"type": "file", "oid": "cce185ba30383db0a5a2a2483cd3dedfb1abe46d", "size": 44, "path": "config.json"},
-                {"type": "file", "oid": "44b36d6e32d13c8fb28b0feab0ac8bfefa7efeda", "size": 4112, "path": "model.safetensors"}
+                {"type": "file", "oid": "44b36d6e32d13c8fb28b0feab0ac8bfefa7efeda", "size": 4112, "path": "model.safetensors",
+                 "lfs": {"oid": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707", "size": 4112, "pointerSize": 134}}
             ])
         );
     }
 
     #[tokio::test]
-    async fn model_info_loses_xet_and_lfs_and_keeps_the_rest() {
+    async fn model_info_loses_xet_and_keeps_the_rest() {
         let up = MockServer::start().await;
         let info = json!({
             "id": "org/model", "sha": "0123456789abcdef0123456789abcdef01234567", "private": false,
@@ -637,7 +638,8 @@ mod tests {
                 "id": "org/model", "sha": "0123456789abcdef0123456789abcdef01234567", "private": false,
                 "siblings": [
                     {"rfilename": "config.json", "blobId": "cce1", "size": 44},
-                    {"rfilename": "model.safetensors", "blobId": "44b3", "size": 4112}
+                    {"rfilename": "model.safetensors", "blobId": "44b3", "size": 4112,
+                     "lfs": {"sha256": "248d", "size": 4112, "pointerSize": 134}}
                 ],
                 "cardData": {"nested": [{"license": "mit"}]}
             })
@@ -976,7 +978,10 @@ mod tests {
     fn xet_keys_go_at_any_depth_and_nothing_else_does() {
         let mut v = json!({"a": 1, "xetHash": "h", "lfs": {}, "b": [{"xetHash": "h", "c": {"lfs": 1, "d": 2}}], "e": "xetHash"});
         strip_xet_metadata(&mut v);
-        assert_eq!(v, json!({"a": 1, "b": [{"c": {"d": 2}}], "e": "xetHash"}));
+        assert_eq!(
+            v,
+            json!({"a": 1, "lfs": {}, "b": [{"c": {"lfs": 1, "d": 2}}], "e": "xetHash"})
+        );
     }
 
     const UP: &str = "https://huggingface.co";
