@@ -3227,23 +3227,25 @@ mod tests {
             .mount(&up)
             .await;
         let ctx = hf_with_upstream(&up);
+        // Other bytes under the key the final answer names, pinned to themselves: served,
+        // they would show that the lookup went past the hop that settled it.
+        let other = b"not what the upstream sends";
         let staged = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
-        std::fs::write(&staged, CONFIG).unwrap();
+        std::fs::write(&staged, other).unwrap();
         ctx.state
             .storage
             .put_from_path(
                 &config_key(),
                 &staged,
-                Some(&hex::encode(sha2::Sha256::digest(CONFIG))),
+                Some(&hex::encode(sha2::Sha256::digest(other))),
             )
             .await
             .unwrap();
         let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
         assert_eq!(header(&resp, "etag"), "\"cce1\"");
-        assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
         assert_eq!(
-            hits(&up, "/cache/config.json").await,
-            1,
+            received(resp).await,
+            (CONFIG.to_vec(), true),
             "served from a key the response does not name"
         );
     }
