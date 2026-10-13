@@ -10,7 +10,9 @@ docker-compose*
 .internal*
 
 # Non-build directories
-fuzz/
+# fuzz/ is a workspace member: the build needs its manifest and targets for
+# `cargo build --locked`, never its corpus.
+fuzz/corpus/
 coverage/
 data/
 deploy/
