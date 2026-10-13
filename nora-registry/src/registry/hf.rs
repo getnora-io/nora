@@ -6,7 +6,7 @@
 //!   GET       /hf/api/models/{...}                  — metadata: model info, revision, tree
 //!                                                     listing, passed through without Xet
 //!   HEAD, GET /hf/{repo}/resolve/{rev}/{file}        — one file, streamed through every
-//!                                                     redirect the Hub gives; not cached yet
+//!                                                     redirect the Hub gives, and cached
 //! Datasets answer 501: only models are in scope for the first release.
 //!
 //! Xet is never proxied and never advertised. `huggingface_hub` takes the Xet path only when
@@ -14,6 +14,12 @@
 //! `xetHash` on a tree-listing entry it has cached — with that, it skips the HEAD call and
 //! asks for a Xet read token, which would send it to the Xet storage around NORA. Metadata
 //! therefore loses those keys at any depth, and only listed headers reach the client.
+//!
+//! Files are cached per repo by the digest the Hub names them by (`X-Linked-Etag`: the sha256
+//! of an LFS file, the git blob sha1 of a regular one), so a weight file unchanged across
+//! commits is one object. The first hop of every GET still goes upstream — it names the commit
+//! and the digest — and the bytes come from the cache when they are there. On the way in they
+//! are checked against that digest, with the last chunk held back until it matches.
 //!
 //! The client's own credentials are never sent upstream: the first release serves public
 //! repositories only.
@@ -25,9 +31,13 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::circuit_breaker::BreakerScope;
 use crate::curation::RequestVersion;
-use crate::registry::{circuit_open_response, nora_base_url, proxy_fetch_with_headers, ProxyError};
+use crate::registry::{
+    circuit_open_response, nora_base_url, proxy_fetch_with_headers, ProxyError, TempFileGuard,
+};
 use crate::registry_type::RegistryType;
+use crate::storage::Storage;
 use crate::AppState;
+use axum::body::Bytes;
 use axum::{
     body::Body,
     extract::State,
@@ -36,8 +46,12 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use nora_registry::verified::{stream_body, verify_while_streaming, VerifiedByteStream};
 use serde_json::Value;
+use sha2::Digest as _;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 /// `huggingface_hub` reads the reason for a failed request from this header when the
@@ -79,6 +93,14 @@ const XET_TOKEN_ROUTES: &[&str] = &["xet-read-token", "xet-write-token"];
 const XET_BODY_KEY: &str = "xetHash";
 
 const MAX_PATH: usize = 2048;
+
+/// Cached files live under `hf/models/{repo}/blobs/{digest}`.
+const CACHE_PREFIX: &str = "hf/models";
+/// Fills in progress, under the storage path as docker's proxy temp files are.
+const FILL_TEMP_DIR: &str = "tmp/hf-proxy";
+/// A temp file untouched this long belongs to a fill that will not finish.
+const FILL_TEMP_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+const CACHED_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_QUERY: usize = 2048;
 
 pub fn routes() -> Router<AppState> {
@@ -143,6 +165,10 @@ const MAX_HOPS: usize = 5;
 /// bytes come through NORA. The commit, etag and size come from the hop that carries them
 /// (on a 302 to the CDN they ride on the redirect only). Curation holds the repo before
 /// anything is fetched and the commit as soon as a hop names it.
+///
+/// A GET looks for the file in the cache at the first hop that names its digest, after that
+/// hop's commit has passed curation and before the next hop is asked; a full GET that misses
+/// fills it. A HEAD is answered from the hops and neither reads nor fills the cache.
 async fn files(
     State(state): State<AppState>,
     method: Method,
@@ -173,8 +199,36 @@ async fn files(
         });
         curation_check(&state, &headers, &repo, version)
     };
-    match fetch_file(&state, &method, &url, range, check_commit).await {
+    let cache_repo = (method == Method::GET).then_some(repo.as_str());
+    let mut fetched = fetch_file(
+        &state,
+        &method,
+        &url,
+        range.clone(),
+        &check_commit,
+        cache_repo,
+    )
+    .await;
+    if let FileFetch::Cached { meta, key, size } = &fetched {
+        if let Some(response) = cached_response(&state, &headers, meta, key, *size).await {
+            state.metrics.record_download("hf");
+            state.metrics.record_cache_hit("hf");
+            state.activity.push(ActivityEntry::new(
+                ActionType::CacheHit,
+                format!("{repo}/{}", file.file),
+                RegistryType::HuggingFace,
+                "CACHE",
+            ));
+            return response;
+        }
+        // The stored copy cannot be read: fetch the file again, as on a miss; its fill
+        // replaces the copy.
+        fetched = fetch_file(&state, &method, &url, range.clone(), &check_commit, None).await;
+    }
+    let stall = Duration::from_secs(state.config.hf.proxy_timeout);
+    match fetched {
         FileFetch::File { status, meta, body } => {
+            let mut fill = None;
             if method == Method::GET && status.is_success() {
                 state.metrics.record_download("hf");
                 state.metrics.record_cache_miss("hf");
@@ -187,41 +241,50 @@ async fn files(
                 state
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "proxy", "", "hf", ""));
+                // A range is part of a file: passed through, never stored.
+                if status == StatusCode::OK && range.is_none() {
+                    fill = plan_fill(&state, &repo, &meta, body.as_ref()).await;
+                }
             }
-            file_response(
-                status,
-                &meta,
-                body,
-                Duration::from_secs(state.config.hf.proxy_timeout),
-            )
+            file_response(status, &meta, body, stall, fill)
         }
         FileFetch::Refused(response) => response,
         FileFetch::UpstreamRefused {
             status,
             code,
             message,
-        } => {
-            let mut response = (
-                status,
-                Json(serde_json::json!({ "error": message.as_ref().and_then(|m| m.to_str().ok()).unwrap_or(NOT_ON_UPSTREAM) })),
-            )
-                .into_response();
-            let h = response.headers_mut();
-            if let Some(code) = code {
-                h.insert(ERROR_CODE_HEADER, code);
-            }
-            h.insert(
-                ERROR_MESSAGE_HEADER,
-                message.unwrap_or(HeaderValue::from_static(NOT_ON_UPSTREAM)),
-            );
-            response
-        }
+        } => upstream_refusal(status, code, message),
         FileFetch::CircuitOpen(registry) => circuit_open_response(&registry),
         FileFetch::Failed(why) => {
             tracing::warn!(registry = "hf", why, "file request failed upstream");
             error_response(StatusCode::BAD_GATEWAY, FILE_UPSTREAM_FAILED)
         }
+        // A fetch without a cache lookup never answers from the cache; reaching this means
+        // the stored copy went unreadable twice in one request.
+        FileFetch::Cached { .. } => error_response(StatusCode::BAD_GATEWAY, FILE_UPSTREAM_FAILED),
     }
+}
+
+/// A Hub refusal handed on: its status, its error code, and its message (or ours).
+fn upstream_refusal(
+    status: StatusCode,
+    code: Option<HeaderValue>,
+    message: Option<HeaderValue>,
+) -> Response {
+    let mut response = (
+        status,
+        Json(serde_json::json!({ "error": message.as_ref().and_then(|m| m.to_str().ok()).unwrap_or(NOT_ON_UPSTREAM) })),
+    )
+        .into_response();
+    let h = response.headers_mut();
+    if let Some(code) = code {
+        h.insert(ERROR_CODE_HEADER, code);
+    }
+    h.insert(
+        ERROR_MESSAGE_HEADER,
+        message.unwrap_or(HeaderValue::from_static(NOT_ON_UPSTREAM)),
+    );
+    response
 }
 
 fn curation_check(
@@ -273,6 +336,13 @@ enum FileFetch {
         meta: FileMeta,
         body: Option<reqwest::Response>,
     },
+    /// The cache holds the file a hop named by its digest: what the hops said, its key and its
+    /// stored size. The hops after that one were not asked.
+    Cached {
+        meta: FileMeta,
+        key: String,
+        size: u64,
+    },
     /// Curation refused the commit a hop named, before the bytes were asked for.
     Refused(Response),
     /// The Hub refused (4xx): its status, error code and message are handed on.
@@ -299,12 +369,17 @@ fn origin(url: &reqwest::Url) -> (String, Option<String>, Option<u16>) {
 /// all; a HEAD stops at a redirect to another origin, as `huggingface_hub` does, and is
 /// answered from that hop — a signed CDN link is issued for GET. `check_commit` runs once,
 /// on the first hop that names a commit (or, when none does, on the final answer).
+///
+/// With `cache_repo`, the first hop that names an etag — `X-Linked-Etag` on any hop, or the
+/// final answer's `ETag` when none does, the same one [`file_meta`] reports — is looked up in
+/// the cache of that repo; a stored copy ends the walk there.
 async fn fetch_file<F>(
     state: &AppState,
     method: &Method,
     url: &str,
     range: Option<HeaderValue>,
     check_commit: F,
+    cache_repo: Option<&str>,
 ) -> FileFetch
 where
     F: Fn(Option<&str>) -> Option<Response>,
@@ -323,6 +398,7 @@ where
     };
     let mut hops: Vec<HeaderMap> = Vec::new();
     let mut commit_checked = false;
+    let mut looked_up = false;
     let outcome = loop {
         if hops.len() > MAX_HOPS {
             break Err("too many redirects");
@@ -353,6 +429,40 @@ where
             }
         }
         let status = response.status();
+        if let Some(repo) = cache_repo.filter(|_| !looked_up) {
+            let named = response.headers().get(&LINKED_ETAG_HEADER).or_else(|| {
+                status
+                    .is_success()
+                    .then(|| response.headers().get(header::ETAG))
+                    .flatten()
+            });
+            if let Some(named) = named {
+                looked_up = true;
+                let key = hub_digest(named).and_then(|digest| cache_key(repo, &digest));
+                let stored = match &key {
+                    Some(key) => state.storage.stat(key).await,
+                    None => None,
+                };
+                if let (Some(key), Some(stored)) = (key, stored) {
+                    if !commit_checked {
+                        if let Some(refused) = check_commit(None) {
+                            break Ok(FileFetch::Refused(refused));
+                        }
+                    }
+                    let meta = if status.is_success() {
+                        file_meta(&hops, Some(response.headers()))
+                    } else {
+                        hops.push(response.headers().clone());
+                        file_meta(&hops, None)
+                    };
+                    break Ok(FileFetch::Cached {
+                        meta,
+                        key,
+                        size: stored.size,
+                    });
+                }
+            }
+        }
         if status.is_redirection() {
             let next = response
                 .headers()
@@ -410,12 +520,15 @@ where
 }
 
 /// The answer to a file request: only listed headers, and the body streamed with a stall
-/// limit per read through the open-world sink (`verified.rs`).
+/// limit per read. With a [`Fill`] the body is checked against the digest the Hub named the
+/// file by on its way through (and stored when it matches); without one it goes through the
+/// open-world sink (`verified.rs`) — a range, or an etag NORA cannot check.
 fn file_response(
     status: StatusCode,
     meta: &FileMeta,
     body: Option<reqwest::Response>,
     stall: Duration,
+    fill: Option<Fill>,
 ) -> Response {
     let mut headers = HeaderMap::new();
     if let Some(commit) = &meta.commit {
@@ -444,7 +557,21 @@ fn file_response(
             headers.insert(name, v.clone());
         }
     }
-    let chunks = futures::stream::unfold(
+    let chunks = upstream_chunks(upstream, stall);
+    let body = match fill {
+        Some(fill) => stream_body(fill_stream(chunks, fill)),
+        // Open world, and said so: upstream bytes passed through with no digest to check
+        // them against.
+        None => nora_registry::verified::open_world_stream_body(chunks),
+    };
+    (status, headers, body).into_response()
+}
+
+type Chunks = Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// The upstream body, a stalled read ending it with an error.
+fn upstream_chunks(upstream: reqwest::Response, stall: Duration) -> Chunks {
+    Box::pin(futures::stream::unfold(
         Some(Box::pin(upstream.bytes_stream())),
         move |chunks| async move {
             let mut chunks = chunks?;
@@ -463,16 +590,380 @@ fn file_response(
                 )),
             }
         },
+    ))
+}
+
+/// The digest the Hub names a file by in its etag (measured on the live Hub: `X-Linked-Etag`
+/// on the resolve answer, quoted lower-case hex): the sha256 of an LFS file's bytes, or the git
+/// blob sha1 of a regular file's.
+#[derive(Debug, Clone, PartialEq)]
+enum HubDigest {
+    Sha256(String),
+    GitBlob(String),
+}
+
+impl HubDigest {
+    fn hex(&self) -> &str {
+        match self {
+            Self::Sha256(hex) | Self::GitBlob(hex) => hex,
+        }
+    }
+}
+
+/// A strong etag of 64 hex digits is a sha256, of 40 a git blob sha1; anything else — a weak
+/// etag, an unquoted one, another length — names nothing NORA can check.
+fn hub_digest(etag: &HeaderValue) -> Option<HubDigest> {
+    let hex = etag.to_str().ok()?.strip_prefix('"')?.strip_suffix('"')?;
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let hex = hex.to_ascii_lowercase();
+    match hex.len() {
+        64 => Some(HubDigest::Sha256(hex)),
+        40 => Some(HubDigest::GitBlob(hex)),
+        _ => None,
+    }
+}
+
+/// The storage key of a file: per repo, by its digest, so a file unchanged across commits is
+/// one object. The id is compared in lower case, as the Hub routes it; only an id the Hub could
+/// serve makes a key — one or two segments of ASCII letters, digits, `-`, `_` and `.`, each
+/// starting with a letter or digit, no `..`. The digest is the last segment and `blobs` the one
+/// before it, so a one-segment (legacy) id and a two-segment one never share a key.
+fn cache_key(repo: &str, digest: &HubDigest) -> Option<String> {
+    let segments: Vec<&str> = repo.split('/').collect();
+    let id_ok = (1..=2).contains(&segments.len())
+        && segments.iter().all(|segment| {
+            segment
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && !segment.contains("..")
+        });
+    id_ok.then(|| {
+        format!(
+            "{CACHE_PREFIX}/{}/blobs/{}",
+            repo.to_ascii_lowercase(),
+            digest.hex()
+        )
+    })
+}
+
+/// A file's bytes on their way to the client: hashed against the digest the Hub named it by
+/// and, when there is somewhere to keep them, written to a temp file that a verified end
+/// commits to the cache.
+struct Fill {
+    expected: HubDigest,
+    sha256: sha2::Sha256,
+    /// Running only for a regular file: its git blob digest, primed with the blob header.
+    git: Option<sha1::Sha1>,
+    /// `None` when there is nowhere to keep the bytes, or a write failed: the client is
+    /// served and checked all the same, the cache is not filled.
+    store: Option<FillStore>,
+}
+
+struct FillStore {
+    storage: Storage,
+    key: String,
+    file: tokio::fs::File,
+    path: PathBuf,
+    /// Removes the temp file on every path but a committed fill.
+    guard: TempFileGuard,
+}
+
+/// Plans the check (and the fill) of a full GET. `None` — the file is passed through unchecked
+/// — when the etag names no digest NORA can check, or a regular file came without its length
+/// (the git blob digest needs it up front). The cache is left out, the check kept, when the
+/// repo id makes no key or the temp file cannot be created.
+async fn plan_fill(
+    state: &AppState,
+    repo: &str,
+    meta: &FileMeta,
+    body: Option<&reqwest::Response>,
+) -> Option<Fill> {
+    let body = body?;
+    let expected = hub_digest(meta.etag.as_ref()?)?;
+    let git = match expected {
+        HubDigest::Sha256(_) => None,
+        HubDigest::GitBlob(_) => {
+            let len: u64 = body
+                .headers()
+                .get(header::CONTENT_LENGTH)?
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()?;
+            let mut git = sha1::Sha1::new();
+            git.update(format!("blob {len}\0").as_bytes());
+            Some(git)
+        }
+    };
+    let store = match cache_key(repo, &expected) {
+        Some(key) => fill_store(state, key).await,
+        None => None,
+    };
+    Some(Fill {
+        expected,
+        sha256: sha2::Sha256::new(),
+        git,
+        store,
+    })
+}
+
+async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
+    let dir = std::path::Path::new(&state.config.storage.path).join(FILL_TEMP_DIR);
+    let path = dir.join(format!("{}.part", uuid::Uuid::new_v4()));
+    let created = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::File::create(&path).await
+    }
+    .await;
+    match created {
+        Ok(file) => Some(FillStore {
+            storage: state.storage.clone(),
+            key,
+            file,
+            guard: TempFileGuard::new(path.clone()),
+            path,
+        }),
+        Err(e) => {
+            tracing::warn!(registry = "hf", path = %path.display(), error = %e, "no temp file for the cache fill; serving uncached");
+            None
+        }
+    }
+}
+
+impl Fill {
+    async fn take(&mut self, chunk: &Bytes) {
+        self.sha256.update(chunk);
+        if let Some(git) = self.git.as_mut() {
+            git.update(chunk);
+        }
+        if let Some(store) = self.store.as_mut() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = store.file.write_all(chunk).await {
+                tracing::warn!(registry = "hf", key = %store.key, error = %e, "cache fill write failed; serving uncached");
+                self.store = None;
+            }
+        }
+    }
+
+    /// At the end of the body: the digest the Hub named, or an error that ends the body before
+    /// its last chunk. A match commits the fill in the background.
+    fn finish(&mut self) -> Result<(), std::io::Error> {
+        let sha256 = hex::encode(std::mem::take(&mut self.sha256).finalize());
+        let computed = match (&self.expected, self.git.take()) {
+            (HubDigest::GitBlob(_), Some(git)) => hex::encode(git.finalize()),
+            _ => sha256.clone(),
+        };
+        if computed != self.expected.hex() {
+            tracing::error!(
+                registry = "hf",
+                expected = %self.expected.hex(),
+                computed = %computed,
+                "upstream file does not match the digest the Hub named it by; body aborted, not cached"
+            );
+            self.store = None;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "hf file integrity verification failed",
+            ));
+        }
+        if let Some(store) = self.store.take() {
+            commit_fill(store, sha256);
+        }
+        Ok(())
+    }
+}
+
+/// The upstream body through a [`Fill`]: every chunk is hashed (and written) before it is
+/// sent, and the last one is held back until the digest matches — a file that does not match
+/// ends one chunk short, so it never arrives as a complete download and is never stored.
+struct FillStream(Chunks);
+
+impl futures::Stream for FillStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.as_mut().poll_next(cx)
+    }
+}
+
+// An EOF-verifying stream like raw's `VerifyingStream`, so it may be served through the
+// `stream_body` sole sink; only `fill_stream` builds one.
+impl nora_registry::verified::stream_sealed::Sealed for FillStream {}
+impl VerifiedByteStream for FillStream {}
+
+fn fill_stream(chunks: Chunks, fill: Fill) -> FillStream {
+    struct Through {
+        chunks: Chunks,
+        fill: Fill,
+        held: Option<Bytes>,
+        done: bool,
+    }
+    let through = Through {
+        chunks,
+        fill,
+        held: None,
+        done: false,
+    };
+    FillStream(Box::pin(futures::stream::unfold(
+        through,
+        |mut t| async move {
+            if t.done {
+                return None;
+            }
+            loop {
+                match t.chunks.next().await {
+                    Some(Ok(chunk)) => {
+                        t.fill.take(&chunk).await;
+                        if let Some(previous) = t.held.replace(chunk) {
+                            return Some((Ok(previous), t));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        t.done = true;
+                        return Some((Err(e), t));
+                    }
+                    None => {
+                        t.done = true;
+                        if let Err(e) = t.fill.finish() {
+                            return Some((Err(e), t));
+                        }
+                        let last = t.held.take();
+                        return last.map(|last| (Ok(last), t));
+                    }
+                }
+            }
+        },
+    )))
+}
+
+/// Commits a verified fill under its key, pinned to its sha256, in a task of its own: the
+/// client already has its bytes, and a client gone at the last moment must not cancel the
+/// commit halfway. A failure leaves the file uncached (the guard removes the temp file).
+fn commit_fill(store: FillStore, sha256: String) {
+    tokio::spawn(
+        std::panic::AssertUnwindSafe(async move {
+            let FillStore {
+                storage,
+                key,
+                mut file,
+                path,
+                mut guard,
+            } = store;
+            // Durability: put_from_path renames the temp file into place, so its bytes must be
+            // on disk before it does (#846).
+            let synced = async {
+                use tokio::io::AsyncWriteExt;
+                file.flush().await?;
+                file.sync_all().await
+            }
+            .await;
+            drop(file);
+            if let Err(e) = synced {
+                tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed: temp file not synced");
+                return;
+            }
+            match storage.put_from_path(&key, &path, Some(&sha256)).await {
+                Ok(()) => guard.disarm(),
+                Err(e) => {
+                    tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
+                }
+            }
+        })
+        .catch_unwind()
+        .map(|r| {
+            if let Err(e) = r {
+                tracing::error!(panic = ?e, "hf cache fill task panicked");
+            }
+        }),
     );
-    // Open world, and said so: these are upstream bytes passed through, not NORA-stored, so
-    // there is no pin to check them against yet. Verifying the linked sha256 on the stream
-    // comes with the cache, where bytes are stored and pinned.
-    (
-        status,
-        headers,
-        nora_registry::verified::open_world_stream_body(chunks),
-    )
-        .into_response()
+}
+
+/// A file served from the cache, with the commit and digest the hops named. A range is read
+/// straight from storage — open world, as every ranged serve: a part cannot be rehashed — and a
+/// full read goes through `verify_while_streaming`, which checks the pin before the last frame.
+/// `None` when the stored copy cannot be read or carries no pin: the caller fetches the file
+/// again.
+async fn cached_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    meta: &FileMeta,
+    key: &str,
+    size: u64,
+) -> Option<Response> {
+    let mut extra: Vec<(HeaderName, String)> = Vec::new();
+    let text = |v: &HeaderValue| v.to_str().ok().map(str::to_string);
+    if let Some(commit) = meta.commit.as_ref().and_then(text) {
+        extra.push((REPO_COMMIT_HEADER, commit));
+    }
+    if let Some(etag) = meta.etag.as_ref().and_then(text) {
+        extra.push((header::ETAG, etag.clone()));
+        extra.push((LINKED_ETAG_HEADER, etag));
+    }
+    let linked_size = meta
+        .size
+        .as_ref()
+        .and_then(text)
+        .unwrap_or_else(|| size.to_string());
+    extra.push((LINKED_SIZE_HEADER, linked_size));
+    if headers.contains_key(header::RANGE) {
+        if let Some(response) = crate::registry::range::range_response(
+            &state.storage,
+            &[key],
+            headers,
+            size,
+            CACHED_CONTENT_TYPE,
+            &extra,
+        )
+        .await
+        {
+            return Some(response);
+        }
+    }
+    let (len, pin, reader) = match state.storage.get_reader(key).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(registry = "hf", key = %key, error = %e, "cached file unreadable; fetching it again");
+            return None;
+        }
+    };
+    let Some(pin) = pin else {
+        tracing::warn!(registry = "hf", key = %key, "cached file has no pin; fetching it again");
+        return None;
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, CACHED_CONTENT_TYPE)
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::ACCEPT_RANGES, "bytes");
+    for (name, value) in &extra {
+        response = response.header(name, value.as_str());
+    }
+    response
+        .body(stream_body(verify_while_streaming(
+            reader,
+            Some(pin),
+            key.to_string(),
+        )))
+        .ok()
+}
+
+/// Removes temp files of cache fills that will not finish (a crash, a kill), at start and
+/// on the periodic sweep, as docker does for its proxy temp files.
+pub fn cleanup_fill_temp_dir(data_dir: &str) {
+    let dir = std::path::Path::new(data_dir).join(FILL_TEMP_DIR);
+    let removed = super::remove_stale_temp_files(&dir, FILL_TEMP_MAX_AGE);
+    if removed > 0 {
+        tracing::info!(removed, dir = %dir.display(), "Cleaned up stale hf cache fill temp files");
+    }
 }
 
 async fn datasets() -> Response {
@@ -1454,7 +1945,11 @@ mod tests {
     // ── files (resolve) ────────────────────────────────────────────────────────
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
-    const SHA256: &str = "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707";
+    /// The sha256 of [`weights`]: the digest the fixture Hub names the LFS file by.
+    const SHA256: &str = "140ce67f4f40ccd0e877eab619ca490a5dd700411b23b4bb19ea5952c7b6d603";
+    /// The git blob sha1 of [`CONFIG`]: the etag of the regular file, as on the live Hub.
+    const CONFIG_BLOB: &str = "302193440cfbfa05b83201c696ca7f96b95dbf75";
+    const CONFIG: &[u8] = b"{\"model_type\": \"fixture\"}\n";
 
     /// An upstream in the live Hub's shape: a regular file answers a relative 307 to the
     /// resolve cache; an LFS file answers a 302 to `cdn` — another host — with the commit,
@@ -1470,7 +1965,7 @@ mod tests {
                             .as_str(),
                     )
                     .insert_header("x-repo-commit", COMMIT)
-                    .insert_header("x-linked-etag", "\"cce1\""),
+                    .insert_header("x-linked-etag", format!("\"{CONFIG_BLOB}\"").as_str()),
             )
             .mount(&up)
             .await;
@@ -1479,8 +1974,8 @@ mod tests {
         ))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(b"{\"model_type\": \"fixture\"}\n".to_vec())
-                .insert_header("etag", "\"cce1\"")
+                .set_body_bytes(CONFIG.to_vec())
+                .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str())
                 .insert_header("x-repo-commit", COMMIT)
                 .insert_header("set-cookie", "hub=1"),
         )
@@ -1550,12 +2045,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
-        assert_eq!(header(&resp, "etag"), "\"cce1\"");
+        assert_eq!(header(&resp, "etag"), format!("\"{CONFIG_BLOB}\""));
         assert_no_leaked_headers(&resp);
-        assert_eq!(
-            &body_bytes(resp).await[..],
-            b"{\"model_type\": \"fixture\"}\n"
-        );
+        assert_eq!(&body_bytes(resp).await[..], CONFIG);
     }
 
     #[tokio::test]
@@ -1614,7 +2106,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
-        assert_eq!(header(&resp, "etag"), "\"cce1\"");
+        assert_eq!(header(&resp, "etag"), format!("\"{CONFIG_BLOB}\""));
         assert_eq!(header(&resp, "content-length"), "26");
         assert_no_leaked_headers(&resp);
     }
@@ -1928,27 +2420,608 @@ mod tests {
 
     /// Nothing is cached in this slice: the same file asked twice is fetched twice, so a
     /// moved `main` is never served stale.
+    const WEIGHTS_PATH: &str = "/hf/org/model/resolve/main/model.safetensors";
+    const CONFIG_PATH: &str = "/hf/org/model/resolve/main/config.json";
+
+    fn weights_key() -> String {
+        format!("hf/models/org/model/blobs/{SHA256}")
+    }
+
+    fn config_key() -> String {
+        format!("hf/models/org/model/blobs/{CONFIG_BLOB}")
+    }
+
+    /// A fill is committed by a task of its own once the body ends: wait for it, with a deadline.
+    /// Committed means pinned — the object is visible a moment before its pin is recorded, and
+    /// a copy without a pin is not served.
+    async fn wait_stored(ctx: &TestContext, key: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(ctx.state.storage.get_reader(key).await, Ok((_, Some(_), _))) {
+            assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Long enough for a fill task that should not exist to have run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// What reached the client, and whether the body ended cleanly.
+    async fn received(resp: Response) -> (Vec<u8>, bool) {
+        let mut frames = resp.into_body().into_data_stream();
+        let mut got = Vec::new();
+        while let Some(frame) = frames.next().await {
+            match frame {
+                Ok(bytes) => got.extend_from_slice(&bytes),
+                Err(_) => return (got, false),
+            }
+        }
+        (got, true)
+    }
+
+    async fn hf_keys(ctx: &TestContext) -> Vec<String> {
+        ctx.state.storage.list("hf/").await.unwrap_or_default()
+    }
+
+    /// Temp files of fills, finished or not.
+    fn fill_temps(ctx: &TestContext) -> usize {
+        std::fs::read_dir(std::path::Path::new(&ctx.state.config.storage.path).join(FILL_TEMP_DIR))
+            .map(|dir| dir.count())
+            .unwrap_or(0)
+    }
+
+    async fn hits(server: &MockServer, suffix: &str) -> usize {
+        upstream_paths(server)
+            .await
+            .iter()
+            .filter(|p| p.ends_with(suffix))
+            .count()
+    }
+
+    /// The resolve answer goes upstream on every request — it names the commit and the digest,
+    /// and curation reads the commit there — while the bytes of a cached file do not.
     #[tokio::test]
-    async fn files_are_fetched_on_every_request() {
+    async fn the_resolve_answer_is_asked_on_every_request() {
         let cdn = cdn_with_weights().await;
         let up = live_hub(&cdn).await;
         let ctx = hf_with_upstream(&up);
-        for _ in 0..2 {
-            let resp = send(
-                &ctx.app,
-                Method::GET,
-                "/hf/org/model/resolve/main/config.json",
-                "",
-            )
-            .await;
+        for round in 0..2 {
+            let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
             assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+            if round == 0 {
+                wait_stored(&ctx, &config_key()).await;
+            }
         }
-        let resolves = upstream_paths(&up)
+        assert_eq!(hits(&up, "/resolve/main/config.json").await, 2);
+        assert_eq!(hits(&up, &format!("/{COMMIT}/config.json")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_download_of_weights_comes_from_the_cache_not_the_cdn() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let first = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(body_bytes(first).await.to_vec(), weights());
+        wait_stored(&ctx, &weights_key()).await;
+
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
+        assert_eq!(header(&resp, "etag"), format!("\"{SHA256}\""));
+        assert_eq!(header(&resp, "x-linked-etag"), format!("\"{SHA256}\""));
+        assert_eq!(header(&resp, "x-linked-size"), "4112");
+        assert_eq!(header(&resp, "content-length"), "4112");
+        assert_no_leaked_headers(&resp);
+        assert_eq!(received(resp).await, (weights(), true));
+        assert_eq!(upstream_paths(&cdn).await.len(), 1, "the CDN is asked once");
+        assert_eq!(hits(&up, "/resolve/main/model.safetensors").await, 2);
+        assert_eq!(fill_temps(&ctx), 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_download_of_a_regular_file_comes_from_the_cache() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let first = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(body_bytes(first).await.to_vec(), CONFIG);
+        wait_stored(&ctx, &config_key()).await;
+
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
+        assert_eq!(header(&resp, "etag"), format!("\"{CONFIG_BLOB}\""));
+        assert_eq!(header(&resp, "x-linked-size"), CONFIG.len().to_string());
+        assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
+        assert_eq!(hits(&up, &format!("/{COMMIT}/config.json")).await, 1);
+    }
+
+    /// An upstream that answers the resolve request like the live Hub but sends `body` for
+    /// the bytes: through the CDN for an LFS file, through the resolve cache for a regular one.
+    async fn hub_sending(body: Vec<u8>) -> (MockServer, MockServer) {
+        let cdn = MockServer::start().await;
+        Mock::given(path("/xet-bridge/model.safetensors"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&cdn)
+            .await;
+        let up = live_hub(&cdn).await;
+        Mock::given(path(
+            format!("/api/resolve-cache/models/org/model/{COMMIT}/config.json").as_str(),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body[..CONFIG.len()].to_vec())
+                .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+        )
+        .with_priority(1)
+        .mount(&up)
+        .await;
+        (up, cdn)
+    }
+
+    /// One byte off, same length: the digest the Hub named does not match. The client gets
+    /// the body one chunk short — never a complete download — and nothing is stored.
+    #[tokio::test]
+    async fn a_file_that_does_not_match_its_digest_ends_short_and_is_not_stored() {
+        let mut corrupt = weights();
+        corrupt[1] ^= 0x01;
+        let (up, cdn) = hub_sending(corrupt).await;
+        let ctx = hf_with_upstream(&up);
+        for (route, len) in [(WEIGHTS_PATH, weights().len()), (CONFIG_PATH, CONFIG.len())] {
+            let resp = send(&ctx.app, Method::GET, route, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let (got, clean) = received(resp).await;
+            assert!(!clean, "{route}: a corrupt file ended cleanly");
+            assert!(
+                got.len() < len,
+                "{route}: all {len} bytes reached the client"
+            );
+        }
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty(), "{:?}", hf_keys(&ctx).await);
+        assert_eq!(fill_temps(&ctx), 0);
+        // Nothing was kept, so the next download asks the CDN again.
+        let _ = received(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        assert_eq!(upstream_paths(&cdn).await.len(), 2);
+    }
+
+    /// A stored copy changed on disk under its pin ends one frame short, like raw's.
+    #[tokio::test]
+    async fn a_tampered_cached_copy_ends_short() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let _ = body_bytes(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        wait_stored(&ctx, &weights_key()).await;
+        let mut tampered = weights();
+        tampered[1] ^= 0x01;
+        std::fs::write(
+            std::path::Path::new(&ctx.state.config.storage.path).join(weights_key()),
+            &tampered,
+        )
+        .unwrap();
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        let (got, clean) = received(resp).await;
+        assert!(!clean, "a tampered copy ended cleanly");
+        assert!(got.len() < weights().len());
+        assert_eq!(upstream_paths(&cdn).await.len(), 1);
+    }
+
+    /// A client gone halfway leaves no stored copy and no temp file.
+    #[tokio::test]
+    async fn a_client_gone_mid_download_leaves_nothing_behind() {
+        let mut big = b"FIXTURE-WEIGHTS-".to_vec();
+        big.resize(8 << 20, 7);
+        let digest = hex::encode(sha2::Sha256::digest(&big));
+        let up = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        Mock::given(path("/org/model/resolve/main/big.safetensors"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/big", cdn.uri()).as_str())
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("x-linked-etag", format!("\"{digest}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(big))
+            .mount(&cdn)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/big.safetensors",
+            "",
+        )
+        .await;
+        let mut frames = resp.into_body().into_data_stream();
+        assert!(matches!(frames.next().await, Some(Ok(_))));
+        assert_eq!(fill_temps(&ctx), 1, "the fill was under way");
+        drop(frames);
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty());
+        assert_eq!(fill_temps(&ctx), 0);
+    }
+
+    #[tokio::test]
+    async fn a_range_on_a_cached_file_is_read_from_storage() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let _ = body_bytes(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        wait_stored(&ctx, &weights_key()).await;
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            WEIGHTS_PATH,
+            vec![("range", "bytes=4100-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&resp, "content-range"), "bytes 4100-4111/4112");
+        assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
+        assert_eq!(header(&resp, "etag"), format!("\"{SHA256}\""));
+        assert_eq!(body_bytes(resp).await.to_vec(), weights()[4100..].to_vec());
+        assert_eq!(upstream_paths(&cdn).await.len(), 1);
+    }
+
+    /// A range is part of a file, and a HEAD has no body: neither is stored.
+    #[tokio::test]
+    async fn a_range_or_a_head_never_fills_the_cache() {
+        let up = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        Mock::given(path("/org/model/resolve/main/model.safetensors"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/w", cdn.uri()).as_str())
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("x-linked-etag", format!("\"{SHA256}\"").as_str())
+                    .insert_header("x-linked-size", "4112"),
+            )
+            .mount(&up)
+            .await;
+        // A CDN that ignores the range and sends the whole file, as a 200: still not stored,
+        // since the client asked for a part.
+        Mock::given(path("/w"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(weights()))
+            .mount(&cdn)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            WEIGHTS_PATH,
+            vec![("range", "bytes=0-")],
+            "",
+        )
+        .await;
+        let _ = body_bytes(resp).await;
+        let resp = send(&ctx.app, Method::HEAD, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty());
+        assert_eq!(fill_temps(&ctx), 0);
+    }
+
+    /// An etag that names no digest NORA can check: the file is passed through, unstored.
+    #[tokio::test]
+    async fn an_etag_that_names_no_digest_is_passed_through_unstored() {
+        for etag in [
+            "\"cce1\"",
+            "W/\"302193440cfbfa05b83201c696ca7f96b95dbf75\"",
+            "302193440cfbfa05b83201c696ca7f96b95dbf75",
+        ] {
+            let up = MockServer::start().await;
+            Mock::given(path("/org/model/resolve/main/config.json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(CONFIG.to_vec())
+                        .insert_header("x-repo-commit", COMMIT)
+                        .insert_header("etag", etag),
+                )
+                .mount(&up)
+                .await;
+            let ctx = hf_with_upstream(&up);
+            for _ in 0..2 {
+                let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+                assert_eq!(received(resp).await, (CONFIG.to_vec(), true), "{etag}");
+            }
+            settle().await;
+            assert!(hf_keys(&ctx).await.is_empty(), "{etag}");
+            assert_eq!(hits(&up, "/config.json").await, 2, "{etag}");
+        }
+    }
+
+    /// Storage that refuses the fill does not cost the client its file.
+    #[tokio::test]
+    async fn a_failed_store_still_serves_the_client() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        // A file where the key's directory would go: the commit fails.
+        let blocked =
+            std::path::Path::new(&ctx.state.config.storage.path).join("hf/models/org/model");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("blobs"), b"in the way").unwrap();
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+            assert_eq!(received(resp).await, (weights(), true));
+        }
+        settle().await;
+        assert_eq!(fill_temps(&ctx), 0, "a failed commit leaves its temp file");
+        assert_eq!(upstream_paths(&cdn).await.len(), 2);
+    }
+
+    /// The cache is per repo: the same digest in another repo is fetched for that repo.
+    #[tokio::test]
+    async fn the_cache_is_per_repo() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        Mock::given(path("/org/other/resolve/main/model.safetensors"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/xet-bridge/model.safetensors", cdn.uri()).as_str(),
+                    )
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("x-linked-etag", format!("\"{SHA256}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let _ = body_bytes(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        wait_stored(&ctx, &weights_key()).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/other/resolve/main/model.safetensors",
+            "",
+        )
+        .await;
+        assert_eq!(body_bytes(resp).await.to_vec(), weights());
+        assert_eq!(upstream_paths(&cdn).await.len(), 2);
+        wait_stored(&ctx, &format!("hf/models/org/other/blobs/{SHA256}")).await;
+    }
+
+    /// Curation reads the commit on the resolve answer before the cache is looked at: a rule
+    /// on the commit refuses a file NORA already holds.
+    #[tokio::test]
+    async fn a_commit_rule_holds_for_a_cached_file() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let rules = format!(
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}", "reason": "r"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &rules, "block");
+        let staged = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
+        std::fs::write(&staged, weights()).unwrap();
+        ctx.state
+            .storage
+            .put_from_path(&weights_key(), &staged, Some(SHA256))
             .await
-            .iter()
-            .filter(|p| p.ends_with("/resolve/main/config.json"))
-            .count();
-        assert_eq!(resolves, 2);
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(upstream_paths(&cdn).await.is_empty());
+    }
+
+    /// The Hub answers a legacy id's file directly, without a redirect; its etag names the
+    /// file all the same, and the second download comes from the cache.
+    #[tokio::test]
+    async fn a_file_answered_without_a_redirect_is_cached_too() {
+        let up = MockServer::start().await;
+        Mock::given(path("/gpt2/resolve/main/config.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CONFIG.to_vec())
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let route = "/hf/gpt2/resolve/main/config.json";
+        let _ = body_bytes(send(&ctx.app, Method::GET, route, "").await).await;
+        wait_stored(&ctx, &format!("hf/models/gpt2/blobs/{CONFIG_BLOB}")).await;
+        let resp = send(&ctx.app, Method::GET, route, "").await;
+        assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
+        assert_eq!(header(&resp, "accept-ranges"), "bytes");
+        assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
+    }
+
+    /// A stored copy without a pin cannot be checked, so it is not served: the file is fetched
+    /// again and its fill replaces the copy with a pinned one.
+    #[tokio::test]
+    async fn an_unpinned_stored_copy_is_fetched_again_and_replaced() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let staged = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
+        std::fs::write(&staged, b"unpinned, unchecked").unwrap();
+        ctx.state
+            .storage
+            .put_from_path(&weights_key(), &staged, None)
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(received(resp).await, (weights(), true));
+        assert_eq!(upstream_paths(&cdn).await.len(), 1);
+        wait_stored(&ctx, &weights_key()).await;
+        let (_, pin, _) = ctx.state.storage.get_reader(&weights_key()).await.unwrap();
+        assert_eq!(pin.as_deref(), Some(SHA256));
+    }
+
+    /// The lookup settles on the first hop that names an etag, the one the response reports:
+    /// an etag NORA cannot check there means no lookup, even if a later answer names a digest
+    /// the cache holds.
+    #[tokio::test]
+    async fn the_first_named_etag_settles_the_lookup() {
+        let up = MockServer::start().await;
+        Mock::given(path("/org/model/resolve/main/config.json"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", "/cache/config.json")
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("x-linked-etag", "\"cce1\""),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/cache/config.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CONFIG.to_vec())
+                    .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let staged = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
+        std::fs::write(&staged, CONFIG).unwrap();
+        ctx.state
+            .storage
+            .put_from_path(
+                &config_key(),
+                &staged,
+                Some(&hex::encode(sha2::Sha256::digest(CONFIG))),
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(header(&resp, "etag"), "\"cce1\"");
+        assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
+        assert_eq!(
+            hits(&up, "/cache/config.json").await,
+            1,
+            "served from a key the response does not name"
+        );
+    }
+
+    /// The periodic sweep and the start remove fills that will not finish, and only those.
+    #[test]
+    fn stale_fill_temp_files_are_removed_and_fresh_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let temps = dir.path().join(FILL_TEMP_DIR);
+        std::fs::create_dir_all(&temps).unwrap();
+        let stale = temps.join("stale.part");
+        let fresh = temps.join("fresh.part");
+        std::fs::write(&stale, b"cut off").unwrap();
+        std::fs::write(&fresh, b"under way").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - FILL_TEMP_MAX_AGE - Duration::from_secs(60),
+            )
+            .unwrap();
+        cleanup_fill_temp_dir(dir.path().to_str().unwrap());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn hub_digests_are_strong_hex_of_a_known_length() {
+        let digest = |s: &str| hub_digest(&HeaderValue::from_str(s).unwrap());
+        assert_eq!(
+            digest(&format!("\"{SHA256}\"")),
+            Some(HubDigest::Sha256(SHA256.into()))
+        );
+        assert_eq!(
+            digest(&format!("\"{}\"", SHA256.to_uppercase())),
+            Some(HubDigest::Sha256(SHA256.into()))
+        );
+        assert_eq!(
+            digest(&format!("\"{CONFIG_BLOB}\"")),
+            Some(HubDigest::GitBlob(CONFIG_BLOB.into()))
+        );
+        for refused in [
+            SHA256.to_string(),
+            format!("W/\"{SHA256}\""),
+            format!("\"{}\"", &SHA256[..63]),
+            format!("\"{}g\"", &SHA256[..63]),
+            format!("\"{CONFIG_BLOB}0\""),
+            "\"\"".to_string(),
+            "\"cce1\"".to_string(),
+        ] {
+            assert_eq!(digest(&refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn cache_keys_take_only_ids_the_hub_serves() {
+        let d = HubDigest::Sha256(SHA256.into());
+        assert_eq!(
+            cache_key("org/model", &d),
+            Some(format!("hf/models/org/model/blobs/{SHA256}"))
+        );
+        assert_eq!(
+            cache_key("Org/Model", &d),
+            Some(format!("hf/models/org/model/blobs/{SHA256}"))
+        );
+        assert_eq!(
+            cache_key("gpt2", &d),
+            Some(format!("hf/models/gpt2/blobs/{SHA256}"))
+        );
+        assert_eq!(
+            cache_key("o-r_g.1/m-o_d.2", &d),
+            Some(format!("hf/models/o-r_g.1/m-o_d.2/blobs/{SHA256}"))
+        );
+        for refused in [
+            "",
+            "a/b/c",
+            "/model",
+            "org/",
+            "org/.model",
+            "org/-model",
+            "org/mo..del",
+            "org/mo del",
+            "org/mödel",
+            "org/mo%2Fdel",
+            ".nora-meta/x",
+        ] {
+            assert_eq!(cache_key(refused, &d), None, "{refused:?}");
+        }
+    }
+
+    /// The git blob digest of a regular file, as git and the Hub compute it.
+    #[tokio::test]
+    async fn a_regular_file_is_checked_by_its_git_blob_digest() {
+        let ctx = hf_enabled();
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello\n".to_vec()))
+            .mount(&up)
+            .await;
+        let body = reqwest::get(up.uri()).await.unwrap();
+        let meta = FileMeta {
+            etag: Some(HeaderValue::from_static(
+                "\"ce013625030ba8dba906f756967f9e9ca394464a\"",
+            )),
+            ..FileMeta::default()
+        };
+        let fill = plan_fill(&ctx.state, "org/model", &meta, Some(&body))
+            .await
+            .unwrap();
+        let resp = file_response(
+            StatusCode::OK,
+            &meta,
+            Some(body),
+            Duration::from_secs(5),
+            Some(fill),
+        );
+        assert_eq!(received(resp).await, (b"hello\n".to_vec(), true));
+        wait_stored(
+            &ctx,
+            "hf/models/org/model/blobs/ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .await;
     }
 
     #[test]

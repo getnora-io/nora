@@ -24,7 +24,11 @@ impl Drop for Server {
 }
 
 fn serve(env: &[(&str, &str)]) -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    serve_in(tempfile::tempdir().unwrap(), env)
+}
+
+/// `nora serve` with its storage under `dir/data`, which a test may have prepared.
+fn serve_in(dir: tempfile::TempDir, env: &[(&str, &str)]) -> Server {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -157,4 +161,26 @@ fn all_registries_leave_hf_off_until_it_is_named() {
     assert!(!body_of(server.port, "/health").contains("\"hf\""));
     let server = serve(&[("NORA_REGISTRIES_ENABLE", "all,hf"), ("NORA_HF_PROXY", "")]);
     assert!(head_of(server.port, "HEAD", DATASETS).starts_with("HTTP/1.1 501"));
+}
+
+/// A cache fill a crash cut off leaves its temp file behind; the next start removes it once
+/// it is old enough to belong to no running fill, and keeps a fresh one.
+#[test]
+fn a_start_removes_stale_fill_temp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let temps = dir.path().join("data/tmp/hf-proxy");
+    std::fs::create_dir_all(&temps).unwrap();
+    let stale = temps.join("stale.part");
+    let fresh = temps.join("fresh.part");
+    std::fs::write(&stale, b"cut off").unwrap();
+    std::fs::write(&fresh, b"under way").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(5 * 60 * 60))
+        .unwrap();
+    let _server = serve_in(dir, &[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", "")]);
+    assert!(!stale.exists(), "a stale fill temp file survived the start");
+    assert!(fresh.exists(), "a fresh fill temp file was removed");
 }

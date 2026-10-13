@@ -2458,6 +2458,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
     }
+    // ...and Hugging Face cache fills a crash cut off mid-file.
+    if state.config.hf.enabled {
+        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
+    }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
         .await
@@ -2544,6 +2548,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let storage_path = metrics_state.config.storage.path.clone();
                 tokio::task::spawn_blocking(move || {
                     registry::docker::cleanup_proxy_temp_dir(&storage_path);
+                    registry::hf::cleanup_fill_temp_dir(&storage_path);
                     // Reclaim upload temp files orphaned by a storage-write failure
                     // without waiting for a restart. cleanup_expired_sessions only
                     // frees temps still tracked by a live (expired) session, so an
