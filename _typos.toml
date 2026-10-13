@@ -18,4 +18,6 @@ enabeld = "enabeld"
 unknwon = "unknwon"
 
 [files]
-extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js"]
+# nora-registry/testdata/**/*.tsv: corpora written by the formats' own tools (each file names the
+# script that regenerates it); their names and versions are data (`Crypt-SecurID`, fuzzed inputs).
+extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js", "nora-registry/testdata/**/*.tsv"]

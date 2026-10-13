@@ -1,0 +1,25 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/pub:/w:ro" dart:stable sh /w/client_requests.sh > nora-registry/testdata/pub/client-requests.tsv
+# 3.13.5: dart pub get, PUB_HOSTED_URL=http://127.0.0.1:<port>/pub
+# package	version	method	path
+Pong		GET	/pub/api/packages/Pong
+Pong	0.1.0	GET	/pub/packages/Pong/versions/0.1.0.tar.gz
+RAL		GET	/pub/api/packages/RAL
+RAL	1.0.0+2	GET	/pub/packages/RAL/versions/1.0.0+2.tar.gz
+_underscore		GET	/pub/api/packages/_underscore
+_underscore	0.0.1	GET	/pub/packages/_underscore/versions/0.0.1.tar.gz
+build_meta		GET	/pub/api/packages/build_meta
+build_meta	1.0.0+1	GET	/pub/packages/build_meta/versions/1.0.0+1.tar.gz
+dotted_build		GET	/pub/api/packages/dotted_build
+dotted_build	2.0.0+build.7	GET	/pub/packages/dotted_build/versions/2.0.0+build.7.tar.gz
+hyphen_pre		GET	/pub/api/packages/hyphen_pre
+hyphen_pre	1.0.0--	GET	/pub/packages/hyphen_pre/versions/1.0.0--.tar.gz
+mixed_pre		GET	/pub/api/packages/mixed_pre
+mixed_pre	1.2.3-x.7.y	GET	/pub/packages/mixed_pre/versions/1.2.3-x.7.y.tar.gz
+plain		GET	/pub/api/packages/plain
+plain	1.0.0	GET	/pub/packages/plain/versions/1.0.0.tar.gz
+pre_and_build		GET	/pub/api/packages/pre_and_build
+pre_and_build	0.1.0-alpha.1+sha.5114f85	GET	/pub/packages/pre_and_build/versions/0.1.0-alpha.1+sha.5114f85.tar.gz
+pre_release		GET	/pub/api/packages/pre_release
+pre_release	2.0.0-dev.1	GET	/pub/packages/pre_release/versions/2.0.0-dev.1.tar.gz
+upper_pre		GET	/pub/api/packages/upper_pre
+upper_pre	3.0.0-Rc-1+Build.7	GET	/pub/packages/upper_pre/versions/3.0.0-Rc-1+Build.7.tar.gz

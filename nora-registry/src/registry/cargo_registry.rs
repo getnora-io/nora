@@ -274,7 +274,7 @@ async fn sparse_index(
 
 /// GET /cargo/api/v1/crates/{crate_name} — JSON metadata.
 async fn get_metadata(State(state): State<AppState>, Path(crate_name): Path<String>) -> Response {
-    if validate_storage_key(&crate_name).is_err() {
+    if !is_valid_crate_name(&crate_name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let crate_name = crate_name.to_lowercase();
@@ -381,7 +381,7 @@ async fn download(
     headers: axum::http::HeaderMap,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
-    if validate_storage_key(&crate_name).is_err() || validate_storage_key(&version).is_err() {
+    if !is_valid_crate_name(&crate_name) || !crate::validation::is_one_segment(&version) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     // The upstream path keeps the name as cargo sent it (the published name, from the index):
@@ -2212,6 +2212,58 @@ mod integration_tests {
         );
         assert_eq!(&body_bytes(resp).await[..], krate);
     }
+
+    /// `corp-secret%2F` decodes to `corp-secret/`, which the exact isolation pattern
+    /// `corp-secret` does not match: it is refused, never requested upstream and never cached
+    /// over `cargo/corp-secret/metadata.json`.
+    #[tokio::test]
+    async fn a_trailing_slash_name_never_takes_an_internal_crate_upstream() {
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"versions":[]}"#))
+            .mount(&upstream)
+            .await;
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.cargo.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["corp-secret".to_string()];
+        });
+        let leaked = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("corp-secret"))
+                .count()
+        };
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/corp-secret",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert_eq!(leaked().await, 0, "control: canonical name is not proxied");
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/corp-secret%2F",
+            "",
+        )
+        .await;
+        assert_eq!(
+            leaked().await,
+            0,
+            "internal crate name sent to the public upstream (alias answered {})",
+            resp.status()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2574,5 +2626,176 @@ mod crate_name_isolation_in_any_spelling {
         }
         assert_eq!(statuses, vec![StatusCode::FORBIDDEN, StatusCode::FORBIDDEN]);
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{create_test_context_with_config, send, upstream_paths};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // A crate name is one cargo name (letters, digits, `-`, `_`) and a version one segment, on
+    // every path that takes them: `corp-secret%2Fx` decodes to `corp-secret/x`, which the
+    // isolation pattern `corp-secret` does not match and which names another crate's files.
+    #[tokio::test]
+    async fn a_crate_name_or_version_that_is_not_one_name_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["corp-secret".to_string()];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/corp-secret",
+            "",
+        )
+        .await;
+        assert!(!resp.status().is_success(), "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        for path in [
+            "/cargo/api/v1/crates/corp-secret%2Fx",
+            "/cargo/api/v1/crates/corp-secret%2F",
+            "/cargo/api/v1/crates/corp-secret%2Fx/1.0.0/download",
+            "/cargo/api/v1/crates/serde/1.0.0%2Fx/download",
+            "/cargo/api/v1/crates/serde/1.0.0%2F/download",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+}
+
+/// A crate is the crate crates.io finds: crates.io looks names up without case and with `-` and
+/// `_` as one character (`canon_crate_name`), so a rule, an allowlist entry or an internal
+/// namespace holds for every spelling that resolves to the same crate.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod crate_name_canonical_curation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"CRATE".to_vec()))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_for_every_spelling_crates_io_resolves() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = write(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [{"registry": "cargo", "name": "evil-crate", "version": "*", "reason": "malware"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for name in ["evil-crate", "evil_crate", "Evil_Crate", "EVIL-CRATE"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{name}/1.0.0/download"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/cargo/api/v1/crates/evil-crates/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "another crate");
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_every_spelling_of_its_crate() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "cargo", "name": "serde_json", "version": "1.0.0"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for name in ["serde_json", "serde-json"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{name}/1.0.0/download"),
+                "",
+            )
+            .await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_internal_namespace_isolates_every_spelling() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUAT".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["corp_*".to_string()];
+        });
+        for name in ["corp_tools", "corp-tools", "Corp-Tools"] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/cargo/api/v1/crates/{name}/1.0.0/download"),
+                "",
+            )
+            .await;
+            assert!(!resp.status().is_success(), "{name}: {}", resp.status());
+        }
+        let asked: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(asked.is_empty(), "internal names sent upstream: {asked:?}");
     }
 }

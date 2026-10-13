@@ -1813,9 +1813,17 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Build curation engine (shared helper, also used by SIGHUP reload).
     // Fail-closed: in enforce mode an unparsable filter aborts boot rather
-    // than starting in a silent allow-all state (#586).
-    let curation_engine = build_curation_engine(&config)
-        .unwrap_or_else(|e| panic!("Cannot start in enforce mode: {e}"));
+    // than starting in a silent allow-all state (#586) — with EXIT_CONFIG, a
+    // clean stop the units do not restart into, as for any other configuration
+    // NORA cannot start with (#1025).
+    let curation_engine = match build_curation_engine(&config) {
+        Ok(engine) => engine,
+        Err(e) => {
+            error!(error = %e, "Cannot start in enforce mode");
+            eprintln!("nora: cannot start in enforce mode: {e}");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    };
     if curation_engine.is_active() {
         info!(
             mode = %config.curation.mode,

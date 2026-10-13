@@ -21,6 +21,7 @@
 )]
 //! NORA Registry — library interface for fuzzing and testing
 
+pub mod pypi_files;
 pub mod validation;
 pub mod verified;
 
@@ -149,22 +150,11 @@ pub mod npm_fuzz {
 
 /// Re-export PyPI HTML parsing for fuzz targets
 pub mod pypi_fuzz {
-    use crate::validation::ends_with_ci;
-
     pub fn extract_filename(url: &str) -> Option<String> {
         let url = url.split('#').next()?;
         let filename = url.rsplit('/').next()?;
 
-        if ends_with_ci(filename, ".tar.gz")
-            || ends_with_ci(filename, ".tgz")
-            || ends_with_ci(filename, ".whl")
-            || ends_with_ci(filename, ".zip")
-            || ends_with_ci(filename, ".egg")
-        {
-            Some(filename.to_string())
-        } else {
-            None
-        }
+        crate::pypi_files::served_extension(filename).map(|_| filename.to_string())
     }
 
     pub fn parse_upstream_html(html: &str) -> Vec<(String, Option<String>)> {
@@ -285,8 +275,6 @@ pub mod maven_fuzz {
 
 /// Re-export version parsing for fuzz targets
 pub mod version_fuzz {
-    use crate::validation::ends_with_ci;
-
     /// The same forms as `curation::parse_npm_tarball_version` in the server.
     pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
         if let Some(version) = parse_npm_tarball_file(package_name, filename) {
@@ -313,29 +301,8 @@ pub mod version_fuzz {
         Some(version.to_string())
     }
 
-    pub fn parse_pypi_version(normalized_name: &str, filename: &str) -> Option<String> {
-        let base = filename
-            .strip_suffix(".tar.gz")
-            .or_else(|| filename.strip_suffix(".tgz"))
-            .or_else(|| filename.strip_suffix(".zip"))
-            .or_else(|| filename.strip_suffix(".whl"))
-            .or_else(|| filename.strip_suffix(".egg"))?;
-
-        let name_underscore = normalized_name.replace('-', "_");
-        let base_lower = base.to_lowercase();
-        let prefix = format!("{}-", name_underscore.to_lowercase());
-
-        let rest = base_lower.strip_prefix(&prefix)?;
-        let version = if ends_with_ci(filename, ".whl") {
-            rest.split('-').next()?
-        } else {
-            rest
-        };
-        if version.is_empty() {
-            return None;
-        }
-        Some(version.to_string())
-    }
+    /// The server's own reader (`crate::pypi_files`): the fuzz target drives the code that runs.
+    pub use crate::pypi_files::parse_pypi_version;
 }
 
 /// Re-export of the escape-aware raw-JSON URL rewrites for fuzz targets (#385).

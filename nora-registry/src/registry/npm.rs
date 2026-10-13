@@ -436,6 +436,12 @@ async fn handle_request(
     } else {
         format!("npm/{}/metadata.json", path)
     };
+    // A path with an empty segment (`npm//x`, `npm/x/`) would name another package's files
+    // and slip past name-based checks (`internal*` does not match `/x`): refuse it before
+    // curation, storage or any upstream request sees the name.
+    if let Err(e) = crate::validation::validate_storage_key(&key) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
 
     let package_name = if let Some((name, _)) = github_packages {
         name.to_string()
@@ -5642,5 +5648,226 @@ mod multi_upstream_tests {
         assert!(String::from_utf8_lossy(&reqs[0].body).contains("lodash"));
         assert_public_clean(&reqs);
         assert!(private.received_requests().await.unwrap().is_empty());
+    }
+
+    // ── A name with an empty segment never names another key's file ─────────
+
+    /// `/npm/evil-pkg//-/evil-pkg-1.0.0.tgz` and `/npm//evil-pkg/-/...` name the canonical
+    /// tarball under the package names `evil-pkg/` and `/evil-pkg`, which the rule `evil-pkg`
+    /// does not match — refused before curation and storage.
+    #[tokio::test]
+    async fn a_tarball_path_with_an_empty_segment_is_refused_before_curation() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "npm", "name": "evil-pkg", "version": "*", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        // A tarball cached (or published) before the version was blocklisted.
+        ctx.state
+            .storage
+            .put("npm/evil-pkg/tarballs/evil-pkg-1.0.0.tgz", b"MALWARE")
+            .await
+            .unwrap();
+        let canonical = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/evil-pkg/-/evil-pkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(canonical.status(), StatusCode::FORBIDDEN, "control");
+
+        let mut served = Vec::new();
+        for alias in [
+            "/npm/evil-pkg//-/evil-pkg-1.0.0.tgz",
+            "/npm//evil-pkg/-/evil-pkg-1.0.0.tgz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!("{alias} -> {:?}", body_bytes(resp).await));
+            }
+        }
+        assert!(served.is_empty(), "blocklisted tarball served: {served:?}");
+    }
+
+    /// `/npm//internalpkg` names `/internalpkg`, which the isolation pattern `internal*` does
+    /// not match: it is refused, and the packument of an internal package is never requested
+    /// from the public upstream or cached over its own file.
+    #[tokio::test]
+    async fn a_leading_slash_name_never_takes_an_internal_package_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "internalpkg",
+                "versions": {"9.9.9": {"name": "internalpkg", "version": "9.9.9"}}
+            })))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let leaked = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("internalpkg"))
+                .count()
+        };
+
+        let resp = send(&ctx.app, Method::GET, "/npm/internalpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert_eq!(leaked().await, 0, "control: canonical name is not proxied");
+
+        let resp = send(&ctx.app, Method::GET, "/npm//internalpkg", "").await;
+        assert_eq!(
+            leaked().await,
+            0,
+            "internal package name sent to the public upstream (alias answered {})",
+            resp.status()
+        );
+    }
+
+    /// Every tarball path form with an empty segment is refused with 400 before curation,
+    /// storage or the upstream sees it.
+    #[tokio::test]
+    async fn every_tarball_path_with_an_empty_segment_never_reaches_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TARBALL".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        for alias in [
+            "/npm//internalpkg/-/internalpkg-1.0.0.tgz",
+            "/npm/internalpkg//-/internalpkg-1.0.0.tgz",
+            "/npm/lodash/-/lodash-4.17.21.tgz/",
+            "/npm/lodash/-/",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{alias}");
+        }
+        let reqs: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(reqs.is_empty(), "sent upstream: {reqs:?}");
+        // Legit tarball path still proxies.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/lodash/-/lodash-4.17.21.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "control");
+    }
+}
+
+/// An npm version is the version npm publishes it as: `semver.clean` drops white space, leading
+/// `=` and `v`, and build metadata, so a rule or an allowlist entry holds however it spells its
+/// version — `v1.3.0`, `=1.3.0` and `1.3.0+build` are `1.3.0`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod npm_version_curation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_however_it_spells_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = write(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "npm", "name": "left-pad", "version": "v1.3.0", "reason": "r"},
+                {"registry": "npm", "name": "left-pad", "version": "=1.4.0", "reason": "r"},
+                {"registry": "npm", "name": "left-pad", "version": "1.5.0+build.1", "reason": "r"}
+            ]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for version in ["1.3.0", "1.4.0", "1.5.0"] {
+            let path = format!("/npm/left-pad/-/left-pad-{version}.tgz");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/left-pad/-/left-pad-1.3.1.tgz",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_its_version_however_spelled() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "npm", "name": "left-pad", "version": "v1.3.0"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/left-pad/-/left-pad-1.3.0.tgz",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/left-pad/-/left-pad-1.3.1.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

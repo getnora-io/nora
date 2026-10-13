@@ -1,0 +1,553 @@
+# RubyGems 3.6.9 (Ruby 3.4.11)
+rails	0		rails-0.gem
+rails	1		rails-1.gem
+rails	1.0		rails-1.0.gem
+rails	1.13.0		rails-1.13.0.gem
+rails	7.1.0.rc1		rails-7.1.0.rc1.gem
+rails	1.0.0.pre.rc1		rails-1.0.0.pre.rc1.gem
+rails	1.0.0.pre.rc.pre.1		rails-1.0.0.pre.rc.pre.1.gem
+rails	2.0.0.pre		rails-2.0.0.pre.gem
+rails	0.5.11000		rails-0.5.11000.gem
+rails	1.0.a		rails-1.0.a.gem
+rails	3.0.0.pre.beta.2		rails-3.0.0.pre.beta.2.gem
+rails	19		rails-19.gem
+rails	2		rails-2.gem
+rack-test	0		rack-test-0.gem
+rack-test	1		rack-test-1.gem
+rack-test	1.0		rack-test-1.0.gem
+rack-test	1.13.0		rack-test-1.13.0.gem
+rack-test	7.1.0.rc1		rack-test-7.1.0.rc1.gem
+rack-test	1.0.0.pre.rc1		rack-test-1.0.0.pre.rc1.gem
+rack-test	1.0.0.pre.rc.pre.1		rack-test-1.0.0.pre.rc.pre.1.gem
+rack-test	2.0.0.pre		rack-test-2.0.0.pre.gem
+rack-test	0.5.11000		rack-test-0.5.11000.gem
+rack-test	1.0.a		rack-test-1.0.a.gem
+rack-test	3.0.0.pre.beta.2		rack-test-3.0.0.pre.beta.2.gem
+rack-test	19		rack-test-19.gem
+rack-test	2		rack-test-2.gem
+devise-2fa	0		devise-2fa-0.gem
+devise-2fa	1		devise-2fa-1.gem
+devise-2fa	1.0		devise-2fa-1.0.gem
+devise-2fa	1.13.0		devise-2fa-1.13.0.gem
+devise-2fa	7.1.0.rc1		devise-2fa-7.1.0.rc1.gem
+devise-2fa	1.0.0.pre.rc1		devise-2fa-1.0.0.pre.rc1.gem
+devise-2fa	1.0.0.pre.rc.pre.1		devise-2fa-1.0.0.pre.rc.pre.1.gem
+devise-2fa	2.0.0.pre		devise-2fa-2.0.0.pre.gem
+devise-2fa	0.5.11000		devise-2fa-0.5.11000.gem
+devise-2fa	1.0.a		devise-2fa-1.0.a.gem
+devise-2fa	3.0.0.pre.beta.2		devise-2fa-3.0.0.pre.beta.2.gem
+devise-2fa	19		devise-2fa-19.gem
+devise-2fa	2		devise-2fa-2.gem
+ffi	0		ffi-0.gem
+ffi	1		ffi-1.gem
+ffi	1.0		ffi-1.0.gem
+ffi	1.13.0		ffi-1.13.0.gem
+ffi	7.1.0.rc1		ffi-7.1.0.rc1.gem
+ffi	1.0.0.pre.rc1		ffi-1.0.0.pre.rc1.gem
+ffi	1.0.0.pre.rc.pre.1		ffi-1.0.0.pre.rc.pre.1.gem
+ffi	2.0.0.pre		ffi-2.0.0.pre.gem
+ffi	0.5.11000		ffi-0.5.11000.gem
+ffi	1.0.a		ffi-1.0.a.gem
+ffi	3.0.0.pre.beta.2		ffi-3.0.0.pre.beta.2.gem
+ffi	19		ffi-19.gem
+ffi	2		ffi-2.gem
+sorbet-static	0		sorbet-static-0.gem
+sorbet-static	1		sorbet-static-1.gem
+sorbet-static	1.0		sorbet-static-1.0.gem
+sorbet-static	1.13.0		sorbet-static-1.13.0.gem
+sorbet-static	7.1.0.rc1		sorbet-static-7.1.0.rc1.gem
+sorbet-static	1.0.0.pre.rc1		sorbet-static-1.0.0.pre.rc1.gem
+sorbet-static	1.0.0.pre.rc.pre.1		sorbet-static-1.0.0.pre.rc.pre.1.gem
+sorbet-static	2.0.0.pre		sorbet-static-2.0.0.pre.gem
+sorbet-static	0.5.11000		sorbet-static-0.5.11000.gem
+sorbet-static	1.0.a		sorbet-static-1.0.a.gem
+sorbet-static	3.0.0.pre.beta.2		sorbet-static-3.0.0.pre.beta.2.gem
+sorbet-static	19		sorbet-static-19.gem
+sorbet-static	2		sorbet-static-2.gem
+nokogiri	0		nokogiri-0.gem
+nokogiri	1		nokogiri-1.gem
+nokogiri	1.0		nokogiri-1.0.gem
+nokogiri	1.13.0		nokogiri-1.13.0.gem
+nokogiri	7.1.0.rc1		nokogiri-7.1.0.rc1.gem
+nokogiri	1.0.0.pre.rc1		nokogiri-1.0.0.pre.rc1.gem
+nokogiri	1.0.0.pre.rc.pre.1		nokogiri-1.0.0.pre.rc.pre.1.gem
+nokogiri	2.0.0.pre		nokogiri-2.0.0.pre.gem
+nokogiri	0.5.11000		nokogiri-0.5.11000.gem
+nokogiri	1.0.a		nokogiri-1.0.a.gem
+nokogiri	3.0.0.pre.beta.2		nokogiri-3.0.0.pre.beta.2.gem
+nokogiri	19		nokogiri-19.gem
+nokogiri	2		nokogiri-2.gem
+foo-2-bar	0		foo-2-bar-0.gem
+foo-2-bar	1		foo-2-bar-1.gem
+foo-2-bar	1.0		foo-2-bar-1.0.gem
+foo-2-bar	1.13.0		foo-2-bar-1.13.0.gem
+foo-2-bar	7.1.0.rc1		foo-2-bar-7.1.0.rc1.gem
+foo-2-bar	1.0.0.pre.rc1		foo-2-bar-1.0.0.pre.rc1.gem
+foo-2-bar	1.0.0.pre.rc.pre.1		foo-2-bar-1.0.0.pre.rc.pre.1.gem
+foo-2-bar	2.0.0.pre		foo-2-bar-2.0.0.pre.gem
+foo-2-bar	0.5.11000		foo-2-bar-0.5.11000.gem
+foo-2-bar	1.0.a		foo-2-bar-1.0.a.gem
+foo-2-bar	3.0.0.pre.beta.2		foo-2-bar-3.0.0.pre.beta.2.gem
+foo-2-bar	19		foo-2-bar-19.gem
+foo-2-bar	2		foo-2-bar-2.gem
+evil-1	0		evil-1-0.gem
+evil-1	1		evil-1-1.gem
+evil-1	1.0		evil-1-1.0.gem
+evil-1	1.13.0		evil-1-1.13.0.gem
+evil-1	7.1.0.rc1		evil-1-7.1.0.rc1.gem
+evil-1	1.0.0.pre.rc1		evil-1-1.0.0.pre.rc1.gem
+evil-1	1.0.0.pre.rc.pre.1		evil-1-1.0.0.pre.rc.pre.1.gem
+evil-1	2.0.0.pre		evil-1-2.0.0.pre.gem
+evil-1	0.5.11000		evil-1-0.5.11000.gem
+evil-1	1.0.a		evil-1-1.0.a.gem
+evil-1	3.0.0.pre.beta.2		evil-1-3.0.0.pre.beta.2.gem
+evil-1	19		evil-1-19.gem
+evil-1	2		evil-1-2.gem
+a-1	0		a-1-0.gem
+a-1	1		a-1-1.gem
+a-1	1.0		a-1-1.0.gem
+a-1	1.13.0		a-1-1.13.0.gem
+a-1	7.1.0.rc1		a-1-7.1.0.rc1.gem
+a-1	1.0.0.pre.rc1		a-1-1.0.0.pre.rc1.gem
+a-1	1.0.0.pre.rc.pre.1		a-1-1.0.0.pre.rc.pre.1.gem
+a-1	2.0.0.pre		a-1-2.0.0.pre.gem
+a-1	0.5.11000		a-1-0.5.11000.gem
+a-1	1.0.a		a-1-1.0.a.gem
+a-1	3.0.0.pre.beta.2		a-1-3.0.0.pre.beta.2.gem
+a-1	19		a-1-19.gem
+a-1	2		a-1-2.gem
+x	0		x-0.gem
+x	1		x-1.gem
+x	1.0		x-1.0.gem
+x	1.13.0		x-1.13.0.gem
+x	7.1.0.rc1		x-7.1.0.rc1.gem
+x	1.0.0.pre.rc1		x-1.0.0.pre.rc1.gem
+x	1.0.0.pre.rc.pre.1		x-1.0.0.pre.rc.pre.1.gem
+x	2.0.0.pre		x-2.0.0.pre.gem
+x	0.5.11000		x-0.5.11000.gem
+x	1.0.a		x-1.0.a.gem
+x	3.0.0.pre.beta.2		x-3.0.0.pre.beta.2.gem
+x	19		x-19.gem
+x	2		x-2.gem
+Flask_RESTful	0		Flask_RESTful-0.gem
+Flask_RESTful	1		Flask_RESTful-1.gem
+Flask_RESTful	1.0		Flask_RESTful-1.0.gem
+Flask_RESTful	1.13.0		Flask_RESTful-1.13.0.gem
+Flask_RESTful	7.1.0.rc1		Flask_RESTful-7.1.0.rc1.gem
+Flask_RESTful	1.0.0.pre.rc1		Flask_RESTful-1.0.0.pre.rc1.gem
+Flask_RESTful	1.0.0.pre.rc.pre.1		Flask_RESTful-1.0.0.pre.rc.pre.1.gem
+Flask_RESTful	2.0.0.pre		Flask_RESTful-2.0.0.pre.gem
+Flask_RESTful	0.5.11000		Flask_RESTful-0.5.11000.gem
+Flask_RESTful	1.0.a		Flask_RESTful-1.0.a.gem
+Flask_RESTful	3.0.0.pre.beta.2		Flask_RESTful-3.0.0.pre.beta.2.gem
+Flask_RESTful	19		Flask_RESTful-19.gem
+Flask_RESTful	2		Flask_RESTful-2.gem
+my.gem	0		my.gem-0.gem
+my.gem	1		my.gem-1.gem
+my.gem	1.0		my.gem-1.0.gem
+my.gem	1.13.0		my.gem-1.13.0.gem
+my.gem	7.1.0.rc1		my.gem-7.1.0.rc1.gem
+my.gem	1.0.0.pre.rc1		my.gem-1.0.0.pre.rc1.gem
+my.gem	1.0.0.pre.rc.pre.1		my.gem-1.0.0.pre.rc.pre.1.gem
+my.gem	2.0.0.pre		my.gem-2.0.0.pre.gem
+my.gem	0.5.11000		my.gem-0.5.11000.gem
+my.gem	1.0.a		my.gem-1.0.a.gem
+my.gem	3.0.0.pre.beta.2		my.gem-3.0.0.pre.beta.2.gem
+my.gem	19		my.gem-19.gem
+my.gem	2		my.gem-2.gem
+Mixed-Case	0		Mixed-Case-0.gem
+Mixed-Case	1		Mixed-Case-1.gem
+Mixed-Case	1.0		Mixed-Case-1.0.gem
+Mixed-Case	1.13.0		Mixed-Case-1.13.0.gem
+Mixed-Case	7.1.0.rc1		Mixed-Case-7.1.0.rc1.gem
+Mixed-Case	1.0.0.pre.rc1		Mixed-Case-1.0.0.pre.rc1.gem
+Mixed-Case	1.0.0.pre.rc.pre.1		Mixed-Case-1.0.0.pre.rc.pre.1.gem
+Mixed-Case	2.0.0.pre		Mixed-Case-2.0.0.pre.gem
+Mixed-Case	0.5.11000		Mixed-Case-0.5.11000.gem
+Mixed-Case	1.0.a		Mixed-Case-1.0.a.gem
+Mixed-Case	3.0.0.pre.beta.2		Mixed-Case-3.0.0.pre.beta.2.gem
+Mixed-Case	19		Mixed-Case-19.gem
+Mixed-Case	2		Mixed-Case-2.gem
+foo-1.0-x86_64-linux	0		foo-1.0-x86_64-linux-0.gem
+foo-1.0-x86_64-linux	1		foo-1.0-x86_64-linux-1.gem
+foo-1.0-x86_64-linux	1.0		foo-1.0-x86_64-linux-1.0.gem
+foo-1.0-x86_64-linux	1.13.0		foo-1.0-x86_64-linux-1.13.0.gem
+foo-1.0-x86_64-linux	7.1.0.rc1		foo-1.0-x86_64-linux-7.1.0.rc1.gem
+foo-1.0-x86_64-linux	1.0.0.pre.rc1		foo-1.0-x86_64-linux-1.0.0.pre.rc1.gem
+foo-1.0-x86_64-linux	1.0.0.pre.rc.pre.1		foo-1.0-x86_64-linux-1.0.0.pre.rc.pre.1.gem
+foo-1.0-x86_64-linux	2.0.0.pre		foo-1.0-x86_64-linux-2.0.0.pre.gem
+foo-1.0-x86_64-linux	0.5.11000		foo-1.0-x86_64-linux-0.5.11000.gem
+foo-1.0-x86_64-linux	1.0.a		foo-1.0-x86_64-linux-1.0.a.gem
+foo-1.0-x86_64-linux	3.0.0.pre.beta.2		foo-1.0-x86_64-linux-3.0.0.pre.beta.2.gem
+foo-1.0-x86_64-linux	19		foo-1.0-x86_64-linux-19.gem
+foo-1.0-x86_64-linux	2		foo-1.0-x86_64-linux-2.gem
+ruby-2.0	0		ruby-2.0-0.gem
+ruby-2.0	1		ruby-2.0-1.gem
+ruby-2.0	1.0		ruby-2.0-1.0.gem
+ruby-2.0	1.13.0		ruby-2.0-1.13.0.gem
+ruby-2.0	7.1.0.rc1		ruby-2.0-7.1.0.rc1.gem
+ruby-2.0	1.0.0.pre.rc1		ruby-2.0-1.0.0.pre.rc1.gem
+ruby-2.0	1.0.0.pre.rc.pre.1		ruby-2.0-1.0.0.pre.rc.pre.1.gem
+ruby-2.0	2.0.0.pre		ruby-2.0-2.0.0.pre.gem
+ruby-2.0	0.5.11000		ruby-2.0-0.5.11000.gem
+ruby-2.0	1.0.a		ruby-2.0-1.0.a.gem
+ruby-2.0	3.0.0.pre.beta.2		ruby-2.0-3.0.0.pre.beta.2.gem
+ruby-2.0	19		ruby-2.0-19.gem
+ruby-2.0	2		ruby-2.0-2.gem
+jruby-openssl	0		jruby-openssl-0.gem
+jruby-openssl	1		jruby-openssl-1.gem
+jruby-openssl	1.0		jruby-openssl-1.0.gem
+jruby-openssl	1.13.0		jruby-openssl-1.13.0.gem
+jruby-openssl	7.1.0.rc1		jruby-openssl-7.1.0.rc1.gem
+jruby-openssl	1.0.0.pre.rc1		jruby-openssl-1.0.0.pre.rc1.gem
+jruby-openssl	1.0.0.pre.rc.pre.1		jruby-openssl-1.0.0.pre.rc.pre.1.gem
+jruby-openssl	2.0.0.pre		jruby-openssl-2.0.0.pre.gem
+jruby-openssl	0.5.11000		jruby-openssl-0.5.11000.gem
+jruby-openssl	1.0.a		jruby-openssl-1.0.a.gem
+jruby-openssl	3.0.0.pre.beta.2		jruby-openssl-3.0.0.pre.beta.2.gem
+jruby-openssl	19		jruby-openssl-19.gem
+jruby-openssl	2		jruby-openssl-2.gem
+123abc	0		123abc-0.gem
+123abc	1		123abc-1.gem
+123abc	1.0		123abc-1.0.gem
+123abc	1.13.0		123abc-1.13.0.gem
+123abc	7.1.0.rc1		123abc-7.1.0.rc1.gem
+123abc	1.0.0.pre.rc1		123abc-1.0.0.pre.rc1.gem
+123abc	1.0.0.pre.rc.pre.1		123abc-1.0.0.pre.rc.pre.1.gem
+123abc	2.0.0.pre		123abc-2.0.0.pre.gem
+123abc	0.5.11000		123abc-0.5.11000.gem
+123abc	1.0.a		123abc-1.0.a.gem
+123abc	3.0.0.pre.beta.2		123abc-3.0.0.pre.beta.2.gem
+123abc	19		123abc-19.gem
+123abc	2		123abc-2.gem
+a1-2-3	0		a1-2-3-0.gem
+a1-2-3	1		a1-2-3-1.gem
+a1-2-3	1.0		a1-2-3-1.0.gem
+a1-2-3	1.13.0		a1-2-3-1.13.0.gem
+a1-2-3	7.1.0.rc1		a1-2-3-7.1.0.rc1.gem
+a1-2-3	1.0.0.pre.rc1		a1-2-3-1.0.0.pre.rc1.gem
+a1-2-3	1.0.0.pre.rc.pre.1		a1-2-3-1.0.0.pre.rc.pre.1.gem
+a1-2-3	2.0.0.pre		a1-2-3-2.0.0.pre.gem
+a1-2-3	0.5.11000		a1-2-3-0.5.11000.gem
+a1-2-3	1.0.a		a1-2-3-1.0.a.gem
+a1-2-3	3.0.0.pre.beta.2		a1-2-3-3.0.0.pre.beta.2.gem
+a1-2-3	19		a1-2-3-19.gem
+a1-2-3	2		a1-2-3-2.gem
+net-http-2	0		net-http-2-0.gem
+net-http-2	1		net-http-2-1.gem
+net-http-2	1.0		net-http-2-1.0.gem
+net-http-2	1.13.0		net-http-2-1.13.0.gem
+net-http-2	7.1.0.rc1		net-http-2-7.1.0.rc1.gem
+net-http-2	1.0.0.pre.rc1		net-http-2-1.0.0.pre.rc1.gem
+net-http-2	1.0.0.pre.rc.pre.1		net-http-2-1.0.0.pre.rc.pre.1.gem
+net-http-2	2.0.0.pre		net-http-2-2.0.0.pre.gem
+net-http-2	0.5.11000		net-http-2-0.5.11000.gem
+net-http-2	1.0.a		net-http-2-1.0.a.gem
+net-http-2	3.0.0.pre.beta.2		net-http-2-3.0.0.pre.beta.2.gem
+net-http-2	19		net-http-2-19.gem
+net-http-2	2		net-http-2-2.gem
+x86_64-linux	0		x86_64-linux-0.gem
+x86_64-linux	1		x86_64-linux-1.gem
+x86_64-linux	1.0		x86_64-linux-1.0.gem
+x86_64-linux	1.13.0		x86_64-linux-1.13.0.gem
+x86_64-linux	7.1.0.rc1		x86_64-linux-7.1.0.rc1.gem
+x86_64-linux	1.0.0.pre.rc1		x86_64-linux-1.0.0.pre.rc1.gem
+x86_64-linux	1.0.0.pre.rc.pre.1		x86_64-linux-1.0.0.pre.rc.pre.1.gem
+x86_64-linux	2.0.0.pre		x86_64-linux-2.0.0.pre.gem
+x86_64-linux	0.5.11000		x86_64-linux-0.5.11000.gem
+x86_64-linux	1.0.a		x86_64-linux-1.0.a.gem
+x86_64-linux	3.0.0.pre.beta.2		x86_64-linux-3.0.0.pre.beta.2.gem
+x86_64-linux	19		x86_64-linux-19.gem
+x86_64-linux	2		x86_64-linux-2.gem
+java	0		java-0.gem
+java	1		java-1.gem
+java	1.0		java-1.0.gem
+java	1.13.0		java-1.13.0.gem
+java	7.1.0.rc1		java-7.1.0.rc1.gem
+java	1.0.0.pre.rc1		java-1.0.0.pre.rc1.gem
+java	1.0.0.pre.rc.pre.1		java-1.0.0.pre.rc.pre.1.gem
+java	2.0.0.pre		java-2.0.0.pre.gem
+java	0.5.11000		java-0.5.11000.gem
+java	1.0.a		java-1.0.a.gem
+java	3.0.0.pre.beta.2		java-3.0.0.pre.beta.2.gem
+java	19		java-19.gem
+java	2		java-2.gem
+1-java	0		1-java-0.gem
+1-java	1		1-java-1.gem
+1-java	1.0		1-java-1.0.gem
+1-java	1.13.0		1-java-1.13.0.gem
+1-java	7.1.0.rc1		1-java-7.1.0.rc1.gem
+1-java	1.0.0.pre.rc1		1-java-1.0.0.pre.rc1.gem
+1-java	1.0.0.pre.rc.pre.1		1-java-1.0.0.pre.rc.pre.1.gem
+1-java	2.0.0.pre		1-java-2.0.0.pre.gem
+1-java	0.5.11000		1-java-0.5.11000.gem
+1-java	1.0.a		1-java-1.0.a.gem
+1-java	3.0.0.pre.beta.2		1-java-3.0.0.pre.beta.2.gem
+1-java	19		1-java-19.gem
+1-java	2		1-java-2.gem
+nokogiri	1.13.0	java	nokogiri-1.13.0-java.gem
+nokogiri	1.13.0	java	nokogiri-1.13.0-java.gem
+nokogiri	1.13.0	x86_64-linux	nokogiri-1.13.0-x86_64-linux.gem
+nokogiri	1.13.0	x86_64-linux-gnu	nokogiri-1.13.0-x86_64-linux-gnu.gem
+nokogiri	1.13.0	x86_64-linux-musl	nokogiri-1.13.0-x86_64-linux-musl.gem
+nokogiri	1.13.0	aarch64-linux	nokogiri-1.13.0-aarch64-linux.gem
+nokogiri	1.13.0	arm-linux-gnueabihf	nokogiri-1.13.0-arm-linux-gnueabihf.gem
+nokogiri	1.13.0	arm64-darwin	nokogiri-1.13.0-arm64-darwin.gem
+nokogiri	1.13.0	x86_64-darwin-19	nokogiri-1.13.0-x86_64-darwin-19.gem
+nokogiri	1.13.0	universal-darwin-20	nokogiri-1.13.0-universal-darwin-20.gem
+nokogiri	1.13.0	universal-darwin	nokogiri-1.13.0-universal-darwin.gem
+nokogiri	1.13.0	x86-mingw32	nokogiri-1.13.0-x86-mingw32.gem
+nokogiri	1.13.0	x64-mingw32	nokogiri-1.13.0-x64-mingw32.gem
+nokogiri	1.13.0	x64-mingw-ucrt	nokogiri-1.13.0-x64-mingw-ucrt.gem
+nokogiri	1.13.0	x86-mswin32	nokogiri-1.13.0-x86-mswin32.gem
+nokogiri	1.13.0	x86-mswin32-60	nokogiri-1.13.0-x86-mswin32-60.gem
+nokogiri	1.13.0	x86-mswin32	nokogiri-1.13.0-x86-mswin32.gem
+nokogiri	1.13.0	x86-mswin32	nokogiri-1.13.0-x86-mswin32.gem
+nokogiri	1.13.0	x86-linux	nokogiri-1.13.0-x86-linux.gem
+nokogiri	1.13.0	universal-java-1.8	nokogiri-1.13.0-universal-java-1.8.gem
+nokogiri	1.13.0	universal-java	nokogiri-1.13.0-universal-java.gem
+nokogiri	1.13.0	x86_64-freebsd-13	nokogiri-1.13.0-x86_64-freebsd-13.gem
+nokogiri	1.13.0	x86_64-openbsd-7.3	nokogiri-1.13.0-x86_64-openbsd-7.3.gem
+nokogiri	1.13.0	sparc-solaris-2.11	nokogiri-1.13.0-sparc-solaris-2.11.gem
+nokogiri	1.13.0	powerpc-aix-7	nokogiri-1.13.0-powerpc-aix-7.gem
+nokogiri	1.13.0	x86-cygwin	nokogiri-1.13.0-x86-cygwin.gem
+nokogiri	1.13.0	wasm32-wasi	nokogiri-1.13.0-wasm32-wasi.gem
+nokogiri	1.13.0	arm-dalvik-24	nokogiri-1.13.0-arm-dalvik-24.gem
+nokogiri	1.13.0	universal-dotnet	nokogiri-1.13.0-universal-dotnet.gem
+nokogiri	1.13.0	universal-dotnet-4.0	nokogiri-1.13.0-universal-dotnet-4.0.gem
+nokogiri	1.13.0	x86_64-unknown	nokogiri-1.13.0-x86_64-unknown.gem
+nokogiri	1.13.0	unknown	nokogiri-1.13.0-unknown.gem
+nokogiri	1.13.0	2.0-java	nokogiri-1.13.0-2.0-java.gem
+nokogiri	1.13.0	1-java	nokogiri-1.13.0-1-java.gem
+nokogiri	1.13.0	x86_64-netbsdelf	nokogiri-1.13.0-x86_64-netbsdelf.gem
+nokogiri	1.13.0	universal-macruby-0.10	nokogiri-1.13.0-universal-macruby-0.10.gem
+nokogiri	1.13.0	darwin-19	nokogiri-1.13.0-darwin-19.gem
+nokogiri	1.13.0	linux	nokogiri-1.13.0-linux.gem
+sorbet-static	0.5.11000	java	sorbet-static-0.5.11000-java.gem
+sorbet-static	0.5.11000	java	sorbet-static-0.5.11000-java.gem
+sorbet-static	0.5.11000	x86_64-linux	sorbet-static-0.5.11000-x86_64-linux.gem
+sorbet-static	0.5.11000	x86_64-linux-gnu	sorbet-static-0.5.11000-x86_64-linux-gnu.gem
+sorbet-static	0.5.11000	x86_64-linux-musl	sorbet-static-0.5.11000-x86_64-linux-musl.gem
+sorbet-static	0.5.11000	aarch64-linux	sorbet-static-0.5.11000-aarch64-linux.gem
+sorbet-static	0.5.11000	arm-linux-gnueabihf	sorbet-static-0.5.11000-arm-linux-gnueabihf.gem
+sorbet-static	0.5.11000	arm64-darwin	sorbet-static-0.5.11000-arm64-darwin.gem
+sorbet-static	0.5.11000	x86_64-darwin-19	sorbet-static-0.5.11000-x86_64-darwin-19.gem
+sorbet-static	0.5.11000	universal-darwin-20	sorbet-static-0.5.11000-universal-darwin-20.gem
+sorbet-static	0.5.11000	universal-darwin	sorbet-static-0.5.11000-universal-darwin.gem
+sorbet-static	0.5.11000	x86-mingw32	sorbet-static-0.5.11000-x86-mingw32.gem
+sorbet-static	0.5.11000	x64-mingw32	sorbet-static-0.5.11000-x64-mingw32.gem
+sorbet-static	0.5.11000	x64-mingw-ucrt	sorbet-static-0.5.11000-x64-mingw-ucrt.gem
+sorbet-static	0.5.11000	x86-mswin32	sorbet-static-0.5.11000-x86-mswin32.gem
+sorbet-static	0.5.11000	x86-mswin32-60	sorbet-static-0.5.11000-x86-mswin32-60.gem
+sorbet-static	0.5.11000	x86-mswin32	sorbet-static-0.5.11000-x86-mswin32.gem
+sorbet-static	0.5.11000	x86-mswin32	sorbet-static-0.5.11000-x86-mswin32.gem
+sorbet-static	0.5.11000	x86-linux	sorbet-static-0.5.11000-x86-linux.gem
+sorbet-static	0.5.11000	universal-java-1.8	sorbet-static-0.5.11000-universal-java-1.8.gem
+sorbet-static	0.5.11000	universal-java	sorbet-static-0.5.11000-universal-java.gem
+sorbet-static	0.5.11000	x86_64-freebsd-13	sorbet-static-0.5.11000-x86_64-freebsd-13.gem
+sorbet-static	0.5.11000	x86_64-openbsd-7.3	sorbet-static-0.5.11000-x86_64-openbsd-7.3.gem
+sorbet-static	0.5.11000	sparc-solaris-2.11	sorbet-static-0.5.11000-sparc-solaris-2.11.gem
+sorbet-static	0.5.11000	powerpc-aix-7	sorbet-static-0.5.11000-powerpc-aix-7.gem
+sorbet-static	0.5.11000	x86-cygwin	sorbet-static-0.5.11000-x86-cygwin.gem
+sorbet-static	0.5.11000	wasm32-wasi	sorbet-static-0.5.11000-wasm32-wasi.gem
+sorbet-static	0.5.11000	arm-dalvik-24	sorbet-static-0.5.11000-arm-dalvik-24.gem
+sorbet-static	0.5.11000	universal-dotnet	sorbet-static-0.5.11000-universal-dotnet.gem
+sorbet-static	0.5.11000	universal-dotnet-4.0	sorbet-static-0.5.11000-universal-dotnet-4.0.gem
+sorbet-static	0.5.11000	x86_64-unknown	sorbet-static-0.5.11000-x86_64-unknown.gem
+sorbet-static	0.5.11000	unknown	sorbet-static-0.5.11000-unknown.gem
+sorbet-static	0.5.11000	2.0-java	sorbet-static-0.5.11000-2.0-java.gem
+sorbet-static	0.5.11000	1-java	sorbet-static-0.5.11000-1-java.gem
+sorbet-static	0.5.11000	x86_64-netbsdelf	sorbet-static-0.5.11000-x86_64-netbsdelf.gem
+sorbet-static	0.5.11000	universal-macruby-0.10	sorbet-static-0.5.11000-universal-macruby-0.10.gem
+sorbet-static	0.5.11000	darwin-19	sorbet-static-0.5.11000-darwin-19.gem
+sorbet-static	0.5.11000	linux	sorbet-static-0.5.11000-linux.gem
+evil-1	2.0	java	evil-1-2.0-java.gem
+evil-1	2.0	java	evil-1-2.0-java.gem
+evil-1	2.0	x86_64-linux	evil-1-2.0-x86_64-linux.gem
+evil-1	2.0	x86_64-linux-gnu	evil-1-2.0-x86_64-linux-gnu.gem
+evil-1	2.0	x86_64-linux-musl	evil-1-2.0-x86_64-linux-musl.gem
+evil-1	2.0	aarch64-linux	evil-1-2.0-aarch64-linux.gem
+evil-1	2.0	arm-linux-gnueabihf	evil-1-2.0-arm-linux-gnueabihf.gem
+evil-1	2.0	arm64-darwin	evil-1-2.0-arm64-darwin.gem
+evil-1	2.0	x86_64-darwin-19	evil-1-2.0-x86_64-darwin-19.gem
+evil-1	2.0	universal-darwin-20	evil-1-2.0-universal-darwin-20.gem
+evil-1	2.0	universal-darwin	evil-1-2.0-universal-darwin.gem
+evil-1	2.0	x86-mingw32	evil-1-2.0-x86-mingw32.gem
+evil-1	2.0	x64-mingw32	evil-1-2.0-x64-mingw32.gem
+evil-1	2.0	x64-mingw-ucrt	evil-1-2.0-x64-mingw-ucrt.gem
+evil-1	2.0	x86-mswin32	evil-1-2.0-x86-mswin32.gem
+evil-1	2.0	x86-mswin32-60	evil-1-2.0-x86-mswin32-60.gem
+evil-1	2.0	x86-mswin32	evil-1-2.0-x86-mswin32.gem
+evil-1	2.0	x86-mswin32	evil-1-2.0-x86-mswin32.gem
+evil-1	2.0	x86-linux	evil-1-2.0-x86-linux.gem
+evil-1	2.0	universal-java-1.8	evil-1-2.0-universal-java-1.8.gem
+evil-1	2.0	universal-java	evil-1-2.0-universal-java.gem
+evil-1	2.0	x86_64-freebsd-13	evil-1-2.0-x86_64-freebsd-13.gem
+evil-1	2.0	x86_64-openbsd-7.3	evil-1-2.0-x86_64-openbsd-7.3.gem
+evil-1	2.0	sparc-solaris-2.11	evil-1-2.0-sparc-solaris-2.11.gem
+evil-1	2.0	powerpc-aix-7	evil-1-2.0-powerpc-aix-7.gem
+evil-1	2.0	x86-cygwin	evil-1-2.0-x86-cygwin.gem
+evil-1	2.0	wasm32-wasi	evil-1-2.0-wasm32-wasi.gem
+evil-1	2.0	arm-dalvik-24	evil-1-2.0-arm-dalvik-24.gem
+evil-1	2.0	universal-dotnet	evil-1-2.0-universal-dotnet.gem
+evil-1	2.0	universal-dotnet-4.0	evil-1-2.0-universal-dotnet-4.0.gem
+evil-1	2.0	x86_64-unknown	evil-1-2.0-x86_64-unknown.gem
+evil-1	2.0	unknown	evil-1-2.0-unknown.gem
+evil-1	2.0	2.0-java	evil-1-2.0-2.0-java.gem
+evil-1	2.0	1-java	evil-1-2.0-1-java.gem
+evil-1	2.0	x86_64-netbsdelf	evil-1-2.0-x86_64-netbsdelf.gem
+evil-1	2.0	universal-macruby-0.10	evil-1-2.0-universal-macruby-0.10.gem
+evil-1	2.0	darwin-19	evil-1-2.0-darwin-19.gem
+evil-1	2.0	linux	evil-1-2.0-linux.gem
+a-1	1	java	a-1-1-java.gem
+a-1	1	java	a-1-1-java.gem
+a-1	1	x86_64-linux	a-1-1-x86_64-linux.gem
+a-1	1	x86_64-linux-gnu	a-1-1-x86_64-linux-gnu.gem
+a-1	1	x86_64-linux-musl	a-1-1-x86_64-linux-musl.gem
+a-1	1	aarch64-linux	a-1-1-aarch64-linux.gem
+a-1	1	arm-linux-gnueabihf	a-1-1-arm-linux-gnueabihf.gem
+a-1	1	arm64-darwin	a-1-1-arm64-darwin.gem
+a-1	1	x86_64-darwin-19	a-1-1-x86_64-darwin-19.gem
+a-1	1	universal-darwin-20	a-1-1-universal-darwin-20.gem
+a-1	1	universal-darwin	a-1-1-universal-darwin.gem
+a-1	1	x86-mingw32	a-1-1-x86-mingw32.gem
+a-1	1	x64-mingw32	a-1-1-x64-mingw32.gem
+a-1	1	x64-mingw-ucrt	a-1-1-x64-mingw-ucrt.gem
+a-1	1	x86-mswin32	a-1-1-x86-mswin32.gem
+a-1	1	x86-mswin32-60	a-1-1-x86-mswin32-60.gem
+a-1	1	x86-mswin32	a-1-1-x86-mswin32.gem
+a-1	1	x86-mswin32	a-1-1-x86-mswin32.gem
+a-1	1	x86-linux	a-1-1-x86-linux.gem
+a-1	1	universal-java-1.8	a-1-1-universal-java-1.8.gem
+a-1	1	universal-java	a-1-1-universal-java.gem
+a-1	1	x86_64-freebsd-13	a-1-1-x86_64-freebsd-13.gem
+a-1	1	x86_64-openbsd-7.3	a-1-1-x86_64-openbsd-7.3.gem
+a-1	1	sparc-solaris-2.11	a-1-1-sparc-solaris-2.11.gem
+a-1	1	powerpc-aix-7	a-1-1-powerpc-aix-7.gem
+a-1	1	x86-cygwin	a-1-1-x86-cygwin.gem
+a-1	1	wasm32-wasi	a-1-1-wasm32-wasi.gem
+a-1	1	arm-dalvik-24	a-1-1-arm-dalvik-24.gem
+a-1	1	universal-dotnet	a-1-1-universal-dotnet.gem
+a-1	1	universal-dotnet-4.0	a-1-1-universal-dotnet-4.0.gem
+a-1	1	x86_64-unknown	a-1-1-x86_64-unknown.gem
+a-1	1	unknown	a-1-1-unknown.gem
+a-1	1	2.0-java	a-1-1-2.0-java.gem
+a-1	1	1-java	a-1-1-1-java.gem
+a-1	1	x86_64-netbsdelf	a-1-1-x86_64-netbsdelf.gem
+a-1	1	universal-macruby-0.10	a-1-1-universal-macruby-0.10.gem
+a-1	1	darwin-19	a-1-1-darwin-19.gem
+a-1	1	linux	a-1-1-linux.gem
+foo-2-bar	1.0.0.pre.rc1	java	foo-2-bar-1.0.0.pre.rc1-java.gem
+foo-2-bar	1.0.0.pre.rc1	java	foo-2-bar-1.0.0.pre.rc1-java.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-linux	foo-2-bar-1.0.0.pre.rc1-x86_64-linux.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-linux-gnu	foo-2-bar-1.0.0.pre.rc1-x86_64-linux-gnu.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-linux-musl	foo-2-bar-1.0.0.pre.rc1-x86_64-linux-musl.gem
+foo-2-bar	1.0.0.pre.rc1	aarch64-linux	foo-2-bar-1.0.0.pre.rc1-aarch64-linux.gem
+foo-2-bar	1.0.0.pre.rc1	arm-linux-gnueabihf	foo-2-bar-1.0.0.pre.rc1-arm-linux-gnueabihf.gem
+foo-2-bar	1.0.0.pre.rc1	arm64-darwin	foo-2-bar-1.0.0.pre.rc1-arm64-darwin.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-darwin-19	foo-2-bar-1.0.0.pre.rc1-x86_64-darwin-19.gem
+foo-2-bar	1.0.0.pre.rc1	universal-darwin-20	foo-2-bar-1.0.0.pre.rc1-universal-darwin-20.gem
+foo-2-bar	1.0.0.pre.rc1	universal-darwin	foo-2-bar-1.0.0.pre.rc1-universal-darwin.gem
+foo-2-bar	1.0.0.pre.rc1	x86-mingw32	foo-2-bar-1.0.0.pre.rc1-x86-mingw32.gem
+foo-2-bar	1.0.0.pre.rc1	x64-mingw32	foo-2-bar-1.0.0.pre.rc1-x64-mingw32.gem
+foo-2-bar	1.0.0.pre.rc1	x64-mingw-ucrt	foo-2-bar-1.0.0.pre.rc1-x64-mingw-ucrt.gem
+foo-2-bar	1.0.0.pre.rc1	x86-mswin32	foo-2-bar-1.0.0.pre.rc1-x86-mswin32.gem
+foo-2-bar	1.0.0.pre.rc1	x86-mswin32-60	foo-2-bar-1.0.0.pre.rc1-x86-mswin32-60.gem
+foo-2-bar	1.0.0.pre.rc1	x86-mswin32	foo-2-bar-1.0.0.pre.rc1-x86-mswin32.gem
+foo-2-bar	1.0.0.pre.rc1	x86-mswin32	foo-2-bar-1.0.0.pre.rc1-x86-mswin32.gem
+foo-2-bar	1.0.0.pre.rc1	x86-linux	foo-2-bar-1.0.0.pre.rc1-x86-linux.gem
+foo-2-bar	1.0.0.pre.rc1	universal-java-1.8	foo-2-bar-1.0.0.pre.rc1-universal-java-1.8.gem
+foo-2-bar	1.0.0.pre.rc1	universal-java	foo-2-bar-1.0.0.pre.rc1-universal-java.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-freebsd-13	foo-2-bar-1.0.0.pre.rc1-x86_64-freebsd-13.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-openbsd-7.3	foo-2-bar-1.0.0.pre.rc1-x86_64-openbsd-7.3.gem
+foo-2-bar	1.0.0.pre.rc1	sparc-solaris-2.11	foo-2-bar-1.0.0.pre.rc1-sparc-solaris-2.11.gem
+foo-2-bar	1.0.0.pre.rc1	powerpc-aix-7	foo-2-bar-1.0.0.pre.rc1-powerpc-aix-7.gem
+foo-2-bar	1.0.0.pre.rc1	x86-cygwin	foo-2-bar-1.0.0.pre.rc1-x86-cygwin.gem
+foo-2-bar	1.0.0.pre.rc1	wasm32-wasi	foo-2-bar-1.0.0.pre.rc1-wasm32-wasi.gem
+foo-2-bar	1.0.0.pre.rc1	arm-dalvik-24	foo-2-bar-1.0.0.pre.rc1-arm-dalvik-24.gem
+foo-2-bar	1.0.0.pre.rc1	universal-dotnet	foo-2-bar-1.0.0.pre.rc1-universal-dotnet.gem
+foo-2-bar	1.0.0.pre.rc1	universal-dotnet-4.0	foo-2-bar-1.0.0.pre.rc1-universal-dotnet-4.0.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-unknown	foo-2-bar-1.0.0.pre.rc1-x86_64-unknown.gem
+foo-2-bar	1.0.0.pre.rc1	unknown	foo-2-bar-1.0.0.pre.rc1-unknown.gem
+foo-2-bar	1.0.0.pre.rc1	2.0-java	foo-2-bar-1.0.0.pre.rc1-2.0-java.gem
+foo-2-bar	1.0.0.pre.rc1	1-java	foo-2-bar-1.0.0.pre.rc1-1-java.gem
+foo-2-bar	1.0.0.pre.rc1	x86_64-netbsdelf	foo-2-bar-1.0.0.pre.rc1-x86_64-netbsdelf.gem
+foo-2-bar	1.0.0.pre.rc1	universal-macruby-0.10	foo-2-bar-1.0.0.pre.rc1-universal-macruby-0.10.gem
+foo-2-bar	1.0.0.pre.rc1	darwin-19	foo-2-bar-1.0.0.pre.rc1-darwin-19.gem
+foo-2-bar	1.0.0.pre.rc1	linux	foo-2-bar-1.0.0.pre.rc1-linux.gem
+x86_64-linux	1	java	x86_64-linux-1-java.gem
+x86_64-linux	1	java	x86_64-linux-1-java.gem
+x86_64-linux	1	x86_64-linux	x86_64-linux-1-x86_64-linux.gem
+x86_64-linux	1	x86_64-linux-gnu	x86_64-linux-1-x86_64-linux-gnu.gem
+x86_64-linux	1	x86_64-linux-musl	x86_64-linux-1-x86_64-linux-musl.gem
+x86_64-linux	1	aarch64-linux	x86_64-linux-1-aarch64-linux.gem
+x86_64-linux	1	arm-linux-gnueabihf	x86_64-linux-1-arm-linux-gnueabihf.gem
+x86_64-linux	1	arm64-darwin	x86_64-linux-1-arm64-darwin.gem
+x86_64-linux	1	x86_64-darwin-19	x86_64-linux-1-x86_64-darwin-19.gem
+x86_64-linux	1	universal-darwin-20	x86_64-linux-1-universal-darwin-20.gem
+x86_64-linux	1	universal-darwin	x86_64-linux-1-universal-darwin.gem
+x86_64-linux	1	x86-mingw32	x86_64-linux-1-x86-mingw32.gem
+x86_64-linux	1	x64-mingw32	x86_64-linux-1-x64-mingw32.gem
+x86_64-linux	1	x64-mingw-ucrt	x86_64-linux-1-x64-mingw-ucrt.gem
+x86_64-linux	1	x86-mswin32	x86_64-linux-1-x86-mswin32.gem
+x86_64-linux	1	x86-mswin32-60	x86_64-linux-1-x86-mswin32-60.gem
+x86_64-linux	1	x86-mswin32	x86_64-linux-1-x86-mswin32.gem
+x86_64-linux	1	x86-mswin32	x86_64-linux-1-x86-mswin32.gem
+x86_64-linux	1	x86-linux	x86_64-linux-1-x86-linux.gem
+x86_64-linux	1	universal-java-1.8	x86_64-linux-1-universal-java-1.8.gem
+x86_64-linux	1	universal-java	x86_64-linux-1-universal-java.gem
+x86_64-linux	1	x86_64-freebsd-13	x86_64-linux-1-x86_64-freebsd-13.gem
+x86_64-linux	1	x86_64-openbsd-7.3	x86_64-linux-1-x86_64-openbsd-7.3.gem
+x86_64-linux	1	sparc-solaris-2.11	x86_64-linux-1-sparc-solaris-2.11.gem
+x86_64-linux	1	powerpc-aix-7	x86_64-linux-1-powerpc-aix-7.gem
+x86_64-linux	1	x86-cygwin	x86_64-linux-1-x86-cygwin.gem
+x86_64-linux	1	wasm32-wasi	x86_64-linux-1-wasm32-wasi.gem
+x86_64-linux	1	arm-dalvik-24	x86_64-linux-1-arm-dalvik-24.gem
+x86_64-linux	1	universal-dotnet	x86_64-linux-1-universal-dotnet.gem
+x86_64-linux	1	universal-dotnet-4.0	x86_64-linux-1-universal-dotnet-4.0.gem
+x86_64-linux	1	x86_64-unknown	x86_64-linux-1-x86_64-unknown.gem
+x86_64-linux	1	unknown	x86_64-linux-1-unknown.gem
+x86_64-linux	1	2.0-java	x86_64-linux-1-2.0-java.gem
+x86_64-linux	1	1-java	x86_64-linux-1-1-java.gem
+x86_64-linux	1	x86_64-netbsdelf	x86_64-linux-1-x86_64-netbsdelf.gem
+x86_64-linux	1	universal-macruby-0.10	x86_64-linux-1-universal-macruby-0.10.gem
+x86_64-linux	1	darwin-19	x86_64-linux-1-darwin-19.gem
+x86_64-linux	1	linux	x86_64-linux-1-linux.gem
+java	19	java	java-19-java.gem
+java	19	java	java-19-java.gem
+java	19	x86_64-linux	java-19-x86_64-linux.gem
+java	19	x86_64-linux-gnu	java-19-x86_64-linux-gnu.gem
+java	19	x86_64-linux-musl	java-19-x86_64-linux-musl.gem
+java	19	aarch64-linux	java-19-aarch64-linux.gem
+java	19	arm-linux-gnueabihf	java-19-arm-linux-gnueabihf.gem
+java	19	arm64-darwin	java-19-arm64-darwin.gem
+java	19	x86_64-darwin-19	java-19-x86_64-darwin-19.gem
+java	19	universal-darwin-20	java-19-universal-darwin-20.gem
+java	19	universal-darwin	java-19-universal-darwin.gem
+java	19	x86-mingw32	java-19-x86-mingw32.gem
+java	19	x64-mingw32	java-19-x64-mingw32.gem
+java	19	x64-mingw-ucrt	java-19-x64-mingw-ucrt.gem
+java	19	x86-mswin32	java-19-x86-mswin32.gem
+java	19	x86-mswin32-60	java-19-x86-mswin32-60.gem
+java	19	x86-mswin32	java-19-x86-mswin32.gem
+java	19	x86-mswin32	java-19-x86-mswin32.gem
+java	19	x86-linux	java-19-x86-linux.gem
+java	19	universal-java-1.8	java-19-universal-java-1.8.gem
+java	19	universal-java	java-19-universal-java.gem
+java	19	x86_64-freebsd-13	java-19-x86_64-freebsd-13.gem
+java	19	x86_64-openbsd-7.3	java-19-x86_64-openbsd-7.3.gem
+java	19	sparc-solaris-2.11	java-19-sparc-solaris-2.11.gem
+java	19	powerpc-aix-7	java-19-powerpc-aix-7.gem
+java	19	x86-cygwin	java-19-x86-cygwin.gem
+java	19	wasm32-wasi	java-19-wasm32-wasi.gem
+java	19	arm-dalvik-24	java-19-arm-dalvik-24.gem
+java	19	universal-dotnet	java-19-universal-dotnet.gem
+java	19	universal-dotnet-4.0	java-19-universal-dotnet-4.0.gem
+java	19	x86_64-unknown	java-19-x86_64-unknown.gem
+java	19	unknown	java-19-unknown.gem
+java	19	2.0-java	java-19-2.0-java.gem
+java	19	1-java	java-19-1-java.gem
+java	19	x86_64-netbsdelf	java-19-x86_64-netbsdelf.gem
+java	19	universal-macruby-0.10	java-19-universal-macruby-0.10.gem
+java	19	darwin-19	java-19-darwin-19.gem
+java	19	linux	java-19-linux.gem

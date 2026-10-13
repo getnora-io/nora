@@ -13,7 +13,6 @@
 //! - [`CurationMetrics`] for raw counters
 
 use crate::config::{CurationConfig, CurationMode};
-use crate::validation::ends_with_ci;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -26,6 +25,7 @@ use subtle::ConstantTimeEq;
 // ============================================================================
 
 pub use crate::registry_type::RegistryType;
+pub use nora_registry::pypi_files::{parse_pypi_version, pep503_normalize};
 
 // ============================================================================
 // Filter Request
@@ -666,38 +666,518 @@ fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> 
     Some(version.to_string())
 }
 
-/// Parse version from a PyPI download filename.
-///
-/// Handles: `.tar.gz`, `.zip`, `.whl`, `.egg`, `.tgz`
-/// For wheels, version is between the first and second `-`.
-pub fn parse_pypi_version(normalized_name: &str, filename: &str) -> Option<String> {
-    // Strip known extensions
-    let base = filename
-        .strip_suffix(".tar.gz")
-        .or_else(|| filename.strip_suffix(".tgz"))
-        .or_else(|| filename.strip_suffix(".zip"))
-        .or_else(|| filename.strip_suffix(".whl"))
-        .or_else(|| filename.strip_suffix(".egg"))?;
+/// A PEP 440 version as `packaging.version.Version` reads one (the spec's `VERSION_PATTERN`:
+/// case-insensitive, an optional leading `v`, surrounding whitespace allowed). Numbers are kept
+/// as digit strings without their leading zeros, so no length overflows.
+#[derive(Debug)]
+struct Pep440 {
+    epoch: String,
+    release: Vec<String>,
+    pre: Option<(&'static str, String)>,
+    post: Option<String>,
+    dev: Option<String>,
+    local: Vec<String>,
+}
 
-    // Normalize: PyPI filenames use underscores, normalized names use hyphens
-    let name_underscore = normalized_name.replace('-', "_");
-    let base_lower = base.to_lowercase();
-    let prefix = format!("{}-", name_underscore.to_lowercase());
-
-    let rest = base_lower.strip_prefix(&prefix)?;
-    // For wheels: rest is "VERSION-py3-none-any" — take until next '-' that starts a tag
-    // For sdist: rest is just "VERSION"
-    // Heuristic: version chars are digits, dots, letters (rc, alpha, beta, post, dev)
-    // Split at first '-' followed by non-digit (wheel tags like py3, cp39)
-    let version = if ends_with_ci(filename, ".whl") {
-        rest.split('-').next()?
+/// A decimal number without its leading zeros (`007` is `7`, `000` is `0`).
+fn pep440_number(digits: &str) -> String {
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
     } else {
-        rest
+        trimmed.to_string()
+    }
+}
+
+fn pep440_digits(s: &str) -> usize {
+    s.bytes().take_while(u8::is_ascii_digit).count()
+}
+
+/// One optional `-`, `_` or `.` separator at the start of `s`.
+fn pep440_separator(s: &str) -> usize {
+    usize::from(s.starts_with(['-', '_', '.']))
+}
+
+/// After a label: an optional separator and an optional number (0 when absent). The separator
+/// is taken even with no number after it, as the regex's greedy `[-_.]?` takes it.
+fn pep440_label_number(after_label: &str) -> (String, &str) {
+    let after = &after_label[pep440_separator(after_label)..];
+    let n = pep440_digits(after);
+    if n > 0 {
+        (pep440_number(&after[..n]), &after[n..])
+    } else {
+        ("0".to_string(), after)
+    }
+}
+
+/// Parse a version as `packaging.version.Version` does; `None` when it is no PEP 440 version.
+fn pep440_parse(version: &str) -> Option<Pep440> {
+    let lower = version.trim().to_ascii_lowercase();
+    let mut rest = lower.strip_prefix('v').unwrap_or(&lower);
+
+    // Epoch: `N!`.
+    let mut epoch = "0".to_string();
+    let n = pep440_digits(rest);
+    if n > 0 && rest[n..].starts_with('!') {
+        epoch = pep440_number(&rest[..n]);
+        rest = &rest[n + 1..];
+    }
+    // Release: `N(.N)*`.
+    let mut release = Vec::new();
+    loop {
+        let n = pep440_digits(rest);
+        if n == 0 {
+            return None;
+        }
+        release.push(pep440_number(&rest[..n]));
+        rest = &rest[n..];
+        match rest.strip_prefix('.').filter(|r| pep440_digits(r) > 0) {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    // Pre-release: `[-_.]?(alpha|a|beta|b|preview|pre|c|rc)[-_.]?N?`, longest label first.
+    let mut pre = None;
+    let s = &rest[pep440_separator(rest)..];
+    const PRE: [(&str, &str); 8] = [
+        ("alpha", "a"),
+        ("beta", "b"),
+        ("preview", "rc"),
+        ("pre", "rc"),
+        ("rc", "rc"),
+        ("a", "a"),
+        ("b", "b"),
+        ("c", "rc"),
+    ];
+    if let Some((label, normal)) = PRE.iter().find(|(label, _)| s.starts_with(label)) {
+        let (n, after) = pep440_label_number(&s[label.len()..]);
+        pre = Some((*normal, n));
+        rest = after;
+    }
+    // Post-release: `-N`, or `[-_.]?(post|rev|r)[-_.]?N?`.
+    let mut post = None;
+    if let Some(r) = rest.strip_prefix('-').filter(|r| pep440_digits(r) > 0) {
+        let n = pep440_digits(r);
+        post = Some(pep440_number(&r[..n]));
+        rest = &r[n..];
+    } else {
+        let s = &rest[pep440_separator(rest)..];
+        if let Some(label) = ["post", "rev", "r"]
+            .iter()
+            .find(|label| s.starts_with(**label))
+        {
+            let (n, after) = pep440_label_number(&s[label.len()..]);
+            post = Some(n);
+            rest = after;
+        }
+    }
+    // Development release: `[-_.]?dev[-_.]?N?`.
+    let mut dev = None;
+    let s = &rest[pep440_separator(rest)..];
+    if let Some(after_label) = s.strip_prefix("dev") {
+        let (n, after) = pep440_label_number(after_label);
+        dev = Some(n);
+        rest = after;
+    }
+    // Local version: `+[a-z0-9]+([-_.][a-z0-9]+)*`, numeric segments as numbers.
+    let mut local = Vec::new();
+    if let Some(segments) = rest.strip_prefix('+') {
+        for segment in segments.split(['-', '_', '.']) {
+            if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            local.push(if segment.bytes().all(|b| b.is_ascii_digit()) {
+                pep440_number(segment)
+            } else {
+                segment.to_string()
+            });
+        }
+        rest = "";
+    }
+    rest.is_empty().then_some(Pep440 {
+        epoch,
+        release,
+        pre,
+        post,
+        dev,
+        local,
+    })
+}
+
+/// A parsed version written back as `packaging` writes it; `trim` drops the release's trailing
+/// zeros as `canonicalize_version` does.
+fn pep440_render(version: &Pep440, trim: bool) -> String {
+    let mut release: &[String] = &version.release;
+    while trim && release.len() > 1 && release[release.len() - 1] == "0" {
+        release = &release[..release.len() - 1];
+    }
+    let mut out = String::new();
+    if version.epoch != "0" {
+        out.push_str(&version.epoch);
+        out.push('!');
+    }
+    out.push_str(&release.join("."));
+    if let Some((label, n)) = &version.pre {
+        out.push_str(label);
+        out.push_str(n);
+    }
+    if let Some(n) = &version.post {
+        out.push_str(".post");
+        out.push_str(n);
+    }
+    if let Some(n) = &version.dev {
+        out.push_str(".dev");
+        out.push_str(n);
+    }
+    if !version.local.is_empty() {
+        out.push('+');
+        out.push_str(&version.local.join("."));
+    }
+    out
+}
+
+/// `str(packaging.version.Version(v))`: a PEP 440 version in its normal form (`1.0-1` is
+/// `1.0.post1`, `2.0.0.RC1` is `2.0.0rc1`); `None` when it is no PEP 440 version.
+pub fn pep440_normalized(version: &str) -> Option<String> {
+    pep440_parse(version).map(|v| pep440_render(&v, false))
+}
+
+/// `packaging.utils.canonicalize_version(v)`: the normal form without the release's trailing
+/// zeros — one key for the versions PEP 440 counts as equal (`1.0`, `1.0.0` and `v1` are `1`);
+/// `None` when it is no PEP 440 version.
+pub fn pep440_key(version: &str) -> Option<String> {
+    pep440_parse(version).map(|v| pep440_render(&v, true))
+}
+
+/// A curation file's registry name in NORA's own spelling: `*` as written, a registry type in
+/// any case or by an alias `RegistryType::from_str_opt` takes (`PyPI`, `maven2`, `rubygems`) as
+/// that type's name; `None` for a name NORA does not know.
+fn curation_registry_name(name: &str) -> Option<String> {
+    if name == "*" {
+        return Some(name.to_string());
+    }
+    RegistryType::from_str_opt(name).map(|registry| registry.to_string())
+}
+
+/// The registry names a curation file may use, for a load error.
+fn known_registry_names() -> String {
+    RegistryType::all()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The curation pattern syntax, defined once for names, versions and registries: `*` holds for
+/// everything; `foo.**` for `foo` and the names under it, which continue with `child` or `:`
+/// (Maven's group/artifact separator); `foo/**` for `foo` and `foo/…`; `foo*` for the names
+/// beginning with `foo`; `*foo` for those ending with it; anything else for itself. `form` puts
+/// the pattern's body in the form the value is in, and never touches the syntax.
+fn pattern_holds(pattern: &str, value: &str, form: impl Fn(&str) -> String, child: char) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let under = |root: &str, separators: &[char]| {
+        value == root
+            || value
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with(separators))
     };
-    if version.is_empty() {
+    if let Some(root) = pattern.strip_suffix(".**") {
+        return under(&form(root), &[child, ':']);
+    }
+    if let Some(root) = pattern.strip_suffix("/**") {
+        return under(&form(root), &['/']);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(&form(prefix));
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return value.ends_with(&form(suffix));
+    }
+    form(pattern) == value
+}
+
+/// Whether a rule's or a namespace's name pattern holds for a name in the registry's form: the
+/// pattern's body is put in that form ([`curation_name`]) in every syntax. PyPI writes every `.`
+/// of a name as `-`, so the names under `corp.**` are `corp-…` there.
+fn curation_glob_match(registry: RegistryType, pattern: &str, name: &str) -> bool {
+    let child = if registry == RegistryType::PyPI {
+        '-'
+    } else {
+        '.'
+    };
+    pattern_holds(pattern, name, |body| curation_name(registry, body), child)
+}
+
+/// One `.`-separated identifier of a NuGet pre-release or metadata part: letters, digits, `-`.
+fn nuget_identifier(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// A NuGet version's normal form, lowercase, as NuGet clients put it in flat-container URLs
+/// (`NuGetVersion.ToNormalizedString().ToLowerInvariant()`): one to four numbers (`1.0` and
+/// `1.0.0.0` are `1.0.0`, a fourth only when not 0, leading zeros dropped), the pre-release as
+/// written, build metadata dropped. `None` when NuGet.Versioning would not parse it.
+pub fn nuget_version_key(version: &str) -> Option<String> {
+    let version = version.trim();
+    let (version, metadata) = match version.split_once('+') {
+        Some((version, metadata)) => (version, Some(metadata)),
+        None => (version, None),
+    };
+    if metadata.is_some_and(|m| !m.split('.').all(nuget_identifier)) {
         return None;
     }
-    Some(version.to_string())
+    let (release, pre) = match version.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (version, None),
+    };
+    let parts: Vec<&str> = release.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut numbers = [0i32; 4];
+    for (number, part) in numbers.iter_mut().zip(&parts) {
+        // Each number is read as `int.Parse` reads it: white space around it is allowed.
+        let part = part.trim_matches(|c: char| c == ' ' || ('\t'..='\r').contains(&c));
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *number = part.parse().ok()?;
+    }
+    let mut out = format!("{}.{}.{}", numbers[0], numbers[1], numbers[2]);
+    if numbers[3] > 0 {
+        out.push_str(&format!(".{}", numbers[3]));
+    }
+    if let Some(pre) = pre {
+        for id in pre.split('.') {
+            let numeric = id.bytes().all(|b| b.is_ascii_digit());
+            if !nuget_identifier(id) || (numeric && id.len() > 1 && id.starts_with('0')) {
+                return None;
+            }
+        }
+        out.push('-');
+        out.push_str(pre);
+    }
+    Some(out.to_lowercase())
+}
+
+/// A semver number as node-semver takes it: `0` or digits without a leading zero, at most
+/// `Number.MAX_SAFE_INTEGER`.
+fn semver_number(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'))
+        && s.parse::<u64>().is_ok_and(|n| n <= 9_007_199_254_740_991)
+}
+
+/// One `.`-separated semver identifier: letters, digits and `-`.
+fn semver_identifier(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// An npm version as npm publishes it (`semver.clean`, npm's semver 7.7): white space trimmed,
+/// leading `=` and `v` dropped, then a strict semver version written back without build
+/// metadata — `v1.3.0`, `=1.3.0` and `1.3.0+build.1` are `1.3.0`. `None` when npm would not take it.
+pub fn npm_version_key(version: &str) -> Option<String> {
+    let version = version.trim().trim_start_matches(['=', 'v']);
+    if version.len() > 256 {
+        return None;
+    }
+    let (version, build) = match version.split_once('+') {
+        Some((version, build)) => (version, Some(build)),
+        None => (version, None),
+    };
+    if build.is_some_and(|b| !b.split('.').all(semver_identifier)) {
+        return None;
+    }
+    let (release, pre) = match version.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (version, None),
+    };
+    let numbers: Vec<&str> = release.split('.').collect();
+    if numbers.len() != 3 || !numbers.iter().all(|n| semver_number(n)) {
+        return None;
+    }
+    // A numeric pre-release identifier follows the number rule; any other is letters, digits, `-`.
+    if pre.is_some_and(|p| {
+        !p.split('.').all(|id| {
+            semver_identifier(id) && (id.bytes().any(|b| !b.is_ascii_digit()) || semver_number(id))
+        })
+    }) {
+        return None;
+    }
+    Some(match pre {
+        Some(pre) => format!("{release}-{pre}"),
+        None => release.to_string(),
+    })
+}
+
+/// A Go semver number: `0` or digits without a leading zero.
+fn go_number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
+}
+
+/// A Go module version as the go command reads it (`module.CanonicalVersion`, golang.org/x/mod):
+/// `v` and up to three numbers (`v1` and `v1.2` are `v1.0.0` and `v1.2.0`; a short form takes
+/// no pre-release or build), the pre-release as written, build metadata dropped except
+/// `+incompatible`. `None` when it is no Go version (`1.2.3` without `v` is not).
+pub fn go_version_key(version: &str) -> Option<String> {
+    let rest = version.strip_prefix('v')?;
+    let (rest, build) = match rest.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (rest, None),
+    };
+    if build.is_some_and(|b| !b.split('.').all(semver_identifier)) {
+        return None;
+    }
+    let (release, pre) = match rest.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (rest, None),
+    };
+    let numbers: Vec<&str> = release.split('.').collect();
+    if numbers.len() > 3 || !numbers.iter().all(|n| go_number(n)) {
+        return None;
+    }
+    if numbers.len() < 3 && (pre.is_some() || build.is_some()) {
+        return None;
+    }
+    if pre.is_some_and(|p| {
+        !p.split('.').all(|id| {
+            semver_identifier(id) && (id.bytes().any(|b| !b.is_ascii_digit()) || go_number(id))
+        })
+    }) {
+        return None;
+    }
+    let mut out = format!(
+        "v{}.{}.{}",
+        numbers[0],
+        numbers.get(1).unwrap_or(&"0"),
+        numbers.get(2).unwrap_or(&"0")
+    );
+    if let Some(pre) = pre {
+        out.push('-');
+        out.push_str(pre);
+    }
+    if build == Some("incompatible") {
+        out.push_str("+incompatible");
+    }
+    Some(out)
+}
+
+/// A pub version as pub_semver reads it (`version.dart`): `major.minor.patch`, then an optional
+/// `-pre-release` and `+build`, each `.`-separated identifiers of letters, digits and `-`. Its key
+/// writes every number without leading zeros, as pub.dev keeps a version (`01.0.0` is `1.0.0`,
+/// `1.0.0-dev.01` is `1.0.0-dev.1`; an all-digit identifier too large for an integer stays text),
+/// and keeps the build and the case of text, which pub compares too (`1.0.0+1` is not
+/// `1.0.0+2`). `None` for a string pub_semver does not parse.
+pub fn pub_version_key(version: &str) -> Option<String> {
+    let (rest, build) = match version.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (version, None),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let numbers: Vec<&str> = core.split('.').collect();
+    if numbers.len() != 3 {
+        return None;
+    }
+    let mut key = numbers
+        .iter()
+        .map(|n| {
+            (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<i64>().ok().map(|n| n.to_string()))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join(".");
+    let identifiers = |part: &str| -> Option<String> {
+        part.split('.')
+            .map(|id| {
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    return None;
+                }
+                if id.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(n) = id.parse::<i64>() {
+                        return Some(n.to_string());
+                    }
+                }
+                Some(id.to_string())
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|ids| ids.join("."))
+    };
+    if let Some(pre) = pre {
+        key.push('-');
+        key.push_str(&identifiers(pre)?);
+    }
+    if let Some(build) = build {
+        key.push('+');
+        key.push_str(&identifiers(build)?);
+    }
+    Some(key)
+}
+
+/// A version as curation compares it. PyPI's as PEP 440 counts versions equal (pip compares
+/// parsed versions, so `1.0-1`, `1.0.post1` and `1.0.0.post1` are one version); NuGet's in
+/// NuGet's lowercase normal form (`13.0`, `13.0.0.0` and `13.0.0+build` are `13.0.0`); npm's as
+/// npm publishes them (`v1.3.0` is `1.3.0`); Go's as the go command reads them (`v1.2` is
+/// `v1.2.0`); pub's as pub.dev keeps them (`01.0.0` is `1.0.0`); every other registry's as
+/// written. A string the format would not parse compares as written (NuGet's in lowercase:
+/// NuGet compares versions without case).
+pub fn curation_version(registry: RegistryType, version: &str) -> String {
+    match registry {
+        RegistryType::PyPI => pep440_key(version).unwrap_or_else(|| version.to_string()),
+        RegistryType::Nuget => nuget_version_key(version).unwrap_or_else(|| version.to_lowercase()),
+        RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
+        RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
+        RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        _ => version.to_string(),
+    }
+}
+
+/// Whether a rule's version names a request's version: compared in curation's form
+/// ([`curation_version`]); a pattern with `*` matches the spelling or the format's normal form
+/// (PyPI: `1.0.*` holds for `1.0-1`, which is `1.0.post1`; NuGet: compared in lowercase).
+fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bool {
+    if rule.contains('*') {
+        let normal = match registry {
+            RegistryType::PyPI => pep440_normalized(version),
+            RegistryType::Nuget => nuget_version_key(version),
+            RegistryType::Npm => npm_version_key(version),
+            RegistryType::Go => go_version_key(version),
+            RegistryType::PubDart => pub_version_key(version),
+            _ => None,
+        };
+        // NuGet compares versions without case: the pattern and the spelling both fold.
+        let fold = |v: &str| match registry {
+            RegistryType::Nuget => v.to_lowercase(),
+            _ => v.to_string(),
+        };
+        let pattern = fold(rule);
+        return glob_match(&pattern, &fold(version))
+            || normal.is_some_and(|normal| glob_match(&pattern, &normal));
+    }
+    curation_version(registry, rule) == curation_version(registry, version)
+}
+
+/// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
+/// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
+/// registry.terraform.io answers provider and module paths in any case), cargo as crates.io's
+/// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
+/// every other registry as written. Requests,
+/// rules, allowlist entries and internal namespaces are compared in this form, so a rule written
+/// in any spelling the registry resolves to the package (`Newtonsoft.Json`, `Flask_RESTful`,
+/// `serde-json`) holds for the request.
+pub fn curation_name(registry: RegistryType, name: &str) -> String {
+    match registry {
+        RegistryType::PyPI => pep503_normalize(name),
+        RegistryType::Nuget | RegistryType::Terraform => name.to_lowercase(),
+        RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
+        _ => name.to_string(),
+    }
 }
 
 // ============================================================================
@@ -831,26 +1311,7 @@ pub struct BlocklistRule {
 /// - `"*foo"` — suffix match
 /// - exact string comparison otherwise
 fn glob_match(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    // "foo.**" → matches "foo" itself and "foo.anything" or "foo:anything" (Maven colon)
-    if let Some(prefix) = pattern.strip_suffix(".**") {
-        return value == prefix
-            || value.starts_with(&format!("{}.", prefix))
-            || value.starts_with(&format!("{}:", prefix));
-    }
-    // "foo/**" → matches "foo" itself and "foo/anything/deeper"
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return value == prefix || value.starts_with(&format!("{}/", prefix));
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return value.starts_with(prefix);
-    }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return value.ends_with(suffix);
-    }
-    pattern == value
+    pattern_holds(pattern, value, str::to_string, '.')
 }
 
 /// A filter that blocks packages matching rules loaded from a JSON file.
@@ -886,7 +1347,18 @@ impl BlocklistFilter {
             if rule.name.contains('*') {
                 globs.push(index);
             } else {
-                by_name.entry(rule.name.clone()).or_default().push(index);
+                // Indexed under the name's form in each registry the rule covers
+                // ([`curation_name`]); `evaluate` looks up the request's name in its form.
+                let mut forms: Vec<String> = RegistryType::all()
+                    .iter()
+                    .filter(|registry| glob_match(&rule.registry, &registry.to_string()))
+                    .map(|&registry| curation_name(registry, &rule.name))
+                    .collect();
+                forms.sort();
+                forms.dedup();
+                for form in forms {
+                    by_name.entry(form).or_default().push(index);
+                }
             }
         }
         Self {
@@ -911,7 +1383,21 @@ impl BlocklistFilter {
             ));
         }
 
-        Ok(Self::new(file.rules))
+        // A rule names its registry in NORA's spelling; one NORA does not know would match
+        // nothing, so it is refused rather than loaded.
+        let mut rules = file.rules;
+        for (index, rule) in rules.iter_mut().enumerate() {
+            rule.registry = curation_registry_name(&rule.registry).ok_or_else(|| {
+                format!(
+                    "blocklist '{}' rule {}: unknown registry '{}' (expected * or one of: {})",
+                    path,
+                    index + 1,
+                    rule.registry,
+                    known_registry_names()
+                )
+            })?;
+        }
+        Ok(Self::new(rules))
     }
 
     /// Number of rules loaded.
@@ -920,10 +1406,16 @@ impl BlocklistFilter {
     }
 
     /// Does this rule cover the request, given a name that already matched?
-    fn covers(&self, index: usize, registry: &str, version: &str) -> bool {
+    fn covers(
+        &self,
+        index: usize,
+        registry: RegistryType,
+        registry_str: &str,
+        version: &str,
+    ) -> bool {
         let rule = &self.rules[index];
-        glob_match(&rule.registry, registry)
-            && (rule.version == "*" || glob_match(&rule.version, version))
+        glob_match(&rule.registry, registry_str)
+            && (rule.version == "*" || rule_version_matches(registry, &rule.version, version))
     }
 }
 
@@ -942,11 +1434,12 @@ impl ProxyFilter for BlocklistFilter {
         // the other.
         let mut winner: Option<usize> = None;
 
-        if let Some(bucket) = self.by_name.get(request.name.as_str()) {
-            winner = bucket
-                .iter()
-                .copied()
-                .find(|&index| self.covers(index, &registry_str, version_str));
+        let request_name = curation_name(request.registry, &request.name);
+        if let Some(bucket) = self.by_name.get(request_name.as_str()) {
+            winner = bucket.iter().copied().find(|&index| {
+                curation_name(request.registry, &self.rules[index].name) == request_name
+                    && self.covers(index, request.registry, &registry_str, version_str)
+            });
         }
 
         for &index in &self.globs {
@@ -955,8 +1448,8 @@ impl ProxyFilter for BlocklistFilter {
             if winner.is_some_and(|w| index > w) {
                 break;
             }
-            if glob_match(&self.rules[index].name, &request.name)
-                && self.covers(index, &registry_str, version_str)
+            if curation_glob_match(request.registry, &self.rules[index].name, &request_name)
+                && self.covers(index, request.registry, &registry_str, version_str)
             {
                 winner = Some(index);
                 break;
@@ -1032,19 +1525,43 @@ impl AllowlistFilter {
         }
 
         let mut entries = std::collections::HashMap::new();
-        for entry in file.entries {
-            let key = (
-                entry.registry.clone(),
-                entry.name.clone(),
-                entry.version.clone(),
-            );
-            entries.insert(key, entry);
+        for (index, mut entry) in file.entries.into_iter().enumerate() {
+            // As for blocklist rules: NORA's spelling, an unknown registry refused.
+            entry.registry = curation_registry_name(&entry.registry)
+                .filter(|registry| registry != "*")
+                .ok_or_else(|| {
+                    format!(
+                        "allowlist '{}' entry {}: unknown registry '{}' (expected one of: {})",
+                        path,
+                        index + 1,
+                        entry.registry,
+                        known_registry_names()
+                    )
+                })?;
+            entries.insert(Self::entry_key(&entry), entry);
         }
 
         Ok(Self {
             entries,
             require_integrity,
         })
+    }
+
+    /// The key an entry is found under: its name and version in the form curation compares
+    /// them for the entry's registry ([`curation_name`], [`curation_version`]).
+    fn entry_key(entry: &AllowlistEntry) -> (String, String, String) {
+        match RegistryType::from_str_opt(&entry.registry) {
+            Some(registry) => (
+                entry.registry.clone(),
+                curation_name(registry, &entry.name),
+                curation_version(registry, &entry.version),
+            ),
+            None => (
+                entry.registry.clone(),
+                entry.name.clone(),
+                entry.version.clone(),
+            ),
+        }
     }
 
     /// Number of entries loaded.
@@ -1079,8 +1596,8 @@ impl ProxyFilter for AllowlistFilter {
 
         let key = (
             request.registry.to_string(),
-            request.name.clone(),
-            version.clone(),
+            curation_name(request.registry, &request.name),
+            curation_version(request.registry, version),
         );
 
         match self.entries.get(&key) {
@@ -1152,8 +1669,9 @@ impl ProxyFilter for NamespaceFilter {
     }
 
     fn evaluate(&self, request: &FilterRequest) -> Decision {
+        let request_name = curation_name(request.registry, &request.name);
         for pattern in &self.patterns {
-            if glob_match(pattern, &request.name) {
+            if curation_glob_match(request.registry, pattern, &request_name) {
                 return Decision::Block {
                     rule: "namespace".to_string(),
                     reason: format!(
@@ -1883,19 +2401,79 @@ mod tests {
         }
     }
 
-    /// The naive scan this filter replaced. The indexed implementation must
-    /// agree with it on every input, including which rule wins.
+    /// The naive scan this filter replaced, comparing names in the registry's form: the
+    /// indexed implementation must agree with it on every input, including which rule wins.
     fn naive_decision(rules: &[BlocklistRule], request: &FilterRequest) -> Option<String> {
         let registry_str = request.registry.to_string();
         let version_str = request.version.known().unwrap_or("");
+        let name = curation_name(request.registry, &request.name);
         rules
             .iter()
             .find(|rule| {
                 glob_match(&rule.registry, &registry_str)
-                    && glob_match(&rule.name, &request.name)
-                    && (rule.version == "*" || glob_match(&rule.version, version_str))
+                    && curation_glob_match(request.registry, &rule.name, &name)
+                    && (rule.version == "*"
+                        || rule_version_matches(request.registry, &rule.version, version_str))
             })
             .map(|rule| rule.reason.clone())
+    }
+
+    /// The index finds a literal rule under its name's form in every registry the rule covers:
+    /// rules and requests in mixed case and separators, in every registry, agree with the scan.
+    #[test]
+    fn the_index_agrees_with_the_scan_in_every_registry_form() {
+        let rules = vec![
+            br("*", "Left-Pad", "*", "any-registry-literal"),
+            br(
+                "nuget",
+                "runtime.linux-x64.Microsoft.NETCore.App",
+                "*",
+                "nuget-dot-dash",
+            ),
+            br("pypi", "Flask_RESTful", "*", "pypi-underscore"),
+            br("cargo", "Serde-JSON", "*", "cargo-dash"),
+            br("terraform", "Acme/foo-bar_baz", "*", "terraform-case"),
+            br("*", "Corp.**", "*", "any-registry-hierarchy"),
+            br("*", "Evil_*", "1.0.0", "any-registry-prefix"),
+        ];
+        let filter = make_blocklist(rules.clone());
+        let names = [
+            "left-pad",
+            "Left_Pad",
+            "LEFT.PAD",
+            "runtime.linux-x64.microsoft.netcore.app",
+            "flask-restful",
+            "Flask.RESTful",
+            "serde_json",
+            "serde-json",
+            "acme/foo-bar_baz",
+            "ACME/FOO-BAR_BAZ",
+            "corp",
+            "corp-tools",
+            "corp.tools",
+            "corporate",
+            "evil-thing",
+            "evil_thing",
+        ];
+        let versions = [None, Some("1.0.0"), Some("2.0.0")];
+        let mut checked = 0;
+        for &registry in RegistryType::all() {
+            for name in names {
+                for version in versions {
+                    let req = make_request_with_registry(registry, name, version);
+                    assert_eq!(
+                        reason_of(&filter.evaluate(&req)),
+                        naive_decision(&rules, &req),
+                        "{registry:?} {name}@{version:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            RegistryType::all().len() * names.len() * versions.len()
+        );
     }
 
     fn reason_of(decision: &Decision) -> Option<String> {
@@ -2507,12 +3085,7 @@ mod tests {
     ) -> AllowlistFilter {
         let mut map = std::collections::HashMap::new();
         for entry in entries {
-            let key = (
-                entry.registry.clone(),
-                entry.name.clone(),
-                entry.version.clone(),
-            );
-            map.insert(key, entry);
+            map.insert(AllowlistFilter::entry_key(&entry), entry);
         }
         AllowlistFilter {
             entries: map,
@@ -3799,5 +4372,1169 @@ mod min_release_age_tests {
 
         let result = extract_mtime_as_publish_date(&storage, "raw/nonexistent.txt").await;
         assert!(result.is_none());
+    }
+}
+
+/// Property tests of the PyPI file-name version parser: the version curation decides on is the
+/// one the file name carries, whatever spelling of the project name the file uses.
+#[cfg(test)]
+mod pypi_file_version_properties {
+    use super::parse_pypi_version;
+    use proptest::prelude::*;
+
+    /// PEP 503 normalization: lowercase, every run of `-`, `_`, `.` is one `-`.
+    fn pep503(name: &str) -> String {
+        let mut out = String::new();
+        let mut run = false;
+        for c in name.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !run {
+                    out.push('-');
+                }
+                run = true;
+            } else {
+                out.extend(c.to_lowercase());
+                run = false;
+            }
+        }
+        out
+    }
+
+    fn project() -> impl Strategy<Value = String> {
+        "[A-Za-z][A-Za-z0-9]{0,8}([-_.][A-Za-z0-9]{1,8}){0,3}"
+    }
+
+    fn version() -> impl Strategy<Value = String> {
+        "(0|[1-9][0-9]{0,3})(\\.(0|[1-9][0-9]{0,3})){0,3}((a|b|rc)[0-9]{1,2}|\\.post[0-9]{1,2}|\\.dev[0-9]{1,2})?"
+    }
+
+    proptest! {
+        // An sdist named with the project name as published (hyphens, dots, any case), or
+        // escaped with underscores (PEP 625), reads back its version.
+        #[test]
+        fn an_sdist_reads_back_its_version_in_any_spelling_of_the_name(name in project(), v in version()) {
+            let normalized = pep503(&name);
+            for ext in [".tar.gz", ".zip"] {
+                let as_published = format!("{name}-{v}{ext}");
+                prop_assert_eq!(parse_pypi_version(&normalized, &as_published), Some(v.clone()), "{}", as_published);
+                let escaped = format!("{}-{v}{ext}", normalized.replace('-', "_"));
+                prop_assert_eq!(parse_pypi_version(&normalized, &escaped), Some(v.clone()), "{}", escaped);
+            }
+        }
+
+        // A wheel (name escaped with underscores, PEP 427) reads back its version.
+        #[test]
+        fn a_wheel_reads_back_its_version(name in project(), v in version()) {
+            let normalized = pep503(&name);
+            let wheel = format!("{}-{v}-py3-none-any.whl", normalized.replace('-', "_"));
+            prop_assert_eq!(parse_pypi_version(&normalized, &wheel), Some(v), "{}", wheel);
+        }
+
+        // A file of another project reads as no version of this one — unless the other name is
+        // this one followed by `-` and more: then the file reads as pip reads it (`Z-A-0.tar.gz`
+        // under `z` is version `A-0`, which pip skips as no PEP 440 version; the corpus test
+        // holds that case). Which files are a project's own, the project's index decides.
+        #[test]
+        fn another_projects_file_is_no_version_of_this_one(name in project(), other in project(), v in version()) {
+            prop_assume!(pep503(&name) != pep503(&other));
+            prop_assume!(!pep503(&other).starts_with(&format!("{}-", pep503(&name))));
+            let file = format!("{other}-{v}.tar.gz");
+            prop_assert_eq!(parse_pypi_version(&pep503(&name), &file), None, "{} as {}", file, name);
+        }
+    }
+}
+
+/// A curation rule names a package as its registry spells it — `Newtonsoft.Json`, `Flask`,
+/// `Inflector` — and holds for the name a request carries after the handler's normalization
+/// (NuGet and cargo lowercase, PyPI per PEP 503).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rule_names_in_published_spelling {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn blocklist(rules: &[(&str, &str)]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocklist.json");
+        let rules: Vec<String> = rules
+            .iter()
+            .map(|(registry, name)| {
+                format!(r#"{{"registry": "{registry}", "name": "{name}", "version": "*", "reason": "malware"}}"#)
+            })
+            .collect();
+        std::fs::write(
+            &path,
+            format!(r#"{{"version": 1, "rules": [{}]}}"#, rules.join(",")),
+        )
+        .unwrap();
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn request(registry: super::RegistryType, name: &str, version: &str) -> super::FilterRequest {
+        super::FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: super::RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        }
+    }
+
+    // The form follows the request's registry: a case-insensitive registry folds the rule's
+    // case, a case-sensitive one does not (npm `JSONStream` is not `jsonstream`).
+    #[test]
+    fn a_rule_folds_only_where_its_registry_folds_names() {
+        use super::{BlocklistFilter, BlocklistRule, Decision, ProxyFilter, RegistryType};
+        let rule = |registry: &str, name: &str| BlocklistRule {
+            registry: registry.to_string(),
+            name: name.to_string(),
+            version: "*".to_string(),
+            reason: "r".to_string(),
+        };
+        let filter = BlocklistFilter::new(vec![
+            rule("npm", "JSONStream"),
+            rule("*", "Flask_RESTful"),
+            rule("nuget", "Corp.*"),
+            rule("cargo", "evil-crate"),
+        ]);
+        let blocked = |registry, name: &str| {
+            matches!(
+                filter.evaluate(&request(registry, name, "1.0")),
+                Decision::Block { .. }
+            )
+        };
+        assert!(blocked(RegistryType::Npm, "JSONStream"));
+        assert!(!blocked(RegistryType::Npm, "jsonstream"));
+        assert!(blocked(RegistryType::PyPI, "flask-restful"));
+        assert!(!blocked(RegistryType::Npm, "flask-restful"));
+        assert!(blocked(RegistryType::Nuget, "corp.tools"));
+        assert!(!blocked(RegistryType::Nuget, "other.tools"));
+        // Whatever spelling a handler passes, the filter decides on the registry's form.
+        assert!(blocked(RegistryType::Cargo, "Evil_Crate"));
+        assert!(blocked(RegistryType::Cargo, "EVIL-CRATE"));
+        assert!(!blocked(RegistryType::Npm, "evil_crate"));
+    }
+
+    // An allowlist entry in the published spelling allows the normalized request.
+    #[test]
+    fn an_allowlist_entry_in_the_published_spelling_allows_the_normalized_request() {
+        use super::{AllowlistFilter, Decision, ProxyFilter, RegistryType};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "entries": [
+                {"registry": "nuget", "name": "Newtonsoft.Json", "version": "13.0.1"},
+                {"registry": "pypi", "name": "Flask_RESTful", "version": "0.3.9"},
+                {"registry": "npm", "name": "JSONStream", "version": "1.3.5"}
+            ]}"#,
+        )
+        .unwrap();
+        let filter = AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        let decide = |registry, name: &str, version: &str| {
+            filter.evaluate(&request(registry, name, version))
+        };
+        assert_eq!(
+            decide(RegistryType::Nuget, "newtonsoft.json", "13.0.1"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(RegistryType::PyPI, "flask-restful", "0.3.9"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(RegistryType::Npm, "JSONStream", "1.3.5"),
+            Decision::Allow
+        );
+        assert!(matches!(
+            decide(RegistryType::Npm, "jsonstream", "1.3.5"),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rule_in_the_published_spelling_blocks_the_normalized_request() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PKG".to_vec()))
+            .mount(&upstream)
+            .await;
+        let (_dir, path) = blocklist(&[
+            ("nuget", "Newtonsoft.Json"),
+            ("pypi", "Flask_RESTful"),
+            ("cargo", "Inflector"),
+        ]);
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.pypi.proxy = Some(uri.clone());
+            cfg.cargo.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(path);
+        });
+        for uri in [
+            "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+            "/simple/flask-restful/Flask-RESTful-0.3.9.tar.gz",
+            "/cargo/api/v1/crates/Inflector/0.11.4/download",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_internal_namespace_in_the_published_spelling_isolates_the_normalized_request() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUAT".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.internal_namespaces =
+                vec!["Corp.Internal".to_string(), "Corp_Tools".to_string()];
+        });
+        for uri in [
+            "/nuget/v3/flatcontainer/corp.internal/1.0.0/corp.internal.1.0.0.nupkg",
+            "/simple/corp-tools/",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert!(!resp.status().is_success(), "{uri}: {}", resp.status());
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "an internal name went upstream"
+        );
+    }
+}
+
+/// PEP 440 normal forms as `packaging` computes them (`testdata/pypi`, measured with the
+/// packaging pip ships): `str(Version(v))` and `canonicalize_version(v)`, or no version.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pep440_per_packaging {
+    use super::{parse_pypi_version, pep440_key, pep440_normalized, pep503_normalize};
+
+    fn rows(file: &str, columns: usize) -> Vec<Vec<String>> {
+        let path = format!("{}/testdata/pypi/{file}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| {
+                let fields: Vec<String> = row.split('\t').map(String::from).collect();
+                assert_eq!(fields.len(), columns, "{row}");
+                fields
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_version_normalizes_as_packaging_does() {
+        let rows = rows("pep440-versions.tsv", 3);
+        assert_eq!(rows.len(), 1309);
+        for row in rows {
+            let (version, normalized, key) = (&row[0], &row[1], &row[2]);
+            let want = |s: &String| (s != "INVALID").then(|| s.clone());
+            assert_eq!(pep440_normalized(version), want(normalized), "{version:?}");
+            assert_eq!(pep440_key(version), want(key), "{version:?}");
+        }
+    }
+
+    // Go module versions as golang.org/x/mod reads them (testdata/go/versions).
+    #[test]
+    fn every_go_version_is_canonical_as_the_go_command_makes_it() {
+        use super::go_version_key;
+        let path = format!(
+            "{}/testdata/go/versions/canonical.tsv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<(&str, &str)> = corpus
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| row.split_once('\t').unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1621);
+        for (version, canonical) in rows {
+            let want = (canonical != "INVALID").then(|| canonical.to_string());
+            assert_eq!(go_version_key(version), want, "{version:?}");
+        }
+    }
+
+    // npm's normal forms as npm 10.9's semver.clean computes them (testdata/npm/versions).
+    #[test]
+    fn every_npm_version_cleans_as_npm_does() {
+        use super::npm_version_key;
+        let path = format!(
+            "{}/testdata/npm/versions/clean.tsv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<(&str, &str)> = corpus
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| row.split_once('\t').unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4373);
+        for (version, clean) in rows {
+            let want = (clean != "INVALID").then(|| clean.to_string());
+            assert_eq!(npm_version_key(version), want, "{version:?}");
+        }
+    }
+
+    // NuGet's normal forms as NuGet.Versioning 6.14 computes them (testdata/nuget/versions).
+    #[test]
+    fn every_nuget_version_normalizes_as_nuget_does() {
+        use super::nuget_version_key;
+        let path = format!(
+            "{}/testdata/nuget/versions/normal-forms.tsv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<Vec<&str>> = corpus
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| row.split('\t').collect())
+            .collect();
+        assert_eq!(rows.len(), 3626);
+        for row in rows {
+            let (version, lowercase) = (row[0], row[2]);
+            let want = (lowercase != "INVALID").then(|| lowercase.to_string());
+            assert_eq!(nuget_version_key(version), want, "{version:?}");
+        }
+    }
+
+    // A registry without a normal form compares versions as written: Maven's `1.0` and `1.0.0`
+    // are two artifacts; and npm's normal form keeps `1.0.0-rc1` apart from `1.0.0rc1`.
+    #[test]
+    fn other_registries_compare_versions_as_written() {
+        use super::{curation_version, AllowlistFilter, BlocklistFilter, BlocklistRule, Decision};
+        use super::{FilterRequest, ProxyFilter, RegistryType, RequestVersion};
+        assert_eq!(curation_version(RegistryType::Maven, "1.0"), "1.0");
+        assert_eq!(
+            curation_version(RegistryType::Npm, "1.0.0-rc1"),
+            "1.0.0-rc1"
+        );
+        assert_eq!(curation_version(RegistryType::PyPI, "1.0.0-rc1"), "1rc1");
+        let request = |registry, name: &str, version: &str| FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        };
+        let blocklist = BlocklistFilter::new(vec![BlocklistRule {
+            registry: "maven".to_string(),
+            name: "com.example:lib".to_string(),
+            version: "1.0".to_string(),
+            reason: "r".to_string(),
+        }]);
+        assert_eq!(
+            blocklist.evaluate(&request(RegistryType::Maven, "com.example:lib", "1.0.0")),
+            Decision::Skip
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "entries": [{"registry": "maven", "name": "com.example:lib", "version": "1.0"}]}"#,
+        )
+        .unwrap();
+        let allowlist = AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        assert!(matches!(
+            allowlist.evaluate(&request(RegistryType::Maven, "com.example:lib", "1.0.0")),
+            Decision::Block { .. }
+        ));
+    }
+
+    // A version pattern matches the spelling or the normal form: `1.0.*` holds for `1.0-1`,
+    // which is `1.0.post1`.
+    #[test]
+    fn a_version_pattern_matches_the_normal_form() {
+        use super::{BlocklistFilter, BlocklistRule, Decision, FilterRequest, ProxyFilter};
+        use super::{RegistryType, RequestVersion};
+        let blocklist = BlocklistFilter::new(vec![BlocklistRule {
+            registry: "pypi".to_string(),
+            name: "foo".to_string(),
+            version: "1.0.*".to_string(),
+            reason: "r".to_string(),
+        }]);
+        let decide = |version: &str| {
+            blocklist.evaluate(&FilterRequest {
+                registry: RegistryType::PyPI,
+                upstream: None,
+                name: "foo".to_string(),
+                version: RequestVersion::Known(version.to_string()),
+                integrity: None,
+                bypass: false,
+                publish_date: None,
+            })
+        };
+        assert!(matches!(decide("1.0-1"), Decision::Block { .. }));
+        assert!(matches!(decide("1.0.3"), Decision::Block { .. }));
+        assert_eq!(decide("1.1"), Decision::Skip);
+    }
+
+    // A NuGet version pattern is matched without case: clients ask for `2.0.0-beta1`.
+    #[test]
+    fn a_nuget_version_pattern_matches_without_case() {
+        use super::{BlocklistFilter, BlocklistRule, Decision, FilterRequest, ProxyFilter};
+        use super::{RegistryType, RequestVersion};
+        let blocklist = BlocklistFilter::new(vec![BlocklistRule {
+            registry: "nuget".to_string(),
+            name: "evil.lib".to_string(),
+            version: "2.0.0-Beta*".to_string(),
+            reason: "r".to_string(),
+        }]);
+        let decide = |version: &str| {
+            blocklist.evaluate(&FilterRequest {
+                registry: RegistryType::Nuget,
+                upstream: None,
+                name: "evil.lib".to_string(),
+                version: RequestVersion::Known(version.to_string()),
+                integrity: None,
+                bypass: false,
+                publish_date: None,
+            })
+        };
+        assert!(matches!(decide("2.0.0-beta1"), Decision::Block { .. }));
+        assert_eq!(decide("2.0.0"), Decision::Skip);
+    }
+
+    // Every file name in the corpus, as the client that takes it reads it (pip's own
+    // LinkEvaluator; setuptools for an egg; pip in lowercase for an extension in another case):
+    // NORA reads the same version, compared as PEP 440 versions, for every file it serves, and
+    // none for another project's file, an empty version, or a file it does not serve.
+    #[test]
+    fn every_file_reads_the_version_its_client_reads() {
+        let key = |v: &str| pep440_key(v).unwrap_or_else(|| v.to_string());
+        let rows = rows("file-versions.tsv", 5);
+        assert_eq!(rows.len(), 7264);
+        let (mut read, mut unread, mut unserved) = (0, 0, 0);
+        for row in rows {
+            let (project, file, how, version) = (&row[0], &row[1], &row[2], &row[3]);
+            let nora = parse_pypi_version(&pep503_normalize(project), file);
+            if nora_registry::pypi_files::served_extension(file).is_none() {
+                assert_eq!(nora, None, "{project} {file}: not served");
+                unserved += 1;
+            } else if version.is_empty() {
+                assert_eq!(nora, None, "{project} {file}: {how}");
+                unread += 1;
+            } else {
+                assert_eq!(
+                    nora.as_deref().map(key),
+                    Some(key(version)),
+                    "{project} {file}: {how}"
+                );
+                read += 1;
+            }
+        }
+        assert_eq!((read, unread, unserved), (3432, 184, 3648));
+    }
+
+    /// The fuzz targets drive the server's reader: `parse_pypi_version` and `pep503_normalize`
+    /// are defined once, in `pypi_files.rs`, and the library and curation re-export them.
+    #[test]
+    fn the_pypi_file_reader_is_defined_once() {
+        for (file, source) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("curation.rs", include_str!("curation.rs")),
+            ("registry/pypi.rs", include_str!("registry/pypi.rs")),
+        ] {
+            for definition in [
+                concat!("fn parse_pypi", "_version("),
+                concat!("fn pep503", "_normalize("),
+            ] {
+                assert!(!source.contains(definition), "{file} defines {definition}");
+            }
+        }
+        assert!(include_str!("lib.rs").contains("pub use crate::pypi_files::parse_pypi_version;"));
+    }
+}
+
+/// A rule or an entry names its registry as NORA's registry types do, in any case or by an
+/// alias `RegistryType::from_str_opt` takes (`PyPI`, `maven2`); a name it does not know is
+/// refused when the file loads, not left to match nothing.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod curation_file_registry_names {
+    use super::{
+        AllowlistFilter, BlocklistFilter, Decision, FilterRequest, ProxyFilter, RegistryType,
+        RequestVersion,
+    };
+
+    fn request(registry: RegistryType, name: &str, version: &str) -> FilterRequest {
+        FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        }
+    }
+
+    fn file(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_rule_names_its_registry_in_any_case_or_by_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "PyPI", "name": "evil", "version": "*", "reason": "r"},
+                {"registry": "maven2", "name": "com.evil:lib", "version": "*", "reason": "r"}
+            ]}"#,
+        );
+        let filter = BlocklistFilter::from_file(&path).unwrap();
+        let blocked = |registry, name: &str| {
+            matches!(
+                filter.evaluate(&request(registry, name, "1.0")),
+                Decision::Block { .. }
+            )
+        };
+        assert!(blocked(RegistryType::PyPI, "evil"));
+        assert!(blocked(RegistryType::Maven, "com.evil:lib"));
+    }
+
+    #[test]
+    fn an_entry_names_its_registry_in_any_case_or_by_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "PyPI", "name": "flask", "version": "3.0.0"}]}"#,
+        );
+        let filter = AllowlistFilter::from_file(&path, false).unwrap();
+        assert_eq!(
+            filter.evaluate(&request(RegistryType::PyPI, "flask", "3.0.0")),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn a_registry_nora_does_not_know_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = file(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [{"registry": "pypy", "name": "evil", "version": "*", "reason": "r"}]}"#,
+        );
+        assert!(BlocklistFilter::from_file(&blocklist).is_err());
+        let allowlist = file(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "rubygem", "name": "rails", "version": "7.0.0"}]}"#,
+        );
+        assert!(AllowlistFilter::from_file(&allowlist, false).is_err());
+        // An allowlist entry is exact: `*` would name no registry a request carries.
+        let any_entry = file(
+            &dir,
+            "any-entry.json",
+            r#"{"version": 1, "entries": [{"registry": "*", "name": "rails", "version": "7.0.0"}]}"#,
+        );
+        assert!(AllowlistFilter::from_file(&any_entry, false).is_err());
+        let any = file(
+            &dir,
+            "any.json",
+            r#"{"version": 1, "rules": [{"registry": "*", "name": "evil", "version": "*", "reason": "r"}]}"#,
+        );
+        assert!(BlocklistFilter::from_file(&any).is_ok());
+    }
+}
+
+/// Registry forms beyond the first example: every `-` of a crate name folds; a NuGet version
+/// NuGet cannot parse still compares without case; a NuGet version pattern matches the normal
+/// form; a version pattern matches the spelling as written.
+#[cfg(test)]
+mod curation_forms_beyond_the_first_example {
+    use super::{
+        AllowlistFilter, BlocklistFilter, BlocklistRule, Decision, FilterRequest, NamespaceFilter,
+        ProxyFilter, RegistryType, RequestVersion,
+    };
+
+    fn request(registry: RegistryType, name: &str, version: &str) -> FilterRequest {
+        FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        }
+    }
+
+    fn rule(registry: &str, name: &str, version: &str) -> BlocklistFilter {
+        BlocklistFilter::new(vec![BlocklistRule {
+            registry: registry.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            reason: "r".to_string(),
+        }])
+    }
+
+    fn allowlist(body: &str) -> (tempfile::TempDir, AllowlistFilter) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, body).unwrap();
+        let filter = AllowlistFilter::from_file(path.to_str().unwrap(), false).unwrap();
+        (dir, filter)
+    }
+
+    fn blocked(d: Decision) -> bool {
+        matches!(d, Decision::Block { .. })
+    }
+
+    // canon_crate_name folds every `-`, not the first one.
+    #[test]
+    fn cargo_name_folds_every_hyphen() {
+        let r = rule("cargo", "evil-crate-x", "*");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Cargo,
+            "evil_crate_x",
+            "1.0.0"
+        ))));
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Cargo,
+            "Evil_Crate-X",
+            "1.0.0"
+        ))));
+        let (_d, a) = allowlist(
+            r#"{"version": 1, "entries": [{"registry": "cargo", "name": "my-crate-x", "version": "1.0.0"}]}"#,
+        );
+        assert_eq!(
+            a.evaluate(&request(RegistryType::Cargo, "my_crate_x", "1.0.0")),
+            Decision::Allow
+        );
+        let ns = NamespaceFilter::new(vec!["corp-int-*".to_string()]);
+        assert!(blocked(ns.evaluate(&request(
+            RegistryType::Cargo,
+            "corp_int_x",
+            "1.0.0"
+        ))));
+    }
+
+    // a NuGet version NuGet does not parse compares as written, without case.
+    #[test]
+    fn nuget_unparsed_version_compares_without_case() {
+        let r = rule("nuget", "evil.lib", "1.0.0-Beta_1");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Nuget,
+            "evil.lib",
+            "1.0.0-beta_1"
+        ))));
+        let (_d, a) = allowlist(
+            r#"{"version": 1, "entries": [{"registry": "nuget", "name": "good.lib", "version": "1.0.0-RC_1"}]}"#,
+        );
+        assert_eq!(
+            a.evaluate(&request(RegistryType::Nuget, "good.lib", "1.0.0-rc_1")),
+            Decision::Allow
+        );
+    }
+
+    // a NuGet version pattern matches the normal form, not only the spelling.
+    #[test]
+    fn nuget_version_pattern_matches_the_normal_form() {
+        let r = rule("nuget", "evil.lib", "13.0.*");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Nuget,
+            "evil.lib",
+            "13.0"
+        ))));
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Nuget,
+            "evil.lib",
+            "13.0.0.0"
+        ))));
+        let r = rule("nuget", "evil.lib", "2.0.0-beta*");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Nuget,
+            "evil.lib",
+            "2.0.0-BETA1"
+        ))));
+    }
+
+    // a version pattern matches the spelling: Maven has no normal form at all, and a
+    // PyPI pattern written in the published spelling holds for that spelling.
+    #[test]
+    fn version_pattern_matches_the_spelling() {
+        let r = rule("maven", "com.evil:lib", "1.*");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::Maven,
+            "com.evil:lib",
+            "1.2"
+        ))));
+        let r = rule("pypi", "evil", "1.0-*");
+        assert!(blocked(r.evaluate(&request(
+            RegistryType::PyPI,
+            "evil",
+            "1.0-1"
+        ))));
+    }
+}
+
+/// A version pattern with `*` matches the spelling and the normal form in npm and Go as well.
+#[cfg(test)]
+mod version_patterns_match_the_normal_form {
+    use super::{BlocklistFilter, BlocklistRule, Decision, FilterRequest, ProxyFilter};
+    use super::{RegistryType, RequestVersion};
+
+    fn decide(registry: RegistryType, rule_version: &str, version: &str) -> Decision {
+        let r = BlocklistFilter::new(vec![BlocklistRule {
+            registry: registry.to_string(),
+            name: "evil".to_string(),
+            version: rule_version.to_string(),
+            reason: "r".to_string(),
+        }]);
+        r.evaluate(&FilterRequest {
+            registry,
+            upstream: None,
+            name: "evil".to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        })
+    }
+
+    #[test]
+    fn npm_version_pattern_matches_the_normal_form() {
+        // The exact rule holds for `v1.3.0` (npm's `1.3.0`) ...
+        assert!(matches!(
+            decide(RegistryType::Npm, "1.3.0", "v1.3.0"),
+            Decision::Block { .. }
+        ));
+        // ... so the pattern over the same version must too.
+        assert!(matches!(
+            decide(RegistryType::Npm, "1.3.*", "v1.3.0"),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn go_version_pattern_matches_the_normal_form() {
+        assert!(matches!(
+            decide(RegistryType::Go, "v1.2.0", "v1.2"),
+            Decision::Block { .. }
+        ));
+        assert!(matches!(
+            decide(RegistryType::Go, "v1.2.*", "v1.2"),
+            Decision::Block { .. }
+        ));
+    }
+}
+
+/// A PyPI internal namespace written as a hierarchical pattern (`corp.**`) isolates the project
+/// itself and every project under it, whose normalized names use `-`.
+#[cfg(test)]
+mod hierarchical_pypi_namespace {
+    use super::{
+        Decision, FilterRequest, NamespaceFilter, ProxyFilter, RegistryType, RequestVersion,
+    };
+
+    fn decide(pattern: &str, name: &str) -> Decision {
+        NamespaceFilter::new(vec![pattern.to_string()]).evaluate(&FilterRequest {
+            registry: RegistryType::PyPI,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::Unspecified,
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        })
+    }
+
+    #[test]
+    fn a_hierarchical_pypi_namespace_isolates_its_projects() {
+        assert!(matches!(
+            decide("corp.*", "corp.tools"),
+            Decision::Block { .. }
+        ));
+        assert!(
+            matches!(decide("corp.**", "corp"), Decision::Block { .. }),
+            "corp.** vs corp"
+        );
+        assert!(
+            matches!(decide("corp.**", "corp.tools"), Decision::Block { .. }),
+            "corp.** vs corp.tools"
+        );
+    }
+}
+
+/// A file of another project, or one with an empty version, reads no version of this project.
+#[cfg(test)]
+mod pypi_files_of_other_projects {
+    use super::parse_pypi_version;
+
+    // pip compares a wheel's name field with the project's canonical name.
+    #[test]
+    fn another_projects_wheel_has_no_version() {
+        assert_eq!(
+            parse_pypi_version("flask", "django-1.0-py3-none-any.whl"),
+            None
+        );
+    }
+
+    // pip returns no version for an empty one.
+    #[test]
+    fn an_empty_version_is_no_version() {
+        assert_eq!(parse_pypi_version("flask", "flask-.tar.gz"), None);
+        assert_eq!(parse_pypi_version("flask", "flask--py3-none-any.whl"), None);
+    }
+
+    // A project whose name merely begins with this one's is another project.
+    #[test]
+    fn a_longer_name_is_another_project() {
+        assert_eq!(parse_pypi_version("flask", "flaskx-1.0.tar.gz"), None);
+        assert_eq!(parse_pypi_version("flask", "flask2-1.0.zip"), None);
+    }
+}
+
+/// Pattern bodies in every syntax take the registry's form, hierarchies hold whole segments
+/// only, a literal rule is found in any registry's form, and a registry is named exactly.
+#[cfg(test)]
+mod curation_patterns_whole_segments_and_forms {
+    use super::{
+        AllowlistFilter, BlocklistFilter, BlocklistRule, Decision, FilterRequest, NamespaceFilter,
+        ProxyFilter, RegistryType, RequestVersion,
+    };
+
+    fn request(registry: RegistryType, name: &str, version: RequestVersion) -> FilterRequest {
+        FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version,
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        }
+    }
+
+    fn internal(registry: RegistryType, pattern: &str, name: &str) -> bool {
+        matches!(
+            NamespaceFilter::new(vec![pattern.to_string()]).evaluate(&request(
+                registry,
+                name,
+                RequestVersion::Unspecified
+            )),
+            Decision::Block { .. }
+        )
+    }
+
+    fn blocked(registry: &str, rule_name: &str, req: RegistryType, name: &str) -> bool {
+        let filter = BlocklistFilter::new(vec![BlocklistRule {
+            registry: registry.to_string(),
+            name: rule_name.to_string(),
+            version: "*".to_string(),
+            reason: "r".to_string(),
+        }]);
+        matches!(
+            filter.evaluate(&request(
+                req,
+                name,
+                RequestVersion::Known("1.0.0".to_string())
+            )),
+            Decision::Block { .. }
+        )
+    }
+
+    // The body of a `foo/**` pattern takes the registry's form like every other pattern.
+    #[test]
+    fn a_slash_hierarchy_root_is_in_the_registry_form() {
+        assert!(internal(
+            RegistryType::Nuget,
+            "Acme.Internal/**",
+            "Acme.Internal"
+        ));
+        assert!(internal(RegistryType::PyPI, "Corp_Tools/**", "corp-tools"));
+        assert!(internal(RegistryType::Terraform, "Acme/**", "acme/infra"));
+    }
+
+    // `foo/**` is `foo` and `foo/...`, not every name starting with `foo`.
+    #[test]
+    fn a_slash_hierarchy_holds_whole_segments_only() {
+        assert!(internal(RegistryType::Go, "acme/**", "acme/x"));
+        assert!(!internal(RegistryType::Go, "acme/**", "acme-public/x"));
+        assert!(!internal(
+            RegistryType::Terraform,
+            "acme/**",
+            "acmecorp/vpc/aws"
+        ));
+        assert!(!blocked("go", "acme/**", RegistryType::Go, "acmecorp/lib"));
+    }
+
+    // `foo.**` is `foo` and `foo.`/`foo:`/(PyPI) `foo-` names, not every name starting with `foo`.
+    #[test]
+    fn a_dot_hierarchy_holds_whole_segments_only() {
+        assert!(internal(RegistryType::PyPI, "corp.**", "corp-tools"));
+        assert!(!internal(RegistryType::PyPI, "corp.**", "corporate"));
+        assert!(!internal(RegistryType::Nuget, "Acme.**", "AcmeTools"));
+        assert!(!internal(
+            RegistryType::Maven,
+            "com.corp.**",
+            "com.corporate:lib"
+        ));
+        assert!(!blocked("pypi", "corp.**", RegistryType::PyPI, "corporate"));
+    }
+
+    // A NuGet (lowercase-form) rule whose name holds both `.` and `-` is found by the index.
+    #[test]
+    fn a_lowercase_form_rule_with_dot_and_dash_is_indexed() {
+        assert!(blocked(
+            "nuget",
+            "runtime.linux-x64.Microsoft.NETCore.App",
+            RegistryType::Nuget,
+            "runtime.linux-x64.microsoft.netcore.app"
+        ));
+        assert!(blocked(
+            "terraform",
+            "Acme/foo-bar_baz",
+            RegistryType::Terraform,
+            "acme/foo-bar_baz"
+        ));
+    }
+
+    // A registry pattern other than `*` names no registry NORA knows and fails the load.
+    #[test]
+    fn a_registry_pattern_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = dir.path().join("blocklist.json");
+        std::fs::write(
+            &block,
+            r#"{"version": 1, "rules": [{"registry": "py*", "name": "evil", "version": "*", "reason": "r"}]}"#,
+        )
+        .unwrap();
+        assert!(BlocklistFilter::from_file(block.to_str().unwrap()).is_err());
+        let allow = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allow,
+            r#"{"version": 1, "entries": [{"registry": "n*", "name": "lodash", "version": "4.17.21"}]}"#,
+        )
+        .unwrap();
+        assert!(AllowlistFilter::from_file(allow.to_str().unwrap(), false).is_err());
+    }
+}
+
+/// A NuGet version NuGet cannot parse compares without case, exactly and through a pattern.
+#[cfg(test)]
+mod nuget_unparsed_version_without_case {
+    use super::{
+        BlocklistFilter, BlocklistRule, Decision, FilterRequest, ProxyFilter, RegistryType,
+        RequestVersion,
+    };
+
+    fn decide(rule_version: &str, version: &str) -> Decision {
+        BlocklistFilter::new(vec![BlocklistRule {
+            registry: "nuget".to_string(),
+            name: "acme".to_string(),
+            version: rule_version.to_string(),
+            reason: "r".to_string(),
+        }])
+        .evaluate(&FilterRequest {
+            registry: RegistryType::Nuget,
+            upstream: None,
+            name: "acme".to_string(),
+            version: RequestVersion::Known(version.to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date: None,
+        })
+    }
+
+    // A NuGet version NuGet cannot parse compares without case — exactly (HEAD holds this)
+    // and through a `*` pattern (HEAD compares the pattern, lowercased, with the spelling as written).
+    #[test]
+    fn nuget_unparsed_version_pattern_matches_without_case() {
+        assert!(matches!(
+            decide("1.0.0-beta_1", "1.0.0-Beta_1"),
+            Decision::Block { .. }
+        ));
+        assert!(matches!(
+            decide("1.0.0-beta_*", "1.0.0-Beta_1"),
+            Decision::Block { .. }
+        ));
+    }
+}
+
+/// The pattern syntax as a table: every form, each boundary on both sides, for plain values and
+/// for names in several registries' forms; and, for any body, a pattern holds exactly where the
+/// same pattern with its body already in the registry's form holds.
+#[cfg(test)]
+mod curation_pattern_spec {
+    use super::{curation_glob_match, curation_name, glob_match, RegistryType};
+    use proptest::prelude::*;
+
+    #[test]
+    fn the_pattern_syntax_holds_where_it_says() {
+        let plain = [
+            ("*", "anything", true),
+            ("*", "", true),
+            ("lodash", "lodash", true),
+            ("lodash", "lodash2", false),
+            ("foo*", "foo", true),
+            ("foo*", "foobar", true),
+            ("foo*", "barfoo", false),
+            ("*bar", "foobar", true),
+            ("*bar", "barbaz", false),
+            ("com.corp.**", "com.corp", true),
+            ("com.corp.**", "com.corp.utils", true),
+            ("com.corp.**", "com.corp:lib", true),
+            ("com.corp.**", "com.corporate:lib", false),
+            ("com.corp.**", "com.corporate", false),
+            ("com.corp.**", "org.com.corp", false),
+            ("internal/**", "internal", true),
+            ("internal/**", "internal/pkg/deep", true),
+            ("internal/**", "internalpkg", false),
+            ("internal/**", "internal-public/x", false),
+        ];
+        for (pattern, value, holds) in plain {
+            assert_eq!(glob_match(pattern, value), holds, "{pattern} {value}");
+        }
+        let named = [
+            (RegistryType::PyPI, "corp.**", "corp", true),
+            (RegistryType::PyPI, "corp.**", "corp-tools", true),
+            (RegistryType::PyPI, "Corp.**", "corp-tools", true),
+            (RegistryType::PyPI, "corp.**", "corporate", false),
+            (RegistryType::PyPI, "Corp_Tools/**", "corp-tools", true),
+            (RegistryType::PyPI, "Corp_*", "corp-tools", true),
+            (RegistryType::PyPI, "*_Tools", "corp-tools", true),
+            (RegistryType::Nuget, "Acme.**", "acme.tools", true),
+            (RegistryType::Nuget, "Acme.**", "acmetools", false),
+            (
+                RegistryType::Nuget,
+                "Acme.Internal/**",
+                "acme.internal",
+                true,
+            ),
+            (
+                RegistryType::Nuget,
+                "runtime.linux-x64.Microsoft.NETCore.App",
+                "runtime.linux-x64.microsoft.netcore.app",
+                true,
+            ),
+            (RegistryType::Cargo, "Corp-*", "corp_tools", true),
+            (RegistryType::Cargo, "corp-tools", "corp_tools", true),
+            (RegistryType::Terraform, "Acme/**", "acme/infra", true),
+            (
+                RegistryType::Terraform,
+                "acme/**",
+                "acmecorp/vpc/aws",
+                false,
+            ),
+            (RegistryType::Go, "acme/**", "acme/x", true),
+            (RegistryType::Go, "acme/**", "acme-public/x", false),
+            (RegistryType::Go, "Acme/**", "acme/x", false),
+            (RegistryType::Maven, "com.corp.**", "com.corp:lib", true),
+            (
+                RegistryType::Maven,
+                "com.corp.**",
+                "com.corporate:lib",
+                false,
+            ),
+            (RegistryType::Npm, "@Scope/*", "@scope/pkg", false),
+        ];
+        for (registry, pattern, name, holds) in named {
+            assert_eq!(
+                curation_glob_match(registry, pattern, name),
+                holds,
+                "{registry:?} {pattern} {name}"
+            );
+        }
+    }
+
+    fn body() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9._-]{0,8}"
+    }
+
+    proptest! {
+        // A pattern's body counts in the registry's form in every syntax: writing the body in
+        // that form changes nothing, for any name.
+        #[test]
+        fn a_pattern_body_counts_in_the_registry_form(body in body(), tail in "[a-zA-Z0-9._/:-]{0,6}") {
+            for &registry in RegistryType::all() {
+                let formed = curation_name(registry, &body);
+                prop_assert_eq!(curation_name(registry, &formed), formed.clone(), "{:?} {}", registry, body);
+                for name in [formed.clone(), format!("{formed}{tail}"), format!("{tail}{formed}"), curation_name(registry, &format!("{body}{tail}"))] {
+                    for (pattern, in_form) in [
+                        (body.clone(), formed.clone()),
+                        (format!("{body}*"), format!("{formed}*")),
+                        (format!("*{body}"), format!("*{formed}")),
+                        (format!("{body}.**"), format!("{formed}.**")),
+                        (format!("{body}/**"), format!("{formed}/**")),
+                    ] {
+                        prop_assert_eq!(
+                            curation_glob_match(registry, &pattern, &name),
+                            curation_glob_match(registry, &in_form, &name),
+                            "{:?} {} {} {}", registry, pattern, in_form, name
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// PyPI file versions as pip 26.2.1 reads them (measured: `.tgz` is a candidate, `.egg` is
+/// unsupported), and the fuzzed copy in step.
+#[cfg(test)]
+mod pypi_files_as_pip_reads_them {
+    use super::{parse_pypi_version, pep503_normalize};
+
+    // pip reads `flask-1.0.tgz` as 1.0.
+    #[test]
+    fn a_tgz_sdist_reads_its_version() {
+        assert_eq!(
+            parse_pypi_version("flask", "flask-1.0.tgz").as_deref(),
+            Some("1.0")
+        );
+    }
+
+    // P02/P03: the fuzzed copy reads every extension NORA serves as curation does.
+    #[test]
+    fn the_fuzzed_copy_reads_every_served_extension_as_curation() {
+        for file in [
+            "flask-1.0.tgz",
+            "flask-1.0-py3.8.egg",
+            "Flask-1.0.tar.gz",
+            "flask-1.0.zip",
+            "flask-1.0-py3-none-any.whl",
+        ] {
+            assert_eq!(
+                parse_pypi_version("flask", file),
+                nora_registry::version_fuzz::parse_pypi_version("flask", file),
+                "{file}"
+            );
+        }
+    }
+
+    // pip's canonicalize_name folds case as Python's `str.lower` does: project `Flas\u{212A}`
+    // (KELVIN SIGN) is `flask`, and pip reads `flask-1.0.tar.gz` as its 1.0.
+    #[test]
+    fn a_project_name_folds_case_as_pip() {
+        let project = pep503_normalize("Flas\u{212A}");
+        assert_eq!(project, "flask");
+        assert_eq!(
+            parse_pypi_version(&project, "flask-1.0.tar.gz").as_deref(),
+            Some("1.0")
+        );
     }
 }

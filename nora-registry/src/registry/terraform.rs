@@ -102,6 +102,63 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
+// ── One decision for every request ─────────────────────────────────────
+
+/// The name curation and namespace isolation decide on for a provider: `ns/type`.
+fn provider_identity(ns: &str, ptype: &str) -> String {
+    format!("{}/{}", ns, ptype)
+}
+
+/// The name curation and namespace isolation decide on for a module: `ns/name/system`.
+fn module_identity(ns: &str, name: &str, system: &str) -> String {
+    format!("{}/{}/{}", ns, name, system)
+}
+
+/// What curation and namespace isolation decide for a request, taken by every handler before it
+/// serves or fetches anything: `Ok(true)` for an internal name (#68/#733), which is answered from
+/// its local copy only and never fetched; `Ok(false)` for a name to serve from a fresh local copy
+/// or fetch; `Err` with curation's refusal. A version list (`version` none) is not refused.
+fn tf_decide(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: &str,
+    version: Option<&str>,
+    publish_date: Option<i64>,
+) -> Result<bool, Box<Response>> {
+    let engine = &state.curation().curation_engine;
+    if crate::curation::is_internal_namespace(
+        engine,
+        crate::curation::RegistryType::Terraform,
+        identity,
+    ) {
+        return Ok(true);
+    }
+    match version.and_then(|version| {
+        crate::curation::check_download(
+            engine,
+            state.bypass_token().as_deref(),
+            headers,
+            crate::curation::RegistryType::Terraform,
+            identity,
+            crate::curation::RequestVersion::Known(version.to_string()),
+            publish_date,
+        )
+    }) {
+        Some(refusal) => Err(Box::new(refusal)),
+        None => Ok(false),
+    }
+}
+
+/// The answer to an internal name with no local copy: an isolation refusal, counted.
+fn tf_isolation_refusal(state: &AppState, identity: &str) -> Response {
+    crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Terraform,
+        identity,
+    )
+    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
 // ── Service discovery ──────────────────────────────────────────────────
 
 async fn service_discovery(State(state): State<AppState>) -> Response {
@@ -136,6 +193,11 @@ async fn provider_versions(
     if !is_valid_name(&ns) || !is_valid_name(&ptype) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let provider = provider_identity(&ns, &ptype);
+    let internal = match tf_decide(&state, &HeaderMap::new(), &provider, None, None) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
 
@@ -155,24 +217,14 @@ async fn provider_versions(
 
     // #68 namespace isolation: an internal-namespace provider's version list must
     // never be fetched upstream (dependency confusion). Serve any local copy (fresh
-    // path returned above), else block — never proxy. Name form matches the existing
-    // provider check_download: "{ns}/{ptype}".
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Terraform,
-        &format!("{}/{}", ns, ptype),
-    ) {
+    // path returned above), else block — never proxy.
+    if internal {
         if let Some(ref data) = cached_data {
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
         }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Terraform,
-            &format!("{}/{}", ns, ptype),
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        return tf_isolation_refusal(&state, &provider);
     }
 
     let proxy_url = upstream_url(&state);
@@ -245,24 +297,11 @@ async fn provider_download_meta(
 
     // Curation check. #733 serve-local: an internal-namespace provider is operator-owned — skip
     // curation and serve any local copy below; block the upstream branch separately.
-    let internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Terraform,
-        &format!("{}/{}", ns, ptype),
-    );
-    if !internal {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Terraform,
-            &format!("{}/{}", ns, ptype),
-            crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
-        ) {
-            return response;
-        }
-    }
+    let provider = provider_identity(&ns, &ptype);
+    let internal = match tf_decide(&state, &headers, &provider, Some(&ver), publish_date) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     let storage_key = format!(
         "terraform/providers/{}/{}/{}/{}_{}.json",
@@ -296,12 +335,7 @@ async fn provider_download_meta(
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
         }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Terraform,
-            &format!("{}/{}", ns, ptype),
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        return tf_isolation_refusal(&state, &provider);
     }
 
     let proxy_url = upstream_url(&state);
@@ -364,26 +398,28 @@ async fn provider_download_binary(
     if !is_safe_path(&path) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // Path format: {ns}/{type}/{ver}/{filename}, as `rewrite_download_url` writes it.
+    let parts: Vec<&str> = path.splitn(4, '/').collect();
+    if parts.len() < 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (ns, ptype, ver, filename) = (parts[0], parts[1], parts[2], parts[3]);
+    let provider = provider_identity(ns, ptype);
 
     let storage_key = format!("terraform/download/{}", path);
 
-    // Release date for the quarantine first-seen clock (#748/#750). The rewritten
-    // binary path is {ns}/{ptype}/{ver}/{file}, so reuse the cached provider
-    // metadata date (gated internally on trust_upstream_dates; None → NORA's clock).
+    // Release date for the quarantine first-seen clock (#748/#750): the cached provider
+    // metadata's date (gated internally on trust_upstream_dates; None → NORA's clock).
     // #754: skip the /v2 round-trip on a cache hit (the digest is already recorded).
     let already_cached = state.storage.stat(&storage_key).await.is_some();
-    let bin_coords: Vec<&str> = path.split('/').collect();
-    let publish_date = if bin_coords.len() >= 3 {
-        extract_terraform_publish_date(
-            &state,
-            bin_coords[0],
-            bin_coords[1],
-            bin_coords[2],
-            already_cached,
-        )
-        .await
-    } else {
-        None
+    let publish_date = extract_terraform_publish_date(&state, ns, ptype, ver, already_cached).await;
+
+    // A provider's files pass the curation its download metadata passes: a client can ask for
+    // them directly. An internal provider is operator-owned — served from the cache below and
+    // never fetched upstream.
+    let internal = match tf_decide(&state, &headers, &provider, Some(ver), publish_date) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
     };
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
@@ -440,15 +476,13 @@ async fn provider_download_binary(
         return with_binary(data.to_vec());
     }
 
-    // Try upstream — resolve the real download URL from cached metadata.
-    // Path format: {ns}/{type}/{ver}/{filename}
-    let parts: Vec<&str> = path.splitn(4, '/').collect();
-    if parts.len() < 4 {
-        return StatusCode::NOT_FOUND.into_response();
+    // #733: an internal provider's file that is not cached is refused, whatever URL metadata
+    // cached before the namespace became internal names.
+    if internal {
+        return tf_isolation_refusal(&state, &provider);
     }
-    let (ns, ptype, ver, filename) = (parts[0], parts[1], parts[2], parts[3]);
 
-    // Resolve the real upstream URL from cached provider metadata.
+    // Try upstream — resolve the real upstream URL from cached provider metadata.
     // The metadata JSON (cached by provider_download_meta) stores the
     // original download_url in `_nora_upstream_url`.
     let url = resolve_upstream_download_url(&state, ns, ptype, ver, filename).await;
@@ -523,6 +557,11 @@ async fn module_versions(
     if !is_valid_name(&ns) || !is_valid_name(&name) || !is_valid_name(&provider) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let module = module_identity(&ns, &name, &provider);
+    let internal = match tf_decide(&state, &HeaderMap::new(), &module, None, None) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     let storage_key = format!(
         "terraform/modules/{}/{}/{}/versions.json",
@@ -545,23 +584,14 @@ async fn module_versions(
 
     // #68 namespace isolation: an internal-namespace module's version list must never
     // be fetched upstream (dependency confusion). Serve any local copy (fresh path
-    // returned above), else block — never proxy. Module name form: "{ns}/{name}/{provider}".
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Terraform,
-        &format!("{}/{}/{}", ns, name, provider),
-    ) {
+    // returned above), else block — never proxy.
+    if internal {
         if let Some(ref data) = cached_data {
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
         }
-        return crate::curation::check_namespace_isolation(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Terraform,
-            &format!("{}/{}/{}", ns, name, provider),
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        return tf_isolation_refusal(&state, &module);
     }
 
     let proxy_url = upstream_url(&state);
@@ -613,6 +643,7 @@ async fn module_versions(
 
 async fn module_download(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -622,6 +653,14 @@ async fn module_download(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
+
+    // The download names the module itself: curation decides on it, and an internal-namespace
+    // module (#68/#733) is answered from a cached source URL only, never asked upstream.
+    let module = module_identity(&ns, &name, &provider);
+    let internal = match tf_decide(&state, &headers, &module, Some(&ver), None) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
     let base_url = nora_base_url(&state);
 
@@ -641,6 +680,10 @@ async fn module_download(
             [("x-terraform-get", rewritten.as_str())],
         )
             .into_response();
+    }
+
+    if internal {
+        return tf_isolation_refusal(&state, &module);
     }
 
     let proxy_url = upstream_url(&state);
@@ -729,6 +772,14 @@ async fn module_source_download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // The archive is the module: curation decides on it, and an internal-namespace module is
+    // served from the cache only, never fetched from its source URL.
+    let module = module_identity(&ns, &name, &provider);
+    let internal = match tf_decide(&state, &headers, &module, Some(&ver), None) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
+
     let storage_key = format!(
         "terraform/modules/{}/{}/{}/{}/source.tar.gz",
         ns, name, provider, ver
@@ -775,6 +826,10 @@ async fn module_source_download(
             return response;
         }
         return with_binary(data.to_vec());
+    }
+
+    if internal {
+        return tf_isolation_refusal(&state, &module);
     }
 
     // Resolve original upstream URL from cached metadata
@@ -881,9 +936,14 @@ async fn mirror_provider_index(
     if !is_valid_name(&hostname) || !is_valid_name(&ns) || !is_valid_name(&ptype) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let provider = provider_identity(&ns, &ptype);
+    let internal = match tf_decide(&state, &HeaderMap::new(), &provider, None, None) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
 
-    // Enforces #68/#733 namespace isolation internally (never proxies an internal ns).
-    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype).await {
+    // An internal provider's version list comes from the cache only (#68/#733).
+    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype, internal).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -921,40 +981,25 @@ async fn mirror_provider_version(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Version list drives the platform enumeration AND enforces namespace isolation.
-    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype).await {
+    // Curation parity (SEC #2): version.json is decided as the download-metadata step is, so a
+    // blocked version lists no archives to a mirror client (its files are refused on the binary
+    // path as well). An internal provider (#68/#733) is answered from the cache only: its version
+    // list and each platform's metadata.
+    let provider = provider_identity(&ns, &ptype);
+    let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, ver, false).await;
+    let internal = match tf_decide(&state, &headers, &provider, Some(ver), publish_date) {
+        Ok(internal) => internal,
+        Err(refusal) => return *refusal,
+    };
+
+    // Version list drives the platform enumeration.
+    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype, internal).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
     let platforms = extract_platforms(&versions_json, ver);
     if platforms.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
-    }
-
-    // Curation parity (SEC #2): the binary path runs only the quarantine gate, so
-    // blocklist / min-release-age is enforced ONLY at the download-metadata step.
-    // A mirror client hits the binary path directly, so version.json must run the
-    // same `check_download` or blocked providers leak to mirror clients. Skip for
-    // internal namespaces (operator-owned) — mirror_fetch_versions already served
-    // any local copy / blocked upstream for those.
-    let internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Terraform,
-        &format!("{}/{}", ns, ptype),
-    );
-    if !internal {
-        let publish_date = extract_terraform_publish_date(&state, &ns, &ptype, ver, false).await;
-        if let Some(resp) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Terraform,
-            &format!("{}/{}", ns, ptype),
-            crate::curation::RequestVersion::Known(ver.to_string()),
-            publish_date,
-        ) {
-            return resp;
-        }
     }
 
     let base_url = nora_base_url(&state);
@@ -966,7 +1011,16 @@ async fn mirror_provider_version(
     let (state_ref, base_ref, ns_ref, ptype_ref) =
         (&state, base_url.as_str(), ns.as_str(), ptype.as_str());
     let results = futures::future::join_all(platforms.iter().map(|(os, arch)| async move {
-        let res = mirror_fetch_archive(state_ref, base_ref, ns_ref, ptype_ref, ver, os, arch).await;
+        let res = mirror_fetch_archive(
+            state_ref,
+            base_ref,
+            ns_ref,
+            ptype_ref,
+            ver,
+            (os.as_str(), arch.as_str()),
+            internal,
+        )
+        .await;
         (os.clone(), arch.clone(), res)
     }))
     .await;
@@ -1010,6 +1064,7 @@ async fn mirror_fetch_versions(
     state: &AppState,
     ns: &str,
     ptype: &str,
+    internal: bool,
 ) -> Result<serde_json::Value, Box<Response>> {
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
     let cached_data = state.storage.get(&storage_key).await.ok();
@@ -1026,23 +1081,15 @@ async fn mirror_fetch_versions(
 
     // #68/#733 namespace isolation: an internal-namespace provider must never be
     // fetched upstream. Serve any local copy, else block — never proxy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Terraform,
-        &format!("{}/{}", ns, ptype),
-    ) {
+    if internal {
         if let Some(ref data) = cached_data {
             state.metrics.record_cache_hit("terraform");
             return parse_json(data);
         }
-        return Err(Box::new(
-            crate::curation::check_namespace_isolation(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Terraform,
-                &format!("{}/{}", ns, ptype),
-            )
-            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()),
-        ));
+        return Err(Box::new(tf_isolation_refusal(
+            state,
+            &provider_identity(ns, ptype),
+        )));
     }
 
     let proxy_url = upstream_url(state);
@@ -1096,8 +1143,8 @@ async fn mirror_fetch_archive(
     ns: &str,
     ptype: &str,
     ver: &str,
-    os: &str,
-    arch: &str,
+    (os, arch): (&str, &str),
+    internal: bool,
 ) -> Result<Option<(String, Option<String>)>, ProxyError> {
     if !is_valid_name(os) || !is_valid_name(arch) {
         return Ok(None);
@@ -1107,9 +1154,11 @@ async fn mirror_fetch_archive(
         ns, ptype, ver, os, arch
     );
 
-    // Cached metadata already carries the NORA-rewritten download_url; reuse it.
+    // Cached metadata already carries the NORA-rewritten download_url; reuse it. An internal
+    // provider's platform without it is not listed: its metadata is never fetched (#68/#733).
     let meta_text = match state.storage.get(&storage_key).await.ok() {
         Some(data) => String::from_utf8_lossy(&data).to_string(),
+        None if internal => return Ok(None),
         None => {
             let proxy_url = upstream_url(state);
             let url = format!(
@@ -2878,5 +2927,1232 @@ mod upstream_failure_edge_cases {
         let ctx = ctx_for(server.uri());
         let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+/// Terraform names compare as the registry resolves them: Terraform lowercases provider
+/// namespaces and types (terraform-registry-address `ParseProviderPart`), and registry.terraform.io
+/// answers provider and module paths in any case. So an internal namespace or a rule holds for a
+/// request in any case — a module source written `Acme/vpc/aws` is still `acme/**`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod terraform_names_in_any_case {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream_paths(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_internal_namespace_isolates_every_case() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"versions": []})),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        for path in [
+            "/terraform/v1/providers/Acme/infra/versions",
+            "/terraform/v1/providers/ACME/infra/1.0.0/download/linux/amd64",
+            "/terraform/v1/modules/Acme/vpc/aws/versions",
+            "/terraform/v1/modules/Acme/vpc/aws/1.0.0/download",
+        ] {
+            let _ = send(&ctx.app, Method::GET, path, "").await;
+        }
+        let asked = upstream_paths(&upstream).await;
+        assert!(asked.is_empty(), "internal names sent upstream: {asked:?}");
+        // Control: the same paths for a public namespace reach the upstream.
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/Public/infra/versions",
+            "",
+        )
+        .await;
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/Public/vpc/aws/versions",
+            "",
+        )
+        .await;
+        assert_eq!(
+            upstream_paths(&upstream).await.len(),
+            2,
+            "public twins reach the upstream"
+        );
+    }
+
+    // A module download is the module itself: an internal one never reaches the upstream,
+    // whatever its case, and the archive is not fetched from a source URL either.
+    #[tokio::test]
+    async fn an_internal_module_download_never_reaches_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", "https://example.invalid/acme-vpc.tar.gz"),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri.clone());
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        // A source URL left from before the namespace was internal.
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/acme/vpc/aws/1.0.0/_source_url",
+                format!("{}/archive.tar.gz", upstream.uri()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        for path in [
+            "/terraform/v1/modules/acme/vpc/aws/2.0.0/download",
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert!(!resp.status().is_success(), "{path}: {}", resp.status());
+        }
+        let asked = upstream_paths(&upstream).await;
+        assert!(asked.is_empty(), "internal module sent upstream: {asked:?}");
+    }
+
+    // A blocklist rule on a module holds for its download and its archive.
+    #[tokio::test]
+    async fn a_blocked_module_is_refused() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", "https://example.invalid/evil.tar.gz"),
+            )
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "terraform", "name": "evilcorp/backdoor/aws", "version": "*", "reason": "r"}]}"#,
+        )
+        .unwrap();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/evilcorp/backdoor/aws/1.0.0/source.tar.gz",
+                b"TGZ",
+            )
+            .await
+            .unwrap();
+        for path in [
+            "/terraform/v1/modules/evilcorp/backdoor/aws/1.0.0/download",
+            "/terraform/v1/modules/download/evilcorp/backdoor/aws/1.0.0/source",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_for_every_case() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "terraform", "name": "HashiCorp/AWS", "version": "*", "reason": "r"}]}"#,
+        )
+        .unwrap();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/aws/5.0.0/download/linux/amd64",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// A module's name and version reach curation whole, in lowercase only, and an internal module
+/// is answered from its cache.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod terraform_module_identity_and_cache {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", "https://example.invalid/m.tar.gz"),
+            )
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn list(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    // P1 (m2): the module system compares without case like the namespace and the name.
+    #[tokio::test]
+    async fn a_module_rule_holds_for_every_case_of_every_segment() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = list(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [{"registry": "terraform", "name": "EvilCorp/Backdoor/AWS", "version": "*", "reason": "r"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/evilcorp/backdoor/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // P2 (m3): `my-vpc` and `my_vpc` are two modules; an allowlist entry admits only its own.
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_only_its_own_module() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = list(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "terraform", "name": "acme/my-vpc/aws", "version": "1.0.0"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let other = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/acme/my_vpc/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::FORBIDDEN, "a module not listed");
+        let listed = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/ACME/My-VPC/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::NO_CONTENT, "the listed module");
+    }
+
+    // P3 (m8): curation sees the module's version — a rule on 1.0.0 refuses 1.0.0 and only it.
+    #[tokio::test]
+    async fn a_version_rule_holds_for_the_download_and_the_archive() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = list(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [{"registry": "terraform", "name": "evilcorp/backdoor/aws", "version": "1.0.0", "reason": "r"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/evilcorp/backdoor/aws/1.0.0/source.tar.gz",
+                b"TGZ",
+            )
+            .await
+            .unwrap();
+        for path in [
+            "/terraform/v1/modules/evilcorp/backdoor/aws/1.0.0/download",
+            "/terraform/v1/modules/download/evilcorp/backdoor/aws/1.0.0/source",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/evilcorp/backdoor/aws/2.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "another version");
+    }
+
+    // P4 (m7, m7b, m12): an internal module is answered from its cache — the saved source URL
+    // and the saved archive — with nothing sent upstream; the pattern names the module whole.
+    #[tokio::test]
+    async fn an_internal_module_is_served_from_its_cache() {
+        let upstream = upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/vpc/aws".to_string()];
+        });
+        let base = "terraform/modules/acme/vpc/aws/1.0.0";
+        ctx.state
+            .storage
+            .put(
+                &format!("{base}/_source_url"),
+                b"https://example.invalid/acme-vpc.tar.gz",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(&format!("{base}/source.tar.gz"), b"TGZ")
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/acme/vpc/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "download");
+        let get = resp.headers()["x-terraform-get"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get.contains("/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source"),
+            "{get}"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "archive");
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ");
+        let asked = upstream.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "internal module sent upstream: {asked:?}");
+    }
+}
+
+/// A provider's files (binary, checksums, signature) pass the curation its download metadata
+/// passes, since a client can ask for them directly, and an internal provider's files are served
+/// only from the cache.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod provider_files_under_curation_and_isolation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::Method;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Same scenario the diff closed for modules: metadata cached before the namespace became
+    // internal still names an upstream URL; the binary download must not follow it.
+    #[tokio::test]
+    async fn an_internal_provider_binary_never_reaches_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ZIP".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/acme/infra/1.0.0/linux_amd64.json",
+                serde_json::json!({"_nora_upstream_url": format!("{}/infra.zip", upstream.uri())})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/acme/infra/1.0.0/terraform-provider-infra_1.0.0_linux_amd64.zip",
+            "",
+        )
+        .await;
+        let asked = upstream.received_requests().await.unwrap();
+        assert!(
+            asked.is_empty(),
+            "internal provider binary fetched upstream ({}): {:?}",
+            resp.status(),
+            asked
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    const BINARY: &str = "/terraform/v1/providers/download/acme/infra/1.0.0/terraform-provider-infra_1.0.0_linux_amd64.zip";
+
+    // With no metadata cached either, an internal provider's file is an isolation refusal, not
+    // a guess at a public download URL.
+    #[tokio::test]
+    async fn an_internal_provider_without_metadata_is_refused() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        let resp = send(&ctx.app, Method::GET, BINARY, "").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // An internal provider's cached file is served.
+    #[tokio::test]
+    async fn an_internal_provider_is_served_from_its_cache() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/download/acme/infra/1.0.0/terraform-provider-infra_1.0.0_linux_amd64.zip",
+                b"ZIP",
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, BINARY, "").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // A blocked provider version is refused on its files too, cached or not; another version is
+    // served.
+    #[tokio::test]
+    async fn a_blocked_provider_version_is_refused_on_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "terraform", "name": "hashicorp/null", "version": "3.2.3", "reason": "bad"}]}"#,
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for ver in ["3.2.3", "3.2.4"] {
+            for file in [
+                format!("terraform-provider-null_{ver}_linux_amd64.zip"),
+                format!("terraform-provider-null_{ver}_SHA256SUMS"),
+            ] {
+                ctx.state
+                    .storage
+                    .put(
+                        &format!("terraform/download/hashicorp/null/{ver}/{file}"),
+                        b"F",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for (ver, expected) in [
+            ("3.2.3", axum::http::StatusCode::FORBIDDEN),
+            ("3.2.4", axum::http::StatusCode::OK),
+        ] {
+            for file in [
+                format!("terraform-provider-null_{ver}_linux_amd64.zip"),
+                format!("terraform-provider-null_{ver}_SHA256SUMS"),
+            ] {
+                let url = format!("/terraform/v1/providers/download/hashicorp/null/{ver}/{file}");
+                let resp = send(&ctx.app, Method::GET, &url, "").await;
+                assert_eq!(resp.status(), expected, "{url}");
+            }
+        }
+    }
+}
+
+/// An internal module refused for want of a cache is refused as an isolation refusal, and counted.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod internal_module_refusal_counted {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn an_internal_module_refusal_is_counted() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        let refused = || {
+            crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+                .with_label_values(&["terraform"])
+                .get()
+        };
+        let before = refused();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/acme/metric/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(refused() > before, "isolation refusal not counted");
+    }
+}
+
+/// Every Terraform path in one order: curation before any cached copy; an internal name, in any
+/// case and named whole, served from its cache and never fetched — files and archives too; every
+/// isolation refusal counted.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod terraform_every_path_one_order {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn recording() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-terraform-get", "https://example.invalid/m.tar.gz")
+                    .set_body_bytes(b"UPSTREAM".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    async fn asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    fn blocklist(dir: &tempfile::TempDir, name: &str, version: &str) -> String {
+        let path = dir.path().join("blocklist.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version": 1, "rules": [{{"registry": "terraform", "name": "{name}", "version": "{version}", "reason": "r"}}]}}"#
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Provider metadata cached before the namespace became internal, naming upstream URLs for
+    /// the archive, the checksums and their signature.
+    async fn seed_provider_meta(
+        ctx: &crate::test_helpers::TestContext,
+        ns: &str,
+        ptype: &str,
+        uri: &str,
+    ) {
+        ctx.state
+            .storage
+            .put(
+                &format!("terraform/providers/{ns}/{ptype}/1.0.0/linux_amd64.json"),
+                serde_json::json!({
+                    "_nora_upstream_url": format!("{uri}/infra.zip"),
+                    "_nora_upstream_shasums_url": format!("{uri}/SHA256SUMS"),
+                    "_nora_upstream_shasums_sig_url": format!("{uri}/SHA256SUMS.sig"),
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // t1 (inv. 2): a blocked module is refused on its download even when its source URL is
+    // cached from before the rule.
+    #[tokio::test]
+    async fn a_blocked_module_with_a_cached_source_url_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = blocklist(&dir, "evilcorp/backdoor/aws", "*");
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(list);
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/evilcorp/backdoor/aws/1.0.0/_source_url",
+                b"https://example.invalid/evil.tar.gz",
+            )
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/EvilCorp/backdoor/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mixed case");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/evilcorp/backdoor/aws/1.0.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "cached source URL");
+    }
+
+    // t2 (inv. 4): the download metadata a provider's files are curated like is curated with a
+    // fresh cache too.
+    #[tokio::test]
+    async fn a_blocked_provider_version_is_refused_on_cached_download_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = blocklist(&dir, "hashicorp/null", "3.2.3");
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(list);
+        });
+        for ver in ["3.2.3", "3.2.4"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("terraform/providers/hashicorp/null/{ver}/linux_amd64.json"),
+                    br#"{"download_url": "x", "shasum": "00"}"#,
+                )
+                .await
+                .unwrap();
+        }
+        for (ver, expected) in [("3.2.3", StatusCode::FORBIDDEN), ("3.2.4", StatusCode::OK)] {
+            let url = format!("/terraform/v1/providers/hashicorp/null/{ver}/download/linux/amd64");
+            let resp = send(&ctx.app, Method::GET, &url, "").await;
+            assert_eq!(resp.status(), expected, "{url}");
+        }
+    }
+
+    // t3 (inv. 4): an internal provider's checksums and signature never reach the upstream,
+    // whatever URL cached metadata names for them.
+    #[tokio::test]
+    async fn an_internal_provider_checksums_and_signature_never_reach_upstream() {
+        let upstream = recording().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        seed_provider_meta(&ctx, "acme", "infra", &upstream.uri()).await;
+        for file in [
+            "terraform-provider-infra_1.0.0_SHA256SUMS",
+            "terraform-provider-infra_1.0.0_SHA256SUMS.sig",
+        ] {
+            let url = format!("/terraform/v1/providers/download/acme/infra/1.0.0/{file}");
+            let resp = send(&ctx.app, Method::GET, &url, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{url}");
+        }
+        let sent = asked(&upstream).await;
+        assert!(
+            sent.is_empty(),
+            "internal provider files sent upstream: {sent:?}"
+        );
+    }
+
+    // t4 (inv. 1, 4): an internal namespace pattern naming the provider itself isolates its
+    // files.
+    #[tokio::test]
+    async fn an_internal_provider_named_whole_is_isolated_and_served_from_its_cache() {
+        let upstream = recording().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/infra".to_string()];
+        });
+        seed_provider_meta(&ctx, "acme", "infra", &upstream.uri()).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/acme/infra/1.0.0/terraform-provider-infra_1.0.0_linux_amd64.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let sent = asked(&upstream).await;
+        assert!(
+            sent.is_empty(),
+            "internal provider binary sent upstream: {sent:?}"
+        );
+        // Its own cached file is served: the pattern makes it internal, not merely refused.
+        ctx.state.storage.put("terraform/download/acme/infra/2.0.0/terraform-provider-infra_2.0.0_linux_amd64.zip", b"OWN").await.unwrap();
+        let resp = send(&ctx.app, Method::GET, "/terraform/v1/providers/download/acme/infra/2.0.0/terraform-provider-infra_2.0.0_linux_amd64.zip", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cached internal provider file"
+        );
+    }
+
+    // t5 (inv. 1, 4): an internal provider's files are isolated in any case.
+    #[tokio::test]
+    async fn an_internal_provider_in_any_case_is_isolated_and_served_from_its_cache() {
+        let upstream = recording().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        seed_provider_meta(&ctx, "Acme", "INFRA", &upstream.uri()).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/Acme/INFRA/1.0.0/terraform-provider-infra_1.0.0_linux_amd64.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let sent = asked(&upstream).await;
+        assert!(
+            sent.is_empty(),
+            "internal provider binary sent upstream: {sent:?}"
+        );
+        // Its own cached file is served: the pattern makes it internal, not merely refused.
+        ctx.state.storage.put("terraform/download/Acme/INFRA/2.0.0/terraform-provider-infra_2.0.0_linux_amd64.zip", b"OWN").await.unwrap();
+        let resp = send(&ctx.app, Method::GET, "/terraform/v1/providers/download/Acme/INFRA/2.0.0/terraform-provider-infra_2.0.0_linux_amd64.zip", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cached internal provider file, mixed case"
+        );
+    }
+
+    // t6 (inv. 1, 3): an internal module's archive is isolated in any case.
+    #[tokio::test]
+    async fn an_internal_module_archive_in_any_case_is_isolated_and_served_from_its_cache() {
+        let upstream = recording().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/Acme/VPC/aws/1.0.0/_source_url",
+                format!("{}/acme-vpc.tar.gz", upstream.uri()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/Acme/VPC/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let sent = asked(&upstream).await;
+        assert!(
+            sent.is_empty(),
+            "internal module archive sent upstream: {sent:?}"
+        );
+        // Its own cached file is served: the pattern makes it internal, not merely refused.
+        ctx.state
+            .storage
+            .put("terraform/modules/Acme/VPC/aws/2.0.0/source.tar.gz", b"OWN")
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/Acme/VPC/aws/2.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cached internal module archive, mixed case"
+        );
+    }
+
+    // t7 (inv. 3): an internal module's archive refused for want of a cache is counted as an
+    // isolation refusal. Many refusals, so parallel tests cannot make up the count.
+    #[tokio::test]
+    async fn an_internal_module_archive_refusal_is_counted() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        let refused = || {
+            crate::metrics::NAMESPACE_ISOLATION_REFUSED_TOTAL
+                .with_label_values(&["terraform"])
+                .get()
+        };
+        let before = refused();
+        const N: u64 = 64;
+        for _ in 0..N {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/terraform/v1/modules/download/acme/counted/aws/1.0.0/source",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(
+            refused() - before >= N,
+            "archive isolation refusals not counted"
+        );
+    }
+
+    // t11 (inv. 1): an internal namespace pattern naming the module whole isolates its version
+    // list, in any case.
+    #[tokio::test]
+    async fn an_internal_module_named_whole_isolates_its_versions() {
+        let upstream = recording().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/vpc/aws".to_string()];
+        });
+        for path in [
+            "/terraform/v1/modules/acme/vpc/aws/versions",
+            "/terraform/v1/modules/ACME/Vpc/AWS/versions",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let sent = asked(&upstream).await;
+        assert!(
+            sent.is_empty(),
+            "internal module versions sent upstream: {sent:?}"
+        );
+    }
+}
+
+/// A mirror `{version}.json` for an internal provider whose version list is cached does not ask
+/// upstream for its platforms' download metadata.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod internal_mirror_version_stays_local {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::Method;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn an_internal_mirror_version_never_reaches_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "download_url": "https://example.invalid/infra.zip", "shasum": "00"
+            })))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["acme/**".to_string()];
+        });
+        // The operator's own version list, published or cached; no platform metadata yet.
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/acme/infra/versions.json",
+                serde_json::json!({"versions": [{"version": "1.0.0",
+                    "platforms": [{"os": "linux", "arch": "amd64"}]}]})
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/acme/infra/1.0.0.json",
+            "",
+        )
+        .await;
+        let asked: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(
+            asked.is_empty(),
+            "internal provider metadata sent upstream ({}): {asked:?}",
+            resp.status()
+        );
+    }
+}
+
+/// Every Terraform handler decides through `tf_decide` before it serves or fetches anything, the
+/// decision's names come only from `provider_identity` and `module_identity`, and curation and
+/// isolation are asked nowhere else: a white list over this file's production code. Its own
+/// controls show the reader catches a handler that serves first, a second decision site and an
+/// identity built by hand.
+#[cfg(test)]
+mod terraform_decides_once {
+    use crate::test_helpers::source_reader::{body, holders, production};
+
+    const HANDLERS: [&str; 8] = [
+        "provider_versions",
+        "provider_download_meta",
+        "provider_download_binary",
+        "module_versions",
+        "module_download",
+        "module_source_download",
+        "mirror_provider_index",
+        "mirror_provider_version",
+    ];
+    const SERVES_OR_FETCHES: [&str; 11] = [
+        "with_json(",
+        "with_binary(",
+        "NO_CONTENT",
+        "proxy_fetch",
+        "resolve_upstream_download_url(",
+        "mirror_fetch_versions(",
+        "mirror_fetch_archive(",
+        "range_binary(",
+        "serve_stale_or_bad_gateway(",
+        ".send()",
+        "storage.get_verified(",
+    ];
+
+    fn violations(source: &str) -> Vec<String> {
+        let code = production(source);
+        let mut wrong = Vec::new();
+        for (needle, allowed) in [
+            (
+                "is_internal_namespace(",
+                &["extract_terraform_publish_date", "tf_decide"][..],
+            ),
+            ("check_download(", &["tf_decide"][..]),
+            ("check_namespace_isolation(", &["tf_isolation_refusal"][..]),
+            ("tf_decide(", &HANDLERS[..]),
+        ] {
+            for holder in holders(code, needle) {
+                if !allowed.contains(&holder.as_str()) {
+                    wrong.push(format!("{needle} in {holder}"));
+                }
+            }
+        }
+        for handler in HANDLERS {
+            let Some(body) = body(code, handler) else {
+                wrong.push(format!("{handler}: not found"));
+                continue;
+            };
+            let Some(decide) = body.find("tf_decide(") else {
+                wrong.push(format!("{handler}: no decision"));
+                continue;
+            };
+            if let Some(first) = SERVES_OR_FETCHES
+                .iter()
+                .filter_map(|token| body.find(token).map(|at| (at, token)))
+                .min()
+            {
+                if first.0 < decide {
+                    wrong.push(format!("{handler}: {} before the decision", first.1));
+                }
+            }
+            let call = &body[decide..];
+            let identity = call[..call.find(';').unwrap_or(call.len())].to_string();
+            if !(identity.contains("&provider") || identity.contains("&module")) {
+                wrong.push(format!("{handler}: decides on {identity}"));
+            }
+            for (variable, builder) in [
+                ("let provider = ", "provider_identity("),
+                ("let module = ", "module_identity("),
+            ] {
+                if let Some(at) = body.find(variable) {
+                    if !body[at + variable.len()..].starts_with(builder) {
+                        wrong.push(format!("{handler}: {variable}not from {builder}"));
+                    }
+                }
+            }
+        }
+        wrong
+    }
+
+    #[test]
+    fn every_handler_decides_once_before_serving() {
+        let wrong = violations(include_str!("terraform.rs"));
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn the_white_list_catches_a_handler_that_serves_first() {
+        let source = include_str!("terraform.rs");
+        let serves_first = source.replacen(
+            "    let provider = provider_identity(&ns, &ptype);\n    let internal = match tf_decide(&state, &HeaderMap::new(), &provider, None, None) {",
+            "    let _early = with_json(Vec::new());\n    let provider = provider_identity(&ns, &ptype);\n    let internal = match tf_decide(&state, &HeaderMap::new(), &provider, None, None) {",
+            1,
+        );
+        assert_ne!(serves_first, source);
+        assert!(!violations(&serves_first).is_empty());
+        let second_site = source.replacen(
+            "fn tf_isolation_refusal(",
+            "fn tf_second(state: &AppState) { let _ = crate::curation::check_download(state); }\nfn tf_isolation_refusal(",
+            1,
+        );
+        assert!(violations(&second_site)
+            .iter()
+            .any(|v| v.contains("check_download")));
+        let by_hand = source.replacen(
+            "    let provider = provider_identity(ns, ptype);",
+            "    let provider = format!(\"{}\", ns);",
+            1,
+        );
+        assert_ne!(by_hand, source);
+        assert!(!violations(&by_hand).is_empty());
+    }
+}
+
+/// The decision as a table: an internal name in any case and pattern form, a curation refusal
+/// for an artifact's version only (a version list is not refused), every other name proxied.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tf_decide_table {
+    use super::{module_identity, provider_identity, tf_decide};
+    use crate::test_helpers::create_test_context_with_config;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn every_name_is_decided_as_the_table_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [
+                {"registry": "terraform", "name": "evilcorp/backdoor", "version": "1.0.0", "reason": "r"},
+                {"registry": "terraform", "name": "evilcorp/vpc/aws", "version": "*", "reason": "r"}
+            ]}"#,
+        )
+        .unwrap();
+        let blocklist = blocklist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.internal_namespaces = vec![
+                "acme/**".to_string(),
+                "corp/infra".to_string(),
+                "corp/vpc/aws".to_string(),
+            ];
+        });
+        let cases = [
+            (
+                provider_identity("acme", "infra"),
+                Some("1.0.0"),
+                "internal",
+            ),
+            (
+                provider_identity("Acme", "INFRA"),
+                Some("1.0.0"),
+                "internal",
+            ),
+            (module_identity("acme", "vpc", "aws"), None, "internal"),
+            (provider_identity("corp", "infra"), None, "internal"),
+            (
+                provider_identity("Corp", "Infra"),
+                Some("2.0.0"),
+                "internal",
+            ),
+            (
+                module_identity("corp", "vpc", "aws"),
+                Some("1.0.0"),
+                "internal",
+            ),
+            (module_identity("CORP", "VPC", "AWS"), None, "internal"),
+            (provider_identity("corp", "other"), Some("1.0.0"), "proxy"),
+            (
+                module_identity("corp", "vpc", "gcp"),
+                Some("1.0.0"),
+                "proxy",
+            ),
+            (provider_identity("acmecorp", "x"), Some("1.0.0"), "proxy"),
+            (
+                provider_identity("evilcorp", "backdoor"),
+                Some("1.0.0"),
+                "refused",
+            ),
+            (
+                provider_identity("EvilCorp", "Backdoor"),
+                Some("1.0.0"),
+                "refused",
+            ),
+            (
+                provider_identity("evilcorp", "backdoor"),
+                Some("2.0.0"),
+                "proxy",
+            ),
+            (provider_identity("evilcorp", "backdoor"), None, "proxy"),
+            (
+                module_identity("evilcorp", "vpc", "aws"),
+                Some("3.1.0"),
+                "refused",
+            ),
+            (module_identity("evilcorp", "vpc", "aws"), None, "proxy"),
+        ];
+        for (identity, version, expected) in cases {
+            let got = match tf_decide(&ctx.state, &HeaderMap::new(), &identity, version, None) {
+                Ok(true) => "internal",
+                Ok(false) => "proxy",
+                Err(_) => "refused",
+            };
+            assert_eq!(got, expected, "{identity} {version:?}");
+        }
+    }
+}
+
+/// The decision is given the version's publish date: a version younger than the minimum release
+/// age is refused on its download metadata and its files, one old enough is served (hosted mode:
+/// the date is when its metadata was stored).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod terraform_release_age_decided {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    fn age(root: &std::path::Path, needle: &str, days: u64) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.to_string_lossy().contains(needle) {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_younger_than_the_minimum_age_is_refused() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = None;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        for ver in ["1.0.0", "2.0.0"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("terraform/providers/hashicorp/null/{ver}/linux_amd64.json"),
+                    br#"{"download_url": "x"}"#,
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(
+                    &format!("terraform/download/hashicorp/null/{ver}/terraform-provider-null_{ver}_linux_amd64.zip"),
+                    b"ZIP",
+                )
+                .await
+                .unwrap();
+        }
+        age(ctx._tempdir.path(), "null/1.0.0/linux_amd64.json", 30);
+        for (ver, expected) in [("1.0.0", StatusCode::OK), ("2.0.0", StatusCode::FORBIDDEN)] {
+            for url in [
+                format!("/terraform/v1/providers/hashicorp/null/{ver}/download/linux/amd64"),
+                format!("/terraform/v1/providers/download/hashicorp/null/{ver}/terraform-provider-null_{ver}_linux_amd64.zip"),
+            ] {
+                let resp = send(&ctx.app, Method::GET, &url, "").await;
+                assert_eq!(resp.status(), expected, "{url}");
+            }
+        }
     }
 }

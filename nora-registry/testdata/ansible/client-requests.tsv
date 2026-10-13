@@ -1,0 +1,151 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/ansible:/w:ro" python:3.13-slim sh -c 'pip install -q "ansible-core==2.21.5" 2>/dev/null; python /w/client_requests.py' > nora-registry/testdata/ansible/client-requests.tsv
+# ansible-core 2.21.5 (python:3.13-slim), server http://127.0.0.1:<port>/ansible/
+# kind	namespace	name	version	artifact file name, or request (method path)
+build	community	general	10.1.0	community-general-10.1.0.tar.gz
+build	my_ns	my_coll	1.0.0-beta.1	my_ns-my_coll-1.0.0-beta.1.tar.gz
+build	acme	tools	2.0.0+build.7	acme-tools-2.0.0+build.7.tar.gz
+build	ns1	c_2	0.1.0-rc.1+sha.5114f85	ns1-c_2-0.1.0-rc.1+sha.5114f85.tar.gz
+build	a	b	1.0.0	a-b-1.0.0.tar.gz
+build	ns	x	1.0.0-0.3.7	ns-x-1.0.0-0.3.7.tar.gz
+build	ns	y	1.0.0-x-y-z.1	ns-y-1.0.0-x-y-z.1.tar.gz
+build	Upper	Coll	1.0.0	Upper-Coll-1.0.0.tar.gz
+build	ns	z	01.0.0	ns-z-01.0.0.tar.gz
+build	ns	w	1.0	ns-w-1.0.tar.gz
+build	ns	v	v1.0.0	ns-v-v1.0.0.tar.gz
+build	ns	u	1.0.0-01	ns-u-1.0.0-01.tar.gz
+build	ns	t	1.0.0+01	ns-t-1.0.0+01.tar.gz
+build	ns	s	1.0.0_1	ns-s-1.0.0_1.tar.gz
+build	n__s	dunder	1.0.0	n__s-dunder-1.0.0.tar.gz
+build	_ns	lead	1.0.0	_ns-lead-1.0.0.tar.gz
+build	ns	if	1.0.0	ns-if-1.0.0.tar.gz
+install	community	general	10.1.0	GET /ansible/
+install	community	general	10.1.0	GET /ansible/v3/collections/community/general/versions/?limit=100
+install	community	general	10.1.0	GET /ansible/v3/collections/community/general/versions/10.1.0/
+install	community	general	10.1.0	GET /ansible/v3/collections/community/general/versions/10.1.0/
+install	community	general	10.1.0	GET /ansible/download/community-general-10.1.0.tar.gz
+download	community	general	10.1.0	GET /ansible/
+download	community	general	10.1.0	GET /ansible/v3/collections/community/general/versions/?limit=100
+download	community	general	10.1.0	GET /ansible/v3/collections/community/general/versions/10.1.0/
+download	community	general	10.1.0	GET /ansible/download/community-general-10.1.0.tar.gz
+install	my_ns	my_coll	1.0.0-beta.1	GET /ansible/
+install	my_ns	my_coll	1.0.0-beta.1	GET /ansible/v3/collections/my_ns/my_coll/versions/?limit=100
+install	my_ns	my_coll	1.0.0-beta.1	GET /ansible/v3/collections/my_ns/my_coll/versions/1.0.0-beta.1/
+install	my_ns	my_coll	1.0.0-beta.1	GET /ansible/v3/collections/my_ns/my_coll/versions/1.0.0-beta.1/
+install	my_ns	my_coll	1.0.0-beta.1	GET /ansible/download/my_ns-my_coll-1.0.0-beta.1.tar.gz
+download	my_ns	my_coll	1.0.0-beta.1	GET /ansible/
+download	my_ns	my_coll	1.0.0-beta.1	GET /ansible/v3/collections/my_ns/my_coll/versions/?limit=100
+download	my_ns	my_coll	1.0.0-beta.1	GET /ansible/v3/collections/my_ns/my_coll/versions/1.0.0-beta.1/
+download	my_ns	my_coll	1.0.0-beta.1	GET /ansible/download/my_ns-my_coll-1.0.0-beta.1.tar.gz
+install	acme	tools	2.0.0+build.7	GET /ansible/
+install	acme	tools	2.0.0+build.7	GET /ansible/v3/collections/acme/tools/versions/?limit=100
+install	acme	tools	2.0.0+build.7	GET /ansible/v3/collections/acme/tools/versions/2.0.0+build.7/
+install	acme	tools	2.0.0+build.7	GET /ansible/v3/collections/acme/tools/versions/2.0.0+build.7/
+install	acme	tools	2.0.0+build.7	GET /ansible/download/acme-tools-2.0.0+build.7.tar.gz
+download	acme	tools	2.0.0+build.7	GET /ansible/
+download	acme	tools	2.0.0+build.7	GET /ansible/v3/collections/acme/tools/versions/?limit=100
+download	acme	tools	2.0.0+build.7	GET /ansible/v3/collections/acme/tools/versions/2.0.0+build.7/
+download	acme	tools	2.0.0+build.7	GET /ansible/download/acme-tools-2.0.0+build.7.tar.gz
+install	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/
+install	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/v3/collections/ns1/c_2/versions/?limit=100
+install	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/v3/collections/ns1/c_2/versions/0.1.0-rc.1+sha.5114f85/
+install	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/v3/collections/ns1/c_2/versions/0.1.0-rc.1+sha.5114f85/
+install	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/download/ns1-c_2-0.1.0-rc.1+sha.5114f85.tar.gz
+download	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/
+download	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/v3/collections/ns1/c_2/versions/?limit=100
+download	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/v3/collections/ns1/c_2/versions/0.1.0-rc.1+sha.5114f85/
+download	ns1	c_2	0.1.0-rc.1+sha.5114f85	GET /ansible/download/ns1-c_2-0.1.0-rc.1+sha.5114f85.tar.gz
+install	a	b	1.0.0	GET /ansible/
+install	a	b	1.0.0	GET /ansible/v3/collections/a/b/versions/?limit=100
+install	a	b	1.0.0	GET /ansible/v3/collections/a/b/versions/1.0.0/
+install	a	b	1.0.0	GET /ansible/v3/collections/a/b/versions/1.0.0/
+install	a	b	1.0.0	GET /ansible/download/a-b-1.0.0.tar.gz
+download	a	b	1.0.0	GET /ansible/
+download	a	b	1.0.0	GET /ansible/v3/collections/a/b/versions/?limit=100
+download	a	b	1.0.0	GET /ansible/v3/collections/a/b/versions/1.0.0/
+download	a	b	1.0.0	GET /ansible/download/a-b-1.0.0.tar.gz
+install	ns	x	1.0.0-0.3.7	GET /ansible/
+install	ns	x	1.0.0-0.3.7	GET /ansible/v3/collections/ns/x/versions/?limit=100
+install	ns	x	1.0.0-0.3.7	GET /ansible/v3/collections/ns/x/versions/1.0.0-0.3.7/
+install	ns	x	1.0.0-0.3.7	GET /ansible/v3/collections/ns/x/versions/1.0.0-0.3.7/
+install	ns	x	1.0.0-0.3.7	GET /ansible/download/ns-x-1.0.0-0.3.7.tar.gz
+download	ns	x	1.0.0-0.3.7	GET /ansible/
+download	ns	x	1.0.0-0.3.7	GET /ansible/v3/collections/ns/x/versions/?limit=100
+download	ns	x	1.0.0-0.3.7	GET /ansible/v3/collections/ns/x/versions/1.0.0-0.3.7/
+download	ns	x	1.0.0-0.3.7	GET /ansible/download/ns-x-1.0.0-0.3.7.tar.gz
+install	ns	y	1.0.0-x-y-z.1	GET /ansible/
+install	ns	y	1.0.0-x-y-z.1	GET /ansible/v3/collections/ns/y/versions/?limit=100
+install	ns	y	1.0.0-x-y-z.1	GET /ansible/v3/collections/ns/y/versions/1.0.0-x-y-z.1/
+install	ns	y	1.0.0-x-y-z.1	GET /ansible/v3/collections/ns/y/versions/1.0.0-x-y-z.1/
+install	ns	y	1.0.0-x-y-z.1	GET /ansible/download/ns-y-1.0.0-x-y-z.1.tar.gz
+download	ns	y	1.0.0-x-y-z.1	GET /ansible/
+download	ns	y	1.0.0-x-y-z.1	GET /ansible/v3/collections/ns/y/versions/?limit=100
+download	ns	y	1.0.0-x-y-z.1	GET /ansible/v3/collections/ns/y/versions/1.0.0-x-y-z.1/
+download	ns	y	1.0.0-x-y-z.1	GET /ansible/download/ns-y-1.0.0-x-y-z.1.tar.gz
+install	Upper	Coll	1.0.0	GET /ansible/
+install	Upper	Coll	1.0.0	GET /ansible/v3/collections/Upper/Coll/versions/?limit=100
+install	Upper	Coll	1.0.0	GET /ansible/v3/collections/Upper/Coll/versions/1.0.0/
+install	Upper	Coll	1.0.0	GET /ansible/v3/collections/Upper/Coll/versions/1.0.0/
+install	Upper	Coll	1.0.0	GET /ansible/download/Upper-Coll-1.0.0.tar.gz
+download	Upper	Coll	1.0.0	GET /ansible/
+download	Upper	Coll	1.0.0	GET /ansible/v3/collections/Upper/Coll/versions/?limit=100
+download	Upper	Coll	1.0.0	GET /ansible/v3/collections/Upper/Coll/versions/1.0.0/
+download	Upper	Coll	1.0.0	GET /ansible/download/Upper-Coll-1.0.0.tar.gz
+install	ns	z	01.0.0	GET /ansible/
+install	ns	z	01.0.0	GET /ansible/v3/collections/ns/z/versions/?limit=100
+install	ns	z	01.0.0	CLIENT-ERROR [ERROR]: invalid semantic version '01.0.0'
+download	ns	z	01.0.0	GET /ansible/
+download	ns	z	01.0.0	GET /ansible/v3/collections/ns/z/versions/?limit=100
+download	ns	z	01.0.0	CLIENT-ERROR [ERROR]: invalid semantic version '01.0.0'
+install	ns	w	1.0	GET /ansible/
+install	ns	w	1.0	GET /ansible/v3/collections/ns/w/versions/?limit=100
+install	ns	w	1.0	CLIENT-ERROR [ERROR]: invalid semantic version '1.0'
+download	ns	w	1.0	GET /ansible/
+download	ns	w	1.0	GET /ansible/v3/collections/ns/w/versions/?limit=100
+download	ns	w	1.0	CLIENT-ERROR [ERROR]: invalid semantic version '1.0'
+install	ns	v	v1.0.0	GET /ansible/
+install	ns	v	v1.0.0	GET /ansible/v3/collections/ns/v/versions/?limit=100
+install	ns	v	v1.0.0	CLIENT-ERROR [ERROR]: invalid semantic version 'v1.0.0'
+download	ns	v	v1.0.0	GET /ansible/
+download	ns	v	v1.0.0	GET /ansible/v3/collections/ns/v/versions/?limit=100
+download	ns	v	v1.0.0	CLIENT-ERROR [ERROR]: invalid semantic version 'v1.0.0'
+install	ns	u	1.0.0-01	GET /ansible/
+install	ns	u	1.0.0-01	GET /ansible/v3/collections/ns/u/versions/?limit=100
+install	ns	u	1.0.0-01	CLIENT-ERROR [ERROR]: invalid semantic version '1.0.0-01'
+download	ns	u	1.0.0-01	GET /ansible/
+download	ns	u	1.0.0-01	GET /ansible/v3/collections/ns/u/versions/?limit=100
+download	ns	u	1.0.0-01	CLIENT-ERROR [ERROR]: invalid semantic version '1.0.0-01'
+install	ns	t	1.0.0+01	GET /ansible/
+install	ns	t	1.0.0+01	GET /ansible/v3/collections/ns/t/versions/?limit=100
+install	ns	t	1.0.0+01	GET /ansible/v3/collections/ns/t/versions/1.0.0+01/
+install	ns	t	1.0.0+01	GET /ansible/v3/collections/ns/t/versions/1.0.0+01/
+install	ns	t	1.0.0+01	GET /ansible/download/ns-t-1.0.0+01.tar.gz
+download	ns	t	1.0.0+01	GET /ansible/
+download	ns	t	1.0.0+01	GET /ansible/v3/collections/ns/t/versions/?limit=100
+download	ns	t	1.0.0+01	GET /ansible/v3/collections/ns/t/versions/1.0.0+01/
+download	ns	t	1.0.0+01	GET /ansible/download/ns-t-1.0.0+01.tar.gz
+install	ns	s	1.0.0_1	GET /ansible/
+install	ns	s	1.0.0_1	GET /ansible/v3/collections/ns/s/versions/?limit=100
+install	ns	s	1.0.0_1	CLIENT-ERROR [ERROR]: invalid semantic version '1.0.0_1'
+download	ns	s	1.0.0_1	GET /ansible/
+download	ns	s	1.0.0_1	GET /ansible/v3/collections/ns/s/versions/?limit=100
+download	ns	s	1.0.0_1	CLIENT-ERROR [ERROR]: invalid semantic version '1.0.0_1'
+install	n__s	dunder	1.0.0	GET /ansible/
+install	n__s	dunder	1.0.0	GET /ansible/v3/collections/n__s/dunder/versions/?limit=100
+install	n__s	dunder	1.0.0	GET /ansible/v3/collections/n__s/dunder/versions/1.0.0/
+install	n__s	dunder	1.0.0	GET /ansible/v3/collections/n__s/dunder/versions/1.0.0/
+install	n__s	dunder	1.0.0	GET /ansible/download/n__s-dunder-1.0.0.tar.gz
+download	n__s	dunder	1.0.0	GET /ansible/
+download	n__s	dunder	1.0.0	GET /ansible/v3/collections/n__s/dunder/versions/?limit=100
+download	n__s	dunder	1.0.0	GET /ansible/v3/collections/n__s/dunder/versions/1.0.0/
+download	n__s	dunder	1.0.0	GET /ansible/download/n__s-dunder-1.0.0.tar.gz
+install	_ns	lead	1.0.0	GET /ansible/
+install	_ns	lead	1.0.0	GET /ansible/v3/collections/_ns/lead/versions/?limit=100
+install	_ns	lead	1.0.0	GET /ansible/v3/collections/_ns/lead/versions/1.0.0/
+install	_ns	lead	1.0.0	GET /ansible/v3/collections/_ns/lead/versions/1.0.0/
+install	_ns	lead	1.0.0	GET /ansible/download/_ns-lead-1.0.0.tar.gz
+download	_ns	lead	1.0.0	GET /ansible/
+download	_ns	lead	1.0.0	GET /ansible/v3/collections/_ns/lead/versions/?limit=100
+download	_ns	lead	1.0.0	GET /ansible/v3/collections/_ns/lead/versions/1.0.0/
+download	_ns	lead	1.0.0	GET /ansible/download/_ns-lead-1.0.0.tar.gz
+install	ns	if	1.0.0	CLIENT-ERROR Could not find ns.if.
+download	ns	if	1.0.0	CLIENT-ERROR Could not find ns.if.

@@ -737,3 +737,83 @@ pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCount
         metric,
     }
 }
+
+/// The path of every request an upstream mock has received, in order.
+pub async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
+    upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+/// A curation blocklist file refusing every version of `name` in `registry`. Keep the
+/// directory alive while a context uses the path.
+pub fn blocklist_file(registry: &str, name: &str) -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocklist.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"version": 1, "rules": [{{"registry": "{registry}", "name": "{name}", "version": "*", "reason": "malware"}}]}}"#),
+    )
+    .unwrap();
+    (dir, path.to_string_lossy().into_owned())
+}
+
+/// Readers of a source file for white-list teeth: which functions hold a call, and the body of a
+/// function. They read production code only — everything before the first test module.
+pub mod source_reader {
+    /// Production code: everything before the first `#[cfg(test)]` at the start of a line.
+    pub fn production(source: &str) -> &str {
+        &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())]
+    }
+
+    /// The name a top-level function's signature line declares (`fn`, `async fn`, `pub fn`,
+    /// `pub(crate) async fn`, …), if the line is one.
+    fn declares(line: &str) -> Option<&str> {
+        let mut rest = line;
+        for prefix in ["pub(crate) ", "pub "] {
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
+        }
+        rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        Some(&rest[..rest.find(['(', '<']).unwrap_or(rest.len())])
+    }
+
+    /// The body of the top-level function `name`, from its signature to its closing brace.
+    pub fn body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+        let mut offset = 0;
+        for line in source.split_inclusive('\n') {
+            if declares(line) == Some(name) {
+                let end = source[offset..].find("\n}\n").map(|end| offset + end)?;
+                return Some(&source[offset..end]);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// The top-level functions whose bodies contain `needle`, a call on the signature's own line
+    /// included; `fn needle(` itself is no call.
+    pub fn holders(source: &str, needle: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            if let Some(name) = declares(line) {
+                current = name.to_string();
+            }
+            // An occurrence that names the function being declared (`fn needle(`) is not a call.
+            if line
+                .match_indices(needle)
+                .any(|(at, _)| !line[..at].ends_with("fn "))
+            {
+                found.push(current.clone());
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+}

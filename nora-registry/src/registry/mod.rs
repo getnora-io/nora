@@ -1522,6 +1522,55 @@ mod tests {
             .await
             .is_none());
     }
+
+    /// What the router hands a handler for paths with empty segments (axum 0.8 / matchit 0.8):
+    /// a `{param}` followed by a literal `/` matches an EMPTY segment; `Path` percent-decodes,
+    /// so `%2F` puts `/` inside a single `{param}`; `{*rest}` keeps `//`, a leading `/` and a
+    /// trailing `/`; nothing normalizes. Every handler must refuse such names itself.
+    #[tokio::test]
+    async fn the_router_hands_empty_segments_to_handlers_as_sent() {
+        use crate::test_helpers::{body_bytes, send};
+        use axum::extract::Path;
+        use axum::http::{Method, StatusCode};
+        use axum::routing::get;
+
+        async fn one(Path(p): Path<String>) -> String {
+            format!("[{p}]")
+        }
+        async fn two(Path((a, b)): Path<(String, String)>) -> String {
+            format!("[{a}][{b}]")
+        }
+        let app: axum::Router = axum::Router::new()
+            .route("/simple/{name}/", get(one))
+            .route("/simple/{name}/{filename}", get(two))
+            .route("/gems/info/{name}", get(one))
+            .route("/w/{*path}", get(one))
+            .route("/r/{repo}/{*path}", get(two));
+        let cases = [
+            ("/simple//", Some("[]")),
+            ("/simple//x", Some("[][x]")),
+            ("/simple/foo%2F/", Some("[foo/]")),
+            ("/simple/%2Ffoo/x", Some("[/foo][x]")),
+            ("/gems/info/", None),
+            ("/gems/info/x%2F%2Fy", Some("[x//y]")),
+            ("/w/a//b", Some("[a//b]")),
+            ("/w//a", Some("[/a]")),
+            ("/w/a/b/", Some("[a/b/]")),
+            ("/w/a%2F%2Fb", Some("[a//b]")),
+            ("/r//x", Some("[][x]")),
+            ("/r/a//b", Some("[a][/b]")),
+        ];
+        for (uri, want) in cases {
+            let resp = send(&app, Method::GET, uri, axum::body::Body::empty()).await;
+            match want {
+                Some(body) => {
+                    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                    assert_eq!(&body_bytes(resp).await[..], body.as_bytes(), "{uri}");
+                }
+                None => assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}"),
+            }
+        }
+    }
 }
 
 /// The upstream-failure class as one table: every proxied cold-miss path of Maven, Docker,

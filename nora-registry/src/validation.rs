@@ -35,6 +35,9 @@ pub enum ValidationError {
     ForbiddenCharacter(char),
     /// Names a path the storage reserves for itself
     ReservedPath(&'static str),
+    /// Has an empty path segment (`a//b`, `a/b/`): it would name the same stored object as
+    /// the key without it
+    EmptySegment,
 }
 
 impl fmt::Display for ValidationError {
@@ -49,6 +52,7 @@ impl fmt::Display for ValidationError {
                 write!(f, "Input exceeds maximum length ({} > {})", actual, max)
             }
             Self::ForbiddenCharacter(c) => write!(f, "Forbidden character: {:?}", c),
+            Self::EmptySegment => write!(f, "Empty path segment"),
             Self::ReservedPath(p) => write!(f, "Reserved path: {}", p),
         }
     }
@@ -133,11 +137,13 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::PathTraversal);
     }
 
-    // Check each segment
+    // Check each segment. An empty one (`a//b`, `a/b/`) is refused: the local backend
+    // joins `a//b` to the same file as `a/b`, and object stores drop empty path parts, so
+    // the key would be a second name for another key's object — and curation, pins and
+    // namespace checks keyed by the string would see a different key than the bytes.
     for segment in key.split('/') {
-        if segment.is_empty() && !key.is_empty() {
-            // Allow trailing slash but not double slashes
-            continue;
+        if segment.is_empty() {
+            return Err(ValidationError::EmptySegment);
         }
         if segment == "." || segment == ".." {
             return Err(ValidationError::PathTraversal);
@@ -145,6 +151,21 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+/// Whether `name`, taken from a request where it must stand for exactly one path segment (a
+/// PyPI project, a cargo version), is one: no `/` — a `%2F` in the URL decodes to one — and a
+/// valid storage key on its own, so no empty, `.` or `..` segment either. Anything else would
+/// name another artifact's files.
+pub fn is_one_segment(name: &str) -> bool {
+    !name.contains('/') && validate_storage_key(name).is_ok()
+}
+
+/// The storage key a listing prefix stands for: the prefix without the one `/` it may end
+/// in (`npm/pkg/versions/` lists what is under `npm/pkg/versions`). A listing validates this
+/// key with [`validate_storage_key`], so a prefix with any other empty segment is refused.
+pub fn listing_key(prefix: &str) -> &str {
+    prefix.strip_suffix('/').unwrap_or(prefix)
 }
 
 /// Validate Docker image name per OCI distribution spec.
@@ -419,6 +440,11 @@ pub fn namespace_match(pattern: &str, value: &str) -> bool {
     }
     let pat: Vec<&str> = pattern.split('/').collect();
     let val: Vec<&str> = value.split('/').collect();
+    // An empty segment (`a//b`, `a/`) names nothing a restricted scope could grant —
+    // neither `*` inside a segment nor `**` across segments may consume one.
+    if val.iter().any(|segment| segment.is_empty()) {
+        return false;
+    }
     segments_match(&pat, &val)
 }
 
@@ -454,6 +480,10 @@ fn segment_glob(pattern: &str, value: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == value;
     }
+    // An empty segment (`a//b`) names nothing: a wildcard must not grant it.
+    if value.is_empty() {
+        return false;
+    }
     // Byte-wise is UTF-8-safe here: `*` is ASCII and never a continuation byte,
     // and non-wildcard bytes must be equal anyway.
     let (p, v) = (pattern.as_bytes(), value.as_bytes());
@@ -481,6 +511,58 @@ fn segment_glob(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard matches inside a segment but never an empty segment, which names nothing.
+    #[test]
+    fn a_wildcard_does_not_match_an_empty_segment() {
+        assert!(!segment_glob("*", ""));
+        assert!(!segment_glob("a*", ""));
+        assert!(segment_glob("*", "x"));
+        assert!(segment_glob("a*", "a"));
+        assert!(segment_glob("", ""));
+    }
+
+    /// A storage key has no empty segment anywhere; a listing prefix may end in one `/`.
+    #[test]
+    fn a_key_has_no_empty_segment_and_a_prefix_may_end_in_a_slash() {
+        for key in ["a//b", "a/b/", "raw//x", "npm/x/"] {
+            assert_eq!(
+                validate_storage_key(key),
+                Err(ValidationError::EmptySegment),
+                "{key}"
+            );
+        }
+        assert!(validate_storage_key("a/b").is_ok());
+        assert!(validate_storage_key(listing_key("npm/pkg/versions/")).is_ok());
+        assert!(validate_storage_key(listing_key("npm/pkg")).is_ok());
+        for prefix in ["a//b/", "a/b//", "/a/"] {
+            assert!(
+                validate_storage_key(listing_key(prefix)).is_err(),
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_segment_name_has_no_slash_and_is_a_valid_key() {
+        for name in ["flask", "my-pkg_2", "1.0.0", "v1.0.0+build"] {
+            assert!(is_one_segment(name), "{name}");
+        }
+        for name in [
+            "",
+            "corp-secret/x",
+            "/x",
+            "x/",
+            "a//b",
+            ".",
+            "..",
+            "a\\b",
+            "a\0b",
+            "naïve",
+        ] {
+            assert!(!is_one_segment(name), "{name:?}");
+        }
+    }
 
     // Storage key tests
     #[test]
@@ -965,15 +1047,31 @@ mod namespace_match_tests {
             prop_assert!(!namespace_match(&seg, &value));
         }
 
-        // `prefix/**` matches every value under `prefix/`.
+        // `prefix/**` matches every value under `prefix/` (segments are never empty: a
+        // coordinate with one names nothing, see the next property).
         #[test]
         fn prop_double_star_matches_all_descendants(
             prefix in "[a-z][a-z0-9]{0,9}",
-            descendant in "[a-z][a-z0-9/]{0,30}",
+            descendant in "[a-z][a-z0-9]{0,8}(/[a-z0-9]{1,8}){0,3}",
         ) {
             let pattern = format!("{}/**", prefix);
             let value = format!("{}/{}", prefix, descendant);
             prop_assert!(namespace_match(&pattern, &value));
+        }
+
+        // A value with an empty segment — inside or at the end — is granted by no
+        // restricted pattern, `**` included.
+        #[test]
+        fn prop_double_star_never_grants_an_empty_segment(
+            prefix in "[a-z][a-z0-9]{0,9}",
+            head in "[a-z][a-z0-9]{0,8}",
+            tail in "([a-z0-9]{1,8})?",
+        ) {
+            let pattern = format!("{}/**", prefix);
+            let value = format!("{}/{}//{}", prefix, head, tail);
+            let trailing = format!("{}/{}/", prefix, head);
+            prop_assert!(!namespace_match(&pattern, &value));
+            prop_assert!(!namespace_match(&pattern, &trailing));
         }
 
         // An intra-segment `*` absorbs any run of characters inside one segment…
@@ -1008,6 +1106,34 @@ mod namespace_match_tests {
             b in "[a-z]{1,8}(/[a-z]{1,8}){0,3}",
         ) {
             prop_assert_eq!(namespace_match(&a, &b), a == b);
+        }
+    }
+
+    /// No all-`*` segment pattern grants an empty segment.
+    #[test]
+    fn an_all_star_segment_does_not_match_an_empty_segment() {
+        for pat in ["*", "**", "***", "****"] {
+            assert!(!segment_glob(pat, ""), "{pat}");
+        }
+        assert!(!namespace_match("org/***", "org/"));
+        assert!(!namespace_match("org/***/x", "org//x"));
+        assert!(namespace_match("org/***", "org/a"), "control");
+    }
+
+    #[test]
+    fn a_double_star_grants_no_empty_segment_anywhere() {
+        assert!(namespace_match("github/**", "github/a/b"), "control");
+        assert!(namespace_match("**", "x"), "control");
+        for (pattern, value) in [
+            ("github/**", "github//x"),
+            ("github/**", "github/x/"),
+            ("github/**", "github/"),
+            ("**", "/x"),
+            ("**", "/"),
+            ("**", "//x"),
+            ("**/x", "/x"),
+        ] {
+            assert!(!namespace_match(pattern, value), "{pattern} {value}");
         }
     }
 }

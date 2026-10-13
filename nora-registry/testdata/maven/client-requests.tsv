@@ -1,0 +1,31 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/maven:/w:ro" maven:3.9-eclipse-temurin-21 java /w/Client.java > nora-registry/testdata/maven/client-requests.tsv
+# Apache Maven 3.9.16, maven-dependency-plugin 3.8.1 dependency:get, repository http://127.0.0.1:<port>/maven2
+# coordinate	method	path
+org.example:plain:1.0	GET	/maven2/org/example/plain/1.0/plain-1.0.pom
+org.example:plain:1.0	GET	/maven2/org/example/plain/1.0/plain-1.0.pom.sha1
+org.example:plain:1.0	GET	/maven2/org/example/plain/1.0/plain-1.0.jar
+org.example:plain:1.0	GET	/maven2/org/example/plain/1.0/plain-1.0.jar.sha1
+org.example:plain:1.0.0	GET	/maven2/org/example/plain/1.0.0/plain-1.0.0.pom
+org.example:plain:1.0.0	GET	/maven2/org/example/plain/1.0.0/plain-1.0.0.pom.sha1
+org.example:plain:1.0.0	GET	/maven2/org/example/plain/1.0.0/plain-1.0.0.jar
+org.example:plain:1.0.0	GET	/maven2/org/example/plain/1.0.0/plain-1.0.0.jar.sha1
+org.example:plain:1.0:jar:sources	GET	/maven2/org/example/plain/1.0/plain-1.0-sources.jar
+org.example:plain:1.0:jar:sources	GET	/maven2/org/example/plain/1.0/plain-1.0-sources.jar.sha1
+com.Example.Mixed:Upper-Art:2.0.0-RC1	GET	/maven2/com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.pom
+com.Example.Mixed:Upper-Art:2.0.0-RC1	GET	/maven2/com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.pom.sha1
+com.Example.Mixed:Upper-Art:2.0.0-RC1	GET	/maven2/com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar
+com.Example.Mixed:Upper-Art:2.0.0-RC1	GET	/maven2/com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar.sha1
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/maven-metadata.xml
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/maven-metadata.xml.sha1
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/snap-1.0-20261012.120000-1.pom
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/snap-1.0-20261012.120000-1.pom.sha1
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/snap-1.0-20261012.120000-1.jar
+org.example:snap:1.0-SNAPSHOT	GET	/maven2/org/example/snap/1.0-SNAPSHOT/snap-1.0-20261012.120000-1.jar.sha1
+org.example:tgz:1.0:tar.gz:bin	GET	/maven2/org/example/tgz/1.0/tgz-1.0.pom
+org.example:tgz:1.0:tar.gz:bin	GET	/maven2/org/example/tgz/1.0/tgz-1.0.pom.sha1
+org.example:tgz:1.0:tar.gz:bin	GET	/maven2/org/example/tgz/1.0/tgz-1.0-bin.tar.gz
+org.example:tgz:1.0:tar.gz:bin	GET	/maven2/org/example/tgz/1.0/tgz-1.0-bin.tar.gz.sha1
+org.example.deep.nested:my.artifact:4.1.100.Final	GET	/maven2/org/example/deep/nested/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.pom
+org.example.deep.nested:my.artifact:4.1.100.Final	GET	/maven2/org/example/deep/nested/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.pom.sha1
+org.example.deep.nested:my.artifact:4.1.100.Final	GET	/maven2/org/example/deep/nested/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar
+org.example.deep.nested:my.artifact:4.1.100.Final	GET	/maven2/org/example/deep/nested/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar.sha1

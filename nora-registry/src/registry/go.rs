@@ -477,11 +477,14 @@ fn split_go_path(path: &str) -> Option<(String, String)> {
         }
     }
 
-    // Try @v/ — find the last occurrence (handles /v2/@v/ correctly)
+    // Try @v/ — find the last occurrence (handles /v2/@v/ correctly). What follows `@v/` is
+    // one file (`list`, `<version>.info|.mod|.zip`): a `/` in it (a `%2F` in the version)
+    // would hand curation another version than the one the upstream path names.
     if let Some(pos) = path.rfind("/@v/") {
         let module = &path[..pos];
         let file = &path[pos + 1..]; // "@v/..."
-        if !module.is_empty() && !file.is_empty() {
+        let one_file = crate::validation::is_one_segment(&file["@v/".len()..]);
+        if !module.is_empty() && one_file {
             return Some((module.to_string(), file.to_string()));
         }
     }
@@ -489,13 +492,11 @@ fn split_go_path(path: &str) -> Option<(String, String)> {
     None
 }
 
-/// Path validation: no traversal attacks
+/// Path validation: a Go proxy path is a valid storage key — no traversal, no null byte, and
+/// no empty segment anywhere: `a//b` and a trailing `/` (no Go proxy path ends in one) would
+/// name another module's file, and `x.zip/` is no longer a `.zip` to curation.
 fn is_safe_path(path: &str) -> bool {
-    !path.contains("..")
-        && !path.starts_with('/')
-        && !path.contains("//")
-        && !path.contains('\0')
-        && !path.is_empty()
+    crate::validation::validate_storage_key(path).is_ok()
 }
 
 /// Content-Type for Go proxy responses
@@ -767,6 +768,15 @@ mod tests {
     #[test]
     fn test_reject_double_slash() {
         assert!(!is_safe_path("github.com//evil/@v/list"));
+        for path in [
+            "example.com/evil/@v/v1.0.0.zip/",
+            "example.com/evil/@v/v1.0.0.mod/",
+            "example.com/evil/@v/v1.0.0.info/",
+            "example.com/evil/@v/list/",
+            "example.com/./evil/@v/list",
+        ] {
+            assert!(!is_safe_path(path), "{path}");
+        }
     }
 
     #[test]
@@ -1082,6 +1092,49 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("accept-ranges").is_none());
     }
+
+    /// `.../v1.0.0.zip/` is refused: it is no `.zip` to the handler, so curation, the integrity
+    /// check and the quarantine gate would not run, and on an object store the key reads the
+    /// cached archive (the local backend answers ENOTDIR — the control).
+    #[tokio::test]
+    async fn a_trailing_slash_archive_is_refused_before_curation() {
+        use crate::storage::{ObjectStorage, Storage};
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "go", "name": "example.com/evil", "version": "*", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_string_lossy().into_owned();
+        let configure = |cfg: &mut crate::config::Config| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp.clone());
+        };
+        let key = "go/example.com/evil/@v/v1.0.0.zip";
+        let canonical = "/go/example.com/evil/@v/v1.0.0.zip";
+        let alias = "/go/example.com/evil/@v/v1.0.0.zip/";
+
+        let local = crate::test_helpers::create_test_context_with_config(configure);
+        local.state.storage.put(key, b"MALWARE").await.unwrap();
+        let resp = send(&local.app, Method::GET, alias, "").await;
+        assert_ne!(resp.status(), StatusCode::OK, "control: local backend");
+
+        let object = crate::test_helpers::create_test_context_with_storage_and_config(
+            Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory())),
+            configure,
+        );
+        object.state.storage.put(key, b"MALWARE").await.unwrap();
+        let resp = send(&object.app, Method::GET, canonical, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control: canonical");
+        let resp = send(&object.app, Method::GET, alias, "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "blocklisted module archive served: {:?}",
+            body_bytes(resp).await
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1135,5 +1188,180 @@ mod index_cost_tests {
             small, large,
             "a cached @v/list must cost the same storage round-trips for 1 and 100 versions: {small_ops} vs {large_ops}"
         );
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{
+        blocklist_file, create_test_context_with_config, send, upstream_paths,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The file after `@v/` is one segment: a `%2F` in the version decodes to `/`, and
+    // `v1.0.0%2F.zip` would reach curation as version `v1.0.0/` — past a rule for `v1.0.0` —
+    // and the upstream as `.../@v/v1.0.0/.zip`.
+    #[tokio::test]
+    async fn a_version_with_an_inner_slash_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL-ZIP".to_vec()))
+            .mount(&up)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "go", "name": "example.com/evil", "version": "v1.0.0", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.go.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        let control = "/go/example.com/evil/@v/v1.0.0.zip";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        // Such a path is no Go proxy path: 404, as any path that does not split.
+        for uri in [
+            "/go/example.com/evil/@v/v1.0.0%2F.zip",
+            "/go/example.com/evil/@v/v1.0.0%2F.mod",
+            "/go/example.com/evil/@v/v1.0.0%2Fx.info",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // No Go proxy path ends in `/` or has an empty segment: `.../v1.0.0.zip/` is no longer a
+    // `.zip` to curation, and none of these forms reaches the upstream.
+    #[tokio::test]
+    async fn no_module_path_with_an_empty_segment_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL-ZIP".to_vec()))
+            .mount(&up)
+            .await;
+        let (_dir, blocklist) = blocklist_file("go", "example.com/evil");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.go.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let control = "/go/example.com/evil/@v/v1.0.0.zip";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for uri in [
+            "/go/example.com/evil/@v/v1.0.0.zip/",
+            "/go/example.com/evil/@v/v1.0.0.mod/",
+            "/go/example.com/evil/@v/v1.0.0.info/",
+            "/go/example.com/evil/@v/list/",
+            "/go/example.com//evil/@v/list",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+}
+
+/// A Go module version is the version the go command reads: `module.CanonicalVersion` gives
+/// `v1` and `v1.2` as `v1.0.0` and `v1.2.0` and drops build metadata other than `+incompatible`,
+/// so a rule or an allowlist entry holds however it spells its version.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod go_version_curation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ZIP".to_vec()))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_however_it_spells_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = write(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "go", "name": "example.com/evil", "version": "v1.2", "reason": "r"},
+                {"registry": "go", "name": "example.com/evil", "version": "v1.3.0+meta", "reason": "r"},
+                {"registry": "go", "name": "example.com/evil", "version": "v2", "reason": "r"}
+            ]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.go.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for version in ["v1.2.0", "v1.3.0", "v2.0.0"] {
+            let path = format!("/go/example.com/evil/@v/{version}.zip");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        }
+        for version in ["v1.2.1", "v2.0.0+incompatible"] {
+            let path = format!("/go/example.com/evil/@v/{version}.zip");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_its_version_however_spelled() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "go", "name": "example.com/good", "version": "v1"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.go.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/go/example.com/good/@v/v1.0.0.zip",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/go/example.com/good/@v/v1.0.1.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

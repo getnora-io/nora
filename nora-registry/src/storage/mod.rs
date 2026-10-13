@@ -9,7 +9,7 @@ pub(crate) use local::NameTaken;
 pub use object::ObjectStorage;
 
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
-use crate::validation::{validate_storage_key, ValidationError};
+use crate::validation::{listing_key, validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use sha2::{Digest, Sha256};
@@ -440,7 +440,7 @@ impl Storage {
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         // Empty prefix is valid for listing all
         if !prefix.is_empty() {
-            validate_storage_key(prefix)?;
+            validate_storage_key(listing_key(prefix))?;
         }
         let keys = match self.inner.list(prefix).await {
             Ok(keys) => {
@@ -464,7 +464,7 @@ impl Storage {
     /// from every registry walk. For walks over internal state such as npm cache
     /// provenance (#1055).
     pub async fn list_internal(&self, prefix: &str) -> Result<Vec<String>> {
-        validate_storage_key(prefix)?;
+        validate_storage_key(listing_key(prefix))?;
         let keys = match self.inner.list(prefix).await {
             Ok(keys) => {
                 STORAGE_OPERATIONS.with_label_values(&["list", "ok"]).inc();
@@ -488,7 +488,7 @@ impl Storage {
     /// from the listing itself, avoiding a per-key `stat()` (#738).
     pub async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
         if !prefix.is_empty() {
-            validate_storage_key(prefix)?;
+            validate_storage_key(listing_key(prefix))?;
         }
         let entries = match self.inner.list_with_meta(prefix).await {
             Ok(entries) => {
@@ -1488,5 +1488,196 @@ mod tests {
         );
         assert_eq!(storage.pin(key).await.as_deref(), Some(expected.as_str()));
         assert_eq!(&storage.get(key).await.unwrap()[..], b"orphan-bytes");
+    }
+
+    // ── Keys with an empty segment ────────────────────────────────────────────
+    //
+    // On both backends `a//b` and `a/b/` would name the file of `a/b`; every
+    // wrapper method refuses them, and these tests pin what that protects.
+
+    /// A key with an empty segment never reaches the object stored under another key. Local:
+    /// `base.join("raw/a//b")` is the file of `raw/a/b`. Object store:
+    /// `object_store::path::Path::from` drops empty parts, so `raw/a//b` and `raw/a/b/` are
+    /// `raw/a/b` there too.
+    #[tokio::test]
+    async fn an_empty_segment_key_never_reaches_another_keys_object() {
+        let dir = TempDir::new().unwrap();
+        let local = Storage::new_local(dir.path().to_str().unwrap());
+        let (_backend, object) = object_storage();
+        let mut aliased = Vec::new();
+        for (name, storage) in [("local", &local), ("object", &object)] {
+            storage.put("raw/a/b", b"canonical").await.unwrap();
+            for alias in ["raw/a//b", "raw//a/b", "raw/a/b/"] {
+                if let Ok(bytes) = storage.get(alias).await {
+                    aliased.push(format!("{name}: `{alias}` -> {bytes:?}"));
+                }
+            }
+        }
+        assert!(aliased.is_empty(), "alias keys read `raw/a/b`: {aliased:?}");
+    }
+
+    /// A write under an empty segment is refused: it would replace the canonical file's bytes
+    /// and record their pin under another string, and every later read of the canonical key
+    /// would fail closed with IntegrityViolation.
+    #[tokio::test]
+    async fn a_write_never_splits_canonical_bytes_from_their_pin() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage.put("raw/a/b", b"v1").await.unwrap();
+        // Whatever the store does with the alias write, the canonical key must
+        // stay readable afterwards.
+        let _ = storage.put("raw/a//b", b"v2").await;
+        let got = storage.get("raw/a/b").await;
+        assert!(
+            got.is_ok(),
+            "canonical key unreadable after a write to its alias: {got:?}"
+        );
+    }
+
+    /// A trailing-slash key is refused on both backends — on an object store it would be a
+    /// second name for `raw/a/b` (`Path::from` drops the empty last part) and a write to it
+    /// would replace that object — and the object stays as it was.
+    #[tokio::test]
+    async fn a_trailing_slash_key_is_refused_on_both_backends() {
+        let dir = TempDir::new().unwrap();
+        let local = Storage::new_local(dir.path().to_str().unwrap());
+        let (_backend, object) = object_storage();
+        for (backend, storage) in [("local", &local), ("object", &object)] {
+            storage.put("raw/a/b", b"canonical").await.unwrap();
+            assert!(
+                matches!(
+                    storage.get("raw/a/b/").await,
+                    Err(StorageError::Validation(ValidationError::EmptySegment))
+                ),
+                "{backend} get"
+            );
+            assert!(
+                matches!(
+                    storage.put("raw/a/b/", b"other").await,
+                    Err(StorageError::Validation(ValidationError::EmptySegment))
+                ),
+                "{backend} put"
+            );
+            assert_eq!(
+                &storage.get("raw/a/b").await.unwrap()[..],
+                b"canonical",
+                "{backend}"
+            );
+        }
+    }
+
+    /// Every method of `impl Storage` that takes a key or a listing prefix.
+    const KEY_METHODS: &[&str] = &[
+        "copy",
+        "delete",
+        "get",
+        "get_range",
+        "get_reader",
+        "get_verified",
+        "list",
+        "list_internal",
+        "list_with_meta",
+        "pin",
+        "put",
+        "put_from_path",
+        "repin",
+        "stat",
+    ];
+
+    /// Every key- or prefix-taking wrapper method refuses an empty segment on both backends
+    /// and leaves the stored objects as they were: on an object store `raw/a/b/` IS `raw/a/b`,
+    /// and on the local backend `raw/a//b` is its file. A prefix with one trailing `/` still
+    /// lists; one with a leading `/` is refused.
+    #[tokio::test]
+    async fn every_wrapper_method_refuses_an_empty_segment() {
+        fn refused<T>(r: &Result<T>) -> bool {
+            matches!(
+                r,
+                Err(StorageError::Validation(ValidationError::EmptySegment))
+            )
+        }
+        let dir = TempDir::new().unwrap();
+        let local = Storage::new_local(dir.path().join("s").to_str().unwrap());
+        let (_backend, object) = object_storage();
+        let src_file = dir.path().join("src.bin");
+        std::fs::write(&src_file, b"other").unwrap();
+        for (b, s) in [("local", &local), ("object", &object)] {
+            s.put("raw/a/b", b"canonical").await.unwrap();
+            s.put("raw/src", b"other").await.unwrap();
+            let mut driven = std::collections::BTreeSet::new();
+            for key in ["raw/a/b/", "raw/a//b", "raw//a/b"] {
+                let copy_to = refused(&s.copy("raw/src", key, None).await);
+                let copy_from = refused(&s.copy(key, "raw/c", None).await);
+                let checks = [
+                    ("put", refused(&s.put(key, b"x").await)),
+                    ("get", refused(&s.get(key).await)),
+                    ("get_verified", refused(&s.get_verified(key).await)),
+                    ("get_reader", refused(&s.get_reader(key).await)),
+                    ("get_range", refused(&s.get_range(key, 0, 0).await)),
+                    ("delete", refused(&s.delete(key).await)),
+                    ("repin", refused(&s.repin(key, "00", false).await)),
+                    (
+                        "put_from_path",
+                        refused(&s.put_from_path(key, &src_file, None).await),
+                    ),
+                    ("copy", copy_to && copy_from),
+                    ("stat", s.stat(key).await.is_none()),
+                    ("pin", s.pin(key).await.is_none()),
+                ];
+                for (method, ok) in checks {
+                    assert!(ok, "{b} {method} {key}");
+                    driven.insert(method);
+                }
+            }
+            for prefix in ["raw//a/", "raw/a//", "/raw/a/", "/raw/"] {
+                let checks = [
+                    ("list", s.list(prefix).await.is_err()),
+                    ("list_internal", s.list_internal(prefix).await.is_err()),
+                    ("list_with_meta", s.list_with_meta(prefix).await.is_err()),
+                ];
+                for (method, ok) in checks {
+                    assert!(ok, "{b} {method} {prefix}");
+                    driven.insert(method);
+                }
+            }
+            let driven: Vec<&str> = driven.into_iter().collect();
+            assert_eq!(driven, KEY_METHODS, "{b}: methods driven");
+            assert_eq!(&s.get("raw/a/b").await.unwrap()[..], b"canonical", "{b}");
+            assert_eq!(&s.get("raw/src").await.unwrap()[..], b"other", "{b}");
+            assert!(s.stat("raw/c").await.is_none(), "{b}: a copy was written");
+            let listed = s.list("raw/a/").await.unwrap();
+            assert_eq!(listed, vec!["raw/a/b".to_string()], "{b} control");
+        }
+    }
+
+    /// The methods of `impl Storage` taking `&self` and a `&str` are exactly `KEY_METHODS`,
+    /// so a new key-taking method cannot miss the test above.
+    #[test]
+    fn every_key_taking_method_is_driven_with_an_empty_segment() {
+        let src = include_str!("mod.rs");
+        let body = &src[src.find("\nimpl Storage {\n").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut found = Vec::new();
+        for (at, _) in body.match_indices("\n    pub") {
+            let mut decl = &body[at + "\n    pub".len()..];
+            if let Some(rest) = decl.strip_prefix('(') {
+                decl = &rest[rest.find(')').unwrap() + 1..];
+            }
+            let decl = decl.trim_start();
+            let decl = decl.strip_prefix("async ").unwrap_or(decl);
+            let Some(decl) = decl.strip_prefix("fn ") else {
+                continue;
+            };
+            let name: String = decl
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let params = &decl[..decl.find(')').unwrap()];
+            if params.contains("&self") && params.contains(": &str") {
+                found.push(name);
+            }
+        }
+        found.sort();
+        assert_eq!(found, KEY_METHODS);
     }
 }

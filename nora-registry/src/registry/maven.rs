@@ -193,6 +193,28 @@ fn classify_path(path: &str) -> MavenPathKind {
     MavenPathKind::Opaque
 }
 
+/// The artifacts a `maven-metadata.xml` path can belong to. maven-resolver writes metadata at
+/// three levels (`Maven2RepositoryLayoutFactory`): an artifact's (`group/artifact/`), a snapshot
+/// version's (`group/artifact/1.0-SNAPSHOT/`) and a group's plugin list (`group/`), and the path
+/// alone does not tell an artifact's from a group's. So the path reads as the artifact
+/// `group:artifact`; as the artifact of a snapshot version, when its last directory is one; and
+/// as the group, every artifact of which a `group.name:` namespace covers.
+fn metadata_names(group_path: &str, artifact_id: &str) -> Vec<String> {
+    let group = group_path.replace('/', ".");
+    let mut names = vec![format!("{group}:{artifact_id}")];
+    if is_snapshot(artifact_id) {
+        if let Some((parent, artifact)) = group_path.rsplit_once('/') {
+            names.push(format!("{}:{artifact}", parent.replace('/', ".")));
+        }
+    }
+    if group.is_empty() {
+        names.push(format!("{artifact_id}:"));
+    } else {
+        names.push(format!("{group}.{artifact_id}:"));
+    }
+    names
+}
+
 fn is_checksum_file(filename: &str) -> bool {
     ends_with_ci(filename, ".md5")
         || ends_with_ci(filename, ".sha1")
@@ -285,6 +307,11 @@ async fn download(
     Path(path): Path<String>,
 ) -> Response {
     let key = storage_key(&path);
+    // A path with an empty segment names another artifact's file and must not reach
+    // curation, storage or an upstream (which may normalise it to that artifact).
+    if crate::validation::validate_storage_key(&key).is_err() {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
 
     let artifact_name = path
         .split('/')
@@ -512,12 +539,17 @@ async fn download(
         ..
     } = classify_path(&path)
     {
-        let maven_name = format!("{}:{}", group_path.replace('/', "."), artifact_id);
-        if crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Maven,
-            &maven_name,
-        ) {
+        if let Some(maven_name) =
+            metadata_names(&group_path, &artifact_id)
+                .into_iter()
+                .find(|name| {
+                    crate::curation::is_internal_namespace(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Maven,
+                        name,
+                    )
+                })
+        {
             if let Some(ref data) = cached {
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_hit("maven");
@@ -715,6 +747,11 @@ async fn upload(
     body: Bytes,
 ) -> Response {
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+    // An empty segment (`com//x`, `x.jar/`) would name another artifact's file: refuse it
+    // with the other invalid paths, before the scope check and the write.
+    if crate::validation::validate_storage_key(&storage_key(&path)).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
@@ -2570,6 +2607,85 @@ mod integration_tests {
         assert!(resp.headers().get(header::ACCEPT_RANGES).is_none());
         assert_eq!(body_bytes(resp).await.as_ref(), &xml[..]);
     }
+
+    /// An upload to `com//acme/...` is refused: written, it would replace the canonical
+    /// SNAPSHOT's bytes and record their pins under another string, so the canonical read
+    /// would fail its pin gate and answer 404.
+    #[tokio::test]
+    async fn a_snapshot_upload_under_an_empty_segment_never_breaks_the_canonical_read() {
+        use axum::http::{Method, StatusCode};
+        let ctx = create_test_context();
+        let canonical = "/maven2/com/acme/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar";
+        let put = send(&ctx.app, Method::PUT, canonical, b"v1".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let _ = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com//acme/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+            b"v2".to_vec(),
+        )
+        .await;
+
+        let mut broken = Vec::new();
+        for path in [canonical.to_string(), format!("{canonical}.sha1")] {
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            if resp.status() != StatusCode::OK {
+                broken.push(format!("{path} -> {}", resp.status()));
+            }
+        }
+        assert!(broken.is_empty(), "canonical keys unservable: {broken:?}");
+    }
+
+    /// An upload path with an empty segment, inside or at the end, is refused at the door
+    /// (400), not turned into a failed write (500).
+    #[tokio::test]
+    async fn an_upload_path_with_an_empty_segment_is_refused_with_400() {
+        let ctx = crate::test_helpers::create_test_context();
+        for uri in [
+            "/maven2/com/example//p/1.0/p-1.0.jar",
+            "/maven2/com/example/p/1.0/p-1.0.jar/",
+        ] {
+            let resp = crate::test_helpers::send(
+                &ctx.app,
+                axum::http::Method::PUT,
+                uri,
+                axum::body::Body::from("x"),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    /// A release upload under `com//acme/...` never replaces the existing release.
+    #[tokio::test]
+    async fn a_release_upload_under_an_empty_segment_never_overwrites() {
+        use axum::http::{Method, StatusCode};
+        let ctx = create_test_context();
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/lib/1.0/lib-1.0.jar",
+            b"v1".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let alias = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com//acme/lib/1.0/lib-1.0.jar",
+            b"v2".to_vec(),
+        )
+        .await;
+        assert!(!alias.status().is_success(), "{}", alias.status());
+        let get = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/acme/lib/1.0/lib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(&body_bytes(get).await[..], b"v1");
+    }
 }
 
 #[cfg(test)]
@@ -2706,5 +2822,291 @@ mod upstream_failure_edge_cases {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{create_test_context_with_config, send, upstream_paths};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The request path is the upstream path: an empty segment in it is refused before the
+    // storage lookup and the upstream fetch.
+    #[tokio::test]
+    async fn an_artifact_path_with_an_empty_segment_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"JAR".to_vec()))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+        });
+        for path in [
+            "/maven2/com//acme/foo/1.0/foo-1.0.jar",
+            "/maven2/com/acme/foo/1.0/foo-1.0.jar/",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/acme/foo/1.0/foo-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "control");
+    }
+}
+
+/// Repository paths as maven-resolver builds them and Maven requests them (testdata/maven,
+/// regenerated by the programs there).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod per_maven_resolver {
+    use super::{classify_path, MavenPathKind};
+    use crate::storage::{ObjectStorage, Storage};
+    use crate::test_helpers::{create_test_context_with_storage_and_config, send, upstream_paths};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn corpus(file: &str) -> Vec<Vec<String>> {
+        let path = format!("{}/testdata/maven/{file}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| row.split('\t').map(String::from).collect())
+            .collect()
+    }
+
+    // Every artifact and checksum path the resolver builds reads back as its coordinates: the
+    // group, the artifact, the base version (the directory; a timestamped snapshot's file lives
+    // in its `-SNAPSHOT` directory) and the file name; every artifact-level metadata path as its
+    // group and artifact.
+    #[test]
+    fn every_path_maven_resolver_builds_reads_as_its_coordinates() {
+        let rows = corpus("layout.tsv");
+        assert_eq!(rows.len(), 680);
+        let mut files = 0;
+        let mut metadata = 0;
+        for row in &rows {
+            let (kind, group, artifact, base_version, path) =
+                (&row[0], &row[1], &row[2], &row[3], &row[7]);
+            let file_name = path.rsplit('/').next().unwrap();
+            match (kind.as_str(), classify_path(path)) {
+                ("artifact" | "checksum", MavenPathKind::VersionFile(c)) => {
+                    assert_eq!(c.group_path.replace('/', "."), *group, "{path}");
+                    assert_eq!(c.artifact_id, *artifact, "{path}");
+                    assert_eq!(c.version, *base_version, "{path}");
+                    assert_eq!(c.filename, file_name, "{path}");
+                    files += 1;
+                }
+                (
+                    "metadata",
+                    MavenPathKind::ArtifactMeta {
+                        group_path,
+                        artifact_id,
+                        filename,
+                    },
+                ) if !artifact.is_empty() && base_version.is_empty() => {
+                    assert_eq!(group_path.replace('/', "."), *group, "{path}");
+                    assert_eq!(artifact_id, *artifact, "{path}");
+                    assert_eq!(filename, "maven-metadata.xml", "{path}");
+                    metadata += 1;
+                }
+                ("metadata", _) => {}
+                (kind, _) => panic!("{kind} {path} is not read as a version file"),
+            }
+        }
+        assert_eq!((files, metadata), (660, 5));
+    }
+
+    const SNAPSHOT_METADATA: &str = "<metadata><groupId>org.example</groupId><artifactId>snap</artifactId>\
+        <version>1.0-SNAPSHOT</version><versioning><snapshot><timestamp>20261012.120000</timestamp>\
+        <buildNumber>1</buildNumber></snapshot><lastUpdated>20261012120000</lastUpdated></versioning></metadata>";
+
+    async fn upstream() -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(path_regex(r"maven-metadata\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SNAPSHOT_METADATA))
+            .mount(&up)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"file".to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// Whether a request names a file of a version (not metadata nor a checksum of metadata).
+    fn is_version_file(path: &str) -> bool {
+        !path.contains("maven-metadata.xml")
+    }
+
+    // Every request Maven sends reaches upstream at the path it sent (a metadata checksum as its
+    // metadata document, from which NORA answers the checksum).
+    #[tokio::test]
+    async fn every_request_maven_sends_is_asked_upstream_as_sent() {
+        let rows = corpus("client-requests.tsv");
+        assert_eq!(rows.len(), 28);
+        let up = upstream().await;
+        let uri = up.uri();
+        let storage = Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory()));
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+        });
+        for row in rows {
+            let (coordinate, path) = (&row[0], &row[2]);
+            assert_eq!(row[1], "GET");
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{coordinate}: {path}");
+            let sent = path.strip_prefix("/maven2").unwrap();
+            let asked = super::metadata_document_key(sent)
+                .filter(|_| !is_version_file(sent))
+                .unwrap_or(sent);
+            assert!(
+                upstream_paths(&up).await.iter().any(|p| p == asked),
+                "{coordinate}: {path}"
+            );
+        }
+    }
+
+    // Every version file Maven fetches is curated as `groupId:artifactId` and the version it
+    // asked for (a snapshot's `-SNAPSHOT` version): a rule naming them refuses it before upstream
+    // is asked.
+    #[tokio::test]
+    async fn every_file_maven_fetches_is_curated_as_its_coordinate() {
+        let rows: Vec<Vec<String>> = corpus("client-requests.tsv")
+            .into_iter()
+            .filter(|row| is_version_file(&row[2]))
+            .collect();
+        assert_eq!(rows.len(), 26);
+        let rules: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let parts: Vec<&str> = row[0].split(':').collect();
+                serde_json::json!({"registry": "maven", "name": format!("{}:{}", parts[0], parts[1]), "version": parts[2], "reason": "test"})
+            })
+            .collect();
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            serde_json::json!({"version": 1, "rules": rules}).to_string(),
+        )
+        .unwrap();
+        let up = upstream().await;
+        let uri = up.uri();
+        let storage = Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory()));
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        for row in rows {
+            let resp = send(&ctx.app, Method::GET, &row[2], "").await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{}: {}",
+                row[0],
+                row[2]
+            );
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod maven_version_metadata_identity {
+    use crate::test_helpers::{create_test_context_with_config, send, upstream_paths};
+    use axum::http::Method;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // maven-resolver writes metadata at three levels: `group/maven-metadata.xml`,
+    // `group/artifact/maven-metadata.xml` and `group/artifact/version/maven-metadata.xml`
+    // (resolver 1.9.27 `Maven2RepositoryLayoutFactory.java:196-213`; testdata/maven/layout.tsv),
+    // and Maven reads the version level for a snapshot before its files
+    // (testdata/maven/client-requests.tsv: `org/example/snap/1.0-SNAPSHOT/maven-metadata.xml`).
+    // `com/mycorp/lib/1.0-SNAPSHOT/maven-metadata.xml` is metadata of `com.mycorp:lib`.
+    #[tokio::test]
+    async fn version_metadata_of_an_internal_artifact_is_not_asked_upstream() {
+        for pattern in ["com.mycorp:*", "com.mycorp:lib"] {
+            let up = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "<metadata><groupId>com.mycorp</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version></metadata>",
+                ))
+                .mount(&up)
+                .await;
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+                cfg.curation.internal_namespaces = vec![pattern.to_string()];
+            });
+            for path in [
+                "/maven2/com/mycorp/lib/maven-metadata.xml",
+                "/maven2/com/mycorp/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.jar",
+                "/maven2/com/mycorp/lib/1.0-SNAPSHOT/maven-metadata.xml",
+                "/maven2/com/mycorp/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1",
+            ] {
+                let resp = send(&ctx.app, Method::GET, path, "").await;
+                let sent = upstream_paths(&up).await;
+                assert!(
+                    sent.is_empty(),
+                    "{pattern} {path}: {} sent {sent:?}",
+                    resp.status()
+                );
+            }
+        }
+    }
+
+    // The group level, `com/mycorp/maven-metadata.xml`, is metadata of the group `com.mycorp`
+    // (the plugins it holds): a namespace on the whole group holds for it, one on a single
+    // artifact does not, and that twin shows the path does reach the upstream.
+    #[tokio::test]
+    async fn group_metadata_of_an_internal_group_is_not_asked_upstream() {
+        for (pattern, internal) in [
+            ("com.mycorp:*", true),
+            ("com.mycorp.**", true),
+            ("com.mycorp:lib", false),
+        ] {
+            let up = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string("<metadata><plugins/></metadata>"),
+                )
+                .mount(&up)
+                .await;
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(|cfg| {
+                cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+                cfg.curation.internal_namespaces = vec![pattern.to_string()];
+            });
+            let path = "/maven2/com/mycorp/maven-metadata.xml";
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            let sent = upstream_paths(&up).await;
+            assert_eq!(
+                sent.is_empty(),
+                internal,
+                "{pattern} {path}: {} sent {sent:?}",
+                resp.status()
+            );
+        }
     }
 }

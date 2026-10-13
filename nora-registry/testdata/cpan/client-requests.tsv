@@ -1,0 +1,24 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/cpan:/w:ro" perl:5.40 python3 /w/client_requests.py > nora-registry/testdata/cpan/client-requests.tsv
+# cpanm (App::cpanminus) version 1.7049, perl:5.40, mirror http://127.0.0.1:<port>/cpan
+# installed	method	path
+Foo::Bar	GET	/cpan/modules/02packages.details.txt.gz
+Foo::Bar	GET	/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.gz
+Baz::Qux	GET	/cpan/modules/02packages.details.txt.gz
+Baz::Qux	GET	/cpan/authors/id/A/AU/AUTHOR/Baz-Qux-v1.2.3.tgz
+CGI::Mini	GET	/cpan/modules/02packages.details.txt.gz
+CGI::Mini	GET	/cpan/authors/id/E/EX/EXAMPLE/CGI-Mini.pm-4.66.tar.gz
+Crypt::Ecbx	GET	/cpan/modules/02packages.details.txt.gz
+Crypt::Ecbx	GET	/cpan/authors/id/C/CH/CHAMAS/Crypt-Ecbx-1.1-2.tar.gz
+Quux	GET	/cpan/modules/02packages.details.txt.gz
+Quux	GET	/cpan/authors/id/X/XY/XYZ-9/Quux-1.0.tar.bz2
+Zip::Dist	GET	/cpan/modules/02packages.details.txt.gz
+Zip::Dist	GET	/cpan/authors/id/Z/ZZ/ZZZ/Zip-Dist-0.01.zip
+Rc::Dist	GET	/cpan/modules/02packages.details.txt.gz
+Rc::Dist	GET	/cpan/authors/id/R/RC/RCAUTH/Rc-Dist-1.23-RC1.tar.gz
+A/AU/AUTHOR/Foo-Bar-1.23.tar.gz	GET	/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.gz
+A/AU/AUTHOR/Baz-Qux-v1.2.3.tgz	GET	/cpan/authors/id/A/AU/AUTHOR/Baz-Qux-v1.2.3.tgz
+E/EX/EXAMPLE/CGI-Mini.pm-4.66.tar.gz	GET	/cpan/authors/id/E/EX/EXAMPLE/CGI-Mini.pm-4.66.tar.gz
+C/CH/CHAMAS/Crypt-Ecbx-1.1-2.tar.gz	GET	/cpan/authors/id/C/CH/CHAMAS/Crypt-Ecbx-1.1-2.tar.gz
+X/XY/XYZ-9/Quux-1.0.tar.bz2	GET	/cpan/authors/id/X/XY/XYZ-9/Quux-1.0.tar.bz2
+Z/ZZ/ZZZ/Zip-Dist-0.01.zip	GET	/cpan/authors/id/Z/ZZ/ZZZ/Zip-Dist-0.01.zip
+R/RC/RCAUTH/Rc-Dist-1.23-RC1.tar.gz	GET	/cpan/authors/id/R/RC/RCAUTH/Rc-Dist-1.23-RC1.tar.gz

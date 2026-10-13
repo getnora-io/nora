@@ -1961,4 +1961,154 @@ mod integration_tests {
             .unwrap();
         assert_eq!(cc, "no-cache");
     }
+
+    // ── A name with an empty segment never names another key's file ─────────
+
+    /// `GET /raw//secret.txt` names the file of `raw/secret.txt` under the name `/secret.txt`,
+    /// which the rule `secret*` does not cover — refused before curation and storage.
+    #[tokio::test]
+    async fn a_read_under_an_empty_segment_is_refused_before_curation() {
+        use crate::config::CurationMode;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "raw", "name": "secret*", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_str().unwrap().to_string();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+        let put = send(&ctx.app, Method::PUT, "/raw/secret.txt", b"data".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let canonical = send(&ctx.app, Method::GET, "/raw/secret.txt", "").await;
+        assert_eq!(canonical.status(), StatusCode::FORBIDDEN, "control");
+
+        let mut served = Vec::new();
+        for alias in ["/raw//secret.txt", "/raw/%2Fsecret.txt"] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!("{alias} -> {:?}", body_bytes(resp).await));
+            }
+        }
+        assert!(served.is_empty(), "blocklisted file served: {served:?}");
+    }
+
+    /// A read at `raw//...` is refused: pins are kept by the key string, so it would find no
+    /// pin and stream tampered bytes the canonical read refuses (the control).
+    #[tokio::test]
+    async fn a_read_under_an_empty_segment_never_skips_the_pin() {
+        let ctx = create_test_context();
+        let body = vec![7u8; 300_000];
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/pinned.bin", body.clone()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let on_disk =
+            std::path::Path::new(&ctx.state.config.storage.path).join("raw/dir/pinned.bin");
+        let mut tampered = std::fs::read(&on_disk).unwrap();
+        tampered[150_000] ^= 0xFF;
+        std::fs::write(&on_disk, &tampered).unwrap();
+
+        let canonical = send(&ctx.app, Method::GET, "/raw/dir/pinned.bin", "").await;
+        let canonical = axum::body::to_bytes(canonical.into_body(), usize::MAX).await;
+        assert!(
+            canonical.map(|b| b.len() < body.len()).unwrap_or(true),
+            "control: the canonical read must not arrive complete"
+        );
+
+        let alias = send(&ctx.app, Method::GET, "/raw/dir//pinned.bin", "").await;
+        let alias = axum::body::to_bytes(alias.into_body(), usize::MAX).await;
+        assert!(
+            alias.map(|b| b != tampered).unwrap_or(true),
+            "the alias read served the tampered bytes in full"
+        );
+    }
+
+    /// An `If-Match: *` write to `raw/dir//f.bin` is refused: it would replace the canonical
+    /// file's bytes and pin them under another string, so the canonical read would abort.
+    #[tokio::test]
+    async fn a_write_under_an_empty_segment_never_breaks_the_canonical_read() {
+        let ctx = create_test_context();
+        let v1 = vec![1u8; 300_000];
+        let v2 = vec![2u8; 300_000];
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/f.bin", v1.clone()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let _ = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/dir//f.bin",
+            vec![("if-match", "*")],
+            v2.clone(),
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/raw/dir/f.bin", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        assert!(
+            matches!(&got, Ok(b) if b[..] == v1[..] || b[..] == v2[..]),
+            "canonical object no longer servable after a PUT to its alias ({} bytes)",
+            got.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
+    }
+
+    /// A create-only write under `raw/dir//f.bin` never replaces the existing `raw/dir/f.bin`.
+    #[tokio::test]
+    async fn a_create_only_write_under_an_empty_segment_never_overwrites() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/dir/g.bin", b"v1".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let alias = send(&ctx.app, Method::PUT, "/raw/dir//g.bin", b"v2".to_vec()).await;
+        assert!(!alias.status().is_success(), "{}", alias.status());
+        let get = send(&ctx.app, Method::GET, "/raw/dir/g.bin", "").await;
+        assert_eq!(&body_bytes(get).await[..], b"v1");
+    }
+
+    /// A `*` segment of a token scope never matches an empty segment: `PUT /raw//releases/x.bin`
+    /// does not pass the scope `*/releases/**` and land on `raw/releases/x.bin`, whose own
+    /// coordinate `releases/x.bin` is outside that scope.
+    #[tokio::test]
+    async fn a_scope_star_never_grants_a_write_through_an_empty_segment() {
+        use crate::config::ScopeEnforcement;
+        use axum::body::Body;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let ctx = create_test_context();
+        let scope = || {
+            crate::auth::NamespaceAuthority::from_oidc_scope(
+                "ci",
+                &["*/releases/**".to_string()],
+                ScopeEnforcement::Enforce,
+            )
+        };
+        // Control: the canonical coordinate is out of scope.
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("releases/x.bin".to_string()),
+            Extension(scope()),
+            None,
+            axum::http::HeaderMap::new(),
+            Body::from(&b"x"[..]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+
+        let resp = super::upload(
+            State(ctx.state.clone()),
+            Path("/releases/x.bin".to_string()),
+            Extension(scope()),
+            None,
+            axum::http::HeaderMap::new(),
+            Body::from(&b"x"[..]),
+        )
+        .await;
+        assert!(
+            !resp.status().is_success(),
+            "out-of-scope write accepted via the alias: {}",
+            resp.status()
+        );
+        assert!(ctx.state.storage.get("raw/releases/x.bin").await.is_err());
+    }
 }

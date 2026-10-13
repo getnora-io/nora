@@ -133,6 +133,9 @@ async fn package_versions(
     headers: HeaderMap,
 ) -> Response {
     let normalized = normalize_name(&name);
+    if !crate::validation::is_one_segment(&normalized) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
@@ -334,6 +337,9 @@ async fn download_file(
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
     let normalized = normalize_name(&name);
+    if !crate::validation::is_one_segment(&normalized) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     // Block download of internal bookkeeping files (dates.json, etc.) that
     // live alongside packages in storage but are not real artifacts (#891).
@@ -1048,9 +1054,10 @@ async fn ensure_pypi_dates_cached(
     map
 }
 
-/// Normalize package name according to PEP 503.
+/// Normalize package name according to PEP 503 — the one normalization curation also uses
+/// (`curation::pep503_normalize`): lowercase, every run of `-`, `_` and `.` one `-`.
 fn normalize_name(name: &str) -> String {
-    name.to_lowercase().replace(['-', '_', '.'], "-")
+    crate::curation::pep503_normalize(name)
 }
 
 /// Check Accept header for PEP 691 JSON.
@@ -1162,11 +1169,7 @@ fn is_valid_pypi_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && (ends_with_ci(name, ".tar.gz")
-            || ends_with_ci(name, ".tgz")
-            || ends_with_ci(name, ".whl")
-            || ends_with_ci(name, ".zip")
-            || ends_with_ci(name, ".egg"))
+        && nora_registry::pypi_files::served_extension(name).is_some()
 }
 
 /// Extract filename from PyPI download URL.
@@ -1174,16 +1177,7 @@ fn extract_filename(url: &str) -> Option<&str> {
     let url = url.split('#').next()?;
     let filename = url.rsplit('/').next()?;
 
-    if ends_with_ci(filename, ".tar.gz")
-        || ends_with_ci(filename, ".tgz")
-        || ends_with_ci(filename, ".whl")
-        || ends_with_ci(filename, ".zip")
-        || ends_with_ci(filename, ".egg")
-    {
-        Some(filename)
-    } else {
-        None
-    }
+    nora_registry::pypi_files::served_extension(filename).map(|_| filename)
 }
 
 /// Parse upstream PyPI simple index HTML into file entries.
@@ -2705,6 +2699,140 @@ mod integration_tests {
              1-file and a 100-file index — {small} vs {large} means the cost scales with N"
         );
     }
+
+    // ── A name with an empty segment never names another key's file ─────────
+
+    /// A project name is one segment: `/simple/evilpkg%2F/...` decodes to `evilpkg/` and
+    /// `%2Fevilpkg` to `/evilpkg`, both naming the canonical file under a name the rule `evilpkg`
+    /// does not cover — refused before curation and storage.
+    #[tokio::test]
+    async fn a_project_name_with_an_empty_segment_is_refused_before_curation() {
+        use crate::test_helpers::create_test_context_with_config;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "pypi", "name": "evilpkg", "version": "*", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp);
+        });
+        ctx.state
+            .storage
+            .put("pypi/evilpkg/evilpkg-1.0.tar.gz", b"MALWARE")
+            .await
+            .unwrap();
+        let canonical = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/evilpkg/evilpkg-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(canonical.status(), StatusCode::FORBIDDEN, "control");
+
+        let mut served = Vec::new();
+        for alias in [
+            "/simple/evilpkg%2F/evilpkg-1.0.tar.gz",
+            "/simple/%2Fevilpkg/evilpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, alias, "").await;
+            if resp.status() == StatusCode::OK {
+                served.push(format!("{alias} -> {:?}", body_bytes(resp).await));
+            }
+        }
+        assert!(served.is_empty(), "blocklisted file served: {served:?}");
+    }
+
+    /// `/simple/%2Finternalpkg/` decodes to `/internalpkg`, which the isolation pattern
+    /// `internal*` does not match: it is refused, and the index of an internal project is never
+    /// requested from the public upstream.
+    #[tokio::test]
+    async fn a_leading_slash_name_never_takes_an_internal_project_upstream() {
+        use crate::test_helpers::create_test_context_with_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let leaked = || async {
+            upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("internalpkg"))
+                .count()
+        };
+        let resp = send(&ctx.app, Method::GET, "/simple/internalpkg/", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert_eq!(leaked().await, 0, "control: canonical name is not proxied");
+
+        let resp = send(&ctx.app, Method::GET, "/simple/%2Finternalpkg/", "").await;
+        assert_eq!(
+            leaked().await,
+            0,
+            "internal project name sent to the public upstream (alias answered {})",
+            resp.status()
+        );
+    }
+
+    /// An upload under `dup/` never replaces the released `dup-1.0.tar.gz`.
+    #[tokio::test]
+    async fn an_upload_under_an_empty_segment_name_never_overwrites_a_release() {
+        let ctx = create_test_context();
+        ctx.state
+            .storage
+            .put("pypi/dup/dup-1.0.tar.gz", b"original")
+            .await
+            .unwrap();
+        let boundary = "p1aliasboundary";
+        let mut body = Vec::new();
+        for (name, value) in [
+            (":action", "file_upload"),
+            ("name", "dup/"),
+            ("version", "1.0"),
+        ] {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"dup-1.0.tar.gz\"\r\nContent-Type: application/octet-stream\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"replacement\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", ct.as_str())],
+            body,
+        )
+        .await;
+        assert!(!resp.status().is_success(), "{}", resp.status());
+        assert_eq!(
+            &ctx.state
+                .storage
+                .get("pypi/dup/dup-1.0.tar.gz")
+                .await
+                .unwrap()[..],
+            b"original"
+        );
+    }
 }
 
 // ============================================================================
@@ -3429,5 +3557,343 @@ mod upstream_failure_edge_cases {
         let resp = send(&ctx.app, Method::GET, "/simple/flask/", "").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!down.received_requests().await.unwrap().is_empty());
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{
+        blocklist_file, create_test_context_with_config, send, send_with_headers, upstream_paths,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream(body: &str) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    #[tokio::test]
+    async fn a_download_under_an_empty_segment_name_never_reaches_upstream() {
+        let up = upstream("<html></html>").await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let control = "/simple/internalpkg/internalpkg-1.0.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert!(!resp.status().is_success(), "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        for uri in [
+            "/simple/%2Finternalpkg/internalpkg-1.0.tar.gz",
+            "/simple/internalpkg%2F%2Fx/internalpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // The JSON index fetches release dates from the upstream; the name is refused first.
+    #[tokio::test]
+    async fn a_json_index_of_an_empty_segment_name_never_reaches_upstream() {
+        let up = upstream(r#"{"files":[]}"#).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let accept = vec![("accept", "application/vnd.pypi.simple.v1+json")];
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/internalpkg/",
+            accept.clone(),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/%2Finternalpkg/",
+            accept,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+
+    // A project name is one segment: a `%2F` that decodes to an inner `/` names another
+    // project's files (`corp-secret/x`, `evilpkg/evilpkg`) and is refused before curation,
+    // namespace isolation or the upstream see it.
+    #[tokio::test]
+    async fn a_project_name_with_an_inner_slash_never_reaches_upstream() {
+        let up = upstream("<html></html>").await;
+        let (_dir, blocklist) = blocklist_file("pypi", "evilpkg");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.internal_namespaces = vec!["corp-secret".to_string()];
+        });
+        let resp = send(&ctx.app, Method::GET, "/simple/corp-secret/", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        assert!(upstream_paths(&up).await.is_empty(), "control");
+        for uri in [
+            "/simple/corp-secret%2Fx/",
+            "/simple/corp-secret%2Fx/corp-secret-1.0.tar.gz",
+            "/simple/evilpkg%2Fevilpkg/evilpkg-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+}
+
+/// Property tests against PEP 503: the normalized name is the registry's key for a project, so
+/// every spelling a client or an uploader may use lands on the one key pip asks for.
+#[cfg(test)]
+mod name_normalization_properties {
+    use super::normalize_name;
+    use proptest::prelude::*;
+
+    /// PEP 503: `re.sub(r"[-_.]+", "-", name).lower()`.
+    fn pep503(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut in_run = false;
+        for c in name.chars() {
+            if matches!(c, '-' | '_' | '.') {
+                if !in_run {
+                    out.push('-');
+                }
+                in_run = true;
+            } else {
+                out.extend(c.to_lowercase());
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    proptest! {
+        // Any PEP 508 project name normalizes as PEP 503 says.
+        #[test]
+        fn a_project_name_normalizes_as_pep_503_says(
+            name in "[A-Za-z0-9]([A-Za-z0-9._-]{0,20}[A-Za-z0-9])?"
+        ) {
+            prop_assert_eq!(normalize_name(&name), pep503(&name));
+        }
+
+        // Normalizing twice changes nothing.
+        #[test]
+        fn normalization_is_idempotent(name in "[A-Za-z0-9._-]{1,24}") {
+            let once = normalize_name(&name);
+            prop_assert_eq!(normalize_name(&once), once);
+        }
+    }
+
+    // An upload under a name with a run of separators is listed under the key pip asks for.
+    #[tokio::test]
+    async fn an_upload_is_listed_under_the_name_pip_asks_for() {
+        use super::local_index_cost_tests::{upload_body, BOUNDARY};
+        use crate::test_helpers::{body_bytes, create_test_context, send_with_headers};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let filename = "foo_bar-1.0-py3-none-any.whl";
+        let body = upload_body("Foo__Bar", "1.0", filename, b"wheel");
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/foo-bar/",
+            vec![("accept", "text/html")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(html.contains(filename), "{html}");
+    }
+
+    #[test]
+    fn a_run_of_separators_is_one_dash() {
+        for (name, normalized) in [
+            ("foo__bar", "foo-bar"),
+            ("Foo._-Bar", "foo-bar"),
+            ("a--b", "a-b"),
+        ] {
+            assert_eq!(normalize_name(name), normalized, "{name}");
+        }
+    }
+}
+
+/// A version-specific blocklist rule holds for every spelling of an sdist's file name.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod blocked_version_in_any_sdist_spelling {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_blocked_version_is_refused_whatever_the_sdist_spelling() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "pypi", "name": "python-dateutil", "version": "2.8.2", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        for file in [
+            "python_dateutil-2.8.2.tar.gz",
+            "python-dateutil-2.8.2.tar.gz",
+            "Python.Dateutil-2.8.2.zip",
+            "python_dateutil-2.8.2-py2.py3-none-any.whl",
+        ] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/simple/python-dateutil/{file}"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        // Another version passes.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/python-dateutil/python-dateutil-2.8.1.tar.gz",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// A PyPI version is the version PEP 440 reads, not its spelling: pip compares parsed versions
+/// (`packaging.version.Version`), so a rule or an allowlist entry holds for every spelling of
+/// its version — `1.0-1` is `1.0.post1`, `2.0.0.RC1` is `2.0rc1`, `1.0.0` is `1.0`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pep440_version_curation {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    fn write(dir: &tempfile::TempDir, file: &str, body: &str) -> String {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_rule_holds_for_every_spelling_of_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = write(
+            &dir,
+            "blocklist.json",
+            r#"{"version": 1, "rules": [
+                {"registry": "pypi", "name": "foo", "version": "1.0.post1", "reason": "malware"},
+                {"registry": "pypi", "name": "foo", "version": "2.0rc1", "reason": "malware"}
+            ]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        for file in [
+            "foo-1.0.post1.tar.gz",
+            "foo-1.0-1.tar.gz",
+            "foo-1.0.POST1.zip",
+            "foo-1.0.0.post1.tar.gz",
+            "foo-1.0.0.post01.tar.gz",
+            "foo-2.0.0.RC1-py3-none-any.whl",
+            "foo-2.0-rc-1.tar.gz",
+            "foo-2.0c1.tar.gz",
+            "foo-v2.0rc1.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        for file in ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "foo-1.0.post2.tar.gz"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_entry_admits_every_spelling_of_its_version() {
+        let upstream = upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            r#"{"version": 1, "entries": [{"registry": "pypi", "name": "foo", "version": "1.0"}]}"#,
+        );
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        for file in ["foo-1.0.tar.gz", "foo-1.0.0.tar.gz", "foo-v1.0.zip"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        for file in ["foo-1.1.tar.gz", "foo-1.0.post1.tar.gz"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
     }
 }

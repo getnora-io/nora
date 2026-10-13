@@ -1,0 +1,604 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/conan:/w:ro" python:3.13-slim sh -c 'pip install -q "conan==2.21.0" 2>/dev/null; python /w/client_requests.py' > nora-registry/testdata/conan/client-requests.tsv
+# Conan 2.21.0 (python:3.13-slim), remote http://127.0.0.1:<port>/conan
+# command	reference	method	path
+		GET	/conan/v2/users/authenticate
+upload	zlib/1.2.13	GET	/conan/v1/ping
+upload	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions
+upload	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	zlib/1.2.13	GET	/conan/v2/users/check_credentials
+upload	zlib/1.2.13	PUT	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	zlib/1.2.13	PUT	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	zlib/1.2.13	PUT	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	zlib/1.2.13	PUT	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	zlib/1.2.13	PUT	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	zlib/1.2.13@acme/stable	GET	/conan/v1/ping
+upload	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions
+upload	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	zlib/1.2.13@acme/stable	GET	/conan/v2/users/check_credentials
+upload	zlib/1.2.13@acme/stable	PUT	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	zlib/1.2.13@acme/stable	PUT	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	zlib/1.2.13@acme/stable	PUT	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	zlib/1.2.13@acme/stable	PUT	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	zlib/1.2.13@acme/stable	PUT	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	fmt/10.2.1	GET	/conan/v1/ping
+upload	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions
+upload	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	fmt/10.2.1	GET	/conan/v2/users/check_credentials
+upload	fmt/10.2.1	PUT	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	fmt/10.2.1	PUT	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	fmt/10.2.1	PUT	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	fmt/10.2.1	PUT	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	fmt/10.2.1	PUT	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	openssl/3.0.13	GET	/conan/v1/ping
+upload	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions
+upload	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	openssl/3.0.13	GET	/conan/v2/users/check_credentials
+upload	openssl/3.0.13	PUT	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	openssl/3.0.13	PUT	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	openssl/3.0.13	PUT	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	openssl/3.0.13	PUT	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	openssl/3.0.13	PUT	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v1/ping
+upload	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions
+upload	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/users/check_credentials
+upload	pkg_a/1.0.0-rc.1+build.7	PUT	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	pkg_a/1.0.0-rc.1+build.7	PUT	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	pkg_a/1.0.0-rc.1+build.7	PUT	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	pkg_a/1.0.0-rc.1+build.7	PUT	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	pkg_a/1.0.0-rc.1+build.7	PUT	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	dots.and+plus/1.0	GET	/conan/v1/ping
+upload	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions
+upload	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	dots.and+plus/1.0	GET	/conan/v2/users/check_credentials
+upload	dots.and+plus/1.0	PUT	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	dots.and+plus/1.0	PUT	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	dots.and+plus/1.0	PUT	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	dots.and+plus/1.0	PUT	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	dots.and+plus/1.0	PUT	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	under_score/0.1@my-user/test.channel	GET	/conan/v1/ping
+upload	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions
+upload	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	under_score/0.1@my-user/test.channel	GET	/conan/v2/users/check_credentials
+upload	under_score/0.1@my-user/test.channel	PUT	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	under_score/0.1@my-user/test.channel	PUT	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	under_score/0.1@my-user/test.channel	PUT	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	under_score/0.1@my-user/test.channel	PUT	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	under_score/0.1@my-user/test.channel	PUT	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	boost/1.84.0	GET	/conan/v1/ping
+upload	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions
+upload	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	boost/1.84.0	GET	/conan/v2/users/check_credentials
+upload	boost/1.84.0	PUT	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	boost/1.84.0	PUT	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	boost/1.84.0	PUT	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	boost/1.84.0	PUT	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	boost/1.84.0	PUT	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	v-pkg/v1.2	GET	/conan/v1/ping
+upload	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions
+upload	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	v-pkg/v1.2	GET	/conan/v2/users/check_credentials
+upload	v-pkg/v1.2	PUT	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	v-pkg/v1.2	PUT	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	v-pkg/v1.2	PUT	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	v-pkg/v1.2	PUT	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	v-pkg/v1.2	PUT	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	date/2024.01.01	GET	/conan/v1/ping
+upload	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions
+upload	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	date/2024.01.01	GET	/conan/v2/users/check_credentials
+upload	date/2024.01.01	PUT	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	date/2024.01.01	PUT	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	date/2024.01.01	PUT	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	date/2024.01.01	PUT	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	date/2024.01.01	PUT	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	aa/1.0.0+b	GET	/conan/v1/ping
+upload	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions
+upload	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	aa/1.0.0+b	GET	/conan/v2/users/check_credentials
+upload	aa/1.0.0+b	PUT	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	aa/1.0.0+b	PUT	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	aa/1.0.0+b	PUT	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	aa/1.0.0+b	PUT	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	aa/1.0.0+b	PUT	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	zz/1.0.0	GET	/conan/v1/ping
+upload	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions
+upload	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	zz/1.0.0	GET	/conan/v2/users/check_credentials
+upload	zz/1.0.0	PUT	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	zz/1.0.0	PUT	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	zz/1.0.0	PUT	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	zz/1.0.0	PUT	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	zz/1.0.0	PUT	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+upload	Upper/1.0@User/Chan	GET	/conan/v1/ping
+upload	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions
+upload	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions
+upload	Upper/1.0@User/Chan	GET	/conan/v2/users/check_credentials
+upload	Upper/1.0@User/Chan	PUT	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+upload	Upper/1.0@User/Chan	PUT	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+upload	Upper/1.0@User/Chan	PUT	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+upload	Upper/1.0@User/Chan	PUT	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+upload	Upper/1.0@User/Chan	PUT	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	zlib/1.2.13	GET	/conan/v1/ping
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/latest
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v1/ping
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/latest
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zlib/1.2.13	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v1/ping
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/latest
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zlib/1.2.13:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list zlib/1.2.13#*:*	zlib/1.2.13	GET	/conan/v1/ping
+list zlib/1.2.13#*:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions
+list zlib/1.2.13#*:*	zlib/1.2.13	GET	/conan/v2/conans/zlib/1.2.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	zlib/1.2.13@acme/stable	GET	/conan/v1/ping
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/latest
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v1/ping
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/latest
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zlib/1.2.13@acme/stable	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v1/ping
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/latest
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zlib/1.2.13@acme/stable:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list zlib/1.2.13@acme/stable#*:*	zlib/1.2.13@acme/stable	GET	/conan/v1/ping
+list zlib/1.2.13@acme/stable#*:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions
+list zlib/1.2.13@acme/stable#*:*	zlib/1.2.13@acme/stable	GET	/conan/v2/conans/zlib/1.2.13/acme/stable/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	fmt/10.2.1	GET	/conan/v1/ping
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/latest
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v1/ping
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/latest
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download fmt/10.2.1	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v1/ping
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/latest
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download fmt/10.2.1:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list fmt/10.2.1#*:*	fmt/10.2.1	GET	/conan/v1/ping
+list fmt/10.2.1#*:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions
+list fmt/10.2.1#*:*	fmt/10.2.1	GET	/conan/v2/conans/fmt/10.2.1/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	openssl/3.0.13	GET	/conan/v1/ping
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/latest
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v1/ping
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/latest
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download openssl/3.0.13	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v1/ping
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/latest
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download openssl/3.0.13:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list openssl/3.0.13#*:*	openssl/3.0.13	GET	/conan/v1/ping
+list openssl/3.0.13#*:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions
+list openssl/3.0.13#*:*	openssl/3.0.13	GET	/conan/v2/conans/openssl/3.0.13/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v1/ping
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/latest
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v1/ping
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/latest
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download pkg_a/1.0.0-rc.1+build.7	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v1/ping
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/latest
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download pkg_a/1.0.0-rc.1+build.7:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list pkg_a/1.0.0-rc.1+build.7#*:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v1/ping
+list pkg_a/1.0.0-rc.1+build.7#*:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions
+list pkg_a/1.0.0-rc.1+build.7#*:*	pkg_a/1.0.0-rc.1+build.7	GET	/conan/v2/conans/pkg_a/1.0.0-rc.1+build.7/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	dots.and+plus/1.0	GET	/conan/v1/ping
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/latest
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v1/ping
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/latest
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download dots.and+plus/1.0	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v1/ping
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/latest
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download dots.and+plus/1.0:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list dots.and+plus/1.0#*:*	dots.and+plus/1.0	GET	/conan/v1/ping
+list dots.and+plus/1.0#*:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions
+list dots.and+plus/1.0#*:*	dots.and+plus/1.0	GET	/conan/v2/conans/dots.and+plus/1.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	under_score/0.1@my-user/test.channel	GET	/conan/v1/ping
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/latest
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v1/ping
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/latest
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/search
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download under_score/0.1@my-user/test.channel	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v1/ping
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/latest
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/search
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/files
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download under_score/0.1@my-user/test.channel:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list under_score/0.1@my-user/test.channel#*:*	under_score/0.1@my-user/test.channel	GET	/conan/v1/ping
+list under_score/0.1@my-user/test.channel#*:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions
+list under_score/0.1@my-user/test.channel#*:*	under_score/0.1@my-user/test.channel	GET	/conan/v2/conans/under_score/0.1/my-user/test.channel/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	boost/1.84.0	GET	/conan/v1/ping
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/latest
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download boost/1.84.0	boost/1.84.0	GET	/conan/v1/ping
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/latest
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download boost/1.84.0	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v1/ping
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/latest
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download boost/1.84.0:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list boost/1.84.0#*:*	boost/1.84.0	GET	/conan/v1/ping
+list boost/1.84.0#*:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions
+list boost/1.84.0#*:*	boost/1.84.0	GET	/conan/v2/conans/boost/1.84.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	v-pkg/v1.2	GET	/conan/v1/ping
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/latest
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v1/ping
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/latest
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download v-pkg/v1.2	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v1/ping
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/latest
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download v-pkg/v1.2:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list v-pkg/v1.2#*:*	v-pkg/v1.2	GET	/conan/v1/ping
+list v-pkg/v1.2#*:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions
+list v-pkg/v1.2#*:*	v-pkg/v1.2	GET	/conan/v2/conans/v-pkg/v1.2/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	date/2024.01.01	GET	/conan/v1/ping
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/latest
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download date/2024.01.01	date/2024.01.01	GET	/conan/v1/ping
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/latest
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download date/2024.01.01	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v1/ping
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/latest
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download date/2024.01.01:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list date/2024.01.01#*:*	date/2024.01.01	GET	/conan/v1/ping
+list date/2024.01.01#*:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions
+list date/2024.01.01#*:*	date/2024.01.01	GET	/conan/v2/conans/date/2024.01.01/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	aa/1.0.0+b	GET	/conan/v1/ping
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/latest
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v1/ping
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/latest
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download aa/1.0.0+b	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v1/ping
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/latest
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download aa/1.0.0+b:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list aa/1.0.0+b#*:*	aa/1.0.0+b	GET	/conan/v1/ping
+list aa/1.0.0+b#*:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions
+list aa/1.0.0+b#*:*	aa/1.0.0+b	GET	/conan/v2/conans/aa/1.0.0+b/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	zz/1.0.0	GET	/conan/v1/ping
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/latest
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zz/1.0.0	zz/1.0.0	GET	/conan/v1/ping
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/latest
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zz/1.0.0	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v1/ping
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/latest
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/files
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download zz/1.0.0:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list zz/1.0.0#*:*	zz/1.0.0	GET	/conan/v1/ping
+list zz/1.0.0#*:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions
+list zz/1.0.0#*:*	zz/1.0.0	GET	/conan/v2/conans/zz/1.0.0/_/_/revisions/66290236faab0c6a82918fe0fe028c85/search
+install	Upper/1.0@User/Chan	GET	/conan/v1/ping
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/latest
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+install	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v1/ping
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/latest
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/search
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download Upper/1.0@User/Chan	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v1/ping
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/latest
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/search
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/latest
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanmanifest.txt
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files/conanfile.py
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/files
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conanmanifest.txt
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conaninfo.txt
+download Upper/1.0@User/Chan:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/packages/da39a3ee5e6b4b0d3255bfef95601890afd80709/revisions/0ba8627bd47edc3a501e8f0eb9a79e5e/files/conan_package.tgz
+list Upper/1.0@User/Chan#*:*	Upper/1.0@User/Chan	GET	/conan/v1/ping
+list Upper/1.0@User/Chan#*:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions
+list Upper/1.0@User/Chan#*:*	Upper/1.0@User/Chan	GET	/conan/v2/conans/Upper/1.0/User/Chan/revisions/66290236faab0c6a82918fe0fe028c85/search
+list z*		GET	/conan/v1/ping
+list z*		GET	/conan/v2/conans/search?q=z%2A

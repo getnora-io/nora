@@ -19,8 +19,10 @@ fmt:
 clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
+# The library, the binary and every test under nora-registry/tests/ (which runs the built
+# binary), as CI's `cargo test --package nora-registry` does; doctests and benches stay out.
 test:
-	$(CARGO) test --lib --bin nora
+	$(CARGO) test --package nora-registry --tests
 
 coherence:
 	@if [ -x scripts/coherence-check.sh ]; then scripts/coherence-check.sh; fi

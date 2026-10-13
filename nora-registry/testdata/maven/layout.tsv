@@ -1,0 +1,683 @@
+# Regenerate: docker run --rm -v "$PWD/nora-registry/testdata/maven:/w:ro" maven:3.9-eclipse-temurin-21 java -cp '/usr/share/maven/lib/*' /w/Layout.java > nora-registry/testdata/maven/layout.tsv
+# maven-resolver 1.9.27 (Maven2RepositoryLayoutFactory), 21.0.12.1
+# kind	groupId	artifactId	baseVersion	version	classifier	extension	path
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0		jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar
+checksum	org.apache.commons	commons-lang3	3.14.0	3.14.0		jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar.sha1
+checksum	org.apache.commons	commons-lang3	3.14.0	3.14.0		jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar.md5
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0		pom	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.pom
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0	sources	jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0-sources.jar
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0	javadoc	jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0-javadoc.jar
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0	linux-x86_64	jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0	tests	jar	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0-tests.jar
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0		tar.gz	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.tar.gz
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0	bin	zip	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0-bin.zip
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0		jar.asc	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar.asc
+artifact	org.apache.commons	commons-lang3	3.14.0	3.14.0		module	org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.module
+artifact	org.apache.commons	commons-lang3	1.0	1.0		jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.jar
+checksum	org.apache.commons	commons-lang3	1.0	1.0		jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0	1.0		jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0	1.0		pom	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.pom
+artifact	org.apache.commons	commons-lang3	1.0	1.0	sources	jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0	1.0	javadoc	jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0	1.0	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0	1.0	tests	jar	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0	1.0		tar.gz	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0	1.0	bin	zip	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0	1.0		jar.asc	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0	1.0		module	org/apache/commons/commons-lang3/1.0/commons-lang3-1.0.module
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0		jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.jar
+checksum	org.apache.commons	commons-lang3	1.0.0	1.0.0		jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0.0	1.0.0		jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0		pom	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.pom
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0	sources	jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0	javadoc	jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0	tests	jar	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0		tar.gz	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0	bin	zip	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0		jar.asc	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0.0	1.0.0		module	org/apache/commons/commons-lang3/1.0.0/commons-lang3-1.0.0.module
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.jar
+checksum	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		pom	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.pom
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT	sources	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT	javadoc	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT	tests	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		tar.gz	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT	bin	zip	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		jar.asc	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		module	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-SNAPSHOT.module
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.jar
+checksum	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		pom	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.pom
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1	sources	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1	javadoc	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1	tests	jar	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		tar.gz	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1	bin	zip	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		jar.asc	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-20261012.120000-1		module	org/apache/commons/commons-lang3/1.0-SNAPSHOT/commons-lang3-1.0-20261012.120000-1.module
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.jar
+checksum	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.jar.sha1
+checksum	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.jar.md5
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		pom	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.pom
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1	sources	jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1-sources.jar
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1	javadoc	jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1-javadoc.jar
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1	linux-x86_64	jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1	tests	jar	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1-tests.jar
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		tar.gz	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.tar.gz
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1	bin	zip	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1-bin.zip
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		jar.asc	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.jar.asc
+artifact	org.apache.commons	commons-lang3	2.0.0-RC1	2.0.0-RC1		module	org/apache/commons/commons-lang3/2.0.0-RC1/commons-lang3-2.0.0-RC1.module
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.jar
+checksum	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.jar.sha1
+checksum	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.jar.md5
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		pom	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.pom
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final	sources	jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final-sources.jar
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final	javadoc	jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final-javadoc.jar
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final	linux-x86_64	jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final	tests	jar	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final-tests.jar
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		tar.gz	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.tar.gz
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final	bin	zip	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final-bin.zip
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		jar.asc	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.jar.asc
+artifact	org.apache.commons	commons-lang3	4.1.100.Final	4.1.100.Final		module	org/apache/commons/commons-lang3/4.1.100.Final/commons-lang3-4.1.100.Final.module
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.jar
+checksum	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		pom	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.pom
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1	sources	jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1	javadoc	jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1	tests	jar	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		tar.gz	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1	bin	zip	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		jar.asc	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0-beta-1	1.0-beta-1		module	org/apache/commons/commons-lang3/1.0-beta-1/commons-lang3-1.0-beta-1.module
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.jar
+checksum	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.jar.sha1
+checksum	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.jar.md5
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		pom	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.pom
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550	sources	jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550-sources.jar
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550	javadoc	jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550-javadoc.jar
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550	linux-x86_64	jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550	tests	jar	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550-tests.jar
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		tar.gz	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.tar.gz
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550	bin	zip	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550-bin.zip
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		jar.asc	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.jar.asc
+artifact	org.apache.commons	commons-lang3	20030203.000550	20030203.000550		module	org/apache/commons/commons-lang3/20030203.000550/commons-lang3-20030203.000550.module
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.jar
+checksum	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		pom	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.pom
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	sources	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	javadoc	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	tests	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		tar.gz	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	bin	zip	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar.asc	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		module	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-SNAPSHOT.module
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.jar
+checksum	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.jar.sha1
+checksum	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.jar.md5
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		pom	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.pom
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	sources	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17-sources.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	javadoc	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17-javadoc.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	linux-x86_64	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17-linux-x86_64.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	tests	jar	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17-tests.jar
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		tar.gz	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.tar.gz
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	bin	zip	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17-bin.zip
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar.asc	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.jar.asc
+artifact	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		module	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/commons-lang3-1.0.0-20261012.120000-17.module
+metadata	org.apache.commons	commons-lang3				maven-metadata.xml	org/apache/commons/commons-lang3/maven-metadata.xml
+metadata	org.apache.commons	commons-lang3	1.0-SNAPSHOT	1.0-SNAPSHOT		maven-metadata.xml	org/apache/commons/commons-lang3/1.0-SNAPSHOT/maven-metadata.xml
+metadata	org.apache.commons	commons-lang3	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		maven-metadata.xml	org/apache/commons/commons-lang3/1.0.0-SNAPSHOT/maven-metadata.xml
+metadata	org.apache.commons					maven-metadata.xml	org/apache/commons/maven-metadata.xml
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.jar
+checksum	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		pom	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.pom
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0	sources	jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0	javadoc	jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0	tests	jar	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		tar.gz	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0	bin	zip	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		jar.asc	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	3.14.0	3.14.0		module	io/netty/netty-tcnative-boringssl-static/3.14.0/netty-tcnative-boringssl-static-3.14.0.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0		jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0	1.0		jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0	1.0		jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0		pom	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0	1.0		module	io/netty/netty-tcnative-boringssl-static/1.0/netty-tcnative-boringssl-static-1.0.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		pom	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0	1.0.0		module	io/netty/netty-tcnative-boringssl-static/1.0.0/netty-tcnative-boringssl-static-1.0.0.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		pom	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		module	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-SNAPSHOT.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		pom	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-20261012.120000-1		module	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0-20261012.120000-1.module
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.jar
+checksum	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		pom	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.pom
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1	sources	jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1	javadoc	jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1	tests	jar	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		tar.gz	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1	bin	zip	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		jar.asc	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	2.0.0-RC1	2.0.0-RC1		module	io/netty/netty-tcnative-boringssl-static/2.0.0-RC1/netty-tcnative-boringssl-static-2.0.0-RC1.module
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.jar
+checksum	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		pom	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.pom
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final	sources	jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final	javadoc	jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final	tests	jar	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		tar.gz	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final	bin	zip	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		jar.asc	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	4.1.100.Final	4.1.100.Final		module	io/netty/netty-tcnative-boringssl-static/4.1.100.Final/netty-tcnative-boringssl-static-4.1.100.Final.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		pom	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0-beta-1	1.0-beta-1		module	io/netty/netty-tcnative-boringssl-static/1.0-beta-1/netty-tcnative-boringssl-static-1.0-beta-1.module
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.jar
+checksum	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		pom	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.pom
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550	sources	jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550	javadoc	jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550	tests	jar	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		tar.gz	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550	bin	zip	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		jar.asc	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	20030203.000550	20030203.000550		module	io/netty/netty-tcnative-boringssl-static/20030203.000550/netty-tcnative-boringssl-static-20030203.000550.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		pom	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		module	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-SNAPSHOT.module
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.jar
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.jar.sha1
+checksum	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.jar.md5
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		pom	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.pom
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	sources	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17-sources.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	javadoc	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17-javadoc.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	linux-x86_64	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17-linux-x86_64.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	tests	jar	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17-tests.jar
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		tar.gz	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.tar.gz
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	bin	zip	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17-bin.zip
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar.asc	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.jar.asc
+artifact	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		module	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/netty-tcnative-boringssl-static-1.0.0-20261012.120000-17.module
+metadata	io.netty	netty-tcnative-boringssl-static				maven-metadata.xml	io/netty/netty-tcnative-boringssl-static/maven-metadata.xml
+metadata	io.netty	netty-tcnative-boringssl-static	1.0-SNAPSHOT	1.0-SNAPSHOT		maven-metadata.xml	io/netty/netty-tcnative-boringssl-static/1.0-SNAPSHOT/maven-metadata.xml
+metadata	io.netty	netty-tcnative-boringssl-static	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		maven-metadata.xml	io/netty/netty-tcnative-boringssl-static/1.0.0-SNAPSHOT/maven-metadata.xml
+metadata	io.netty					maven-metadata.xml	io/netty/maven-metadata.xml
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.jar
+checksum	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.jar.md5
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		pom	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.pom
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0	sources	jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0-sources.jar
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0	javadoc	jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0	linux-x86_64	jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0	tests	jar	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0-tests.jar
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		tar.gz	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.tar.gz
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0	bin	zip	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0-bin.zip
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		jar.asc	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.jar.asc
+artifact	com.Example.Mixed	Upper-Art	3.14.0	3.14.0		module	com/Example/Mixed/Upper-Art/3.14.0/Upper-Art-3.14.0.module
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0		jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.jar
+checksum	com.Example.Mixed	Upper-Art	1.0	1.0		jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0	1.0		jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0		pom	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.pom
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0	sources	jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0	javadoc	jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0	tests	jar	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0		tar.gz	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0	bin	zip	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0		jar.asc	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0	1.0		module	com/Example/Mixed/Upper-Art/1.0/Upper-Art-1.0.module
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.jar
+checksum	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		pom	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.pom
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0	sources	jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0	javadoc	jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0	tests	jar	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		tar.gz	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0	bin	zip	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		jar.asc	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0.0	1.0.0		module	com/Example/Mixed/Upper-Art/1.0.0/Upper-Art-1.0.0.module
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.jar
+checksum	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		pom	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.pom
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT	sources	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT	javadoc	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT	tests	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		tar.gz	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT	bin	zip	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		jar.asc	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		module	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-SNAPSHOT.module
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.jar
+checksum	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		pom	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.pom
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1	sources	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1	javadoc	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1	tests	jar	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		tar.gz	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1	bin	zip	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		jar.asc	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-20261012.120000-1		module	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/Upper-Art-1.0-20261012.120000-1.module
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar
+checksum	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar.md5
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		pom	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.pom
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1	sources	jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1-sources.jar
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1	javadoc	jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1	linux-x86_64	jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1	tests	jar	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1-tests.jar
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		tar.gz	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.tar.gz
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1	bin	zip	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1-bin.zip
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		jar.asc	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.jar.asc
+artifact	com.Example.Mixed	Upper-Art	2.0.0-RC1	2.0.0-RC1		module	com/Example/Mixed/Upper-Art/2.0.0-RC1/Upper-Art-2.0.0-RC1.module
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.jar
+checksum	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.jar.md5
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		pom	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.pom
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final	sources	jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final-sources.jar
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final	javadoc	jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final	linux-x86_64	jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final	tests	jar	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final-tests.jar
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		tar.gz	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.tar.gz
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final	bin	zip	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final-bin.zip
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		jar.asc	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.jar.asc
+artifact	com.Example.Mixed	Upper-Art	4.1.100.Final	4.1.100.Final		module	com/Example/Mixed/Upper-Art/4.1.100.Final/Upper-Art-4.1.100.Final.module
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.jar
+checksum	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		pom	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.pom
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1	sources	jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1	javadoc	jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1	tests	jar	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		tar.gz	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1	bin	zip	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		jar.asc	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0-beta-1	1.0-beta-1		module	com/Example/Mixed/Upper-Art/1.0-beta-1/Upper-Art-1.0-beta-1.module
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.jar
+checksum	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.jar.md5
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		pom	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.pom
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550	sources	jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550-sources.jar
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550	javadoc	jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550	linux-x86_64	jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550	tests	jar	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550-tests.jar
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		tar.gz	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.tar.gz
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550	bin	zip	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550-bin.zip
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		jar.asc	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.jar.asc
+artifact	com.Example.Mixed	Upper-Art	20030203.000550	20030203.000550		module	com/Example/Mixed/Upper-Art/20030203.000550/Upper-Art-20030203.000550.module
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.jar
+checksum	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		pom	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.pom
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	sources	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	javadoc	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	tests	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		tar.gz	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	bin	zip	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar.asc	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		module	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-SNAPSHOT.module
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.jar
+checksum	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.jar.sha1
+checksum	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.jar.md5
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		pom	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.pom
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	sources	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17-sources.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	javadoc	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17-javadoc.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	linux-x86_64	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17-linux-x86_64.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	tests	jar	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17-tests.jar
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		tar.gz	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.tar.gz
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	bin	zip	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17-bin.zip
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar.asc	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.jar.asc
+artifact	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		module	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/Upper-Art-1.0.0-20261012.120000-17.module
+metadata	com.Example.Mixed	Upper-Art				maven-metadata.xml	com/Example/Mixed/Upper-Art/maven-metadata.xml
+metadata	com.Example.Mixed	Upper-Art	1.0-SNAPSHOT	1.0-SNAPSHOT		maven-metadata.xml	com/Example/Mixed/Upper-Art/1.0-SNAPSHOT/maven-metadata.xml
+metadata	com.Example.Mixed	Upper-Art	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		maven-metadata.xml	com/Example/Mixed/Upper-Art/1.0.0-SNAPSHOT/maven-metadata.xml
+metadata	com.Example.Mixed					maven-metadata.xml	com/Example/Mixed/maven-metadata.xml
+artifact	a	my.artifact	3.14.0	3.14.0		jar	a/my.artifact/3.14.0/my.artifact-3.14.0.jar
+checksum	a	my.artifact	3.14.0	3.14.0		jar	a/my.artifact/3.14.0/my.artifact-3.14.0.jar.sha1
+checksum	a	my.artifact	3.14.0	3.14.0		jar	a/my.artifact/3.14.0/my.artifact-3.14.0.jar.md5
+artifact	a	my.artifact	3.14.0	3.14.0		pom	a/my.artifact/3.14.0/my.artifact-3.14.0.pom
+artifact	a	my.artifact	3.14.0	3.14.0	sources	jar	a/my.artifact/3.14.0/my.artifact-3.14.0-sources.jar
+artifact	a	my.artifact	3.14.0	3.14.0	javadoc	jar	a/my.artifact/3.14.0/my.artifact-3.14.0-javadoc.jar
+artifact	a	my.artifact	3.14.0	3.14.0	linux-x86_64	jar	a/my.artifact/3.14.0/my.artifact-3.14.0-linux-x86_64.jar
+artifact	a	my.artifact	3.14.0	3.14.0	tests	jar	a/my.artifact/3.14.0/my.artifact-3.14.0-tests.jar
+artifact	a	my.artifact	3.14.0	3.14.0		tar.gz	a/my.artifact/3.14.0/my.artifact-3.14.0.tar.gz
+artifact	a	my.artifact	3.14.0	3.14.0	bin	zip	a/my.artifact/3.14.0/my.artifact-3.14.0-bin.zip
+artifact	a	my.artifact	3.14.0	3.14.0		jar.asc	a/my.artifact/3.14.0/my.artifact-3.14.0.jar.asc
+artifact	a	my.artifact	3.14.0	3.14.0		module	a/my.artifact/3.14.0/my.artifact-3.14.0.module
+artifact	a	my.artifact	1.0	1.0		jar	a/my.artifact/1.0/my.artifact-1.0.jar
+checksum	a	my.artifact	1.0	1.0		jar	a/my.artifact/1.0/my.artifact-1.0.jar.sha1
+checksum	a	my.artifact	1.0	1.0		jar	a/my.artifact/1.0/my.artifact-1.0.jar.md5
+artifact	a	my.artifact	1.0	1.0		pom	a/my.artifact/1.0/my.artifact-1.0.pom
+artifact	a	my.artifact	1.0	1.0	sources	jar	a/my.artifact/1.0/my.artifact-1.0-sources.jar
+artifact	a	my.artifact	1.0	1.0	javadoc	jar	a/my.artifact/1.0/my.artifact-1.0-javadoc.jar
+artifact	a	my.artifact	1.0	1.0	linux-x86_64	jar	a/my.artifact/1.0/my.artifact-1.0-linux-x86_64.jar
+artifact	a	my.artifact	1.0	1.0	tests	jar	a/my.artifact/1.0/my.artifact-1.0-tests.jar
+artifact	a	my.artifact	1.0	1.0		tar.gz	a/my.artifact/1.0/my.artifact-1.0.tar.gz
+artifact	a	my.artifact	1.0	1.0	bin	zip	a/my.artifact/1.0/my.artifact-1.0-bin.zip
+artifact	a	my.artifact	1.0	1.0		jar.asc	a/my.artifact/1.0/my.artifact-1.0.jar.asc
+artifact	a	my.artifact	1.0	1.0		module	a/my.artifact/1.0/my.artifact-1.0.module
+artifact	a	my.artifact	1.0.0	1.0.0		jar	a/my.artifact/1.0.0/my.artifact-1.0.0.jar
+checksum	a	my.artifact	1.0.0	1.0.0		jar	a/my.artifact/1.0.0/my.artifact-1.0.0.jar.sha1
+checksum	a	my.artifact	1.0.0	1.0.0		jar	a/my.artifact/1.0.0/my.artifact-1.0.0.jar.md5
+artifact	a	my.artifact	1.0.0	1.0.0		pom	a/my.artifact/1.0.0/my.artifact-1.0.0.pom
+artifact	a	my.artifact	1.0.0	1.0.0	sources	jar	a/my.artifact/1.0.0/my.artifact-1.0.0-sources.jar
+artifact	a	my.artifact	1.0.0	1.0.0	javadoc	jar	a/my.artifact/1.0.0/my.artifact-1.0.0-javadoc.jar
+artifact	a	my.artifact	1.0.0	1.0.0	linux-x86_64	jar	a/my.artifact/1.0.0/my.artifact-1.0.0-linux-x86_64.jar
+artifact	a	my.artifact	1.0.0	1.0.0	tests	jar	a/my.artifact/1.0.0/my.artifact-1.0.0-tests.jar
+artifact	a	my.artifact	1.0.0	1.0.0		tar.gz	a/my.artifact/1.0.0/my.artifact-1.0.0.tar.gz
+artifact	a	my.artifact	1.0.0	1.0.0	bin	zip	a/my.artifact/1.0.0/my.artifact-1.0.0-bin.zip
+artifact	a	my.artifact	1.0.0	1.0.0		jar.asc	a/my.artifact/1.0.0/my.artifact-1.0.0.jar.asc
+artifact	a	my.artifact	1.0.0	1.0.0		module	a/my.artifact/1.0.0/my.artifact-1.0.0.module
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.jar
+checksum	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.jar.sha1
+checksum	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.jar.md5
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		pom	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.pom
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT	sources	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT-sources.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT	javadoc	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT-javadoc.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT	linux-x86_64	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT-linux-x86_64.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT	tests	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT-tests.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		tar.gz	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.tar.gz
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT	bin	zip	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT-bin.zip
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		jar.asc	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.jar.asc
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		module	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-SNAPSHOT.module
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.jar
+checksum	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.jar.sha1
+checksum	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.jar.md5
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		pom	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.pom
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1	sources	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1-sources.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1	javadoc	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1-javadoc.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1	linux-x86_64	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1-linux-x86_64.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1	tests	jar	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1-tests.jar
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		tar.gz	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.tar.gz
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1	bin	zip	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1-bin.zip
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		jar.asc	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.jar.asc
+artifact	a	my.artifact	1.0-SNAPSHOT	1.0-20261012.120000-1		module	a/my.artifact/1.0-SNAPSHOT/my.artifact-1.0-20261012.120000-1.module
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1		jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.jar
+checksum	a	my.artifact	2.0.0-RC1	2.0.0-RC1		jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.jar.sha1
+checksum	a	my.artifact	2.0.0-RC1	2.0.0-RC1		jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.jar.md5
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1		pom	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.pom
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1	sources	jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1-sources.jar
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1	javadoc	jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1-javadoc.jar
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1	linux-x86_64	jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1-linux-x86_64.jar
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1	tests	jar	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1-tests.jar
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1		tar.gz	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.tar.gz
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1	bin	zip	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1-bin.zip
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1		jar.asc	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.jar.asc
+artifact	a	my.artifact	2.0.0-RC1	2.0.0-RC1		module	a/my.artifact/2.0.0-RC1/my.artifact-2.0.0-RC1.module
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final		jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar
+checksum	a	my.artifact	4.1.100.Final	4.1.100.Final		jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar.sha1
+checksum	a	my.artifact	4.1.100.Final	4.1.100.Final		jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar.md5
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final		pom	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.pom
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final	sources	jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final-sources.jar
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final	javadoc	jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final-javadoc.jar
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final	linux-x86_64	jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final-linux-x86_64.jar
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final	tests	jar	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final-tests.jar
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final		tar.gz	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.tar.gz
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final	bin	zip	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final-bin.zip
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final		jar.asc	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.jar.asc
+artifact	a	my.artifact	4.1.100.Final	4.1.100.Final		module	a/my.artifact/4.1.100.Final/my.artifact-4.1.100.Final.module
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1		jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.jar
+checksum	a	my.artifact	1.0-beta-1	1.0-beta-1		jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.jar.sha1
+checksum	a	my.artifact	1.0-beta-1	1.0-beta-1		jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.jar.md5
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1		pom	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.pom
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1	sources	jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1-sources.jar
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1	javadoc	jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1-javadoc.jar
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1	linux-x86_64	jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1-linux-x86_64.jar
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1	tests	jar	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1-tests.jar
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1		tar.gz	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.tar.gz
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1	bin	zip	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1-bin.zip
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1		jar.asc	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.jar.asc
+artifact	a	my.artifact	1.0-beta-1	1.0-beta-1		module	a/my.artifact/1.0-beta-1/my.artifact-1.0-beta-1.module
+artifact	a	my.artifact	20030203.000550	20030203.000550		jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550.jar
+checksum	a	my.artifact	20030203.000550	20030203.000550		jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550.jar.sha1
+checksum	a	my.artifact	20030203.000550	20030203.000550		jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550.jar.md5
+artifact	a	my.artifact	20030203.000550	20030203.000550		pom	a/my.artifact/20030203.000550/my.artifact-20030203.000550.pom
+artifact	a	my.artifact	20030203.000550	20030203.000550	sources	jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550-sources.jar
+artifact	a	my.artifact	20030203.000550	20030203.000550	javadoc	jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550-javadoc.jar
+artifact	a	my.artifact	20030203.000550	20030203.000550	linux-x86_64	jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550-linux-x86_64.jar
+artifact	a	my.artifact	20030203.000550	20030203.000550	tests	jar	a/my.artifact/20030203.000550/my.artifact-20030203.000550-tests.jar
+artifact	a	my.artifact	20030203.000550	20030203.000550		tar.gz	a/my.artifact/20030203.000550/my.artifact-20030203.000550.tar.gz
+artifact	a	my.artifact	20030203.000550	20030203.000550	bin	zip	a/my.artifact/20030203.000550/my.artifact-20030203.000550-bin.zip
+artifact	a	my.artifact	20030203.000550	20030203.000550		jar.asc	a/my.artifact/20030203.000550/my.artifact-20030203.000550.jar.asc
+artifact	a	my.artifact	20030203.000550	20030203.000550		module	a/my.artifact/20030203.000550/my.artifact-20030203.000550.module
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.jar
+checksum	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.jar.sha1
+checksum	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.jar.md5
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		pom	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.pom
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	sources	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT-sources.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	javadoc	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT-javadoc.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	linux-x86_64	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT-linux-x86_64.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	tests	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT-tests.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		tar.gz	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.tar.gz
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	bin	zip	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT-bin.zip
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar.asc	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.jar.asc
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		module	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-SNAPSHOT.module
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.jar
+checksum	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.jar.sha1
+checksum	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.jar.md5
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		pom	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.pom
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	sources	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17-sources.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	javadoc	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17-javadoc.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	linux-x86_64	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17-linux-x86_64.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	tests	jar	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17-tests.jar
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		tar.gz	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.tar.gz
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	bin	zip	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17-bin.zip
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar.asc	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.jar.asc
+artifact	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		module	a/my.artifact/1.0.0-SNAPSHOT/my.artifact-1.0.0-20261012.120000-17.module
+metadata	a	my.artifact				maven-metadata.xml	a/my.artifact/maven-metadata.xml
+metadata	a	my.artifact	1.0-SNAPSHOT	1.0-SNAPSHOT		maven-metadata.xml	a/my.artifact/1.0-SNAPSHOT/maven-metadata.xml
+metadata	a	my.artifact	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		maven-metadata.xml	a/my.artifact/1.0.0-SNAPSHOT/maven-metadata.xml
+metadata	a					maven-metadata.xml	a/maven-metadata.xml
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0		jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.jar
+checksum	org.example.deep.nested.group	lib	3.14.0	3.14.0		jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.jar.sha1
+checksum	org.example.deep.nested.group	lib	3.14.0	3.14.0		jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.jar.md5
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0		pom	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.pom
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0	sources	jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0-sources.jar
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0	javadoc	jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0-javadoc.jar
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0	linux-x86_64	jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0	tests	jar	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0-tests.jar
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0		tar.gz	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.tar.gz
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0	bin	zip	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0-bin.zip
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0		jar.asc	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.jar.asc
+artifact	org.example.deep.nested.group	lib	3.14.0	3.14.0		module	org/example/deep/nested/group/lib/3.14.0/lib-3.14.0.module
+artifact	org.example.deep.nested.group	lib	1.0	1.0		jar	org/example/deep/nested/group/lib/1.0/lib-1.0.jar
+checksum	org.example.deep.nested.group	lib	1.0	1.0		jar	org/example/deep/nested/group/lib/1.0/lib-1.0.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0	1.0		jar	org/example/deep/nested/group/lib/1.0/lib-1.0.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0	1.0		pom	org/example/deep/nested/group/lib/1.0/lib-1.0.pom
+artifact	org.example.deep.nested.group	lib	1.0	1.0	sources	jar	org/example/deep/nested/group/lib/1.0/lib-1.0-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0	1.0	javadoc	jar	org/example/deep/nested/group/lib/1.0/lib-1.0-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0	1.0	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0/lib-1.0-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0	1.0	tests	jar	org/example/deep/nested/group/lib/1.0/lib-1.0-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0	1.0		tar.gz	org/example/deep/nested/group/lib/1.0/lib-1.0.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0	1.0	bin	zip	org/example/deep/nested/group/lib/1.0/lib-1.0-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0	1.0		jar.asc	org/example/deep/nested/group/lib/1.0/lib-1.0.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0	1.0		module	org/example/deep/nested/group/lib/1.0/lib-1.0.module
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0		jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.jar
+checksum	org.example.deep.nested.group	lib	1.0.0	1.0.0		jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0.0	1.0.0		jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0		pom	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.pom
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0	sources	jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0	javadoc	jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0	tests	jar	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0		tar.gz	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0	bin	zip	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0		jar.asc	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0.0	1.0.0		module	org/example/deep/nested/group/lib/1.0.0/lib-1.0.0.module
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar
+checksum	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		pom	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.pom
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT	sources	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT	javadoc	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT	tests	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		tar.gz	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT	bin	zip	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		jar.asc	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		module	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.module
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.jar
+checksum	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		pom	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.pom
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1	sources	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1	javadoc	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1	tests	jar	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		tar.gz	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1	bin	zip	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		jar.asc	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-20261012.120000-1		module	org/example/deep/nested/group/lib/1.0-SNAPSHOT/lib-1.0-20261012.120000-1.module
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.jar
+checksum	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.jar.sha1
+checksum	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.jar.md5
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		pom	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.pom
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1	sources	jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1-sources.jar
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1	javadoc	jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1-javadoc.jar
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1	linux-x86_64	jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1	tests	jar	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1-tests.jar
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		tar.gz	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.tar.gz
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1	bin	zip	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1-bin.zip
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		jar.asc	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.jar.asc
+artifact	org.example.deep.nested.group	lib	2.0.0-RC1	2.0.0-RC1		module	org/example/deep/nested/group/lib/2.0.0-RC1/lib-2.0.0-RC1.module
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.jar
+checksum	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.jar.sha1
+checksum	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.jar.md5
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		pom	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.pom
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final	sources	jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final-sources.jar
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final	javadoc	jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final-javadoc.jar
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final	linux-x86_64	jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final	tests	jar	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final-tests.jar
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		tar.gz	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.tar.gz
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final	bin	zip	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final-bin.zip
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		jar.asc	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.jar.asc
+artifact	org.example.deep.nested.group	lib	4.1.100.Final	4.1.100.Final		module	org/example/deep/nested/group/lib/4.1.100.Final/lib-4.1.100.Final.module
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.jar
+checksum	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		pom	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.pom
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1	sources	jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1	javadoc	jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1	tests	jar	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		tar.gz	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1	bin	zip	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		jar.asc	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0-beta-1	1.0-beta-1		module	org/example/deep/nested/group/lib/1.0-beta-1/lib-1.0-beta-1.module
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.jar
+checksum	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.jar.sha1
+checksum	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.jar.md5
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		pom	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.pom
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550	sources	jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550-sources.jar
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550	javadoc	jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550-javadoc.jar
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550	linux-x86_64	jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550	tests	jar	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550-tests.jar
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		tar.gz	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.tar.gz
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550	bin	zip	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550-bin.zip
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		jar.asc	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.jar.asc
+artifact	org.example.deep.nested.group	lib	20030203.000550	20030203.000550		module	org/example/deep/nested/group/lib/20030203.000550/lib-20030203.000550.module
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.jar
+checksum	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		pom	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.pom
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	sources	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	javadoc	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	tests	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		tar.gz	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT	bin	zip	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		jar.asc	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		module	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-SNAPSHOT.module
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.jar
+checksum	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.jar.sha1
+checksum	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.jar.md5
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		pom	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.pom
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	sources	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17-sources.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	javadoc	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17-javadoc.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	linux-x86_64	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17-linux-x86_64.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	tests	jar	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17-tests.jar
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		tar.gz	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.tar.gz
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17	bin	zip	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17-bin.zip
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		jar.asc	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.jar.asc
+artifact	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-20261012.120000-17		module	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/lib-1.0.0-20261012.120000-17.module
+metadata	org.example.deep.nested.group	lib				maven-metadata.xml	org/example/deep/nested/group/lib/maven-metadata.xml
+metadata	org.example.deep.nested.group	lib	1.0-SNAPSHOT	1.0-SNAPSHOT		maven-metadata.xml	org/example/deep/nested/group/lib/1.0-SNAPSHOT/maven-metadata.xml
+metadata	org.example.deep.nested.group	lib	1.0.0-SNAPSHOT	1.0.0-SNAPSHOT		maven-metadata.xml	org/example/deep/nested/group/lib/1.0.0-SNAPSHOT/maven-metadata.xml
+metadata	org.example.deep.nested.group					maven-metadata.xml	org/example/deep/nested/group/maven-metadata.xml

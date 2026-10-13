@@ -158,12 +158,19 @@ async fn distribution_proxy(
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    let dist_path = path.strip_prefix('/').unwrap_or(&path);
+    // The wildcard holds the path after `id/` as sent; a leading `/` is an empty segment
+    // (`id//F/...`), refused below like any other, not a second name for the same archive.
+    let dist_path = path.as_str();
     if !is_valid_dist_path(dist_path) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     let storage_key = format!("cpan/authors/id/{}", dist_path);
+    // An empty segment (`A//B`, a trailing `/`) names another file, and leaves curation an
+    // empty file name: refuse it before curation, storage or the upstream see it.
+    if crate::validation::validate_storage_key(&storage_key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let filename = dist_path.rsplit('/').next().unwrap_or(dist_path);
 
     // Eager cache read — preserve data for serve-stale fallback
@@ -171,10 +178,11 @@ async fn distribution_proxy(
 
     // Curation check — extract name and optional version from dist filename
     let (dist_name, dist_version) = parse_dist_filename(filename);
+    let dist_name = dist_name.as_str();
     // A distribution archive carries its version in its name; `.meta`, `.readme`
     // and other files name none.
     let request_version = match dist_version {
-        Some(v) => crate::curation::RequestVersion::Known(v.to_string()),
+        Some(ref v) => crate::curation::RequestVersion::Known(v.to_string()),
         None if cpan_archive_stem(filename).is_some() => {
             crate::curation::RequestVersion::Unrecognised
         }
@@ -218,7 +226,7 @@ async fn distribution_proxy(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Cpan,
             dist_name,
-            dist_version,
+            dist_version.as_deref(),
             &data,
         ) {
             return response;
@@ -397,125 +405,146 @@ fn with_index_response(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// Extract a distribution name and version from a CPAN archive filename.
-///
-/// Returns `None` for sidecars, non-archives, and legacy archives from which no
-/// version can be inferred.
-pub(crate) fn parse_dist_archive_filename(filename: &str) -> Option<(&str, &str)> {
-    let mut stem = cpan_archive_stem(filename)?;
-
-    // Port of the useful grouping heuristics from CPAN::DistnameInfo. Old CPAN
-    // uploads predate the modern Dist-1.23 convention and use '_', '.', or no
-    // separator at all. Keep this local and deterministic; UI browsing must not
-    // depend on Perl being installed or on another upstream request.
-    stem = stem.strip_suffix("-withoutworldwriteables").unwrap_or(stem);
-
-    // An underscore following a non-digit is an old version separator (for
-    // example finance-quote_0.18). An underscore between digits remains part
-    // of a name/version, as in Task-Deprecations5_14-1.00 and 0_06.
-    for (pos, _) in stem.rmatch_indices('_') {
-        let before = &stem[..pos];
-        let version = &stem[pos + 1..];
-        if before
-            .chars()
-            .next_back()
-            .is_some_and(|c| !c.is_ascii_digit())
-            && looks_like_cpan_version(version)
-        {
-            return Some((normalize_cpan_dist(before), version));
+/// CPAN::DistnameInfo 0.12's `distname_info` (`lib/CPAN/DistnameInfo.pm`), the reading PAUSE
+/// indexes and cpanm resolves by: the distribution name and version of an archive's name without
+/// its extension. The name is the longest run of "units" — separators, then letters, digits and
+/// underscores (an underscore between two digits is not one), ending in a letter that no letter
+/// follows or a digit that `-` follows, but not in `v` after a separator — and the version is the
+/// rest, after the module's fix-ups.
+pub(crate) fn distname_info(distvname: &str) -> (String, Option<String>) {
+    let b = distvname.as_bytes();
+    // One unit from `start`, its end if one matches there (the regex's greedy `[-+.]*`, word
+    // characters, then the last position its final character may take).
+    let unit_end = |start: usize| -> Option<usize> {
+        let mut p = start;
+        while p < b.len() && matches!(b[p], b'-' | b'+' | b'.') {
+            p += 1;
         }
-    }
-
-    // Prefer the rightmost plausible hyphen. This naturally retains release
-    // suffixes such as 1.0-TRIAL and numeric components inside dist names.
-    for (pos, _) in stem.rmatch_indices('-') {
-        let name = &stem[..pos];
-        let version = &stem[pos + 1..];
-        if !name.is_empty() && looks_like_cpan_version(version) {
-            return Some((normalize_cpan_dist(name), version));
+        let word_start = p;
+        let mut e = p;
+        while e < b.len() {
+            let ok = b[e].is_ascii_alphanumeric()
+                || (b[e] == b'_'
+                    && ((e > 0 && !b[e - 1].is_ascii_digit())
+                        || (e + 1 < b.len() && !b[e + 1].is_ascii_digit())));
+            if !ok {
+                break;
+            }
+            e += 1;
         }
-    }
-
-    // Very old releases also used Dist.1.23 or glued the version directly to
-    // the final word (Tk800.025, File-Remove0.20).
-    for (pos, _) in stem.rmatch_indices('.') {
-        let name = &stem[..pos];
-        let version = &stem[pos + 1..];
-        if !name.is_empty()
-            && name
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphabetic())
-            && looks_like_cpan_version(version)
-        {
-            return Some((normalize_cpan_dist(name), version));
-        }
-    }
-    for (pos, ch) in stem.char_indices().rev() {
-        if !ch.is_ascii_digit() || pos == 0 {
-            continue;
-        }
-        let name = &stem[..pos];
-        if name
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        {
-            return Some((normalize_cpan_dist(name), &stem[pos..]));
-        }
-    }
-
-    None
-}
-
-fn cpan_archive_stem(filename: &str) -> Option<&str> {
-    filename
-        .strip_suffix(".tar.gz")
-        .or_else(|| filename.strip_suffix(".tar.bz2"))
-        .or_else(|| filename.strip_suffix(".tar.xz"))
-        .or_else(|| filename.strip_suffix(".zip"))
-        .or_else(|| filename.strip_suffix(".tgz"))
-}
-
-fn normalize_cpan_dist(name: &str) -> &str {
-    name.strip_suffix(".pm").unwrap_or(name)
-}
-
-fn looks_like_cpan_version(value: &str) -> bool {
-    let Some(first) = value.chars().next() else {
-        return false;
-    };
-    if first.is_ascii_digit() {
-        return true;
-    }
-    if matches!(first, 'v' | 'V') {
-        return value[1..]
-            .trim_start_matches('.')
-            .starts_with(|c: char| c.is_ascii_digit());
-    }
-
-    // CPAN::DistnameInfo recognises several historical non-numeric forms.
-    let lower = value.to_ascii_lowercase();
-    ["alpha", "beta", "pre", "rc", "oct", "ye"]
-        .iter()
-        .any(|prefix| {
-            lower
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        (word_start..e).rev().find_map(|c| {
+            let ch = b[c];
+            let last = if ch.is_ascii_alphabetic() {
+                c + 1 == b.len() || !b[c + 1].is_ascii_alphabetic()
+            } else {
+                ch.is_ascii_digit() && b.get(c + 1) == Some(&b'-')
+            };
+            let v_after_separator =
+                matches!(ch, b'v' | b'V') && c >= 1 && matches!(b[c - 1], b'.' | b'_' | b'-');
+            (last && !v_after_separator).then_some(c + 1)
         })
-        || (first.is_ascii_alphabetic() && value[1..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let mut end = 0;
+    while let Some(next) = unit_end(end) {
+        end = next;
+    }
+    if end == 0 {
+        return (distvname.to_string(), None);
+    }
+    let mut dist = distvname[..end].to_string();
+    let mut version = distvname[end..].to_string();
+
+    if version.is_empty() && dist.ends_with("-undef") {
+        dist.truncate(dist.len() - "-undef".len());
+    }
+    if let Some(stripped) = version.strip_suffix("-withoutworldwriteables") {
+        version = stripped.to_string();
+    }
+    // `^(-[Vv].*)-(\d.*)`: a `-V…` part belongs to the name, up to the last `-` before a digit.
+    if version.starts_with("-V") || version.starts_with("-v") {
+        if let Some(at) = version
+            .match_indices('-')
+            .map(|(at, _)| at)
+            .rfind(|&at| at >= 2 && version[at + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        {
+            dist.push_str(&version[..at]);
+            version = version[at + 1..].to_string();
+        }
+    }
+    // `(.+_.*)-(\d.*)`: a part with an underscore before the last `-digit` belongs to the name.
+    if let Some(at) = version.match_indices('-').map(|(at, _)| at).rfind(|&at| {
+        version[at + 1..].starts_with(|c: char| c.is_ascii_digit())
+            && version[..at]
+                .char_indices()
+                .any(|(i, c)| c == '_' && i >= 1)
+    }) {
+        dist.push_str(&version[..at]);
+        version = version[at + 1..].to_string();
+    }
+    if let Some(stripped) = dist.strip_suffix(".pm") {
+        dist = stripped.to_string();
+    }
+    // `-(\d+\w)$` on the name, when no version is left.
+    if version.is_empty() {
+        if let Some(dash) = dist.rfind('-') {
+            let tail = &dist[dash + 1..];
+            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+            let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+            if digits >= 1 && tail.len() >= 2 && tail.bytes().all(word) && digits >= tail.len() - 1
+            {
+                version = tail.to_string();
+                dist.truncate(dash);
+            }
+        }
+    }
+    // An all-digit version takes the name's last `-word` in front of it.
+    if !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit()) {
+        if let Some(dash) = dist.rfind('-') {
+            let tail = &dist[dash + 1..];
+            if !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                version = format!("{tail}{version}");
+                dist.truncate(dash);
+            }
+        }
+    }
+    let dotted = version
+        .as_bytes()
+        .windows(3)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit());
+    let lead: &[char] = if dotted {
+        &['-', '_', '.']
+    } else {
+        &['-', '_']
+    };
+    let version = version.trim_start_matches(lead).to_string();
+    (dist, (!version.is_empty()).then_some(version))
 }
 
-fn parse_dist_filename(filename: &str) -> (&str, Option<&str>) {
-    if let Some((name, version)) = parse_dist_archive_filename(filename) {
-        (name, Some(version))
-    } else {
-        let stem = cpan_archive_stem(filename)
-            .or_else(|| filename.strip_suffix(".meta"))
-            .or_else(|| filename.strip_suffix(".readme"))
-            .unwrap_or(filename);
-        (stem, None)
+/// The distribution name and version of a CPAN archive, as CPAN::DistnameInfo reads them
+/// ([`distname_info`]). `None` for a file that is no archive, or an archive without a version.
+pub(crate) fn parse_dist_archive_filename(filename: &str) -> Option<(String, String)> {
+    let (dist, version) = distname_info(cpan_archive_stem(filename)?);
+    Some((dist, version?))
+}
+
+/// An archive's name without its extension: the extensions CPAN::DistnameInfo reads (`tar.gz`,
+/// `tar.z`, `tar.bz2`, `zip`, `tgz`, in any case), and `.tar.xz`, which NORA serves as well.
+fn cpan_archive_stem(filename: &str) -> Option<&str> {
+    [".tar.gz", ".tar.z", ".tar.bz2", ".tar.xz", ".zip", ".tgz"]
+        .iter()
+        .find(|ext| crate::validation::ends_with_ci(filename, ext))
+        .map(|ext| &filename[..filename.len() - ext.len()])
+}
+
+fn parse_dist_filename(filename: &str) -> (String, Option<String>) {
+    if let Some(stem) = cpan_archive_stem(filename) {
+        return distname_info(stem);
     }
+    let stem = filename
+        .strip_suffix(".meta")
+        .or_else(|| filename.strip_suffix(".readme"))
+        .unwrap_or(filename);
+    (stem.to_string(), None)
 }
 
 /// Validate distribution path: no path traversal, no null bytes.
@@ -552,36 +581,39 @@ mod tests {
     fn parses_distribution_archive_name_and_version() {
         assert_eq!(
             parse_dist_archive_filename("Module-Build-XSUtil-0.19.tar.gz"),
-            Some(("Module-Build-XSUtil", "0.19"))
+            Some(("Module-Build-XSUtil".to_string(), "0.19".to_string()))
         );
         assert_eq!(
             parse_dist_archive_filename("Acme-123-Widget-v1.2-TRIAL.tar.xz"),
-            Some(("Acme-123-Widget", "v1.2-TRIAL"))
+            Some(("Acme-123-Widget".to_string(), "v1.2-TRIAL".to_string()))
         );
         // Representative legacy cases from CPAN::DistnameInfo's own suite.
         assert_eq!(
             parse_dist_archive_filename("finance-quote_0.18.tar.gz"),
-            Some(("finance-quote", "0.18"))
+            Some(("finance-quote".to_string(), "0.18".to_string()))
         );
         assert_eq!(
             parse_dist_archive_filename("CGI.pm-2.34.tar.gz"),
-            Some(("CGI", "2.34"))
+            Some(("CGI".to_string(), "2.34".to_string()))
         );
         assert_eq!(
             parse_dist_archive_filename("Tk800.025.tar.gz"),
-            Some(("Tk", "800.025"))
+            Some(("Tk".to_string(), "800.025".to_string()))
         );
         assert_eq!(
             parse_dist_archive_filename("Dist-Zilla-2.100860-TRIAL.tar.gz"),
-            Some(("Dist-Zilla", "2.100860-TRIAL"))
+            Some(("Dist-Zilla".to_string(), "2.100860-TRIAL".to_string()))
         );
         assert_eq!(
             parse_dist_archive_filename("Unicode-Collate-Standard-V3_1_1-0.1.tar.gz"),
-            Some(("Unicode-Collate-Standard-V3_1_1", "0.1"))
+            Some((
+                "Unicode-Collate-Standard-V3_1_1".to_string(),
+                "0.1".to_string()
+            ))
         );
         assert_eq!(
             parse_dist_archive_filename("Bio-ASN1-EntrezGene-1.10-withoutworldwriteables.tar.gz"),
-            Some(("Bio-ASN1-EntrezGene", "1.10"))
+            Some(("Bio-ASN1-EntrezGene".to_string(), "1.10".to_string()))
         );
         assert_eq!(parse_dist_archive_filename("CHECKSUMS"), None);
         assert_eq!(
@@ -590,7 +622,7 @@ mod tests {
         );
         assert_eq!(
             parse_dist_filename("plain-name.tar.gz"),
-            ("plain-name", None)
+            ("plain-name".to_string(), None)
         );
     }
 }
@@ -1020,6 +1052,62 @@ mod integration_tests {
             ]
         );
     }
+
+    /// `.../Foo-1.0.tar.gz/` is refused: its file name is the empty last segment, which no
+    /// rule matches, and on an object store the key is the cached archive itself (the local
+    /// backend answers ENOTDIR — the control).
+    #[tokio::test]
+    async fn a_trailing_slash_distribution_is_refused_before_curation() {
+        use crate::storage::{ObjectStorage, Storage};
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "cpan", "name": "Foo", "version": "*", "reason": "malware"}]}"#,
+        )
+        .unwrap();
+        let bp = blocklist.to_string_lossy().into_owned();
+        let configure = |cfg: &mut crate::config::Config| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bp.clone());
+        };
+        let key = "cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz";
+        let canonical = "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz";
+
+        let local = create_test_context_with_config(configure);
+        local.state.storage.put(key, b"MALWARE").await.unwrap();
+        let resp = send(&local.app, Method::GET, &format!("{canonical}/"), "").await;
+        assert_ne!(resp.status(), StatusCode::OK, "control: local backend");
+        let resp = send(
+            &local.app,
+            Method::GET,
+            "/cpan/authors/id/F/FO/FOO//Foo-1.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "control: `//` keeps the filename"
+        );
+
+        let object = create_test_context_with_storage_and_config(
+            Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory())),
+            configure,
+        );
+        object.state.storage.put(key, b"MALWARE").await.unwrap();
+        let resp = send(&object.app, Method::GET, canonical, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control: canonical");
+        let resp = send(&object.app, Method::GET, &format!("{canonical}/"), "").await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "blocklisted distribution served: {:?}",
+            body_bytes(resp).await
+        );
+    }
 }
 
 /// Archive forms and author subdirectories in the CPAN counts.
@@ -1095,5 +1183,228 @@ mod cpan_counts_archive_forms {
             ]
         );
         assert_eq!(artifact_counts(&ctx, "cpan").await.stats, 2);
+    }
+}
+
+/// A name or path with an empty segment (or, where the name is one segment, any `/`) never
+/// reaches curation, storage or an upstream: it would name another artifact's files, and an
+/// upstream that normalises paths would answer for that other artifact.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_segment_requests {
+    use crate::test_helpers::{
+        blocklist_file, create_test_context_with_config, send, upstream_paths,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // `.../Foo-1.0.tar.gz/` would leave curation an empty file name, and `F/FO//FOO` and
+    // `id//F` name the same archive under another path.
+    #[tokio::test]
+    async fn a_distribution_path_with_an_empty_segment_never_reaches_upstream() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL-TGZ".to_vec()))
+            .mount(&up)
+            .await;
+        let (_dir, blocklist) = blocklist_file("cpan", "Foo");
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(up.uri());
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let control = "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for uri in [
+            "/cpan/authors/id/F/FO/FOO/Foo-1.0.tar.gz/",
+            "/cpan/authors/id/F/FO//FOO/Foo-1.0.tar.gz",
+            "/cpan/authors/id//F/FO/FOO/Foo-1.0.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let sent = upstream_paths(&up).await;
+        assert!(sent.is_empty(), "sent upstream: {sent:?}");
+    }
+}
+
+/// CPAN distribution paths as CPAN::DistnameInfo reads them and cpanm requests them
+/// (testdata/cpan, regenerated by the scripts there).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod per_cpan_distnameinfo {
+    use super::parse_dist_filename;
+    use crate::storage::{ObjectStorage, Storage};
+    use crate::test_helpers::{create_test_context_with_storage_and_config, send, upstream_paths};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn corpus(file: &str) -> Vec<Vec<String>> {
+        let path = format!("{}/testdata/cpan/{file}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+            .map(|row| row.split('\t').map(String::from).collect())
+            .collect()
+    }
+
+    // Every archive's distribution name and version, as CPAN::DistnameInfo reads them (the
+    // reading PAUSE indexes and cpanm resolves by).
+    #[test]
+    fn archives_read_as_cpan_distnameinfo_reads_them_are_counted() {
+        let rows = corpus("distnames.tsv");
+        assert_eq!(rows.len(), 982);
+        let archives: Vec<&Vec<String>> = rows.iter().filter(|row| row[3] != "UNDEF").collect();
+        assert_eq!(archives.len(), 890);
+        let agreeing = archives
+            .iter()
+            .filter(|row| {
+                let filename = row[0].rsplit('/').next().unwrap();
+                let (dist, version) = parse_dist_filename(filename);
+                (dist.as_str(), version.as_deref().unwrap_or("UNDEF"))
+                    == (row[1].as_str(), row[2].as_str())
+            })
+            .count();
+        assert_eq!(agreeing, 890);
+        // `.tar.xz`, which CPAN::DistnameInfo does not read but NORA serves, reads as the same
+        // archive under `.tar.gz` does: a rule on a distribution holds for both.
+        let xz: Vec<&Vec<String>> = rows
+            .iter()
+            .filter(|row| row[0].ends_with(".tar.xz"))
+            .collect();
+        assert_eq!(xz.len(), 30);
+        for row in xz {
+            let filename = row[0].rsplit('/').next().unwrap();
+            let gz = format!("{}.tar.gz", filename.strip_suffix(".tar.xz").unwrap());
+            assert_eq!(
+                parse_dist_filename(filename),
+                parse_dist_filename(&gz),
+                "{filename}"
+            );
+        }
+    }
+
+    // Every request cpanm sends to a mirror at NORA's mount reaches upstream at the path it sent.
+    #[tokio::test]
+    async fn every_request_cpanm_sends_is_asked_upstream_as_sent() {
+        let rows = corpus("client-requests.tsv");
+        assert_eq!(rows.len(), 21);
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".to_vec()))
+            .mount(&up)
+            .await;
+        let proxy = up.uri();
+        let storage = Storage::from_backend(std::sync::Arc::new(ObjectStorage::in_memory()));
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(proxy);
+        });
+        for row in rows {
+            let (installed, path) = (&row[0], &row[2]);
+            assert_eq!(row[1], "GET");
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{installed}: {path}");
+            let asked = path.strip_prefix("/cpan").unwrap().to_string();
+            assert!(
+                upstream_paths(&up).await.contains(&asked),
+                "{installed}: {path}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cpan_rule_holds_for_every_archive_reading {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // PAUSE indexes and cpanm resolves a distribution by CPAN::DistnameInfo's reading
+    // (PAUSE `lib/PAUSE/mldistwatch.pm:11,873`, `lib/PAUSE/dist.pm:853`; Menlo `CLI/Compat.pm:1658-1680`).
+    // CPAN::DistnameInfo 0.12 (`DistnameInfo.pm:10-18,35-41,47-51`) reads these, measured in
+    // testdata/cpan/distnames.tsv (the first three are real uploads from its own test data):
+    // `Crypt-ECB-1.1-2` → `Crypt-ECB` 1.1-2, `perl-5.8.1-RC2` → `perl` 5.8.1-RC2,
+    // `Win32-API-Prototype` → `Win32-API-Prototype` (no version), `Foo-Bar-1.23-RC1` → `Foo-Bar` 1.23-RC1.
+    // A rule on a distribution holds for its archives.
+    #[tokio::test]
+    async fn a_rule_holds_for_the_distribution_cpan_distnameinfo_reads() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".to_vec()))
+            .mount(&up)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        let rules: Vec<serde_json::Value> = ["Crypt-ECB", "perl", "Win32-API-Prototype", "Foo-Bar"]
+            .iter()
+            .map(|name| serde_json::json!({"registry": "cpan", "name": name, "version": "*", "reason": "test"}))
+            .collect();
+        std::fs::write(
+            &blocklist,
+            serde_json::json!({"version": 1, "rules": rules}).to_string(),
+        )
+        .unwrap();
+        let proxy = up.uri();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(proxy);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        });
+        let control = "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        for path in [
+            "/cpan/authors/id/D/DE/DESTRUCT/Crypt-ECB-1.1-2.tar.gz",
+            "/cpan/authors/id/J/JH/JHI/perl-5.8.1-RC2.tar.gz",
+            "/cpan/authors/id/A/AU/AUTHOR/Win32-API-Prototype.tar.gz",
+            "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23-RC1.tar.gz",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cpan_every_archive_extension {
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // PAUSE takes `.tar.Z` archives as Perl distributions (`lib/PAUSE/dist.pm:247`), and
+    // CPAN::DistnameInfo 0.12 reads `tar.(g?z|bz2)|zip|tgz` without case (`DistnameInfo.pm:87`):
+    // `A/AU/AUTHOR/Foo-Bar-1.23.tar.Z` is `Foo-Bar` 1.23 (testdata/cpan/distnames.tsv).
+    #[tokio::test]
+    async fn a_rule_holds_for_a_tar_z_archive_of_its_distribution() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"compressed".to_vec()))
+            .mount(&up)
+            .await;
+        let (_dir, blocklist) = crate::test_helpers::blocklist_file("cpan", "Foo-Bar");
+        let proxy = up.uri();
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(proxy);
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+        });
+        let control = "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.gz";
+        let resp = send(&ctx.app, Method::GET, control, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "control");
+        let path = "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.Z";
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
     }
 }

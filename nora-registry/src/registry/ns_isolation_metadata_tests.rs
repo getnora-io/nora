@@ -729,3 +729,199 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
         "a non-docker internal-namespace refusal (check_namespace_isolation) must increment the isolation-refused metric"
     );
 }
+
+// ── A recording upstream: an internal name never reaches it, dates included ──
+//
+// BLACKHOLE shows a missing guard only where the failed fetch changes the answer. A
+// best-effort lookup — a release date for the quarantine clock, a metadata self-prime —
+// swallows its failure, so a leak there answers the same. A recording upstream sees every
+// request; each internal path has a public twin that must reach it, so no path passes for
+// being dead.
+
+const INTERNAL_PATHS: [&str; 34] = [
+    "/npm/internalpkg",
+    "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
+    "/simple/internalpkg/",
+    "/simple/internalpkg/internalpkg-1.0.tar.gz",
+    "/cargo/api/v1/crates/internalpkg",
+    "/cargo/api/v1/crates/internalpkg/1.0.0/download",
+    "/gems/info/internalpkg",
+    "/gems/gems/internalpkg-1.0.0.gem",
+    "/gems/gems/internalpkg-1.0.0-x86_64-linux.gem",
+    "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+    "/nuget/v3/flatcontainer/internalpkg/index.json",
+    "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+    "/go/internal.corp/lib/@v/list",
+    "/go/internal.corp/lib/@v/v1.0.0.info",
+    "/go/internal.corp/lib/@v/v1.0.0.zip",
+    "/pub/api/packages/internalpkg",
+    "/pub/packages/internalpkg/versions/1.0.0.tar.gz",
+    "/conan/v2/conans/internalpkg/1.0/_/_/latest",
+    "/ansible/api/v3/plugin/ansible/content/published/collections/index/internalns/coll/",
+    "/ansible/api/v3/plugin/ansible/content/published/collections/index/internalns/coll/versions/",
+    "/ansible/download/internalns-coll-1.0.0.tar.gz",
+    "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+    "/terraform/v1/providers/internalns/infra/versions",
+    "/terraform/v1/providers/internalns/infra/1.0.0/download/linux/amd64",
+    "/terraform/v1/providers/download/internalns/infra/1.0.0/terraform-provider-infra_1.0.0_darwin_arm64.zip",
+    "/terraform/v1/modules/internalns/vpc/aws/versions",
+    "/terraform/v1/modules/internalns/vpc/aws/1.0.0/download",
+    "/terraform/v1/modules/download/internalns/vpc/aws/2.0.0/source",
+    "/terraform/registry.terraform.io/internalns/infra/index.json",
+    "/terraform/registry.terraform.io/internalns/infra/1.0.0.json",
+    "/maven2/internalpkg/lib/maven-metadata.xml",
+    "/maven2/internalpkg/lib/1.0/lib-1.0.jar",
+    "/v2/internalpkg/manifests/1.0",
+    "/v2/internalpkg/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+];
+
+async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
+    upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+fn public_twin(path: &str) -> String {
+    path.replace("internalpkg", "publicpkg")
+        .replace("internal.corp", "public.corp")
+        .replace("internalns", "publicns")
+        .replace("I/IN/INTERNAL", "P/PU/PUBLIC")
+}
+
+#[tokio::test]
+async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let seed_uri = uri.clone();
+    let ctx = create_test_context_with_config(move |c| {
+        c.server.trust_upstream_dates = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.cargo.proxy = Some(uri.clone());
+        c.gems.enabled = true;
+        c.gems.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri.clone());
+        c.go.proxy = Some(uri.clone());
+        c.pub_dart.enabled = true;
+        c.pub_dart.proxy = Some(uri.clone());
+        c.conan.enabled = true;
+        c.conan.proxy = Some(uri.clone());
+        c.ansible.enabled = true;
+        c.ansible.proxy = Some(uri.clone());
+        c.cpan.enabled = true;
+        c.cpan.proxy = Some(uri.clone());
+        c.terraform.enabled = true;
+        c.terraform.proxy = Some(uri.clone());
+        c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri.clone())];
+        c.docker.upstreams = vec![crate::config::DockerUpstream {
+            url: uri,
+            auth: None,
+            namespace: None,
+            prefix: None,
+        }];
+    });
+    // Terraform metadata cached before the namespace became internal still names an upstream
+    // URL for a provider's files and a module's archive; the public twin's names the same
+    // upstream.
+    for ns in ["internalns", "publicns"] {
+        ctx.state
+            .storage
+            .put(
+                &format!("terraform/providers/{ns}/infra/1.0.0/darwin_arm64.json"),
+                serde_json::json!({"_nora_upstream_url": format!("{seed_uri}/{ns}-infra.zip")})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                &format!("terraform/modules/{ns}/vpc/aws/2.0.0/_source_url"),
+                format!("{seed_uri}/{ns}-vpc.tar.gz").as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+    for path in INTERNAL_PATHS {
+        let _ = send(&ctx.app, Method::GET, path, "").await;
+    }
+    let leaked = upstream_paths(&upstream).await;
+    assert!(
+        leaked.is_empty(),
+        "internal names sent upstream: {leaked:?}"
+    );
+
+    // Control: each path is live — its public twin reaches the upstream.
+    let mut dead = Vec::new();
+    for path in INTERNAL_PATHS {
+        let before = upstream_paths(&upstream).await.len();
+        let twin = public_twin(path);
+        let _ = send(&ctx.app, Method::GET, &twin, "").await;
+        if upstream_paths(&upstream).await.len() == before {
+            dead.push(twin);
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "public twins that never reached upstream: {dead:?}"
+    );
+}
+
+/// A hierarchical internal namespace isolates the PyPI projects under it in the form pip
+/// requests them (`corp.tools` and `Corp_Tools` are requested as `corp-tools`).
+#[tokio::test]
+async fn a_hierarchical_namespace_isolates_pypi_projects_under_it() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.curation.internal_namespaces = vec!["corp.**".to_string()];
+        c.pypi.proxy = Some(uri);
+    });
+    for path in [
+        "/simple/corp/",
+        "/simple/corp.tools/",
+        "/simple/corp-tools/",
+        "/simple/Corp_Tools/",
+        "/simple/corp-tools/corp_tools-1.0.tar.gz",
+    ] {
+        let _ = send(&ctx.app, Method::GET, path, "").await;
+    }
+    let requested: Vec<String> = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        requested.is_empty(),
+        "internal projects sent upstream: {requested:?}"
+    );
+    let _ = send(&ctx.app, Method::GET, "/simple/corporate/", "").await;
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        1,
+        "a project outside the namespace reaches the upstream"
+    );
+}
