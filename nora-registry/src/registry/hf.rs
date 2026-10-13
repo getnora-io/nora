@@ -31,9 +31,7 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::circuit_breaker::BreakerScope;
 use crate::curation::RequestVersion;
-use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch_with_headers, ProxyError, TempFileGuard,
-};
+use crate::registry::{circuit_open_response, nora_base_url, ProxyError, TempFileGuard};
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
 use crate::AppState;
@@ -167,21 +165,38 @@ async fn models_api(State(state): State<AppState>, uri: Uri) -> Response {
         }
         Err(Refusal::BadPath) => return error_response(StatusCode::BAD_REQUEST, BAD_PATH),
     };
-    let fetched = proxy_fetch_with_headers(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.hf.proxy_timeout),
-        None,
-        &state.circuit_breaker,
-        RegistryType::HuggingFace,
-    )
-    .await;
-    match fetched {
-        Ok((headers, body)) => metadata_response(upstream, &nora_hf_base(&state), &headers, &body),
-        Err(ProxyError::NotFound) => error_response(StatusCode::NOT_FOUND, NOT_ON_UPSTREAM),
-        Err(ProxyError::CircuitOpen(registry)) => circuit_open_response(&registry),
-        Err(e) => {
-            tracing::warn!(registry = "hf", error = ?e, "metadata request failed upstream");
+    // The same walk as a file's: redirects followed inside (a legacy id's relative 307), and a
+    // Hub refusal handed on with its status, code and rate-limit headers.
+    let timeout = Duration::from_secs(state.config.hf.proxy_timeout);
+    match fetch_file(&state, &Method::GET, &url, None, |_| None, None).await {
+        FileFetch::File {
+            body: Some(response),
+            ..
+        } => {
+            let headers = response.headers().clone();
+            // CANCEL-SAFETY: a timed-out read drops its own response and nothing else.
+            match tokio::time::timeout(timeout, response.bytes()).await {
+                Ok(Ok(body)) => metadata_response(upstream, &nora_hf_base(&state), &headers, &body),
+                Ok(Err(_)) | Err(_) => {
+                    tracing::warn!(registry = "hf", "metadata body did not arrive");
+                    error_response(StatusCode::BAD_GATEWAY, UPSTREAM_FAILED)
+                }
+            }
+        }
+        FileFetch::UpstreamRefused {
+            status,
+            code,
+            message,
+            limits,
+        } => upstream_refusal(status, code, message, limits),
+        FileFetch::CircuitOpen(registry) => circuit_open_response(&registry),
+        FileFetch::Refused(response) => response,
+        FileFetch::Failed(why) => {
+            tracing::warn!(registry = "hf", why, "metadata request failed upstream");
+            error_response(StatusCode::BAD_GATEWAY, UPSTREAM_FAILED)
+        }
+        // A GET answers with a body, and metadata is never looked up in the cache.
+        FileFetch::File { body: None, .. } | FileFetch::Cached { .. } => {
             error_response(StatusCode::BAD_GATEWAY, UPSTREAM_FAILED)
         }
     }
@@ -240,7 +255,8 @@ async fn files(
                 status,
                 code,
                 message,
-            } => return upstream_refusal(status, code, message),
+                limits,
+            } => return upstream_refusal(status, code, message, limits),
             Canonical::CircuitOpen(registry) => return circuit_open_response(&registry),
             Canonical::Failed(why) => {
                 tracing::warn!(registry = "hf", why, repo = %repo, "canonical repo id unknown; refused for curation");
@@ -315,7 +331,8 @@ async fn files(
             status,
             code,
             message,
-        } => upstream_refusal(status, code, message),
+            limits,
+        } => upstream_refusal(status, code, message, limits),
         FileFetch::CircuitOpen(registry) => circuit_open_response(&registry),
         FileFetch::Failed(why) => {
             tracing::warn!(registry = "hf", why, "file request failed upstream");
@@ -327,11 +344,13 @@ async fn files(
     }
 }
 
-/// A Hub refusal handed on: its status, its error code, and its message (or ours).
+/// A Hub refusal handed on: its status, its error code, its message (or ours), and on a rate
+/// limit the headers the client waits by.
 fn upstream_refusal(
     status: StatusCode,
     code: Option<HeaderValue>,
     message: Option<HeaderValue>,
+    limits: HeaderMap,
 ) -> Response {
     let mut response = (
         status,
@@ -346,7 +365,23 @@ fn upstream_refusal(
         ERROR_MESSAGE_HEADER,
         message.unwrap_or(HeaderValue::from_static(NOT_ON_UPSTREAM)),
     );
+    h.extend(limits);
     response
+}
+
+/// What a client waits by when the Hub limits its rate: `Retry-After`, and `RateLimit` /
+/// `RateLimit-Policy`, which huggingface_hub reads to sleep until the window resets
+/// (`utils/_http.py`). A white list; nothing else of a refusal's headers is handed on.
+fn rate_limit_headers(headers: &HeaderMap) -> HeaderMap {
+    const NAMES: [HeaderName; 3] = [
+        header::RETRY_AFTER,
+        HeaderName::from_static("ratelimit"),
+        HeaderName::from_static("ratelimit-policy"),
+    ];
+    NAMES
+        .into_iter()
+        .filter_map(|name| headers.get(&name).cloned().map(|value| (name, value)))
+        .collect()
 }
 
 fn curation_check(
@@ -374,6 +409,7 @@ enum Canonical {
         status: StatusCode,
         code: Option<HeaderValue>,
         message: Option<HeaderValue>,
+        limits: HeaderMap,
     },
     CircuitOpen(String),
     Failed(&'static str),
@@ -450,6 +486,7 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
                 status,
                 code: response.headers().get(&ERROR_CODE_HEADER).cloned(),
                 message: response.headers().get(&ERROR_MESSAGE_HEADER).cloned(),
+                limits: rate_limit_headers(response.headers()),
             });
         }
         break Err("upstream error");
@@ -512,11 +549,13 @@ enum FileFetch {
     },
     /// Curation refused the commit a hop named, before the bytes were asked for.
     Refused(Response),
-    /// The Hub refused (4xx): its status, error code and message are handed on.
+    /// The Hub refused (4xx): its status, error code and message are handed on, and on a rate
+    /// limit what the client waits by ([`rate_limit_headers`]).
     UpstreamRefused {
         status: StatusCode,
         code: Option<HeaderValue>,
         message: Option<HeaderValue>,
+        limits: HeaderMap,
     },
     CircuitOpen(String),
     Failed(&'static str),
@@ -566,6 +605,7 @@ where
     let mut hops: Vec<HeaderMap> = Vec::new();
     let mut commit_checked = false;
     let mut looked_up = false;
+    let started = std::time::Instant::now();
     let outcome = loop {
         if hops.len() > MAX_HOPS {
             break Err("too many redirects");
@@ -581,7 +621,8 @@ where
         // state outlives it.
         let response = match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => break Err("upstream unreachable"),
+            Ok(Err(e)) if !e.is_timeout() => break Err("upstream unreachable"),
+            Ok(Err(_)) | Err(_) => break Err("upstream timed out"),
         };
         if !commit_checked {
             if let Some(commit) = response
@@ -666,14 +707,37 @@ where
             break Ok(FileFetch::File { status, meta, body });
         }
         if status.is_client_error() {
+            // A CDN or WAF policy block is a 4xx that is an outage, not the Hub's answer (#881).
+            if let Some(reason) = super::policy_block_reason(response.headers()) {
+                crate::metrics::UPSTREAM_POLICY_BLOCKED_TOTAL
+                    .with_label_values(&["hf", reason])
+                    .inc();
+                tracing::warn!(
+                    registry = "hf",
+                    status = status.as_u16(),
+                    reason,
+                    "upstream answered with a policy/geo block, handed on as its status — check egress/region"
+                );
+            }
             break Ok(FileFetch::UpstreamRefused {
                 status,
                 code: response.headers().get(&ERROR_CODE_HEADER).cloned(),
                 message: response.headers().get(&ERROR_MESSAGE_HEADER).cloned(),
+                limits: rate_limit_headers(response.headers()),
             });
         }
         break Err("upstream error");
     };
+    let class = match &outcome {
+        Ok(FileFetch::UpstreamRefused { .. }) => "4xx",
+        Ok(_) => "2xx",
+        Err("upstream error") => "5xx",
+        Err("upstream timed out") => "timeout",
+        Err(_) => "error",
+    };
+    crate::metrics::UPSTREAM_REQUEST_DURATION
+        .with_label_values(&["hf", class])
+        .observe(started.elapsed().as_secs_f64());
     match outcome {
         Ok(FileFetch::UpstreamRefused { .. })
         | Err("too many redirects")
@@ -2473,6 +2537,95 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A Hub refusal under its rate limit keeps what the client waits by — the status, the
+    /// reason, and `Retry-After`, `RateLimit`, `RateLimit-Policy` (huggingface_hub waits by
+    /// them; without them it gives up after a few short retries, while the Hub's window is
+    /// minutes long) — on metadata and on files alike, and nothing else of its headers.
+    #[tokio::test]
+    async fn a_rate_limited_answer_keeps_what_the_client_waits_by() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-error-message", "Too many requests")
+                    .insert_header("retry-after", "55")
+                    .insert_header("ratelimit", "\"api\";r=0;t=55")
+                    .insert_header("ratelimit-policy", "\"fixed window\";\"api\";q=500;w=300")
+                    .insert_header("set-cookie", "hub=1"),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        for (m, uri) in [
+            (Method::GET, "/hf/api/models/org/model"),
+            (Method::GET, "/hf/api/models/org/model/tree/main"),
+            (Method::HEAD, "/hf/org/model/resolve/main/config.json"),
+            (Method::GET, "/hf/org/model/resolve/main/config.json"),
+        ] {
+            let resp = send(&ctx.app, m.clone(), uri, "").await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{m} {uri}");
+            assert_eq!(
+                header(&resp, "x-error-message"),
+                "Too many requests",
+                "{m} {uri}"
+            );
+            assert_eq!(header(&resp, "retry-after"), "55", "{m} {uri}");
+            assert_eq!(header(&resp, "ratelimit"), "\"api\";r=0;t=55", "{m} {uri}");
+            assert_eq!(
+                header(&resp, "ratelimit-policy"),
+                "\"fixed window\";\"api\";q=500;w=300",
+                "{m} {uri}"
+            );
+            assert!(!resp.headers().contains_key("set-cookie"), "{m} {uri}");
+        }
+    }
+
+    /// A metadata refusal keeps its kind as a file refusal does: a repository the Hub does not
+    /// show answers with the Hub's status and code, not a 404 of NORA's own.
+    #[tokio::test]
+    async fn a_metadata_refusal_keeps_its_status_and_code() {
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/private"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("x-error-code", "RepoNotFound")
+                    .insert_header("x-error-message", "Repository not found"),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let resp = send(&ctx.app, Method::GET, "/hf/api/models/org/private", "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(header(&resp, "x-error-code"), "RepoNotFound");
+        assert_eq!(header(&resp, "x-error-message"), "Repository not found");
+    }
+
+    /// A refusal that is the CDN's or WAF's policy block, not the Hub's answer, is counted as
+    /// one, so an operator can tell a geo block from a missing file.
+    #[tokio::test]
+    async fn a_policy_block_is_counted() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(403).insert_header("x-amzn-waf-reason", "geo"))
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let blocked = || {
+            crate::metrics::UPSTREAM_POLICY_BLOCKED_TOTAL
+                .with_label_values(&["hf", "geo"])
+                .get()
+        };
+        let before = blocked();
+        for uri in [
+            "/hf/api/models/org/model",
+            "/hf/org/model/resolve/main/config.json",
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        assert!(blocked() >= before + 2, "geo blocks not counted");
     }
 
     #[tokio::test]
