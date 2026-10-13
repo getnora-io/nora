@@ -3036,6 +3036,65 @@ mod spec_conformance_tests {
         );
     }
 
+    /// Every file carries the CORRECT `hashes` object across the matrix: filename extension
+    /// (`.tar.gz` / `.whl`) × hash present/absent × each `(size, upload-time)` combination.
+    /// `hashes` is exactly `{}` when no digest is known and exactly `{"sha256": <hex>}` when
+    /// one is — never missing, `null`, an array, or an empty-string digest. The no-hash +
+    /// upload-time cell is the production proxy case uv rejected (#1100).
+    #[test]
+    fn test_pep691_hashes_object_present_across_pep700_matrix() {
+        use std::collections::HashMap;
+        // Both extensions, with and without a hash.
+        let specs: [(&str, Option<&str>); 4] = [
+            ("hashed-1.0.tar.gz", Some("deadbeef")),
+            ("nohash-1.0.tar.gz", None),
+            ("hashed-1.0-py3-none-any.whl", Some("cafef00d")),
+            ("nohash-1.0-py3-none-any.whl", None),
+        ];
+        let files: Vec<FileEntry> = specs
+            .iter()
+            .map(|(name, sha)| FileEntry {
+                filename: (*name).into(),
+                sha256: sha.map(str::to_string),
+            })
+            .collect();
+        let combos: [(Option<u64>, Option<String>); 4] = [
+            (None, None),
+            (Some(1234), None),
+            (None, Some("2026-01-01T00:00:00Z".to_string())),
+            (Some(1234), Some("2026-01-01T00:00:00Z".to_string())),
+        ];
+        for (size, upload_time) in combos {
+            let pep700: HashMap<String, (Option<u64>, Option<String>)> = specs
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), (size, upload_time.clone())))
+                .collect();
+            let response = versions_json_response("pkg", &files, "http://nora:4000", &pep700);
+            let bytes = futures::executor::block_on(axum::body::to_bytes(
+                response.into_body(),
+                1024 * 1024,
+            ))
+            .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let arr = json["files"].as_array().expect("files array");
+            for (name, sha) in specs {
+                let file = arr
+                    .iter()
+                    .find(|f| f["filename"] == name)
+                    .unwrap_or_else(|| panic!("file {name} missing from response"));
+                let want = match sha {
+                    Some(h) => serde_json::json!({ "sha256": h }),
+                    None => serde_json::json!({}),
+                };
+                assert_eq!(
+                    file.get("hashes"),
+                    Some(&want),
+                    "wrong hashes for {name} (size={size:?} upload_time={upload_time:?})"
+                );
+            }
+        }
+    }
+
     /// PEP 691: `name` field must match the normalized package name.
     #[test]
     fn test_pep691_name_is_normalized() {
