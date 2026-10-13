@@ -83,6 +83,13 @@ impl RegistryType {
         ]
     }
 
+    /// Whether `all` in `[registries] enable` / `NORA_REGISTRIES_ENABLE` switches this
+    /// format on. An opt-in format is enabled only by name: an operator who wrote `all`
+    /// before it existed did not choose it.
+    pub fn in_all(&self) -> bool {
+        !matches!(self, Self::HuggingFace)
+    }
+
     /// Parse from string (case-insensitive), accepting common aliases. Kept hand-written
     /// because of the aliases; `test_as_str_roundtrip` guards that every variant's
     /// canonical `as_str` parses back.

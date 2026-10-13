@@ -107,7 +107,40 @@ mod tests {
                 StatusCode::NOT_IMPLEMENTED,
                 "{m} {uri} must reach the hf skeleton"
             );
+            // The reason is the model one: a model path routed to the datasets answer
+            // would tell the client its model is out of scope.
+            let reason = resp
+                .headers()
+                .get("x-error-message")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                reason.contains("not implemented") && !reason.contains("datasets"),
+                "{m} {uri}: {reason:?}"
+            );
         }
+    }
+
+    /// The skeleton fetches and caches nothing, whatever form an upstream call would take.
+    #[tokio::test]
+    async fn the_skeleton_contacts_no_upstream() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+        });
+        for (m, uri) in MODEL_DOWNLOAD_REQUESTS {
+            send(&ctx.app, method(m), uri, "").await;
+        }
+        let sent = crate::test_helpers::upstream_paths(&up).await;
+        assert!(sent.is_empty(), "the skeleton went upstream: {sent:?}");
     }
 
     #[tokio::test]

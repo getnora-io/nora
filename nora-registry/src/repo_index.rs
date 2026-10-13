@@ -877,9 +877,16 @@ mod tests {
     async fn hf_index_builds_empty_and_settles() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().to_str().unwrap());
+        // Other formats' data must not leak into it either.
+        storage
+            .put("cpan/authors/id/F/FO/FOO/Foo-Bar-1.0.tar.gz", b"tgz")
+            .await
+            .unwrap();
+        storage.put("raw/some/file.bin", b"raw").await.unwrap();
         let idx = RepoIndex::new();
         assert!(idx.get("hf", &storage).await.is_empty());
         assert!(!idx.indexes[&RegistryType::HuggingFace].is_dirty());
+        assert!(!idx.get("cpan", &storage).await.is_empty(), "control");
     }
 
     #[test]

@@ -3676,14 +3676,37 @@ proxies = [
     // EnableSpec + [registries] tests
     // ========================================================================
 
+    /// How many registries `all` switches on: every one except the opt-in ones.
+    fn in_all_count() -> usize {
+        RegistryType::all().iter().filter(|rt| rt.in_all()).count()
+    }
+
     #[test]
     fn test_enable_spec_single_all() {
         let spec = EnableSpec::Single("all".to_string());
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len());
         for rt in RegistryType::all() {
-            assert!(set.contains(rt), "missing {:?}", rt);
+            assert_eq!(set.contains(rt), rt.in_all(), "{:?}", rt);
         }
+    }
+
+    /// An opt-in format is never switched on by `all`: an operator who wrote `all` before
+    /// it existed did not opt in. It is named beside `all` to have both.
+    #[test]
+    fn test_all_leaves_out_opt_in_formats_until_named() {
+        assert!(!RegistryType::HuggingFace.in_all());
+        let all = EnableSpec::Single("all".to_string()).resolve().unwrap();
+        assert!(!all.contains(&RegistryType::HuggingFace));
+        let with_hf = EnableSpec::List(vec!["all".to_string(), "hf".to_string()])
+            .resolve()
+            .unwrap();
+        assert!(with_hf.contains(&RegistryType::HuggingFace));
+        assert_eq!(with_hf.len(), all.len() + 1);
+        // A format `all` already covers still cannot be named beside it.
+        let err = EnableSpec::List(vec!["all".to_string(), "docker".to_string()])
+            .resolve()
+            .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {}", err);
     }
 
     #[test]
@@ -3712,7 +3735,7 @@ proxies = [
     fn test_enable_spec_all_minus() {
         let spec = EnableSpec::List(vec!["all".to_string(), "-maven".to_string()]);
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len() - 1);
+        assert_eq!(set.len(), in_all_count() - 1);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(set.contains(&RegistryType::Docker));
     }
@@ -3725,7 +3748,7 @@ proxies = [
             "-conan".to_string(),
         ]);
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert_eq!(set.len(), in_all_count() - 2);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
     }
@@ -3879,7 +3902,8 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len());
+        let in_all = RegistryType::all().iter().filter(|rt| rt.in_all()).count();
+        assert_eq!(set.len(), in_all);
     }
 
     /// `enabled_registries_legacy` is a chain of `if` blocks, not a `match`: a format left
@@ -3892,6 +3916,66 @@ proxies = [
         let all: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
         config.apply_enabled_registries(&all);
         assert_eq!(config.enabled_registries_legacy(), all);
+    }
+
+    /// Each `[x] enabled` flag switches on its own format and no other: a chain slot that
+    /// read a neighbour's flag would pass a test that switches every flag on at once.
+    #[test]
+    fn test_each_legacy_flag_enables_only_its_own_format() {
+        for rt in RegistryType::all() {
+            let mut config = Config::default();
+            let one: HashSet<RegistryType> = [*rt].into_iter().collect();
+            config.apply_enabled_registries(&one);
+            assert_eq!(config.enabled_registries_legacy(), one, "{:?}", rt);
+        }
+    }
+
+    #[test]
+    fn test_hf_enabled_only_by_true_or_one() {
+        let _lock = env_lock();
+        for (val, on) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+        ] {
+            let mut config = Config::default();
+            config.hf.enabled = !on;
+            std::env::set_var("NORA_HF_ENABLED", val);
+            let applied = config.apply_env_overrides();
+            std::env::remove_var("NORA_HF_ENABLED");
+            applied.unwrap();
+            assert_eq!(config.hf.enabled, on, "NORA_HF_ENABLED={val:?}");
+        }
+    }
+
+    #[test]
+    fn test_hf_proxy_from_toml_is_the_upstream() {
+        let config: Config =
+            toml::from_str("[hf]\nenabled = true\nproxy = \"https://hf-mirror.example\"\n")
+                .unwrap();
+        assert_eq!(
+            config.hf.proxy.as_deref(),
+            Some("https://hf-mirror.example")
+        );
+        assert!(config
+            .upstream_hostnames()
+            .contains(&("hf".to_string(), "hf-mirror.example".to_string())));
+    }
+
+    /// The keys of `[hf]`, held by the compiler: destructured without `..`, so adding a
+    /// field — a credential among them — does not build until this line names it. The first
+    /// release proxies public repositories only.
+    #[test]
+    fn test_hf_config_keys_are_exactly_these() {
+        let HfConfig {
+            enabled: _,
+            proxy: _,
+        } = HfConfig::default();
     }
 
     #[test]
@@ -4066,7 +4150,7 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert_eq!(set.len(), in_all_count() - 2);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
         assert!(set.contains(&RegistryType::Docker));
