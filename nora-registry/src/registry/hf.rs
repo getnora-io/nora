@@ -3019,6 +3019,68 @@ mod tests {
         wait_stored(&ctx, key).await;
     }
 
+    fn git_blob(bytes: &[u8]) -> String {
+        let mut h = sha1::Sha1::new();
+        h.update(format!("blob {}\0", bytes.len()).as_bytes());
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+
+    /// The commit served with a file comes from the same answer as its bytes: when `main`
+    /// moves between two downloads, the second gets the new commit with the new bytes — not
+    /// the first one's copy from the cache under the new commit, nor the old commit.
+    #[tokio::test]
+    async fn a_moving_main_serves_the_new_commit_with_its_own_bytes() {
+        let moved = b"{\"model_type\": \"moved\"}\n";
+        let new_commit = "fedcba9876543210fedcba9876543210fedcba98";
+        let up = MockServer::start().await;
+        for (commit, bytes, cache, priority, times) in [
+            (COMMIT, CONFIG, "/cache/old", 1u8, Some(1u64)),
+            (new_commit, &moved[..], "/cache/new", 2, None),
+        ] {
+            let mut first = Mock::given(path("/org/model/resolve/main/config.json"))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", cache)
+                        .insert_header("x-repo-commit", commit)
+                        .insert_header(
+                            "x-linked-etag",
+                            format!("\"{}\"", git_blob(bytes)).as_str(),
+                        ),
+                )
+                .with_priority(priority);
+            if let Some(n) = times {
+                first = first.up_to_n_times(n);
+            }
+            first.mount(&up).await;
+            Mock::given(path(cache))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(bytes.to_vec())
+                        .insert_header("etag", format!("\"{}\"", git_blob(bytes)).as_str()),
+                )
+                .mount(&up)
+                .await;
+        }
+        let ctx = hf_with_upstream(&up);
+        for (commit, bytes) in [(COMMIT, CONFIG), (new_commit, &moved[..])] {
+            let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+            assert_eq!(header(&resp, "x-repo-commit"), commit);
+            assert_eq!(header(&resp, "etag"), format!("\"{}\"", git_blob(bytes)));
+            assert_eq!(received(resp).await, (bytes.to_vec(), true));
+            wait_stored(
+                &ctx,
+                &format!("hf/models/org/model/blobs/{}", git_blob(bytes)),
+            )
+            .await;
+        }
+        assert_eq!(
+            git_blob(CONFIG),
+            CONFIG_BLOB,
+            "the helper agrees with the fixture"
+        );
+    }
+
     /// A stored copy changed on disk under its pin ends one frame short, like raw's.
     #[tokio::test]
     async fn a_tampered_cached_copy_ends_short() {
