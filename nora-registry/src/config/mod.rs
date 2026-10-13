@@ -4075,6 +4075,7 @@ proxies = [
     /// min_release_age would hold nothing there: refused, not ignored.
     #[test]
     fn test_min_release_age_is_refused_with_hf() {
+        let _lock = env_lock();
         let mut config = Config::default();
         config.curation.min_release_age = Some("7d".to_string());
         config.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);

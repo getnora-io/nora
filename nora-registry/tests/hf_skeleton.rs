@@ -1,9 +1,9 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! The Hugging Face format is mounted by `nora serve` itself, not only by the test router:
-//! with `NORA_HF_ENABLED=true` the file route answers its 501 until the download path
-//! lands, and without it the routes do not exist.
+//! The Hugging Face format is mounted by `nora serve` itself, not only by the test router.
+//! No test here reaches the network: the upstream is switched off (`NORA_HF_PROXY=`), so a
+//! mounted file route answers 404 with its reason, and the datasets route its 501.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -35,6 +35,7 @@ fn serve(env: &[(&str, &str)]) -> Server {
         .current_dir(dir.path())
         .env_remove("NORA_CONFIG_PATH")
         .env_remove("NORA_HF_ENABLED")
+        .env_remove("NORA_HF_PROXY")
         .env_remove("NORA_REGISTRIES_ENABLE")
         .env("NORA_HOST", "127.0.0.1")
         .env("NORA_PORT", port.to_string())
@@ -104,22 +105,33 @@ fn body_of(port: u16, path: &str) -> String {
 }
 
 const RESOLVE: &str = "/hf/org/model/resolve/main/config.json";
+const DATASETS: &str = "/hf/datasets/org/data/resolve/main/train.parquet";
+
+/// Whether the response head carries NORA's reason header — a mounted hf route — as opposed
+/// to the router's bare 404.
+fn has_reason(head: &str) -> bool {
+    head.to_lowercase().contains("x-error-message:")
+}
 
 #[test]
-fn enabled_by_env_the_routes_answer_501() {
-    let server = serve(&[("NORA_HF_ENABLED", "true")]);
+fn enabled_by_env_the_routes_are_mounted() {
+    let server = serve(&[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", "")]);
     let head = head_of(server.port, "HEAD", RESOLVE);
-    assert!(head.starts_with("HTTP/1.1 501"), "{head}");
     assert!(
-        head.to_lowercase().contains("x-error-message:"),
-        "the reason must travel in a header on HEAD: {head}"
+        head.starts_with("HTTP/1.1 404") && has_reason(&head),
+        "{head}"
     );
-    // And in the JSON body on GET, as `nora serve` assembles the response — not only as
-    // the test router does.
-    let body = body_of(server.port, RESOLVE);
+    let head = head_of(server.port, "HEAD", DATASETS);
+    assert!(
+        head.starts_with("HTTP/1.1 501") && has_reason(&head),
+        "{head}"
+    );
+    // The JSON body as `nora serve` assembles the response — not only as the test
+    // router does.
+    let body = body_of(server.port, DATASETS);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let error = json["error"].as_str().unwrap_or_default();
-    assert!(error.contains("not implemented"), "body: {body:?}");
+    assert!(error.contains("datasets"), "body: {body:?}");
     assert!(body_of(server.port, "/health").contains("\"hf\""));
 }
 
@@ -127,15 +139,22 @@ fn enabled_by_env_the_routes_answer_501() {
 fn off_by_default_the_routes_do_not_exist() {
     let server = serve(&[]);
     let head = head_of(server.port, "HEAD", RESOLVE);
-    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    assert!(
+        head.starts_with("HTTP/1.1 404") && !has_reason(&head),
+        "{head}"
+    );
 }
 
 /// `all` predates the format: it does not opt an operator in.
 #[test]
 fn all_registries_leave_hf_off_until_it_is_named() {
-    let server = serve(&[("NORA_REGISTRIES_ENABLE", "all")]);
-    assert!(head_of(server.port, "HEAD", RESOLVE).starts_with("HTTP/1.1 404"));
+    let server = serve(&[("NORA_REGISTRIES_ENABLE", "all"), ("NORA_HF_PROXY", "")]);
+    let head = head_of(server.port, "HEAD", DATASETS);
+    assert!(
+        head.starts_with("HTTP/1.1 404") && !has_reason(&head),
+        "{head}"
+    );
     assert!(!body_of(server.port, "/health").contains("\"hf\""));
-    let server = serve(&[("NORA_REGISTRIES_ENABLE", "all,hf")]);
-    assert!(head_of(server.port, "HEAD", RESOLVE).starts_with("HTTP/1.1 501"));
+    let server = serve(&[("NORA_REGISTRIES_ENABLE", "all,hf"), ("NORA_HF_PROXY", "")]);
+    assert!(head_of(server.port, "HEAD", DATASETS).starts_with("HTTP/1.1 501"));
 }
