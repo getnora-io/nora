@@ -689,14 +689,13 @@ mod tests {
             .await;
         let v = std::sync::Arc::new(OidcValidator::new(config, Client::new()));
 
-        let tasks: Vec<_> = (0..50)
-            .map(|_| {
-                let (v, t) = (v.clone(), token.clone());
-                tokio::spawn(async move { v.validate_token(&t).await })
-            })
-            .collect();
-        for t in tasks {
-            assert!(t.await.unwrap().is_ok());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let (v, t) = (v.clone(), token.clone());
+            tasks.spawn(async move { v.validate_token(&t).await });
+        }
+        while let Some(r) = tasks.join_next().await {
+            assert!(r.unwrap().is_ok());
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
@@ -714,14 +713,13 @@ mod tests {
             .await;
         let v = std::sync::Arc::new(OidcValidator::new(config, Client::new()));
 
-        let tasks: Vec<_> = (0..20)
-            .map(|_| {
-                let (v, t) = (v.clone(), token.clone());
-                tokio::spawn(async move { v.validate_token(&t).await })
-            })
-            .collect();
-        for t in tasks {
-            let err = t.await.unwrap().unwrap_err();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let (v, t) = (v.clone(), token.clone());
+            tasks.spawn(async move { v.validate_token(&t).await });
+        }
+        while let Some(r) = tasks.join_next().await {
+            let err = r.unwrap().unwrap_err();
             assert_eq!(classify_rejection(&err), "jwks", "{err}");
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -755,5 +753,255 @@ mod tests {
             assert!(v.validate_token(&token).await.is_ok());
         }
         server.verify().await;
+    }
+
+    /// The failure backoff reliably EXPIRES and does not SLIDE: a second failing
+    /// request inside the window must not refresh the failure marker (otherwise the
+    /// window would never end under continuous load), and once the window passes a
+    /// request fetches again. Guards `oidc-jwks-failure-backoff`.
+    #[tokio::test]
+    async fn test_backoff_window_expires_and_does_not_slide() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, token) = mock_issuer(Some("/jwks"), 300).await;
+        // First JWKS fetch fails; any later fetch succeeds.
+        Mock::given(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let v = OidcValidator::new(config, Client::new());
+        let issuer = v.config.providers[0].issuer.clone();
+
+        // 1) Cold fetch fails with nothing cached: the failure is recorded.
+        assert!(v.validate_token(&token).await.is_err());
+        let marked = *v
+            .jwks_failed_at
+            .read()
+            .get(&issuer)
+            .expect("failure recorded");
+
+        // 2) Inside the window: a second failing request must NOT move the marker.
+        assert!(v.validate_token(&token).await.is_err());
+        assert_eq!(
+            *v.jwks_failed_at.read().get(&issuer).unwrap(),
+            marked,
+            "backoff window slid — failure timestamp refreshed inside the window"
+        );
+
+        // 3) Past the window: the next request fetches again and now succeeds.
+        v.jwks_failed_at.write().insert(
+            issuer.clone(),
+            marked - (JWKS_FAILURE_BACKOFF + Duration::from_secs(1)),
+        );
+        assert!(
+            v.validate_token(&token).await.is_ok(),
+            "backoff did not expire after the window"
+        );
+    }
+
+    /// A failed discovery must NOT pin the legacy fallback URI as a discovered
+    /// one (some issuers 404 the fallback, e.g. GitHub). Guards
+    /// `oidc-discovered-uri-sticky-not-fallback`.
+    #[tokio::test]
+    async fn test_fallback_uri_not_pinned() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, token) = mock_issuer(None, 300).await;
+        let issuer = config.providers[0].issuer.clone();
+        // Discovery returns a doc with no jwks_uri -> code must fall back to the legacy URI.
+        Mock::given(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        // The legacy fallback answers, so the validation succeeds via it.
+        Mock::given(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let v = OidcValidator::new(config, Client::new());
+
+        assert!(v.validate_token(&token).await.is_ok());
+        // The fallback URI must not have been cached as a discovered jwks_uri.
+        assert!(
+            v.discovered_jwks_uri.read().get(&issuer).is_none(),
+            "legacy fallback URI was pinned as a discovered jwks_uri"
+        );
+    }
+
+    /// Build a two-provider config from two single-provider ones (distinct issuers).
+    fn two_issuer_config(a: OidcConfig, b: OidcConfig) -> OidcConfig {
+        let mut c = a;
+        c.providers[0].name = "a".to_string();
+        let mut pb = b.providers[0].clone();
+        pb.name = "b".to_string();
+        c.providers.push(pb);
+        c
+    }
+
+    /// Within the backoff window, expired-but-present keys are still served and the
+    /// issuer is not hammered. Guards `oidc-jwks-failure-backoff` (stale-still-served).
+    #[tokio::test]
+    async fn test_stale_keys_served_during_backoff() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        // TTL 0: every validation refreshes, so a failing refresh must fall back to stale.
+        let (server, config, token) = mock_issuer(Some("/jwks"), 0).await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let v = OidcValidator::new(config, Client::new());
+
+        assert!(v.validate_token(&token).await.is_ok(), "cold fetch");
+        assert!(
+            v.validate_token(&token).await.is_ok(),
+            "first failure must serve stale keys"
+        );
+        assert!(
+            v.validate_token(&token).await.is_ok(),
+            "in-backoff must still serve stale keys"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "issuer was hammered while stale keys were available"
+        );
+    }
+
+    /// A transient non-2xx discovery must NOT pin the legacy fallback: once discovery
+    /// recovers, the real jwks_uri is used again. Guards
+    /// `oidc-discovered-uri-sticky-not-fallback` (the GitHub-404 scenario).
+    #[tokio::test]
+    async fn test_transient_discovery_failure_does_not_pin_fallback() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, config, token) = mock_issuer(None, 0).await;
+        Mock::given(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let discovery = serde_json::json!({ "jwks_uri": format!("{}/keys", server.uri()) });
+        Mock::given(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+            .mount(&server)
+            .await;
+        // Fallback answers once, then 404s (issuer whose jwks.json is not the real URI).
+        Mock::given(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let v = OidcValidator::new(config, Client::new());
+
+        assert!(
+            v.validate_token(&token).await.is_ok(),
+            "served via fallback"
+        );
+        // Stale keys mask the outage for the caller; the observable defect of pinning is
+        // that the refresh never returns to discovery and so never reaches the real /keys.
+        assert!(v.validate_token(&token).await.is_ok());
+        let keys_hits = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/keys")
+            .count();
+        assert_eq!(
+            keys_hits, 1,
+            "fallback was pinned after a transient discovery failure"
+        );
+    }
+
+    /// The discovered jwks_uri is kept per issuer: issuer B's keys come from B, never
+    /// from A's discovered URI. Guards `oidc-discovered-uri-sticky-not-fallback`.
+    #[tokio::test]
+    async fn test_discovered_jwks_uri_is_per_issuer() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (sa, ca, ta) = mock_issuer(None, 300).await;
+        let (sb, cb, tb) = mock_issuer(None, 300).await;
+        for s in [&sa, &sb] {
+            let d = serde_json::json!({ "jwks_uri": format!("{}/keys", s.uri()) });
+            Mock::given(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(d))
+                .mount(s)
+                .await;
+            Mock::given(path("/keys"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+                )
+                .expect(1)
+                .mount(s)
+                .await;
+        }
+        let v = OidcValidator::new(two_issuer_config(ca, cb), Client::new());
+
+        assert!(v.validate_token(&ta).await.is_ok());
+        assert!(v.validate_token(&tb).await.is_ok());
+        sa.verify().await;
+        sb.verify().await;
+    }
+
+    /// A backoff recorded for issuer A must not fail-fast a healthy issuer B. Guards
+    /// `oidc-jwks-failure-backoff` (per-issuer).
+    #[tokio::test]
+    async fn test_backoff_is_per_issuer() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (sa, ca, ta) = mock_issuer(Some("/jwks"), 300).await;
+        let (sb, cb, tb) = mock_issuer(Some("/jwks"), 300).await;
+        Mock::given(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&sa)
+            .await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&sb)
+            .await;
+        let v = OidcValidator::new(two_issuer_config(ca, cb), Client::new());
+
+        assert!(v.validate_token(&ta).await.is_err());
+        assert!(
+            v.validate_token(&tb).await.is_ok(),
+            "healthy issuer B was blocked by issuer A's backoff"
+        );
     }
 }
