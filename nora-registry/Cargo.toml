@@ -67,7 +67,7 @@ socket2 = "0.6"
 rpm = { version = "0.25", default-features = false }
 ar = "0.9"
 lzma-rs = "0.3"
-ruzstd = "0.8"
+ruzstd = "0.9"
 pgp = { version = "0.20", default-features = false }
 rand = "0.8"
 
