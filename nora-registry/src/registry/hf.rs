@@ -2649,8 +2649,7 @@ mod tests {
     #[tokio::test]
     async fn the_canonical_id_is_remembered() {
         let up = hub_with_alias().await;
-        let rules =
-            r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "reason": "r"}]}"#;
+        let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "version": "*", "reason": "r"}]}"#;
         let (ctx, _dir) = curated(&up, rules, "block");
         for _ in 0..2 {
             let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
@@ -2698,7 +2697,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(CONFIG.to_vec()))
                 .mount(&up)
                 .await;
-            let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "reason": "r"}]}"#;
+            let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "version": "*", "reason": "r"}]}"#;
             let (ctx, _dir) = curated(&up, rules, "block");
             let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
             assert_eq!(resp.status(), expected);

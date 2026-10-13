@@ -287,17 +287,18 @@ fn build_context_with(
 
     // Build curation engine before consuming config (mirroring main.rs)
     let mut curation_engine = CurationEngine::new(config.curation.clone());
+    // A list that does not parse fails the test: main.rs refuses it in enforce mode, and a
+    // test that silently runs without its list checks nothing.
     if let Some(ref path) = config.curation.blocklist_path {
-        if let Ok(filter) = crate::curation::BlocklistFilter::from_file(path) {
-            curation_engine.add_filter(Box::new(filter));
-        }
+        let filter = crate::curation::BlocklistFilter::from_file(path)
+            .unwrap_or_else(|e| panic!("test blocklist {path}: {e}"));
+        curation_engine.add_filter(Box::new(filter));
     }
     if let Some(ref path) = config.curation.allowlist_path {
-        if let Ok(filter) =
+        let filter =
             crate::curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
-        {
-            curation_engine.add_filter(Box::new(filter));
-        }
+                .unwrap_or_else(|e| panic!("test allowlist {path}: {e}"));
+        curation_engine.add_filter(Box::new(filter));
     }
     if !config.curation.internal_namespaces.is_empty() {
         let ns_filter =
