@@ -3690,6 +3690,66 @@ proxies = [
         }
     }
 
+    /// `EnableSpec::resolve` is the one place `all`, inclusions, exclusions and aliases
+    /// meet: every combination an operator writes, with the set or the refusal it gives.
+    #[test]
+    fn test_enable_spec_resolve_table() {
+        let in_all: HashSet<RegistryType> = RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|rt| rt.in_all())
+            .collect();
+        let plus = |extra: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all.iter().chain(extra).copied().collect()
+        };
+        let minus = |gone: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all
+                .iter()
+                .filter(|rt| !gone.contains(rt))
+                .copied()
+                .collect()
+        };
+        let set = |rts: &[RegistryType]| -> HashSet<RegistryType> { rts.iter().copied().collect() };
+        use RegistryType::{Docker, HuggingFace as Hf, Maven, Npm};
+        let ok: &[(&[&str], HashSet<RegistryType>)] = &[
+            (&["all"], in_all.clone()),
+            (&["all", "hf"], plus(&[Hf])),
+            (&["all", "huggingface"], plus(&[Hf])),
+            (&["all", "HF"], plus(&[Hf])),
+            (&["all", "-maven"], minus(&[Maven])),
+            (&["all", "-hf"], in_all.clone()),
+            (&["all", "hf", "-hf"], in_all.clone()),
+            (
+                &["all", "hf", "-maven"],
+                plus(&[Hf]).difference(&set(&[Maven])).copied().collect(),
+            ),
+            (&["hf"], set(&[Hf])),
+            (&["hf", "npm"], set(&[Hf, Npm])),
+            (&["docker"], set(&[Docker])),
+        ];
+        for (items, want) in ok {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            assert_eq!(spec.resolve().as_ref(), Ok(want), "{items:?}");
+        }
+        let refused: &[(&[&str], &str)] = &[
+            (&["all", "docker"], "cannot be combined"),
+            (&["all", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "npm"], "cannot be combined"),
+            (&["all", "-dokcer"], "unknown registry"),
+            (&["-hf"], "require \"all\""),
+            (&["dokcer"], "unknown registry"),
+            (&[], "must not be empty"),
+        ];
+        for (items, why) in refused {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            let err = spec
+                .resolve()
+                .expect_err(&format!("{items:?} must be refused"));
+            assert!(err.contains(why), "{items:?}: {err}");
+        }
+    }
+
     /// An opt-in format is never switched on by `all`: an operator who wrote `all` before
     /// it existed did not opt in. It is named beside `all` to have both.
     #[test]

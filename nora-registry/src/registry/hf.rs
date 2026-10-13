@@ -68,6 +68,7 @@ fn not_implemented(message: &'static str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::{DATASETS_NOT_IMPLEMENTED, MODELS_NOT_IMPLEMENTED};
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
 
@@ -107,19 +108,37 @@ mod tests {
                 StatusCode::NOT_IMPLEMENTED,
                 "{m} {uri} must reach the hf skeleton"
             );
-            // The reason is the model one: a model path routed to the datasets answer
-            // would tell the client its model is out of scope.
-            let reason = resp
-                .headers()
-                .get("x-error-message")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            assert!(
-                reason.contains("not implemented") && !reason.contains("datasets"),
-                "{m} {uri}: {reason:?}"
+            // Exactly the model reason, in the header and in the body: a model path given
+            // the datasets answer would tell the client its model is out of scope.
+            assert_eq!(
+                reason_of(resp, m).await,
+                (
+                    MODELS_NOT_IMPLEMENTED.to_string(),
+                    MODELS_NOT_IMPLEMENTED.to_string()
+                ),
+                "{m} {uri}"
             );
         }
+    }
+
+    /// The reason a 501 gives in `X-Error-Message`, and in the JSON body for a GET (HEAD has
+    /// no body; the header alone is checked twice then).
+    async fn reason_of(resp: axum::response::Response, m: &str) -> (String, String) {
+        let header = resp
+            .headers()
+            .get("x-error-message")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if m == "HEAD" {
+            return (header.clone(), header);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap_or_default();
+        (
+            header,
+            body["error"].as_str().unwrap_or_default().to_string(),
+        )
     }
 
     /// The skeleton fetches and caches nothing, whatever form an upstream call would take.
@@ -182,16 +201,18 @@ mod tests {
         for (m, uri) in [
             ("GET", "/hf/api/datasets/org/data/revision/main"),
             ("HEAD", "/hf/datasets/org/data/resolve/main/train.parquet"),
+            ("GET", "/hf/datasets/org/data/resolve/main/train.parquet"),
         ] {
             let resp = send(&ctx.app, method(m), uri, "").await;
             assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{m} {uri}");
-            let header = resp
-                .headers()
-                .get("x-error-message")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            assert!(header.contains("datasets"), "{m} {uri}: {header:?}");
+            assert_eq!(
+                reason_of(resp, m).await,
+                (
+                    DATASETS_NOT_IMPLEMENTED.to_string(),
+                    DATASETS_NOT_IMPLEMENTED.to_string()
+                ),
+                "{m} {uri}"
+            );
         }
     }
 
