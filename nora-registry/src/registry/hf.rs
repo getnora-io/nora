@@ -1656,6 +1656,34 @@ mod tests {
         assert_eq!(body_bytes(resp).await.to_vec(), weights()[4100..].to_vec());
     }
 
+    /// Every hop asks for the bytes as stored: a compressed answer would be decompressed by
+    /// the HTTP client while its Content-Length still counted the compressed size.
+    #[tokio::test]
+    async fn every_hop_asks_for_identity_encoding() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/model.safetensors",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        for server in [&up, &cdn] {
+            for r in server.received_requests().await.unwrap() {
+                let ae = r
+                    .headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                assert_eq!(ae, "identity", "{}", r.url.path());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn files_go_upstream_as_the_client_encoded_them() {
         let up = MockServer::start().await;
