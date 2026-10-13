@@ -419,6 +419,17 @@ fn build_http_client(
         .expect("Failed to build HTTP client")
 }
 
+/// The client that never follows a redirect, for a format whose answer depends on what each
+/// hop said (hf: the commit rides on the Hub's redirect). Built like [`build_http_client`]
+/// (custom CA, user agent, proxy settings); the test context builds it here too, so the
+/// tests run against the very client the server uses.
+pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
+    http_client_builder(tls, None, false)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
 /// The builder behind [`build_http_client`], for a client that differs in one setting.
 fn http_client_builder(
     tls: &TlsConfig,
@@ -2093,10 +2104,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     config.warn_plaintext_credentials();
 
     let http_client = build_http_client(&config.tls, None, false);
-    let http_client_no_redirect = http_client_builder(&config.tls, None, false)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Failed to build HTTP client");
+    let http_client_no_redirect = build_no_redirect_client(&config.tls);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)

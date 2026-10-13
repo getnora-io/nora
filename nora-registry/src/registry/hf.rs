@@ -2248,7 +2248,13 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_bytes(weights())
                     .insert_header("etag", "\"cdn-etag\"")
-                    .insert_header("x-amz-request-id", "abc"),
+                    .insert_header("x-amz-request-id", "abc")
+                    .insert_header("cache-control", "public, max-age=31536000, immutable")
+                    .insert_header("x-request-id", "upstream")
+                    .insert_header(
+                        "content-disposition",
+                        "inline; filename=\"model.safetensors\"",
+                    ),
             )
             .mount(&cdn)
             .await;
@@ -2261,18 +2267,24 @@ mod tests {
         w
     }
 
-    /// No header that could send a client to Xet, and no upstream cookie or storage header.
+    /// Only listed headers reach the client — a white list by exact name, so nothing the
+    /// upstream sends beside them (Xet, `Link`, `Location`, cookies, storage or cache headers)
+    /// gets through. `x-request-id` is NORA's own (its request-id middleware).
     fn assert_no_leaked_headers(resp: &Response) {
-        for (name, _) in resp.headers() {
-            let n = name.as_str();
-            assert!(
-                !n.starts_with("x-xet-")
-                    && n != "link"
-                    && n != "set-cookie"
-                    && !n.starts_with("x-amz-")
-                    && n != "location",
-                "{n} reached the client"
-            );
+        const LISTED: &[&str] = &[
+            "x-repo-commit",
+            "etag",
+            "x-linked-etag",
+            "x-linked-size",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "content-type",
+            "x-request-id",
+        ];
+        for (name, value) in resp.headers() {
+            assert!(LISTED.contains(&name.as_str()), "{name} reached the client");
+            assert_ne!(value, "upstream", "{name} carries the upstream's value");
         }
     }
 
@@ -2750,8 +2762,10 @@ mod tests {
     async fn a_commit_rule_holds_for_the_branch_that_resolves_to_it() {
         let cdn = cdn_with_weights().await;
         let up = live_hub(&cdn).await;
+        // The rule names the commit in upper case; the Hub names it in lower case.
         let rules = format!(
-            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}", "reason": "r"}}]}}"#
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{}", "reason": "r"}}]}}"#,
+            COMMIT.to_uppercase()
         );
         let (ctx, _dir) = curated(&up, &rules, "block");
         let resp = send(
@@ -2833,6 +2847,21 @@ mod tests {
         let up = hub_with_alias().await;
         let rules = format!(
             r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "openai-community/gpt2", "version": "{COMMIT}", "reason": "r"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &rules, "block");
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty());
+    }
+
+    /// Both names are checked on the commit: a rule on the alias as requested holds as well as
+    /// one on its canonical id.
+    #[tokio::test]
+    async fn a_commit_rule_on_the_alias_itself_holds() {
+        let up = hub_with_alias().await;
+        let rules = format!(
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "gpt2", "version": "{COMMIT}", "reason": "r"}}]}}"#
         );
         let (ctx, _dir) = curated(&up, &rules, "block");
         let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
@@ -3375,6 +3404,31 @@ mod tests {
         assert_eq!(upstream_paths(&cdn).await.len(), 1);
     }
 
+    /// A HEAD is answered from the hops and never reads the cache, even for a file it holds.
+    #[tokio::test]
+    async fn a_head_never_reads_the_cache() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        let _ = body_bytes(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        wait_stored(&ctx, &weights_key()).await;
+        let hits = |ctx: &TestContext| {
+            ctx.state
+                .activity
+                .all()
+                .iter()
+                .filter(|e| matches!(e.action, ActionType::CacheHit))
+                .count()
+        };
+        let before = hits(&ctx);
+        let resp = send(&ctx.app, Method::HEAD, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-repo-commit"), COMMIT);
+        assert_eq!(hits(&ctx), before, "a HEAD read the cache");
+        let _ = body_bytes(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+        assert_eq!(hits(&ctx), before + 1, "the control: a GET reads it");
+    }
+
     /// A range is part of a file, and a HEAD has no body: neither is stored.
     #[tokio::test]
     async fn a_range_or_a_head_never_fills_the_cache() {
@@ -3636,41 +3690,48 @@ mod tests {
         );
     }
 
-    /// The periodic sweep and the start remove fills that will not finish, and only those.
+    /// The periodic sweep and the start remove fills that will not finish, and only those: a
+    /// temp file quiet for four hours is a fill that died, one quiet for less may be a slow one.
     #[test]
     fn stale_fill_temp_files_are_removed_and_fresh_ones_kept() {
         let dir = tempfile::tempdir().unwrap();
         let temps = dir.path().join(FILL_TEMP_DIR);
         std::fs::create_dir_all(&temps).unwrap();
-        let stale = temps.join("stale.part");
-        let fresh = temps.join("fresh.part");
-        std::fs::write(&stale, b"cut off").unwrap();
-        std::fs::write(&fresh, b"under way").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&stale)
-            .unwrap()
-            .set_modified(
-                std::time::SystemTime::now() - FILL_TEMP_MAX_AGE - Duration::from_secs(60),
-            )
-            .unwrap();
+        let aged = |name: &str, quiet: Duration| {
+            let path = temps.join(name);
+            std::fs::write(&path, b"part").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - quiet)
+                .unwrap();
+            path
+        };
+        let dead = aged("dead.part", Duration::from_secs(4 * 3600 + 60));
+        let slow = aged("slow.part", Duration::from_secs(4 * 3600 - 60));
+        let live = aged("live.part", Duration::ZERO);
         cleanup_fill_temp_dir(dir.path().to_str().unwrap());
-        assert!(!stale.exists());
-        assert!(fresh.exists());
+        assert!(!dead.exists());
+        assert!(
+            slow.exists(),
+            "a fill quiet for less than four hours was removed"
+        );
+        assert!(live.exists());
     }
 
     /// The memory of canonical ids is bounded: past the limit it starts over.
     #[tokio::test]
     async fn canonical_ids_are_bounded() {
         let ids = CanonicalIds::default();
-        for n in 0..=CANONICAL_MAX {
+        for n in 0..=4096 {
             ids.remember(format!("id{n}"), format!("org/id{n}")).await;
         }
-        assert!(ids.0.lock().await.len() <= CANONICAL_MAX);
-        assert_eq!(
-            ids.get(&format!("id{CANONICAL_MAX}")).await.as_deref(),
-            Some(format!("org/id{CANONICAL_MAX}").as_str())
+        assert!(
+            ids.0.lock().await.len() <= 4096,
+            "more than 4096 ids remembered"
         );
+        assert_eq!(ids.get("id4096").await.as_deref(), Some("org/id4096"));
     }
 
     #[test]
