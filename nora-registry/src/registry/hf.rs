@@ -988,6 +988,10 @@ fn fill_stream(chunks: Chunks, fill: Fill) -> FillStream {
             }
             loop {
                 match t.chunks.next().await {
+                    // An empty chunk (an HTTP/2 body can end with an empty DATA frame) is
+                    // neither held nor sent: holding it would let the last real chunk out
+                    // before the digest is checked.
+                    Some(Ok(chunk)) if chunk.is_empty() => {}
                     Some(Ok(chunk)) => {
                         t.fill.take(&chunk).await;
                         if let Some(previous) = t.held.replace(chunk) {
@@ -2959,6 +2963,60 @@ mod tests {
         // Nothing was kept, so the next download asks the CDN again.
         let _ = received(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
         assert_eq!(upstream_paths(&cdn).await.len(), 2);
+    }
+
+    /// An HTTP/2 upstream can end a body with an empty DATA frame (the live Hub's resolve
+    /// cache does, behind its CDN). Held back, that empty chunk would let the last real one
+    /// out before the digest is checked, and the client, its Content-Length met, would stop
+    /// reading there: a corrupt file would arrive whole, and a good one would never be stored.
+    #[tokio::test]
+    async fn an_empty_last_chunk_lets_nothing_out_unchecked() {
+        let ctx = hf_enabled();
+        let key = "hf/models/org/model/blobs/x";
+        let body = weights();
+        let run = |expected: HubDigest| {
+            let state = ctx.state.clone();
+            let body = body.clone();
+            async move {
+                let fill = Fill {
+                    expected,
+                    sha256: sha2::Sha256::new(),
+                    git: None,
+                    store: fill_store(&state, key.to_string()).await,
+                };
+                let chunks: Chunks = Box::pin(futures::stream::iter(vec![
+                    Ok(Bytes::from(body[..100].to_vec())),
+                    Ok(Bytes::from(body[100..].to_vec())),
+                    Ok(Bytes::new()),
+                ]));
+                let mut frames = fill_stream(chunks, fill);
+                let (mut got, mut clean) = (Vec::new(), true);
+                while let Some(frame) = frames.next().await {
+                    match frame {
+                        Ok(b) => got.extend_from_slice(&b),
+                        Err(_) => {
+                            clean = false;
+                            break;
+                        }
+                    }
+                    // The client stops once its Content-Length is met, as hyper does.
+                    if got.len() == body.len() {
+                        break;
+                    }
+                }
+                (got, clean)
+            }
+        };
+        let (got, clean) = run(HubDigest::Sha256("0".repeat(64))).await;
+        assert!(
+            got.len() < body.len() || !clean,
+            "a corrupt file arrived whole"
+        );
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty());
+        let (got, clean) = run(HubDigest::Sha256(SHA256.into())).await;
+        assert_eq!((got, clean), (body.clone(), true));
+        wait_stored(&ctx, key).await;
     }
 
     /// A stored copy changed on disk under its pin ends one frame short, like raw's.
