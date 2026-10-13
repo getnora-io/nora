@@ -70,6 +70,10 @@ lzma-rs = "0.3"
 ruzstd = "0.8"
 pgp = { version = "0.20", default-features = false }
 rand = "0.8"
+# Global allocator. musl's malloc serializes every allocation on one global lock;
+# under load every tokio worker spins on it. No default features:
+# the plain allocator is enough and keeps the build dependency-free.
+mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # flock(2) on the local backend's staging lock, without unsafe; already in the tree

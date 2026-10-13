@@ -19,6 +19,9 @@
         clippy::items_after_test_module
     )
 )]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod activity_log;
 mod admin;
 mod audit;
