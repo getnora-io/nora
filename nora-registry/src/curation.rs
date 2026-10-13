@@ -176,6 +176,13 @@ impl CurationEngine {
         self.config.mode != CurationMode::Off
     }
 
+    /// Whether a download can be refused by its name: curation is on, or a namespace filter
+    /// is set (it runs even with curation off). A format that learns an alias's canonical
+    /// name from its upstream, for curation to read, asks only when this holds.
+    pub fn can_refuse_names(&self) -> bool {
+        self.is_active() || self.namespace_filter.is_some()
+    }
+
     /// Access raw metrics counters.
     pub fn metrics(&self) -> &CurationMetrics {
         &self.metrics
@@ -1923,6 +1930,17 @@ mod tests {
     use super::*;
     use crate::config::{CurationConfig, CurationMode, CurationOnFailure};
     use sha2::Digest;
+
+    #[test]
+    fn names_can_be_refused_when_curation_is_on_or_a_namespace_is_set() {
+        let mut config = CurationConfig::default();
+        assert!(!CurationEngine::new(config.clone()).can_refuse_names());
+        let mut with_namespace = CurationEngine::new(config.clone());
+        with_namespace.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["acme/*".into()])));
+        assert!(with_namespace.can_refuse_names());
+        config.mode = CurationMode::Audit;
+        assert!(CurationEngine::new(config).can_refuse_names());
+    }
 
     /// A test filter that always allows.
     struct AllowAllFilter;

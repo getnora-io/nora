@@ -355,6 +355,7 @@ fn build_context_with(
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
+        hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,

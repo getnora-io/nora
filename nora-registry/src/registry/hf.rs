@@ -93,6 +93,7 @@ const XET_TOKEN_ROUTES: &[&str] = &["xet-read-token", "xet-write-token"];
 const XET_BODY_KEY: &str = "xetHash";
 
 const MAX_PATH: usize = 2048;
+const MAX_QUERY: usize = 2048;
 
 /// Cached files live under `hf/models/{repo}/blobs/{digest}`.
 const CACHE_PREFIX: &str = "hf/models";
@@ -101,7 +102,20 @@ const FILL_TEMP_DIR: &str = "tmp/hf-proxy";
 /// A temp file untouched this long belongs to a fill that will not finish.
 const FILL_TEMP_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 const CACHED_CONTENT_TYPE: &str = "application/octet-stream";
-const MAX_QUERY: usize = 2048;
+
+/// How long the canonical id the Hub named for an id is trusted; renames are rare.
+const CANONICAL_TTL: Duration = Duration::from_secs(60 * 60);
+/// Bound on remembered ids; past it the memory starts over.
+const CANONICAL_MAX: usize = 4096;
+const CANONICAL_UNKNOWN: &str =
+    "NORA could not learn this repository's canonical id from the Hugging Face upstream, which curation needs.";
+
+/// Canonical ids the Hub named, per upstream and id as the client spelled it (lower case),
+/// with when they were learned. Held by the application state, one per instance.
+#[derive(Default)]
+pub struct CanonicalIds(
+    parking_lot::Mutex<std::collections::HashMap<(String, String), (String, std::time::Instant)>>,
+);
 
 pub fn routes() -> Router<AppState> {
     // `get` answers HEAD as well; anything else is 405.
@@ -188,6 +202,34 @@ async fn files(
     if let Some(refused) = curation_check(&state, &headers, &repo, RequestVersion::Unspecified) {
         return refused;
     }
+    // An alias — a legacy one-segment id, a renamed repo — is answered by the Hub as its
+    // canonical repo, so a rule on the canonical id must hold for it too: when curation can
+    // refuse by name, both names are checked, on the repo and on the commit.
+    let mut names = vec![repo.clone()];
+    if state.curation().curation_engine.can_refuse_names() {
+        match canonical_id(&state, upstream, file.repo).await {
+            Canonical::Id(id) => {
+                if !id.eq_ignore_ascii_case(&repo) {
+                    if let Some(refused) =
+                        curation_check(&state, &headers, &id, RequestVersion::Unspecified)
+                    {
+                        return refused;
+                    }
+                    names.push(id);
+                }
+            }
+            Canonical::Refused {
+                status,
+                code,
+                message,
+            } => return upstream_refusal(status, code, message),
+            Canonical::CircuitOpen(registry) => return circuit_open_response(&registry),
+            Canonical::Failed(why) => {
+                tracing::warn!(registry = "hf", why, repo = %repo, "canonical repo id unknown; refused for curation");
+                return error_response(StatusCode::BAD_GATEWAY, CANONICAL_UNKNOWN);
+            }
+        }
+    }
     let url = format!(
         "{upstream}/{}/resolve/{}/{}",
         file.repo, file.revision, file.file
@@ -197,7 +239,9 @@ async fn files(
         let version = commit.map_or(RequestVersion::Unrecognised, |c| {
             RequestVersion::Known(c.to_string())
         });
-        curation_check(&state, &headers, &repo, version)
+        names
+            .iter()
+            .find_map(|name| curation_check(&state, &headers, name, version.clone()))
     };
     let cache_repo = (method == Method::GET).then_some(repo.as_str());
     let mut fetched = fetch_file(
@@ -302,6 +346,114 @@ fn curation_check(
         version,
         None,
     )
+}
+
+/// What the Hub calls a repo id.
+enum Canonical {
+    Id(String),
+    /// The Hub refused the id (4xx): handed on, as a file refusal is.
+    Refused {
+        status: StatusCode,
+        code: Option<HeaderValue>,
+        message: Option<HeaderValue>,
+    },
+    CircuitOpen(String),
+    Failed(&'static str),
+}
+
+/// The canonical id of `encoded` (the id as the client encoded it), for curation. The Hub
+/// answers an alias on `api/models` — a legacy one-segment id, another case, a renamed repo —
+/// with a relative redirect to the canonical id, and the canonical id with 200 (measured on
+/// the live Hub); a HEAD asks without the model-info body. Only a redirect within the
+/// upstream's origin to another `api/models` path is followed. Remembered for
+/// [`CANONICAL_TTL`].
+async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canonical {
+    let remembered = (upstream.to_string(), encoded.to_ascii_lowercase());
+    if let Some((id, at)) = state.hf_canonical_ids.0.lock().get(&remembered).cloned() {
+        if at.elapsed() < CANONICAL_TTL {
+            return Canonical::Id(id);
+        }
+    }
+    let scope = BreakerScope::from(RegistryType::HuggingFace);
+    let key = scope.key();
+    let probe = match state.circuit_breaker.check(&key) {
+        Ok(probe) => probe,
+        Err(ProxyError::CircuitOpen(registry)) => return Canonical::CircuitOpen(registry),
+        Err(_) => return Canonical::Failed("breaker"),
+    };
+    let timeout = Duration::from_secs(state.config.hf.proxy_timeout);
+    let Ok(mut url) = reqwest::Url::parse(&format!("{upstream}/api/models/{encoded}")) else {
+        state.circuit_breaker.record_alive(&key, probe);
+        return Canonical::Failed("bad upstream url");
+    };
+    let start = origin(&url);
+    let mut hops = 0;
+    let outcome = loop {
+        if hops > MAX_HOPS {
+            break Err("too many redirects");
+        }
+        // CANCEL-SAFETY: a timed-out send drops its own connection and nothing else; no
+        // state outlives it.
+        let response = match tokio::time::timeout(
+            timeout,
+            state.http_client_no_redirect.head(url.clone()).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => break Err("upstream unreachable"),
+        };
+        let status = response.status();
+        if status.is_success() {
+            let id = url.path().split_once("/api/models/").map(|(_, id)| {
+                percent_encoding::percent_decode_str(id)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            });
+            break id
+                .filter(|id| !id.is_empty())
+                .map(Canonical::Id)
+                .ok_or("no id in the path");
+        }
+        if status.is_redirection() {
+            let next = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| url.join(l).ok())
+                .filter(|next| origin(next) == start && next.path().contains("/api/models/"));
+            let Some(next) = next else {
+                break Err("redirect away from the upstream's api/models");
+            };
+            url = next;
+            hops += 1;
+            continue;
+        }
+        if status.is_client_error() {
+            break Ok(Canonical::Refused {
+                status,
+                code: response.headers().get(&ERROR_CODE_HEADER).cloned(),
+                message: response.headers().get(&ERROR_MESSAGE_HEADER).cloned(),
+            });
+        }
+        break Err("upstream error");
+    };
+    match outcome {
+        Ok(Canonical::Refused { .. })
+        | Err("too many redirects")
+        | Err("redirect away from the upstream's api/models")
+        | Err("no id in the path") => state.circuit_breaker.record_alive(&key, probe),
+        Ok(_) => state.circuit_breaker.record_success(&key, probe),
+        Err(_) => state.circuit_breaker.record_failure(&key, probe),
+    }
+    if let Ok(Canonical::Id(id)) = &outcome {
+        let mut ids = state.hf_canonical_ids.0.lock();
+        if ids.len() >= CANONICAL_MAX {
+            ids.clear();
+        }
+        ids.insert(remembered, (id.clone(), std::time::Instant::now()));
+    }
+    outcome.unwrap_or_else(Canonical::Failed)
 }
 
 /// What the Hub said about a file across the hops of one request.
@@ -1956,6 +2108,11 @@ mod tests {
     /// etag and size on that hop only and Xet advertised beside them.
     async fn live_hub(cdn: &MockServer) -> MockServer {
         let up = MockServer::start().await;
+        // The canonical id answers its own `api/models` with 200, as on the live Hub.
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
         Mock::given(path("/org/model/resolve/main/config.json"))
             .respond_with(
                 ResponseTemplate::new(307)
@@ -2390,6 +2547,171 @@ mod tests {
         );
     }
 
+    const ALIAS_PATH: &str = "/hf/gpt2/resolve/main/config.json";
+
+    /// The Hub in the live shape for an alias: `api/models/gpt2` answers a relative redirect
+    /// to the canonical id, which answers 200; the alias's file is answered directly.
+    async fn hub_with_alias() -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/gpt2"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", "/api/models/openai-community/gpt2"),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/api/models/openai-community/gpt2"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        Mock::given(path("/gpt2/resolve/main/config.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CONFIG.to_vec())
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        up
+    }
+
+    /// The methods of the canonical-id requests the upstream saw.
+    async fn canonical_asks(up: &MockServer) -> Vec<String> {
+        up.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/models/"))
+            .map(|r| r.method.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rule_on_the_canonical_id_holds_for_an_alias() {
+        let up = hub_with_alias().await;
+        let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "openai-community/gpt2", "version": "*", "reason": "r"}]}"#;
+        let (ctx, _dir) = curated(&up, rules, "block");
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            hits(&up, "/resolve/main/config.json").await,
+            0,
+            "file asked for a refused repo"
+        );
+        let asks = canonical_asks(&up).await;
+        assert!(
+            !asks.is_empty() && asks.iter().all(|m| m == "HEAD"),
+            "{asks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_rule_on_the_canonical_id_holds_for_an_alias() {
+        let up = hub_with_alias().await;
+        let rules = format!(
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "openai-community/gpt2", "version": "{COMMIT}", "reason": "r"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &rules, "block");
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        settle().await;
+        assert!(hf_keys(&ctx).await.is_empty());
+    }
+
+    /// An internal namespace refuses even with curation off, so the canonical id is asked then
+    /// too.
+    #[tokio::test]
+    async fn an_internal_namespace_holds_for_an_alias_with_curation_off() {
+        let up = hub_with_alias().await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["openai-community/gpt2".to_string()];
+        });
+        assert!(!ctx.state.curation().curation_engine.is_active());
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(hits(&up, "/resolve/main/config.json").await, 0);
+    }
+
+    /// With no rule that could refuse a name, no request is spent on the canonical id.
+    #[tokio::test]
+    async fn without_a_rule_to_read_no_canonical_id_is_asked() {
+        let up = hub_with_alias().await;
+        let ctx = hf_with_upstream(&up);
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
+        assert!(canonical_asks(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_canonical_id_is_remembered() {
+        let up = hub_with_alias().await;
+        let rules =
+            r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "reason": "r"}]}"#;
+        let (ctx, _dir) = curated(&up, rules, "block");
+        for _ in 0..2 {
+            let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+            assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
+        }
+        assert_eq!(
+            canonical_asks(&up).await.len(),
+            2,
+            "the alias and its target, once"
+        );
+    }
+
+    /// Curation fails closed: without the canonical id the alias is refused, and a Hub refusal
+    /// of the id is handed on; the file is never asked for.
+    #[tokio::test]
+    async fn without_the_canonical_id_the_alias_is_refused() {
+        let other = MockServer::start().await;
+        let cases: Vec<(ResponseTemplate, StatusCode)> = vec![
+            (ResponseTemplate::new(500), StatusCode::BAD_GATEWAY),
+            (
+                ResponseTemplate::new(307).insert_header(
+                    "location",
+                    format!("{}/api/models/openai-community/gpt2", other.uri()).as_str(),
+                ),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ResponseTemplate::new(307).insert_header("location", "/elsewhere/gpt2"),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ResponseTemplate::new(401)
+                    .insert_header("x-error-code", "RepoNotFound")
+                    .insert_header("x-error-message", "Repository not found"),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (answer, expected) in cases {
+            let up = MockServer::start().await;
+            Mock::given(path("/api/models/gpt2"))
+                .respond_with(answer)
+                .mount(&up)
+                .await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(CONFIG.to_vec()))
+                .mount(&up)
+                .await;
+            let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "reason": "r"}]}"#;
+            let (ctx, _dir) = curated(&up, rules, "block");
+            let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+            assert_eq!(resp.status(), expected);
+            if expected == StatusCode::UNAUTHORIZED {
+                assert_eq!(header(&resp, "x-error-code"), "RepoNotFound");
+            } else {
+                assert_eq!(header(&resp, "x-error-message"), CANONICAL_UNKNOWN);
+            }
+            assert_eq!(hits(&up, "/resolve/main/config.json").await, 0);
+            assert!(upstream_paths(&other).await.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn an_allowlist_lets_through_only_the_listed_commit() {
         let cdn = cdn_with_weights().await;
@@ -2438,6 +2760,18 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !matches!(ctx.state.storage.get_reader(key).await, Ok((_, Some(_), _))) {
             assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A failed commit removes its temp file from its own task: wait for it, with a deadline.
+    async fn wait_no_fill_temps(ctx: &TestContext) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fill_temps(ctx) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a fill temp file stayed behind"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -2753,8 +3087,7 @@ mod tests {
             let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
             assert_eq!(received(resp).await, (weights(), true));
         }
-        settle().await;
-        assert_eq!(fill_temps(&ctx), 0, "a failed commit leaves its temp file");
+        wait_no_fill_temps(&ctx).await;
         assert_eq!(upstream_paths(&cdn).await.len(), 2);
     }
 

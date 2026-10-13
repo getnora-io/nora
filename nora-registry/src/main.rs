@@ -261,6 +261,8 @@ pub struct AppState {
     /// The same client, except that it never follows a redirect: for a format whose answer
     /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
     pub http_client_no_redirect: reqwest::Client,
+    /// Canonical repo ids the Hugging Face upstream named, for curation of aliases (#579).
+    pub hf_canonical_ids: Arc<registry::hf::CanonicalIds>,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
@@ -2276,6 +2278,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
+        hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
