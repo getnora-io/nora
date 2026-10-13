@@ -9,7 +9,8 @@ use std::env;
 /// A single retention rule applied to a registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionRule {
-    /// Registry name (e.g., "docker", "maven", "npm", "pypi", "cargo") or "*" for all
+    /// Registry name (e.g., "docker", "maven", "npm", "pypi", "cargo", "hf") or "*" for every
+    /// registry `all` enables; an opt-in format (hf) is pruned only by a rule that names it
     pub registry: String,
     /// Optional glob matched against the group name within the registry
     /// (e.g. `myrepo/*` for one rpm/deb repository, `archive/*` for one raw

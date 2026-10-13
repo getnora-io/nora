@@ -490,6 +490,44 @@ async fn collect_raw_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
         .collect()
 }
 
+/// Collect Hugging Face cached files (#579): one group per repository (`hf:{repo}`), one
+/// version per file the Hub named by its digest (`hf/models/{repo}/blobs/{digest}`), dated
+/// by when it was cached. The format is pull-through only, so every file is a copy the next
+/// download fetches again: `older_than_days` bounds how long one is kept, `keep_last` how
+/// many files of a repository are.
+async fn collect_hf_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
+    let keys = match storage.list_with_meta("hf/models/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("Failed to list hf/models/ keys: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut groups: std::collections::HashMap<String, Vec<VersionEntry>> =
+        std::collections::HashMap::new();
+    for (key, meta) in &keys {
+        let Some((repo, digest)) = key
+            .strip_prefix("hf/models/")
+            .and_then(|rest| rest.rsplit_once("/blobs/"))
+        else {
+            continue;
+        };
+        if repo.is_empty() || digest.is_empty() || digest.contains('/') {
+            continue;
+        }
+        groups
+            .entry(format!("hf:{repo}"))
+            .or_default()
+            .push(VersionEntry {
+                name: digest.to_string(),
+                keys: vec![key.clone()],
+                modified: meta.modified,
+                size: meta.size,
+            });
+    }
+    groups.into_iter().collect()
+}
+
 /// Collect Docker tags for each repository.
 async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
     let all_keys = storage.list("docker/").await.unwrap_or_else(|e| {
@@ -841,6 +879,7 @@ pub async fn run_retention(
     all_groups.extend(collect_rpm_versions(storage).await);
     all_groups.extend(collect_deb_versions(storage).await);
     all_groups.extend(collect_raw_versions(storage).await);
+    all_groups.extend(collect_hf_versions(storage).await);
 
     let mut all_plans: Vec<(String, Vec<DeletionPlan>)> = Vec::new();
     let mut total_planned = 0usize;
@@ -1032,9 +1071,16 @@ fn find_matching_rule<'a>(
         .map(|(_, n)| n)
         .unwrap_or(group_name);
     rules.iter().find(|r| {
-        (r.registry == registry || r.registry == "*")
+        (r.registry == registry || (r.registry == "*" && wildcard_covers(registry)))
             && r.name_glob.as_deref().is_none_or(|g| glob_match(g, name))
     })
+}
+
+/// A `*` rule covers the registries `all` enables. An opt-in format (Hugging Face) is pruned
+/// only by a rule that names it, so a wildcard written before the format existed does not
+/// start deleting its cache on upgrade — `keep_last` counts files there, not versions.
+fn wildcard_covers(registry: &str) -> bool {
+    crate::registry_type::RegistryType::from_str_opt(registry).is_none_or(|rt| rt.in_all())
 }
 
 // ============================================================================
@@ -2732,6 +2778,99 @@ mod format_retention_tests {
         )
         .unwrap();
         assert!(focal.contains("Version: 2.0\n"), "{focal}");
+    }
+
+    /// Hugging Face: one group per repository, one version per cached file; only a rule
+    /// that names hf applies.
+    #[tokio::test]
+    async fn test_hf_files_grouped_per_repository_and_pruned_by_name() {
+        let ctx = create_test_context();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        for (key, aged) in [
+            (
+                "hf/models/org/model/blobs/1111111111111111111111111111111111111111",
+                true,
+            ),
+            (
+                "hf/models/org/model/blobs/2222222222222222222222222222222222222222",
+                false,
+            ),
+            (
+                "hf/models/gpt2/blobs/3333333333333333333333333333333333333333",
+                true,
+            ),
+            (
+                "hf/models/org/blobs/blobs/4444444444444444444444444444444444444444",
+                true,
+            ),
+        ] {
+            ctx.state.storage.put(key, b"data").await.unwrap();
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(std::path::Path::new(&ctx.state.config.storage.path).join(key))
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+        let mut groups = collect_hf_versions(&ctx.state.storage).await;
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<(&str, usize)> = groups.iter().map(|(g, v)| (g.as_str(), v.len())).collect();
+        assert_eq!(
+            names,
+            vec![("hf:gpt2", 1), ("hf:org/blobs", 1), ("hf:org/model", 2)]
+        );
+
+        // A wildcard rule written for the other formats leaves the opt-in cache alone.
+        let wildcard = vec![rule("*", None, Some(1), Some(1))];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &wildcard,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 0);
+        assert_eq!(ctx.state.storage.list("hf/").await.unwrap().len(), 4);
+
+        // A rule that names hf prunes what is older than its age, in the repositories it names.
+        let rules = vec![rule("hf", Some("org/*"), None, Some(1))];
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2);
+        let mut left = ctx.state.storage.list("hf/").await.unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "hf/models/gpt2/blobs/3333333333333333333333333333333333333333".to_string(),
+                "hf/models/org/model/blobs/2222222222222222222222222222222222222222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_rule_covers_what_all_enables() {
+        let rules = vec![rule("*", None, Some(1), None)];
+        for registry in [
+            "docker", "npm", "maven", "pypi", "cargo", "go", "rpm", "deb", "raw",
+        ] {
+            assert!(
+                find_matching_rule(&rules, registry, &format!("{registry}:x")).is_some(),
+                "{registry}"
+            );
+        }
+        assert!(find_matching_rule(&rules, "hf", "hf:org/model").is_none());
+        let named = vec![rule("hf", None, Some(1), None)];
+        assert!(find_matching_rule(&named, "hf", "hf:org/model").is_some());
     }
 
     /// Raw: a depth-2 prefix is the version unit — the whole CALVER-style
