@@ -136,16 +136,11 @@ fn nora_hf_base(state: &AppState) -> String {
 }
 
 /// The answer to a metadata request: the upstream's JSON without Xet, with only
-/// `Content-Type`, `X-Repo-Commit` and a rewritten `Link` beside it. Anything NORA cannot
-/// read as JSON is refused rather than handed on unfiltered.
+/// `Content-Type`, `X-Repo-Commit` and a rewritten `Link` beside it. A body NORA cannot
+/// parse as JSON is refused rather than handed on unfiltered.
 fn metadata_response(upstream: &str, nora_hf: &str, headers: &HeaderMap, body: &[u8]) -> Response {
-    let is_json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("json"));
-    let mut value: Value = match serde_json::from_slice(body) {
-        Ok(value) if is_json => value,
-        _ => return error_response(StatusCode::BAD_GATEWAY, UNREADABLE),
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return error_response(StatusCode::BAD_GATEWAY, UNREADABLE);
     };
     strip_xet_metadata(&mut value);
 
