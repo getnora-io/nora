@@ -3690,6 +3690,50 @@ mod tests {
         );
     }
 
+    /// A redirect's own `ETag` names the redirect, not the file: only `X-Linked-Etag` on a hop,
+    /// or the final answer's `ETag`, names what the cache is looked up by.
+    #[tokio::test]
+    async fn a_redirects_own_etag_names_nothing() {
+        let other = b"another file NORA holds";
+        let other_digest = hex::encode(sha2::Sha256::digest(other));
+        let up = MockServer::start().await;
+        Mock::given(path("/org/model/resolve/main/config.json"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", "/cache/config.json")
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("etag", format!("\"{other_digest}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/cache/config.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CONFIG.to_vec())
+                    .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let staged = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
+        std::fs::write(&staged, other).unwrap();
+        ctx.state
+            .storage
+            .put_from_path(
+                &format!("hf/models/org/model/blobs/{other_digest}"),
+                &staged,
+                Some(&other_digest),
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(
+            received(resp).await,
+            (CONFIG.to_vec(), true),
+            "served by the redirect's etag"
+        );
+    }
+
     /// The periodic sweep and the start remove fills that will not finish, and only those: a
     /// temp file quiet for four hours is a fill that died, one quiet for less may be a slow one.
     #[test]
