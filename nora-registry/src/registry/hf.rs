@@ -2935,6 +2935,10 @@ mod tests {
                     .insert_header("x-error-message", "Repository not found"),
                 StatusCode::UNAUTHORIZED,
             ),
+            (
+                ResponseTemplate::new(429).insert_header("retry-after", "55"),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
         ];
         for (answer, expected) in cases {
             let up = MockServer::start().await;
@@ -2952,6 +2956,8 @@ mod tests {
             assert_eq!(resp.status(), expected);
             if expected == StatusCode::UNAUTHORIZED {
                 assert_eq!(header(&resp, "x-error-code"), "RepoNotFound");
+            } else if expected == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(header(&resp, "retry-after"), "55");
             } else {
                 assert_eq!(header(&resp, "x-error-message"), CANONICAL_UNKNOWN);
             }
