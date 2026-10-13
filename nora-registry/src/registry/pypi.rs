@@ -804,8 +804,8 @@ struct Pep691Meta {
 struct Pep691File {
     filename: String,
     url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hashes: Option<Pep691Hashes>,
+    /// Required by PEP 691 even when no digest is known — then it is `{}` (#1100).
+    hashes: Pep691Hashes,
     /// PEP 700 upload-time (RFC3339), when known (from the cached dates.json).
     #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
     upload_time: Option<String>,
@@ -816,7 +816,8 @@ struct Pep691File {
 
 #[derive(serde::Serialize)]
 struct Pep691Hashes {
-    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
 }
 
 /// Render the PEP 691 + PEP 700 simple JSON. `pep700` maps filename → (size,
@@ -837,10 +838,9 @@ fn versions_json_response(
             Pep691File {
                 filename: f.filename.clone(),
                 url: format!("{}/simple/{}/{}", base, normalized, f.filename),
-                hashes: f
-                    .sha256
-                    .as_ref()
-                    .map(|h| Pep691Hashes { sha256: h.clone() }),
+                hashes: Pep691Hashes {
+                    sha256: f.sha256.clone(),
+                },
                 upload_time,
                 size,
             }
@@ -1950,6 +1950,112 @@ mod integration_tests {
         assert_eq!(json["files"][0]["hashes"]["sha256"], "deadbeef");
     }
 
+    /// #1100: every file in the simple JSON carries a `hashes` object, also a file NORA
+    /// has no digest for — an upstream link without `#sha256=` (a mirror that publishes
+    /// none) or a stored file without its sidecar. uv reads `hashes` as a required map
+    /// and refused the whole index (`missing field hashes`) when one file lacked it.
+    /// Parsed here the way uv parses it: absent or null fails, `{}` is read as no hashes.
+    #[tokio::test]
+    async fn test_pypi_json_every_file_has_hashes_object() {
+        use crate::test_helpers::create_test_context_with_config;
+        use std::collections::BTreeMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(serde::Deserialize)]
+        struct StrictIndex {
+            files: Vec<StrictFile>,
+        }
+        #[derive(serde::Deserialize)]
+        struct StrictFile {
+            filename: String,
+            hashes: BTreeMap<String, String>,
+        }
+
+        let up_sha = "a".repeat(64);
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/flask/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body>
+                <a href="https://up/flask-1.0.tar.gz">flask-1.0.tar.gz</a>
+                <a href="https://up/flask-1.1.tar.gz#sha256={up_sha}">flask-1.1.tar.gz</a>
+                </body></html>"#
+            )))
+            .mount(&upstream)
+            .await;
+
+        let proxied = create_test_context_with_config(|cfg| {
+            cfg.pypi.proxy = Some(upstream.uri());
+        });
+        let local_only = create_test_context();
+        for ctx in [&proxied, &local_only] {
+            // Stored before sidecars and markers existed: no digest anywhere.
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-0.9.tar.gz", b"old")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-2.0.tar.gz", b"data")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/flask/flask-2.0.tar.gz.sha256", b"deadbeef")
+                .await
+                .unwrap();
+        }
+
+        let none = BTreeMap::new();
+        let sha = |h: &str| BTreeMap::from([("sha256".to_string(), h.to_string())]);
+        for (ctx, want) in [
+            (
+                &proxied,
+                vec![
+                    ("flask-0.9.tar.gz", none.clone()),
+                    ("flask-1.0.tar.gz", none.clone()),
+                    ("flask-1.1.tar.gz", sha(&up_sha)),
+                    ("flask-2.0.tar.gz", sha("deadbeef")),
+                ],
+            ),
+            (
+                &local_only,
+                vec![
+                    ("flask-0.9.tar.gz", none.clone()),
+                    ("flask-2.0.tar.gz", sha("deadbeef")),
+                ],
+            ),
+        ] {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/flask/",
+                vec![("Accept", "application/vnd.pypi.simple.v1+json")],
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_bytes(response).await;
+            let index: StrictIndex = serde_json::from_slice(&body).unwrap_or_else(|e| {
+                panic!(
+                    "a strict PEP 691 client cannot read the index: {e}\n{}",
+                    String::from_utf8_lossy(&body)
+                )
+            });
+            let mut got: Vec<(String, BTreeMap<String, String>)> = index
+                .files
+                .into_iter()
+                .map(|f| (f.filename, f.hashes))
+                .collect();
+            got.sort();
+            let want: Vec<(String, BTreeMap<String, String>)> =
+                want.into_iter().map(|(f, h)| (f.to_string(), h)).collect();
+            assert_eq!(got, want);
+        }
+    }
+
     /// #896: NORA's simple JSON must also carry PEP 700 fields so clients (e.g. Renovate)
     /// can compute a minimum release age: `meta.api-version` 1.1, a project-level
     /// `versions` list, and per-file `upload-time` + `size`. Upload-time is sourced from
@@ -2907,10 +3013,11 @@ mod spec_conformance_tests {
         );
     }
 
-    /// PEP 691: `hashes` field must be omitted when no hash is available,
-    /// not set to null or empty object.
+    /// PEP 691: "The hashes dictionary MUST be present, even if no hashes are
+    /// available for the file". With no digest it is the empty object — not absent
+    /// (uv: `missing field hashes`, #1100) and not null.
     #[test]
-    fn test_pep691_hashes_omitted_when_none() {
+    fn test_pep691_hashes_present_as_empty_object_when_none() {
         let files = vec![FileEntry {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: None,
@@ -2922,9 +3029,10 @@ mod spec_conformance_tests {
                 .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(
-            json["files"][0].get("hashes").is_none(),
-            "hashes must be omitted (not null) when no hash available"
+        assert_eq!(
+            json["files"][0].get("hashes"),
+            Some(&serde_json::json!({})),
+            "hashes must be present as {{}} when no hash is available"
         );
     }
 

@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 
+### Fixed
+- **uv installs from a PyPI index whose files have no hash (#1100)** — NORA left the `hashes` key out of a file in the PEP 691 JSON index when it had no digest for it: a proxied upstream link without `#sha256=` (a mirror that publishes none) or a stored file without its checksum sidecar. PEP 691 requires the key on every file, and uv refused the whole index with `missing field hashes`; pip reads the HTML index and was not affected. Such a file is now listed with `"hashes": {}`.
+
 ## [1.3.5] - 2026-10-13
 
 ### Added
