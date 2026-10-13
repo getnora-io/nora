@@ -19,6 +19,16 @@
         clippy::items_after_test_module
     )
 )]
+
+// musl's mallocng serializes every allocation on one global lock, which collapses into kernel
+// futex contention under many async workers; mimalloc's per-thread heaps avoid it. Feature
+// `mimalloc` is on by default; `--no-default-features` falls back to the system allocator.
+// Declaring the static needs no unsafe here (the GlobalAlloc impl lives in the crate), so
+// `#![forbid(unsafe_code)]` still holds.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod activity_log;
 mod admin;
 mod audit;
