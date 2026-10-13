@@ -3442,6 +3442,34 @@ mod tests {
         }
     }
 
+    /// With nowhere to put a temp file the client is served all the same — checked, not stored.
+    #[tokio::test]
+    async fn no_room_for_the_fill_still_serves_the_client() {
+        let mut corrupt = weights();
+        corrupt[1] ^= 0x01;
+        let (bad_up, _bad_cdn) = hub_sending(corrupt).await;
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        for (hub, good) in [(&up, true), (&bad_up, false)] {
+            let ctx = hf_with_upstream(hub);
+            // A file where the temp directory would go: no fill can start.
+            let tmp = std::path::Path::new(&ctx.state.config.storage.path).join("tmp");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("hf-proxy"), b"in the way").unwrap();
+            let (got, clean) = received(send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await).await;
+            if good {
+                assert_eq!((got, clean), (weights(), true));
+            } else {
+                assert!(
+                    !clean && got.len() < weights().len(),
+                    "unchecked without a fill"
+                );
+            }
+            settle().await;
+            assert!(hf_keys(&ctx).await.is_empty());
+        }
+    }
+
     /// Storage that refuses the fill does not cost the client its file.
     #[tokio::test]
     async fn a_failed_store_still_serves_the_client() {
