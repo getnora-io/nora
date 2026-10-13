@@ -430,7 +430,8 @@ impl futures::Stream for VerifyingStream {
                                 computed = %computed,
                                 "SECURITY: integrity pin mismatch on streamed read — aborting body"
                             );
-                            return Poll::Ready(Some(Err(std::io::Error::other(
+                            return Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
                                 "integrity pin mismatch",
                             ))));
                         }

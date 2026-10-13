@@ -45,7 +45,7 @@ use axum::{
     Json, Router,
 };
 use futures::{FutureExt, StreamExt};
-use nora_registry::verified::{stream_body, verify_while_streaming, VerifiedByteStream};
+use nora_registry::verified::{stream_body, verify_while_streaming};
 use serde_json::Value;
 use sha2::Digest as _;
 use std::path::PathBuf;
@@ -439,6 +439,14 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
         return Canonical::Failed("bad upstream url");
     };
     let start = origin(&url);
+    // The upstream's own api/models path, the only one a redirect may name an id under.
+    let api_models = match url.path().split_once("/api/models/") {
+        Some((base, _)) => format!("{base}/api/models/"),
+        None => {
+            state.circuit_breaker.record_alive(&key, probe);
+            return Canonical::Failed("bad upstream url");
+        }
+    };
     let mut hops = 0;
     let outcome = loop {
         if hops > MAX_HOPS {
@@ -457,7 +465,7 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
         };
         let status = response.status();
         if status.is_success() {
-            let id = url.path().split_once("/api/models/").map(|(_, id)| {
+            let id = url.path().strip_prefix(api_models.as_str()).map(|id| {
                 percent_encoding::percent_decode_str(id)
                     .decode_utf8_lossy()
                     .into_owned()
@@ -473,7 +481,9 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
                 .get(header::LOCATION)
                 .and_then(|l| l.to_str().ok())
                 .and_then(|l| url.join(l).ok())
-                .filter(|next| origin(next) == start && next.path().contains("/api/models/"));
+                .filter(|next| {
+                    origin(next) == start && next.path().starts_with(api_models.as_str())
+                });
             let Some(next) = next else {
                 break Err("redirect away from the upstream's api/models");
             };
@@ -790,7 +800,7 @@ fn file_response(
     }
     let chunks = upstream_chunks(upstream, stall);
     let body = match fill {
-        Some(fill) => stream_body(fill_stream(chunks, fill)),
+        Some(fill) => stream_body(checked::fill_stream(chunks, fill)),
         // Open world, and said so: upstream bytes passed through with no digest to check
         // them against.
         None => nora_registry::verified::open_world_stream_body(chunks),
@@ -1017,74 +1027,143 @@ impl Fill {
     }
 }
 
-/// The upstream body through a [`Fill`]: every chunk is hashed (and written) before it is
-/// sent, and the last one is held back until the digest matches — a file that does not match
-/// ends one chunk short, so it never arrives as a complete download and is never stored.
-struct FillStream(Chunks);
+/// The two streams hf serves through the verified sink, behind constructors of their own: a
+/// tuple field outside this module cannot be filled in, so a raw stream cannot be passed off
+/// as either.
+mod checked {
+    use super::{Chunks, Fill};
+    use axum::body::Bytes;
+    use futures::StreamExt;
+    use nora_registry::verified::{stream_sealed, VerifiedByteStream, VerifyingStream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-impl futures::Stream for FillStream {
-    type Item = Result<Bytes, std::io::Error>;
+    /// The upstream body through a [`Fill`]: every chunk is hashed (and written) before it is
+    /// sent, and the last one is held back until the digest matches — a file that does not
+    /// match ends one chunk short, so it never arrives as a complete download and is never
+    /// stored. Built only by [`fill_stream`].
+    pub(super) struct FillStream(Chunks);
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.as_mut().poll_next(cx)
+    impl futures::Stream for FillStream {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.as_mut().poll_next(cx)
+        }
     }
-}
 
-// An EOF-verifying stream like raw's `VerifyingStream`, so it may be served through the
-// `stream_body` sole sink; only `fill_stream` builds one.
-impl nora_registry::verified::stream_sealed::Sealed for FillStream {}
-impl VerifiedByteStream for FillStream {}
+    // EOF-verifying streams like raw's `VerifyingStream`, so they may be served through the
+    // `stream_body` sole sink.
+    impl stream_sealed::Sealed for FillStream {}
+    impl VerifiedByteStream for FillStream {}
 
-fn fill_stream(chunks: Chunks, fill: Fill) -> FillStream {
-    struct Through {
-        chunks: Chunks,
-        fill: Fill,
-        held: Option<Bytes>,
-        done: bool,
+    /// A cached copy read through its pin check. A copy that fails the check — tampered, or
+    /// torn by a power cut after it was committed — is dropped, so the next download fetches
+    /// the file again instead of failing the same way forever. A read error is not a failed
+    /// check and drops nothing. Built only by [`healing`].
+    pub(super) struct Healing {
+        inner: VerifyingStream,
+        drop_on_mismatch: Option<(crate::storage::Storage, String)>,
     }
-    let through = Through {
-        chunks,
-        fill,
-        held: None,
-        done: false,
-    };
-    FillStream(Box::pin(futures::stream::unfold(
-        through,
-        |mut t| async move {
-            if t.done {
-                return None;
-            }
-            loop {
-                match t.chunks.next().await {
-                    // An empty chunk (an HTTP/2 body can end with an empty DATA frame) is
-                    // neither held nor sent: holding it would let the last real chunk out
-                    // before the digest is checked.
-                    Some(Ok(chunk)) if chunk.is_empty() => {}
-                    Some(Ok(chunk)) => {
-                        t.fill.take(&chunk).await;
-                        if let Some(previous) = t.held.replace(chunk) {
-                            return Some((Ok(previous), t));
-                        }
-                    }
-                    Some(Err(e)) => {
-                        t.done = true;
-                        return Some((Err(e), t));
-                    }
-                    None => {
-                        t.done = true;
-                        if let Err(e) = t.fill.finish() {
-                            return Some((Err(e), t));
-                        }
-                        let last = t.held.take();
-                        return last.map(|last| (Ok(last), t));
+
+    pub(super) fn healing(
+        inner: VerifyingStream,
+        storage: crate::storage::Storage,
+        key: String,
+    ) -> Healing {
+        Healing {
+            inner,
+            drop_on_mismatch: Some((storage, key)),
+        }
+    }
+
+    impl futures::Stream for Healing {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let next = Pin::new(&mut self.inner).poll_next(cx);
+            if let Poll::Ready(Some(Err(e))) = &next {
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    if let Some((storage, key)) = self.drop_on_mismatch.take() {
+                        super::drop_bad_copy(storage, key);
                     }
                 }
             }
-        },
-    )))
+            next
+        }
+    }
+
+    impl stream_sealed::Sealed for Healing {}
+    impl VerifiedByteStream for Healing {}
+
+    pub(super) fn fill_stream(chunks: Chunks, fill: Fill) -> FillStream {
+        struct Through {
+            chunks: Chunks,
+            fill: Fill,
+            held: Option<Bytes>,
+            done: bool,
+        }
+        let through = Through {
+            chunks,
+            fill,
+            held: None,
+            done: false,
+        };
+        FillStream(Box::pin(futures::stream::unfold(
+            through,
+            |mut t| async move {
+                if t.done {
+                    return None;
+                }
+                loop {
+                    match t.chunks.next().await {
+                        // An empty chunk (an HTTP/2 body can end with an empty DATA frame) is
+                        // neither held nor sent: holding it would let the last real chunk out
+                        // before the digest is checked.
+                        Some(Ok(chunk)) if chunk.is_empty() => {}
+                        Some(Ok(chunk)) => {
+                            t.fill.take(&chunk).await;
+                            if let Some(previous) = t.held.replace(chunk) {
+                                return Some((Ok(previous), t));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            t.done = true;
+                            return Some((Err(e), t));
+                        }
+                        None => {
+                            t.done = true;
+                            if let Err(e) = t.fill.finish() {
+                                return Some((Err(e), t));
+                            }
+                            let last = t.held.take();
+                            return last.map(|last| (Ok(last), t));
+                        }
+                    }
+                }
+            },
+        )))
+    }
+}
+
+/// Deletes a cached copy that failed its pin, in a task of its own.
+fn drop_bad_copy(storage: Storage, key: String) {
+    use std::panic::AssertUnwindSafe;
+    let task = async move {
+        match storage.delete(&key).await {
+            Ok(()) => {
+                tracing::warn!(registry = "hf", key = %key, "cached copy failed its pin; dropped")
+            }
+            Err(e) => {
+                tracing::warn!(registry = "hf", key = %key, error = %e, "cached copy failed its pin; drop failed")
+            }
+        }
+    };
+    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
+        if let Err(panic) = done {
+            tracing::error!(panic = ?panic, "hf bad-copy drop task panicked");
+        }
+    }));
 }
 
 /// Commits a verified fill under its key, pinned to its sha256, in a task of its own: the
@@ -1187,10 +1266,11 @@ async fn cached_response(
     for (name, value) in &extra {
         response = response.header(name, value.as_str());
     }
+    let verified = verify_while_streaming(reader, Some(pin), key.to_string());
     response
-        .body(stream_body(verify_while_streaming(
-            reader,
-            Some(pin),
+        .body(stream_body(checked::healing(
+            verified,
+            state.storage.clone(),
             key.to_string(),
         )))
         .ok()
@@ -2959,6 +3039,11 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
             (
+                ResponseTemplate::new(307)
+                    .insert_header("location", "/x/api/models/openai-community/gpt2"),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
                 ResponseTemplate::new(401)
                     .insert_header("x-error-code", "RepoNotFound")
                     .insert_header("x-error-message", "Repository not found"),
@@ -3229,7 +3314,7 @@ mod tests {
                     Ok(Bytes::from(body[100..].to_vec())),
                     Ok(Bytes::new()),
                 ]));
-                let mut frames = fill_stream(chunks, fill);
+                let mut frames = checked::fill_stream(chunks, fill);
                 let (mut got, mut clean) = (Vec::new(), true);
                 while let Some(frame) = frames.next().await {
                     match frame {
@@ -3341,6 +3426,20 @@ mod tests {
         assert!(!clean, "a tampered copy ended cleanly");
         assert!(got.len() < weights().len());
         assert_eq!(upstream_paths(&cdn).await.len(), 1);
+        // A copy that fails its pin is dropped, so the next download heals the cache instead
+        // of failing the same way forever (a torn write after a power cut ends here too).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ctx.state.storage.stat(&weights_key()).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bad copy stayed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(received(resp).await, (weights(), true));
+        assert_eq!(upstream_paths(&cdn).await.len(), 2);
+        wait_stored(&ctx, &weights_key()).await;
     }
 
     /// A client gone halfway leaves no stored copy and no temp file.
@@ -3776,6 +3875,28 @@ mod tests {
             "more than 4096 ids remembered"
         );
         assert_eq!(ids.get("id4096").await.as_deref(), Some("org/id4096"));
+    }
+
+    /// A canonical id is trusted for an hour, and then asked again.
+    #[tokio::test]
+    async fn canonical_ids_expire_after_an_hour() {
+        let ids = CanonicalIds::default();
+        let ago = |secs| {
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .unwrap()
+        };
+        {
+            let mut map = ids.0.lock().await;
+            map.insert("fresh".into(), ("org/fresh".into(), ago(3599)));
+            map.insert("stale".into(), ("org/stale".into(), ago(3601)));
+        }
+        assert_eq!(ids.get("fresh").await.as_deref(), Some("org/fresh"));
+        assert_eq!(
+            ids.get("stale").await,
+            None,
+            "an id learned over an hour ago was trusted"
+        );
     }
 
     #[test]
