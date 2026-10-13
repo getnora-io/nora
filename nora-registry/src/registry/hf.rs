@@ -376,6 +376,17 @@ mod tests {
             .to_string()
     }
 
+    /// The reason a 501 gives in `X-Error-Message`, and in the JSON body for a GET (HEAD has
+    /// no body; the header alone is checked twice then).
+    async fn reason_of(resp: Response, m: &str) -> (String, String) {
+        let h = header(&resp, "x-error-message");
+        if m == "HEAD" {
+            return (h.clone(), h);
+        }
+        let body: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap_or_default();
+        (h, body["error"].as_str().unwrap_or_default().to_string())
+    }
+
     async fn json_of(resp: Response) -> Value {
         serde_json::from_slice(&body_bytes(resp).await).expect("JSON body")
     }
@@ -423,12 +434,15 @@ mod tests {
         for (m, uri) in RESOLVE_REQUESTS {
             let resp = send(&ctx.app, verb(m), uri, "").await;
             assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{m} {uri}");
-            // The reason is the model one: a model path routed to the datasets answer
-            // would tell the client its model is out of scope.
-            let reason = header(&resp, "x-error-message");
-            assert!(
-                reason.contains("not implemented") && !reason.contains("datasets"),
-                "{m} {uri}: {reason:?}"
+            // Exactly the file reason, in the header and in the body: a model path given
+            // the datasets answer would tell the client its model is out of scope.
+            assert_eq!(
+                reason_of(resp, m).await,
+                (
+                    FILES_NOT_IMPLEMENTED.to_string(),
+                    FILES_NOT_IMPLEMENTED.to_string()
+                ),
+                "{m} {uri}"
             );
         }
     }
@@ -509,11 +523,16 @@ mod tests {
         for (m, uri) in [
             ("GET", "/hf/api/datasets/org/data/revision/main"),
             ("HEAD", "/hf/datasets/org/data/resolve/main/train.parquet"),
+            ("GET", "/hf/datasets/org/data/resolve/main/train.parquet"),
         ] {
             let resp = send(&ctx.app, verb(m), uri, "").await;
             assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{m} {uri}");
-            assert!(
-                header(&resp, "x-error-message").contains("datasets"),
+            assert_eq!(
+                reason_of(resp, m).await,
+                (
+                    DATASETS_NOT_IMPLEMENTED.to_string(),
+                    DATASETS_NOT_IMPLEMENTED.to_string()
+                ),
                 "{m} {uri}"
             );
         }
