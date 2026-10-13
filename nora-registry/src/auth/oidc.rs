@@ -21,6 +21,7 @@ use parking_lot::RwLock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
@@ -102,10 +103,11 @@ pub struct OidcValidator {
     discovered_jwks_uri: RwLock<HashMap<String, String>>,
     /// issuer URL → time of the last failed fetch
     jwks_failed_at: RwLock<HashMap<String, Instant>>,
-    /// Single-flight for JWKS refreshes: on a cold start under load, one request
-    /// fetches and the rest wait for its result instead of each calling the issuer.
-    /// One lock for all providers; refreshes are rare and bounded by the request timeout.
-    refresh_lock: tokio::sync::Mutex<()>,
+    /// Per-issuer single-flight for JWKS refreshes: on a cold start under load, one request
+    /// per issuer fetches and the rest wait for its result. Keyed per issuer so a slow or
+    /// unreachable issuer never blocks refreshes for a healthy one. Bounded by the number of
+    /// configured issuers; each wait is bounded by the discovery + fetch timeouts.
+    issuer_refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Per-request timeout for OIDC HTTP calls (discovery + JWKS fetch).
@@ -114,6 +116,62 @@ const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a failed JWKS fetch with no stale keys to serve, requests fail fast for
 /// this long instead of each one calling the issuer again.
 const JWKS_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Outcome of an OIDC discovery request, reduced to what the caller needs. Pure classification,
+/// so every "unusable" case (non-2xx, unparseable body, empty `jwks_uri`, or no response at all)
+/// collapses to one branch that falls back WITHOUT caching — a transient discovery failure can
+/// never pin the fallback. Unit-tested in `classify_discovery_only_accepts_2xx_json_with_uri`.
+#[derive(Debug, PartialEq, Eq)]
+enum DiscoveryOutcome {
+    /// A usable `jwks_uri` was discovered (2xx + parseable body + non-empty uri).
+    Found(String),
+    /// Nothing usable; the caller uses the legacy fallback and caches nothing.
+    Unusable,
+}
+
+/// Pure: classify a discovery response. `status` is `None` when there was no response
+/// (transport error / timeout); `body` is the raw response body.
+fn classify_discovery(status: Option<u16>, body: &[u8]) -> DiscoveryOutcome {
+    match status {
+        Some(s) if (200..300).contains(&s) => {
+            match serde_json::from_slice::<OidcDiscoveryDoc>(body) {
+                Ok(doc) if !doc.jwks_uri.is_empty() => DiscoveryOutcome::Found(doc.jwks_uri),
+                _ => DiscoveryOutcome::Unusable,
+            }
+        }
+        _ => DiscoveryOutcome::Unusable,
+    }
+}
+
+/// What to do about a provider's JWKS before any network call.
+#[derive(Debug, PartialEq, Eq)]
+enum JwksAction {
+    /// Serve the fresh cached keys.
+    ServeFresh,
+    /// In the failure-backoff window with expired-but-present keys: serve those.
+    ServeStale,
+    /// In the backoff window with nothing cached: fail without calling the issuer.
+    FailFast,
+    /// Go to the network (resolve + fetch).
+    Refresh,
+}
+
+/// Pure: decide what to do before touching the network, from cache + failure state. Keeping
+/// `Refresh` out of every backoff branch is what makes "discovery runs inside the backoff
+/// window" unrepresentable. Unit-tested in `decide_jwks_action_covers_every_state`.
+fn decide_jwks_action(fresh_cache: bool, stale_cache: bool, failed_recently: bool) -> JwksAction {
+    if fresh_cache {
+        JwksAction::ServeFresh
+    } else if failed_recently {
+        if stale_cache {
+            JwksAction::ServeStale
+        } else {
+            JwksAction::FailFast
+        }
+    } else {
+        JwksAction::Refresh
+    }
+}
 
 impl OidcValidator {
     /// Create a new validator from config.
@@ -127,7 +185,7 @@ impl OidcValidator {
             jwks_cache: RwLock::new(HashMap::new()),
             discovered_jwks_uri: RwLock::new(HashMap::new()),
             jwks_failed_at: RwLock::new(HashMap::new()),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            issuer_refresh_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -251,30 +309,51 @@ impl OidcValidator {
     async fn get_jwks(&self, provider: &OidcProvider) -> Result<JwkSet, String> {
         let cache_ttl = Duration::from_secs(self.config.jwks_cache_secs);
 
+        // Fast path: a fresh cache hit needs no lock.
         if let Some(jwks) = self.cached_jwks(&provider.issuer, cache_ttl) {
             return Ok(jwks);
         }
 
-        // One refresh at a time; whoever waited re-reads what it fetched.
-        let _refresh = self.refresh_lock.lock().await;
-        if let Some(jwks) = self.cached_jwks(&provider.issuer, cache_ttl) {
-            return Ok(jwks);
-        }
+        // One refresh at a time PER ISSUER; a slow issuer never blocks a healthy one.
+        let lock = self.issuer_refresh_lock(&provider.issuer);
+        let _refresh = lock.lock().await;
 
+        // Decide from cache + failure state BEFORE any network call. Snapshot the cache once so
+        // the decision and the value served stay consistent under the lock.
+        let cached: Option<(JwkSet, bool)> = {
+            let cache = self.jwks_cache.read();
+            cache
+                .get(&provider.issuer)
+                .map(|c| (c.jwks.clone(), c.fetched_at.elapsed() < cache_ttl))
+        };
         let failed_recently = self
             .jwks_failed_at
             .read()
             .get(&provider.issuer)
             .is_some_and(|t| t.elapsed() < JWKS_FAILURE_BACKOFF);
-        let fetched = if failed_recently {
-            Err("previous fetch failed, retrying shortly".to_string())
-        } else {
-            // Resolve JWKS URI: explicit config > OIDC discovery > legacy fallback
-            let jwks_uri = self.resolve_jwks_uri(provider).await?;
-            self.fetch_jwks(&jwks_uri).await
-        };
+        let fresh = matches!(cached, Some((_, true)));
+        let stale = matches!(cached, Some((_, false)));
 
-        match fetched {
+        match decide_jwks_action(fresh, stale, failed_recently) {
+            // The lock winner refreshed the cache while we waited, or stale keys cover the
+            // backoff window: serve what we snapshotted (`cached` is Some in both arms).
+            JwksAction::ServeFresh | JwksAction::ServeStale => {
+                if let Some((jwks, _)) = cached {
+                    return Ok(jwks);
+                }
+            }
+            JwksAction::FailFast => {
+                return Err(format!(
+                    "JWKS unavailable for {} (backing off after a recent fetch failure)",
+                    provider.name
+                ));
+            }
+            JwksAction::Refresh => {}
+        }
+
+        // Refresh over the network (only reached when not backing off).
+        let jwks_uri = self.resolve_jwks_uri(provider).await?;
+        match self.fetch_jwks(&jwks_uri).await {
             Ok(jwks) => {
                 self.jwks_cache.write().insert(
                     provider.issuer.clone(),
@@ -287,27 +366,40 @@ impl OidcValidator {
                 Ok(jwks)
             }
             Err(e) => {
-                if !failed_recently {
-                    self.jwks_failed_at
-                        .write()
-                        .insert(provider.issuer.clone(), Instant::now());
+                self.jwks_failed_at
+                    .write()
+                    .insert(provider.issuer.clone(), Instant::now());
+                // Stale fallback: serve expired keys if we have any.
+                if let Some(jwks) = self.stale_jwks(&provider.issuer) {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        error = %e,
+                        "JWKS fetch failed, serving stale keys"
+                    );
+                    Ok(jwks)
+                } else {
+                    Err(format!("JWKS fetch failed for {}: {}", provider.name, e))
                 }
-                // Stale fallback: return expired cache if available
-                let cache = self.jwks_cache.read();
-                if let Some(cached) = cache.get(&provider.issuer) {
-                    if !failed_recently {
-                        tracing::warn!(
-                            provider = %provider.name,
-                            error = %e,
-                            stale_age_secs = cached.fetched_at.elapsed().as_secs(),
-                            "JWKS fetch failed, serving stale keys"
-                        );
-                    }
-                    return Ok(cached.jwks.clone());
-                }
-                Err(format!("JWKS fetch failed for {}: {}", provider.name, e))
             }
         }
+    }
+
+    /// The per-issuer refresh lock, created on first use. Bounded by the number of issuers.
+    fn issuer_refresh_lock(&self, issuer: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.issuer_refresh_locks.read().get(issuer) {
+            return Arc::clone(lock);
+        }
+        Arc::clone(
+            self.issuer_refresh_locks
+                .write()
+                .entry(issuer.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Any cached JWKS for an issuer regardless of age (for the stale-serving fallback).
+    fn stale_jwks(&self, issuer: &str) -> Option<JwkSet> {
+        self.jwks_cache.read().get(issuer).map(|c| c.jwks.clone())
     }
 
     /// Cached JWKS for an issuer if younger than `ttl`.
@@ -321,10 +413,10 @@ impl OidcValidator {
 
     /// Resolve the JWKS URI for a provider using (in order):
     /// 1. Explicit `jwks_uri` from config
-    /// 2. OIDC discovery via `.well-known/openid-configuration`
-    /// 3. Fallback to `{issuer}/.well-known/jwks.json`
+    /// 2. A `jwks_uri` from a previous successful discovery (cached per issuer)
+    /// 3. OIDC discovery via `.well-known/openid-configuration`
+    /// 4. Legacy fallback `{issuer}/.well-known/jwks.json` (never cached)
     async fn resolve_jwks_uri(&self, provider: &OidcProvider) -> Result<String, String> {
-        // 1. Explicit override
         if let Some(ref uri) = provider.jwks_uri {
             return Ok(uri.clone());
         }
@@ -332,41 +424,45 @@ impl OidcValidator {
             return Ok(uri.clone());
         }
 
-        // 2. OIDC discovery
+        // Discovery (I/O), then a pure classification decides usability.
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             provider.issuer.trim_end_matches('/')
         );
-
-        if let Ok(resp) = self
+        let (status, body) = match self
             .http_client
             .get(&discovery_url)
             .timeout(OIDC_REQUEST_TIMEOUT)
             .send()
             .await
         {
-            if resp.status().is_success() {
-                if let Ok(config) = resp.json::<OidcDiscoveryDoc>().await {
-                    if !config.jwks_uri.is_empty() {
-                        tracing::debug!(
-                            provider = %provider.name,
-                            jwks_uri = %config.jwks_uri,
-                            "Discovered JWKS URI via openid-configuration"
-                        );
-                        self.discovered_jwks_uri
-                            .write()
-                            .insert(provider.issuer.clone(), config.jwks_uri.clone());
-                        return Ok(config.jwks_uri);
-                    }
-                }
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.bytes().await.unwrap_or_default();
+                (Some(status), body)
             }
-        }
+            Err(_) => (None, Default::default()),
+        };
 
-        // 3. Legacy fallback
-        Ok(format!(
-            "{}/.well-known/jwks.json",
-            provider.issuer.trim_end_matches('/')
-        ))
+        match classify_discovery(status, &body) {
+            DiscoveryOutcome::Found(uri) => {
+                tracing::debug!(
+                    provider = %provider.name,
+                    jwks_uri = %uri,
+                    "Discovered JWKS URI via openid-configuration"
+                );
+                self.discovered_jwks_uri
+                    .write()
+                    .insert(provider.issuer.clone(), uri.clone());
+                Ok(uri)
+            }
+            // Non-2xx, unparseable, empty, or no response: fall back WITHOUT caching, so a
+            // transient discovery failure can never pin the fallback.
+            DiscoveryOutcome::Unusable => Ok(format!(
+                "{}/.well-known/jwks.json",
+                provider.issuer.trim_end_matches('/')
+            )),
+        }
     }
 
     /// HTTP fetch of JWKS from provider.
@@ -489,6 +585,47 @@ pub fn classify_rejection(reason: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::{OidcProvider, OidcRoleRule};
+
+    #[test]
+    fn classify_discovery_only_accepts_2xx_json_with_uri() {
+        use DiscoveryOutcome::*;
+        // 2xx + parseable + non-empty uri -> Found.
+        assert_eq!(
+            classify_discovery(Some(200), br#"{"jwks_uri":"https://idp/keys"}"#),
+            Found("https://idp/keys".to_string())
+        );
+        // 2xx but no usable uri -> Unusable.
+        assert_eq!(classify_discovery(Some(200), b"{}"), Unusable);
+        assert_eq!(
+            classify_discovery(Some(200), br#"{"jwks_uri":""}"#),
+            Unusable
+        );
+        // 2xx but the body is not JSON -> Unusable (pinning this path would fail here).
+        assert_eq!(classify_discovery(Some(200), b"<html>not json"), Unusable);
+        // non-2xx -> Unusable.
+        assert_eq!(
+            classify_discovery(Some(503), br#"{"jwks_uri":"https://idp/keys"}"#),
+            Unusable
+        );
+        assert_eq!(classify_discovery(Some(404), b""), Unusable);
+        // no response (transport error / timeout) -> Unusable.
+        assert_eq!(classify_discovery(None, b""), Unusable);
+    }
+
+    #[test]
+    fn decide_jwks_action_covers_every_state() {
+        use JwksAction::*;
+        // A fresh cache is served regardless of failure state.
+        assert_eq!(decide_jwks_action(true, false, false), ServeFresh);
+        assert_eq!(decide_jwks_action(true, true, true), ServeFresh);
+        // Backing off, nothing fresh: serve stale if present, else fail fast — never the
+        // network (this is what makes discovery-inside-backoff unrepresentable).
+        assert_eq!(decide_jwks_action(false, true, true), ServeStale);
+        assert_eq!(decide_jwks_action(false, false, true), FailFast);
+        // Not backing off, nothing fresh: go to the network (even with stale present).
+        assert_eq!(decide_jwks_action(false, false, false), Refresh);
+        assert_eq!(decide_jwks_action(false, true, false), Refresh);
+    }
 
     #[test]
     fn classify_rejection_buckets_each_real_reason() {
