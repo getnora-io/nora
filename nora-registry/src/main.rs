@@ -2180,9 +2180,9 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
             RegistryType::HuggingFace => {
-                tracing::warn!(
-                    "Hugging Face proxy is enabled but incomplete in this build: \
-                     metadata is served, files answer 501"
+                tracing::info!(
+                    "Hugging Face proxy enabled: public models only (datasets answer 501), \
+                     files over plain HTTP (Xet is never proxied)"
                 );
                 registry_routes = registry_routes.merge(registry::hf_routes())
             }
