@@ -788,7 +788,14 @@ fn hub_digest(etag: &HeaderValue) -> Option<HubDigest> {
     match hex.len() {
         64 => Some(HubDigest::Sha256(hex)),
         40 => Some(HubDigest::GitBlob(hex)),
-        _ => None,
+        len => {
+            tracing::debug!(
+                registry = "hf",
+                len,
+                "etag names no digest NORA checks; the file is passed through uncached"
+            );
+            None
+        }
     }
 }
 
