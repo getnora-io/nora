@@ -410,7 +410,7 @@ where
 }
 
 /// The answer to a file request: only listed headers, and the body streamed with a stall
-/// limit per read.
+/// limit per read through the open-world sink (`verified.rs`).
 fn file_response(
     status: StatusCode,
     meta: &FileMeta,
@@ -464,7 +464,15 @@ fn file_response(
             }
         },
     );
-    (status, headers, Body::from_stream(chunks)).into_response()
+    // Open world, and said so: these are upstream bytes passed through, not NORA-stored, so
+    // there is no pin to check them against yet. Verifying the linked sha256 on the stream
+    // comes with the cache, where bytes are stored and pinned.
+    (
+        status,
+        headers,
+        nora_registry::verified::open_world_stream_body(chunks),
+    )
+        .into_response()
 }
 
 async fn datasets() -> Response {
