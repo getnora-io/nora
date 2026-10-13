@@ -51,6 +51,17 @@ const UPSTREAM_FAILED: &str = "The Hugging Face upstream did not answer.";
 const UNREADABLE: &str = "The Hugging Face upstream answered with metadata NORA cannot read.";
 const LINK_LEAVES_NORA: &str =
     "The Hugging Face upstream pointed the next page outside itself; NORA does not follow it.";
+const LINK_UNREADABLE: &str = "The Hugging Face upstream sent a Link header NORA cannot hand on.";
+
+/// The relations a client follows to page through a listing: the only `Link` entries handed
+/// on (`huggingface_hub` follows `next`).
+const PAGINATION_RELS: &[&str] = &["next", "prev", "first", "last"];
+
+/// The Xet token routes: `api/{type}s/{repo}/xet-{read|write}-token/{rev}` in
+/// `huggingface_hub` (`utils/_xet.py`), and the `xet-auth` link of the live Hub points at
+/// `xet-read-token`. Matched whole, after the first segment, so a repo whose id merely starts
+/// with `xet-` (`xet-team/...`, `celinah/xet-experiments` on the live Hub) is served.
+const XET_TOKEN_ROUTES: &[&str] = &["xet-read-token", "xet-write-token"];
 
 /// The key removed from metadata at any depth. Without it no client takes the Xet path:
 /// the shortcut that skips the HEAD call needs the Xet hash beside the LFS block, and
@@ -152,7 +163,7 @@ fn metadata_response(upstream: &str, nora_hf: &str, headers: &HeaderMap, body: &
     for v in headers.get_all(header::LINK) {
         match v.to_str() {
             Ok(line) => lines.push(line),
-            Err(_) => return error_response(StatusCode::BAD_GATEWAY, LINK_LEAVES_NORA),
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, LINK_UNREADABLE),
         }
     }
     let link = if lines.is_empty() {
@@ -160,7 +171,12 @@ fn metadata_response(upstream: &str, nora_hf: &str, headers: &HeaderMap, body: &
     } else {
         match rewrite_link(&lines.join(", "), upstream, nora_hf) {
             Ok(link) => link,
-            Err(ForeignLink) => return error_response(StatusCode::BAD_GATEWAY, LINK_LEAVES_NORA),
+            Err(LinkRefusal::Foreign) => {
+                return error_response(StatusCode::BAD_GATEWAY, LINK_LEAVES_NORA)
+            }
+            Err(LinkRefusal::Unreadable) => {
+                return error_response(StatusCode::BAD_GATEWAY, LINK_UNREADABLE)
+            }
         }
     };
 
@@ -175,7 +191,7 @@ fn metadata_response(upstream: &str, nora_hf: &str, headers: &HeaderMap, body: &
             Ok(v) => {
                 response.headers_mut().insert(header::LINK, v);
             }
-            Err(_) => return error_response(StatusCode::BAD_GATEWAY, LINK_LEAVES_NORA),
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, LINK_UNREADABLE),
         }
     }
     response
@@ -198,12 +214,16 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
     if rest.is_empty() || rest.len() > MAX_PATH {
         return Err(Refusal::BadPath);
     }
-    for segment in rest.split('/') {
+    for (i, segment) in rest.split('/').enumerate() {
         let decoded = decode_segment(segment).ok_or(Refusal::BadPath)?;
         if decoded.is_empty() || decoded == "." || decoded == ".." {
             return Err(Refusal::BadPath);
         }
-        if decoded.to_ascii_lowercase().starts_with("xet-") {
+        if i > 0
+            && XET_TOKEN_ROUTES
+                .iter()
+                .any(|route| decoded.eq_ignore_ascii_case(route))
+        {
             return Err(Refusal::XetRoute);
         }
     }
@@ -283,17 +303,28 @@ fn strip_xet_metadata(value: &mut Value) {
     }
 }
 
-/// A `Link` target would send the client around NORA.
+/// Why a `Link` header is not handed on.
 #[derive(Debug, PartialEq)]
-struct ForeignLink;
+enum LinkRefusal {
+    /// A page outside the upstream: handed on, it sends the client around NORA; dropped, it
+    /// leaves the client with part of a listing.
+    Foreign,
+    /// An entry NORA cannot read, or one that mixes a page with another relation — it can be
+    /// neither handed on nor dropped whole.
+    Unreadable,
+}
 
-/// Rewrites a `Link` header value for the client. Entries with a `xet-*` relation are
-/// dropped; every other target on the upstream — absolute, or relative to its root — moves
-/// under NORA's mount. The Hub paginates a tree listing with an absolute `rel="next"` that
-/// the client requests as it is, so handing it on sends page two around NORA and dropping
-/// it leaves the client with page one; a target anywhere else is therefore an error, not a
-/// silent drop. `None` when no entry remains.
-fn rewrite_link(value: &str, upstream: &str, nora_hf: &str) -> Result<Option<String>, ForeignLink> {
+/// Rewrites a `Link` header value for the client, by a white list of relations. An entry
+/// whose relations are all [`PAGINATION_RELS`] moves under NORA's mount when its target is on
+/// the upstream (absolute, or relative to its root); the Hub pages a tree listing with an
+/// absolute `rel="next"` that the client requests as it is, so a page anywhere else is
+/// refused rather than handed on or dropped. An entry with no pagination relation — Xet's
+/// `xet-auth` and `xet-reconstruction-info`, or anything else — is dropped: a client of the
+/// proxy needs none of them. Relations are read the way the most liberal reader does: every
+/// `rel` parameter (RFC 8288 takes the first, requests and httpx keep the last), every
+/// space-separated type, whitespace and quotes around the value removed. `None` when no
+/// entry remains.
+fn rewrite_link(value: &str, upstream: &str, nora_hf: &str) -> Result<Option<String>, LinkRefusal> {
     let upstream = upstream.trim_end_matches('/');
     let mut kept = Vec::new();
     for entry in split_link_entries(value) {
@@ -304,15 +335,23 @@ fn rewrite_link(value: &str, upstream: &str, nora_hf: &str) -> Result<Option<Str
         let (target, params) = entry
             .strip_prefix('<')
             .and_then(|e| e.split_once('>'))
-            .ok_or(ForeignLink)?;
-        if link_rels(params).any(|rel| rel.to_ascii_lowercase().starts_with("xet-")) {
+            .ok_or(LinkRefusal::Unreadable)?;
+        let rels: Vec<String> = link_rels(params).map(str::to_ascii_lowercase).collect();
+        let pages = rels
+            .iter()
+            .filter(|rel| PAGINATION_RELS.contains(&rel.as_str()))
+            .count();
+        if pages == 0 {
             continue;
+        }
+        if pages != rels.len() {
+            return Err(LinkRefusal::Unreadable);
         }
         let path = match target.strip_prefix(upstream) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') => rest,
-            Some(_) => return Err(ForeignLink),
+            Some(_) => return Err(LinkRefusal::Foreign),
             None if target.starts_with('/') && !target.starts_with("//") => target,
-            None => return Err(ForeignLink),
+            None => return Err(LinkRefusal::Foreign),
         };
         kept.push(format!("<{nora_hf}{path}>{params}"));
     }
@@ -404,6 +443,13 @@ mod tests {
         (h, body["error"].as_str().unwrap_or_default().to_string())
     }
 
+    /// The reasons a client reads, as text: compared with the constants, an aliased or
+    /// swapped constant would pass.
+    const FILES_REASON: &str =
+        "Downloading files through the Hugging Face proxy is not implemented in this NORA build yet.";
+    const DATASETS_REASON: &str =
+        "Hugging Face datasets are not implemented in this NORA build: only models are in scope.";
+
     async fn json_of(resp: Response) -> Value {
         serde_json::from_slice(&body_bytes(resp).await).expect("JSON body")
     }
@@ -455,10 +501,7 @@ mod tests {
             // the datasets answer would tell the client its model is out of scope.
             assert_eq!(
                 reason_of(resp, m).await,
-                (
-                    FILES_NOT_IMPLEMENTED.to_string(),
-                    FILES_NOT_IMPLEMENTED.to_string()
-                ),
+                (FILES_REASON.to_string(), FILES_REASON.to_string()),
                 "{m} {uri}"
             );
         }
@@ -546,10 +589,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{m} {uri}");
             assert_eq!(
                 reason_of(resp, m).await,
-                (
-                    DATASETS_NOT_IMPLEMENTED.to_string(),
-                    DATASETS_NOT_IMPLEMENTED.to_string()
-                ),
+                (DATASETS_REASON.to_string(), DATASETS_REASON.to_string()),
                 "{m} {uri}"
             );
         }
@@ -809,7 +849,10 @@ mod tests {
                         "</api/models/org/model/xet-read-token/main>; rel=\"xet-auth\"",
                     )
                     .insert_header("etag", "\"abc\"")
-                    .insert_header("set-cookie", "token=upstream"),
+                    .insert_header("set-cookie", "token=upstream")
+                    .insert_header("x-repo-commit-signature", "upstream")
+                    .insert_header("x-repo-type", "model")
+                    .insert_header("x-request-id", "upstream"),
             )
             .mount(&up)
             .await;
@@ -820,23 +863,26 @@ mod tests {
             header(&resp, "x-repo-commit"),
             "0123456789abcdef0123456789abcdef01234567"
         );
-        let names: Vec<String> = resp
-            .headers()
-            .keys()
-            .map(|k| k.as_str().to_string())
-            .collect();
-        for gone in [
-            "x-xet-hash",
-            "x-xet-refresh-route",
-            "link",
-            "etag",
-            "set-cookie",
-        ] {
+        // A white list, by exact name: whatever else the upstream sent stays with NORA.
+        // `x-request-id` is NORA's own (its request-id middleware), never the upstream's.
+        for name in resp.headers().keys() {
             assert!(
-                !names.iter().any(|n| n == gone),
-                "{gone} reached the client: {names:?}"
+                [
+                    "content-type",
+                    "content-length",
+                    "x-repo-commit",
+                    "link",
+                    "x-request-id"
+                ]
+                .contains(&name.as_str()),
+                "{name} reached the client"
             );
         }
+        assert_ne!(header(&resp, "x-request-id"), "upstream");
+        assert!(
+            !resp.headers().contains_key("link"),
+            "a Xet-only Link reached the client"
+        );
         assert!(header(&resp, "content-type").starts_with("application/json"));
     }
 
@@ -987,14 +1033,33 @@ mod tests {
             .mount(&up)
             .await;
         let ctx = hf_with_upstream(&up);
-        let resp = send(&ctx.app, Method::GET, "/hf/api/models/org/missing", "").await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(!header(&resp, "x-error-message").is_empty());
-        let resp = send(&ctx.app, Method::GET, "/hf/api/models/org/broken", "").await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        // A metadata answer NORA cannot read is not handed on unfiltered.
-        let resp = send(&ctx.app, Method::GET, "/hf/api/models/org/html", "").await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // Each kind says its own reason, compared with the text a client reads.
+        for (uri, status, reason) in [
+            (
+                "/hf/api/models/org/missing",
+                StatusCode::NOT_FOUND,
+                "Not found on the Hugging Face upstream, or not a public repository.",
+            ),
+            (
+                "/hf/api/models/org/broken",
+                StatusCode::BAD_GATEWAY,
+                "The Hugging Face upstream did not answer.",
+            ),
+            // A metadata answer NORA cannot read is not handed on unfiltered.
+            (
+                "/hf/api/models/org/html",
+                StatusCode::BAD_GATEWAY,
+                "The Hugging Face upstream answered with metadata NORA cannot read.",
+            ),
+        ] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_eq!(
+                reason_of(resp, "GET").await,
+                (reason.into(), reason.into()),
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1046,6 +1111,8 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let reason = "The Hugging Face upstream sent a Link header NORA cannot hand on.";
+        assert_eq!(reason_of(resp, "GET").await, (reason.into(), reason.into()));
     }
 
     /// Metadata leaves nothing behind in storage — no cache anywhere on its path, called
@@ -1076,6 +1143,58 @@ mod tests {
             v,
             json!({"a": 1, "xetEnabled": true, "lfs": {}, "b": [{"c": {"lfs": 1, "d": 2, "xetSize": 3}}], "e": "xetHash"})
         );
+        let mut nested = json!([[{"xetHash": "h", "k": 1}], [[[{"xetHash": "h"}]]], {"a": [[{"xetHash": "h"}]]}]);
+        strip_xet_metadata(&mut nested);
+        assert_eq!(nested, json!([[{"k": 1}], [[[{}]]], {"a": [[{}]]}]));
+    }
+
+    /// Every shape up to depth five, objects and arrays in every order: no `xetHash` is left
+    /// anywhere, and everything else is kept.
+    #[test]
+    fn xet_keys_go_from_every_shape() {
+        fn build(depth: u32, seed: u32) -> Value {
+            if depth == 0 {
+                return json!(seed);
+            }
+            let child = |n: u32| build(depth - 1, seed.wrapping_mul(31).wrapping_add(n));
+            if seed.is_multiple_of(2) {
+                json!([child(1), child(2), {"xetHash": "h", "inner": child(3)}])
+            } else {
+                json!({"xetHash": "h", "keep": child(1), "list": [child(2), [child(3)]]})
+            }
+        }
+        fn has_xet(v: &Value) -> bool {
+            match v {
+                Value::Object(m) => m.contains_key(XET_BODY_KEY) || m.values().any(has_xet),
+                Value::Array(a) => a.iter().any(has_xet),
+                _ => false,
+            }
+        }
+        fn without_xet(v: &Value) -> Value {
+            match v {
+                Value::Object(m) => Value::Object(
+                    m.iter()
+                        .filter(|(k, _)| k.as_str() != XET_BODY_KEY)
+                        .map(|(k, v)| (k.clone(), without_xet(v)))
+                        .collect(),
+                ),
+                Value::Array(a) => Value::Array(a.iter().map(without_xet).collect()),
+                other => other.clone(),
+            }
+        }
+        for depth in 1..=5 {
+            for seed in 0..8 {
+                let original = build(depth, seed);
+                let mut stripped = original.clone();
+                strip_xet_metadata(&mut stripped);
+                assert!(!has_xet(&stripped), "depth {depth} seed {seed}");
+                assert_eq!(
+                    stripped,
+                    without_xet(&original),
+                    "depth {depth} seed {seed}"
+                );
+            }
+        }
     }
 
     const UP: &str = "https://huggingface.co";
@@ -1092,7 +1211,15 @@ mod tests {
             ("<https://huggingface.co/api/t>; rel='xet-auth'", None),
             ("<https://huggingface.co/api/t>; REL=\"Xet-Auth\"", None),
             ("<https://cas.example/r>; rel=\"xet-reconstruction-info\"", None),
-            ("<https://huggingface.co/api/x>; rel=\"next xet-auth\"", None),
+            // White list: only pages are handed on, everything else is dropped.
+            ("<https://huggingface.co/api/x>", None),
+            ("<https://huggingface.co/api/x>; rel=\"alternate\"", None),
+            ("<https://elsewhere.example/x>; rel=\"describedby\"", None),
+            ("<https://huggingface.co/api/x>; rel = \"next\"", Some("<http://nora:4000/hf/api/x>; rel = \"next\"")),
+            ("<https://huggingface.co/api/x>; rel=\" next \"", Some("<http://nora:4000/hf/api/x>; rel=\" next \"")),
+            ("<https://huggingface.co/api/x>; rel=\"NEXT\"", Some("<http://nora:4000/hf/api/x>; rel=\"NEXT\"")),
+            ("<https://huggingface.co/api/x>; rel=\"next prev\"", Some("<http://nora:4000/hf/api/x>; rel=\"next prev\"")),
+            ("<https://huggingface.co/api/x>; type=\"a\"; rel=\"last\"", Some("<http://nora:4000/hf/api/x>; type=\"a\"; rel=\"last\"")),
             (
                 "<https://huggingface.co/api/t>; rel=\"xet-auth\", <https://huggingface.co/api/x?a=1,2>; rel=\"next\"",
                 Some("<http://nora:4000/hf/api/x?a=1,2>; rel=\"next\""),
@@ -1115,6 +1242,27 @@ mod tests {
         );
     }
 
+    /// A page beside another relation in one entry can be neither handed on (an RFC reader
+    /// sees the other relation; requests and httpx keep the last `rel`) nor dropped (the
+    /// listing would stop short).
+    #[test]
+    fn a_page_mixed_with_another_relation_is_refused() {
+        for input in [
+            "<https://huggingface.co/api/x>; rel=\"next xet-auth\"",
+            "<https://huggingface.co/api/x>; rel=\"next\"; rel=\"xet-auth\"",
+            "<https://huggingface.co/api/x>; rel=\"xet-auth\"; rel=\"next\"",
+            "<https://huggingface.co/api/x>; rel=next; REL = 'alternate'",
+            "garbage",
+            "<https://huggingface.co/api/x; rel=\"next\"",
+        ] {
+            assert_eq!(
+                rewrite_link(input, UP, NORA_HF),
+                Err(LinkRefusal::Unreadable),
+                "{input}"
+            );
+        }
+    }
+
     #[test]
     fn a_link_that_would_leave_nora_is_refused() {
         for input in [
@@ -1123,11 +1271,11 @@ mod tests {
             "<https://huggingface.co.evil.example/api/x>; rel=\"next\"",
             "<https://huggingface.coffee/api/x>; rel=\"next\"",
             "<http://huggingface.co/api/x>; rel=\"next\"",
-            "garbage",
+            "<https://elsewhere.example/api/x>; rel=\"prev\"",
         ] {
             assert_eq!(
                 rewrite_link(input, UP, NORA_HF),
-                Err(ForeignLink),
+                Err(LinkRefusal::Foreign),
                 "{input}"
             );
         }
@@ -1151,9 +1299,28 @@ mod tests {
             "org/m/xet-read-token/main",
             "org/m/Xet-Read-Token/main",
             "org/m/xet%2dread-token/main",
+            "org/m/%78et-read-token/main",
             "org/m/xet-write-token/main",
+            "org/m/xet-write-token",
+            "gpt2/xet-read-token/main",
         ] {
             assert_eq!(ok(rest, None), Err(Refusal::XetRoute), "{rest}");
+        }
+        // Repos on the live Hub whose id starts with or holds `xet-` are plain repos.
+        for rest in [
+            "xet-team/SmolVLM-256M-Instruct-test",
+            "xet-team/SmolVLM-256M-Instruct-test/tree/main",
+            "celinah/xet-experiments/revision/main",
+            "julien-c/xet-feb14",
+            "org/pixet-model",
+            "org/m/tree/main/xet-notes",
+            "xet-read-token",
+        ] {
+            assert_eq!(
+                ok(rest, None),
+                Ok(format!("{UP}/api/models/{rest}")),
+                "{rest}"
+            );
         }
         for rest in [
             "",
@@ -1180,5 +1347,55 @@ mod tests {
             Ok(format!("{UP}/api/models/org/m?a=%41"))
         );
         assert_eq!(ok("org/m", Some(&"a".repeat(3000))), Err(Refusal::BadPath));
+    }
+
+    /// Every ASCII byte, in a segment and in a query, against RFC 3986 written out here rather
+    /// than read from the code under test: `pchar` in a segment, `pchar` and `/` `?` in a
+    /// query, `%` only as the start of an escape. Non-ASCII is refused too.
+    #[test]
+    fn every_byte_is_judged_by_rfc_3986() {
+        const PCHAR: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@";
+        for b in 0u8..128 {
+            let c = (b as char).to_string();
+            if b == b'/' || b == b'%' {
+                continue;
+            }
+            let segment_ok = PCHAR.contains(&b);
+            assert_eq!(
+                models_api_upstream(UP, &format!("org/a{c}b"), None).is_ok(),
+                segment_ok,
+                "segment byte {b:#04x}"
+            );
+            let query_ok = segment_ok || b == b'?';
+            assert_eq!(
+                models_api_upstream(UP, "org/m", Some(&format!("a=x{c}y"))).is_ok(),
+                query_ok,
+                "query byte {b:#04x}"
+            );
+        }
+        assert!(models_api_upstream(UP, "org/m", Some("a=x/y")).is_ok());
+        for bad in [
+            "a=%", "a=%4", "a=%4z", "a=%z4", "a=%zz", "a=%%41", "a=é", "a=%41%",
+        ] {
+            assert_eq!(
+                models_api_upstream(UP, "org/m", Some(bad)),
+                Err(Refusal::BadPath),
+                "{bad}"
+            );
+        }
+        for bad in ["org/%", "org/%4", "org/%4z", "org/%z4", "org/é"] {
+            assert_eq!(
+                models_api_upstream(UP, bad, None),
+                Err(Refusal::BadPath),
+                "{bad}"
+            );
+        }
+        for good in ["a=%41", "a=%4a%4A", "a=x&b=%2F"] {
+            assert!(
+                models_api_upstream(UP, "org/m", Some(good)).is_ok(),
+                "{good}"
+            );
+        }
     }
 }

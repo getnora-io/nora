@@ -4036,6 +4036,9 @@ proxies = [
             config.hf.proxy.as_deref(),
             Some("https://hf-mirror.example")
         );
+        // An `[hf]` section that does not name a timeout keeps the default: zero would
+        // time out every request.
+        assert_eq!(config.hf.proxy_timeout, 30);
         assert!(
             !config
                 .upstream_hostnames()
