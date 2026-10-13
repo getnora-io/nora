@@ -2675,6 +2675,33 @@ mod tests {
         );
     }
 
+    /// Only a redirect to another `api/models` path names the canonical id: one through any
+    /// other path is not followed, even if it would come back to `api/models`.
+    #[tokio::test]
+    async fn a_redirect_through_another_path_names_no_canonical_id() {
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/gpt2"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/login?next=gpt2"))
+            .mount(&up)
+            .await;
+        Mock::given(path("/login"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", "/api/models/someone/else"),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/api/models/someone/else"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "org/other", "version": "*", "reason": "r"}]}"#;
+        let (ctx, _dir) = curated(&up, rules, "block");
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(header(&resp, "x-error-message"), CANONICAL_UNKNOWN);
+        assert_eq!(hits(&up, "/login").await, 0);
+    }
+
     /// Curation fails closed: without the canonical id the alias is refused, and a Hub refusal
     /// of the id is handed on; the file is never asked for.
     #[tokio::test]
