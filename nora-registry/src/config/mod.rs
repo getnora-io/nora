@@ -30,9 +30,7 @@ pub use self::auth::{
 };
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
-pub use self::curation::{
-    CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
-};
+pub use self::curation::{CurationConfig, CurationMode, CurationOnFailure};
 pub use self::gc::GcConfig;
 pub use self::rate_limit::RateLimitConfig;
 pub use self::registries::{EnableSpec, RegistriesSection};
@@ -1008,10 +1006,17 @@ impl Config {
         // min-release-age, an active quarantine, namespace isolation, or integrity
         // checking each make enforce meaningful, so a deny-list-only / age-only /
         // quarantine-only policy is valid (#740).
+        // A per-registry min_release_age is a control on its own (#1098).
+        let any_registry_min_age = RegistryType::all().iter().any(|&rt| {
+            self.curation
+                .registry_override(rt)
+                .is_some_and(|o| o.min_release_age.is_some())
+        });
         if self.curation.mode == CurationMode::Enforce {
             let any_control = self.curation.allowlist_path.is_some()
                 || self.curation.blocklist_path.is_some()
                 || self.curation.min_release_age.is_some()
+                || any_registry_min_age
                 || quarantine_active
                 || !self.curation.internal_namespaces.is_empty()
                 || self.curation.require_integrity;
@@ -1066,6 +1071,52 @@ impl Config {
                 errors.push(
                     "curation.min_release_age is set with an enabled proxy registry but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine=\"observe\"|\"enforce\" (the unspoofable first-seen age control). server.trust_upstream_dates enhances min-release-age with real upstream dates where a registry caches one (e.g. npm) but is NOT a substitute for the quarantine. (#741)".to_string(),
                 );
+            }
+            // The same rules for a registry's own value, which applies without a
+            // global one (#1098). It needs a quarantine when that registry is an
+            // enabled proxy; on rpm and deb it could never apply, since their
+            // downloads are not checked by name or release date.
+            for &rt in RegistryType::all() {
+                let Some(age) = self
+                    .curation
+                    .registry_override(rt)
+                    .and_then(|o| o.min_release_age.as_deref())
+                else {
+                    continue;
+                };
+                let cannot_apply = match rt {
+                    RegistryType::Rpm | RegistryType::Deb => Some(format!(
+                        "{rt} downloads are not checked by name or release date. Remove it; curation.{rt}.quarantine holds new {rt} packages"
+                    )),
+                    // There is no `[curation.hf]` section, so this is not reached; were one
+                    // added, a Hub commit would still have no release date (see below).
+                    RegistryType::HuggingFace => Some(format!(
+                        "a Hub commit has no publish date NORA reads, and {rt} has no quarantine path. Remove it"
+                    )),
+                    RegistryType::Docker
+                    | RegistryType::Maven
+                    | RegistryType::Npm
+                    | RegistryType::Cargo
+                    | RegistryType::PyPI
+                    | RegistryType::Go
+                    | RegistryType::Raw
+                    | RegistryType::Gems
+                    | RegistryType::Terraform
+                    | RegistryType::Ansible
+                    | RegistryType::Nuget
+                    | RegistryType::PubDart
+                    | RegistryType::Conan
+                    | RegistryType::Cpan => None,
+                };
+                if let Some(why) = cannot_apply {
+                    errors.push(format!(
+                        "curation.{rt}.min_release_age=\"{age}\" cannot apply: {why}. (#1098)"
+                    ));
+                } else if !quarantine_active && self.is_enabled_proxy(rt) {
+                    errors.push(format!(
+                        "curation.{rt}.min_release_age=\"{age}\" is set and {rt} is an enabled proxy registry, but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine or curation.{rt}.quarantine=\"observe\"|\"enforce\". (#741, #1098)"
+                    ));
+                }
             }
         }
 
@@ -3557,6 +3608,103 @@ proxies = [
                 .any(|e| e.contains("no age control would be active")),
             "a docker-only quarantine should satisfy the age-control requirement (#765)"
         );
+    }
+
+    /// A config with npm hosted only (no upstream) and nothing else that curates.
+    fn npm_hosted_only() -> Config {
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = None;
+        config.npm.proxies.clear();
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        config
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_is_an_active_control_in_enforce() {
+        let _lock = env_lock();
+        // #1098: `[curation.npm] min_release_age` alone is a control enforce can apply.
+        let mut config = npm_hosted_only();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_on_a_proxy_needs_a_quarantine() {
+        let _lock = env_lock();
+        // #1098: the #741 rule covers a per-registry value too, and names it.
+        let mut config = npm_hosted_only();
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("curation.npm.min_release_age")
+                    && e.contains("no age control would be active")),
+            "{errors:?}"
+        );
+        // An active quarantine satisfies it as it satisfies the global value (#765):
+        // npm's own, the global one, or one on another registry.
+        for (npm, global, docker) in [
+            (Some(QuarantineMode::Observe), None, None),
+            (None, Some(QuarantineMode::Enforce), None),
+            (None, None, Some(QuarantineMode::Enforce)),
+        ] {
+            config.curation.npm.quarantine = npm;
+            config.curation.quarantine = global;
+            config.curation.docker.quarantine = docker;
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                !errors.iter().any(|e| e.contains("min_release_age")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_on_a_hosted_registry_needs_no_quarantine() {
+        let _lock = env_lock();
+        // Hosted packages are dated by NORA's own clock: nothing for a quarantine to back.
+        let mut config = npm_hosted_only();
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("min_release_age")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_min_release_age_for_rpm_or_deb_is_refused() {
+        let _lock = env_lock();
+        // rpm and deb downloads are not checked by name or release date: the value
+        // could never apply, so startup says so instead of accepting it (#1098).
+        for registry in ["rpm", "deb"] {
+            let mut config = npm_hosted_only();
+            config.curation.quarantine = Some(QuarantineMode::Enforce);
+            let value = Some("3d".to_string());
+            match registry {
+                "rpm" => config.curation.rpm.min_release_age = value,
+                _ => config.curation.deb.min_release_age = value,
+            }
+            let (_, errors) = config.validate_with_config_path(None);
+            let key = format!("curation.{registry}.min_release_age");
+            assert!(
+                errors.iter().any(|e| e.contains(&key)
+                    && e.contains("not checked by name or release date")
+                    && !e.contains("no age control would be active")),
+                "{registry}: {errors:?}"
+            );
+        }
     }
 
     #[test]

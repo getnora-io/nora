@@ -1836,34 +1836,85 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
     Ok(total)
 }
 
-/// Filter that blocks packages published less than `min_age_secs` ago.
+/// Filter that blocks packages published less than a minimum age ago.
 ///
-/// If `publish_date` is `None` (unknown), the filter fails **closed**: it returns
-/// `Block` when the quarantine is active (threshold > 0), so an unverifiable age
-/// cannot slip past the cooldown, and `Skip` only when the quarantine is disabled
-/// for that registry (threshold `0`). Supports per-registry overrides: if a
-/// registry has its own threshold, it takes precedence over the global
-/// `min_age_secs`.
+/// The minimum is per registry: a registry's own `[curation.<registry>]
+/// min_release_age` if it has one, else the global `min_release_age`. A registry
+/// with neither is not filtered by age — and a per-registry value needs no global
+/// one to apply (#1098). If `publish_date` is `None` (unknown), the filter defers
+/// (`Skip`) to the digest quarantine (#741).
 pub struct MinReleaseAgeFilter {
-    min_age_secs: i64,
-    label: String,
-    /// Per-registry override thresholds (seconds).
+    /// The global threshold (seconds, label): the default for registries
+    /// without their own.
+    default: Option<(i64, String)>,
+    /// Per-registry thresholds (seconds, label).
     overrides: std::collections::HashMap<RegistryType, (i64, String)>,
 }
 
 impl MinReleaseAgeFilter {
+    /// A filter with a global threshold only (unit tests; the server builds it
+    /// with [`Self::from_config`]).
+    #[cfg(test)]
     pub fn new(min_age_secs: i64, label: &str) -> Self {
         Self {
-            min_age_secs,
-            label: label.to_string(),
+            default: Some((min_age_secs, label.to_string())),
             overrides: std::collections::HashMap::new(),
         }
     }
 
-    /// Add a per-registry override. If `registry` has its own min_release_age,
-    /// it will be used instead of the global default.
-    pub fn add_override(&mut self, registry: RegistryType, age_secs: i64, label: String) {
-        self.overrides.insert(registry, (age_secs, label));
+    /// The filter `cfg` asks for: the global `min_release_age` as the default and
+    /// each `[curation.<registry>] min_release_age` as that registry's own
+    /// threshold; `None` when no value is set anywhere. The one builder for
+    /// startup, SIGHUP reload, `curation explain` and the test state.
+    ///
+    /// A value that does not parse is left out and returned by its key and value,
+    /// for the caller to refuse (enforce) or log.
+    pub fn from_config(cfg: &crate::config::CurationConfig) -> (Option<Self>, Vec<String>) {
+        let mut problems = Vec::new();
+        let mut parse = |key: String, value: &str| match parse_duration(value) {
+            Ok(secs) => Some((secs, value.to_string())),
+            Err(e) => {
+                problems.push(format!("{key}=\"{value}\": {e}"));
+                None
+            }
+        };
+        let default = cfg
+            .min_release_age
+            .as_deref()
+            .and_then(|value| parse("curation.min_release_age".to_string(), value));
+        let mut overrides = std::collections::HashMap::new();
+        for &rt in RegistryType::all() {
+            let Some(value) = cfg
+                .registry_override(rt)
+                .and_then(|o| o.min_release_age.as_deref())
+            else {
+                continue;
+            };
+            if let Some(threshold) = parse(format!("curation.{rt}.min_release_age"), value) {
+                overrides.insert(rt, threshold);
+            }
+        }
+        let filter =
+            (default.is_some() || !overrides.is_empty()).then_some(Self { default, overrides });
+        (filter, problems)
+    }
+
+    /// The thresholds for a log line: `"7d (npm: 3d)"`, or `"npm: 3d"` without a
+    /// global value.
+    pub fn summary(&self) -> String {
+        let overrides: Vec<String> = RegistryType::all()
+            .iter()
+            .filter_map(|rt| {
+                self.overrides
+                    .get(rt)
+                    .map(|(_, label)| format!("{rt}: {label}"))
+            })
+            .collect();
+        match (&self.default, overrides.is_empty()) {
+            (Some((_, label)), true) => label.clone(),
+            (Some((_, label)), false) => format!("{label} ({})", overrides.join(", ")),
+            (None, _) => overrides.join(", "),
+        }
     }
 
     fn format_duration(secs: i64) -> String {
@@ -1891,11 +1942,15 @@ impl ProxyFilter for MinReleaseAgeFilter {
     fn evaluate(&self, request: &FilterRequest) -> Decision {
         // Resolve the threshold for this registry first: a per-registry override
         // takes precedence over the global default.
-        let (threshold, label) = if let Some((secs, lbl)) = self.overrides.get(&request.registry) {
-            (*secs, lbl.as_str())
-        } else {
-            (self.min_age_secs, self.label.as_str())
+        let Some((threshold, label)) = self
+            .overrides
+            .get(&request.registry)
+            .or(self.default.as_ref())
+        else {
+            // Neither a value of its own nor a global one: not filtered by age.
+            return Decision::Skip;
         };
+        let threshold = *threshold;
 
         let Some(publish_ts) = request.publish_date else {
             // Defer to digest-quarantine — the unspoofable first-seen holder
