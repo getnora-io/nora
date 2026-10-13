@@ -2602,6 +2602,51 @@ mod tests {
         assert_eq!(header(&resp, "x-error-message"), "Repository not found");
     }
 
+    /// Every walk upstream is timed under its outcome: an answer, a refusal, a timeout.
+    #[tokio::test]
+    async fn upstream_requests_are_timed_by_outcome() {
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&up)
+            .await;
+        Mock::given(path("/api/models/org/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&up)
+            .await;
+        Mock::given(path("/api/models/org/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.hf.proxy_timeout = 1;
+        });
+        let timed = |class: &str| {
+            crate::metrics::UPSTREAM_REQUEST_DURATION
+                .with_label_values(&["hf", class])
+                .get_sample_count()
+        };
+        let before: Vec<u64> = ["2xx", "4xx", "timeout"].iter().map(|c| timed(c)).collect();
+        for (route, status) in [
+            ("/hf/api/models/org/model", StatusCode::OK),
+            ("/hf/api/models/org/missing", StatusCode::NOT_FOUND),
+            ("/hf/api/models/org/slow", StatusCode::BAD_GATEWAY),
+        ] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, route, "").await.status(),
+                status,
+                "{route}"
+            );
+        }
+        let after: Vec<u64> = ["2xx", "4xx", "timeout"].iter().map(|c| timed(c)).collect();
+        for (i, class) in ["2xx", "4xx", "timeout"].iter().enumerate() {
+            assert!(after[i] > before[i], "{class} not timed");
+        }
+    }
+
     /// A refusal that is the CDN's or WAF's policy block, not the Hub's answer, is counted as
     /// one, so an operator can tell a geo block from a missing file.
     #[tokio::test]
