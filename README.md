@@ -15,7 +15,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 ## Why NORA
 
 - **Zero-config** — single binary, no database, no dependencies. `docker run` and it works.
-- **16 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, RPM (yum/dnf), Debian/APT.
+- **17 registries** — Docker, Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, RPM (yum/dnf), Debian/APT, and Hugging Face Hub models (opt-in).
 - **Secure by default** — [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/getnora-io/nora), signed releases, SBOM, fuzz testing, 2000+ tests.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
@@ -23,7 +23,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/) — your registry is
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nora)](https://artifacthub.io/packages/helm/nora/nora)
 [![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
 
-**< 35 MB** binary | **< 50 MB** RAM idle | **3s** startup | **16** registries
+**< 35 MB** binary | **< 50 MB** RAM idle | **3s** startup | **17** registries
 
 ## Supported Registries
 
@@ -47,6 +47,7 @@ Authentication is off by default: every endpoint is public until you set `NORA_A
 | Conan (C/C++) | ✅ | ❌ | `center2.conan.io` | proxy only (Conan 2 clients) |
 | RPM (yum/dnf) | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[rpm.proxies]` / `NORA_RPM_PROXIES` (off by default); auto-generates `repodata/` |
 | Debian/APT | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[deb.proxies]` / `NORA_DEB_PROXIES` (off by default); flat & structured layouts; auto-generates `Packages`/`Release`/`InRelease` |
+| Hugging Face Hub | ✅ | — | `huggingface.co` | opt-in (`NORA_HF_ENABLED=true`, not in `all`); public models; files cached by digest, checked on the way in; never Xet; datasets not served — see COMPAT.md |
 
 > **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
 
@@ -126,6 +127,9 @@ GOPROXY=http://localhost:4000/go go get golang.org/x/text@latest
 
 # CPAN
 cpanm --from http://localhost:4000/cpan Module::Name
+
+# Hugging Face (opt-in: start NORA with NORA_HF_ENABLED=true)
+HF_ENDPOINT=http://localhost:4000/hf hf download openai-community/gpt2
 ```
 
 See [full documentation](https://getnora.dev) for all registries.

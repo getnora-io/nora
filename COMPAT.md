@@ -393,6 +393,78 @@ Client:
 cpanm --from http://nora:4000/cpan Module::Name
 ```
 
+## Hugging Face Hub
+
+Pull-through proxy for public models on huggingface.co, **opt-in**: `NORA_HF_ENABLED=true`
+(`[hf] enabled = true`); `NORA_REGISTRIES_ENABLE=all` leaves it off. Upstream: `[hf] proxy` /
+`NORA_HF_PROXY` (default `https://huggingface.co`; empty disables the upstream), timeout
+`[hf] proxy_timeout` / `NORA_HF_PROXY_TIMEOUT` (default 30 s).
+
+| Endpoint | Method | Status | Notes |
+|----------|--------|--------|-------|
+| `/hf/api/models/{repo}` | GET | Full | Model info; `xetHash` removed at any depth |
+| `/hf/api/models/{repo}/revision/{rev}` | GET | Full | Revision as the client encoded it (`refs%2Fpr%2F1` stays one segment) |
+| `/hf/api/models/{repo}/tree/{rev}[/{path}]` | GET | Full | Paginated listing; `Link rel="next"` moved under `/hf` |
+| Other `GET /hf/api/models/…` | GET | Full | Passed through as JSON, without Xet; a body that is not JSON is a 502 |
+| `/hf/api/models/{repo}/xet-read-token/…`, `xet-write-token/…` | GET | Refused (404) | NORA never serves Xet |
+| `/hf/{repo}/resolve/{rev}/{file}` | HEAD | Full | Answered from the Hub's resolve answer (commit, etag, size); the CDN is not asked |
+| `/hf/{repo}/resolve/{rev}/{file}` | GET | Full | Cached by digest; `Range` supported |
+| `/hf/api/datasets/…`, `/hf/datasets/…` | * | — (501) | Models only in this release |
+| Uploads (`POST`, `PUT`, `DELETE`, `PATCH`) | * | — (405) | Pull-through only |
+
+Client: `HF_ENDPOINT=https://nora.example.com/hf hf download org/model` (also `hf_hub_download`,
+`snapshot_download`). Measured with huggingface_hub 0.36.0, 1.0.0, 1.33.0, 2.0.0, 2.1.1 and 2.2.0
+against a fixture Hub in the live Hub's shapes, and with 2.1.1 against huggingface.co: a regular
+file, an LFS file of a Xet-backed repo, a legacy repo id (`gpt2`), revisions `refs/pr/N` and a
+commit, every request through NORA.
+
+### Proxy cache and freshness
+
+- NORA follows the Hub's redirects itself — the relative 307 to its resolve cache, the 302 to its
+  CDN for an LFS file — so no `Location` reaches the client and every byte comes through NORA.
+- The Hub's resolve answer is asked on every download: it names the commit, which curation reads,
+  and the file's digest. `main` therefore never goes stale, and the bytes come from the cache when
+  NORA already holds that digest.
+- Files are kept per repository by the digest the Hub names them by (`X-Linked-Etag`: the sha256 of
+  an LFS file, the git blob sha1 of a regular one), under `hf/models/{repo}/blobs/{digest}`. A weight
+  file that does not change across commits is downloaded once.
+- On the way in, a file is checked against that digest with its last chunk held back until it
+  matches: a corrupt file ends one chunk short and is not stored. A file read back from the cache
+  is checked against its pin the same way, and a copy that fails is dropped, so the next download
+  fetches it again; a range read from the cache is not checked (a part cannot be rehashed), as for
+  every format.
+- A range request on a file not yet cached, a HEAD, and a file whose etag names no digest are passed
+  through and not stored. A client that leaves early leaves nothing behind.
+- Cached files count toward `[gc] proxy_cache_max_bytes` with rpm and deb, oldest first. Retention
+  rules that name `hf` prune them (`older_than_days`, and `keep_last` counted in files); a `*` rule
+  does not apply to the opt-in format.
+
+### Curation
+
+A download is named by its repository id and versioned by its commit: a rule on the repository
+refuses before the upstream is asked, a rule on a commit holds for `main` when `main` resolves to it,
+also for a file already cached. When curation can refuse by name (curation on, or an internal
+namespace set), an alias — a legacy id such as `gpt2`, another case, a renamed repository — is
+checked under its canonical id too, learned from the upstream (`HEAD /api/models/{id}`); if NORA
+cannot learn it, the download is refused. `curation.min_release_age` with hf enabled is refused at
+start: a Hub commit has no publish date NORA can read.
+
+**Limitations (this release):**
+- **Datasets and Spaces** are not served (501).
+- **Public repositories only** — a client's token is never sent upstream, so a gated or private
+  repository answers with the Hub's own refusal (its status, `X-Error-Code` and message).
+- **One anonymous client at the Hub** — every request reaches the Hub from NORA's address without a
+  token, so the Hub's anonymous rate limits are shared by every client behind NORA (cached files
+  still cost a resolve request each). A `429` is handed on with `Retry-After`, `RateLimit` and
+  `RateLimit-Policy`, by which huggingface_hub waits for the window to reset.
+- **The Hub must be reachable** for a download: the resolve answer is asked every time, and there is
+  no stale serving yet.
+- **`HfFileSystem`** is not measured; its `paths-info` call is a `POST` and answers 405.
+- **An alias and its canonical id are cached separately** (`gpt2` and `openai-community/gpt2`).
+- **S3**: set an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket. A cache fill cut off
+  during its upload (a restart) leaves multipart parts the object store keeps until they are aborted;
+  NORA cannot abort them itself after a restart.
+
 ## Helm OCI
 
 Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm push` and `helm pull` work through the standard `/v2/` API.
