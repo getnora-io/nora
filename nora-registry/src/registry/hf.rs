@@ -110,23 +110,23 @@ const CANONICAL_MAX: usize = 4096;
 const CANONICAL_UNKNOWN: &str =
     "NORA could not learn this repository's canonical id from the Hugging Face upstream, which curation needs.";
 
-/// Canonical ids the Hub named, per upstream and id as the client spelled it (lower case),
-/// with when they were learned. Held by the application state, one per instance.
+/// Canonical ids the Hub named, per id as the client spelled it (lower case), with when they
+/// were learned. Held by the application state, one per instance and so one upstream.
 #[derive(Default)]
 pub struct CanonicalIds(
-    tokio::sync::Mutex<std::collections::HashMap<(String, String), (String, std::time::Instant)>>,
+    tokio::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 );
 
 impl CanonicalIds {
     /// The canonical id learned for `asked`, while it is fresh.
-    async fn get(&self, asked: &(String, String)) -> Option<String> {
+    async fn get(&self, asked: &str) -> Option<String> {
         let ids = self.0.lock().await;
         ids.get(asked)
             .filter(|(_, learned)| learned.elapsed() < CANONICAL_TTL)
             .map(|(id, _)| id.clone())
     }
 
-    async fn remember(&self, asked: (String, String), id: String) {
+    async fn remember(&self, asked: String, id: String) {
         let mut ids = self.0.lock().await;
         if ids.len() >= CANONICAL_MAX {
             ids.clear();
@@ -386,7 +386,7 @@ enum Canonical {
 /// upstream's origin to another `api/models` path is followed. Remembered for
 /// [`CANONICAL_TTL`].
 async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canonical {
-    let remembered = (upstream.to_string(), encoded.to_ascii_lowercase());
+    let remembered = encoded.to_ascii_lowercase();
     if let Some(id) = state.hf_canonical_ids.get(&remembered).await {
         return Canonical::Id(id);
     }
@@ -3271,6 +3271,20 @@ mod tests {
         cleanup_fill_temp_dir(dir.path().to_str().unwrap());
         assert!(!stale.exists());
         assert!(fresh.exists());
+    }
+
+    /// The memory of canonical ids is bounded: past the limit it starts over.
+    #[tokio::test]
+    async fn canonical_ids_are_bounded() {
+        let ids = CanonicalIds::default();
+        for n in 0..=CANONICAL_MAX {
+            ids.remember(format!("id{n}"), format!("org/id{n}")).await;
+        }
+        assert!(ids.0.lock().await.len() <= CANONICAL_MAX);
+        assert_eq!(
+            ids.get(&format!("id{CANONICAL_MAX}")).await.as_deref(),
+            Some(format!("org/id{CANONICAL_MAX}").as_str())
+        );
     }
 
     #[test]
