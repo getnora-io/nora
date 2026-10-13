@@ -684,6 +684,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_link_line_is_read_not_only_the_first() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([]))
+                    .append_header(
+                        "link",
+                        format!(
+                            "<{}/api/models/org/model/xet-read-token/main>; rel=xet-auth",
+                            up.uri()
+                        )
+                        .as_str(),
+                    )
+                    .append_header(
+                        "link",
+                        format!(
+                            "<{}/api/models/org/model/tree/main?cursor=1>; rel=\"next\"",
+                            up.uri()
+                        )
+                        .as_str(),
+                    ),
+            )
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let nora = crate::registry::nora_base_url(&ctx.state);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/api/models/org/model/tree/main",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lines: Vec<String> = resp
+            .headers()
+            .get_all("link")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![format!(
+                "<{nora}/hf/api/models/org/model/tree/main?cursor=1>; rel=\"next\""
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn a_next_page_on_another_host_is_a_gateway_error_not_a_short_listing() {
         let up = MockServer::start().await;
         Mock::given(any())
@@ -944,6 +994,8 @@ mod tests {
             ("</api/x?c=1>; rel=\"next\"", Some("<http://nora:4000/hf/api/x?c=1>; rel=\"next\"")),
             ("<https://huggingface.co/api/x>; rel=next", Some("<http://nora:4000/hf/api/x>; rel=next")),
             ("<https://huggingface.co/api/t>; rel=\"xet-auth\"", None),
+            ("<https://huggingface.co/api/t>; rel=xet-auth", None),
+            ("<https://huggingface.co/api/t>; REL=\"Xet-Auth\"", None),
             ("<https://cas.example/r>; rel=\"xet-reconstruction-info\"", None),
             ("<https://huggingface.co/api/x>; rel=\"next xet-auth\"", None),
             (
