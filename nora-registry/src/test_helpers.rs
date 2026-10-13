@@ -351,6 +351,10 @@ fn build_context_with(
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
+        http_client_no_redirect: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,

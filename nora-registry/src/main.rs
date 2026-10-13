@@ -258,6 +258,9 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
+    /// The same client, except that it never follows a redirect: for a format whose answer
+    /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
+    pub http_client_no_redirect: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
@@ -409,6 +412,17 @@ fn build_http_client(
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
 ) -> reqwest::Client {
+    http_client_builder(tls, timeout, no_proxy)
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// The builder behind [`build_http_client`], for a client that differs in one setting.
+fn http_client_builder(
+    tls: &TlsConfig,
+    timeout: Option<std::time::Duration>,
+    no_proxy: bool,
+) -> reqwest::ClientBuilder {
     let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
 
     if let Some(t) = timeout {
@@ -441,7 +455,7 @@ fn build_http_client(
         }
     }
 
-    builder.build().expect("Failed to build HTTP client")
+    builder
 }
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
@@ -2077,6 +2091,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     config.warn_plaintext_credentials();
 
     let http_client = build_http_client(&config.tls, None, false);
+    let http_client_no_redirect = http_client_builder(&config.tls, None, false)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to build HTTP client");
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -2257,6 +2275,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
+        http_client_no_redirect,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
