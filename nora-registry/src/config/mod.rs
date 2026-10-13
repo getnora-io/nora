@@ -298,6 +298,8 @@ pub struct Config {
     #[serde(default)]
     pub cpan: CpanConfig,
     #[serde(default)]
+    pub hf: HfConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -407,6 +409,7 @@ impl Config {
                 RegistryType::Rpm => self.rpm.enabled = on,
                 RegistryType::Deb => self.deb.enabled = on,
                 RegistryType::Cpan => self.cpan.enabled = on,
+                RegistryType::HuggingFace => self.hf.enabled = on,
             }
         }
     }
@@ -462,6 +465,9 @@ impl Config {
         if self.cpan.enabled {
             set.insert(RegistryType::Cpan);
         }
+        if self.hf.enabled {
+            set.insert(RegistryType::HuggingFace);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -495,6 +501,7 @@ impl Config {
             RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
             RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
+            RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
         }
     }
 
@@ -531,6 +538,10 @@ impl Config {
             // its handlers (quarantine gates proxy downloads).
             RegistryType::Raw => return QuarantineMode::Off,
             RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
+            // Hugging Face serves no artifact bytes yet (every route answers 501), so
+            // nothing in it enforces quarantine; counting it would be the same phantom
+            // control as Raw. Its curation override arrives with the download path.
+            RegistryType::HuggingFace => return QuarantineMode::Off,
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -699,6 +710,7 @@ impl Config {
             ("pub", self.pub_dart.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
             ("cpan", self.cpan.proxy.as_deref()),
+            ("hf", self.hf.proxy.as_deref()),
         ];
         for (name, url) in simple {
             if let Some(url) = url {
@@ -1273,6 +1285,7 @@ impl Config {
         self.rpm.apply_env_overrides();
         self.deb.apply_env_overrides();
         self.cpan.apply_env_overrides();
+        self.hf.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -1491,6 +1504,7 @@ proxies = [
         assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
         assert_eq!(config.auth.token_storage, "data/tokens");
         assert!(!config.cpan.enabled, "CPAN defaults to disabled");
+        assert!(!config.hf.enabled, "Hugging Face defaults to disabled");
     }
 
     #[test]
@@ -2031,6 +2045,7 @@ proxies = [
         assert_serde_default_eq_default::<RpmConfig>("rpm");
         assert_serde_default_eq_default::<DebConfig>("deb");
         assert_serde_default_eq_default::<CpanConfig>("cpan");
+        assert_serde_default_eq_default::<HfConfig>("hf");
         assert_serde_default_eq_default::<SigningConfig>("signing");
 
         // Whole-Config fallback agrees with deserializing an empty file.
@@ -3867,6 +3882,48 @@ proxies = [
         assert_eq!(set.len(), RegistryType::all().len());
     }
 
+    /// `enabled_registries_legacy` is a chain of `if` blocks, not a `match`: a format left
+    /// out of it is never enabled by its own `[x] enabled = true`, and nothing fails to
+    /// compile. Every flag switched on through the exhaustive `apply_enabled_registries`
+    /// has to come back as the full set.
+    #[test]
+    fn test_legacy_flags_cover_every_registry() {
+        let mut config = Config::default();
+        let all: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
+        config.apply_enabled_registries(&all);
+        assert_eq!(config.enabled_registries_legacy(), all);
+    }
+
+    #[test]
+    fn test_hf_enabled_from_toml_and_env() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str("[hf]\nenabled = true\n").unwrap();
+        assert!(config
+            .enabled_registries()
+            .contains(&RegistryType::HuggingFace));
+        assert_eq!(config.hf.proxy.as_deref(), Some("https://huggingface.co"));
+
+        let mut config = Config::default();
+        std::env::set_var("NORA_HF_ENABLED", "true");
+        std::env::set_var("NORA_HF_PROXY", "http://127.0.0.1:9");
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_HF_ENABLED");
+        std::env::remove_var("NORA_HF_PROXY");
+        applied.unwrap();
+        assert!(config.hf.enabled);
+        assert_eq!(config.hf.proxy.as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    /// The first release proxies public repositories only: a server-side Hub token would let
+    /// the cache hand gated repositories to every NORA user. Until that is decided otherwise,
+    /// `[hf]` has no credential key, and a file that sets one is told so.
+    #[test]
+    fn test_hf_has_no_server_side_token() {
+        let (_, unknown) =
+            parse_config("[hf]\nenabled = true\nproxy_auth = \"user:token\"\n").unwrap();
+        assert_eq!(unknown, vec!["hf.proxy_auth".to_string()]);
+    }
+
     #[test]
     fn test_registries_toml_absent() {
         let _lock = env_lock();
@@ -4034,6 +4091,7 @@ proxies = [
             hostnames.contains(&"proxy.golang.org"),
             "go default missing"
         );
+        assert!(hostnames.contains(&"huggingface.co"), "hf default missing");
         // localhost should be excluded
         assert!(!hostnames.contains(&"localhost"));
         assert!(!hostnames.contains(&"127.0.0.1"));

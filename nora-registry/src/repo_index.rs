@@ -201,6 +201,9 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Cpan => build_cpan_index(storage).await,
+                // Nothing is cached under hf/ until the download path lands; the slice
+                // that fixes the storage layout builds this index.
+                RegistryType::HuggingFace => Some(Vec::new()),
             };
             match data {
                 Some(data) => {
@@ -866,6 +869,17 @@ mod tests {
                 rt
             );
         }
+    }
+
+    /// Nothing is cached under `hf/` yet: its index builds empty and settles, rather than
+    /// staying dirty and rebuilding (with a storage-failure warning) on every read.
+    #[tokio::test]
+    async fn hf_index_builds_empty_and_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let idx = RepoIndex::new();
+        assert!(idx.get("hf", &storage).await.is_empty());
+        assert!(!idx.indexes[&RegistryType::HuggingFace].is_dirty());
     }
 
     #[test]

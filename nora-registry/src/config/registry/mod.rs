@@ -145,6 +145,7 @@ mod deb;
 mod docker;
 mod gems;
 mod go;
+mod hf;
 mod maven;
 mod npm;
 mod nuget;
@@ -164,6 +165,7 @@ pub use self::deb::DebConfig;
 pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, DockerUpstream};
 pub use self::gems::GemsConfig;
 pub use self::go::GoConfig;
+pub use self::hf::HfConfig;
 #[allow(unused_imports)]
 pub use self::maven::{MavenConfig, MavenProxy, MavenProxyEntry};
 pub use self::npm::{npm_scope_of, NpmConfig, NpmProxyEntry};

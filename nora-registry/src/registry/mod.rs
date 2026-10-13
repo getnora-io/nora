@@ -10,6 +10,7 @@ pub mod docker;
 pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
+pub(crate) mod hf;
 mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
@@ -33,6 +34,7 @@ pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
+pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;
 pub use npm::routes as npm_routes;
 
