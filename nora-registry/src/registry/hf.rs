@@ -209,7 +209,9 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
     }
     let mut url = format!("{}/api/models/{rest}", base.trim_end_matches('/'));
     if let Some(query) = query {
-        if query.len() > MAX_QUERY || !query.bytes().all(|b| is_pchar(b) || b == b'/' || b == b'?')
+        if query.len() > MAX_QUERY
+            || !query.bytes().all(|b| is_pchar(b) || b == b'/' || b == b'?')
+            || !escapes_are_whole(query)
         {
             return Err(Refusal::BadPath);
         }
@@ -224,6 +226,17 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
 /// RFC 3986 `pchar` bytes, with `%` standing for the start of an escape.
 fn is_pchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@%".contains(&b)
+}
+
+/// Whether every `%` in `s` starts a two-hex-digit escape.
+fn escapes_are_whole(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || bytes
+                .get(i + 1..i + 3)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    })
 }
 
 /// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
@@ -332,7 +345,11 @@ fn link_rels(params: &str) -> impl Iterator<Item = &str> {
         .split(';')
         .filter_map(|p| p.split_once('='))
         .filter(|(k, _)| k.trim().eq_ignore_ascii_case("rel"))
-        .flat_map(|(_, v)| v.trim().trim_matches('"').split_ascii_whitespace())
+        .flat_map(|(_, v)| {
+            v.trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .split_ascii_whitespace()
+        })
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response {
@@ -353,7 +370,7 @@ mod tests {
     };
     use axum::http::Method;
     use serde_json::{json, Value};
-    use wiremock::matchers::{any, method, path};
+    use wiremock::matchers::{any, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn hf_enabled() -> TestContext {
@@ -854,10 +871,18 @@ mod tests {
         let ctx = hf_with_upstream(&up);
         for uri in [
             "/hf/api/models/org/%2e%2e/secret",
+            // First position: the HTTP client folds `%2e%2e`, so this would reach
+            // /api/datasets/... through the models route.
+            "/hf/api/models/%2e%2e/datasets/org/data/revision/main",
+            "/hf/api/models/./org/model",
             "/hf/api/models/org/model/..",
             "/hf/api/models/org//model",
+            "/hf/api/models/org/model/",
             "/hf/api/models/org/model%",
             "/hf/api/models/org/model%zz",
+            "/hf/api/models/org/model%4z",
+            "/hf/api/models/org/model%z4",
+            "/hf/api/models/org/model?recursive=%zz",
         ] {
             let resp = send(&ctx.app, Method::GET, uri, "").await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -975,31 +1000,81 @@ mod tests {
     #[tokio::test]
     async fn metadata_is_read_only() {
         let up = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(any())
             .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        for m in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let resp = send(
+                &ctx.app,
+                m.clone(),
+                "/hf/api/models/org/model/paths-info/main",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+        }
+        assert!(upstream_paths(&up).await.is_empty());
+    }
+
+    /// A Link line NORA cannot read is refused, not skipped: skipped, its `next` would go
+    /// missing and the client would keep page one only.
+    #[tokio::test]
+    async fn an_unreadable_link_line_is_a_gateway_error() {
+        let up = MockServer::start().await;
+        let mut line = format!(
+            "<{}/api/models/org/model/tree/main?cursor=1>; rel=\"next\"; title=\"",
+            up.uri()
+        )
+        .into_bytes();
+        line.extend_from_slice(b"\xe9\"");
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([]))
+                    .insert_header("link", HeaderValue::from_bytes(&line).unwrap()),
+            )
             .mount(&up)
             .await;
         let ctx = hf_with_upstream(&up);
         let resp = send(
             &ctx.app,
-            Method::POST,
-            "/hf/api/models/org/model/paths-info/main",
+            Method::GET,
+            "/hf/api/models/org/model/tree/main",
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert!(upstream_paths(&up).await.is_empty());
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Metadata leaves nothing behind in storage — no cache anywhere on its path, called
+    /// directly or from a helper — so a moved `main` cannot be served from one.
+    #[tokio::test]
+    async fn metadata_leaves_nothing_in_storage() {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(live_tree()))
+            .mount(&up)
+            .await;
+        let ctx = hf_with_upstream(&up);
+        let before = ctx.state.storage.list("").await.unwrap();
+        for uri in METADATA_REQUESTS {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+        assert_eq!(ctx.state.storage.list("").await.unwrap(), before);
     }
 
     // ── the pure rules ─────────────────────────────────────────────────────────
 
     #[test]
     fn xet_keys_go_at_any_depth_and_nothing_else_does() {
-        let mut v = json!({"a": 1, "xetHash": "h", "lfs": {}, "b": [{"xetHash": "h", "c": {"lfs": 1, "d": 2}}], "e": "xetHash"});
+        let mut v = json!({"a": 1, "xetHash": "h", "xetEnabled": true, "lfs": {}, "b": [{"xetHash": "h", "c": {"lfs": 1, "d": 2, "xetSize": 3}}], "e": "xetHash"});
         strip_xet_metadata(&mut v);
         assert_eq!(
             v,
-            json!({"a": 1, "lfs": {}, "b": [{"c": {"lfs": 1, "d": 2}}], "e": "xetHash"})
+            json!({"a": 1, "xetEnabled": true, "lfs": {}, "b": [{"c": {"lfs": 1, "d": 2, "xetSize": 3}}], "e": "xetHash"})
         );
     }
 
@@ -1014,6 +1089,7 @@ mod tests {
             ("<https://huggingface.co/api/x>; rel=next", Some("<http://nora:4000/hf/api/x>; rel=next")),
             ("<https://huggingface.co/api/t>; rel=\"xet-auth\"", None),
             ("<https://huggingface.co/api/t>; rel=xet-auth", None),
+            ("<https://huggingface.co/api/t>; rel='xet-auth'", None),
             ("<https://huggingface.co/api/t>; REL=\"Xet-Auth\"", None),
             ("<https://cas.example/r>; rel=\"xet-reconstruction-info\"", None),
             ("<https://huggingface.co/api/x>; rel=\"next xet-auth\"", None),
@@ -1096,6 +1172,13 @@ mod tests {
             assert_eq!(ok(rest, None), Err(Refusal::BadPath), "{rest:?}");
         }
         assert_eq!(ok("org/m", Some("a=b c")), Err(Refusal::BadPath));
+        for q in ["a=%zz", "a=%4", "a=%"] {
+            assert_eq!(ok("org/m", Some(q)), Err(Refusal::BadPath), "{q}");
+        }
+        assert_eq!(
+            ok("org/m", Some("a=%41")),
+            Ok(format!("{UP}/api/models/org/m?a=%41"))
+        );
         assert_eq!(ok("org/m", Some(&"a".repeat(3000))), Err(Refusal::BadPath));
     }
 }
