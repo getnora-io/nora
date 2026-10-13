@@ -114,8 +114,26 @@ const CANONICAL_UNKNOWN: &str =
 /// with when they were learned. Held by the application state, one per instance.
 #[derive(Default)]
 pub struct CanonicalIds(
-    parking_lot::Mutex<std::collections::HashMap<(String, String), (String, std::time::Instant)>>,
+    tokio::sync::Mutex<std::collections::HashMap<(String, String), (String, std::time::Instant)>>,
 );
+
+impl CanonicalIds {
+    /// The canonical id learned for `asked`, while it is fresh.
+    async fn get(&self, asked: &(String, String)) -> Option<String> {
+        let ids = self.0.lock().await;
+        ids.get(asked)
+            .filter(|(_, learned)| learned.elapsed() < CANONICAL_TTL)
+            .map(|(id, _)| id.clone())
+    }
+
+    async fn remember(&self, asked: (String, String), id: String) {
+        let mut ids = self.0.lock().await;
+        if ids.len() >= CANONICAL_MAX {
+            ids.clear();
+        }
+        ids.insert(asked, (id, std::time::Instant::now()));
+    }
+}
 
 pub fn routes() -> Router<AppState> {
     // `get` answers HEAD as well; anything else is 405.
@@ -369,10 +387,8 @@ enum Canonical {
 /// [`CANONICAL_TTL`].
 async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canonical {
     let remembered = (upstream.to_string(), encoded.to_ascii_lowercase());
-    if let Some((id, at)) = state.hf_canonical_ids.0.lock().get(&remembered).cloned() {
-        if at.elapsed() < CANONICAL_TTL {
-            return Canonical::Id(id);
-        }
+    if let Some(id) = state.hf_canonical_ids.get(&remembered).await {
+        return Canonical::Id(id);
     }
     let scope = BreakerScope::from(RegistryType::HuggingFace);
     let key = scope.key();
@@ -447,11 +463,10 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
         Err(_) => state.circuit_breaker.record_failure(&key, probe),
     }
     if let Ok(Canonical::Id(id)) = &outcome {
-        let mut ids = state.hf_canonical_ids.0.lock();
-        if ids.len() >= CANONICAL_MAX {
-            ids.clear();
-        }
-        ids.insert(remembered, (id.clone(), std::time::Instant::now()));
+        state
+            .hf_canonical_ids
+            .remember(remembered, id.clone())
+            .await;
     }
     outcome.unwrap_or_else(Canonical::Failed)
 }
@@ -1001,42 +1016,40 @@ fn fill_stream(chunks: Chunks, fill: Fill) -> FillStream {
 /// client already has its bytes, and a client gone at the last moment must not cancel the
 /// commit halfway. A failure leaves the file uncached (the guard removes the temp file).
 fn commit_fill(store: FillStore, sha256: String) {
-    tokio::spawn(
-        std::panic::AssertUnwindSafe(async move {
-            let FillStore {
-                storage,
-                key,
-                mut file,
-                path,
-                mut guard,
-            } = store;
-            // Durability: put_from_path renames the temp file into place, so its bytes must be
-            // on disk before it does (#846).
-            let synced = async {
-                use tokio::io::AsyncWriteExt;
-                file.flush().await?;
-                file.sync_all().await
+    use std::panic::AssertUnwindSafe;
+    let task = async move {
+        let FillStore {
+            storage,
+            key,
+            mut file,
+            path,
+            mut guard,
+        } = store;
+        // Durability: put_from_path renames the temp file into place, so its bytes must be
+        // on disk before it does (#846).
+        let synced = async {
+            use tokio::io::AsyncWriteExt;
+            file.flush().await?;
+            file.sync_all().await
+        }
+        .await;
+        drop(file);
+        if let Err(e) = synced {
+            tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed: temp file not synced");
+            return;
+        }
+        match storage.put_from_path(&key, &path, Some(&sha256)).await {
+            Ok(()) => guard.disarm(),
+            Err(e) => {
+                tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
             }
-            .await;
-            drop(file);
-            if let Err(e) = synced {
-                tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed: temp file not synced");
-                return;
-            }
-            match storage.put_from_path(&key, &path, Some(&sha256)).await {
-                Ok(()) => guard.disarm(),
-                Err(e) => {
-                    tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
-                }
-            }
-        })
-        .catch_unwind()
-        .map(|r| {
-            if let Err(e) = r {
-                tracing::error!(panic = ?e, "hf cache fill task panicked");
-            }
-        }),
-    );
+        }
+    };
+    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
+        if let Err(panic) = done {
+            tracing::error!(panic = ?panic, "hf cache fill task panicked");
+        }
+    }));
 }
 
 /// A file served from the cache, with the commit and digest the hops named. A range is read
