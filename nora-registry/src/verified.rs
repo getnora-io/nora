@@ -370,6 +370,104 @@ pub fn reader_stream_body<R: VerifiedByteReader>(reader: R) -> axum::body::Body 
     axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader))
 }
 
+/// Frame stream that hashes every frame and, when an integrity pin is
+/// present, withholds the FINAL frame until the digest has been checked at
+/// EOF — a mismatch aborts the body one frame short of completion, so a
+/// tampered object can never arrive at the client as a complete download.
+/// (The streaming counterpart of the buffered `get_verified` gate.) Serves raw
+/// artifacts and the Hugging Face file cache; it lives here, beside the sinks, so
+/// neither handler imports the other.
+pub struct VerifyingStream {
+    frames:
+        tokio_util::io::ReaderStream<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>,
+    /// Expected pin + running hash; `None` = unpinned key, no check.
+    hashing: Option<(String, sha2::Sha256)>,
+    key: String,
+    /// One-frame holdback buffer (only used while `hashing` is active).
+    held: Option<axum::body::Bytes>,
+    done: bool,
+}
+
+impl futures::Stream for VerifyingStream {
+    type Item = Result<axum::body::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use sha2::Digest;
+        use std::task::Poll;
+
+        loop {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            match std::pin::Pin::new(&mut self.frames).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if let Some((_, hasher)) = self.hashing.as_mut() {
+                        hasher.update(&chunk);
+                        // Holdback applies only when a pin will be checked.
+                        match self.held.replace(chunk) {
+                            Some(prev) => return Poll::Ready(Some(Ok(prev))),
+                            None => continue, // primed the holdback, read on
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    if let Some((expected, hasher)) = self.hashing.take() {
+                        let computed = hex::encode(hasher.finalize());
+                        if computed != expected {
+                            tracing::error!(
+                                key = %self.key,
+                                expected = %expected,
+                                computed = %computed,
+                                "SECURITY: integrity pin mismatch on streamed read — aborting body"
+                            );
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                "integrity pin mismatch",
+                            ))));
+                        }
+                    }
+                    return match self.held.take() {
+                        Some(last) => Poll::Ready(Some(Ok(last))),
+                        None => Poll::Ready(None),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Wraps a storage reader: hashes every frame and, with `pin` set, checks the
+/// digest at EOF before the final frame goes out. `key` names the object in logs.
+pub fn verify_while_streaming(
+    reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    pin: Option<String>,
+    key: String,
+) -> VerifyingStream {
+    use sha2::Digest;
+    VerifyingStream {
+        frames: tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024),
+        hashing: pin.map(|p| (p, sha2::Sha256::new())),
+        key,
+        held: None,
+        done: false,
+    }
+}
+
+// #849: `VerifyingStream` is an EOF-verifying stream, so it may be served through the
+// `stream_body` sole-sink. A raw `ReaderStream` (no digest check) does not carry these
+// impls, so it cannot be handed to `stream_body` — a compile-time serve-integrity witness.
+impl stream_sealed::Sealed for VerifyingStream {}
+impl VerifiedByteStream for VerifyingStream {}
+
 /// The explicit open-world streaming arm: partial-content / byte-range serves, where a
 /// partial range has no whole-file digest to check against. Named — never silent — the
 /// streaming counterpart of [`GateOutcome::Unpinned`]: the call site states that these
