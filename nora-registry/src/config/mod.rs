@@ -4047,6 +4047,7 @@ proxies = [
         let HfConfig {
             enabled: _,
             proxy: _,
+            proxy_timeout: _,
         } = HfConfig::default();
     }
 
@@ -4062,12 +4063,15 @@ proxies = [
         let mut config = Config::default();
         std::env::set_var("NORA_HF_ENABLED", "true");
         std::env::set_var("NORA_HF_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("NORA_HF_PROXY_TIMEOUT", "7");
         let applied = config.apply_env_overrides();
         std::env::remove_var("NORA_HF_ENABLED");
         std::env::remove_var("NORA_HF_PROXY");
+        std::env::remove_var("NORA_HF_PROXY_TIMEOUT");
         applied.unwrap();
         assert!(config.hf.enabled);
         assert_eq!(config.hf.proxy.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(config.hf.proxy_timeout, 7);
     }
 
     /// The first release proxies public repositories only: a server-side Hub token would let
