@@ -461,6 +461,10 @@ start: a Hub commit has no publish date NORA can read.
   no stale serving yet.
 - **`HfFileSystem`** is not measured; its `paths-info` call is a `POST` and answers 405.
 - **An alias and its canonical id are cached separately** (`gpt2` and `openai-community/gpt2`).
+- **The web UI** shows the format on the dashboard but does not list cached files yet.
+- **`nora backup` includes the cache** — every stored weight file, which the next download would fetch
+  again; there is no option to leave `hf/` out yet, so on a large cache keep it within
+  `[gc] proxy_cache_max_bytes` or a retention rule before a backup.
 - **S3**: set an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket. A cache fill cut off
   during its upload (a restart) leaves multipart parts the object store keeps until they are aborted;
   NORA cannot abort them itself after a restart.
