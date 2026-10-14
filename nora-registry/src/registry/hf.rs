@@ -3711,6 +3711,69 @@ mod tests {
         assert!(upstream_paths(&cdn).await.is_empty());
     }
 
+    /// Curation holds on every path to bytes, not only on the first walk: a file already in the
+    /// cache whose hops name no commit is refused by an allowlist that does not know an
+    /// unnamed commit, and the walk that refetches past an unusable copy checks the commit too.
+    #[tokio::test]
+    async fn curation_holds_on_every_path_to_the_bytes() {
+        let stage = |ctx: &TestContext, pinned: bool| {
+            let storage = ctx.state.storage.clone();
+            let path = std::path::Path::new(&ctx.state.config.storage.path).join("staged");
+            async move {
+                std::fs::write(&path, weights()).unwrap();
+                storage
+                    .put_from_path(&weights_key(), &path, pinned.then_some(SHA256))
+                    .await
+                    .unwrap();
+            }
+        };
+        // A cached file whose resolve answer names no commit: the allowlist lists one commit,
+        // and an unnamed one is not it.
+        let cdn = cdn_with_weights().await;
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        Mock::given(path("/org/model/resolve/main/model.safetensors"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/xet-bridge/model.safetensors", cdn.uri()).as_str(),
+                    )
+                    .insert_header("x-linked-etag", format!("\"{SHA256}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let allowed = format!(
+            r#"{{"version": 1, "entries": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &allowed, "allow");
+        stage(&ctx, true).await;
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a cached file passed an unnamed commit"
+        );
+        // A blocked commit and an unpinned copy: the refetch walk checks the commit as well.
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let blocked = format!(
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}", "reason": "r"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &blocked, "block");
+        stage(&ctx, false).await;
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the refetch walk skipped the commit"
+        );
+        assert!(upstream_paths(&cdn).await.is_empty());
+    }
+
     /// The Hub answers a legacy id's file directly, without a redirect; its etag names the
     /// file all the same, and the second download comes from the cache.
     #[tokio::test]
