@@ -27,40 +27,64 @@ fn serve(env: &[(&str, &str)]) -> Server {
     serve_in(tempfile::tempdir().unwrap(), env)
 }
 
-/// `nora serve` with its storage under `dir/data`, which a test may have prepared.
+/// `nora serve` with its storage under `dir/data`, which a test may have prepared. Ready means
+/// this server's own start-up line, not any listener on the port: a port picked here and
+/// released could be taken by another test's server in between, and a connection to that one
+/// would pass for this one. If the port was taken, this server cannot bind and exits; another
+/// port is tried.
 fn serve_in(dir: tempfile::TempDir, env: &[(&str, &str)]) -> Server {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nora"));
-    cmd.arg("serve")
-        .current_dir(dir.path())
-        .env_remove("NORA_CONFIG_PATH")
-        .env_remove("NORA_HF_ENABLED")
-        .env_remove("NORA_HF_PROXY")
-        .env_remove("NORA_REGISTRIES_ENABLE")
-        .env("NORA_HOST", "127.0.0.1")
-        .env("NORA_PORT", port.to_string())
-        .env("NORA_STORAGE_PATH", dir.path().join("data"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for (key, value) in env {
-        cmd.env(key, value);
+    for _ in 0..5 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let log = dir.path().join("nora.log");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nora"));
+        cmd.arg("serve")
+            .current_dir(dir.path())
+            .env_remove("NORA_CONFIG_PATH")
+            .env_remove("NORA_HF_ENABLED")
+            .env_remove("NORA_HF_PROXY")
+            .env_remove("NORA_REGISTRIES_ENABLE")
+            .env("NORA_HOST", "127.0.0.1")
+            .env("NORA_PORT", port.to_string())
+            .env("NORA_STORAGE_PATH", dir.path().join("data"))
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(Stdio::null());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = loop {
+            assert!(Instant::now() < deadline, "nora serve did not start");
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            let lines = std::fs::read_to_string(&log).unwrap_or_default();
+            if lines.lines().any(|line| {
+                line.contains("Nora started") && line.contains(&format!("127.0.0.1:{port}"))
+            }) {
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !started {
+            continue;
+        }
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "nora serve did not accept");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return Server {
+            child,
+            port,
+            _dir: dir,
+        };
     }
-    let child = cmd.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "nora serve did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Server {
-        child,
-        port,
-        _dir: dir,
-    }
+    panic!("nora serve did not start on any of five ports");
 }
 
 /// The whole response to `method path`, over a plain HTTP/1.1 connection.
