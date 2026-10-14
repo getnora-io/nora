@@ -3757,11 +3757,34 @@ mod tests {
             StatusCode::FORBIDDEN,
             "a cached file passed an unnamed commit"
         );
-        // A blocked commit and an unpinned copy: the refetch walk checks the commit as well.
+        // An unpinned copy sends the request on a second walk; main moves between the two, and
+        // the second walk's commit is blocked: it is checked too.
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
         let cdn = cdn_with_weights().await;
-        let up = live_hub(&cdn).await;
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        for (commit, priority, times) in [(COMMIT, 1u8, Some(1u64)), (moved, 2, None)] {
+            let mut answer = Mock::given(path("/org/model/resolve/main/model.safetensors"))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header(
+                            "location",
+                            format!("{}/xet-bridge/model.safetensors", cdn.uri()).as_str(),
+                        )
+                        .insert_header("x-repo-commit", commit)
+                        .insert_header("x-linked-etag", format!("\"{SHA256}\"").as_str()),
+                )
+                .with_priority(priority);
+            if let Some(n) = times {
+                answer = answer.up_to_n_times(n);
+            }
+            answer.mount(&up).await;
+        }
         let blocked = format!(
-            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}", "reason": "r"}}]}}"#
+            r#"{{"version": 1, "rules": [{{"registry": "hf", "name": "org/model", "version": "{moved}", "reason": "r"}}]}}"#
         );
         let (ctx, _dir) = curated(&up, &blocked, "block");
         stage(&ctx, false).await;
