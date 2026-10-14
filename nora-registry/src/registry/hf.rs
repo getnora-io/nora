@@ -34,6 +34,7 @@ use crate::curation::RequestVersion;
 use crate::registry::{circuit_open_response, nora_base_url, ProxyError, TempFileGuard};
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
+use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::body::Bytes;
 use axum::{
@@ -68,6 +69,9 @@ const XET_NOT_SERVED: &str = "NORA does not serve Xet; files come over plain HTT
 const BAD_PATH: &str = "Not a Hugging Face metadata path NORA forwards.";
 const NO_UPSTREAM: &str = "No Hugging Face upstream is configured.";
 const NOT_ON_UPSTREAM: &str = "Not found on the Hugging Face upstream, or not a public repository.";
+const RATE_LIMITED: &str =
+    "The Hugging Face upstream limits the rate of requests from this proxy; retry later.";
+const REFUSED_UPSTREAM: &str = "Refused by the Hugging Face upstream.";
 const UPSTREAM_FAILED: &str = "The Hugging Face upstream did not answer.";
 const UNREADABLE: &str = "The Hugging Face upstream answered with metadata NORA cannot read.";
 const LINK_LEAVES_NORA: &str =
@@ -236,10 +240,15 @@ async fn files(
         return refused;
     }
     // An alias — a legacy one-segment id, a renamed repo — is answered by the Hub as its
-    // canonical repo, so a rule on the canonical id must hold for it too: when curation can
-    // refuse by name, both names are checked, on the repo and on the commit.
+    // canonical repo, so a rule on the canonical id must hold for it too: when curation reads
+    // names, both are checked, on the repo and on the commit. Without the canonical id a
+    // download is refused only where curation could refuse it; audit logs and goes on.
     let mut names = vec![repo.clone()];
-    if state.curation().curation_engine.can_refuse_names() {
+    let (reads_names, can_refuse) = {
+        let engine = &state.curation().curation_engine;
+        (engine.reads_names(), engine.can_refuse_names())
+    };
+    if reads_names {
         match canonical_id(&state, upstream, file.repo).await {
             Canonical::Id(id) => {
                 if !id.eq_ignore_ascii_case(&repo) {
@@ -258,9 +267,12 @@ async fn files(
                 limits,
             } => return upstream_refusal(status, code, message, limits),
             Canonical::CircuitOpen(registry) => return circuit_open_response(&registry),
-            Canonical::Failed(why) => {
+            Canonical::Failed(why) if can_refuse => {
                 tracing::warn!(registry = "hf", why, repo = %repo, "canonical repo id unknown; refused for curation");
                 return error_response(StatusCode::BAD_GATEWAY, CANONICAL_UNKNOWN);
+            }
+            Canonical::Failed(why) => {
+                tracing::warn!(registry = "hf", why, repo = %repo, "canonical repo id unknown; audited under the requested id only");
             }
         }
     }
@@ -269,14 +281,12 @@ async fn files(
         file.repo, file.revision, file.file
     );
     let range = headers.get(header::RANGE).cloned();
-    let check_commit = |commit: Option<&str>| {
-        let version = commit.map_or(RequestVersion::Unrecognised, |c| {
-            RequestVersion::Known(c.to_string())
-        });
-        names
-            .iter()
-            .find_map(|name| curation_check(&state, &headers, name, version.clone()))
+    let curation = FileCuration {
+        state: &state,
+        headers: &headers,
+        names: &names,
     };
+    let check_commit = |commit: Option<&str>| curation.check(commit);
     let cache_repo = (method == Method::GET).then_some(repo.as_str());
     let mut fetched = fetch_file(
         &state,
@@ -287,6 +297,9 @@ async fn files(
         cache_repo,
     )
     .await;
+    if let Some(refused) = curation.admit(&fetched) {
+        return refused;
+    }
     if let FileFetch::Cached { meta, key, size } = &fetched {
         if let Some(response) = cached_response(&state, &headers, meta, key, *size).await {
             state.metrics.record_download("hf");
@@ -302,6 +315,9 @@ async fn files(
         // The stored copy cannot be read: fetch the file again, as on a miss; its fill
         // replaces the copy.
         fetched = fetch_file(&state, &method, &url, range.clone(), &check_commit, None).await;
+        if let Some(refused) = curation.admit(&fetched) {
+            return refused;
+        }
     }
     let stall = Duration::from_secs(state.config.hf.proxy_timeout);
     match fetched {
@@ -344,17 +360,18 @@ async fn files(
     }
 }
 
-/// A Hub refusal handed on: its status, its error code, its message (or ours), and on a rate
-/// limit the headers the client waits by.
+/// A Hub refusal handed on: its status, its error code, its message (or ours, by its status),
+/// and on a rate limit the headers the client waits by.
 fn upstream_refusal(
     status: StatusCode,
     code: Option<HeaderValue>,
     message: Option<HeaderValue>,
-    limits: HeaderMap,
+    limits: RateLimit,
 ) -> Response {
+    let reason = refusal_reason(status);
     let mut response = (
         status,
-        Json(serde_json::json!({ "error": message.as_ref().and_then(|m| m.to_str().ok()).unwrap_or(NOT_ON_UPSTREAM) })),
+        Json(serde_json::json!({ "error": message.as_ref().and_then(|m| m.to_str().ok()).unwrap_or(reason) })),
     )
         .into_response();
     let h = response.headers_mut();
@@ -363,25 +380,95 @@ fn upstream_refusal(
     }
     h.insert(
         ERROR_MESSAGE_HEADER,
-        message.unwrap_or(HeaderValue::from_static(NOT_ON_UPSTREAM)),
+        message.unwrap_or_else(|| HeaderValue::from_static(reason)),
     );
-    h.extend(limits);
+    limits.apply(h);
     response
+}
+
+/// Our reason for a Hub refusal that names none, by its status: the Hub answers a missing or
+/// private repository with 401 or 404, a rate limit with 429.
+fn refusal_reason(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND => NOT_ON_UPSTREAM,
+        StatusCode::TOO_MANY_REQUESTS => RATE_LIMITED,
+        _ => REFUSED_UPSTREAM,
+    }
 }
 
 /// What a client waits by when the Hub limits its rate: `Retry-After`, and `RateLimit` /
 /// `RateLimit-Policy`, which huggingface_hub reads to sleep until the window resets
-/// (`utils/_http.py`). A white list; nothing else of a refusal's headers is handed on.
-fn rate_limit_headers(headers: &HeaderMap) -> HeaderMap {
-    const NAMES: [HeaderName; 3] = [
-        header::RETRY_AFTER,
-        HeaderName::from_static("ratelimit"),
-        HeaderName::from_static("ratelimit-policy"),
-    ];
-    NAMES
-        .into_iter()
-        .filter_map(|name| headers.get(&name).cloned().map(|value| (name, value)))
-        .collect()
+/// (`utils/_http.py`). A white list by type: these three fields are all a refusal can hand
+/// on of the Hub's headers.
+#[derive(Debug, Default, Clone)]
+struct RateLimit {
+    retry_after: Option<HeaderValue>,
+    ratelimit: Option<HeaderValue>,
+    policy: Option<HeaderValue>,
+}
+
+const RATELIMIT: HeaderName = HeaderName::from_static("ratelimit");
+const RATELIMIT_POLICY: HeaderName = HeaderName::from_static("ratelimit-policy");
+
+impl From<&HeaderMap> for RateLimit {
+    fn from(headers: &HeaderMap) -> Self {
+        Self {
+            retry_after: headers.get(header::RETRY_AFTER).cloned(),
+            ratelimit: headers.get(RATELIMIT).cloned(),
+            policy: headers.get(RATELIMIT_POLICY).cloned(),
+        }
+    }
+}
+
+impl RateLimit {
+    fn apply(self, headers: &mut HeaderMap) {
+        for (name, value) in [
+            (header::RETRY_AFTER, self.retry_after),
+            (RATELIMIT, self.ratelimit),
+            (RATELIMIT_POLICY, self.policy),
+        ] {
+            if let Some(value) = value {
+                headers.insert(name, value);
+            }
+        }
+    }
+}
+
+/// What a commit a hop names is to curation: a known version, or — when no hop names one —
+/// an unrecognised one, which an allowlist of commits does not let through. Never "any".
+fn commit_version(commit: Option<&str>) -> RequestVersion {
+    commit.map_or(RequestVersion::Unrecognised, |c| {
+        RequestVersion::Known(c.to_string())
+    })
+}
+
+/// Curation of one file request: every name it goes by (as requested, and the canonical id),
+/// checked on a commit.
+struct FileCuration<'a> {
+    state: &'a AppState,
+    headers: &'a HeaderMap,
+    names: &'a [String],
+}
+
+impl FileCuration<'_> {
+    fn check(&self, commit: Option<&str>) -> Option<Response> {
+        let version = commit_version(commit);
+        self.names
+            .iter()
+            .find_map(|name| curation_check(self.state, self.headers, name, version.clone()))
+    }
+
+    /// The last word before an answer that serves a file goes out, whichever walk produced
+    /// it: the commit that answer carries is checked again. The walks check it as soon as a
+    /// hop names it, so a refused commit never reaches the CDN; this check holds when a walk
+    /// did not.
+    fn admit(&self, fetched: &FileFetch) -> Option<Response> {
+        let meta = match fetched {
+            FileFetch::File { meta, .. } | FileFetch::Cached { meta, .. } => meta,
+            _ => return None,
+        };
+        self.check(meta.commit.as_ref().and_then(|c| c.to_str().ok()))
+    }
 }
 
 fn curation_check(
@@ -409,10 +496,40 @@ enum Canonical {
         status: StatusCode,
         code: Option<HeaderValue>,
         message: Option<HeaderValue>,
-        limits: HeaderMap,
+        limits: RateLimit,
     },
     CircuitOpen(String),
     Failed(&'static str),
+}
+
+/// Counts a refusal that is a CDN or WAF policy block — an outage, not the Hub's answer
+/// (#881) — on any walk upstream.
+fn note_policy_block(status: StatusCode, headers: &HeaderMap) {
+    if let Some(reason) = super::policy_block_reason(headers) {
+        crate::metrics::UPSTREAM_POLICY_BLOCKED_TOTAL
+            .with_label_values(&["hf", reason])
+            .inc();
+        tracing::warn!(
+            registry = "hf",
+            status = status.as_u16(),
+            reason,
+            "upstream answered with a policy/geo block, handed on as its status — check egress/region"
+        );
+    }
+}
+
+/// Times one walk upstream by how it ended: an answer (`Ok(refused)`) or a failure.
+fn time_walk(started: std::time::Instant, ended: Result<bool, &str>) {
+    let class = match ended {
+        Ok(true) => "4xx",
+        Ok(false) => "2xx",
+        Err("upstream error") => "5xx",
+        Err("upstream timed out") => "timeout",
+        Err(_) => "error",
+    };
+    crate::metrics::UPSTREAM_REQUEST_DURATION
+        .with_label_values(&["hf", class])
+        .observe(started.elapsed().as_secs_f64());
 }
 
 /// The canonical id of `encoded` (the id as the client encoded it), for curation. The Hub
@@ -448,6 +565,7 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
         }
     };
     let mut hops = 0;
+    let started = std::time::Instant::now();
     let outcome = loop {
         if hops > MAX_HOPS {
             break Err("too many redirects");
@@ -461,7 +579,8 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
         .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => break Err("upstream unreachable"),
+            Ok(Err(e)) if !e.is_timeout() => break Err("upstream unreachable"),
+            Ok(Err(_)) | Err(_) => break Err("upstream timed out"),
         };
         let status = response.status();
         if status.is_success() {
@@ -492,15 +611,24 @@ async fn canonical_id(state: &AppState, upstream: &str, encoded: &str) -> Canoni
             continue;
         }
         if status.is_client_error() {
+            note_policy_block(status, response.headers());
             break Ok(Canonical::Refused {
                 status,
                 code: response.headers().get(&ERROR_CODE_HEADER).cloned(),
                 message: response.headers().get(&ERROR_MESSAGE_HEADER).cloned(),
-                limits: rate_limit_headers(response.headers()),
+                limits: RateLimit::from(response.headers()),
             });
         }
         break Err("upstream error");
     };
+    time_walk(
+        started,
+        match &outcome {
+            Ok(Canonical::Refused { .. }) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(why) => Err(*why),
+        },
+    );
     match outcome {
         Ok(Canonical::Refused { .. })
         | Err("too many redirects")
@@ -560,12 +688,12 @@ enum FileFetch {
     /// Curation refused the commit a hop named, before the bytes were asked for.
     Refused(Response),
     /// The Hub refused (4xx): its status, error code and message are handed on, and on a rate
-    /// limit what the client waits by ([`rate_limit_headers`]).
+    /// limit what the client waits by ([`RateLimit`]).
     UpstreamRefused {
         status: StatusCode,
         code: Option<HeaderValue>,
         message: Option<HeaderValue>,
-        limits: HeaderMap,
+        limits: RateLimit,
     },
     CircuitOpen(String),
     Failed(&'static str),
@@ -661,12 +789,9 @@ where
                     Some(key) => state.storage.stat(key).await,
                     None => None,
                 };
+                // A hit asks nothing more upstream; its commit — named or not — is checked by
+                // the caller before it is served (`FileCuration::admit`).
                 if let (Some(key), Some(stored)) = (key, stored) {
-                    if !commit_checked {
-                        if let Some(refused) = check_commit(None) {
-                            break Ok(FileFetch::Refused(refused));
-                        }
-                    }
                     let meta = if status.is_success() {
                         file_meta(&hops, Some(response.headers()))
                     } else {
@@ -717,37 +842,24 @@ where
             break Ok(FileFetch::File { status, meta, body });
         }
         if status.is_client_error() {
-            // A CDN or WAF policy block is a 4xx that is an outage, not the Hub's answer (#881).
-            if let Some(reason) = super::policy_block_reason(response.headers()) {
-                crate::metrics::UPSTREAM_POLICY_BLOCKED_TOTAL
-                    .with_label_values(&["hf", reason])
-                    .inc();
-                tracing::warn!(
-                    registry = "hf",
-                    status = status.as_u16(),
-                    reason,
-                    "upstream answered with a policy/geo block, handed on as its status — check egress/region"
-                );
-            }
+            note_policy_block(status, response.headers());
             break Ok(FileFetch::UpstreamRefused {
                 status,
                 code: response.headers().get(&ERROR_CODE_HEADER).cloned(),
                 message: response.headers().get(&ERROR_MESSAGE_HEADER).cloned(),
-                limits: rate_limit_headers(response.headers()),
+                limits: RateLimit::from(response.headers()),
             });
         }
         break Err("upstream error");
     };
-    let class = match &outcome {
-        Ok(FileFetch::UpstreamRefused { .. }) => "4xx",
-        Ok(_) => "2xx",
-        Err("upstream error") => "5xx",
-        Err("upstream timed out") => "timeout",
-        Err(_) => "error",
-    };
-    crate::metrics::UPSTREAM_REQUEST_DURATION
-        .with_label_values(&["hf", class])
-        .observe(started.elapsed().as_secs_f64());
+    time_walk(
+        started,
+        match &outcome {
+            Ok(FileFetch::UpstreamRefused { .. }) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(why) => Err(*why),
+        },
+    );
     match outcome {
         Ok(FileFetch::UpstreamRefused { .. })
         | Err("too many redirects")
@@ -891,13 +1003,15 @@ fn cache_key(repo: &str, digest: &HubDigest) -> Option<String> {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
                 && !segment.contains("..")
         });
-    id_ok.then(|| {
-        format!(
-            "{CACHE_PREFIX}/{}/blobs/{}",
-            repo.to_ascii_lowercase(),
-            digest.hex()
-        )
-    })
+    id_ok
+        .then(|| {
+            format!(
+                "{CACHE_PREFIX}/{}/blobs/{}",
+                repo.to_ascii_lowercase(),
+                digest.hex()
+            )
+        })
+        .filter(|key| validate_storage_key(key).is_ok())
 }
 
 /// A file's bytes on their way to the client: hashed against the digest the Hub named it by
@@ -1629,7 +1743,7 @@ mod tests {
     };
     use axum::http::Method;
     use serde_json::{json, Value};
-    use wiremock::matchers::{any, path};
+    use wiremock::matchers::{any, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn hf_enabled() -> TestContext {
@@ -2789,6 +2903,174 @@ mod tests {
         assert!(blocked() >= before + 2, "geo blocks not counted");
     }
 
+    /// The canonical-id lookup is a walk upstream like any other: timed, its policy blocks
+    /// counted, and of its refusal's headers only what the client waits by is handed on.
+    #[tokio::test]
+    async fn the_canonical_lookup_is_timed_and_hands_on_only_what_a_client_waits_by() {
+        let unrelated = r#"{"version": 1, "rules": [{"registry": "hf", "name": "other/x", "version": "*", "reason": "r"}]}"#;
+        let up = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/api/models/org/limited"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "55")
+                    .insert_header("ratelimit", "\"api\";r=0;t=55")
+                    .insert_header("set-cookie", "hub=1"),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/api/models/org/geo"))
+            .respond_with(ResponseTemplate::new(403).insert_header("x-amzn-waf-reason", "geo"))
+            .mount(&up)
+            .await;
+        Mock::given(path_regex("/resolve/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&up)
+            .await;
+        let (ctx, _dir) = curated(&up, unrelated, "block");
+        let timed = || {
+            crate::metrics::UPSTREAM_REQUEST_DURATION
+                .with_label_values(&["hf", "4xx"])
+                .get_sample_count()
+        };
+        let blocked = || {
+            crate::metrics::UPSTREAM_POLICY_BLOCKED_TOTAL
+                .with_label_values(&["hf", "geo"])
+                .get()
+        };
+        let (timed_before, blocked_before) = (timed(), blocked());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/limited/resolve/main/config.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header(&resp, "retry-after"), "55");
+        assert_eq!(header(&resp, "ratelimit"), "\"api\";r=0;t=55");
+        assert_eq!(header(&resp, "x-error-message"), RATE_LIMITED);
+        assert!(
+            !resp.headers().contains_key("set-cookie"),
+            "a refusal header leaked"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/geo/resolve/main/config.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            timed() >= timed_before + 2,
+            "the canonical lookup is not timed"
+        );
+        assert!(
+            blocked() > blocked_before,
+            "a geo block on the lookup is not counted"
+        );
+    }
+
+    /// Our reason for a refusal that names none tells its kind by the status.
+    #[test]
+    fn a_refusal_without_a_reason_gets_ours_by_its_status() {
+        for (status, reason) in [
+            (StatusCode::UNAUTHORIZED, NOT_ON_UPSTREAM),
+            (StatusCode::NOT_FOUND, NOT_ON_UPSTREAM),
+            (StatusCode::TOO_MANY_REQUESTS, RATE_LIMITED),
+            (StatusCode::FORBIDDEN, REFUSED_UPSTREAM),
+            (StatusCode::GONE, REFUSED_UPSTREAM),
+        ] {
+            assert_eq!(refusal_reason(status), reason, "{status}");
+        }
+    }
+
+    /// A commit no hop names is unrecognised — an allowlist of commits does not let it
+    /// through — never "any version".
+    #[test]
+    fn a_commit_no_hop_names_is_unrecognised() {
+        assert_eq!(commit_version(None), RequestVersion::Unrecognised);
+        assert_eq!(
+            commit_version(Some(COMMIT)),
+            RequestVersion::Known(COMMIT.to_string())
+        );
+    }
+
+    /// An upstream that names no commit on any hop — a mirror, say — gets nothing past an
+    /// allowlist of commits.
+    #[tokio::test]
+    async fn an_allowlist_of_commits_refuses_a_file_no_hop_names_a_commit_for() {
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&up)
+            .await;
+        Mock::given(path("/org/model/resolve/main/config.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CONFIG.to_vec())
+                    .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str()),
+            )
+            .mount(&up)
+            .await;
+        let allowed = format!(
+            r#"{{"version": 1, "entries": [{{"registry": "hf", "name": "org/model", "version": "{COMMIT}"}}]}}"#
+        );
+        let (ctx, _dir) = curated(&up, &allowed, "allow");
+        for m in [Method::GET, Method::HEAD] {
+            let resp = send(
+                &ctx.app,
+                m.clone(),
+                "/hf/org/model/resolve/main/config.json",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{m}");
+        }
+    }
+
+    /// Audit never refuses: when the canonical id cannot be learned, an audited download goes
+    /// on under the requested id, and only enforcing curation answers 502.
+    #[tokio::test]
+    async fn without_the_canonical_id_only_enforcing_curation_refuses() {
+        let cdn = cdn_with_weights().await;
+        let hub = live_hub(&cdn).await;
+        let up = MockServer::start().await;
+        Mock::given(path("/api/models/org/model"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&up)
+            .await;
+        Mock::given(path_regex("/resolve/"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/org/model/resolve/main/config.json", hub.uri()).as_str(),
+            ))
+            .mount(&up)
+            .await;
+        let unrelated = r#"{"version": 1, "rules": [{"registry": "hf", "name": "other/x", "version": "*", "reason": "r"}]}"#;
+        let (enforcing, _d1) = curated(&up, unrelated, "block");
+        let resp = send(
+            &enforcing.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/config.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let (ctx, _d2) = curated_in(&up, unrelated, "block", crate::config::CurationMode::Audit);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/config.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "audit refused a download");
+    }
+
     #[tokio::test]
     async fn the_clients_credentials_stay_with_nora_on_every_hop() {
         let cdn = cdn_with_weights().await;
@@ -2816,6 +3098,15 @@ mod tests {
     }
 
     fn curated(up: &MockServer, rules: &str, mode: &str) -> (TestContext, tempfile::TempDir) {
+        curated_in(up, rules, mode, crate::config::CurationMode::Enforce)
+    }
+
+    fn curated_in(
+        up: &MockServer,
+        rules: &str,
+        mode: &str,
+        curation: crate::config::CurationMode,
+    ) -> (TestContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("list.json");
         std::fs::write(&file, rules).unwrap();
@@ -2825,7 +3116,7 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
-            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.mode = curation;
             if mode == "allow" {
                 cfg.curation.allowlist_path = Some(file);
             } else {

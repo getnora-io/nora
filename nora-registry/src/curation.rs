@@ -176,11 +176,19 @@ impl CurationEngine {
         self.config.mode != CurationMode::Off
     }
 
-    /// Whether a download can be refused by its name: curation is on, or a namespace filter
-    /// is set (it runs even with curation off). A format that learns an alias's canonical
-    /// name from its upstream, for curation to read, asks only when this holds.
-    pub fn can_refuse_names(&self) -> bool {
+    /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
+    /// or a namespace filter is set (it runs even with curation off). A format that learns an
+    /// alias's canonical name from its upstream, for curation to read, asks only when this
+    /// holds.
+    pub fn reads_names(&self) -> bool {
         self.is_active() || self.namespace_filter.is_some()
+    }
+
+    /// Whether a download can be refused by its name: curation enforces, or a namespace filter
+    /// is set (its blocks are never audit-only). Where this does not hold, a name curation
+    /// cannot learn costs the download nothing.
+    pub fn can_refuse_names(&self) -> bool {
+        self.config.mode == CurationMode::Enforce || self.namespace_filter.is_some()
     }
 
     /// Access raw metrics counters.
@@ -1932,14 +1940,25 @@ mod tests {
     use sha2::Digest;
 
     #[test]
-    fn names_can_be_refused_when_curation_is_on_or_a_namespace_is_set() {
+    fn names_are_read_when_curation_is_on_and_refused_when_it_enforces() {
+        let with_namespace = |config: &CurationConfig| {
+            let mut engine = CurationEngine::new(config.clone());
+            engine.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["acme/*".into()])));
+            engine
+        };
         let mut config = CurationConfig::default();
-        assert!(!CurationEngine::new(config.clone()).can_refuse_names());
-        let mut with_namespace = CurationEngine::new(config.clone());
-        with_namespace.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["acme/*".into()])));
-        assert!(with_namespace.can_refuse_names());
+        let off = CurationEngine::new(config.clone());
+        assert!(!off.reads_names() && !off.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
         config.mode = CurationMode::Audit;
-        assert!(CurationEngine::new(config).can_refuse_names());
+        let audit = CurationEngine::new(config.clone());
+        assert!(audit.reads_names() && !audit.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
+        config.mode = CurationMode::Enforce;
+        let enforce = CurationEngine::new(config);
+        assert!(enforce.reads_names() && enforce.can_refuse_names());
     }
 
     /// A test filter that always allows.
