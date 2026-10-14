@@ -286,18 +286,20 @@ async fn files(
         headers: &headers,
         names: &names,
     };
-    let check_commit = |commit: Option<&str>| curation.check(commit);
+    // Commits this request's curation has let through: the check at serving does not
+    // decide one twice (each decision is counted, and audit logs each).
+    let mut admitted = Vec::new();
     let cache_repo = (method == Method::GET).then_some(repo.as_str());
     let mut fetched = fetch_file(
         &state,
         &method,
         &url,
         range.clone(),
-        &check_commit,
+        |commit| curation.check(commit, &mut admitted),
         cache_repo,
     )
     .await;
-    if let Some(refused) = curation.admit(&fetched) {
+    if let Some(refused) = curation.admit(&fetched, &mut admitted) {
         return refused;
     }
     if let FileFetch::Cached { meta, key, size } = &fetched {
@@ -314,8 +316,16 @@ async fn files(
         }
         // The stored copy cannot be read: fetch the file again, as on a miss; its fill
         // replaces the copy.
-        fetched = fetch_file(&state, &method, &url, range.clone(), &check_commit, None).await;
-        if let Some(refused) = curation.admit(&fetched) {
+        fetched = fetch_file(
+            &state,
+            &method,
+            &url,
+            range.clone(),
+            |commit| curation.check(commit, &mut admitted),
+            None,
+        )
+        .await;
+        if let Some(refused) = curation.admit(&fetched, &mut admitted) {
             return refused;
         }
     }
@@ -451,23 +461,33 @@ struct FileCuration<'a> {
 }
 
 impl FileCuration<'_> {
-    fn check(&self, commit: Option<&str>) -> Option<Response> {
+    /// Checks a commit under every name; one let through is noted in `admitted`.
+    fn check(&self, commit: Option<&str>, admitted: &mut Vec<Option<String>>) -> Option<Response> {
         let version = commit_version(commit);
-        self.names
+        let refused = self
+            .names
             .iter()
-            .find_map(|name| curation_check(self.state, self.headers, name, version.clone()))
+            .find_map(|name| curation_check(self.state, self.headers, name, version.clone()));
+        if refused.is_none() {
+            admitted.push(commit.map(str::to_string));
+        }
+        refused
     }
 
     /// The last word before an answer that serves a file goes out, whichever walk produced
-    /// it: the commit that answer carries is checked again. The walks check it as soon as a
-    /// hop names it, so a refused commit never reaches the CDN; this check holds when a walk
-    /// did not.
-    fn admit(&self, fetched: &FileFetch) -> Option<Response> {
+    /// it: the commit that answer carries must have been let through by this curation. The
+    /// walks check it as soon as a hop names it, so a refused commit never reaches the CDN;
+    /// a commit no walk checked here is checked now.
+    fn admit(&self, fetched: &FileFetch, admitted: &mut Vec<Option<String>>) -> Option<Response> {
         let meta = match fetched {
             FileFetch::File { meta, .. } | FileFetch::Cached { meta, .. } => meta,
             _ => return None,
         };
-        self.check(meta.commit.as_ref().and_then(|c| c.to_str().ok()))
+        let commit = meta.commit.as_ref().and_then(|c| c.to_str().ok());
+        if admitted.iter().any(|done| done.as_deref() == commit) {
+            return None;
+        }
+        self.check(commit, admitted)
     }
 }
 
@@ -722,11 +742,11 @@ async fn fetch_file<F>(
     method: &Method,
     url: &str,
     range: Option<HeaderValue>,
-    check_commit: F,
+    mut check_commit: F,
     cache_repo: Option<&str>,
 ) -> FileFetch
 where
-    F: Fn(Option<&str>) -> Option<Response>,
+    F: FnMut(Option<&str>) -> Option<Response>,
 {
     let scope = BreakerScope::from(RegistryType::HuggingFace);
     let key = scope.key();
@@ -2972,6 +2992,39 @@ mod tests {
             blocked() > blocked_before,
             "a geo block on the lookup is not counted"
         );
+    }
+
+    /// Each curation decision of a download is made once: on the repository, then on the
+    /// commit the hop names; serving that answer does not decide its commit again.
+    #[tokio::test]
+    async fn a_download_decides_each_curation_question_once() {
+        let unrelated = r#"{"version": 1, "rules": [{"registry": "hf", "name": "other/x", "version": "*", "reason": "r"}]}"#;
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let (ctx, _dir) = curated(&up, unrelated, "block");
+        let allowed = || {
+            ctx.state
+                .curation()
+                .curation_engine
+                .metrics()
+                .allowed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for (round, uri) in [
+            "/hf/org/model/resolve/main/config.json",
+            "/hf/org/model/resolve/main/config.json",
+            WEIGHTS_PATH,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = allowed();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let _ = body_bytes(resp).await;
+            assert_eq!(allowed() - before, 2, "round {round}: {uri}");
+            settle().await;
+        }
     }
 
     /// Our reason for a refusal that names none tells its kind by the status.
