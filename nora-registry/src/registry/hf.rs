@@ -3290,6 +3290,31 @@ mod tests {
         );
     }
 
+    /// Audit shows what enforce would refuse, so it reads an alias under its canonical id
+    /// too: the lookup is made, the download goes on, and the rule on the canonical id is
+    /// decided (audited) for the repository and the commit.
+    #[tokio::test]
+    async fn audit_decides_an_alias_under_its_canonical_id() {
+        let up = hub_with_alias().await;
+        let rules = r#"{"version": 1, "rules": [{"registry": "hf", "name": "openai-community/gpt2", "version": "*", "reason": "r"}]}"#;
+        let (ctx, _dir) = curated_in(&up, rules, "block", crate::config::CurationMode::Audit);
+        let allowed = || {
+            ctx.state
+                .curation()
+                .curation_engine
+                .metrics()
+                .allowed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = allowed();
+        let resp = send(&ctx.app, Method::GET, ALIAS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "audit refused");
+        let asks = canonical_asks(&up).await;
+        assert!(!asks.is_empty(), "audit did not learn the canonical id");
+        // gpt2 and openai-community/gpt2, each on the repository and on the commit.
+        assert_eq!(allowed() - before, 4);
+    }
+
     #[tokio::test]
     async fn a_commit_rule_on_the_canonical_id_holds_for_an_alias() {
         let up = hub_with_alias().await;
