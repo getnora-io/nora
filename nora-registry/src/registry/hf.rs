@@ -1175,24 +1175,11 @@ fn commit_fill(store: FillStore, sha256: String) {
         let FillStore {
             storage,
             key,
-            mut file,
+            file,
             path,
             mut guard,
         } = store;
-        // Durability: put_from_path renames the temp file into place, so its bytes must be
-        // on disk before it does (#846).
-        let synced = async {
-            use tokio::io::AsyncWriteExt;
-            file.flush().await?;
-            file.sync_all().await
-        }
-        .await;
-        drop(file);
-        if let Err(e) = synced {
-            tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed: temp file not synced");
-            return;
-        }
-        match storage.put_from_path(&key, &path, Some(&sha256)).await {
+        match sync_and_commit(&storage, &key, file, &path, &sha256).await {
             Ok(()) => guard.disarm(),
             Err(e) => {
                 tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
@@ -1204,6 +1191,43 @@ fn commit_fill(store: FillStore, sha256: String) {
             tracing::error!(panic = ?panic, "hf cache fill task panicked");
         }
     }));
+}
+
+/// Why a verified fill was not committed.
+#[derive(Debug)]
+enum CommitFailed {
+    /// The temp file's bytes could not be put on disk.
+    Sync(std::io::Error),
+    Store(crate::storage::StorageError),
+}
+
+impl std::fmt::Display for CommitFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sync(e) => write!(f, "temp file not synced: {e}"),
+            Self::Store(e) => write!(f, "storage refused it: {e}"),
+        }
+    }
+}
+
+/// Puts the temp file's bytes on disk, then commits it under `key` pinned to `sha256`.
+/// put_from_path renames the file into place, so a sync that fails is an error and nothing
+/// is committed whose bytes may not be on disk (#846); each step's error ends the commit.
+async fn sync_and_commit(
+    storage: &Storage,
+    key: &str,
+    mut file: tokio::fs::File,
+    path: &std::path::Path,
+    sha256: &str,
+) -> Result<(), CommitFailed> {
+    use tokio::io::AsyncWriteExt;
+    file.flush().await.map_err(CommitFailed::Sync)?;
+    file.sync_all().await.map_err(CommitFailed::Sync)?;
+    drop(file);
+    storage
+        .put_from_path(key, path, Some(sha256))
+        .await
+        .map_err(CommitFailed::Store)
 }
 
 /// A file served from the cache, with the commit and digest the hops named. A range is read
@@ -3419,6 +3443,49 @@ mod tests {
             CONFIG_BLOB,
             "the helper agrees with the fixture"
         );
+    }
+
+    /// A write that fails mid-fill stops the fill for good: what reached the temp file is no
+    /// longer the whole file, so nothing is committed, while the client is served and checked.
+    #[tokio::test]
+    async fn a_failed_write_stops_the_fill() {
+        let ctx = hf_enabled();
+        let key = "hf/models/org/model/blobs/w";
+        let dir = std::path::Path::new(&ctx.state.config.storage.path).join(FILL_TEMP_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("read-only.part");
+        std::fs::write(&path, b"").unwrap();
+        // Opened for reading only: every write to it fails.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let fill = Fill {
+            expected: HubDigest::Sha256(SHA256.into()),
+            sha256: sha2::Sha256::new(),
+            git: None,
+            store: Some(FillStore {
+                storage: ctx.state.storage.clone(),
+                key: key.to_string(),
+                file,
+                guard: TempFileGuard::new(path.clone()),
+                path,
+            }),
+        };
+        let body = weights();
+        let chunks: Chunks = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from(body[..100].to_vec())),
+            Ok(Bytes::from(body[100..].to_vec())),
+        ]));
+        let mut frames = checked::fill_stream(chunks, fill);
+        let mut got = Vec::new();
+        while let Some(frame) = frames.next().await {
+            got.extend_from_slice(&frame.expect("served despite the failed write"));
+        }
+        assert_eq!(got, body);
+        settle().await;
+        assert!(
+            ctx.state.storage.stat(key).await.is_none(),
+            "a fill that lost a write was committed"
+        );
+        assert_eq!(fill_temps(&ctx), 0);
     }
 
     /// A stored copy changed on disk under its pin ends one frame short, like raw's.
