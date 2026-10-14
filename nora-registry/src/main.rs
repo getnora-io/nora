@@ -408,35 +408,17 @@ const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
 /// (used by `nora mirror` for long-running downloads). When `no_proxy` is true
 /// the client ignores any `HTTP(S)_PROXY` env — required for loopback probes
 /// (the healthcheck) that must reach the local server directly, not via an
-/// upstream proxy.
+/// upstream proxy. `redirect` is reqwest's own default (`Policy::default()`) for
+/// every client but the one in [`build_no_redirect_client`].
 fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
+    redirect: reqwest::redirect::Policy,
 ) -> reqwest::Client {
-    http_client_builder(tls, timeout, no_proxy)
-        .build()
-        .expect("Failed to build HTTP client")
-}
-
-/// The client that never follows a redirect, for a format whose answer depends on what each
-/// hop said (hf: the commit rides on the Hub's redirect). Built like [`build_http_client`]
-/// (custom CA, user agent, proxy settings); the test context builds it here too, so the
-/// tests run against the very client the server uses.
-pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
-    http_client_builder(tls, None, false)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Failed to build HTTP client")
-}
-
-/// The builder behind [`build_http_client`], for a client that differs in one setting.
-fn http_client_builder(
-    tls: &TlsConfig,
-    timeout: Option<std::time::Duration>,
-    no_proxy: bool,
-) -> reqwest::ClientBuilder {
-    let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
+    let mut builder = reqwest::ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .redirect(redirect);
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -468,7 +450,15 @@ fn http_client_builder(
         }
     }
 
-    builder
+    builder.build().expect("Failed to build HTTP client")
+}
+
+/// The client that never follows a redirect, for a format whose answer depends on what each
+/// hop said (hf: the commit rides on the Hub's redirect). Built by [`build_http_client`]
+/// (custom CA, user agent, proxy settings); the test context builds it here too, so the
+/// tests run against the very client the server uses.
+pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
+    build_http_client(tls, None, false, reqwest::redirect::Policy::none())
 }
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
@@ -509,6 +499,7 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
         true,
+        reqwest::redirect::Policy::default(),
     );
     match client.get(&url).send().await {
         // /health returns 200 when healthy, 503 when storage is unreachable.
@@ -1129,6 +1120,7 @@ async fn main() {
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
+                reqwest::redirect::Policy::default(),
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -2103,7 +2095,12 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None, false);
+    let http_client = build_http_client(
+        &config.tls,
+        None,
+        false,
+        reqwest::redirect::Policy::default(),
+    );
     let http_client_no_redirect = build_no_redirect_client(&config.tls);
     log_outbound_proxy();
 
