@@ -3,11 +3,13 @@
 
 //! The Hugging Face format is mounted by `nora serve` itself, not only by the test router.
 //! No test here reaches the network: the upstream is switched off (`NORA_HF_PROXY=`), so a
-//! mounted file route answers 404 with its reason, and the datasets route its 501.
+//! mounted file route answers 404 with its reason, and the datasets route its 501 — or it is
+//! a local server on a thread of the test.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Server {
@@ -207,4 +209,75 @@ fn a_start_removes_stale_fill_temp_files() {
     let _server = serve_in(dir, &[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", "")]);
     assert!(!stale.exists(), "a stale fill temp file survived the start");
     assert!(fresh.exists(), "a fresh fill temp file was removed");
+}
+
+/// A local upstream on a thread of its own: every request gets `answer`, and its request
+/// line is kept.
+struct Upstream {
+    port: u16,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+fn upstream(answer: String) -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                request.push(byte[0]);
+            }
+            let line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            log.lock().unwrap().push(line);
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    Upstream { port, seen }
+}
+
+/// The client `nora serve` walks the Hub with does not follow redirects: the commit and
+/// digest ride on the 302 to the CDN only, and a HEAD answers from that hop without asking
+/// the CDN — with a client that followed the 302 the CDN would be asked, and its answer
+/// carries no commit. The handler tests build their own client; this one is the server's.
+#[test]
+fn the_served_hub_client_walks_redirects_itself() {
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let cdn = upstream(
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".to_string(),
+    );
+    let hub = upstream(format!(
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/blob\r\nX-Repo-Commit: {COMMIT}\r\n\
+         X-Linked-Etag: \"{}\"\r\nX-Linked-Size: 4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        cdn.port,
+        "a".repeat(64)
+    ));
+    let proxy = format!("http://127.0.0.1:{}", hub.port);
+    let server = serve(&[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", &proxy)]);
+    let head = head_of(
+        server.port,
+        "HEAD",
+        "/hf/org/model/resolve/main/model.safetensors",
+    )
+    .to_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains(&format!("x-repo-commit: {COMMIT}")), "{head}");
+    assert!(!head.contains("location:"), "{head}");
+    assert_eq!(
+        hub.seen.lock().unwrap().len(),
+        1,
+        "the hub was not asked once"
+    );
+    assert!(
+        cdn.seen.lock().unwrap().is_empty(),
+        "the CDN was asked: the server's client followed the redirect"
+    );
 }
