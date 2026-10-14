@@ -3059,7 +3059,10 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
             ),
             (
-                ResponseTemplate::new(429).insert_header("retry-after", "55"),
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "55")
+                    .insert_header("set-cookie", "hub=1")
+                    .insert_header("x-request-id", "upstream"),
                 StatusCode::TOO_MANY_REQUESTS,
             ),
         ];
@@ -3081,6 +3084,9 @@ mod tests {
                 assert_eq!(header(&resp, "x-error-code"), "RepoNotFound");
             } else if expected == StatusCode::TOO_MANY_REQUESTS {
                 assert_eq!(header(&resp, "retry-after"), "55");
+                // Only what the client waits by: nothing else of the refusal's headers.
+                assert!(!resp.headers().contains_key("set-cookie"));
+                assert_ne!(header(&resp, "x-request-id"), "upstream");
             } else {
                 assert_eq!(header(&resp, "x-error-message"), CANONICAL_UNKNOWN);
             }
