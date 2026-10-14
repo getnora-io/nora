@@ -446,8 +446,10 @@ refuses before the upstream is asked, a rule on a commit holds for `main` when `
 also for a file already cached. When curation can refuse by name (curation on, or an internal
 namespace set), an alias — a legacy id such as `gpt2`, another case, a renamed repository — is
 checked under its canonical id too, learned from the upstream (`HEAD /api/models/{id}`); if NORA
-cannot learn it, the download is refused. `curation.min_release_age` with hf enabled is refused at
-start: a Hub commit has no publish date NORA can read.
+cannot learn it, enforcing curation refuses the download (502), while audit logs it under the
+requested id and goes on. A commit no hop of the Hub's answer names is not "any version": an
+allowlist of commits lets nothing through without one. `curation.min_release_age` with hf enabled is
+refused at start: a Hub commit has no publish date NORA can read.
 
 **Limitations (this release):**
 - **Datasets and Spaces** are not served (501).
@@ -456,7 +458,8 @@ start: a Hub commit has no publish date NORA can read.
 - **One anonymous client at the Hub** — every request reaches the Hub from NORA's address without a
   token, so the Hub's anonymous rate limits are shared by every client behind NORA (cached files
   still cost a resolve request each). A `429` is handed on with `Retry-After`, `RateLimit` and
-  `RateLimit-Policy`, by which huggingface_hub waits for the window to reset.
+  `RateLimit-Policy`, by which huggingface_hub waits for the window to reset, and says it is a rate
+  limit when the Hub's answer names no reason.
 - **The Hub must be reachable** for a download: the resolve answer is asked every time, and there is
   no stale serving yet.
 - **`HfFileSystem`** is not measured; its `paths-info` call is a `POST` and answers 405.
