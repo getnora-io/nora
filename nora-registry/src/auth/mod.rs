@@ -1763,6 +1763,9 @@ Jd74nq6dNCjpWG4drIsyhqX+
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            pull_stats: std::sync::Arc::new(
+                crate::registry::docker::PullStatsAccumulator::default(),
+            ),
         };
 
         // Rebuild router with new state

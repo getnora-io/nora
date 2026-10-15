@@ -364,6 +364,7 @@ fn build_context_with(
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

@@ -373,6 +373,58 @@ pub struct LayerInfo {
     pub size: u64,
 }
 
+/// One manifest's un-flushed pull statistics (#1114).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct PullDelta {
+    /// Pulls counted since the last flush.
+    pub downloads: u64,
+    /// Most recent pull time (unix secs) seen since the last flush.
+    pub last_pulled: u64,
+}
+
+/// In-memory, off-request-path accumulator for docker pull statistics (#1114).
+///
+/// A manifest GET bumps the per-key counter here (a microsecond lock, no I/O)
+/// instead of rewriting the manifest's `.meta.json` — which every pull used to
+/// do and which raced the request-path publish-date read, logging INTEGRITY
+/// VIOLATION on healthy data. A background task drains this in batches into a
+/// separate `.stats.json` sidecar, so `.meta.json` is immutable after publish.
+///
+/// Soft state: the map is rebuildable-empty after a restart, so at most one
+/// flush interval of counts is lost on a crash (accepted — pull stats are
+/// best-effort, like the in-memory indexes). Mirrors the `publish_locks`
+/// pattern (`parking_lot::Mutex<HashMap>`) to add no new dependency.
+#[derive(Default)]
+pub(crate) struct PullStatsAccumulator {
+    inner: parking_lot::Mutex<std::collections::HashMap<String, PullDelta>>,
+}
+
+impl PullStatsAccumulator {
+    /// Record one pull of `meta_key` at `now` (unix secs). Cheap: a brief lock,
+    /// no storage I/O, no spawn, no publish lock.
+    pub(crate) fn record(&self, meta_key: &str, now: u64) {
+        let mut g = self.inner.lock();
+        let e = g.entry(meta_key.to_string()).or_default();
+        e.downloads += 1;
+        if now > e.last_pulled {
+            e.last_pulled = now;
+        }
+    }
+
+    /// Take and clear every accumulated delta — for the flush task.
+    pub(crate) fn drain(&self) -> Vec<(String, PullDelta)> {
+        std::mem::take(&mut *self.inner.lock())
+            .into_iter()
+            .collect()
+    }
+
+    /// The current un-flushed delta for one key (for the UI read path to add on
+    /// top of the flushed sidecar value). Default (zeros) when nothing pending.
+    pub(crate) fn peek(&self, meta_key: &str) -> PullDelta {
+        self.inner.lock().get(meta_key).copied().unwrap_or_default()
+    }
+}
+
 /// In-progress upload session with metadata.
 ///
 /// Blob data is streamed frame-by-frame to a temporary file, bounded per request
@@ -2398,14 +2450,17 @@ fn serve_cached_manifest(
     // Detect manifest media type from content
     let content_type = detect_manifest_media_type(data);
 
-    // Update metadata (downloads, last_pulled) in background
-    tokio::spawn(update_metadata_on_pull(
-        state.clone(),
-        state.storage.clone(),
-        ns.map(String::from),
-        name.to_string(),
-        reference.to_string(),
-    ));
+    // Count the pull OFF the request path (#1114): bump the in-memory
+    // accumulator instead of rewriting `.meta.json`. A background task flushes
+    // it to a `.stats.json` sidecar. No spawn, no publish lock, no storage write
+    // here — so the request-path publish-date read never races a pull.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    state
+        .pull_stats
+        .record(&manifest_meta_key(ns, name, reference), now);
 
     manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
@@ -2696,6 +2751,9 @@ async fn delete_manifest_and_meta(
             let lock = state.publish_lock(&meta_key);
             let _guard = lock.lock().await;
             let _ = state.storage.delete(&meta_key).await;
+            // #1114: drop the pull-stats sidecar under the same lock, so a
+            // concurrent flush cannot leave a stale .stats.json for a gone manifest.
+            let _ = state.storage.delete(&manifest_stats_key(&meta_key)).await;
         }
     }
     result
@@ -4221,61 +4279,120 @@ async fn get_config_info(
     (os, arch, variant)
 }
 
-/// Update metadata when a manifest is pulled: increments the download counter and updates
-/// last_pulled — under the metadata lock only, and only while a manifest the pull could have
-/// been served from is still stored. The task runs at any later point; after a delete it must
-/// not bring the deleted manifest's metadata back.
-async fn update_metadata_on_pull(
-    state: AppState,
-    storage: Storage,
-    ns: Option<String>,
-    name: String,
-    reference: String,
-) {
-    let ns = ns.as_deref();
-    let meta_key = manifest_meta_key(ns, &name, &reference);
-    // The manifest the pull was served from: `get_manifest` passes a namespace only for a hit on
-    // the namespaced key, so this is that key — the bare key may hold another manifest.
-    let manifest_keys = [manifest_key(ns, &name, &reference)];
-    // Lock to prevent lost counter increments from concurrent pulls; push and delete write and
-    // remove the metadata under the same lock.
-    let lock = state.publish_lock(&meta_key);
-    let _guard = lock.lock().await;
+/// How often the background task folds accumulated pull counts into the
+/// sidecars (#1114). Soft state: a crash loses at most this much (accepted).
+pub(crate) const PULL_STATS_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(45);
 
-    let mut stored = false;
-    for key in &manifest_keys {
-        if storage.stat(key).await.is_some() {
-            stored = true;
-            break;
+/// Fold accumulated pull counts into their `.stats.json` sidecars every
+/// `interval`, and once more on shutdown, so a hard crash loses at most one
+/// interval of counts. Extracted from `main` (with the interval injected) so a
+/// test can drive the tick path (not only the shutdown path): the loss bound
+/// depends on the tick flush running, not just the final flush on cancel (#1114).
+pub(crate) async fn pull_stats_flush_loop(state: AppState, interval: std::time::Duration) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        // CANCEL-SAFETY: both arms are cancel-safe (an interval tick and a
+        // cancellation token). On shutdown we run one final flush, then stop.
+        tokio::select! {
+            _ = tick.tick() => {
+                flush_pull_stats(&state).await;
+            }
+            _ = state.cancel_token.cancelled() => {
+                flush_pull_stats(&state).await;
+                break;
+            }
         }
     }
-    if !stored {
-        return;
+}
+
+/// Cumulative pull statistics for one manifest, stored in a `.stats.json`
+/// sidecar beside its `.meta.json` (#1114). Kept out of `.meta.json` so a pull
+/// never rewrites the integrity metadata a concurrent request reads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct StatsSidecar {
+    pub downloads: u64,
+    pub last_pulled: u64,
+}
+
+/// The `.stats.json` sidecar key for a manifest's `.meta.json` key.
+fn manifest_stats_key(meta_key: &str) -> String {
+    let base = meta_key.strip_suffix(".meta.json").unwrap_or(meta_key);
+    format!("{base}.stats.json")
+}
+
+/// Cumulative stats for a manifest: the `.stats.json` sidecar if present, else
+/// the legacy counts still in a pre-V3 `.meta.json` (migrated on the next flush),
+/// else zero.
+async fn read_cumulative_stats(storage: &Storage, meta_key: &str) -> StatsSidecar {
+    let stats_key = manifest_stats_key(meta_key);
+    if let Ok(data) = storage.get(&stats_key).await {
+        if let Ok(s) = serde_json::from_slice::<StatsSidecar>(&data) {
+            return s;
+        }
     }
+    // Migration: a manifest pushed before V3 still carries counts in .meta.json.
+    if let Ok(data) = storage.get(meta_key).await {
+        if let Ok(m) = serde_json::from_slice::<ImageMetadata>(&data) {
+            return StatsSidecar {
+                downloads: m.downloads,
+                last_pulled: m.last_pulled,
+            };
+        }
+    }
+    StatsSidecar::default()
+}
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+/// Current pull stats for the UI and reports: the flushed cumulative value plus
+/// the un-flushed in-memory delta.
+pub(crate) async fn current_pull_stats(state: &AppState, meta_key: &str) -> StatsSidecar {
+    let base = read_cumulative_stats(&state.storage, meta_key).await;
+    let delta = state.pull_stats.peek(meta_key);
+    StatsSidecar {
+        downloads: base.downloads + delta.downloads,
+        last_pulled: base.last_pulled.max(delta.last_pulled),
+    }
+}
 
-    // Try to read existing metadata
-    let mut metadata = if let Ok(data) = storage.get(&meta_key).await {
-        serde_json::from_slice::<ImageMetadata>(&data).unwrap_or_default()
-    } else {
-        ImageMetadata::default()
-    };
-
-    // Update pull stats
-    metadata.downloads += 1;
-    metadata.last_pulled = now;
-
-    // Save back
-    if let Ok(json) = serde_json::to_vec(&metadata) {
-        if let Err(e) = storage.put(&meta_key, &json).await {
-            tracing::warn!(key = %meta_key, error = %e, "cache write failed (pull stats update)");
-            crate::metrics::CACHE_WRITE_ERRORS
-                .with_label_values(&["docker", "metadata"])
-                .inc();
+/// Drain the pull-stats accumulator and fold each delta into its `.stats.json`
+/// sidecar (#1114). Keeps the deleted-manifest guard of the old per-pull
+/// writer: a delta for a manifest no longer stored is dropped, never
+/// resurrecting its stats. Replaces the per-pull `.meta.json` rewrite.
+pub(crate) async fn flush_pull_stats(state: &AppState) {
+    for (meta_key, delta) in state.pull_stats.drain() {
+        if delta.downloads == 0 && delta.last_pulled == 0 {
+            continue;
+        }
+        // Serialize with push/delete on this manifest, as the old per-pull writer
+        // did: take the publish lock, THEN re-check the manifest is stored, so a
+        // delete that landed since the pull cannot be undone by writing a stale
+        // sidecar after it (the sidecar is removed under the same lock on delete).
+        let lock = state.publish_lock(&meta_key);
+        let _guard = lock.lock().await;
+        // The manifest blob key is the meta key with `.meta.json` → `.json`
+        // (what `manifest_key` builds); stripping only `.meta.json` would check
+        // `…/<ref>` and always miss, so the guard would skip every flush and the
+        // sidecar would never be written (the stats would be silently lost).
+        let manifest_key = format!(
+            "{}.json",
+            meta_key.strip_suffix(".meta.json").unwrap_or(&meta_key)
+        );
+        // Deleted-manifest guard: never resurrect a gone manifest's stats.
+        if state.storage.stat(&manifest_key).await.is_none() {
+            continue;
+        }
+        let mut stats = read_cumulative_stats(&state.storage, &meta_key).await;
+        stats.downloads += delta.downloads;
+        stats.last_pulled = stats.last_pulled.max(delta.last_pulled);
+        let stats_key = manifest_stats_key(&meta_key);
+        if let Ok(json) = serde_json::to_vec(&stats) {
+            if let Err(e) = state.storage.put(&stats_key, &json).await {
+                tracing::warn!(key = %stats_key, error = %e, "pull-stats sidecar write failed");
+                crate::metrics::CACHE_WRITE_ERRORS
+                    .with_label_values(&["docker", "stats"])
+                    .inc();
+            }
         }
     }
 }
@@ -5073,17 +5190,12 @@ mod integration_tests {
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         }
 
-        // Pull statistics are written in the background.
+        // #1114: pull stats live in the in-memory accumulator (flushed to a
+        // .stats.json sidecar), read via current_pull_stats. record() runs
+        // synchronously on the GET path, so the counts are already visible.
         let downloads = |key: String| {
-            let storage = ctx.state.storage.clone();
-            async move {
-                storage
-                    .get(&key)
-                    .await
-                    .ok()
-                    .and_then(|d| serde_json::from_slice::<super::ImageMetadata>(&d).ok())
-                    .map(|m| m.downloads)
-            }
+            let state = ctx.state.clone();
+            async move { Some(super::current_pull_stats(&state, &key).await.downloads) }
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -5106,6 +5218,384 @@ mod integration_tests {
         );
         // Curation still reads the push date after the pulls.
         assert_eq!(pushed_at(ctx.state.clone()).await, date);
+    }
+
+    /// #1114: a manifest pull must NOT rewrite its `.meta.json`. Pull statistics
+    /// (downloads, last_pulled) are accumulated off the request path and flushed in
+    /// batches to a separate sidecar, so the integrity-relevant `.meta.json` that a
+    /// concurrent request reads (`extract_docker_publish_date`) is never rewritten by
+    /// a pull — the source of the false INTEGRITY VIOLATION on healthy data (33-41
+    /// per 100 GETs on 1.3.5). RED before V3: `update_metadata_on_pull` rewrites the
+    /// `.meta.json` on every GET (downloads += 1, last_pulled = now).
+    #[tokio::test]
+    async fn a_pull_does_not_rewrite_the_manifest_meta_json() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        seed_zero_config(&ctx.state, "stable-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/stable-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let meta_key = "docker/stable-img/manifests/v1.meta.json";
+        let before = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta written at push");
+
+        for _ in 0..5 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // Give any off-request-path stats work time to land before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta still present");
+        assert_eq!(
+            before, after,
+            "a pull rewrote the manifest .meta.json (stats must go to the off-path sidecar, not the integrity meta)"
+        );
+    }
+
+    /// #1114: the same holds under the real trigger — a herd of parallel pulls
+    /// of one manifest (the docker proxy's thundering herd). On 1.3.5 each pull's
+    /// off-path stats write raced the others and the request-path publish-date read,
+    /// logging INTEGRITY VIOLATION on healthy data (19 even from one client pulling
+    /// back-to-back). A batched off-path sidecar leaves `.meta.json` byte-identical
+    /// no matter how many concurrent pulls land.
+    #[tokio::test]
+    async fn concurrent_pulls_do_not_rewrite_the_manifest_meta_json() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        seed_zero_config(&ctx.state, "herd-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/herd-img/manifests/v1",
+            Body::from(manifest_bytes),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let meta_key = "docker/herd-img/manifests/v1.meta.json";
+        let before = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta written at push");
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let app = ctx.app.clone();
+            handles.push(tokio::spawn(async move {
+                send(
+                    &app,
+                    Method::GET,
+                    "/v2/herd-img/manifests/v1",
+                    Body::empty(),
+                )
+                .await
+                .status()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), StatusCode::OK);
+        }
+        // Let any off-request-path stats work settle before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = ctx
+            .state
+            .storage
+            .get(meta_key)
+            .await
+            .expect("meta still present");
+        assert_eq!(
+            before, after,
+            "concurrent pulls rewrote the manifest .meta.json"
+        );
+    }
+
+    /// #1114 unit: the pull-stats accumulator counts, peeks the un-flushed
+    /// delta, keeps last_pulled as the max seen, and drains to empty.
+    #[test]
+    fn pull_stats_accumulator_counts_peeks_and_drains() {
+        let acc = super::PullStatsAccumulator::default();
+        acc.record("k1", 100);
+        acc.record("k1", 200);
+        acc.record("k2", 150);
+        assert_eq!(
+            acc.peek("k1"),
+            super::PullDelta {
+                downloads: 2,
+                last_pulled: 200
+            }
+        );
+        assert_eq!(
+            acc.peek("k2"),
+            super::PullDelta {
+                downloads: 1,
+                last_pulled: 150
+            }
+        );
+        assert_eq!(acc.peek("absent"), super::PullDelta::default());
+
+        let mut drained = acc.drain();
+        drained.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            drained,
+            vec![
+                (
+                    "k1".to_string(),
+                    super::PullDelta {
+                        downloads: 2,
+                        last_pulled: 200
+                    }
+                ),
+                (
+                    "k2".to_string(),
+                    super::PullDelta {
+                        downloads: 1,
+                        last_pulled: 150
+                    }
+                ),
+            ]
+        );
+        assert_eq!(acc.peek("k1"), super::PullDelta::default());
+        assert!(acc.drain().is_empty());
+
+        // last_pulled is the max seen, never regressed by a later-but-smaller now.
+        acc.record("k1", 50);
+        acc.record("k1", 40);
+        assert_eq!(
+            acc.peek("k1"),
+            super::PullDelta {
+                downloads: 2,
+                last_pulled: 50
+            }
+        );
+    }
+
+    /// Minimal hosted manifest for the flush tests: push `stable-img:v1`, return
+    /// its meta key. Mirrors the push the other V3 tests use.
+    async fn push_stable_img(ctx: &crate::test_helpers::TestContext) -> &'static str {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "stable-img").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/stable-img/manifests/v1",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        "docker/stable-img/manifests/v1.meta.json"
+    }
+
+    /// #1114 (M5): the flush LOOP persists on an interval tick, not only on
+    /// shutdown. Without the tick flush a crash loses every count since start,
+    /// not "at most one interval" as the soft-state contract promises. A short
+    /// interval drives a real tick; the assert is taken before any cancellation,
+    /// so a loop that flushes only on shutdown fails it.
+    #[tokio::test]
+    async fn a_flush_loop_tick_persists_the_sidecar_before_shutdown() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        ctx.state.pull_stats.record(meta_key, 100);
+        let handle = tokio::spawn(super::pull_stats_flush_loop(
+            ctx.state.clone(),
+            std::time::Duration::from_millis(10),
+        ));
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+        let mut persisted = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if ctx.state.storage.get(stats_key).await.is_ok() {
+                persisted = true;
+                break;
+            }
+        }
+        ctx.state.cancel_token.cancel();
+        let _ = handle.await;
+        assert!(
+            persisted,
+            "a tick must flush the sidecar before any shutdown (the loss bound depends on it)"
+        );
+    }
+
+    /// #1114 positive control: a flush actually PERSISTS the stats to the
+    /// `.stats.json` sidecar for a live manifest (the guard must find the
+    /// manifest at `…/v1.json`, not `…/v1`). This is the control that was
+    /// missing — without it the flush guard was vacuous and the stats were
+    /// silently dropped. RED if the flush never writes the sidecar.
+    #[tokio::test]
+    async fn a_flush_persists_the_pull_stats_sidecar() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+
+        for _ in 0..3 {
+            let r = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        // Batched: nothing in the sidecar until a flush runs.
+        assert!(
+            ctx.state.storage.get(stats_key).await.is_err(),
+            "sidecar must not exist before a flush"
+        );
+
+        super::flush_pull_stats(&ctx.state).await;
+
+        let raw = ctx
+            .state
+            .storage
+            .get(stats_key)
+            .await
+            .expect("flush must persist the .stats.json sidecar");
+        let sidecar: super::StatsSidecar = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(sidecar.downloads, 3, "three pulls persisted");
+        assert!(sidecar.last_pulled > 0, "last_pulled persisted");
+        // current_pull_stats equals the flushed value (accumulator drained).
+        assert_eq!(
+            super::current_pull_stats(&ctx.state, meta_key)
+                .await
+                .downloads,
+            3
+        );
+    }
+
+    /// (M8, M12): the read path SUMS the flushed count and the pending delta;
+    /// a later flush ADVANCES last_pulled past the flushed value.
+    #[tokio::test]
+    async fn read_sums_pending_and_flush_advances_last_pulled() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        ctx.state.pull_stats.record(meta_key, 100);
+        ctx.state.pull_stats.record(meta_key, 100);
+        super::flush_pull_stats(&ctx.state).await;
+        ctx.state.pull_stats.record(meta_key, 200);
+        assert_eq!(
+            super::current_pull_stats(&ctx.state, meta_key)
+                .await
+                .downloads,
+            3
+        );
+        super::flush_pull_stats(&ctx.state).await;
+        let raw = ctx
+            .state
+            .storage
+            .get("docker/stable-img/manifests/v1.stats.json")
+            .await
+            .unwrap();
+        let s: super::StatsSidecar = serde_json::from_slice(&raw).unwrap();
+        assert_eq!((s.downloads, s.last_pulled), (3, 200));
+    }
+
+    /// #1114: legacy counts in a pre-V3 `.meta.json` are migrated into the
+    /// sidecar on the first flush — not lost, and not re-migrated (doubled) on
+    /// later flushes (the sidecar becomes authoritative once written).
+    #[tokio::test]
+    async fn flush_migrates_legacy_meta_counts_once() {
+        let ctx = create_test_context();
+        let meta_key = push_stable_img(&ctx).await;
+        let stats_key = "docker/stable-img/manifests/v1.stats.json";
+
+        // Seed a pre-V3 .meta.json carrying 5 downloads.
+        let mut m: super::ImageMetadata =
+            serde_json::from_slice(&ctx.state.storage.get(meta_key).await.unwrap()).unwrap();
+        m.downloads = 5;
+        m.last_pulled = 1_000;
+        ctx.state
+            .storage
+            .put(meta_key, &serde_json::to_vec(&m).unwrap())
+            .await
+            .unwrap();
+
+        let pull = || async {
+            let r = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/stable-img/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        };
+
+        pull().await;
+        super::flush_pull_stats(&ctx.state).await;
+        let read = |k: &'static str| {
+            let st = ctx.state.storage.clone();
+            async move {
+                serde_json::from_slice::<super::StatsSidecar>(&st.get(k).await.unwrap()).unwrap()
+            }
+        };
+        assert_eq!(
+            read(stats_key).await.downloads,
+            6,
+            "legacy 5 migrated + 1 new, not lost"
+        );
+
+        pull().await;
+        super::flush_pull_stats(&ctx.state).await;
+        assert_eq!(
+            read(stats_key).await.downloads,
+            7,
+            "second flush adds 1 to the sidecar, does not re-migrate the legacy 5"
+        );
     }
 
     /// A pull leaves the push date curation reads where it was, even when the
@@ -5163,14 +5653,11 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let downloads = ctx
-                .state
-                .storage
-                .get(meta_key)
-                .await
-                .ok()
-                .and_then(|d| serde_json::from_slice::<super::ImageMetadata>(&d).ok())
-                .map(|m| m.downloads);
+            let downloads = Some(
+                super::current_pull_stats(&ctx.state, meta_key)
+                    .await
+                    .downloads,
+            );
             if downloads == Some(1) {
                 break;
             }
@@ -5219,14 +5706,11 @@ mod integration_tests {
         let meta_key = super::manifest_meta_key(Some("docker.io"), "library/proxied", &digest);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let downloads = ctx
-                .state
-                .storage
-                .get(&meta_key)
-                .await
-                .ok()
-                .and_then(|d| serde_json::from_slice::<super::ImageMetadata>(&d).ok())
-                .map(|m| m.downloads);
+            let downloads = Some(
+                super::current_pull_stats(&ctx.state, &meta_key)
+                    .await
+                    .downloads,
+            );
             if downloads == Some(2) {
                 break;
             }
@@ -9106,8 +9590,8 @@ mod hosted_pull_stats_and_re_push {
             .unwrap();
 
         if with_pull {
-            // A pull: its statistics write is held after it read the old metadata.
-            backend.armed.store(true, Ordering::SeqCst);
+            // V3: the pull records in-memory and never writes .meta.json, so it
+            // cannot clobber the publish date curation reads.
             let pull = super::get_manifest(
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
@@ -9115,20 +9599,12 @@ mod hosted_pull_stats_and_re_push {
             )
             .await;
             assert_eq!(pull.status(), StatusCode::OK);
-            // CANCEL-SAFETY: a timed-out wait drops only the notification future; the test
-            // fails on the expect below.
-            tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
-                .await
-                .expect("the pull statistics write was not reached");
         }
 
-        // A re-push now; give it time to land (or to wait on a shared lock), then release.
-        let repush = tokio::spawn(push(state.clone(), manifest.clone()));
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        release.notify_one();
-        assert_eq!(repush.await.unwrap(), StatusCode::CREATED);
-        // Let the released write finish.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // A re-push sets the new date; a flush then touches only the .stats.json sidecar.
+        let repush = push(state.clone(), manifest.clone()).await;
+        assert_eq!(repush, StatusCode::CREATED);
+        super::flush_pull_stats(&state).await;
 
         super::extract_docker_publish_date(
             &state.storage,
@@ -9212,7 +9688,11 @@ mod hosted_pull_stats_and_re_push {
         .await;
         assert_eq!(pushed.status(), StatusCode::CREATED);
 
-        backend.armed.store(true, Ordering::SeqCst);
+        // V3: the pull records in-memory (no storage write); the manifest is then
+        // deleted; a later flush must honour the deleted-manifest guard and
+        // resurrect neither the .meta.json nor the .stats.json. The held-put arming
+        // (backend.armed / reached / release) is left unused — the pull no longer
+        // writes, so there is nothing to hold.
         let pull = super::get_manifest(
             State(state.clone()),
             axum::http::HeaderMap::new(),
@@ -9220,23 +9700,24 @@ mod hosted_pull_stats_and_re_push {
         )
         .await;
         assert_eq!(pull.status(), StatusCode::OK);
-        // CANCEL-SAFETY: a timed-out wait drops only the notification future; the test fails
-        // on the expect below.
-        tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
-            .await
-            .expect("the pull statistics write was not reached");
 
-        let delete = tokio::spawn(super::delete_manifest(
+        let delete = super::delete_manifest(
             State(state.clone()),
             Path(("race-img".to_string(), "v1".to_string())),
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        release.notify_one();
-        assert_eq!(delete.await.unwrap().status(), StatusCode::ACCEPTED);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        )
+        .await;
+        assert_eq!(delete.status(), StatusCode::ACCEPTED);
+        super::flush_pull_stats(&state).await;
+        // The flush never writes .meta.json: the metadata the delete removed stays
+        // removed. On this backend (in-memory + an upstream namespace) the bare
+        // manifest survives the delete through a separate pre-existing gap, so the
+        // flush legitimately persists the .stats.json sidecar (the manifest is
+        // still stored); the no-resurrect guard for a truly-gone manifest is
+        // covered on the local backend by delete_during_pull and
+        // a_pull_stats_task_after_the_delete_leaves_no_metadata.
         assert!(
             state.storage.stat(meta_key).await.is_none(),
-            "the deleted manifest's metadata was written back"
+            "the deleted manifest's .meta.json was written back by the flush"
         );
     }
 }
@@ -9455,20 +9936,28 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             StatusCode::CREATED
         );
         assert!(f.state.storage.stat(&key).await.is_some());
-        f.held.hold_put.store(true, Ordering::SeqCst);
+        // V3: the pull records in-memory (no storage write); the manifest is then
+        // deleted; a later flush must honour the deleted-manifest guard and
+        // resurrect neither the .meta.json nor the .stats.json of a gone manifest.
         pull(&f.state, pull_ref).await;
-        reached(&f.held.put_reached, "pull stats write not reached").await;
-        let del = tokio::spawn(super::delete_manifest(
+        let del = super::delete_manifest(
             State(f.state.clone()),
             Path(("race-img".to_string(), delete_ref.to_string())),
-        ));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        f.held.put_release.notify_one();
-        assert_eq!(del.await.unwrap().status(), StatusCode::ACCEPTED);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::ACCEPTED);
+        super::flush_pull_stats(&f.state).await;
         assert!(
             f.state.storage.stat(&key).await.is_none(),
             "metadata {key} of the deleted manifest was written back"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "the stats sidecar of the deleted manifest was written back"
         );
     }
 
@@ -9506,14 +9995,15 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             StatusCode::CREATED
         );
         set_push_ts(&f.state, &key, 1_000_000).await;
-        f.held.hold_put.store(true, Ordering::SeqCst);
+        // V3: the pull records in-memory and never writes .meta.json, so it cannot
+        // clobber the publish date. A re-push sets the new date; a later flush
+        // touches only the .stats.json sidecar, never the publish timestamp.
         pull(&f.state, pull_ref).await;
-        reached(&f.held.put_reached, "pull stats write not reached").await;
-        let rp = tokio::spawn(push(f.state.clone(), tag.into(), f.manifest.clone()));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        f.held.put_release.notify_one();
-        assert_eq!(rp.await.unwrap(), StatusCode::CREATED);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            push(f.state.clone(), tag.into(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        super::flush_pull_stats(&f.state).await;
         let got = date(&f.state, pull_ref).await.unwrap();
         assert!(
             got > 1_000_000,
@@ -9559,13 +10049,16 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             Path(("race-img".to_string(), "v1".to_string())),
         ));
         reached(&f.held.del_reached, "metadata delete not reached").await;
-        let stats = tokio::spawn(super::update_metadata_on_pull(
-            f.state.clone(),
-            f.state.storage.clone(),
-            None,
-            "race-img".to_string(),
-            "v1".to_string(),
-        ));
+        // V3: a pull recorded now; its flush races the in-flight delete. The flush
+        // waits on the publish lock the delete holds, then finds the manifest gone
+        // and drops the delta — the sidecar must not resurrect the deleted manifest.
+        f.state.pull_stats.record(&key, 1_700_000_000);
+        let stats = {
+            let st = f.state.clone();
+            tokio::spawn(async move {
+                super::flush_pull_stats(&st).await;
+            })
+        };
         tokio::time::sleep(Duration::from_millis(300)).await;
         f.held.del_release.notify_one();
         assert_eq!(del.await.unwrap().status(), StatusCode::ACCEPTED);
@@ -9573,6 +10066,14 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
         assert!(
             f.state.storage.stat(&key).await.is_none(),
             "the deleted manifest's metadata is back"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "a flush resurrected the deleted manifest's stats sidecar"
         );
         assert_eq!(
             date(&f.state, "v1").await,
@@ -9647,17 +10148,22 @@ mod hosted_pull_stats_after_a_delete {
         )
         .await;
         assert_eq!(del.status(), StatusCode::ACCEPTED);
-        super::update_metadata_on_pull(
-            state.clone(),
-            state.storage.clone(),
-            None,
-            "race-img".to_string(),
-            "v1".to_string(),
-        )
-        .await;
+        // V3: a late pull records into the in-memory accumulator; the flush's
+        // deleted-manifest guard must drop it — neither .meta.json nor the
+        // .stats.json sidecar may reappear for a manifest that was deleted.
+        state.pull_stats.record(&key, 1_700_000_000);
+        super::flush_pull_stats(&state).await;
         assert!(
             state.storage.stat(&key).await.is_none(),
-            "the deleted manifest's metadata was re-created by a late pull stats task"
+            "the deleted manifest's metadata was re-created by a late pull flush"
+        );
+        assert!(
+            state
+                .storage
+                .stat(&super::manifest_stats_key(&key))
+                .await
+                .is_none(),
+            "the deleted manifest's stats sidecar was created by a late pull flush"
         );
     }
 }
@@ -9887,10 +10393,7 @@ mod manifest_before_metadata_one_lock_order {
     }
 
     async fn downloads(state: &crate::AppState, key: &str) -> Option<u64> {
-        let d = state.storage.get(key).await.ok()?;
-        serde_json::from_slice::<super::ImageMetadata>(&d)
-            .ok()
-            .map(|m| m.downloads)
+        Some(super::current_pull_stats(state, key).await.downloads)
     }
 
     /// The delete is held at `held_manifest`'s removal; a pull of `pull_ref` is served and its
@@ -9958,23 +10461,124 @@ mod manifest_before_metadata_one_lock_order {
         pull_while_manifest_delete_held(&f, &dm, &d, "v1", &dmeta).await;
     }
 
-    /// the statistics task's "manifest still stored" answer must not be used after a whole
-    /// delete ran in between (check outside the lock = TOCTOU).
+    // ---- pull-stats sidecar: regression fixtures ----
+
+    /// (M1, M2): a FLUSH must not rewrite .meta.json either — not to mirror
+    /// the counts, not to clear migrated legacy counts.
     #[tokio::test]
-    async fn a_delete_between_the_stats_check_and_its_write_leaves_no_metadata() {
-        let f = fx(false, false).await;
-        f.held.arm(STAT, TAG_MANIFEST);
+    async fn flush_never_rewrites_the_meta_json() {
+        let f = fx(false, true).await;
+        let mut m: super::ImageMetadata =
+            serde_json::from_slice(&f.state.storage.get(TAG_META).await.unwrap()).unwrap();
+        m.downloads = 5;
+        m.last_pulled = 1_000;
+        f.state
+            .storage
+            .put(TAG_META, &serde_json::to_vec(&m).unwrap())
+            .await
+            .unwrap();
+        let before = f.state.storage.get(TAG_META).await.unwrap();
+        for _ in 0..2 {
+            pull(&f.state, "v1").await;
+            super::flush_pull_stats(&f.state).await;
+        }
+        assert_eq!(
+            downloads(&f.state, TAG_META).await,
+            Some(7),
+            "control: the flush ran and migrated"
+        );
+        assert_eq!(
+            f.state.storage.get(TAG_META).await.unwrap(),
+            before,
+            "a flush rewrote .meta.json"
+        );
+    }
+
+    /// the flush's existence answer is held; a whole delete runs; on
+    /// release the flush must not resurrect the deleted manifest's stats sidecar.
+    #[tokio::test]
+    async fn delete_while_the_flush_check_is_held_leaves_no_stats() {
+        let f = fx(false, true).await;
         pull(&f.state, "v1").await;
-        reached(&f.held.reached, "statistics existence check not reached").await;
+        f.held.arm(STAT, TAG_MANIFEST);
+        let flush = {
+            let st = f.state.clone();
+            tokio::spawn(async move { super::flush_pull_stats(&st).await })
+        };
+        reached(&f.held.reached, "flush existence check not reached").await;
         let del = tokio::spawn(delete(f.state.clone(), "v1".into()));
         tokio::time::sleep(Duration::from_millis(300)).await;
         f.held.release.notify_one();
+        finishes(flush, "flush hung").await;
         assert_eq!(finishes(del, "delete hung").await, StatusCode::ACCEPTED);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(f.state.storage.stat(TAG_MANIFEST).await.is_none());
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(TAG_META))
+                .await
+                .is_none(),
+            "the flush resurrected the deleted manifest's stats sidecar"
+        );
+    }
+
+    /// a delete removes an ALREADY-FLUSHED sidecar; a re-push of the
+    /// same tag starts from zero, not from the deleted manifest's count.
+    #[tokio::test]
+    async fn delete_drops_the_flushed_stats_sidecar() {
+        let f = fx(false, true).await;
+        pull(&f.state, "v1").await;
+        super::flush_pull_stats(&f.state).await;
+        let sk = super::manifest_stats_key(TAG_META);
+        assert!(
+            f.state.storage.stat(&sk).await.is_some(),
+            "control: flushed"
+        );
+        assert_eq!(
+            delete(f.state.clone(), "v1".into()).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            f.state.storage.stat(&sk).await.is_none(),
+            "the deleted manifest's stats sidecar survived the delete"
+        );
+        assert_eq!(
+            push(f.state.clone(), f.manifest.clone()).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(downloads(&f.state, TAG_META).await, Some(0));
+    }
+
+    /// A delete that lands before a flush leaves no metadata and no stats sidecar:
+    /// the flush re-checks the manifest under the publish lock and skips a gone
+    /// one. This is the SEQUENTIAL case; the concurrent race — the flush's
+    /// existence answer held across a whole delete — is covered by
+    /// `delete_while_the_flush_check_is_held_leaves_no_stats`.
+    #[tokio::test]
+    async fn a_delete_between_the_stats_check_and_its_write_leaves_no_metadata() {
+        let f = fx(false, false).await;
+        // V3: the pull records in-memory; the flush's existence check and its
+        // sidecar write are both under the per-key publish lock (a delete takes the
+        // same lock), so a delete cannot slip between the check and the write. After
+        // a delete, a flush resurrects neither the metadata nor the stats sidecar.
+        pull(&f.state, "v1").await;
+        assert_eq!(
+            delete(f.state.clone(), "v1".into()).await,
+            StatusCode::ACCEPTED
+        );
+        super::flush_pull_stats(&f.state).await;
         assert!(f.state.storage.stat(TAG_MANIFEST).await.is_none());
         assert!(
             f.state.storage.stat(TAG_META).await.is_none(),
             "the deleted manifest's metadata was created after the delete"
+        );
+        assert!(
+            f.state
+                .storage
+                .stat(&super::manifest_stats_key(TAG_META))
+                .await
+                .is_none(),
+            "the deleted manifest's stats sidecar was created after the delete"
         );
     }
 
@@ -9983,14 +10587,17 @@ mod manifest_before_metadata_one_lock_order {
     #[tokio::test]
     async fn push_and_delete_during_a_pull_do_not_deadlock() {
         let f = fx(false, false).await;
-        f.held.arm(PUT, TAG_META);
+        // V3: the pull records in-memory; the flush, a re-push, and a delete all
+        // take the per-key publish lock, so they serialize without a lock-order
+        // deadlock. Run them concurrently and require all three to finish.
         pull(&f.state, "v1").await;
-        reached(&f.held.reached, "pull statistics write not reached").await;
+        let flush = {
+            let st = f.state.clone();
+            tokio::spawn(async move { super::flush_pull_stats(&st).await })
+        };
         let rp = tokio::spawn(push(f.state.clone(), f.manifest.clone()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let del = tokio::spawn(delete(f.state.clone(), "v1".into()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        f.held.release.notify_one();
+        finishes(flush, "flush hung (lock-order deadlock)").await;
         assert_eq!(
             finishes(rp, "re-push hung (lock-order deadlock)").await,
             StatusCode::CREATED
@@ -10054,12 +10661,16 @@ mod manifest_before_metadata_one_lock_order {
 mod only_the_metadata_section_builds_metadata_keys {
     /// The functions that may build a metadata key: its definition, the three helpers, and the
     /// reader of a push date.
-    const ALLOWED: [&str; 5] = [
+    const ALLOWED: [&str; 7] = [
         "manifest_meta_key",
         "write_manifest_meta",
         "delete_manifest_and_meta",
-        "update_metadata_on_pull",
         "extract_docker_publish_date",
+        // #1114: pull stats are keyed off the manifest meta key and derive the
+        // .stats.json sidecar key from it.
+        "serve_cached_manifest",
+        "manifest_stats_key",
+        "flush_pull_stats",
     ];
 
     /// The function a line belongs to: the last `fn name` header above it.
