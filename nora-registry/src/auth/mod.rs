@@ -1981,6 +1981,84 @@ mod integration_tests {
         );
     }
 
+    /// #1094: the new token is owned by EXACTLY the authenticated
+    /// token owner — not merely "not the forged Basic username" (F2). A mutant
+    /// that sets the owner to any other constant source (`"admin"`,
+    /// `x-remote-user`, a form field) passes F2 but fails here.
+    #[tokio::test]
+    async fn ui_token_create_owner_is_exactly_the_token_owner() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("not-the-owner", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let owners: Vec<String> = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .into_iter()
+            .map(|t| t.user)
+            .collect();
+        assert_eq!(
+            owners,
+            vec![TOKEN_OWNER.to_string(), TOKEN_OWNER.to_string()],
+            "the minted token's owner is not exactly the authenticated caller"
+        );
+    }
+
+    /// #1094: the admin gate is by ROLE, not by name. A write
+    /// identity whose name happens to be `admin` (an htpasswd user, an OIDC
+    /// subject, or a token owner called `admin`) still cannot mint an admin
+    /// token. A mutant that gates on `user != "admin"` passes F1 (which only
+    /// exercises the `ci-bot` caller) but fails here.
+    #[tokio::test]
+    async fn ui_token_create_admin_named_write_caller_cannot_mint_admin() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let header_val = basic_header("docker", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=admin".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a write identity named 'admin' minted an admin token via the UI"
+        );
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "a token was created despite the 403"
+        );
+    }
+
     /// #1094: the role gate holds on the htpasswd-less Basic path — a read
     /// token reads but cannot write (403), as over Bearer and with htpasswd.
     /// The 403 is about the request, not the credential: it clears the per-IP
@@ -2599,7 +2677,14 @@ Jd74nq6dNCjpWG4drIsyhqX+
             start_time: ctx.state.start_time,
             startup_duration_ms: ctx.state.startup_duration_ms,
             auth: ctx.state.auth.clone(),
-            tokens: ctx.state.tokens.clone(),
+            // Prod builds a token store whenever `auth.enabled` (main.rs:1782);
+            // the base builder keyed it off its `auth_enabled` arg (false here,
+            // the `enabled` tweak comes from `customize`), leaving OIDC
+            // identities' token operations untested. Mirror prod so the store is
+            // present for an OIDC caller that reaches a token handler.
+            tokens: Some(crate::tokens::TokenStore::new(
+                ctx._tempdir.path().join("tokens").as_path(),
+            )),
             metrics: Arc::new(crate::dashboard_metrics::DashboardMetrics::new()),
             activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
@@ -2755,6 +2840,80 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::FORBIDDEN,
             "PR token must not write outside its rule scope"
+        );
+    }
+
+    /// #1094: a namespace-scoped OIDC identity must not escalate by
+    /// minting an unrestricted opaque token through the UI create path. The
+    /// write handlers enforce the scope (the control below), and the UI mint
+    /// now refuses a scoped caller (`decide_ui_token_mint`) instead of handing
+    /// it an `nra_` token that writes anywhere. Before the fix the mint returned
+    /// 200 and that token wrote to `prod/`; on `github/main` the UI path
+    /// required Basic auth and returned 400.
+    #[tokio::test]
+    async fn test_oidc_scoped_identity_cannot_mint_unrestricted_token_via_ui() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // pull_request rule: role=write, namespace_scope=["ci-transport/**"].
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:pull_request",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", jwt);
+
+        // Control: the identity cannot write to prod/ directly — scope enforced.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/prod/a.txt",
+            vec![("authorization", &bearer)],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "control: a ci-transport-scoped identity must not write to prod/"
+        );
+
+        // The UI mint refuses the scoped caller: nothing is handed out.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=3650".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a namespace-scoped identity minted an unrestricted token via the UI"
+        );
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "a token was minted for a scoped caller despite the 403"
         );
     }
 

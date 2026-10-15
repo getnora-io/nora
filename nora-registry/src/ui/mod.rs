@@ -21,7 +21,7 @@ use axum::{
     Extension, Form, Router,
 };
 
-use crate::auth::{AuthenticatedRole, AuthenticatedUser};
+use crate::auth::{AuthenticatedRole, AuthenticatedUser, NamespaceAuthority};
 use api::*;
 use i18n::Lang;
 use templates::*;
@@ -965,10 +965,65 @@ struct CreateTokenForm {
     ttl_days: Option<u64>,
 }
 
+/// Why a UI token-mint request is refused. One variant per refusal branch so
+/// the error text cannot drift from the reason it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMintRefusal {
+    /// An admin token was requested by a caller who cannot admin.
+    AdminRequiresAdmin,
+    /// The caller's identity is namespace-scoped; the UI mints only unrestricted
+    /// opaque tokens, so handing one out would widen the caller's authority.
+    ScopedCannotMintUnrestricted,
+}
+
+impl UiMintRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            UiMintRefusal::AdminRequiresAdmin => {
+                "An admin token may be minted only by an admin identity"
+            }
+            UiMintRefusal::ScopedCannotMintUnrestricted => {
+                "A namespace-scoped identity cannot mint an unrestricted token"
+            }
+        }
+    }
+}
+
+/// Decide the role of a UI-minted token, or refuse — pure: no I/O, no state.
+///
+/// A UI-minted opaque (`nra_`) token is always role-only and namespace-
+/// *unrestricted* (`auth::namespace`): it carries no scope. So two invariants
+/// must hold before one is handed out (#1094, GHSA-78cx-cfhm-rgmx class):
+///
+/// * an admin token may be minted only by a caller who `can_admin()` — a write
+///   identity must not mint admin; and
+/// * a namespace-*scoped* caller must not mint one at all — an identity limited
+///   to `ci-transport/**` would otherwise obtain an unrestricted token and write
+///   to `prod/`, escalating past its own scope.
+///
+/// The POST write-method gate in the auth middleware already bounds callers that
+/// reach this path to write-or-admin, so a read caller cannot mint write here;
+/// the admin check is kept as defence in depth. Table-tested in this module's
+/// tests — this replaces an inline gate that a regression could slip past.
+fn decide_ui_token_mint(
+    caller_role: Role,
+    caller_authority: &NamespaceAuthority,
+    requested_role: Role,
+) -> Result<Role, UiMintRefusal> {
+    if requested_role == Role::Admin && !caller_role.can_admin() {
+        return Err(UiMintRefusal::AdminRequiresAdmin);
+    }
+    if caller_authority.is_scoped() {
+        return Err(UiMintRefusal::ScopedCannotMintUnrestricted);
+    }
+    Ok(requested_role)
+}
+
 async fn tokens_create(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
     Extension(caller_role): Extension<AuthenticatedRole>,
+    Extension(caller_authority): Extension<NamespaceAuthority>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -999,18 +1054,23 @@ async fn tokens_create(
         "admin" => Role::Admin,
         _ => Role::Read,
     };
-    // An admin token may be minted only by a caller who can admin — mirroring
-    // token_routes::create_token and the list/revoke handlers. This UI create
-    // path had missed that gate (GHSA-78cx-cfhm-rgmx class): any write identity
-    // could mint an admin token for an arbitrary name.
-    if requested_role == Role::Admin && !caller_role.0.can_admin() {
-        return (
-            StatusCode::FORBIDDEN,
-            Html(
-                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">An admin token may be minted only by an admin identity</div>"##.to_string(),
-            ),
-        );
-    }
+    // Who may mint what is a pure decision over the caller's role AND namespace
+    // authority (#1094) — kept in `decide_ui_token_mint` with a unit
+    // table, because an inline gate here could let a regression slip the owner
+    // source and the admin-by-name check past the tests.
+    let granted_role = match decide_ui_token_mint(caller_role.0, &caller_authority, requested_role)
+    {
+        Ok(role) => role,
+        Err(refusal) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Html(format!(
+                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">{}</div>"##,
+                    refusal.message()
+                )),
+            );
+        }
+    };
 
     let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
 
@@ -1020,7 +1080,7 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    match store.create_token(&user, ttl_days, description, requested_role) {
+    match store.create_token(&user, ttl_days, description, granted_role) {
         Ok(raw_token) => {
             let html = render_token_created_fragment(&raw_token, lang);
             (StatusCode::OK, Html(html))
@@ -1177,5 +1237,73 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+
+    /// A namespace-scoped authority, as an OIDC identity limited to
+    /// `ci-transport/**` carries.
+    fn scoped_authority() -> NamespaceAuthority {
+        let scope = vec!["ci-transport/**".to_string()];
+        NamespaceAuthority::from_oidc_scopes(
+            "test-ci",
+            std::iter::once(scope.as_slice()),
+            crate::config::ScopeEnforcement::Enforce,
+        )
+    }
+
+    /// #1094: the UI mint decision, as a table. This is the acceptance
+    /// test — an inline gate was slipped twice (owner source,
+    /// admin-by-name), so the decision is a pure function verified exhaustively
+    /// here rather than through an integration regex.
+    #[test]
+    fn decide_ui_token_mint_table() {
+        use crate::tokens::Role::{Admin, Read, Write};
+        let open = NamespaceAuthority::Unrestricted;
+        let scoped = scoped_authority();
+        assert!(scoped.is_scoped());
+        assert!(!open.is_scoped());
+
+        // Unrestricted admin caller: mints any role.
+        assert_eq!(decide_ui_token_mint(Admin, &open, Admin), Ok(Admin));
+        assert_eq!(decide_ui_token_mint(Admin, &open, Write), Ok(Write));
+        assert_eq!(decide_ui_token_mint(Admin, &open, Read), Ok(Read));
+
+        // Unrestricted write caller: read/write ok, admin refused by role.
+        assert_eq!(decide_ui_token_mint(Write, &open, Write), Ok(Write));
+        assert_eq!(decide_ui_token_mint(Write, &open, Read), Ok(Read));
+        assert_eq!(
+            decide_ui_token_mint(Write, &open, Admin),
+            Err(UiMintRefusal::AdminRequiresAdmin)
+        );
+        // Defence in depth: a read caller (stopped earlier by the POST
+        // write-method gate) is still refused an admin token here.
+        assert_eq!(
+            decide_ui_token_mint(Read, &open, Admin),
+            Err(UiMintRefusal::AdminRequiresAdmin)
+        );
+
+        // Scoped caller: refused for every role it could request — handing out
+        // an unrestricted token would widen its authority (the scope escape).
+        assert_eq!(
+            decide_ui_token_mint(Write, &scoped, Write),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        assert_eq!(
+            decide_ui_token_mint(Write, &scoped, Read),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        assert_eq!(
+            decide_ui_token_mint(Admin, &scoped, Admin),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        // A scoped non-admin requesting admin is refused either way.
+        assert!(decide_ui_token_mint(Write, &scoped, Admin).is_err());
+
+        // The refusal text matches its branch (no drift).
+        assert!(UiMintRefusal::AdminRequiresAdmin
+            .message()
+            .contains("admin"));
+        assert!(UiMintRefusal::ScopedCannotMintUnrestricted
+            .message()
+            .contains("scoped"));
     }
 }
