@@ -495,17 +495,40 @@ async fn detect_docker_orphans(storage: &Storage) -> DockerDetectionResult {
         let mut blobs = HashSet::new();
         let mut children = HashSet::new();
         collect_manifest_refs(json, &mut blobs, &mut children);
-        referenced_blobs.extend(
-            blobs
-                .into_iter()
-                .map(|digest| format!("{repo}/blobs/{digest}")),
-        );
+        // A referenced blob may be stored under this repository's key or, for a
+        // namespaced repository, under the un-namespaced legacy key that the serve
+        // path falls back to (storage_get_with_fallback). Protect both so GC keeps
+        // a blob the server would still serve. strip_docker_namespace only drops a
+        // leading registry host (a first segment containing '.'), so genuinely
+        // distinct repositories do not collide and #984 cross-repo isolation holds.
+        let legacy_repo = repo
+            .strip_prefix("docker/")
+            .map(|name| {
+                format!(
+                    "docker/{}",
+                    crate::registry::docker::strip_docker_namespace(name)
+                )
+            })
+            .filter(|legacy| legacy.as_str() != repo);
+        for digest in blobs {
+            referenced_blobs.insert(format!("{repo}/blobs/{digest}"));
+            if let Some(ref legacy) = legacy_repo {
+                referenced_blobs.insert(format!("{legacy}/blobs/{digest}"));
+            }
+        }
         for digest in children {
             let child_key = format!("{repo}/manifests/{digest}.json");
-            if !manifests.contains_key(&child_key) {
-                return docker_mark_failure(total, &child_key);
+            // A child absent from local storage is not corruption: a pull-through
+            // cache holds only the platforms clients actually pulled, so a cached
+            // multi-arch index routinely lists children that were never fetched.
+            // Skip it rather than abort — its own blobs are absent too, and any
+            // blob it shares with a present sibling stays reachable through that
+            // sibling. Aborting here would stop GC from ever collecting on a cache
+            // that holds any partial index. A manifest that IS present but cannot
+            // be read or parsed still aborts the sweep (handled when reading it).
+            if manifests.contains_key(&child_key) {
+                pending.push(child_key);
             }
-            pending.push(child_key);
         }
         if let Some(subject) = json
             .get("subject")
@@ -1446,7 +1469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gc_docker_missing_index_child_aborts_sweep() {
+    async fn test_gc_docker_missing_index_child_does_not_abort_sweep() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().to_str().unwrap());
         storage
@@ -1457,19 +1480,23 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put("docker/proof/blobs/sha256:required", b"required")
+            .put("docker/proof/blobs/sha256:unused", b"unused")
             .await
             .unwrap();
-        for dry_run in [true, false] {
-            let result = run_gc(&storage, &test_publish_locks(), dry_run, 0, false, 0).await;
-            assert!(result.docker_mark_failed);
-            assert_eq!(result.deleted, 0);
-            assert_eq!(result.bytes_freed, 0);
-            assert!(storage
-                .get("docker/proof/blobs/sha256:required")
-                .await
-                .is_ok());
-        }
+        // A child the index lists but local storage does not hold — e.g. a
+        // platform a pull-through cache never fetched — is not corruption and must
+        // not abort the sweep. The absent child has no present blobs of its own,
+        // so an unreferenced blob stays collectible and marking does not fail.
+        // (A manifest that IS present but cannot be read or parsed still aborts:
+        // see test_gc_docker_invalid_manifest_aborts_sweep and
+        // test_gc_docker_failed_manifest_read_aborts_sweep.)
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(!result.docker_mark_failed);
+        assert_eq!(result.deleted, 1, "the unreferenced blob is collectible");
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -3195,5 +3222,226 @@ mod tests {
         assert_eq!(result.total_bytes, 400);
         assert_eq!(result.evicted_files, 2);
         assert_eq!(result.bytes_freed, 200);
+    }
+}
+
+#[cfg(test)]
+mod docker_gc_reachability {
+    //! Independent reachability checks for Docker GC (#1079): a pull-through
+    //! cache holds only the platforms clients pulled, and a cross-repo mount
+    //! lands its blob before its manifest. Both must stay correct.
+    use super::*;
+    use std::sync::Arc;
+
+    fn locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    async fn put(storage: &Storage, key: &str, bytes: &[u8]) {
+        storage.put(key, bytes).await.unwrap();
+    }
+
+    /// A manifest stored as a client pushes it: under its digest, and under `tag` if given.
+    async fn manifest(
+        storage: &Storage,
+        repo: &str,
+        tag: Option<&str>,
+        json: serde_json::Value,
+    ) -> String {
+        let bytes = json.to_string().into_bytes();
+        let d = digest(&bytes);
+        put(
+            storage,
+            &format!("docker/{repo}/manifests/{d}.json"),
+            &bytes,
+        )
+        .await;
+        if let Some(tag) = tag {
+            put(
+                storage,
+                &format!("docker/{repo}/manifests/{tag}.json"),
+                &bytes,
+            )
+            .await;
+        }
+        d
+    }
+
+    fn image(config: &str, layers: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": 1},
+            "layers": layers.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn index(children: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": children.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    async fn blobs(storage: &Storage, repo: &str, digests: &[&str]) {
+        for d in digests {
+            put(storage, &format!("docker/{repo}/blobs/{d}"), d.as_bytes()).await;
+        }
+    }
+
+    /// The keys a dry run would delete.
+    async fn would_delete(storage: &Storage) -> Vec<String> {
+        run_gc(storage, &locks(), true, 0, false, 0)
+            .await
+            .orphan_keys
+    }
+
+    fn kept(deleted: &[String], keys: &[String]) {
+        for key in keys {
+            assert!(
+                !deleted.contains(key),
+                "{key} would be deleted; deleted: {deleted:?}"
+            );
+        }
+    }
+
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    const ORPHAN: &str = "docker/app/blobs/sha256:0rphan";
+
+    // A pull-through cache holds only the platforms clients pulled: the index's other children
+    // are not here, which is no reason to stop collecting.
+    #[tokio::test]
+    async fn an_index_child_not_held_does_not_stop_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        blobs(&storage, "app", &["sha256:cfg", "sha256:layer"]).await;
+        put(&storage, ORPHAN, b"x").await;
+        let pulled = manifest(
+            &storage,
+            "app",
+            None,
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+        let arm = format!("sha256:{}", "a".repeat(64));
+        let ppc = format!("sha256:{}", "b".repeat(64));
+        manifest(
+            &storage,
+            "app",
+            Some("latest"),
+            index(&[&pulled, &arm, &ppc]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                format!("docker/app/manifests/{pulled}.json"),
+                "docker/app/blobs/sha256:cfg".to_string(),
+                "docker/app/blobs/sha256:layer".to_string(),
+            ],
+        );
+        assert!(
+            deleted.contains(&ORPHAN.to_string()),
+            "GC stopped over children it does not hold: {deleted:?}"
+        );
+    }
+
+    // `POST /v2/b/blobs/uploads/?mount=L&from=a` links the blob into `b` (a hard link on local
+    // storage); the manifest that references it in `b` lands next. GC between the two must keep
+    // it — a freshly linked object is stamped current so the grace window covers it.
+    #[tokio::test]
+    async fn a_blob_mounted_into_a_repository_survives_until_its_manifest_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let storage = Storage::new_local(path.to_str().unwrap());
+        blobs(&storage, "a", &["sha256:cfg", "sha256:shared"]).await;
+        manifest(
+            &storage,
+            "a",
+            Some("v1"),
+            image("sha256:cfg", &["sha256:shared"]),
+        )
+        .await;
+        // An hour old, as a layer pushed long ago is.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in walkdir_files(&path) {
+            std::fs::File::options()
+                .write(true)
+                .open(&entry)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        storage
+            .copy(
+                "docker/a/blobs/sha256:shared",
+                "docker/b/blobs/sha256:shared",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &locks(), false, 600, false, 0).await;
+        assert!(
+            storage.get("docker/b/blobs/sha256:shared").await.is_ok(),
+            "a mounted blob was deleted before its manifest landed: {:?}",
+            result.orphan_keys
+        );
+    }
+
+    // A namespaced manifest can reference a blob stranded at the legacy
+    // (un-namespaced) key — a partial key migration, or a flat blob still served
+    // through the ns→legacy read fallback (storage_get_with_fallback). The server
+    // serves it; GC must keep it, mirroring the fallback the serve path honors.
+    #[tokio::test]
+    async fn a_namespaced_manifest_keeps_its_legacy_keyed_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        put(&storage, "docker/library/nginx/blobs/sha256:cfg", b"cfg").await;
+        put(
+            &storage,
+            "docker/library/nginx/blobs/sha256:layer",
+            b"layer",
+        )
+        .await;
+        manifest(
+            &storage,
+            "docker.io/library/nginx",
+            Some("latest"),
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                "docker/library/nginx/blobs/sha256:cfg".to_string(),
+                "docker/library/nginx/blobs/sha256:layer".to_string(),
+            ],
+        );
     }
 }
