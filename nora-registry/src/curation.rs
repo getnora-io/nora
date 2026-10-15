@@ -352,7 +352,7 @@ pub fn check_download(
                     BlockedResponse {
                         rule: rule.clone(),
                         reason: reason.clone(),
-                        registry: registry.to_string(),
+                        registry,
                         package: name.to_string(),
                         version: version.known().map(|v| v.to_string()),
                     }
@@ -396,7 +396,7 @@ pub fn check_namespace_isolation(
                 BlockedResponse {
                     rule: rule.clone(),
                     reason: reason.clone(),
-                    registry: registry.to_string(),
+                    registry,
                     package: name.to_string(),
                     version: None,
                 }
@@ -545,7 +545,7 @@ pub fn verify_integrity(
                     BlockedResponse {
                         rule: rule.clone(),
                         reason: reason.clone(),
-                        registry: registry.to_string(),
+                        registry,
                         package: name.to_string(),
                         version: version.map(|v| v.to_string()),
                     }
@@ -613,7 +613,7 @@ pub fn verify_integrity_by_hash(
                     BlockedResponse {
                         rule: rule.clone(),
                         reason: reason.clone(),
-                        registry: registry.to_string(),
+                        registry,
                         package: name.to_string(),
                         version: version.map(|v| v.to_string()),
                     }
@@ -1189,7 +1189,11 @@ pub fn curation_name(registry: RegistryType, name: &str) -> String {
 pub struct BlockedResponse {
     pub rule: String,
     pub reason: String,
-    pub registry: String,
+    /// The registry the refused package belongs to. The enum, not a string, so
+    /// every refusal path hands the same value and the body and hint format it
+    /// in ONE place — a path cannot emit a mount point (`/npm/`) where the hint
+    /// needs the name (`npm`) (#1099).
+    pub registry: RegistryType,
     pub package: String,
     pub version: Option<String>,
 }
@@ -1206,12 +1210,75 @@ pub struct CurationRefusal {
     pub version: Option<String>,
 }
 
+/// The curation page a refusal links to.
+const CURATION_DOCS_URL: &str = "https://getnora.dev/configuration/curation/";
+
+/// The command a refusal's hint names: `nora curation explain registry:name@version`,
+/// without `@version` when the request named none, and the spec as one shell word, so
+/// the hint pasted into a shell runs as it is (#1099).
+pub(crate) fn explain_command(registry: &str, package: &str, version: Option<&str>) -> String {
+    let spec = match version {
+        Some(version) => format!("{registry}:{package}@{version}"),
+        None => format!("{registry}:{package}"),
+    };
+    format!("nora curation explain {}", shell_word(&spec))
+}
+
+/// `word` as one shell word: as it is when no character means anything to a shell,
+/// else in single quotes, a `'` inside closed, escaped and reopened.
+fn shell_word(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(test)]
+mod shell_word_quoting {
+    use super::shell_word;
+
+    /// A 403 hint is meant to be pasted into a shell and run; a package name with
+    /// a shell metacharacter must be single-quoted, or the hint is an injection
+    /// vector (#1099). Only
+    /// `[A-Za-z0-9@%+=:,./_-]` may stay bare.
+    #[test]
+    fn shell_word_quotes_every_shell_metacharacter() {
+        for dangerous in [
+            "a;b", "a$b", "a`b", "a!b", "a b", "a'b", "a|b", "a&b", "a(b", "a)b", "a>b", "a<b",
+            "a\nb", "a\\b", "a*b", "a?b", "a[b", "a]b", "a{b", "a}b", "a#b", "a~b", "a\"b",
+        ] {
+            let q = shell_word(dangerous);
+            assert!(
+                q.starts_with('\''),
+                "shell_word({dangerous:?}) = {q:?} left a metacharacter bare — a shell would interpret it"
+            );
+        }
+    }
+
+    /// The bare path must stay bare — a mutant that quotes everything would pass
+    /// the test above but break the readable hint for ordinary specs.
+    #[test]
+    fn shell_word_leaves_a_safe_spec_bare() {
+        for safe in [
+            "npm:is-number@7.0.0",
+            "npm:@scope/pkg@1.0.0",
+            "docker:library/nginx@sha256:abc",
+            "raw:dir/a.b_c-1.txt",
+            "cargo:serde",
+        ] {
+            assert_eq!(shell_word(safe), safe, "a safe spec must not be quoted");
+        }
+    }
+}
+
 impl IntoResponse for BlockedResponse {
     fn into_response(self) -> Response {
         let refusal = CurationRefusal {
             rule: self.rule.clone(),
             reason: self.reason.clone(),
-            registry: self.registry.clone(),
+            registry: self.registry.as_str().to_string(),
             package: self.package.clone(),
             version: self.version.clone(),
         };
@@ -1222,12 +1289,15 @@ impl IntoResponse for BlockedResponse {
             "context": {
                 "rule": self.rule,
                 "reason": self.reason,
-                "registry": self.registry,
+                "registry": self.registry.as_str(),
                 "package": self.package,
                 "version": version_str,
             },
-            "hint": format!("Run: nora curation explain {}@{}", self.package, version_str),
-            "docs": "https://docs.getnora.dev/curation"
+            "hint": format!(
+                "Run: {}",
+                explain_command(self.registry.as_str(), &self.package, self.version.as_deref())
+            ),
+            "docs": CURATION_DOCS_URL
         });
 
         let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
@@ -1717,12 +1787,18 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
                 .map_err(|_| format!("invalid number '{}'", num_buf))?;
             num_buf.clear();
 
-            match ch {
-                'd' => total += n * 86400,
-                'h' => total += n * 3600,
-                'w' => total += n * 604800,
+            let unit: i64 = match ch {
+                'd' => 86400,
+                'h' => 3600,
+                'w' => 604800,
                 _ => return Err(format!("unknown unit '{}' (use d/h/w)", ch)),
-            }
+            };
+            // A sum that does not fit is refused: wrapped, it became a negative or
+            // small threshold (#1099).
+            total = n
+                .checked_mul(unit)
+                .and_then(|secs| total.checked_add(secs))
+                .ok_or_else(|| format!("duration '{}' is too large", s))?;
         }
     }
 
@@ -2229,7 +2305,7 @@ mod tests {
         let resp = BlockedResponse {
             rule: "test-rule".to_string(),
             reason: "test reason".to_string(),
-            registry: "npm".to_string(),
+            registry: RegistryType::Npm,
             package: "lodash".to_string(),
             version: Some("4.17.21".to_string()),
         };
@@ -2242,7 +2318,7 @@ mod tests {
         let resp = BlockedResponse {
             rule: "blocklist".to_string(),
             reason: "known-vulnerable".to_string(),
-            registry: "npm".to_string(),
+            registry: RegistryType::Npm,
             package: "evil".to_string(),
             version: None,
         };
@@ -2256,6 +2332,97 @@ mod tests {
             response.headers().get("x-nora-reason").unwrap(),
             "known-vulnerable"
         );
+    }
+
+    /// The JSON body of a refusal, as a client reads it.
+    async fn refusal_body(refusal: BlockedResponse) -> serde_json::Value {
+        let body = axum::body::to_bytes(refusal.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn refusal(registry: RegistryType, package: &str, version: Option<&str>) -> BlockedResponse {
+        BlockedResponse {
+            rule: "blocklist".to_string(),
+            reason: "r".to_string(),
+            registry,
+            package: package.to_string(),
+            version: version.map(str::to_string),
+        }
+    }
+
+    /// #1099: the hint names the registry, in the form `nora curation explain`
+    /// takes, as one shell word — quoted only when a character would not survive
+    /// a shell — and without a version when the request named none.
+    #[test]
+    fn a_refusal_hint_is_an_explain_command_a_shell_runs_as_it_is() {
+        for (registry, package, version, command) in [
+            (
+                "npm",
+                "is-number",
+                Some("7.0.0"),
+                "nora curation explain npm:is-number@7.0.0",
+            ),
+            (
+                "npm",
+                "@scope/pkg",
+                Some("1.0.0"),
+                "nora curation explain npm:@scope/pkg@1.0.0",
+            ),
+            (
+                "docker",
+                "library/nginx",
+                Some("sha256:0123abcd"),
+                "nora curation explain docker:library/nginx@sha256:0123abcd",
+            ),
+            ("pub", "Pong", None, "nora curation explain pub:Pong"),
+            (
+                "raw",
+                "dir/my file.txt",
+                None,
+                "nora curation explain 'raw:dir/my file.txt'",
+            ),
+            ("raw", "it's", None, r"nora curation explain 'raw:it'\''s'"),
+            ("raw", "a*", None, "nora curation explain 'raw:a*'"),
+        ] {
+            assert_eq!(
+                explain_command(registry, package, version),
+                command,
+                "{registry}:{package}"
+            );
+        }
+    }
+
+    /// #1099: the docs link opens the curation page.
+    #[tokio::test]
+    async fn a_refusal_links_the_curation_page() {
+        let body = refusal_body(refusal(RegistryType::Npm, "is-number", Some("7.0.0"))).await;
+        assert_eq!(body["docs"], "https://getnora.dev/configuration/curation/");
+    }
+
+    /// The JSON body of a refusal that a real refusal path has already turned into
+    /// a `Response` (those return a `Response`, not a `BlockedResponse`).
+    async fn body_of_response(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// #1099: the hint on the NAMESPACE refusal path names the registry
+    /// (`npm`), not its mount point (`/npm/`) — a `/npm/:…` spec does not resolve,
+    /// so the hint would not run. Exercises the real `check_namespace_isolation`,
+    /// not a hand-built response, since that is where the registry is set.
+    #[tokio::test]
+    async fn a_namespace_refusal_hint_names_the_registry_not_the_mount_point() {
+        let mut engine = CurationEngine::new(CurationConfig::default());
+        engine.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["@corp/*".to_string()])));
+        let response = check_namespace_isolation(&engine, RegistryType::Npm, "@corp/secret")
+            .expect("a package in an internal namespace is refused");
+        let body = body_of_response(response).await;
+        assert_eq!(body["context"]["registry"], "npm");
+        assert_eq!(body["hint"], "Run: nora curation explain npm:@corp/secret");
     }
 
     // ---- CurationConfig defaults ----
@@ -4204,6 +4371,24 @@ mod min_release_age_tests {
         assert!(parse_duration("7").is_err()); // no unit
         assert!(parse_duration("7x").is_err()); // unknown unit
         assert!(parse_duration("d").is_err()); // no number
+    }
+
+    /// #1099: a duration too large for the counter is refused, not wrapped into a
+    /// negative or small threshold.
+    #[test]
+    fn test_parse_duration_overflow_is_an_error() {
+        for value in [
+            "99999999999999999w",
+            "9223372036854775807d",
+            "15250284452471w15250284452471w",
+            "99999999999999999999h",
+        ] {
+            assert!(parse_duration(value).is_err(), "{value}");
+        }
+        assert_eq!(
+            parse_duration("15250284452w").unwrap(),
+            15250284452 * 604800
+        );
     }
 
     // ── MinReleaseAgeFilter tests ───────────────────────────────────────

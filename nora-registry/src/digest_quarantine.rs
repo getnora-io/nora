@@ -305,6 +305,8 @@ pub fn resolve_global(mode: Option<&QuarantineMode>, ttl: Option<&str>) -> (Quar
     if matches!(mode, QuarantineMode::Off) {
         return (QuarantineMode::Off, 0);
     }
+    // Config validation refuses a TTL that does not parse (#1099); the default only
+    // covers a config built without it.
     let secs = crate::curation::parse_duration(ttl.unwrap_or("14d")).unwrap_or(14 * 86400);
     (mode, secs)
 }

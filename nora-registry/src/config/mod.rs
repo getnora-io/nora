@@ -985,6 +985,10 @@ impl Config {
         // handlers and the main.rs store gate use.
         let quarantine_active = self.any_quarantine_active();
 
+        // Every curation duration parses, in every mode: a typo in one is a
+        // configuration error naming it, never a silent default (#1099).
+        errors.extend(self.curation.duration_errors());
+
         // Enforce mode must have at least ONE active control, otherwise it blocks
         // nothing. An allowlist is one option, not the only one — a blocklist,
         // min-release-age, an active quarantine, namespace isolation, or integrity
@@ -3538,6 +3542,87 @@ proxies = [
             errors.iter().any(|e| e.contains("does not exist")),
             "enforce with missing allowlist file should be an error"
         );
+    }
+
+    /// Every curation duration key: global, then each `[curation.<registry>]` section.
+    fn curation_duration_keys() -> Vec<String> {
+        let mut keys = vec![
+            "curation.min_release_age".to_string(),
+            "curation.quarantine_ttl".to_string(),
+        ];
+        for rt in RegistryType::all() {
+            if *rt != RegistryType::Raw {
+                keys.push(format!("curation.{rt}.min_release_age"));
+                keys.push(format!("curation.{rt}.quarantine_ttl"));
+            }
+        }
+        keys
+    }
+
+    /// A config file setting `key` (a dotted curation key) to `value`, in `mode`.
+    fn curation_toml(key: &str, value: &str, mode: &str) -> Config {
+        let (table, field) = key.rsplit_once('.').unwrap();
+        let mut content = format!("[curation]\nmode = \"{mode}\"\n");
+        if table != "curation" {
+            content.push_str(&format!("[{table}]\n"));
+        }
+        content.push_str(&format!("{field} = \"{value}\"\n"));
+        let (config, unknown) = parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
+        assert!(unknown.is_empty(), "{content}: {unknown:?}");
+        config
+    }
+
+    #[test]
+    fn an_unparsable_curation_duration_is_a_config_error_naming_it() {
+        let _lock = env_lock();
+        // #1099: `quarantine_ttl = "30m"` became 14 days without a word, and an
+        // unparsable min_release_age stopped startup only in enforce mode.
+        for key in curation_duration_keys() {
+            for mode in ["off", "audit", "enforce"] {
+                let config = curation_toml(&key, "30m", mode);
+                let (_, errors) = config.validate_with_config_path(None);
+                let named = format!("{key}=\"30m\" is not a duration");
+                assert!(
+                    errors.iter().any(|e| e.contains(&named)),
+                    "{key} in {mode}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// #1099: the validator accepts EXACTLY what the consumer's
+    /// `parse_duration` accepts — no normalization (case, trim, sign) the consumer
+    /// does not do, or a value the validator passes is silently taken as 14 days
+    /// by `digest_quarantine`/`docker`.
+    #[test]
+    fn the_duration_validator_accepts_exactly_what_the_consumer_parses() {
+        let _lock = env_lock();
+        for s in ["7d", "7D", " 2d", "2d ", "+2d", "30m", "1w2d", "0d", "２d"] {
+            let config = curation_toml("curation.quarantine_ttl", s, "off");
+            let (_, errors) = config.validate_with_config_path(None);
+            let flagged = errors.iter().any(|e| e.contains("curation.quarantine_ttl"));
+            let consumer_ok = crate::curation::parse_duration(s).is_ok();
+            assert_eq!(
+                flagged, !consumer_ok,
+                "validator flagged {s:?}={flagged}, but consumer parse_duration Ok={consumer_ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_curation_durations_are_not_errors() {
+        let _lock = env_lock();
+        for key in curation_duration_keys() {
+            for value in ["14d", "36h", "1w2d"] {
+                let config = curation_toml(&key, value, "audit");
+                let (_, errors) = config.validate_with_config_path(None);
+                let named = format!("{key}=\"{value}\" is not a duration");
+                assert!(
+                    !errors.iter().any(|e| e.contains(&named)),
+                    "{key}={value}: {errors:?}"
+                );
+            }
+        }
     }
 
     #[test]

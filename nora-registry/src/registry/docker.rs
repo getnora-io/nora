@@ -635,6 +635,8 @@ fn resolve_quarantine(state: &AppState) -> (crate::digest_quarantine::Quarantine
         .or(state.config.curation.quarantine_ttl.as_deref())
         .unwrap_or("14d");
 
+    // Config validation refuses a TTL that does not parse (#1099); the default only
+    // covers a config built without it.
     let secs = crate::curation::parse_duration(ttl_str).unwrap_or(14 * 86400);
     (mode, secs)
 }
