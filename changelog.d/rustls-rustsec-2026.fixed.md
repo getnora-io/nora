@@ -1,0 +1,1 @@
+**`rustls` 0.23.45 → 0.23.46 (RUSTSEC-2026-0346/-0347/-0348/-0349)** — four low/medium advisories in the TLS stack (client session `Debug` impls exposing secrets, buffered data after ECH rejection, unauthenticated ServerHello downgrade, unauthenticated Brotli certificate decompression up to 1 GiB). All fixed in rustls 0.23.46; a lock-only bump, no code change.
