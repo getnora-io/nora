@@ -79,6 +79,15 @@ impl NamespaceAuthority {
             mode,
         }
     }
+
+    /// Whether this authority restricts writes to a set of namespace scopes.
+    /// `Unrestricted` (Basic auth, opaque `nra_` tokens, anonymous reads, auth
+    /// disabled, or an OIDC provider scoped to `["*"]`) is `false`; a
+    /// scope-limited OIDC identity is `true`. Used where a handler must refuse
+    /// to grant unrestricted authority to a scoped caller (#1094).
+    pub fn is_scoped(&self) -> bool {
+        matches!(self, NamespaceAuthority::Scoped { .. })
+    }
 }
 
 /// A write was denied because its artifact coordinate fell outside the
