@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tower_governor::errors::GovernorError;
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::{KeyExtractor, SmartIpKeyExtractor};
+use tower_governor::key_extractor::KeyExtractor;
 
 /// Convert a "requests per second" value to a replenishment period.
 ///
@@ -148,14 +148,24 @@ pub fn auth_rate_limiter(
 
 /// Create rate limiter layer for upload endpoints
 ///
-/// High limits to accommodate Docker client's aggressive parallel layer uploads
-pub fn upload_rate_limiter(quota: Quota) -> (Limiter<SmartIpKeyExtractor>, Quota) {
-    limiter(SmartIpKeyExtractor, quota)
+/// High limits to accommodate Docker client's aggressive parallel layer uploads.
+/// Keyed by [`TrustedProxyKeyExtractor`], like the auth limiter: an untrusted peer
+/// cannot mint a fresh bucket per request by varying X-Forwarded-For (#541 fixed
+/// only the auth limiter; `SmartIpKeyExtractor` here trusted XFF from any peer).
+pub fn upload_rate_limiter(
+    quota: Quota,
+    trusted_proxies: TrustedProxies,
+) -> (Limiter<TrustedProxyKeyExtractor>, Quota) {
+    limiter(TrustedProxyKeyExtractor::new(trusted_proxies), quota)
 }
 
-/// Create rate limiter layer for general endpoints (lenient)
-pub fn general_rate_limiter(quota: Quota) -> (Limiter<SmartIpKeyExtractor>, Quota) {
-    limiter(SmartIpKeyExtractor, quota)
+/// Create rate limiter layer for general endpoints (lenient). Keyed by
+/// [`TrustedProxyKeyExtractor`] for the same reason as the upload limiter.
+pub fn general_rate_limiter(
+    quota: Quota,
+    trusted_proxies: TrustedProxies,
+) -> (Limiter<TrustedProxyKeyExtractor>, Quota) {
+    limiter(TrustedProxyKeyExtractor::new(trusted_proxies), quota)
 }
 
 #[cfg(test)]
@@ -186,13 +196,96 @@ mod tests {
     #[test]
     fn test_upload_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = upload_rate_limiter(limiter_quotas(&config).upload).0;
+        let _limiter = upload_rate_limiter(
+            limiter_quotas(&config).upload,
+            TrustedProxies::default_loopback(),
+        )
+        .0;
     }
 
     #[test]
     fn test_general_rate_limiter_creation() {
         let config = RateLimitConfig::default();
-        let _limiter = general_rate_limiter(limiter_quotas(&config).general).0;
+        let _limiter = general_rate_limiter(
+            limiter_quotas(&config).general,
+            TrustedProxies::default_loopback(),
+        )
+        .0;
+    }
+
+    /// A request routed through `layer`, from `peer`, carrying `xff` as X-Forwarded-For.
+    async fn status_through(
+        layer: &Limiter<TrustedProxyKeyExtractor>,
+        peer: [u8; 4],
+        xff: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(layer.clone());
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", xff)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((peer, 10000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    // The upload and general limiters must bucket an untrusted peer by its TCP address, not by a
+    // header it controls: a burst of one is spent by the first request, and a second request from
+    // the same peer with a different X-Forwarded-For is limited (429), not given a fresh bucket.
+    #[tokio::test]
+    async fn edge_limiters_ignore_xff_from_an_untrusted_peer() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        // The peer (2.2.2.2) is not in the trusted set, so its XFF must not be honored.
+        let trusted = TrustedProxies::default_loopback();
+        type Make = fn(Quota, TrustedProxies) -> (Limiter<TrustedProxyKeyExtractor>, Quota);
+        for make in [upload_rate_limiter as Make, general_rate_limiter as Make] {
+            let (layer, _) = make(quota, trusted.clone());
+            let peer = [2, 2, 2, 2];
+            assert_eq!(
+                status_through(&layer, peer, "1.1.1.1").await,
+                axum::http::StatusCode::OK,
+                "first request spends the single token"
+            );
+            assert_eq!(
+                status_through(&layer, peer, "9.9.9.9").await,
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a different XFF from the same peer must not mint a fresh bucket"
+            );
+        }
+    }
+
+    // A trusted proxy's XFF is still honored: two different clients behind it keep their own
+    // buckets, so the fix does not collapse everyone behind a reverse proxy into one limit.
+    #[tokio::test]
+    async fn edge_limiters_honor_xff_from_a_trusted_proxy() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        let trusted = TrustedProxies::default_loopback(); // 127.0.0.1 is trusted
+        let (layer, _) = upload_rate_limiter(quota, trusted);
+        let proxy = [127, 0, 0, 1];
+        assert_eq!(
+            status_through(&layer, proxy, "1.1.1.1").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            status_through(&layer, proxy, "2.2.2.2").await,
+            axum::http::StatusCode::OK,
+            "a second client behind the trusted proxy keeps its own bucket"
+        );
+        assert_eq!(
+            status_through(&layer, proxy, "1.1.1.1").await,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "the first client's bucket is spent"
+        );
     }
 
     #[test]
@@ -211,8 +304,16 @@ mod tests {
             TrustedProxies::default_loopback(),
         )
         .0;
-        let _upload = upload_rate_limiter(limiter_quotas(&config).upload).0;
-        let _general = general_rate_limiter(limiter_quotas(&config).general).0;
+        let _upload = upload_rate_limiter(
+            limiter_quotas(&config).upload,
+            TrustedProxies::default_loopback(),
+        )
+        .0;
+        let _general = general_rate_limiter(
+            limiter_quotas(&config).general,
+            TrustedProxies::default_loopback(),
+        )
+        .0;
     }
 
     #[test]
@@ -285,7 +386,11 @@ mod tests {
         assert_eq!(statuses!(auth, 20, gap), all_pass, "auth");
         assert_eq!(
             statuses!(
-                upload_rate_limiter(limiter_quotas(&config).upload).0,
+                upload_rate_limiter(
+                    limiter_quotas(&config).upload,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 20,
                 gap
             ),
@@ -294,7 +399,11 @@ mod tests {
         );
         assert_eq!(
             statuses!(
-                general_rate_limiter(limiter_quotas(&config).general).0,
+                general_rate_limiter(
+                    limiter_quotas(&config).general,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 20,
                 gap
             ),
@@ -317,7 +426,11 @@ mod tests {
         assert_eq!(statuses!(auth, 4, gap), burst, "auth");
         assert_eq!(
             statuses!(
-                upload_rate_limiter(limiter_quotas(&config).upload).0,
+                upload_rate_limiter(
+                    limiter_quotas(&config).upload,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 4,
                 gap
             ),
@@ -326,7 +439,11 @@ mod tests {
         );
         assert_eq!(
             statuses!(
-                general_rate_limiter(limiter_quotas(&config).general).0,
+                general_rate_limiter(
+                    limiter_quotas(&config).general,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 4,
                 gap
             ),
@@ -356,13 +473,21 @@ mod tests {
         .0;
         assert_eq!(statuses!(auth, 4, gap), vec![200, 429, 429, 429], "auth");
         let upload = statuses!(
-            upload_rate_limiter(limiter_quotas(&config).upload).0,
+            upload_rate_limiter(
+                limiter_quotas(&config).upload,
+                TrustedProxies::default_loopback()
+            )
+            .0,
             4,
             gap
         );
         assert_eq!(upload, vec![200, 200, 429, 429], "upload");
         let general = statuses!(
-            general_rate_limiter(limiter_quotas(&config).general).0,
+            general_rate_limiter(
+                limiter_quotas(&config).general,
+                TrustedProxies::default_loopback()
+            )
+            .0,
             4,
             gap
         );
@@ -395,13 +520,21 @@ mod tests {
                 "{fast} fast: auth"
             );
             let upload = statuses!(
-                upload_rate_limiter(limiter_quotas(&config).upload).0,
+                upload_rate_limiter(
+                    limiter_quotas(&config).upload,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 5,
                 gap
             );
             assert_eq!(upload, expected("upload"), "{fast} fast: upload");
             let general = statuses!(
-                general_rate_limiter(limiter_quotas(&config).general).0,
+                general_rate_limiter(
+                    limiter_quotas(&config).general,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 5,
                 gap
             );
@@ -423,7 +556,11 @@ mod tests {
         assert_eq!(statuses!(auth, 3, gap), vec![200; 3], "auth");
         assert_eq!(
             statuses!(
-                upload_rate_limiter(limiter_quotas(&config).upload).0,
+                upload_rate_limiter(
+                    limiter_quotas(&config).upload,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 3,
                 gap
             ),
@@ -432,7 +569,11 @@ mod tests {
         );
         assert_eq!(
             statuses!(
-                general_rate_limiter(limiter_quotas(&config).general).0,
+                general_rate_limiter(
+                    limiter_quotas(&config).general,
+                    TrustedProxies::default_loopback()
+                )
+                .0,
                 3,
                 gap
             ),
@@ -486,12 +627,12 @@ mod tests {
             let (_, auth) = auth_rate_limiter(quotas.auth, TrustedProxies::default_loopback());
             assert_eq!(auth, quotas.auth, "auth enforced");
             assert_eq!(
-                upload_rate_limiter(quotas.upload).1,
+                upload_rate_limiter(quotas.upload, TrustedProxies::default_loopback()).1,
                 quotas.upload,
                 "upload enforced"
             );
             assert_eq!(
-                general_rate_limiter(quotas.general).1,
+                general_rate_limiter(quotas.general, TrustedProxies::default_loopback()).1,
                 quotas.general,
                 "general enforced"
             );
@@ -531,9 +672,9 @@ mod tests {
             };
             let (layer, reported) = auth_rate_limiter(quota, TrustedProxies::default_loopback());
             assert_eq!(reported, applied(&layer), "auth {rps} {burst}");
-            let (layer, reported) = upload_rate_limiter(quota);
+            let (layer, reported) = upload_rate_limiter(quota, TrustedProxies::default_loopback());
             assert_eq!(reported, applied(&layer), "upload {rps} {burst}");
-            let (layer, reported) = general_rate_limiter(quota);
+            let (layer, reported) = general_rate_limiter(quota, TrustedProxies::default_loopback());
             assert_eq!(reported, applied(&layer), "general {rps} {burst}");
         }
     }
@@ -600,12 +741,24 @@ mod tests {
             .0;
             assert_eq!(announced_burst!(auth), auth_burst, "auth");
             assert_eq!(
-                announced_burst!(upload_rate_limiter(limiter_quotas(&config).upload).0),
+                announced_burst!(
+                    upload_rate_limiter(
+                        limiter_quotas(&config).upload,
+                        TrustedProxies::default_loopback()
+                    )
+                    .0
+                ),
                 upload_burst,
                 "upload"
             );
             assert_eq!(
-                announced_burst!(general_rate_limiter(limiter_quotas(&config).general).0),
+                announced_burst!(
+                    general_rate_limiter(
+                        limiter_quotas(&config).general,
+                        TrustedProxies::default_loopback()
+                    )
+                    .0
+                ),
                 general_burst,
                 "general"
             );

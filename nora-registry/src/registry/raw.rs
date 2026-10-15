@@ -135,6 +135,9 @@ async fn download(
                     header::CACHE_CONTROL,
                     state.config.raw.cache_control.clone(),
                 )];
+                for (name, value) in download_safety_headers() {
+                    extra.push((name, value.to_string()));
+                }
                 if let Some(tag) = etag {
                     extra.push((header::ETAG, tag));
                 }
@@ -172,6 +175,9 @@ async fn download(
                 .header(header::CONTENT_LENGTH, len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
+            for (name, value) in download_safety_headers() {
+                builder = builder.header(name, value);
+            }
             if let Some(ref hash) = pin {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
             }
@@ -740,6 +746,25 @@ fn format_http_date(timestamp: u64) -> String {
     }
 }
 
+/// Headers that make a raw download safe to serve: the browser saves the file
+/// instead of rendering it, and even a forced render runs nothing.
+///
+/// Raw stores arbitrary user-uploaded bytes, and `guess_content_type` labels
+/// `.html`/`.svg`/`.js` with their active types. Without these a stored file
+/// would execute as a page at NORA's own origin, with the viewer's session.
+/// `Content-Disposition: attachment` makes the browser download rather than
+/// render it (RFC 6266; no filename, so there is no header-injection surface —
+/// the browser names it from the URL). `Content-Security-Policy: sandbox` with
+/// no tokens is the strongest fallback for anything a client renders anyway:
+/// no scripts, no forms, no same-origin. Both paths (full and ranged) carry
+/// them, so they cannot drift apart.
+fn download_safety_headers() -> [(header::HeaderName, &'static str); 2] {
+    [
+        (header::CONTENT_DISPOSITION, "attachment"),
+        (header::CONTENT_SECURITY_POLICY, "sandbox"),
+    ]
+}
+
 fn guess_content_type(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext.to_lowercase().as_str() {
@@ -970,6 +995,57 @@ mod integration_tests {
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = body_bytes(get_resp).await;
         assert_eq!(&body[..], b"hello");
+    }
+
+    // Raw holds arbitrary user bytes, and a file named `.html`/`.svg` is served with an active
+    // content-type. Every raw download — full, ranged, and whatever the extension — must carry
+    // `Content-Disposition: attachment` (the browser saves it, does not render it) and
+    // `Content-Security-Policy: sandbox` (a forced render runs nothing).
+    #[tokio::test]
+    async fn test_raw_download_is_served_as_an_inert_attachment() {
+        use crate::test_helpers::send_with_headers;
+        let ctx = create_test_context();
+        for (name, body) in [
+            ("page.html", b"<script>alert(1)</script>".to_vec()),
+            (
+                "drawing.svg",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+            ),
+            ("app.js", b"globalThis.x = 1".to_vec()),
+            ("notes.txt", b"plain".to_vec()),
+        ] {
+            let path = format!("/raw/xss/{name}");
+            assert_eq!(
+                send(&ctx.app, Method::PUT, &path, body).await.status(),
+                StatusCode::OK
+            );
+            for (label, resp) in [
+                ("full", send(&ctx.app, Method::GET, &path, "").await),
+                (
+                    "ranged",
+                    send_with_headers(
+                        &ctx.app,
+                        Method::GET,
+                        &path,
+                        vec![("range", "bytes=0-1")],
+                        "",
+                    )
+                    .await,
+                ),
+            ] {
+                let h = resp.headers();
+                assert_eq!(
+                    h.get("content-disposition").map(|v| v.as_bytes()),
+                    Some(b"attachment".as_ref()),
+                    "{name} {label}: not an attachment"
+                );
+                assert_eq!(
+                    h.get("content-security-policy").map(|v| v.as_bytes()),
+                    Some(b"sandbox".as_ref()),
+                    "{name} {label}: not sandboxed"
+                );
+            }
+        }
     }
 
     #[tokio::test]

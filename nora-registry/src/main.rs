@@ -497,6 +497,37 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
 /// → request_id → leak_detection → rewrite_ui_base_path → auth. auth runs first of these;
 /// the audit layer sits inside it so it knows who was refused, and request_id runs before
 /// the handler so the ID is available to it.
+/// Response security headers applied to every route, outermost. `nosniff`,
+/// `DENY` framing and the referrer policy are uniform and override whatever a
+/// handler set. The Content-Security-Policy is added only when a handler set
+/// none (`if_not_present`): the UI's permissive policy (it needs `unsafe-inline`)
+/// is the default, but the raw download handler sets its own `sandbox` policy on
+/// user-uploaded bytes and that stricter one must survive. Kept in one function
+/// so the server and its test run the same layering.
+pub(crate) fn apply_security_headers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    use tower_http::set_header::SetResponseHeaderLayer;
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
+        ))
+}
+
 pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Router<AppState> {
     router
         .layer(middleware::from_fn_with_state(
@@ -540,6 +571,62 @@ mod middleware_stack_tests {
             code.matches(&needle).count() <= 1,
             "{needle} applied more than once"
         );
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::apply_security_headers;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn header_of(app: &Router, path: &str, name: &str) -> Option<String> {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    // A handler that sets its own CSP (the raw download handler, `sandbox`) keeps it; a handler
+    // that sets none gets the permissive UI default. The default must not override a stricter
+    // handler policy, or raw's user-uploaded bytes would run under the UI's `unsafe-inline`.
+    #[tokio::test]
+    async fn a_handler_csp_survives_the_default() {
+        let app = apply_security_headers(
+            Router::<()>::new()
+                .route(
+                    "/raw-like",
+                    get(|| async { ([(header::CONTENT_SECURITY_POLICY, "sandbox")], "bytes") }),
+                )
+                .route("/ui-like", get(|| async { "page" })),
+        );
+        assert_eq!(
+            header_of(&app, "/raw-like", "content-security-policy").await,
+            Some("sandbox".to_string())
+        );
+        let default = header_of(&app, "/ui-like", "content-security-policy")
+            .await
+            .expect("a route without its own CSP gets the default");
+        assert!(
+            default.contains("script-src 'self' 'unsafe-inline'"),
+            "default UI CSP expected, got {default}"
+        );
+        // nosniff is uniform and overrides, on both.
+        for path in ["/raw-like", "/ui-like"] {
+            assert_eq!(
+                header_of(&app, path, "x-content-type-options").await,
+                Some("nosniff".to_string())
+            );
+        }
     }
 }
 
@@ -1580,9 +1667,11 @@ fn rate_limited_routes<S: Clone + Send + Sync + 'static>(
     quotas: &rate_limit::LimiterQuotas,
     trusted_proxies: config::TrustedProxies,
 ) -> (Router<S>, rate_limit::LimiterQuotas) {
-    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies);
-    let (upload_limiter, upload) = rate_limit::upload_rate_limiter(quotas.upload);
-    let (general_limiter, general) = rate_limit::general_rate_limiter(quotas.general);
+    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies.clone());
+    let (upload_limiter, upload) =
+        rate_limit::upload_rate_limiter(quotas.upload, trusted_proxies.clone());
+    let (general_limiter, general) =
+        rate_limit::general_rate_limiter(quotas.general, trusted_proxies);
 
     // Auth routes: auth_limiter (strict 1rps) + general_limiter
     let auth_routes = auth_routes.layer(auth_limiter).layer(general_limiter);
@@ -2122,24 +2211,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(admin::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::HeaderName::from_static("content-security-policy"),
-            HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"),
-        ))
-        ;
+        ));
+    let app = apply_security_headers(app);
     // Middleware layer order — LOAD-BEARING, do not reorder (#542).
     //
     // In axum, last .layer() = outermost (runs first). Execution order:
