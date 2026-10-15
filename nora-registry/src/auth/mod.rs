@@ -535,11 +535,13 @@ pub async fn auth_middleware(
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
-    // htpasswd provider required for Basic auth
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return unauthorized_response("Basic auth not configured", realm),
-    };
+    // Basic needs htpasswd or the token store to check the password against. An
+    // OIDC-only setup (#996) has no htpasswd, but API tokens sent as the Basic
+    // password must still work there: Docker, twine and Maven have no other way
+    // to present one. (#1094)
+    if state.auth.is_none() && state.tokens.is_none() {
+        return unauthorized_response("Basic auth not configured", realm);
+    }
 
     let encoded = &auth_header[6..];
     let decoded = match STANDARD.decode(encoded) {
@@ -557,11 +559,16 @@ pub async fn auth_middleware(
         None => return unauthorized_response("Invalid credentials format", realm),
     };
 
-    // Verify credentials. htpasswd first; if that fails, the password may be an API
-    // token (`nra_…`). Docker, twine and Maven send the token as the Basic-auth
-    // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
-    // path must fall through to token verification for token auth to work at all. (#736)
-    if !auth.authenticate(username, password) {
+    // Verify credentials. htpasswd first, when there is one; if that fails or there
+    // is none, the password may be an API token (`nra_…`). Docker, twine and Maven
+    // send the token as the Basic-auth password and never use Bearer (the `/v2/`
+    // challenge is Basic), so the Basic path must fall through to token
+    // verification for token auth to work at all. (#736, #1094)
+    let htpasswd_ok = state
+        .auth
+        .as_deref()
+        .is_some_and(|auth| auth.authenticate(username, password));
+    if !htpasswd_ok {
         let token_result = state.tokens.as_ref().map(|ts| ts.verify_token(password));
         // Same fail-closed rule as the Bearer path: a store I/O/parse failure is
         // not "wrong password". A 401 here makes valid token creds flap and feeds
@@ -1338,6 +1345,298 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Auth enabled with no htpasswd file — the OIDC-only setup (#996). The
+    /// token store is there, as main.rs always creates it when auth is enabled.
+    fn create_test_context_without_htpasswd() -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_auth(&[]);
+        assert!(ctx.state.auth.is_none(), "no htpasswd provider");
+        assert!(ctx.state.tokens.is_some(), "token store present");
+        ctx
+    }
+
+    /// Owner of the tokens `mint` creates. The Basic username the tests send
+    /// (`docker`) differs, so a request attributed to the Basic username
+    /// instead of the token's owner shows.
+    const TOKEN_OWNER: &str = "ci-bot";
+
+    fn mint(ctx: &crate::test_helpers::TestContext, role: crate::tokens::Role) -> String {
+        ctx.state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token(TOKEN_OWNER, 30, None, role)
+            .unwrap()
+    }
+
+    fn basic_header(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    /// The test client's address (`send_with_headers` connects from it).
+    const CLIENT_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// Record failures for the test client up to one short of lockout: the
+    /// test tracker locks out at its 5th, so whether the next request counts
+    /// as a failure decides whether the client ends up blocked.
+    fn one_failure_from_lockout(tracker: &super::AuthFailureTracker) {
+        for _ in 0..4 {
+            tracker.record_failure(CLIENT_IP);
+        }
+        assert!(tracker.check_blocked(&CLIENT_IP).is_none());
+    }
+
+    /// #1094: without htpasswd, an API token sent as the Basic password is
+    /// still a credential — `docker login` (the `/v2/` ping) and a write with a
+    /// write token pass, as they do with htpasswd (#736).
+    #[tokio::test]
+    async fn test_basic_auth_api_token_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("docker", &token);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.as_ref(), b"data");
+    }
+
+    /// #1094: the role gate holds on the htpasswd-less Basic path — a read
+    /// token reads but cannot write (403), as over Bearer and with htpasswd.
+    #[tokio::test]
+    async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let header_val = basic_header("docker", &token);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+            let response = send_with_headers(
+                &ctx.app,
+                method.clone(),
+                "/raw/test.txt",
+                vec![("authorization", &header_val)],
+                b"data".to_vec(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+        }
+    }
+
+    /// #1094: a token over Basic without htpasswd authenticates as the token's
+    /// owner with the token's role, not as the Basic username: npm whoami
+    /// names the owner, and the token list shows a write token only its
+    /// owner's tokens while an admin token sees every user's (GHSA-78cx).
+    #[tokio::test]
+    async fn test_basic_auth_token_identity_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let store = ctx.state.tokens.as_ref().unwrap();
+        store
+            .create_token(
+                "other",
+                30,
+                Some("theirs".into()),
+                crate::tokens::Role::Read,
+            )
+            .unwrap();
+        let write = basic_header("docker", &mint(&ctx, crate::tokens::Role::Write));
+        let admin = basic_header("docker", &mint(&ctx, crate::tokens::Role::Admin));
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &write)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["username"], TOKEN_OWNER);
+
+        for (header_val, sees_theirs) in [(&write, false), (&admin, true)] {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/api/ui/tokens/list",
+                vec![("authorization", header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+            assert!(body.contains(TOKEN_OWNER), "{body}");
+            assert_eq!(body.contains("theirs"), sees_theirs, "{body}");
+        }
+    }
+
+    /// #1094: the admin gate holds too — a write token over Basic cannot reach
+    /// /api/v1/admin/*, an admin token can (an OIDC-only admin mints tokens
+    /// there, #808, and hands them to Basic-only clients).
+    #[tokio::test]
+    async fn test_basic_auth_token_admin_gate_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let body = br#"{"username":"svc","ttl_days":1,"role":"read"}"#;
+        for (role, want) in [
+            (crate::tokens::Role::Write, StatusCode::FORBIDDEN),
+            (crate::tokens::Role::Admin, StatusCode::OK),
+        ] {
+            let header_val = basic_header("docker", &mint(&ctx, role.clone()));
+            let response = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/v1/admin/tokens",
+                vec![
+                    ("authorization", &header_val),
+                    ("content-type", "application/json"),
+                ],
+                body.to_vec(),
+            )
+            .await;
+            assert_eq!(response.status(), want, "{role:?}");
+        }
+    }
+
+    /// #1094: a token-store failure on the htpasswd-less Basic path is an
+    /// outage (503), not a credential verdict (401), and is not counted.
+    #[tokio::test]
+    async fn test_basic_auth_token_store_error_returns_503_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+
+        one_failure_from_lockout(&ctx.state.auth_failures);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("docker", &token))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ctx.state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+    }
+
+    /// #1094: an unknown, malformed or expired token over Basic without
+    /// htpasswd answers 401 and counts toward the per-IP lockout; a valid
+    /// token clears the count, as on every other credential path.
+    #[tokio::test]
+    async fn test_basic_auth_bad_token_without_htpasswd_is_401_and_counted() {
+        let ctx = create_test_context_without_htpasswd();
+        let tracker = &ctx.state.auth_failures;
+        let expired = mint(&ctx, crate::tokens::Role::Write);
+        let path = token_file_path(&ctx, &expired);
+        let mut info: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        info["expires_at"] = 0.into();
+        std::fs::write(&path, info.to_string()).unwrap();
+
+        let bad = [
+            "nra_00000000000000000000000000000000".to_string(),
+            "secret".to_string(),
+            expired,
+        ];
+        for password in &bad {
+            one_failure_from_lockout(tracker);
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/v2/",
+                vec![("authorization", &basic_header("docker", password))],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password}");
+            assert!(response.headers().contains_key("www-authenticate"));
+            assert!(
+                tracker.check_blocked(&CLIENT_IP).is_some(),
+                "{password}: not counted as a failure"
+            );
+            tracker.record_success(&CLIENT_IP);
+        }
+
+        one_failure_from_lockout(tracker);
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("docker", &token))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tracker.record_failure(CLIENT_IP);
+        assert!(
+            tracker.check_blocked(&CLIENT_IP).is_none(),
+            "a valid token clears the count"
+        );
+    }
+
+    /// With neither htpasswd nor a token store, Basic has nothing to check
+    /// against: the answer stays 401 "Basic auth not configured", uncounted.
+    #[tokio::test]
+    async fn test_basic_auth_without_htpasswd_or_token_store_not_configured() {
+        let ctx = create_test_context_without_htpasswd();
+        let mut state = ctx.state.clone();
+        state.tokens = None;
+        let app = crate::request_layers(crate::registry::docker_routes(), &state)
+            .with_state(state.clone());
+
+        one_failure_from_lockout(&state.auth_failures);
+        let response = send_with_headers(
+            &app,
+            Method::GET,
+            "/v2/",
+            vec![(
+                "authorization",
+                &basic_header("docker", "nra_00000000000000000000000000000000"),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_bytes(response).await.as_ref(),
+            br#"{"error":"Basic auth not configured"}"#
+        );
+        assert!(state.auth_failures.check_blocked(&CLIENT_IP).is_none());
     }
 
     #[tokio::test]

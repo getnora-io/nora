@@ -1745,10 +1745,11 @@ async fn run_server(mut config: Config, storage: Storage) {
             None if config.auth.oidc.is_active() => {
                 // #996 — OIDC-only is the intended setup; a missing htpasswd is
                 // not a misconfiguration, so log at info rather than a warning
-                // that trains operators to ignore auth warnings.
+                // that trains operators to ignore auth warnings. Basic still
+                // takes API tokens as the password (#1094).
                 info!(
                     oidc_providers = config.auth.oidc.providers.len(),
-                    "Basic auth disabled (no htpasswd); OIDC is the write path"
+                    "No htpasswd (OIDC-only): Basic auth accepts API tokens only"
                 );
                 None
             }
