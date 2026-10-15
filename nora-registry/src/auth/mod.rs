@@ -1347,6 +1347,41 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// htpasswd is verified BEFORE the token store: when both exist, a password
+    /// that merely *looks* like an API token (`nra_…`) authenticates against
+    /// htpasswd and never reaches token verification. The order has held since
+    /// #736 (htpasswd first, token on fallback), but no test pinned it — an
+    /// acceptance mutant that tried the token store first survived the #1094 net
+    /// (M12). Without the order a token-store blip would turn a valid htpasswd
+    /// login into a 503, and an htpasswd password that collided with a live token
+    /// would borrow the token's role and owner instead of the htpasswd identity.
+    /// Correct order: htpasswd matches, store never read → 200. Token-first: the
+    /// corrupt token file is read → Storage error → 503.
+    #[tokio::test]
+    async fn test_basic_auth_htpasswd_checked_before_token_store() {
+        // htpasswd user whose password is shaped like an `nra_` token, so a
+        // token-first order would try to verify it against the store.
+        let ctx = create_test_context_with_auth(&[("svc", "nra_witness")]);
+        assert!(ctx.state.auth.is_some(), "htpasswd provider present");
+        assert!(ctx.state.tokens.is_some(), "token store present");
+        // Corrupt the file the store would read for this password: reaching it at
+        // all yields a Storage error (→503). htpasswd-first never reads it.
+        std::fs::write(token_file_path(&ctx, "nra_witness"), "{\"token_ha").unwrap();
+
+        let header_val = basic_header("svc", "nra_witness");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        // htpasswd matched first → authenticated; the token store was never
+        // consulted, so the corrupt file never mattered.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// Auth enabled with no htpasswd file — the OIDC-only setup (#996). The
     /// token store is there, as main.rs always creates it when auth is enabled.
     fn create_test_context_without_htpasswd() -> crate::test_helpers::TestContext {
