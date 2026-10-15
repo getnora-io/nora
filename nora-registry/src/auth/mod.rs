@@ -499,19 +499,13 @@ pub async fn auth_middleware(
                         );
                         request.extensions_mut().insert(authority);
                         // Carry the provider's lifetime ceiling so a token minted
-                        // by this identity cannot outlive it (#1094). The JWT is
-                        // already bounded by it; the minted token must be too.
-                        if let Some(secs) = state
-                            .config
-                            .auth
-                            .oidc
-                            .providers
-                            .iter()
-                            .find(|p| p.name == identity.provider)
-                            .map(|p| p.max_token_lifetime_secs)
-                        {
-                            request.extensions_mut().insert(MintLifetimeCeiling(secs));
-                        }
+                        // by this identity cannot outlive it (#1094). Taken from
+                        // the identity — i.e. the provider that actually validated
+                        // this JWT — never re-looked-up by name, since provider
+                        // names are not unique (#1094 N2).
+                        request
+                            .extensions_mut()
+                            .insert(MintLifetimeCeiling(identity.max_token_lifetime_secs));
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));

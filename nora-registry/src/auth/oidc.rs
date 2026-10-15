@@ -49,6 +49,12 @@ pub struct OidcIdentity {
     /// Whether `namespace_scope` is enforced (403 on mismatch) or only audited
     /// for this provider.
     pub namespace_scope_enforcement: ScopeEnforcement,
+    /// The validating provider's `max_token_lifetime_secs`, carried from the
+    /// provider that actually validated this JWT (selected by issuer). A UI
+    /// token mint caps the new token's lifetime by this, rather than
+    /// re-looking-up the provider by name — provider names are not unique, so a
+    /// disabled same-name provider would mislead a by-name lookup (#1094 N2).
+    pub max_token_lifetime_secs: u64,
 }
 
 /// Standard JWT claims we extract.
@@ -302,6 +308,7 @@ impl OidcValidator {
             namespace_scope: provider.namespace_scope.clone(),
             rule_namespace_scope: rule_scope,
             namespace_scope_enforcement: provider.namespace_scope_enforcement,
+            max_token_lifetime_secs: provider.max_token_lifetime_secs,
         })
     }
 
@@ -807,6 +814,51 @@ mod tests {
         });
         let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         (server, config, encode(&header, &claims, &key).unwrap())
+    }
+
+    /// #1094 N2: the lifetime ceiling carried on the identity comes from the
+    /// provider that VALIDATED the JWT (issuer match), not a by-name lookup —
+    /// provider names are not unique, so a disabled same-name provider must not
+    /// supply the ceiling. A by-name lookup would pick the decoy below.
+    #[tokio::test]
+    async fn test_identity_ceiling_from_validating_provider_not_same_name() {
+        use crate::auth::oidc_integration_tests::TEST_JWKS_JSON;
+        use wiremock::{matchers::path, Mock, ResponseTemplate};
+
+        let (server, mut config, token) = mock_issuer(Some("/keys"), 300).await;
+        Mock::given(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        assert_eq!(config.providers[0].max_token_lifetime_secs, 900);
+        // Prepend a DISABLED provider sharing the name "ci", 100-year ceiling, on
+        // a different issuer: a by-name lookup would wrongly pick this one.
+        let decoy = OidcProvider {
+            name: "ci".to_string(),
+            issuer: "https://disabled.invalid".to_string(),
+            jwks_uri: None,
+            audience: "nora".to_string(),
+            algorithms: vec!["RS256".to_string()],
+            max_token_lifetime_secs: 99_999_999,
+            namespace_scope: vec!["*".to_string()],
+            namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
+            enabled: false,
+            role_rules: vec![OidcRoleRule {
+                pattern: "repo:myorg/*".to_string(),
+                role: "read".to_string(),
+                namespace_scope: None,
+            }],
+        };
+        config.providers.insert(0, decoy);
+
+        let v = OidcValidator::new(config, Client::new());
+        let identity = v.validate_token(&token).await.expect("valid token");
+        assert_eq!(
+            identity.max_token_lifetime_secs, 900,
+            "ceiling must come from the validating provider, not the disabled same-name decoy"
+        );
     }
 
     /// Cold start under load: concurrent requests share one JWKS fetch.
