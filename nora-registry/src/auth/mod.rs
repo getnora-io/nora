@@ -1913,11 +1913,15 @@ mod integration_tests {
 
     /// #1094: the role gate holds on the htpasswd-less Basic path — a read
     /// token reads but cannot write (403), as over Bearer and with htpasswd.
+    /// The 403 is about the request, not the credential: it clears the per-IP
+    /// failure count instead of adding to it, so a client with a valid read
+    /// token is never locked out for trying to write.
     #[tokio::test]
     async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
         let token = mint(&ctx, crate::tokens::Role::Read);
         let header_val = basic_header("docker", &token);
+        let tracker = &ctx.state.auth_failures;
 
         let response = send_with_headers(
             &ctx.app,
@@ -1930,6 +1934,7 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+            one_failure_from_lockout(tracker);
             let response = send_with_headers(
                 &ctx.app,
                 method.clone(),
@@ -1939,6 +1944,10 @@ mod integration_tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            assert!(
+                tracker.check_blocked(&CLIENT_IP).is_none(),
+                "{method}: a valid read token's 403 counted as a failure"
+            );
         }
     }
 
