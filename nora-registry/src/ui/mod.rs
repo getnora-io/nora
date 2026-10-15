@@ -104,16 +104,7 @@ fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
     Lang::default()
 }
 
-/// Extract username from Basic Auth header (already validated by auth middleware)
-fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let encoded = auth_header.strip_prefix("Basic ")?;
-    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
-    let (user, _) = decoded.split_once(':')?;
-    Some(user.to_string())
-}
-
+/// The UI router: pages and the HTMX fragment endpoints under `/api/ui`.
 pub fn routes() -> Router<AppState> {
     Router::new()
         // UI Pages
@@ -976,6 +967,8 @@ struct CreateTokenForm {
 
 async fn tokens_create(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedUser>,
+    Extension(caller_role): Extension<AuthenticatedRole>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -996,26 +989,28 @@ async fn tokens_create(
         }
     };
 
-    // Get authenticated user from Basic Auth header — token creation requires
-    // knowing who created it, so we reject requests without Basic auth identity.
-    let user = match extract_basic_auth_user(&headers) {
-        Some(u) => u,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(
-                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token creation requires Basic authentication to identify the owner</div>"##.to_string(),
-                ),
-            );
-        }
-    };
+    // The owner is the authenticated caller — the token owner on the Basic-token
+    // path (#1094), NOT the forgeable Basic-header username.
+    let user = caller.0;
 
-    let role = match form.role.as_str() {
+    let requested_role = match form.role.as_str() {
         "read" => Role::Read,
         "write" => Role::Write,
         "admin" => Role::Admin,
         _ => Role::Read,
     };
+    // An admin token may be minted only by a caller who can admin — mirroring
+    // token_routes::create_token and the list/revoke handlers. This UI create
+    // path had missed that gate (GHSA-78cx-cfhm-rgmx class): any write identity
+    // could mint an admin token for an arbitrary name.
+    if requested_role == Role::Admin && !caller_role.0.can_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">An admin token may be minted only by an admin identity</div>"##.to_string(),
+            ),
+        );
+    }
 
     let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
 
@@ -1025,7 +1020,7 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    match store.create_token(&user, ttl_days, description, role) {
+    match store.create_token(&user, ttl_days, description, requested_role) {
         Ok(raw_token) => {
             let html = render_token_created_fragment(&raw_token, lang);
             (StatusCode::OK, Html(html))

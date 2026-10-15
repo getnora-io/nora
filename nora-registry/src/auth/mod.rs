@@ -1911,6 +1911,76 @@ mod integration_tests {
         assert_eq!(body_bytes(response).await.as_ref(), b"data");
     }
 
+    /// #1094: a write identity may not mint an ADMIN token through the
+    /// UI create path, even over a Basic-token credential in OIDC-only — the
+    /// caller's role gates the request, not the form. Without the gate any write
+    /// token escalates to admin (GHSA-78cx-cfhm-rgmx class, the UI create path
+    /// had missed it).
+    #[tokio::test]
+    async fn test_ui_token_create_write_caller_cannot_mint_admin() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("victim-admin", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=admin".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a write identity minted an admin token via the UI"
+        );
+        // Nothing was minted: only the original write token remains.
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "a token was created despite the 403"
+        );
+    }
+
+    /// #1094: the UI create path owns the new token to the AUTHENTICATED
+    /// caller (the token owner), never to the forgeable Basic-header username (H3).
+    #[tokio::test]
+    async fn test_ui_token_create_owner_is_the_caller_not_the_basic_username() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("not-the-owner", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let owners: Vec<String> = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .into_iter()
+            .map(|t| t.user)
+            .collect();
+        assert!(
+            !owners.iter().any(|u| u == "not-the-owner"),
+            "the new token was owned by the forged Basic username: {owners:?}"
+        );
+    }
+
     /// #1094: the role gate holds on the htpasswd-less Basic path — a read
     /// token reads but cannot write (403), as over Bearer and with htpasswd.
     /// The 403 is about the request, not the credential: it clears the per-IP
