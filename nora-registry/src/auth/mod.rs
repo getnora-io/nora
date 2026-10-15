@@ -2663,6 +2663,22 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                     enabled: true,
                     role_rules: vec![
+                        // Admin ROLE with a RESTRICTED scope, and admin role with
+                        // no rule scope (unrestricted under provider `["*"]`).
+                        // Distinct `admin-scoped`/`admin-free` segments so these
+                        // never match the `repo:myorg/app:*` subjects other OIDC
+                        // tests mint (first-match-wins). Used by the admin-mint
+                        // scope-escape test.
+                        OidcRoleRule {
+                            pattern: "repo:myorg/admin-scoped:*".to_string(),
+                            role: "admin".to_string(),
+                            namespace_scope: Some(vec!["ci-transport/**".to_string()]),
+                        },
+                        OidcRoleRule {
+                            pattern: "repo:myorg/admin-free:*".to_string(),
+                            role: "admin".to_string(),
+                            namespace_scope: None,
+                        },
                         OidcRoleRule {
                             pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
                             role: "write".to_string(),
@@ -2744,6 +2760,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let app_routes = Router::new()
             .merge(crate::auth::token_routes())
             .merge(crate::ui::routes())
+            .merge(crate::admin::routes())
             .merge(registry_routes);
         let app = Router::new()
             .merge(public_routes)
@@ -2931,6 +2948,97 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .list_all_tokens()
                 .is_empty(),
             "a token was minted for a scoped caller despite the 403"
+        );
+    }
+
+    /// #1094 (admin sibling): the admin-gated mint route `POST
+    /// /api/v1/admin/tokens` is reachable by every identity the admin gate
+    /// admits — including an OIDC identity assigned the `admin` ROLE with a
+    /// RESTRICTED `namespace_scope`. Admin role is not admin authority: the
+    /// opaque token minted here is always namespace-unrestricted, so a scoped
+    /// admin must be refused (403, nothing minted) or it escalates past its own
+    /// `ci-transport/**` scope through the token. The non-vacuous pair: an
+    /// UNRESTRICTED admin (rule scope `None`, provider `["*"]`) is NOT refused —
+    /// the refusal keys on the caller's scope, not on the route.
+    #[tokio::test]
+    async fn test_oidc_scoped_admin_cannot_mint_unrestricted_token_via_admin_route() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+
+        // Scoped admin: role=admin WITH namespace_scope=["ci-transport/**"].
+        let scoped = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-scoped:deploy",
+            "nora",
+            now,
+            now + 600,
+        );
+        let scoped_bearer = format!("Bearer {}", scoped);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/v1/admin/tokens",
+            vec![
+                ("authorization", &scoped_bearer),
+                ("content-type", "application/json"),
+            ],
+            br#"{"username":"svc","role":"write","ttl_days":36500}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a namespace-scoped admin minted an unrestricted token via the admin route"
+        );
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "a token was minted for a scoped admin despite the 403"
+        );
+
+        // Non-vacuous pair: an unrestricted admin (rule scope None, provider
+        // ["*"]) IS allowed — the refusal keys on scope, not on the route.
+        let free = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-free:deploy",
+            "nora",
+            now,
+            now + 600,
+        );
+        let free_bearer = format!("Bearer {}", free);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/v1/admin/tokens",
+            vec![
+                ("authorization", &free_bearer),
+                ("content-type", "application/json"),
+            ],
+            br#"{"username":"svc","role":"write","ttl_days":30}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unrestricted admin must still be able to mint via the admin route"
+        );
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "exactly one token minted by the unrestricted admin"
         );
     }
 
