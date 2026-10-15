@@ -505,7 +505,10 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if ends_with_ci(tag_file, ".json") && !ends_with_ci(tag_file, ".meta.json") {
+                if ends_with_ci(tag_file, ".json")
+                    && !ends_with_ci(tag_file, ".meta.json")
+                    && !ends_with_ci(tag_file, ".stats.json")
+                {
                     let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
                     // Skip digest references (sha256:…, sha512:…) — they are
                     // stored alongside the tag file by put_manifest and must not
@@ -1805,6 +1808,46 @@ mod tests {
         assert_eq!(
             result.planned, 1,
             "exactly 1 tag should be planned for deletion"
+        );
+    }
+
+    /// #1114: a `.stats.json` pull-stats sidecar is not a tag — retention must
+    /// not count it toward keep_last. With 4 tags and keep_last=3 exactly one tag
+    /// is planned; if the sidecar were mistaken for a fifth tag, two would be.
+    #[tokio::test]
+    async fn retention_does_not_treat_the_stats_sidecar_as_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+
+        for (i, tag) in ["v1", "v2", "v3", "v4"].iter().enumerate() {
+            let body = serde_json::to_vec(&serde_json::json!({"tag": tag, "i": i})).unwrap();
+            storage
+                .put(&format!("docker/img/manifests/{}.json", tag), &body)
+                .await
+                .unwrap();
+        }
+        // A pull-stats sidecar beside one tag — NOT a fifth tag.
+        storage
+            .put(
+                "docker/img/manifests/v1.stats.json",
+                b"{\"downloads\":3,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
+
+        let rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(3),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: vec![],
+        }];
+        let result =
+            super::run_retention(&storage, &test_publish_locks(), None, &rules, true).await;
+        assert_eq!(
+            result.planned, 1,
+            "one real tag planned; the .stats.json sidecar is not a tag"
         );
     }
 

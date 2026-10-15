@@ -282,6 +282,11 @@ pub struct AppState {
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
     /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Off-request-path docker pull-stats accumulator (#1114): a manifest GET
+    /// bumps the per-key counter here; a background task flushes it in batches
+    /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
+    /// In-memory, rebuildable-empty after a restart.
+    pub(crate) pull_stats: Arc<registry::docker::PullStatsAccumulator>,
 }
 
 impl AppState {
@@ -1910,10 +1915,11 @@ async fn run_server(mut config: Config, storage: Storage) {
             None if config.auth.oidc.is_active() => {
                 // #996 — OIDC-only is the intended setup; a missing htpasswd is
                 // not a misconfiguration, so log at info rather than a warning
-                // that trains operators to ignore auth warnings.
+                // that trains operators to ignore auth warnings. Basic still
+                // takes API tokens as the password (#1094).
                 info!(
                     oidc_providers = config.auth.oidc.providers.len(),
-                    "Basic auth disabled (no htpasswd); OIDC is the write path"
+                    "No htpasswd (OIDC-only): Basic auth accepts API tokens only"
                 );
                 None
             }
@@ -2161,6 +2167,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
+        pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2175,6 +2182,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // #1114: fold accumulated docker pull counts into their .stats.json sidecars
+    // every PULL_STATS_FLUSH_INTERVAL and once more on shutdown. Pushed to the
+    // scheduler handles so the final flush completes within the shutdown drain,
+    // keeping the stats loss to at most one interval only on a hard crash.
+    scheduler_handles.push(tokio::spawn(registry::docker::pull_stats_flush_loop(
+        state.clone(),
+        registry::docker::PULL_STATS_FLUSH_INTERVAL,
+    )));
 
     // Retention is pushed first: it deletes expired versions, creating the
     // orphans the GC pass then sweeps in the same cycle.

@@ -420,8 +420,8 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
 
     let mut tags = Vec::new();
     for key in &keys {
-        // Skip .meta.json files
-        if ends_with_ci(key, ".meta.json") {
+        // Skip the .meta.json / .stats.json sidecars (not tags)
+        if ends_with_ci(key, ".meta.json") || ends_with_ci(key, ".stats.json") {
             continue;
         }
 
@@ -441,6 +441,10 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
             } else {
                 crate::registry::docker::ImageMetadata::default()
             };
+            // #1114: downloads/last_pulled live in the pull-stats sidecar plus the
+            // un-flushed in-memory delta, not the (now immutable after publish)
+            // .meta.json. Other fields (push_timestamp, size, os/arch) stay in meta.
+            let stats = crate::registry::docker::current_pull_stats(state, &meta_key).await;
 
             // Get file stats for created timestamp if metadata doesn't have push_timestamp
             let created = if metadata.push_timestamp > 0 {
@@ -484,9 +488,9 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
                 }
             };
 
-            // Format last_pulled
-            let last_pulled = if metadata.last_pulled > 0 {
-                Some(format_timestamp(metadata.last_pulled))
+            // Format last_pulled (from the pull-stats sidecar + accumulator)
+            let last_pulled = if stats.last_pulled > 0 {
+                Some(format_timestamp(stats.last_pulled))
             } else {
                 None
             };
@@ -498,7 +502,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
                 name: tag_name.to_string(),
                 size,
                 created,
-                downloads: metadata.downloads,
+                downloads: stats.downloads,
                 last_pulled,
                 os: if metadata.os.is_empty() {
                     "unknown".to_string()
@@ -2377,5 +2381,27 @@ mod npm_card_stored_layouts {
         let detail = get_npm_detail(&storage, "@scope/pkg", true, true).await;
         let names: Vec<&str> = detail.versions.iter().map(|v| v.version.as_str()).collect();
         assert!(names.is_empty(), "{names:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod docker_detail_tests {
+    /// the UI tag list does not show the .stats.json sidecar as a tag.
+    #[tokio::test]
+    async fn ui_tag_list_skips_the_stats_sidecar() {
+        let ctx = crate::test_helpers::create_test_context();
+        let st = &ctx.state.storage;
+        st.put("docker/img/manifests/v1.json", b"{}").await.unwrap();
+        st.put(
+            "docker/img/manifests/v1.stats.json",
+            b"{\"downloads\":4,\"last_pulled\":1}",
+        )
+        .await
+        .unwrap();
+        let d = super::get_docker_detail(&ctx.state, "img").await;
+        let names: Vec<_> = d.tags.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names, vec!["v1".to_string()]);
+        assert_eq!(d.tags[0].downloads, 4);
     }
 }
