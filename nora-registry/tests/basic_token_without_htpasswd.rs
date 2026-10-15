@@ -105,6 +105,31 @@ fn mint(port: u16, role: &str) -> String {
     token
 }
 
+/// The API tokens work on a server without htpasswd: over Basic (as Docker, twine and Maven send
+/// them) and over Bearer, with the read token gated to reads.
+fn assert_tokens_work(port: u16, write: &str, read: &str) {
+    let call = |method, path, authorization: String| {
+        request(port, method, path, Some(&authorization), "").unwrap()
+    };
+    let status = |method, path, password: &str| call(method, path, basic(password)).0;
+
+    // `docker login`: the /v2/ ping with the token as the Basic password.
+    assert_eq!(status("GET", "/v2/", write), 200);
+    assert_eq!(status("GET", "/v2/", read), 200);
+    // `docker pull` starts with HEAD: a read, which the read token may do.
+    assert_eq!(status("HEAD", "/v2/", read), 200);
+    // A push starts with a blob upload: the write token may, the read token may not.
+    assert_eq!(status("POST", "/v2/app/blobs/uploads/", write), 202);
+    assert_eq!(status("POST", "/v2/app/blobs/uploads/", read), 403);
+    // The same tokens over Bearer.
+    assert_eq!(call("GET", "/v2/", format!("Bearer {write}")).0, 200);
+    assert_eq!(call("GET", "/v2/", format!("Bearer {read}")).0, 200);
+    // A wrong token is still refused — as a wrong credential, not as an unconfigured Basic.
+    let (code, body) = call("GET", "/v2/", basic("nra_00000000000000000000000000000000"));
+    assert_eq!(code, 401);
+    assert!(body.contains("Invalid username or password"), "{body}");
+}
+
 #[test]
 fn an_api_token_as_the_basic_password_works_without_htpasswd() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,30 +150,20 @@ fn an_api_token_as_the_basic_password_works_without_htpasswd() {
         (mint(server.port, "write"), mint(server.port, "read"))
     };
 
+    // OIDC-only (#996), the setup #1094 was reported on.
     let missing = dir.path().join("no-such-htpasswd");
-    let server = serve(
-        dir.path(),
-        &[
-            ("NORA_AUTH_HTPASSWD_FILE", &missing),
-            ("NORA_CONFIG_PATH", &oidc),
-        ],
-    );
-    let port = server.port;
-    let status = |method, path, password: &str| {
-        request(port, method, path, Some(&basic(password)), "")
-            .unwrap()
-            .0
-    };
+    {
+        let server = serve(
+            dir.path(),
+            &[
+                ("NORA_AUTH_HTPASSWD_FILE", &missing),
+                ("NORA_CONFIG_PATH", &oidc),
+            ],
+        );
+        assert_tokens_work(server.port, &write, &read);
+    }
 
-    // `docker login`: the /v2/ ping with the token as the Basic password.
-    assert_eq!(status("GET", "/v2/", &write), 200);
-    assert_eq!(status("GET", "/v2/", &read), 200);
-    // A push starts with a blob upload: the write token may, the read token may not.
-    assert_eq!(status("POST", "/v2/app/blobs/uploads/", &write), 202);
-    assert_eq!(status("POST", "/v2/app/blobs/uploads/", &read), 403);
-    // A wrong token is still refused.
-    assert_eq!(
-        status("GET", "/v2/", "nra_00000000000000000000000000000000"),
-        401
-    );
+    // Neither htpasswd nor OIDC: the token store is still created, so the tokens still work.
+    let server = serve(dir.path(), &[("NORA_AUTH_HTPASSWD_FILE", &missing)]);
+    assert_tokens_work(server.port, &write, &read);
 }
