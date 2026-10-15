@@ -21,7 +21,7 @@ use axum::{
     Extension, Form, Router,
 };
 
-use crate::auth::{AuthenticatedRole, AuthenticatedUser, NamespaceAuthority};
+use crate::auth::{AuthenticatedRole, AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use api::*;
 use i18n::Lang;
 use templates::*;
@@ -1019,11 +1019,24 @@ fn decide_ui_token_mint(
     Ok(requested_role)
 }
 
+/// Cap a requested token lifetime (days) by an optional ceiling in seconds —
+/// an OIDC caller's provider `max_token_lifetime_secs` (#1094). Day-granular,
+/// matching the store's whole-day TTL: a sub-day ceiling floors to 1 day (the
+/// store's minimum), still far below the 3650-day clamp. `None` (Basic/opaque
+/// callers, which carry no ceiling) leaves the lifetime unchanged.
+fn cap_ttl_days(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
+    match ceiling_secs {
+        Some(secs) => requested_days.min((secs / 86_400).max(1)),
+        None => requested_days,
+    }
+}
+
 async fn tokens_create(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
     Extension(caller_role): Extension<AuthenticatedRole>,
     Extension(caller_authority): Extension<NamespaceAuthority>,
+    caller_mint_ceiling: Option<Extension<MintLifetimeCeiling>>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -1072,7 +1085,10 @@ async fn tokens_create(
         }
     };
 
-    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
+    let ttl_days = cap_ttl_days(
+        form.ttl_days.unwrap_or(90).clamp(1, 3650),
+        caller_mint_ceiling.map(|Extension(c)| c.0),
+    );
 
     let description = if form.description.trim().is_empty() {
         None
@@ -1305,5 +1321,23 @@ mod base_path_tests {
         assert!(UiMintRefusal::ScopedCannotMintUnrestricted
             .message()
             .contains("scoped"));
+    }
+
+    /// #1094: an OIDC caller's provider lifetime ceiling caps the minted token;
+    /// a caller with no ceiling (Basic/opaque) is unchanged.
+    #[test]
+    fn cap_ttl_days_respects_the_ceiling() {
+        // No ceiling: the requested (already clamped) lifetime is unchanged.
+        assert_eq!(cap_ttl_days(3650, None), 3650);
+        assert_eq!(cap_ttl_days(1, None), 1);
+        // A whole-day ceiling caps a longer request…
+        assert_eq!(cap_ttl_days(3650, Some(7 * 86_400)), 7);
+        // …but leaves a shorter request alone.
+        assert_eq!(cap_ttl_days(3, Some(7 * 86_400)), 3);
+        // Exactly one day.
+        assert_eq!(cap_ttl_days(3650, Some(86_400)), 1);
+        // A sub-day ceiling floors to the store's 1-day minimum (still << 3650).
+        assert_eq!(cap_ttl_days(3650, Some(900)), 1);
+        assert_eq!(cap_ttl_days(3650, Some(0)), 1);
     }
 }

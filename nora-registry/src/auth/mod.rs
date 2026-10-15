@@ -28,6 +28,15 @@ pub struct AuthenticatedUser(pub String);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
+/// The lifetime ceiling (seconds) the caller's own credential imposes on any
+/// token it mints. Inserted ONLY for OIDC identities — the provider's
+/// `max_token_lifetime_secs`, which already bounds the JWT itself. Absent for
+/// Basic and opaque (`nra_`) callers, which carry no such ceiling. A UI mint
+/// reads it to cap the new token so a short-lived federated identity cannot
+/// bootstrap a long-lived static one (#1094).
+#[derive(Clone, Copy, Debug)]
+pub struct MintLifetimeCeiling(pub u64);
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -489,6 +498,20 @@ pub async fn auth_middleware(
                             identity.namespace_scope_enforcement,
                         );
                         request.extensions_mut().insert(authority);
+                        // Carry the provider's lifetime ceiling so a token minted
+                        // by this identity cannot outlive it (#1094). The JWT is
+                        // already bounded by it; the minted token must be too.
+                        if let Some(secs) = state
+                            .config
+                            .auth
+                            .oidc
+                            .providers
+                            .iter()
+                            .find(|p| p.name == identity.provider)
+                            .map(|p| p.max_token_lifetime_secs)
+                        {
+                            request.extensions_mut().insert(MintLifetimeCeiling(secs));
+                        }
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));
@@ -2914,6 +2937,61 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .list_all_tokens()
                 .is_empty(),
             "a token was minted for a scoped caller despite the 403"
+        );
+    }
+
+    /// #1094: a token minted by an OIDC identity through the UI must not outlive
+    /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
+    /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
+    /// scope-refused — but the 3650-day request is capped to the 1-day floor.
+    #[tokio::test]
+    async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // main-ref rule: role=write, no rule scope, provider scope ["*"] -> an
+        // UNRESTRICTED identity (not refused by the scope gate).
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", jwt);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=3650".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unrestricted OIDC identity may mint a token"
+        );
+
+        let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(entries.len(), 1, "exactly one token minted");
+        let lifetime = entries[0].expires_at - entries[0].created_at;
+        assert_eq!(
+            lifetime, 86_400,
+            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 1 day)"
         );
     }
 
