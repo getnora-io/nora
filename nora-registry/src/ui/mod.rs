@@ -21,7 +21,7 @@ use axum::{
     Extension, Form, Router,
 };
 
-use crate::auth::{AuthenticatedRole, AuthenticatedUser};
+use crate::auth::{AuthenticatedRole, AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use api::*;
 use i18n::Lang;
 use templates::*;
@@ -104,16 +104,7 @@ fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
     Lang::default()
 }
 
-/// Extract username from Basic Auth header (already validated by auth middleware)
-fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let encoded = auth_header.strip_prefix("Basic ")?;
-    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
-    let (user, _) = decoded.split_once(':')?;
-    Some(user.to_string())
-}
-
+/// The UI router: pages and the HTMX fragment endpoints under `/api/ui`.
 pub fn routes() -> Router<AppState> {
     Router::new()
         // UI Pages
@@ -974,8 +965,78 @@ struct CreateTokenForm {
     ttl_days: Option<u64>,
 }
 
+/// Why a UI token-mint request is refused. One variant per refusal branch so
+/// the error text cannot drift from the reason it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMintRefusal {
+    /// An admin token was requested by a caller who cannot admin.
+    AdminRequiresAdmin,
+    /// The caller's identity is namespace-scoped; the UI mints only unrestricted
+    /// opaque tokens, so handing one out would widen the caller's authority.
+    ScopedCannotMintUnrestricted,
+}
+
+impl UiMintRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            UiMintRefusal::AdminRequiresAdmin => {
+                "An admin token may be minted only by an admin identity"
+            }
+            UiMintRefusal::ScopedCannotMintUnrestricted => {
+                "A namespace-scoped identity cannot mint an unrestricted token"
+            }
+        }
+    }
+}
+
+/// Decide the role of a UI-minted token, or refuse — pure: no I/O, no state.
+///
+/// A UI-minted opaque (`nra_`) token is always role-only and namespace-
+/// *unrestricted* (`auth::namespace`): it carries no scope. So two invariants
+/// must hold before one is handed out (#1094, GHSA-78cx-cfhm-rgmx class):
+///
+/// * an admin token may be minted only by a caller who `can_admin()` — a write
+///   identity must not mint admin; and
+/// * a namespace-*scoped* caller must not mint one at all — an identity limited
+///   to `ci-transport/**` would otherwise obtain an unrestricted token and write
+///   to `prod/`, escalating past its own scope.
+///
+/// The POST write-method gate in the auth middleware already bounds callers that
+/// reach this path to write-or-admin, so a read caller cannot mint write here;
+/// the admin check is kept as defence in depth. Table-tested in this module's
+/// tests — this replaces an inline gate that a regression could slip past.
+fn decide_ui_token_mint(
+    caller_role: Role,
+    caller_authority: &NamespaceAuthority,
+    requested_role: Role,
+) -> Result<Role, UiMintRefusal> {
+    if requested_role == Role::Admin && !caller_role.can_admin() {
+        return Err(UiMintRefusal::AdminRequiresAdmin);
+    }
+    if caller_authority.is_scoped() {
+        return Err(UiMintRefusal::ScopedCannotMintUnrestricted);
+    }
+    Ok(requested_role)
+}
+
+/// Cap a requested token lifetime (days) by an optional ceiling in seconds —
+/// an OIDC caller's provider `max_token_lifetime_secs` (#1094). Day-granular,
+/// matching the store's whole-day TTL: a sub-day ceiling floors to 1 day (the
+/// store's minimum), still far below the 3650-day clamp. `None` (Basic/opaque
+/// callers, which carry no ceiling) leaves the lifetime unchanged.
+fn cap_ttl_days(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
+    match ceiling_secs {
+        Some(secs) => requested_days.min((secs / 86_400).max(1)),
+        None => requested_days,
+    }
+}
+
 async fn tokens_create(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedUser>,
+    Extension(caller_role): Extension<AuthenticatedRole>,
+    Extension(caller_authority): Extension<NamespaceAuthority>,
+    caller_mint_ceiling: Option<Extension<MintLifetimeCeiling>>,
     headers: axum::http::HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> impl IntoResponse {
@@ -996,28 +1057,38 @@ async fn tokens_create(
         }
     };
 
-    // Get authenticated user from Basic Auth header — token creation requires
-    // knowing who created it, so we reject requests without Basic auth identity.
-    let user = match extract_basic_auth_user(&headers) {
-        Some(u) => u,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(
-                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token creation requires Basic authentication to identify the owner</div>"##.to_string(),
-                ),
-            );
-        }
-    };
+    // The owner is the authenticated caller — the token owner on the Basic-token
+    // path (#1094), NOT the forgeable Basic-header username.
+    let user = caller.0;
 
-    let role = match form.role.as_str() {
+    let requested_role = match form.role.as_str() {
         "read" => Role::Read,
         "write" => Role::Write,
         "admin" => Role::Admin,
         _ => Role::Read,
     };
+    // Who may mint what is a pure decision over the caller's role AND namespace
+    // authority (#1094) — kept in `decide_ui_token_mint` with a unit
+    // table, because an inline gate here could let a regression slip the owner
+    // source and the admin-by-name check past the tests.
+    let granted_role = match decide_ui_token_mint(caller_role.0, &caller_authority, requested_role)
+    {
+        Ok(role) => role,
+        Err(refusal) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Html(format!(
+                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">{}</div>"##,
+                    refusal.message()
+                )),
+            );
+        }
+    };
 
-    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
+    let ttl_days = cap_ttl_days(
+        form.ttl_days.unwrap_or(90).clamp(1, 3650),
+        caller_mint_ceiling.map(|Extension(c)| c.0),
+    );
 
     let description = if form.description.trim().is_empty() {
         None
@@ -1025,7 +1096,7 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    match store.create_token(&user, ttl_days, description, role) {
+    match store.create_token(&user, ttl_days, description, granted_role) {
         Ok(raw_token) => {
             let html = render_token_created_fragment(&raw_token, lang);
             (StatusCode::OK, Html(html))
@@ -1182,5 +1253,91 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+
+    /// A namespace-scoped authority, as an OIDC identity limited to
+    /// `ci-transport/**` carries.
+    fn scoped_authority() -> NamespaceAuthority {
+        let scope = vec!["ci-transport/**".to_string()];
+        NamespaceAuthority::from_oidc_scopes(
+            "test-ci",
+            std::iter::once(scope.as_slice()),
+            crate::config::ScopeEnforcement::Enforce,
+        )
+    }
+
+    /// #1094: the UI mint decision, as a table. This is the acceptance
+    /// test — an inline gate was slipped twice (owner source,
+    /// admin-by-name), so the decision is a pure function verified exhaustively
+    /// here rather than through an integration regex.
+    #[test]
+    fn decide_ui_token_mint_table() {
+        use crate::tokens::Role::{Admin, Read, Write};
+        let open = NamespaceAuthority::Unrestricted;
+        let scoped = scoped_authority();
+        assert!(scoped.is_scoped());
+        assert!(!open.is_scoped());
+
+        // Unrestricted admin caller: mints any role.
+        assert_eq!(decide_ui_token_mint(Admin, &open, Admin), Ok(Admin));
+        assert_eq!(decide_ui_token_mint(Admin, &open, Write), Ok(Write));
+        assert_eq!(decide_ui_token_mint(Admin, &open, Read), Ok(Read));
+
+        // Unrestricted write caller: read/write ok, admin refused by role.
+        assert_eq!(decide_ui_token_mint(Write, &open, Write), Ok(Write));
+        assert_eq!(decide_ui_token_mint(Write, &open, Read), Ok(Read));
+        assert_eq!(
+            decide_ui_token_mint(Write, &open, Admin),
+            Err(UiMintRefusal::AdminRequiresAdmin)
+        );
+        // Defence in depth: a read caller (stopped earlier by the POST
+        // write-method gate) is still refused an admin token here.
+        assert_eq!(
+            decide_ui_token_mint(Read, &open, Admin),
+            Err(UiMintRefusal::AdminRequiresAdmin)
+        );
+
+        // Scoped caller: refused for every role it could request — handing out
+        // an unrestricted token would widen its authority (the scope escape).
+        assert_eq!(
+            decide_ui_token_mint(Write, &scoped, Write),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        assert_eq!(
+            decide_ui_token_mint(Write, &scoped, Read),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        assert_eq!(
+            decide_ui_token_mint(Admin, &scoped, Admin),
+            Err(UiMintRefusal::ScopedCannotMintUnrestricted)
+        );
+        // A scoped non-admin requesting admin is refused either way.
+        assert!(decide_ui_token_mint(Write, &scoped, Admin).is_err());
+
+        // The refusal text matches its branch (no drift).
+        assert!(UiMintRefusal::AdminRequiresAdmin
+            .message()
+            .contains("admin"));
+        assert!(UiMintRefusal::ScopedCannotMintUnrestricted
+            .message()
+            .contains("scoped"));
+    }
+
+    /// #1094: an OIDC caller's provider lifetime ceiling caps the minted token;
+    /// a caller with no ceiling (Basic/opaque) is unchanged.
+    #[test]
+    fn cap_ttl_days_respects_the_ceiling() {
+        // No ceiling: the requested (already clamped) lifetime is unchanged.
+        assert_eq!(cap_ttl_days(3650, None), 3650);
+        assert_eq!(cap_ttl_days(1, None), 1);
+        // A whole-day ceiling caps a longer request…
+        assert_eq!(cap_ttl_days(3650, Some(7 * 86_400)), 7);
+        // …but leaves a shorter request alone.
+        assert_eq!(cap_ttl_days(3, Some(7 * 86_400)), 3);
+        // Exactly one day.
+        assert_eq!(cap_ttl_days(3650, Some(86_400)), 1);
+        // A sub-day ceiling floors to the store's 1-day minimum (still << 3650).
+        assert_eq!(cap_ttl_days(3650, Some(900)), 1);
+        assert_eq!(cap_ttl_days(3650, Some(0)), 1);
     }
 }

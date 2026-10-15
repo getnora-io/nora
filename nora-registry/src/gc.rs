@@ -410,6 +410,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         } else if key.contains("/manifests/")
             && ends_with_ci(key, ".json")
             && !ends_with_ci(key, ".meta.json")
+            && !ends_with_ci(key, ".stats.json")
         {
             all_manifest_keys.push(key.clone());
         }
@@ -469,6 +470,11 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         .iter()
         .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".meta.json"))
         .collect();
+    // #1114: the pull-stats sidecar is reaped with its digest manifest too.
+    let stats_sidecars: HashSet<&String> = keys
+        .iter()
+        .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".stats.json"))
+        .collect();
     let mut orphan_digest_manifests: Vec<String> = Vec::new();
     for key in &all_manifest_keys {
         let filename = key.rsplit('/').next().unwrap_or("");
@@ -484,6 +490,11 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
                 let sidecar = format!("{stem}.meta.json");
                 if meta_sidecars.contains(&sidecar) {
                     orphan_digest_manifests.push(sidecar);
+                }
+                // #1114: reap the .stats.json pull-stats sidecar with it too.
+                let stats_sidecar = format!("{stem}.stats.json");
+                if stats_sidecars.contains(&stats_sidecar) {
+                    orphan_digest_manifests.push(stats_sidecar);
                 }
             }
         }
@@ -1671,7 +1682,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Untagged digest manifest: orphan, and its sidecar must go with it.
+        // Untagged digest manifest: orphan, and its sidecars must go with it —
+        // both the .meta.json and the #1114 .stats.json pull-stats sidecar.
         storage
             .put("docker/test/manifests/sha256:dead.json", b"{}")
             .await
@@ -1680,9 +1692,16 @@ mod tests {
             .put("docker/test/manifests/sha256:dead.meta.json", b"{}")
             .await
             .unwrap();
+        storage
+            .put(
+                "docker/test/manifests/sha256:dead.stats.json",
+                b"{\"downloads\":9,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
-        assert_eq!(result.deleted, 2);
+        assert_eq!(result.deleted, 3);
         assert!(storage.get(&alias_key).await.is_ok());
         assert!(storage.get(&alias_meta_key).await.is_ok());
         assert!(storage
@@ -1691,6 +1710,37 @@ mod tests {
             .is_err());
         assert!(storage
             .get("docker/test/manifests/sha256:dead.meta.json")
+            .await
+            .is_err());
+        assert!(
+            storage
+                .get("docker/test/manifests/sha256:dead.stats.json")
+                .await
+                .is_err(),
+            "the orphan manifest's .stats.json sidecar must be reaped with it"
+        );
+    }
+
+    /// an orphan digest manifest WITHOUT a .meta.json (best-effort
+    /// meta write failed) still has its .stats.json reaped with it.
+    #[tokio::test]
+    async fn gc_reaps_stats_sidecar_without_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("docker/t/manifests/sha256:dead.json", b"{}")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/t/manifests/sha256:dead.stats.json",
+                b"{\"downloads\":1,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
+        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(storage
+            .get("docker/t/manifests/sha256:dead.stats.json")
             .await
             .is_err());
     }

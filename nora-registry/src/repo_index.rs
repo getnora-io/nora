@@ -268,7 +268,7 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
 
     for (key, meta) in &keys {
-        if ends_with_ci(key, ".meta.json") {
+        if ends_with_ci(key, ".meta.json") || ends_with_ci(key, ".stats.json") {
             continue;
         }
 
@@ -1172,5 +1172,18 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].versions, 1);
         assert_eq!(repos[0].size, 440);
+    }
+
+    /// a .stats.json sidecar is not a tag in the docker repo index.
+    #[tokio::test]
+    async fn docker_index_skips_the_stats_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::new_local(dir.path().to_str().unwrap());
+        s.put("docker/img/manifests/v1.json", b"{}").await.unwrap();
+        s.put("docker/img/manifests/v1.stats.json", b"{}")
+            .await
+            .unwrap();
+        let repos = build_docker_index(&s).await.expect("index built");
+        assert_eq!(repos[0].versions, 1);
     }
 }
