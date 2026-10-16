@@ -719,8 +719,13 @@ pub fn render_activity_log(rows: &str, t: &Translations) -> String {
     )
 }
 
-/// Render the polling script for auto-refresh
-pub fn render_polling_script() -> String {
+/// Render the polling script for auto-refresh.
+///
+/// The live uptime recomputed here every 5s must agree with [`format_uptime`],
+/// so the day/hour/minute units are the same localized strings from `t` and the
+/// arithmetic (the 86400/3600/60 split and the `days > 0` conditional) is kept in
+/// lockstep with it.
+pub fn render_polling_script(t: &Translations) -> String {
     r##"
     <script>
         setInterval(async () => {
@@ -742,20 +747,26 @@ pub fn render_polling_script() -> String {
                 else sizeStr = bytes + ' B';
                 document.getElementById('stat-storage').textContent = sizeStr;
 
-                // Update uptime
+                // Update uptime (days/hours/minutes; the day part appears only when
+                // there is one, matching the server-rendered value)
                 const uptime = document.getElementById('uptime');
                 if (uptime) {
                     const secs = data.uptime_seconds;
-                    const hours = Math.floor(secs / 3600);
+                    const days = Math.floor(secs / 86400);
+                    const hours = Math.floor((secs % 86400) / 3600);
                     const mins = Math.floor((secs % 3600) / 60);
-                    uptime.textContent = hours + 'h ' + mins + 'm';
+                    uptime.textContent =
+                        (days > 0 ? days + '__UPTIME_D__ ' : '') + hours + '__UPTIME_H__ ' + mins + '__UPTIME_M__';
                 }
             } catch (e) {
                 console.error('Dashboard poll failed:', e);
             }
         }, 5000);
     </script>
-    "##.to_string()
+    "##
+    .replace("__UPTIME_D__", t.uptime_days)
+    .replace("__UPTIME_H__", t.uptime_hours)
+    .replace("__UPTIME_M__", t.uptime_mins)
 }
 
 /// SVG icon definitions for registries (exported for use in templates)
@@ -965,6 +976,29 @@ pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
         deps_label = t.deps_label,
         tagline = t.tagline,
     )
+}
+
+/// Format an uptime in seconds as `Xd Xh Ym`, with the day/hour/minute units
+/// taken from `t` so they localize with the rest of the dashboard.
+///
+/// The day component is shown only when there is one, so a registry that has been
+/// up for a week reads `7d 3h 12m` instead of `171h 12m`, while a freshly
+/// started one reads `0h 12m` (the hours place is always present).
+///
+/// The polling script in `render_polling_script` mirrors this formatting; keep the
+/// two in step so the server-rendered value and the live one do not disagree.
+pub fn format_uptime(secs: u64, t: &Translations) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!(
+            "{days}{} {hours}{} {mins}{}",
+            t.uptime_days, t.uptime_hours, t.uptime_mins
+        )
+    } else {
+        format!("{hours}{} {mins}{}", t.uptime_hours, t.uptime_mins)
+    }
 }
 
 /// Format Unix timestamp as relative time
@@ -1226,6 +1260,60 @@ mod tests {
         assert_eq!(sanitize_href("ftp://example.com"), None);
         assert_eq!(sanitize_href("ssh://git@github.com"), None);
         assert_eq!(sanitize_href("git://github.com/repo"), None);
+    }
+
+    #[test]
+    fn format_uptime_renders_days_hours_minutes() {
+        let t = get_translations(Lang::En);
+        let cases: [(u64, &str); 6] = [
+            (0, "0h 0m"),        // nothing on the clock yet
+            (60, "0h 1m"),       // the minute rolls, hours stay 0
+            (3660, "1h 1m"),     // an hour and a minute
+            (90060, "1d 1h 1m"), // all three places non-zero: 1 day + 1 hour + 1 minute
+            (86399, "23h 59m"),  // one second short of a day: no day part yet
+            (86400, "1d 0h 0m"), // exactly one day: day part appears, hours/mins zero
+        ];
+        for (secs, expected) in cases {
+            assert_eq!(format_uptime(secs, t), expected, "uptime_seconds={secs}");
+        }
+    }
+
+    #[test]
+    fn format_uptime_localizes_units() {
+        // Units come from the active locale, not hardcoded English.
+        assert_eq!(format_uptime(90060, get_translations(Lang::Ru)), "1д 1ч 1м");
+        assert_eq!(
+            format_uptime(90060, get_translations(Lang::Zh)),
+            "1天 1小时 1分"
+        );
+    }
+
+    #[test]
+    fn polling_script_uptime_mirrors_format_uptime() {
+        // The live-refresh script recomputes uptime in JS every 5s; if it drifts
+        // from `format_uptime` the dashboard flips between two values. Pin the
+        // arithmetic split and the day conditional, and that the units are the
+        // same localized strings (here Russian) rather than hardcoded English.
+        let script = render_polling_script(get_translations(Lang::Ru));
+        assert!(script.contains("secs / 86400"), "day divisor drifted");
+        assert!(
+            script.contains("(secs % 86400) / 3600"),
+            "hour split drifted"
+        );
+        assert!(
+            script.contains("(secs % 3600) / 60"),
+            "minute split drifted"
+        );
+        assert!(script.contains("days > 0 ?"), "day conditional drifted");
+        assert!(
+            script.contains("days + 'д ' : '') + hours + 'ч ' + mins + 'м'"),
+            "polling units not localized in lockstep with format_uptime"
+        );
+        // No leftover hardcoded English unit in the localized render.
+        assert!(
+            !script.contains("+ 'h '"),
+            "English hour unit leaked into localized script"
+        );
     }
 
     proptest! {
