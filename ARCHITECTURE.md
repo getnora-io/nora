@@ -203,7 +203,7 @@ nora/
 │   │   ├── api.rs           #   Dashboard JSON API
 │   │   ├── i18n.rs          #   English/Russian UI strings
 │   │   ├── static_assets.rs #   Embedded CSS/JS (Tailwind, htmx)
-│   │   ├── static/          #   tailwind.css, htmx.min.js
+│   │   ├── static/          #   tailwind.css, htmx.min.js; swagger-ui/ (the /api-docs page)
 │   │   └── logo.jpg         #   UI logo asset
 │   │
 │   ├── openapi.rs           # OpenAPI spec generation (utoipa)
