@@ -52,6 +52,7 @@ use crate::AppState;
         (name = "rpm", description = "RPM (yum/dnf) Hosted & Pull-Through Repository API"),
         (name = "deb", description = "Debian (APT) Hosted & Pull-Through Repository API"),
         (name = "cpan", description = "CPAN (Perl Archive) Proxy API"),
+        (name = "hf", description = "Hugging Face Hub Pull-Through Proxy API (opt-in: NORA_HF_ENABLED=true)"),
         (name = "auth", description = "Authentication & API Tokens")
     ),
     paths(
@@ -135,6 +136,11 @@ use crate::AppState;
         // CPAN
         crate::openapi::cpan_index,
         crate::openapi::cpan_download,
+        // Hugging Face
+        crate::openapi::hf_models_api,
+        crate::openapi::hf_resolve,
+        crate::openapi::hf_resolve_head,
+        crate::openapi::hf_datasets,
         // Tokens
         crate::openapi::create_token,
         crate::openapi::list_tokens,
@@ -1287,6 +1293,76 @@ pub async fn cpan_index() {}
     ),
 )]
 pub async fn cpan_download() {}
+
+// -------------------- Hugging Face --------------------
+
+/// Hugging Face model metadata (model info, `revision/{rev}`, `tree/{rev}[/{path}]`), without Xet
+#[utoipa::path(
+    get,
+    path = "/hf/api/models/{path}",
+    tag = "hf",
+    params(
+        ("path" = String, Path, description = "Repository id, optionally followed by `revision/{rev}` or `tree/{rev}[/{path}]`; a revision such as `refs%2Fpr%2F1` stays one encoded segment"),
+    ),
+    responses(
+        (status = 200, description = "Metadata as JSON, `xetHash` removed; `Link rel=\"next\"` under /hf", content_type = "application/json"),
+        (status = 400, description = "Not a metadata path NORA forwards"),
+        (status = 401, description = "The Hub's refusal, with its X-Error-Code"),
+        (status = 404, description = "Not on the upstream, a Xet token route, or no upstream configured"),
+        (status = 429, description = "The Hub's rate limit, with Retry-After / RateLimit / RateLimit-Policy"),
+        (status = 502, description = "Upstream unavailable, or an answer NORA cannot hand on"),
+    ),
+)]
+pub async fn hf_models_api() {}
+
+/// Download a Hugging Face model file through the proxy (cached by its digest)
+#[utoipa::path(
+    get,
+    path = "/hf/{repo}/resolve/{revision}/{file}",
+    tag = "hf",
+    params(
+        ("repo" = String, Path, description = "Repository id (`org/name`, or a legacy one-segment id)"),
+        ("revision" = String, Path, description = "Branch, tag, commit or `refs%2Fpr%2FN`"),
+        ("file" = String, Path, description = "Path of the file in the repository"),
+    ),
+    responses(
+        (status = 200, description = "File, with X-Repo-Commit and X-Linked-Etag", content_type = "application/octet-stream"),
+        (status = 206, description = "Range of the file"),
+        (status = 401, description = "The Hub's refusal (a gated repository), with its X-Error-Code"),
+        (status = 403, description = "Refused by curation"),
+        (status = 404, description = "Not on the upstream, or no upstream configured"),
+        (status = 429, description = "The Hub's rate limit, with Retry-After / RateLimit / RateLimit-Policy"),
+        (status = 502, description = "Upstream unavailable"),
+    ),
+)]
+pub async fn hf_resolve() {}
+
+/// File metadata (commit, digest, size) from the Hub's resolve answer
+#[utoipa::path(
+    head,
+    path = "/hf/{repo}/resolve/{revision}/{file}",
+    tag = "hf",
+    params(
+        ("repo" = String, Path, description = "Repository id"),
+        ("revision" = String, Path, description = "Branch, tag, commit or `refs%2Fpr%2FN`"),
+        ("file" = String, Path, description = "Path of the file in the repository"),
+    ),
+    responses(
+        (status = 200, description = "X-Repo-Commit, X-Linked-Etag, X-Linked-Size"),
+        (status = 404, description = "Not on the upstream"),
+    ),
+)]
+pub async fn hf_resolve_head() {}
+
+/// Hugging Face datasets are not served in this release
+#[utoipa::path(
+    get,
+    path = "/hf/api/datasets/{path}",
+    tag = "hf",
+    params(("path" = String, Path, description = "Dataset id and route")),
+    responses((status = 501, description = "Datasets are not implemented: only models are in scope")),
+)]
+pub async fn hf_datasets() {}
 
 // -------------------- Auth / Tokens --------------------
 
