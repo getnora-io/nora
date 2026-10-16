@@ -103,7 +103,9 @@ const CACHE_PREFIX: &str = "hf/models";
 const FILL_TEMP_DIR: &str = "tmp/hf-proxy";
 /// A temp file untouched this long belongs to a fill that will not finish.
 const FILL_TEMP_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
-const CACHED_CONTENT_TYPE: &str = "application/octet-stream";
+/// The content type of every file answer, cached or not: the label an upstream gave a file
+/// never reaches a browser.
+const FILE_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// How long the canonical id the Hub named for an id is trusted; renames are rare.
 const CANONICAL_TTL: Duration = Duration::from_secs(60 * 60);
@@ -892,6 +894,18 @@ where
     outcome.unwrap_or_else(FileFetch::Failed)
 }
 
+/// Headers every file answer carries, cached or not, full or ranged: a repository file is
+/// bytes anyone can push to a public repo, served at NORA's own origin. The browser saves it
+/// instead of rendering it, and a forced render runs nothing — the Hub marks its own answers
+/// `sandbox` too, and NORA hands on no upstream header but the listed ones. Raw downloads carry
+/// the same pair (#1120).
+fn inert_file_headers() -> [(HeaderName, &'static str); 2] {
+    [
+        (header::CONTENT_DISPOSITION, "attachment"),
+        (header::CONTENT_SECURITY_POLICY, "sandbox"),
+    ]
+}
+
 /// The answer to a file request: only listed headers, and the body streamed with a stall
 /// limit per read. With a [`Fill`] the body is checked against the digest the Hub named the
 /// file by on its way through (and stored when it matches); without one it goes through the
@@ -904,6 +918,13 @@ fn file_response(
     fill: Option<Fill>,
 ) -> Response {
     let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(FILE_CONTENT_TYPE),
+    );
+    for (name, value) in inert_file_headers() {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
     if let Some(commit) = &meta.commit {
         headers.insert(REPO_COMMIT_HEADER, commit.clone());
     }
@@ -924,7 +945,6 @@ fn file_response(
         header::CONTENT_LENGTH,
         header::CONTENT_RANGE,
         header::ACCEPT_RANGES,
-        header::CONTENT_TYPE,
     ] {
         if let Some(v) = upstream.headers().get(&name) {
             headers.insert(name, v.clone());
@@ -1376,7 +1396,10 @@ async fn cached_response(
     key: &str,
     size: u64,
 ) -> Option<Response> {
-    let mut extra: Vec<(HeaderName, String)> = Vec::new();
+    let mut extra: Vec<(HeaderName, String)> = inert_file_headers()
+        .into_iter()
+        .map(|(name, value)| (name, value.to_string()))
+        .collect();
     let text = |v: &HeaderValue| v.to_str().ok().map(str::to_string);
     if let Some(commit) = meta.commit.as_ref().and_then(text) {
         extra.push((REPO_COMMIT_HEADER, commit));
@@ -1397,7 +1420,7 @@ async fn cached_response(
             &[key],
             headers,
             size,
-            CACHED_CONTENT_TYPE,
+            FILE_CONTENT_TYPE,
             &extra,
         )
         .await
@@ -1418,7 +1441,7 @@ async fn cached_response(
     };
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, CACHED_CONTENT_TYPE)
+        .header(header::CONTENT_TYPE, FILE_CONTENT_TYPE)
         .header(header::CONTENT_LENGTH, len)
         .header(header::ACCEPT_RANGES, "bytes");
     for (name, value) in &extra {
@@ -2507,7 +2530,9 @@ mod tests {
 
     /// Only listed headers reach the client — a white list by exact name, so nothing the
     /// upstream sends beside them (Xet, `Link`, `Location`, cookies, storage or cache headers)
-    /// gets through. `x-request-id` is NORA's own (its request-id middleware).
+    /// gets through. `x-request-id` is NORA's own (its request-id middleware), and so are the
+    /// two that make a file inert: allowed with NORA's value only, so the CDN's
+    /// `content-disposition` cannot pass under their name.
     fn assert_no_leaked_headers(resp: &Response) {
         const LISTED: &[&str] = &[
             "x-repo-commit",
@@ -2520,7 +2545,15 @@ mod tests {
             "content-type",
             "x-request-id",
         ];
+        const OWN: &[(&str, &str)] = &[
+            ("content-disposition", "attachment"),
+            ("content-security-policy", "sandbox"),
+        ];
         for (name, value) in resp.headers() {
+            if let Some((_, own)) = OWN.iter().find(|(n, _)| *n == name.as_str()) {
+                assert_eq!(value, own, "{name} is NORA's own");
+                continue;
+            }
             assert!(LISTED.contains(&name.as_str()), "{name} reached the client");
             assert_ne!(value, "upstream", "{name} carries the upstream's value");
         }
@@ -3647,6 +3680,66 @@ mod tests {
         assert_eq!(header(&resp, "x-linked-size"), CONFIG.len().to_string());
         assert_eq!(received(resp).await, (CONFIG.to_vec(), true));
         assert_eq!(hits(&up, &format!("/{COMMIT}/config.json")).await, 1);
+    }
+
+    /// A repository file is served at NORA's origin as an inert attachment, whatever the
+    /// upstream labelled it: here a page. HEAD, a range passed through, the fill, the cached
+    /// copy and a range read from it carry one content type, `attachment` and `sandbox`.
+    #[tokio::test]
+    async fn a_file_is_served_as_an_inert_attachment() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        Mock::given(path(
+            format!("/api/resolve-cache/models/org/model/{COMMIT}/config.json").as_str(),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(CONFIG.to_vec())
+                .insert_header("content-type", "text/html")
+                .insert_header("etag", format!("\"{CONFIG_BLOB}\"").as_str())
+                .insert_header("x-repo-commit", COMMIT),
+        )
+        .with_priority(1)
+        .mount(&up)
+        .await;
+        let ctx = hf_with_upstream(&up);
+        let ranged = || {
+            send_with_headers(
+                &ctx.app,
+                Method::GET,
+                CONFIG_PATH,
+                vec![("range", "bytes=0-3")],
+                "",
+            )
+        };
+        let inert = |label: &str, resp: &Response| {
+            assert_eq!(
+                (
+                    header(resp, "content-type"),
+                    header(resp, "content-disposition"),
+                    header(resp, "content-security-policy"),
+                ),
+                (
+                    "application/octet-stream".to_string(),
+                    "attachment".to_string(),
+                    "sandbox".to_string(),
+                ),
+                "{label}"
+            );
+        };
+        inert("head", &send(&ctx.app, Method::HEAD, CONFIG_PATH, "").await);
+        inert("range, upstream", &ranged().await);
+        assert!(hf_keys(&ctx).await.is_empty(), "a range fills nothing");
+        let fill = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        inert("fill", &fill);
+        assert_eq!(received(fill).await, (CONFIG.to_vec(), true));
+        wait_stored(&ctx, &config_key()).await;
+        let cached = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        inert("cached", &cached);
+        assert_eq!(received(cached).await, (CONFIG.to_vec(), true));
+        let cached_range = ranged().await;
+        assert_eq!(cached_range.status(), StatusCode::PARTIAL_CONTENT);
+        inert("range, cached", &cached_range);
     }
 
     /// An upstream that answers the resolve request like the live Hub but sends `body` for
