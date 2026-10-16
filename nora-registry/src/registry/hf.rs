@@ -1069,6 +1069,8 @@ struct Fill {
 
 struct FillStore {
     storage: Storage,
+    /// Marked stale once the fill is committed, so the dashboard counts the new file.
+    index: std::sync::Arc<crate::repo_index::RepoIndex>,
     key: String,
     file: tokio::fs::File,
     path: PathBuf,
@@ -1126,6 +1128,7 @@ async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
     match created {
         Ok(file) => Some(FillStore {
             storage: state.storage.clone(),
+            index: std::sync::Arc::clone(&state.repo_index),
             key,
             file,
             guard: TempFileGuard::new(path.clone()),
@@ -1217,17 +1220,22 @@ mod checked {
     /// check and drops nothing. Built only by [`healing`].
     pub(super) struct Healing {
         inner: VerifyingStream,
-        drop_on_mismatch: Option<(crate::storage::Storage, String)>,
+        drop_on_mismatch: Option<(
+            crate::storage::Storage,
+            std::sync::Arc<crate::repo_index::RepoIndex>,
+            String,
+        )>,
     }
 
     pub(super) fn healing(
         inner: VerifyingStream,
         storage: crate::storage::Storage,
+        index: std::sync::Arc<crate::repo_index::RepoIndex>,
         key: String,
     ) -> Healing {
         Healing {
             inner,
-            drop_on_mismatch: Some((storage, key)),
+            drop_on_mismatch: Some((storage, index, key)),
         }
     }
 
@@ -1238,8 +1246,8 @@ mod checked {
             let next = Pin::new(&mut self.inner).poll_next(cx);
             if let Poll::Ready(Some(Err(e))) = &next {
                 if e.kind() == std::io::ErrorKind::InvalidData {
-                    if let Some((storage, key)) = self.drop_on_mismatch.take() {
-                        super::drop_bad_copy(storage, key);
+                    if let Some((storage, index, key)) = self.drop_on_mismatch.take() {
+                        super::drop_bad_copy(storage, index, key);
                     }
                 }
             }
@@ -1301,11 +1309,16 @@ mod checked {
 }
 
 /// Deletes a cached copy that failed its pin, in a task of its own.
-fn drop_bad_copy(storage: Storage, key: String) {
+fn drop_bad_copy(
+    storage: Storage,
+    index: std::sync::Arc<crate::repo_index::RepoIndex>,
+    key: String,
+) {
     use std::panic::AssertUnwindSafe;
     let task = async move {
         match storage.delete(&key).await {
             Ok(()) => {
+                index.invalidate("hf");
                 tracing::warn!(registry = "hf", key = %key, "cached copy failed its pin; dropped")
             }
             Err(e) => {
@@ -1328,13 +1341,17 @@ fn commit_fill(store: FillStore, sha256: String) {
     let task = async move {
         let FillStore {
             storage,
+            index,
             key,
             file,
             path,
             mut guard,
         } = store;
         match sync_and_commit(&storage, &key, file, &path, &sha256).await {
-            Ok(()) => guard.disarm(),
+            Ok(()) => {
+                guard.disarm();
+                index.invalidate("hf");
+            }
             Err(e) => {
                 tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
             }
@@ -1452,6 +1469,7 @@ async fn cached_response(
         .body(stream_body(checked::healing(
             verified,
             state.storage.clone(),
+            std::sync::Arc::clone(&state.repo_index),
             key.to_string(),
         )))
         .ok()
@@ -3664,6 +3682,51 @@ mod tests {
         assert_eq!(fill_temps(&ctx), 0);
     }
 
+    /// A cached file shows on the dashboard: the index counts it per repository, and the UI
+    /// stats and the dashboard's storage total include it (hf used to be missing from all
+    /// three: the index was a placeholder and a fill never marked it stale).
+    #[tokio::test]
+    async fn a_cached_file_is_counted_on_the_dashboard() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        // Built, empty, before the download: only the fill's invalidation can show the file.
+        let before = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
+        assert!(before.is_empty(), "{before:?}");
+        let first = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(body_bytes(first).await.to_vec(), weights());
+        wait_stored(&ctx, &weights_key()).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let idx = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
+            if !idx.is_empty() {
+                assert_eq!(idx.len(), 1, "{idx:?}");
+                assert_eq!(idx[0].name, "org/model");
+                assert_eq!(idx[0].versions, 1);
+                assert_eq!(idx[0].size, weights().len() as u64);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the index never saw the cached file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stats: Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, "/api/ui/stats", "").await).await,
+        )
+        .unwrap();
+        assert_eq!(stats["hf"], 1, "{stats}");
+        let dash: Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await).await,
+        )
+        .unwrap();
+        assert!(
+            dash["global_stats"]["storage_bytes"].as_u64().unwrap() >= weights().len() as u64,
+            "{dash}"
+        );
+    }
+
     #[tokio::test]
     async fn a_second_download_of_a_regular_file_comes_from_the_cache() {
         let cdn = cdn_with_weights().await;
@@ -3925,6 +3988,7 @@ mod tests {
             git: None,
             store: Some(FillStore {
                 storage: ctx.state.storage.clone(),
+                index: std::sync::Arc::clone(&ctx.state.repo_index),
                 key: key.to_string(),
                 file,
                 guard: TempFileGuard::new(path.clone()),
