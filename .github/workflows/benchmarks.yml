@@ -75,7 +75,7 @@ jobs:
           echo "Idle VmRSS: ${VMRSS} kB"
 
       - name: Run criterion benchmarks
-        run: cargo bench -p nora-registry -- --output-format bencher 2>/dev/null | tee /tmp/criterion-results.txt || true
+        run: cargo bench --locked -p nora-registry -- --output-format bencher 2>/dev/null | tee /tmp/criterion-results.txt || true
 
       - name: Generate summary report
         id: report
