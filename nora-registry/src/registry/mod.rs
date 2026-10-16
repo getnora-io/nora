@@ -1814,9 +1814,24 @@ mod curation_label_whitelist {
         ),
     ];
 
-    /// The file up to its module-level `#[cfg(test)]`.
+    /// The file up to its first test module: a module-level `#[cfg(test)]` whose item,
+    /// after any further attributes, is a `mod`. A `#[cfg(test)]` helper function between
+    /// production items (go.rs has one) does not end the production code.
     fn code(src: &str) -> &str {
-        src.split("\n#[cfg(test)]").next().unwrap_or(src)
+        let mut at = 0;
+        while let Some(i) = src[at..].find("\n#[cfg(test)]") {
+            let start = at + i + 1;
+            let item = src[start..]
+                .lines()
+                .skip(1)
+                .find(|l| !l.trim_start().starts_with("#["))
+                .unwrap_or("");
+            if item.starts_with("mod ") || item.starts_with("pub mod ") {
+                return &src[..start];
+            }
+            at = start;
+        }
+        src
     }
 
     /// The variants named as `RegistryType::<Variant>` in `code`.
@@ -1829,6 +1844,15 @@ mod curation_label_whitelist {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_production_code_ends_at_the_first_test_module() {
+        let src = "fn a() {}\n#[cfg(test)]\nfn helper() {}\nfn b() { RegistryType::Go }\n#[cfg(test)]\n#[allow(x)]\nmod tests {\n    fn t() { RegistryType::Npm }\n}\n";
+        let code = code(src);
+        assert!(code.contains("fn b()"), "{code}");
+        assert!(!code.contains("mod tests"), "{code}");
+        assert_eq!(variants(code), BTreeSet::from(["Go".to_string()]));
     }
 
     #[test]
