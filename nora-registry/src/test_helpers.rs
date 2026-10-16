@@ -287,17 +287,18 @@ fn build_context_with(
 
     // Build curation engine before consuming config (mirroring main.rs)
     let mut curation_engine = CurationEngine::new(config.curation.clone());
+    // A list that does not parse fails the test: main.rs refuses it in enforce mode, and a
+    // test that silently runs without its list checks nothing.
     if let Some(ref path) = config.curation.blocklist_path {
-        if let Ok(filter) = crate::curation::BlocklistFilter::from_file(path) {
-            curation_engine.add_filter(Box::new(filter));
-        }
+        let filter = crate::curation::BlocklistFilter::from_file(path)
+            .unwrap_or_else(|e| panic!("test blocklist {path}: {e}"));
+        curation_engine.add_filter(Box::new(filter));
     }
     if let Some(ref path) = config.curation.allowlist_path {
-        if let Ok(filter) =
+        let filter =
             crate::curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
-        {
-            curation_engine.add_filter(Box::new(filter));
-        }
+                .unwrap_or_else(|e| panic!("test allowlist {path}: {e}"));
+        curation_engine.add_filter(Box::new(filter));
     }
     if !config.curation.internal_namespaces.is_empty() {
         let ns_filter =
@@ -337,6 +338,7 @@ fn build_context_with(
     } else {
         None
     };
+    let http_client_no_redirect = crate::build_no_redirect_client(&config.tls);
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -351,6 +353,8 @@ fn build_context_with(
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client: reqwest::Client::new(),
+        http_client_no_redirect,
+        hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,

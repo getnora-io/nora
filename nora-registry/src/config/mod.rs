@@ -1069,6 +1069,17 @@ impl Config {
             }
         }
 
+        // Hugging Face: a Hub commit has no publish date NORA reads, and hf has no quarantine
+        // path, so min_release_age would hold nothing there — refused rather than ignored
+        // (hf-curation-applies).
+        if self.curation.min_release_age.is_some()
+            && self.is_enabled_proxy(RegistryType::HuggingFace)
+        {
+            errors.push(
+                "curation.min_release_age cannot hold the Hugging Face proxy: a Hub commit has no publish date NORA reads, and hf has no quarantine path. Unset curation.min_release_age, or disable [hf]. (#579)".to_string(),
+            );
+        }
+
         // 9. Docker upstream prefix validation
         {
             const RESERVED_PREFIXES: &[&str] =
@@ -4058,6 +4069,33 @@ proxies = [
             proxy: _,
             proxy_timeout: _,
         } = HfConfig::default();
+    }
+
+    /// A Hub commit has no publish date NORA reads and hf has no quarantine path, so a
+    /// min_release_age would hold nothing there: refused, not ignored.
+    #[test]
+    fn test_min_release_age_is_refused_with_hf() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.curation.min_release_age = Some("7d".to_string());
+        config.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
+        config.hf.enabled = true;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
+        config.curation.min_release_age = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
     }
 
     #[test]

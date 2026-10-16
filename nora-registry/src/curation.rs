@@ -176,6 +176,21 @@ impl CurationEngine {
         self.config.mode != CurationMode::Off
     }
 
+    /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
+    /// or a namespace filter is set (it runs even with curation off). A format that learns an
+    /// alias's canonical name from its upstream, for curation to read, asks only when this
+    /// holds.
+    pub fn reads_names(&self) -> bool {
+        self.is_active() || self.namespace_filter.is_some()
+    }
+
+    /// Whether a download can be refused by its name: curation enforces, or a namespace filter
+    /// is set (its blocks are never audit-only). Where this does not hold, a name curation
+    /// cannot learn costs the download nothing.
+    pub fn can_refuse_names(&self) -> bool {
+        self.config.mode == CurationMode::Enforce || self.namespace_filter.is_some()
+    }
+
     /// Access raw metrics counters.
     pub fn metrics(&self) -> &CurationMetrics {
         &self.metrics
@@ -1134,6 +1149,8 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        // A Hub commit is hex, served in lower case.
+        RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
     }
 }
@@ -1165,7 +1182,8 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 
 /// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
 /// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
-/// registry.terraform.io answers provider and module paths in any case), cargo as crates.io's
+/// registry.terraform.io answers provider and module paths in any case), Hugging Face repo ids
+/// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), cargo as crates.io's
 /// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
 /// every other registry as written. Requests,
 /// rules, allowlist entries and internal namespaces are compared in this form, so a rule written
@@ -1174,7 +1192,9 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 pub fn curation_name(registry: RegistryType, name: &str) -> String {
     match registry {
         RegistryType::PyPI => pep503_normalize(name),
-        RegistryType::Nuget | RegistryType::Terraform => name.to_lowercase(),
+        RegistryType::Nuget | RegistryType::Terraform | RegistryType::HuggingFace => {
+            name.to_lowercase()
+        }
         RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
         _ => name.to_string(),
     }
@@ -1918,6 +1938,28 @@ mod tests {
     use super::*;
     use crate::config::{CurationConfig, CurationMode, CurationOnFailure};
     use sha2::Digest;
+
+    #[test]
+    fn names_are_read_when_curation_is_on_and_refused_when_it_enforces() {
+        let with_namespace = |config: &CurationConfig| {
+            let mut engine = CurationEngine::new(config.clone());
+            engine.set_namespace_filter(Box::new(NamespaceFilter::new(vec!["acme/*".into()])));
+            engine
+        };
+        let mut config = CurationConfig::default();
+        let off = CurationEngine::new(config.clone());
+        assert!(!off.reads_names() && !off.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
+        config.mode = CurationMode::Audit;
+        let audit = CurationEngine::new(config.clone());
+        assert!(audit.reads_names() && !audit.can_refuse_names());
+        let ns = with_namespace(&config);
+        assert!(ns.reads_names() && ns.can_refuse_names());
+        config.mode = CurationMode::Enforce;
+        let enforce = CurationEngine::new(config);
+        assert!(enforce.reads_names() && enforce.can_refuse_names());
+    }
 
     /// A test filter that always allows.
     struct AllowAllFilter;

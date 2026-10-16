@@ -258,6 +258,11 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
+    /// The same client, except that it never follows a redirect: for a format whose answer
+    /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
+    pub http_client_no_redirect: reqwest::Client,
+    /// Canonical repo ids the Hugging Face upstream named, for curation of aliases (#579).
+    pub hf_canonical_ids: Arc<registry::hf::CanonicalIds>,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
@@ -403,13 +408,17 @@ const USER_AGENT: &str = concat!("nora/", env!("CARGO_PKG_VERSION"));
 /// (used by `nora mirror` for long-running downloads). When `no_proxy` is true
 /// the client ignores any `HTTP(S)_PROXY` env — required for loopback probes
 /// (the healthcheck) that must reach the local server directly, not via an
-/// upstream proxy.
+/// upstream proxy. `redirect` is reqwest's own default (`Policy::default()`) for
+/// every client but the one in [`build_no_redirect_client`].
 fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
+    redirect: reqwest::redirect::Policy,
 ) -> reqwest::Client {
-    let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
+    let mut builder = reqwest::ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .redirect(redirect);
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -442,6 +451,14 @@ fn build_http_client(
     }
 
     builder.build().expect("Failed to build HTTP client")
+}
+
+/// The client that never follows a redirect, for a format whose answer depends on what each
+/// hop said (hf: the commit rides on the Hub's redirect). Built by [`build_http_client`]
+/// (custom CA, user agent, proxy settings); the test context builds it here too, so the
+/// tests run against the very client the server uses.
+pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
+    build_http_client(tls, None, false, reqwest::redirect::Policy::none())
 }
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
@@ -482,6 +499,7 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
         true,
+        reqwest::redirect::Policy::default(),
     );
     match client.get(&url).send().await {
         // /health returns 200 when healthy, 503 when storage is unreachable.
@@ -1102,6 +1120,7 @@ async fn main() {
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
+                reqwest::redirect::Policy::default(),
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -2076,7 +2095,13 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None, false);
+    let http_client = build_http_client(
+        &config.tls,
+        None,
+        false,
+        reqwest::redirect::Policy::default(),
+    );
+    let http_client_no_redirect = build_no_redirect_client(&config.tls);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -2160,9 +2185,9 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
             RegistryType::HuggingFace => {
-                tracing::warn!(
-                    "Hugging Face proxy is enabled but incomplete in this build: \
-                     metadata is served, files answer 501"
+                tracing::info!(
+                    "Hugging Face proxy enabled: public models only (datasets answer 501), \
+                     files over plain HTTP (Xet is never proxied)"
                 );
                 registry_routes = registry_routes.merge(registry::hf_routes())
             }
@@ -2257,6 +2282,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
+        http_client_no_redirect,
+        hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
@@ -2439,6 +2466,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     if state.config.raw.enabled {
         registry::raw::cleanup_upload_temp_dir(&state.config.storage.path);
     }
+    // ...and Hugging Face cache fills a crash cut off mid-file.
+    if state.config.hf.enabled {
+        registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
+    }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
         .await
@@ -2525,6 +2556,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let storage_path = metrics_state.config.storage.path.clone();
                 tokio::task::spawn_blocking(move || {
                     registry::docker::cleanup_proxy_temp_dir(&storage_path);
+                    registry::hf::cleanup_fill_temp_dir(&storage_path);
                     // Reclaim upload temp files orphaned by a storage-write failure
                     // without waiting for a restart. cleanup_expired_sessions only
                     // frees temps still tracked by a live (expired) session, so an

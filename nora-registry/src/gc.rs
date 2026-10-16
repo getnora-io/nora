@@ -283,7 +283,7 @@ pub async fn run_gc(
         );
     }
 
-    // Proxy-cache eviction (#866): size-based LRU for rpm/deb proxy-cached
+    // Proxy-cache eviction (#866): size-based LRU for rpm/deb/hf proxy-cached
     // files that have no sidecar and are not indexes.
     let proxy_cache_eviction =
         evict_proxy_cache(storage, publish_locks, proxy_cache_max_bytes, dry_run).await;
@@ -1111,12 +1111,15 @@ fn is_index_file(key: &str) -> bool {
     )
 }
 
-/// Evict proxy-cached artifacts (rpm/deb) when total size exceeds `max_bytes`.
+/// Evict proxy-cached artifacts (rpm/deb/hf) when total size exceeds `max_bytes`.
 ///
 /// Proxy-cached files = files under `rpm/` or `deb/` that:
 /// - have NO corresponding `.nora-meta/` sidecar (hosted packages have one)
 /// - are NOT themselves under `.nora-meta/`
 /// - are NOT index files (repodata/, Packages, Release, etc.)
+///
+/// and every file under `hf/`: the Hugging Face format is pull-through only, with no
+/// hosted files, sidecars or indexes (#579), so a repo named `repodata` is no index.
 ///
 /// Eviction order: oldest by mtime first (LRU approximation; immutable files
 /// are never re-written, so mtime ≈ "least recently cached").
@@ -1133,7 +1136,7 @@ async fn evict_proxy_cache(
     let mut proxy_files: Vec<(String, u64, u64)> = Vec::new(); // (key, size, mtime)
     let mut sidecar_covered: HashSet<String> = HashSet::new();
 
-    for prefix in ["rpm/", "deb/"] {
+    for prefix in ["rpm/", "deb/", "hf/"] {
         let entries = match storage.list_with_meta(prefix).await {
             Ok(e) => e,
             Err(e) => {
@@ -1157,6 +1160,10 @@ async fn evict_proxy_cache(
 
         // Second pass: identify proxy-only files
         for (key, meta) in &entries {
+            if prefix == "hf/" {
+                proxy_files.push((key.clone(), meta.size, meta.modified));
+                continue;
+            }
             // Skip .nora-meta/ entries themselves
             if key.contains("/.nora-meta/") {
                 continue;
@@ -3193,6 +3200,44 @@ mod tests {
             .is_ok());
         assert!(storage.get("deb/repo/dists/stable/Release").await.is_ok());
         assert!(storage.get("deb/repo/dists/stable/InRelease").await.is_ok());
+    }
+
+    /// Hugging Face files (#579) count toward the same cap as rpm/deb, oldest first across
+    /// formats, and every one is evictable: hf has no hosted files or indexes, so a repo
+    /// named `repodata` is no exemption.
+    #[tokio::test]
+    async fn test_evict_proxy_cache_counts_hf_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::new_local(data.to_str().unwrap());
+        let payload = vec![0u8; 100];
+        let keys = [
+            "hf/models/org/repodata/blobs/0000000000000000000000000000000000000000",
+            "rpm/repo/Packages/old-1.0.rpm",
+            "hf/models/gpt2/blobs/1111111111111111111111111111111111111111",
+            "hf/models/org/model/blobs/2222222222222222222222222222222222222222222222222222222222222222",
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            storage.put(key, &payload).await.unwrap();
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i as u64 * 1000);
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(key))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+        let result = evict_proxy_cache(&storage, &test_publish_locks(), 150, false).await;
+        assert_eq!(result.total_bytes, 400);
+        assert_eq!(
+            result.evicted_files, 3,
+            "the three oldest go, across formats"
+        );
+        for key in &keys[..3] {
+            assert!(storage.get(key).await.is_err(), "{key} survived");
+        }
+        assert!(storage.get(keys[3]).await.is_ok());
     }
 
     /// Both rpm/ and deb/ proxy files count toward the same cap.

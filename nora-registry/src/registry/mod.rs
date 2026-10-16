@@ -453,33 +453,6 @@ pub(crate) async fn proxy_fetch(
     .await
 }
 
-/// Fetch binary content with its response headers, with timeout and 1 retry: for a
-/// format whose answer depends on what the upstream said beside the body (pagination in
-/// `Link`, the commit a metadata answer describes).
-pub(crate) async fn proxy_fetch_with_headers(
-    client: &reqwest::Client,
-    url: &str,
-    timeout: Duration,
-    auth: Option<UpstreamAuth<'_>>,
-    cb: &CircuitBreakerRegistry,
-    scope: impl Into<BreakerScope<'_>>,
-) -> Result<(reqwest::header::HeaderMap, Vec<u8>), ProxyError> {
-    proxy_fetch_core(
-        client,
-        url,
-        timeout,
-        auth,
-        None,
-        |r| async {
-            let headers = r.headers().clone();
-            r.bytes().await.map(|b| (headers, b.to_vec()))
-        },
-        cb,
-        scope,
-    )
-    .await
-}
-
 /// Fetch text content from upstream proxy with timeout and 1 retry.
 pub(crate) async fn proxy_fetch_text(
     client: &reqwest::Client,
