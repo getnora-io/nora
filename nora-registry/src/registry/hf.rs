@@ -1674,8 +1674,6 @@ fn escapes_are_whole(s: &str) -> bool {
     })
 }
 
-/// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
-/// percent-escape, or bytes that are not UTF-8.
 /// A decoded segment the upstream may be handed: not empty, and no `.` or `..` component
 /// once its encoded separators are read as separators. A revision travels as one segment
 /// (`refs%2Fpr%2F1`), but `main%2F..%2F..%2Fother-org%2Fother` decodes to a walk out of the
@@ -1687,6 +1685,8 @@ fn plain_segment(decoded: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
+/// percent-escape, or bytes that are not UTF-8.
 fn decode_segment(segment: &str) -> Option<String> {
     let bytes = segment.as_bytes();
     let mut i = 0;
