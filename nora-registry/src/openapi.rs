@@ -7,9 +7,12 @@
 
 #![allow(dead_code)] // utoipa doc stubs — not called at runtime, used by derive macros
 
-use axum::Router;
+use axum::extract::Path;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 
 use crate::activity_log::ActivityEntry;
 use crate::auth::{TokenListItem, TokenListResponse};
@@ -1363,9 +1366,89 @@ pub async fn admin_reindex() {}
 
 // ============ Routes ============
 
+/// Swagger UI 5.17.14: the page at `/api-docs` and the files it loads, from
+/// `ui/static/swagger-ui/` (where they come from and how to update them: the README
+/// there), with the content type each is served under. `swagger-initializer.js`
+/// already names `/api-docs/openapi.json`.
+const SWAGGER_UI: &[(&str, &str, &[u8])] = &[
+    (
+        "index.html",
+        "text/html",
+        include_bytes!("ui/static/swagger-ui/index.html"),
+    ),
+    (
+        "index.css",
+        "text/css",
+        include_bytes!("ui/static/swagger-ui/index.css"),
+    ),
+    (
+        "swagger-ui.css",
+        "text/css",
+        include_bytes!("ui/static/swagger-ui/swagger-ui.css"),
+    ),
+    (
+        "swagger-ui-bundle.js",
+        "text/javascript",
+        include_bytes!("ui/static/swagger-ui/swagger-ui-bundle.js"),
+    ),
+    (
+        "swagger-ui-standalone-preset.js",
+        "text/javascript",
+        include_bytes!("ui/static/swagger-ui/swagger-ui-standalone-preset.js"),
+    ),
+    (
+        "swagger-initializer.js",
+        "text/javascript",
+        include_bytes!("ui/static/swagger-ui/swagger-initializer.js"),
+    ),
+    (
+        "favicon-32x32.png",
+        "image/png",
+        include_bytes!("ui/static/swagger-ui/favicon-32x32.png"),
+    ),
+    (
+        "favicon-16x16.png",
+        "image/png",
+        include_bytes!("ui/static/swagger-ui/favicon-16x16.png"),
+    ),
+    (
+        "oauth2-redirect.html",
+        "text/html",
+        include_bytes!("ui/static/swagger-ui/oauth2-redirect.html"),
+    ),
+];
+
+/// The file of [`SWAGGER_UI`] named `name`, matched exactly; 404 for any other name.
+fn swagger_ui_file(name: &str) -> Response {
+    match SWAGGER_UI.iter().find(|(file, _, _)| *file == name) {
+        Some((_, content_type, bytes)) => {
+            ([(header::CONTENT_TYPE, *content_type)], *bytes).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `/api-docs`: the Swagger UI page (`/api-docs` redirects to `/api-docs/`), the files it
+/// loads, and the OpenAPI document at `/api-docs/openapi.json`.
 pub fn routes() -> Router<AppState> {
+    let spec = ApiDoc::openapi();
     Router::new()
-        .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/api-docs", get(|| async { Redirect::to("/api-docs/") }))
+        .route(
+            "/api-docs/",
+            get(|| async { swagger_ui_file("index.html") }),
+        )
+        .route(
+            "/api-docs/openapi.json",
+            get(move || {
+                let spec = spec.clone();
+                async move { Json(spec) }
+            }),
+        )
+        .route(
+            "/api-docs/{file}",
+            get(|Path(file): Path<String>| async move { swagger_ui_file(&file) }),
+        )
 }
 
 #[cfg(test)]
@@ -1373,27 +1456,162 @@ mod tests {
     use super::ApiDoc;
     use utoipa::OpenApi;
 
-    /// Swagger UI comes from the `vendored` feature (a crates.io crate,
-    /// checksummed in Cargo.lock), not a build-time GitHub download. The page,
-    /// its bundle and the spec must still be served under /api-docs.
+    /// Swagger UI comes from the files in `ui/static/swagger-ui/`, embedded in the binary,
+    /// as `utoipa-swagger-ui` served them before: `/api-docs` redirects to the page, each
+    /// file has its content type and its bytes, the spec is the document, and a name the
+    /// page does not load is 404 — a source map, another bundle, a path out of the folder.
     #[tokio::test]
-    async fn swagger_ui_is_served_from_the_vendored_bundle() {
+    async fn swagger_ui_is_served_from_the_files_in_the_repository() {
+        use super::SWAGGER_UI;
         use crate::test_helpers::{body_bytes, create_test_context, send};
         use axum::http::{Method, StatusCode};
 
         let ctx = create_test_context();
         let app = super::routes().with_state(ctx.state.clone());
-        for (path, needle) in [
-            ("/api-docs/", "swagger-ui"),
-            ("/api-docs/swagger-ui-bundle.js", "SwaggerUIBundle"),
-            ("/api-docs/openapi.json", "\"openapi\""),
+        let header = |resp: &axum::response::Response, name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let resp = send(&app, Method::GET, "/api-docs", "").await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(header(&resp, "location"), "/api-docs/");
+
+        let page = SWAGGER_UI.iter().find(|(f, _, _)| *f == "index.html");
+        let served = SWAGGER_UI
+            .iter()
+            .map(|(file, content_type, bytes)| (format!("/api-docs/{file}"), *content_type, *bytes))
+            .chain(page.map(|(_, t, b)| ("/api-docs/".to_string(), *t, *b)));
+        for (path, content_type, bytes) in served {
+            let resp = send(&app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(header(&resp, "content-type"), content_type, "{path}");
+            assert_eq!(body_bytes(resp).await.as_ref(), bytes, "{path}");
+        }
+
+        let resp = send(&app, Method::GET, "/api-docs/openapi.json", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "content-type"), "application/json");
+        let spec: serde_json::Value =
+            serde_json::from_slice(&body_bytes(resp).await).expect("the spec is JSON");
+        assert_eq!(spec, serde_json::to_value(ApiDoc::openapi()).unwrap());
+
+        for path in [
+            "/api-docs/swagger-ui-bundle.js.map",
+            "/api-docs/swagger-ui-es-bundle.js",
+            "/api-docs/README.md",
+            "/api-docs/..%2FLICENSE",
+            "/api-docs/INDEX.HTML",
+            "/api-docs/a-index.html",
+            "/api-docs/index.html.bak",
         ] {
             let resp = send(&app, Method::GET, path, "").await;
-            assert_eq!(resp.status(), StatusCode::OK, "{path}");
-            let body = body_bytes(resp).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    /// Every file the page loads is one NORA serves, so an updated `index.html` that names
+    /// a new file fails here rather than in a browser; and the initializer names the spec at
+    /// the path the UI's base-path rewrite (`ui::rewrite_ui_base_path`) prefixes.
+    #[test]
+    fn swagger_ui_page_loads_only_served_files() {
+        use super::SWAGGER_UI;
+        let file = |name: &str| {
+            SWAGGER_UI
+                .iter()
+                .find(|(f, _, _)| *f == name)
+                .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default()
+        };
+        let page = file("index.html");
+        let mut loaded = Vec::new();
+        for attr in ["href=\"", "src=\""] {
+            for (i, _) in page.match_indices(attr) {
+                let rest = &page[i + attr.len()..];
+                let target = &rest[..rest.find('"').expect("the attribute value is quoted")];
+                loaded.push(target.trim_start_matches("./").to_string());
+            }
+        }
+        assert_eq!(loaded.len(), 7, "{loaded:?}");
+        for target in &loaded {
             assert!(
-                String::from_utf8_lossy(&body).contains(needle),
-                "{path} lacks {needle}"
+                SWAGGER_UI.iter().any(|(f, _, _)| f == target),
+                "index.html loads {target}, which is not served"
+            );
+        }
+        assert!(file("swagger-initializer.js").contains("\"url\": \"/api-docs/openapi.json\""));
+    }
+
+    /// The files are Swagger UI 5.17.14's as its npm package `swagger-ui-dist` ships them,
+    /// and the initializer is the release's with NORA's configuration block; each is served
+    /// under the content type `utoipa-swagger-ui` gave it (a wrong one is refused under
+    /// `nosniff`). A file changes only together with its pin here (see
+    /// `ui/static/swagger-ui/README.md`).
+    #[test]
+    fn swagger_ui_files_are_pinned() {
+        use super::SWAGGER_UI;
+        use sha2::{Digest, Sha256};
+        let pins = [
+            (
+                "index.html",
+                "text/html",
+                "bb9928afd0ea8c12e124c42fef58fb080f36770389684badb2a4dcf548624eeb",
+            ),
+            (
+                "index.css",
+                "text/css",
+                "9324807d424565a1639bb29f3754c8d4d45c1009c67674e996e33355f6929ce7",
+            ),
+            (
+                "swagger-ui.css",
+                "text/css",
+                "40170f0ee859d17f92131ba707329a88a070e4f66874d11365e9a77d232f6117",
+            ),
+            (
+                "swagger-ui-bundle.js",
+                "text/javascript",
+                "c2e4a9ef08144839ff47c14202063ecfe4e59e70a4e7154a26bd50d880c88ba1",
+            ),
+            (
+                "swagger-ui-standalone-preset.js",
+                "text/javascript",
+                "33b7a6f5afcac4902fdf93281be2d2e12db15f241d384606e6e6d17745b7f86f",
+            ),
+            (
+                "swagger-initializer.js",
+                "text/javascript",
+                "b3f050cda277c970e7e0b7378ee7566125feb8c7b13a373e5bf8a667e68abf53",
+            ),
+            (
+                "favicon-32x32.png",
+                "image/png",
+                "3ed612f41e050ca5e7000cad6f1cbe7e7da39f65fca99c02e99e6591056e5837",
+            ),
+            (
+                "favicon-16x16.png",
+                "image/png",
+                "af24ad604dd7b3bcda8f975ab973075f4a2f70a4087944a12f8ef8b63a3e07c2",
+            ),
+            (
+                "oauth2-redirect.html",
+                "text/html",
+                "397fd30a2499cd2c5f3411ade0ca7fbd786d5011639ca78a06824d580b83c122",
+            ),
+        ];
+        let mut served: Vec<(&str, &str)> = SWAGGER_UI.iter().map(|(f, t, _)| (*f, *t)).collect();
+        let mut pinned: Vec<(&str, &str)> = pins.iter().map(|(f, t, _)| (*f, *t)).collect();
+        served.sort_unstable();
+        pinned.sort_unstable();
+        assert_eq!(served, pinned);
+        for (file, _, bytes) in SWAGGER_UI {
+            let pin = pins.iter().find(|(f, _, _)| f == file).map(|(_, _, p)| *p);
+            assert_eq!(
+                Some(hex::encode(Sha256::digest(bytes)).as_str()),
+                pin,
+                "{file}"
             );
         }
     }
