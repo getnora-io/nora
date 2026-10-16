@@ -616,9 +616,10 @@ impl Config {
             // its handlers (quarantine gates proxy downloads).
             RegistryType::Raw => return QuarantineMode::Off,
             RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
-            // Hugging Face serves no artifact bytes yet (every route answers 501), so
-            // nothing in it enforces quarantine; counting it would be the same phantom
-            // control as Raw. Its curation override arrives with the download path.
+            // Hugging Face has no curation section and its handler no quarantine path
+            // (files are kept by the digest the Hub names and checked on the way in), so
+            // nothing in it enforces a quarantine; counting it would be the same phantom
+            // control as Raw.
             RegistryType::HuggingFace => return QuarantineMode::Off,
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
