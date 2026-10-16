@@ -892,7 +892,29 @@ impl StorageBackend for LocalStorage {
             other => other,
         };
         match linked {
-            Ok(()) => sync_parent_dir(&dst_path).await?,
+            Ok(()) => {
+                // A hard link shares the source inode and thus its mtime; a freshly
+                // published object must look fresh so GC's grace window covers an
+                // in-flight mount whose referencing manifest lands next (the
+                // byte-copy fallback below gets a current mtime from the new file,
+                // and S3 copy stamps a current LastModified). Sharing the inode means
+                // this also refreshes the source's mtime, which can only defer the
+                // source's own grace-based collection (fail-safe), never delete early.
+                // Best-effort: a failed stamp only leaves the old mtime — never fail
+                // the mount for it.
+                let touch = dst_path.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&touch)
+                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|inner| inner)
+                {
+                    tracing::warn!(dst = %dst, error = %e, "copy: could not refresh mtime of linked object");
+                }
+                sync_parent_dir(&dst_path).await?;
+            }
             Err(e) if is_missing(&e) => return Err(StorageError::NotFound),
             // Cross-device, or a filesystem without links — copy the bytes.
             Err(_) => {

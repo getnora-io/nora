@@ -92,6 +92,14 @@ pub static GC_STAT_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("gc_stat_failures metric")
 });
 
+pub static GC_DOCKER_MARK_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_gc_docker_mark_failures_total",
+        "Docker GC sweeps skipped because manifest reachability could not be established"
+    )
+    .expect("gc_docker_mark_failures metric")
+});
+
 // ============================================================================
 // GC Result
 // ============================================================================
@@ -115,6 +123,8 @@ pub struct GcResult {
     /// silently). Tracked separately from `skipped_recent` and metered via
     /// `nora_gc_stat_failures_total` so it can be alerted on.
     pub stat_failures: usize,
+    /// Docker objects were kept because the manifest graph could not be read.
+    pub docker_mark_failed: bool,
     /// Proxy-cache eviction result (#866).
     pub proxy_cache_eviction: ProxyCacheEviction,
 }
@@ -153,6 +163,7 @@ pub async fn run_gc(
     // Docker orphan detection (existing logic)
     let docker_result = detect_docker_orphans(storage).await;
     total_candidates += docker_result.total;
+    let docker_mark_failed = docker_result.failed;
     all_orphans.extend(docker_result.orphans);
 
     // Checksum orphan detection (Maven, npm, PyPI)
@@ -325,6 +336,7 @@ pub async fn run_gc(
         metadata_phantoms_removed,
         skipped_recent,
         stat_failures,
+        docker_mark_failed,
         proxy_cache_eviction,
     }
 }
@@ -336,6 +348,12 @@ pub async fn run_gc(
 struct DetectionResult {
     total: usize,
     orphans: Vec<String>,
+}
+
+struct DockerDetectionResult {
+    total: usize,
+    orphans: Vec<String>,
+    failed: bool,
 }
 
 /// Extract config.digest + layers[].digest into `referenced`, and
@@ -353,10 +371,20 @@ fn collect_manifest_refs(
     {
         referenced.insert(digest.to_string());
     }
-    // layer digests
-    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
+    // Image layers and OCI artifact blobs.
+    for field in ["layers", "blobs"] {
+        if let Some(layers) = json.get(field).and_then(|v| v.as_array()) {
+            for layer in layers {
+                if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                    referenced.insert(digest.to_string());
+                }
+            }
+        }
+    }
+    // Docker schema 1 uses fsLayers[].blobSum.
+    if let Some(layers) = json.get("fsLayers").and_then(|v| v.as_array()) {
         for layer in layers {
-            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+            if let Some(digest) = layer.get("blobSum").and_then(|v| v.as_str()) {
                 referenced.insert(digest.to_string());
             }
         }
@@ -371,35 +399,16 @@ fn collect_manifest_refs(
     }
 }
 
-/// Extract config.digest + layers[].digest into `referenced` (blob refs only,
-/// no sub-manifest traversal).
-fn collect_blob_refs(json: &serde_json::Value, referenced: &mut HashSet<String>) {
-    if let Some(digest) = json
-        .get("config")
-        .and_then(|c| c.get("digest"))
-        .and_then(|v| v.as_str())
-    {
-        referenced.insert(digest.to_string());
-    }
-    if let Some(layers) = json.get("layers").and_then(|v| v.as_array()) {
-        for layer in layers {
-            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
-                referenced.insert(digest.to_string());
-            }
-        }
-    }
-}
-
 /// True if `ref_name` is a digest reference (sha256:… or sha512:…), not a tag.
 fn is_digest_ref(ref_name: &str) -> bool {
     ref_name.starts_with("sha256:") || ref_name.starts_with("sha512:")
 }
 
-async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
-    let keys = storage.list("docker/").await.unwrap_or_else(|e| {
-        tracing::error!("GC: storage.list(docker/) failed: {}", e);
-        Vec::new()
-    });
+async fn detect_docker_orphans(storage: &Storage) -> DockerDetectionResult {
+    let keys = match storage.list("docker/").await {
+        Ok(keys) => keys,
+        Err(_) => return docker_mark_failure(0, "cannot list Docker objects"),
+    };
 
     let mut blobs: Vec<String> = Vec::new();
     let mut all_manifest_keys: Vec<String> = Vec::new();
@@ -410,73 +419,141 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
         } else if key.contains("/manifests/")
             && ends_with_ci(key, ".json")
             && !ends_with_ci(key, ".meta.json")
+            && !ends_with_ci(key, ".stats.json")
         {
             all_manifest_keys.push(key.clone());
         }
     }
 
-    // Step 1: Identify tag manifests (filename does NOT start with sha256:/sha512:)
-    let tag_manifests: Vec<&String> = all_manifest_keys
-        .iter()
-        .filter(|k| {
-            let filename = k.rsplit('/').next().unwrap_or("");
-            let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-            !is_digest_ref(ref_name)
-        })
-        .collect();
+    let total = blobs.len();
+    let mut manifests = HashMap::new();
+    let mut referrers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending = Vec::new();
 
-    // Step 2: Read tag manifests, collect referenced blob digests.
-    // For manifest lists, also collect sub-manifest digests to resolve in step 3.
-    let mut referenced = HashSet::new();
-    let mut sub_manifest_digests: HashSet<String> = HashSet::new();
-    // The digest-named aliases of the tag manifests themselves: the OCI
-    // distribution spec keeps content pullable by digest whenever it is
-    // pullable by tag, so these files are roots too (#949).
-    let mut tag_manifest_digests: HashSet<String> = HashSet::new();
-
-    for key in &tag_manifests {
-        if let Ok(data) = storage.get(key).await {
+    // Read the entire manifest set before marking. Untagged manifests may be
+    // subject-bearing referrers; a failed read or parse leaves an incomplete
+    // graph, never evidence that their layers are unreferenced.
+    for key in &all_manifest_keys {
+        let data = match storage.get(key).await {
+            Ok(data) => data,
+            Err(_) => return docker_mark_failure(total, key),
+        };
+        let json: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(json) if json.is_object() => json,
+            _ => return docker_mark_failure(total, key),
+        };
+        let Some((repo, filename)) = key.rsplit_once("/manifests/") else {
+            return docker_mark_failure(total, key);
+        };
+        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
+        if !is_digest_ref(ref_name) {
             use sha2::Digest;
-            tag_manifest_digests.insert(format!(
-                "sha256:{}",
+            pending.push(key.clone());
+            // A tagged manifest and its content-addressed aliases are roots,
+            // including when only the tag file is present in local fixtures.
+            pending.push(format!(
+                "{repo}/manifests/sha256:{}.json",
                 hex::encode(sha2::Sha256::digest(&data))
             ));
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                collect_manifest_refs(&json, &mut referenced, &mut sub_manifest_digests);
+            pending.push(format!(
+                "{repo}/manifests/sha512:{}.json",
+                hex::encode(sha2::Sha512::digest(&data))
+            ));
+        }
+        if let Some(subject) = json
+            .get("subject")
+            .and_then(|subject| subject.get("digest"))
+            .and_then(|digest| digest.as_str())
+        {
+            referrers
+                .entry(format!("{repo}/manifests/{subject}.json"))
+                .or_default()
+                .push(key.clone());
+        }
+        manifests.insert(key.clone(), json);
+    }
+
+    // Walk to a fixed point rather than imposing an index-depth limit. Both
+    // forward index/subject edges and reverse subject->referrer edges stay in
+    // their repository: the same digest in another repository is a separate
+    // object. The visited set also terminates subject/index cycles.
+    let mut reachable = HashSet::new();
+    let mut referenced_blobs = HashSet::new();
+    while let Some(key) = pending.pop() {
+        if !reachable.insert(key.clone()) {
+            continue;
+        }
+        if let Some(children) = referrers.get(&key) {
+            pending.extend(children.iter().cloned());
+        }
+        let Some(json) = manifests.get(&key) else {
+            continue; // A virtual content-addressed alias of a tagged manifest.
+        };
+        let Some((repo, _)) = key.rsplit_once("/manifests/") else {
+            return docker_mark_failure(total, &key);
+        };
+        let mut blobs = HashSet::new();
+        let mut children = HashSet::new();
+        collect_manifest_refs(json, &mut blobs, &mut children);
+        // A referenced blob may be stored under this repository's key or, for a
+        // namespaced repository, under the un-namespaced legacy key that the serve
+        // path falls back to (storage_get_with_fallback). Protect both so GC keeps
+        // a blob the server would still serve. strip_docker_namespace only drops a
+        // leading registry host (a first segment containing '.'), so genuinely
+        // distinct repositories do not collide and #984 cross-repo isolation holds.
+        let legacy_repo = repo
+            .strip_prefix("docker/")
+            .map(|name| {
+                format!(
+                    "docker/{}",
+                    crate::registry::docker::strip_docker_namespace(name)
+                )
+            })
+            .filter(|legacy| legacy.as_str() != repo);
+        for digest in blobs {
+            referenced_blobs.insert(format!("{repo}/blobs/{digest}"));
+            if let Some(ref legacy) = legacy_repo {
+                referenced_blobs.insert(format!("{legacy}/blobs/{digest}"));
             }
+        }
+        for digest in children {
+            let child_key = format!("{repo}/manifests/{digest}.json");
+            // A child absent from local storage is not corruption: a pull-through
+            // cache holds only the platforms clients actually pulled, so a cached
+            // multi-arch index routinely lists children that were never fetched.
+            // Skip it rather than abort — its own blobs are absent too, and any
+            // blob it shares with a present sibling stays reachable through that
+            // sibling. Aborting here would stop GC from ever collecting on a cache
+            // that holds any partial index. A manifest that IS present but cannot
+            // be read or parsed still aborts the sweep (handled when reading it).
+            if manifests.contains_key(&child_key) {
+                pending.push(child_key);
+            }
+        }
+        if let Some(subject) = json
+            .get("subject")
+            .and_then(|subject| subject.get("digest"))
+            .and_then(|digest| digest.as_str())
+        {
+            pending.push(format!("{repo}/manifests/{subject}.json"));
         }
     }
 
-    // Step 3: Resolve sub-manifests (manifest list entries) — these are
-    // digest-keyed but reachable from a tag, so their blobs must be kept.
-    for key in &all_manifest_keys {
-        let filename = key.rsplit('/').next().unwrap_or("");
-        let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-        if sub_manifest_digests.contains(ref_name) {
-            if let Ok(data) = storage.get(key).await {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    // Only collect blob refs, not further sub-manifests (2 levels deep enough)
-                    collect_blob_refs(&json, &mut referenced);
-                }
-            }
-        }
-    }
-
-    // Step 4: Detect orphaned digest manifests — digest-keyed manifests not
-    // reachable from any tag (neither directly tagged nor a sub-manifest of a
-    // tagged manifest list).
+    // Only unreachable digest manifests and their sidecars may be swept.
     let meta_sidecars: HashSet<&String> = keys
         .iter()
         .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".meta.json"))
+        .collect();
+    // #1114: the pull-stats sidecar is reaped with its digest manifest too.
+    let stats_sidecars: HashSet<&String> = keys
+        .iter()
+        .filter(|k| k.contains("/manifests/") && ends_with_ci(k, ".stats.json"))
         .collect();
     let mut orphan_digest_manifests: Vec<String> = Vec::new();
     for key in &all_manifest_keys {
         let filename = key.rsplit('/').next().unwrap_or("");
         let ref_name = filename.strip_suffix(".json").unwrap_or(filename);
-        if is_digest_ref(ref_name)
-            && !sub_manifest_digests.contains(ref_name)
-            && !tag_manifest_digests.contains(ref_name)
-        {
+        if is_digest_ref(ref_name) && !reachable.contains(key) {
             orphan_digest_manifests.push(key.clone());
             // Reap the .meta.json sidecar with its manifest (#949): it is
             // invisible to detection on its own, so it would leak forever.
@@ -485,26 +562,42 @@ async fn detect_docker_orphans(storage: &Storage) -> DetectionResult {
                 if meta_sidecars.contains(&sidecar) {
                     orphan_digest_manifests.push(sidecar);
                 }
+                // #1114: reap the .stats.json pull-stats sidecar with it too.
+                let stats_sidecar = format!("{stem}.stats.json");
+                if stats_sidecars.contains(&stats_sidecar) {
+                    orphan_digest_manifests.push(stats_sidecar);
+                }
             }
         }
     }
 
-    let total = blobs.len();
     let mut orphans: Vec<String> = blobs
         .into_iter()
-        .filter(|key| {
-            key.rsplit('/')
-                .next()
-                .map(|digest| !referenced.contains(digest))
-                .unwrap_or(false)
-        })
+        .filter(|key| !referenced_blobs.contains(key))
         .collect();
 
     // Append orphaned digest manifests — they will be sorted after blobs by
     // the caller (run_gc's #305 invariant: blobs before manifests).
     orphans.extend(orphan_digest_manifests);
 
-    DetectionResult { total, orphans }
+    DockerDetectionResult {
+        total,
+        orphans,
+        failed: false,
+    }
+}
+
+fn docker_mark_failure(total: usize, key: &str) -> DockerDetectionResult {
+    warn!(
+        key,
+        "GC: cannot establish Docker manifest reachability; keeping all Docker objects"
+    );
+    GC_DOCKER_MARK_FAILURES.inc();
+    DockerDetectionResult {
+        total,
+        orphans: Vec::new(),
+        failed: true,
+    }
 }
 
 // ============================================================================
@@ -1162,6 +1255,7 @@ mod tests {
             metadata_phantoms_removed: 0,
             skipped_recent: 0,
             stat_failures: 0,
+            docker_mark_failed: false,
             proxy_cache_eviction: ProxyCacheEviction::default(),
         };
         assert_eq!(result.total_candidates, 0);
@@ -1188,6 +1282,307 @@ mod tests {
     }
 
     // -- Docker GC tests --
+
+    #[tokio::test]
+    async fn test_gc_docker_keeps_subject_referrers() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let image =
+            serde_json::json!({"config":{"digest":"sha256:image-config"},"layers":[]}).to_string();
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(image.as_bytes()))
+        );
+        storage
+            .put("docker/proof/manifests/release.json", image.as_bytes())
+            .await
+            .unwrap();
+        let image_key = format!("docker/proof/manifests/{digest}.json");
+        storage.put(&image_key, image.as_bytes()).await.unwrap();
+        let attestation_key = "docker/proof/manifests/sha256:attestation.json";
+        let attestation = serde_json::json!({
+            "artifactType":"application/vnd.in-toto+json",
+            "subject":{"digest":digest},
+            "layers":[{"digest":"sha256:provenance"}]
+        });
+        storage
+            .put(attestation_key, attestation.to_string().as_bytes())
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:image-config", b"config")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:provenance", b"provenance")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(result.deleted, 1, "only the unrelated orphan is deleted");
+        assert!(storage.get(&image_key).await.is_ok());
+        assert!(storage.get(attestation_key).await.is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:provenance")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_failed_manifest_read_aborts_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "docker/proof/manifests/release.json";
+        storage
+            .put(key, br#"{"layers":[{"digest":"sha256:required"}]}"#)
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+        // Change the bytes without their integrity pin: the real storage GET fails.
+        std::fs::write(
+            dir.path().join(key),
+            br#"{"layers":[{"digest":"sha256:changed"}]}"#,
+        )
+        .unwrap();
+        assert!(storage.get(key).await.is_err());
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(
+            result.deleted, 0,
+            "an incomplete mark must not sweep Docker objects"
+        );
+        assert!(result.docker_mark_failed);
+        assert!(storage
+            .get("docker/proof/blobs/sha256:required")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_invalid_manifest_aborts_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("docker/proof/manifests/release.json", b"invalid JSON")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(
+            result.deleted, 0,
+            "unparseable manifests cannot prove blobs are unused"
+        );
+        assert!(result.docker_mark_failed);
+        assert!(storage
+            .get("docker/proof/blobs/sha256:required")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_traverses_nested_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (name, child) in [
+            ("release", "sha256:level1"),
+            ("sha256:level1", "sha256:level2"),
+            ("sha256:level2", "sha256:image"),
+        ] {
+            let manifest = serde_json::json!({"manifests":[{"digest":child}]}).to_string();
+            storage
+                .put(
+                    &format!("docker/proof/manifests/{name}.json"),
+                    manifest.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .put(
+                "docker/proof/manifests/sha256:image.json",
+                br#"{"layers":[{"digest":"sha256:required"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:required", b"required")
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(
+            result.deleted, 0,
+            "index depth must not make reachable layers collectible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_references_are_repository_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/live/manifests/release.json",
+                br#"{"layers":[{"digest":"sha256:shared"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/live/blobs/sha256:shared", b"same content")
+            .await
+            .unwrap();
+        storage
+            .put("docker/unused/blobs/sha256:shared", b"same content")
+            .await
+            .unwrap();
+
+        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(storage.get("docker/live/blobs/sha256:shared").await.is_ok());
+        assert!(storage
+            .get("docker/unused/blobs/sha256:shared")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_missing_index_child_does_not_abort_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/proof/manifests/release.json",
+                br#"{"manifests":[{"digest":"sha256:missing"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:unused", b"unused")
+            .await
+            .unwrap();
+        // A child the index lists but local storage does not hold — e.g. a
+        // platform a pull-through cache never fetched — is not corruption and must
+        // not abort the sweep. The absent child has no present blobs of its own,
+        // so an unreferenced blob stays collectible and marking does not fail.
+        // (A manifest that IS present but cannot be read or parsed still aborts:
+        // see test_gc_docker_invalid_manifest_aborts_sweep and
+        // test_gc_docker_failed_manifest_read_aborts_sweep.)
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(!result.docker_mark_failed);
+        assert_eq!(result.deleted, 1, "the unreferenced blob is collectible");
+        assert!(storage
+            .get("docker/proof/blobs/sha256:unused")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_subject_cycles_terminate_and_orphan_groups_are_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (repo, tagged) in [("live", true), ("unused", false)] {
+            let a = br#"{"subject":{"digest":"sha256:b"},"layers":[{"digest":"sha256:layer-a"}]}"#;
+            let b = br#"{"subject":{"digest":"sha256:a"},"layers":[{"digest":"sha256:layer-b"}]}"#;
+            storage
+                .put(&format!("docker/{repo}/manifests/sha256:a.json"), a)
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/{repo}/manifests/sha256:b.json"), b)
+                .await
+                .unwrap();
+            if tagged {
+                storage
+                    .put(&format!("docker/{repo}/manifests/release.json"), a)
+                    .await
+                    .unwrap();
+            }
+            storage
+                .put(&format!("docker/{repo}/blobs/sha256:layer-a"), b"a")
+                .await
+                .unwrap();
+            storage
+                .put(&format!("docker/{repo}/blobs/sha256:layer-b"), b"b")
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_gc(&storage, &test_publish_locks(), false, 0, false, 0),
+        )
+        .await
+        .unwrap();
+        assert!(!result.docker_mark_failed);
+        assert_eq!(
+            result.deleted, 4,
+            "only the unrooted subject group is deleted"
+        );
+        for suffix in [
+            "manifests/sha256:a.json",
+            "manifests/sha256:b.json",
+            "blobs/sha256:layer-a",
+            "blobs/sha256:layer-b",
+        ] {
+            assert!(storage.get(&format!("docker/live/{suffix}")).await.is_ok());
+            assert!(storage
+                .get(&format!("docker/unused/{suffix}"))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gc_docker_keeps_schema1_layers_and_artifact_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/proof/manifests/legacy.json",
+                br#"{"schemaVersion":1,"fsLayers":[{"blobSum":"sha256:legacy"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/proof/manifests/artifact.json",
+                br#"{"blobs":[{"digest":"sha256:artifact"}]}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:legacy", b"legacy")
+            .await
+            .unwrap();
+        storage
+            .put("docker/proof/blobs/sha256:artifact", b"artifact")
+            .await
+            .unwrap();
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(result.deleted, 0);
+    }
 
     #[tokio::test]
     async fn test_gc_empty_storage() {
@@ -1671,7 +2066,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Untagged digest manifest: orphan, and its sidecar must go with it.
+        // Untagged digest manifest: orphan, and its sidecars must go with it —
+        // both the .meta.json and the #1114 .stats.json pull-stats sidecar.
         storage
             .put("docker/test/manifests/sha256:dead.json", b"{}")
             .await
@@ -1680,9 +2076,16 @@ mod tests {
             .put("docker/test/manifests/sha256:dead.meta.json", b"{}")
             .await
             .unwrap();
+        storage
+            .put(
+                "docker/test/manifests/sha256:dead.stats.json",
+                b"{\"downloads\":9,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
 
         let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
-        assert_eq!(result.deleted, 2);
+        assert_eq!(result.deleted, 3);
         assert!(storage.get(&alias_key).await.is_ok());
         assert!(storage.get(&alias_meta_key).await.is_ok());
         assert!(storage
@@ -1691,6 +2094,37 @@ mod tests {
             .is_err());
         assert!(storage
             .get("docker/test/manifests/sha256:dead.meta.json")
+            .await
+            .is_err());
+        assert!(
+            storage
+                .get("docker/test/manifests/sha256:dead.stats.json")
+                .await
+                .is_err(),
+            "the orphan manifest's .stats.json sidecar must be reaped with it"
+        );
+    }
+
+    /// an orphan digest manifest WITHOUT a .meta.json (best-effort
+    /// meta write failed) still has its .stats.json reaped with it.
+    #[tokio::test]
+    async fn gc_reaps_stats_sidecar_without_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        storage
+            .put("docker/t/manifests/sha256:dead.json", b"{}")
+            .await
+            .unwrap();
+        storage
+            .put(
+                "docker/t/manifests/sha256:dead.stats.json",
+                b"{\"downloads\":1,\"last_pulled\":1}",
+            )
+            .await
+            .unwrap();
+        run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(storage
+            .get("docker/t/manifests/sha256:dead.stats.json")
             .await
             .is_err());
     }
@@ -2788,5 +3222,226 @@ mod tests {
         assert_eq!(result.total_bytes, 400);
         assert_eq!(result.evicted_files, 2);
         assert_eq!(result.bytes_freed, 200);
+    }
+}
+
+#[cfg(test)]
+mod docker_gc_reachability {
+    //! Independent reachability checks for Docker GC (#1079): a pull-through
+    //! cache holds only the platforms clients pulled, and a cross-repo mount
+    //! lands its blob before its manifest. Both must stay correct.
+    use super::*;
+    use std::sync::Arc;
+
+    fn locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    async fn put(storage: &Storage, key: &str, bytes: &[u8]) {
+        storage.put(key, bytes).await.unwrap();
+    }
+
+    /// A manifest stored as a client pushes it: under its digest, and under `tag` if given.
+    async fn manifest(
+        storage: &Storage,
+        repo: &str,
+        tag: Option<&str>,
+        json: serde_json::Value,
+    ) -> String {
+        let bytes = json.to_string().into_bytes();
+        let d = digest(&bytes);
+        put(
+            storage,
+            &format!("docker/{repo}/manifests/{d}.json"),
+            &bytes,
+        )
+        .await;
+        if let Some(tag) = tag {
+            put(
+                storage,
+                &format!("docker/{repo}/manifests/{tag}.json"),
+                &bytes,
+            )
+            .await;
+        }
+        d
+    }
+
+    fn image(config: &str, layers: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": 1},
+            "layers": layers.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn index(children: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": children.iter().map(|d| serde_json::json!({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": d, "size": 1})).collect::<Vec<_>>(),
+        })
+    }
+
+    async fn blobs(storage: &Storage, repo: &str, digests: &[&str]) {
+        for d in digests {
+            put(storage, &format!("docker/{repo}/blobs/{d}"), d.as_bytes()).await;
+        }
+    }
+
+    /// The keys a dry run would delete.
+    async fn would_delete(storage: &Storage) -> Vec<String> {
+        run_gc(storage, &locks(), true, 0, false, 0)
+            .await
+            .orphan_keys
+    }
+
+    fn kept(deleted: &[String], keys: &[String]) {
+        for key in keys {
+            assert!(
+                !deleted.contains(key),
+                "{key} would be deleted; deleted: {deleted:?}"
+            );
+        }
+    }
+
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    const ORPHAN: &str = "docker/app/blobs/sha256:0rphan";
+
+    // A pull-through cache holds only the platforms clients pulled: the index's other children
+    // are not here, which is no reason to stop collecting.
+    #[tokio::test]
+    async fn an_index_child_not_held_does_not_stop_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        blobs(&storage, "app", &["sha256:cfg", "sha256:layer"]).await;
+        put(&storage, ORPHAN, b"x").await;
+        let pulled = manifest(
+            &storage,
+            "app",
+            None,
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+        let arm = format!("sha256:{}", "a".repeat(64));
+        let ppc = format!("sha256:{}", "b".repeat(64));
+        manifest(
+            &storage,
+            "app",
+            Some("latest"),
+            index(&[&pulled, &arm, &ppc]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                format!("docker/app/manifests/{pulled}.json"),
+                "docker/app/blobs/sha256:cfg".to_string(),
+                "docker/app/blobs/sha256:layer".to_string(),
+            ],
+        );
+        assert!(
+            deleted.contains(&ORPHAN.to_string()),
+            "GC stopped over children it does not hold: {deleted:?}"
+        );
+    }
+
+    // `POST /v2/b/blobs/uploads/?mount=L&from=a` links the blob into `b` (a hard link on local
+    // storage); the manifest that references it in `b` lands next. GC between the two must keep
+    // it — a freshly linked object is stamped current so the grace window covers it.
+    #[tokio::test]
+    async fn a_blob_mounted_into_a_repository_survives_until_its_manifest_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let storage = Storage::new_local(path.to_str().unwrap());
+        blobs(&storage, "a", &["sha256:cfg", "sha256:shared"]).await;
+        manifest(
+            &storage,
+            "a",
+            Some("v1"),
+            image("sha256:cfg", &["sha256:shared"]),
+        )
+        .await;
+        // An hour old, as a layer pushed long ago is.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in walkdir_files(&path) {
+            std::fs::File::options()
+                .write(true)
+                .open(&entry)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        storage
+            .copy(
+                "docker/a/blobs/sha256:shared",
+                "docker/b/blobs/sha256:shared",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = run_gc(&storage, &locks(), false, 600, false, 0).await;
+        assert!(
+            storage.get("docker/b/blobs/sha256:shared").await.is_ok(),
+            "a mounted blob was deleted before its manifest landed: {:?}",
+            result.orphan_keys
+        );
+    }
+
+    // A namespaced manifest can reference a blob stranded at the legacy
+    // (un-namespaced) key — a partial key migration, or a flat blob still served
+    // through the ns→legacy read fallback (storage_get_with_fallback). The server
+    // serves it; GC must keep it, mirroring the fallback the serve path honors.
+    #[tokio::test]
+    async fn a_namespaced_manifest_keeps_its_legacy_keyed_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        put(&storage, "docker/library/nginx/blobs/sha256:cfg", b"cfg").await;
+        put(
+            &storage,
+            "docker/library/nginx/blobs/sha256:layer",
+            b"layer",
+        )
+        .await;
+        manifest(
+            &storage,
+            "docker.io/library/nginx",
+            Some("latest"),
+            image("sha256:cfg", &["sha256:layer"]),
+        )
+        .await;
+
+        let deleted = would_delete(&storage).await;
+        kept(
+            &deleted,
+            &[
+                "docker/library/nginx/blobs/sha256:cfg".to_string(),
+                "docker/library/nginx/blobs/sha256:layer".to_string(),
+            ],
+        );
     }
 }

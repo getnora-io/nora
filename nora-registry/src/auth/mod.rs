@@ -28,10 +28,19 @@ pub struct AuthenticatedUser(pub String);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
+/// The lifetime ceiling (seconds) the caller's own credential imposes on any
+/// token it mints. Inserted ONLY for OIDC identities — the provider's
+/// `max_token_lifetime_secs`, which already bounds the JWT itself. Absent for
+/// Basic and opaque (`nra_`) callers, which carry no such ceiling. A UI mint
+/// reads it to cap the new token so a short-lived federated identity cannot
+/// bootstrap a long-lived static one (#1094).
+#[derive(Clone, Copy, Debug)]
+pub struct MintLifetimeCeiling(pub u64);
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -424,13 +433,7 @@ pub async fn auth_middleware(
                     if let Some(ip) = client_ip {
                         state.auth_failures.record_success(&ip);
                     }
-                    let method = request.method().clone();
-                    if (method == axum::http::Method::PUT
-                        || method == axum::http::Method::POST
-                        || method == axum::http::Method::DELETE
-                        || method == axum::http::Method::PATCH)
-                        && !role.can_write()
-                    {
+                    if is_write_method(request.method()) && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
                     if is_admin && !role.can_admin() {
@@ -477,13 +480,7 @@ pub async fn auth_middleware(
                             role = ?identity.role,
                             "OIDC authentication successful"
                         );
-                        let method = request.method().clone();
-                        if (method == axum::http::Method::PUT
-                            || method == axum::http::Method::POST
-                            || method == axum::http::Method::DELETE
-                            || method == axum::http::Method::PATCH)
-                            && !identity.role.can_write()
-                        {
+                        if is_write_method(request.method()) && !identity.role.can_write() {
                             return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
                                 .into_response();
                         }
@@ -501,6 +498,14 @@ pub async fn auth_middleware(
                             identity.namespace_scope_enforcement,
                         );
                         request.extensions_mut().insert(authority);
+                        // Carry the provider's lifetime ceiling so a token minted
+                        // by this identity cannot outlive it (#1094). Taken from
+                        // the identity — i.e. the provider that actually validated
+                        // this JWT — never re-looked-up by name, since provider
+                        // names are not unique (#1094 N2).
+                        request
+                            .extensions_mut()
+                            .insert(MintLifetimeCeiling(identity.max_token_lifetime_secs));
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));
@@ -535,100 +540,180 @@ pub async fn auth_middleware(
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
-    // htpasswd provider required for Basic auth
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return unauthorized_response("Basic auth not configured", realm),
-    };
-
-    let encoded = &auth_header[6..];
-    let decoded = match STANDARD.decode(encoded) {
-        Ok(d) => d,
-        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
-    };
-
-    let credentials = match String::from_utf8(decoded) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_response("Invalid credentials encoding", realm),
-    };
-
-    let (username, password) = match credentials.split_once(':') {
-        Some((u, p)) => (u, p),
-        None => return unauthorized_response("Invalid credentials format", realm),
-    };
-
-    // Verify credentials. htpasswd first; if that fails, the password may be an API
-    // token (`nra_…`). Docker, twine and Maven send the token as the Basic-auth
-    // password and never use Bearer (the `/v2/` challenge is Basic), so the Basic
-    // path must fall through to token verification for token auth to work at all. (#736)
-    if !auth.authenticate(username, password) {
-        let token_result = state.tokens.as_ref().map(|ts| ts.verify_token(password));
-        // Same fail-closed rule as the Bearer path: a store I/O/parse failure is
-        // not "wrong password". A 401 here makes valid token creds flap and feeds
-        // the failure tracker toward lockout for the duration of a storage blip.
-        if let Some(Err(crate::tokens::TokenError::Storage(ref e))) = token_result {
-            tracing::error!(error = %e, "token store read failed during Basic auth fallback");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Token verification unavailable",
-            )
-                .into_response();
-        }
-        if let Some(Ok((token_user, role))) = token_result {
+    // Verify credentials: htpasswd first, then the token store (#736, #1094);
+    // `decide_basic_auth` has the rules, this applies its decision.
+    let decision = decide_basic_auth(
+        &auth_header[6..],
+        state
+            .auth
+            .as_deref()
+            .map(|auth| move |user: &str, password: &str| auth.authenticate(user, password)),
+        state
+            .tokens
+            .as_ref()
+            .map(|store| move |password: &str| store.verify_token(password)),
+        request.method(),
+        is_admin,
+    );
+    match decision {
+        BasicDecision::Authenticated { user, role } => {
+            // Auth successful — clear failure counter
             if let Some(ip) = client_ip {
                 state.auth_failures.record_success(&ip);
             }
-            let method = request.method().clone();
-            if (method == axum::http::Method::PUT
-                || method == axum::http::Method::POST
-                || method == axum::http::Method::DELETE
-                || method == axum::http::Method::PATCH)
-                && !role.can_write()
-            {
-                return (StatusCode::FORBIDDEN, "Read-only token").into_response();
-            }
-            // An API token sent as the Basic password is a full bearer identity
-            // (#737), so it must clear the admin gate too — else a write token via
-            // Basic would reach /api/v1/admin/* unchecked.
-            if is_admin && !role.can_admin() {
-                return (StatusCode::FORBIDDEN, "Admin role required").into_response();
-            }
-            // Opaque (nra_) tokens are not namespace-scoped (#583 is OIDC-only).
+            // Basic-auth identities and opaque (nra_) tokens are not
+            // namespace-scoped (#583 is OIDC-only).
             request
                 .extensions_mut()
                 .insert(NamespaceAuthority::Unrestricted);
-            request
-                .extensions_mut()
-                .insert(AuthenticatedUser(token_user));
+            request.extensions_mut().insert(AuthenticatedUser(user));
             request.extensions_mut().insert(AuthenticatedRole(role));
-            return next.run(request).await;
+            next.run(request).await
         }
-        if let Some(ip) = client_ip {
-            state.auth_failures.record_failure(ip);
+        BasicDecision::Forbidden(reason) => {
+            // Valid credentials, not authorized: the credential still counts as good.
+            if let Some(ip) = client_ip {
+                state.auth_failures.record_success(&ip);
+            }
+            (StatusCode::FORBIDDEN, reason).into_response()
         }
-        return unauthorized_response("Invalid username or password", realm);
+        BasicDecision::Unauthorized {
+            message,
+            record_failure,
+        } => {
+            if record_failure {
+                if let Some(ip) = client_ip {
+                    state.auth_failures.record_failure(ip);
+                }
+            }
+            unauthorized_response(message, realm)
+        }
+        BasicDecision::ServiceUnavailable(e) => {
+            tracing::error!(error = %e, "token store read failed during Basic auth fallback");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Token verification unavailable",
+            )
+                .into_response()
+        }
+        BasicDecision::NotConfigured => unauthorized_response("Basic auth not configured", realm),
+    }
+}
+
+/// What the Basic branch of [`auth_middleware`] does with a request, as
+/// decided by [`decide_basic_auth`].
+#[derive(Clone, Debug, PartialEq)]
+enum BasicDecision {
+    /// Valid credentials, authorized: run the request as `user` with `role`.
+    Authenticated {
+        user: String,
+        role: crate::tokens::Role,
+    },
+    /// Valid credentials, not authorized for this request (403). The
+    /// credentials still count as a success for the failure tracker.
+    Forbidden(&'static str),
+    /// Credentials malformed or wrong (401). Only a wrong credential counts
+    /// toward the per-IP lockout (`record_failure`), a malformed header does not.
+    Unauthorized {
+        message: &'static str,
+        record_failure: bool,
+    },
+    /// The token store could not be read (503): an outage, not a credential
+    /// verdict, so it is not counted (#912).
+    ServiceUnavailable(String),
+    /// Neither htpasswd nor a token store to check a Basic password against (401).
+    NotConfigured,
+}
+
+/// Decide a Basic-auth request from its credentials (`encoded`, the header
+/// value after `Basic `), the method and whether the path is an admin one.
+///
+/// `htpasswd` and `tokens` check a username/password and a password against
+/// the htpasswd file and the token store; `None` when the deployment has no
+/// such store. The function does no I/O of its own and decides whether each
+/// check runs at all:
+/// - Basic needs htpasswd or the token store; with neither the answer is
+///   [`BasicDecision::NotConfigured`] whatever the header. An OIDC-only setup
+///   (#996) has no htpasswd, but API tokens sent as the Basic password must
+///   still work there: Docker, twine and Maven have no other way to present
+///   one (#1094).
+/// - htpasswd first. A match is that user with the `Write` role, never admin,
+///   and the token store is not read — not even for a password shaped like an
+///   API token, so a store failure cannot turn a valid login into a 503 and a
+///   colliding token cannot lend its owner or role.
+/// - Otherwise the password may be an API token (`nra_…`): Docker, twine and
+///   Maven send the token as the Basic-auth password and never use Bearer (the
+///   `/v2/` challenge is Basic) (#736). A valid token is its owner with its
+///   role, never the Basic username, and is gated like on the Bearer path: a
+///   read token may not write ([`is_write_method`]), an admin path needs an
+///   admin token. A store I/O/parse failure is not "wrong password": a 401
+///   would make valid token creds flap and feed the failure tracker toward
+///   lockout for the duration of a storage blip.
+fn decide_basic_auth<H, T>(
+    encoded: &str,
+    htpasswd: Option<H>,
+    tokens: Option<T>,
+    method: &Method,
+    is_admin: bool,
+) -> BasicDecision
+where
+    H: FnOnce(&str, &str) -> bool,
+    T: FnOnce(&str) -> Result<(String, crate::tokens::Role), crate::tokens::TokenError>,
+{
+    if htpasswd.is_none() && tokens.is_none() {
+        return BasicDecision::NotConfigured;
+    }
+    let malformed = |message| BasicDecision::Unauthorized {
+        message,
+        record_failure: false,
+    };
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return malformed("Invalid credentials encoding");
+    };
+    let Ok(credentials) = String::from_utf8(decoded) else {
+        return malformed("Invalid credentials encoding");
+    };
+    let Some((username, password)) = credentials.split_once(':') else {
+        return malformed("Invalid credentials format");
+    };
+
+    if htpasswd.is_some_and(|check| check(username, password)) {
+        // Basic-auth carries no role, so it can never satisfy an admin path:
+        // deny fail-closed (403 — authenticated but not authorized).
+        if is_admin {
+            return BasicDecision::Forbidden("Admin role required");
+        }
+        return BasicDecision::Authenticated {
+            user: username.to_string(),
+            role: crate::tokens::Role::Write,
+        };
     }
 
-    // Auth successful — clear failure counter
-    if let Some(ip) = client_ip {
-        state.auth_failures.record_success(&ip);
+    match tokens.map(|verify| verify(password)) {
+        Some(Ok((user, role))) => {
+            if is_write_method(method) && !role.can_write() {
+                BasicDecision::Forbidden("Read-only token")
+            } else if is_admin && !role.can_admin() {
+                // An API token sent as the Basic password is a full bearer
+                // identity (#737), so it must clear the admin gate too.
+                BasicDecision::Forbidden("Admin role required")
+            } else {
+                BasicDecision::Authenticated { user, role }
+            }
+        }
+        Some(Err(crate::tokens::TokenError::Storage(e))) => BasicDecision::ServiceUnavailable(e),
+        Some(Err(_)) | None => BasicDecision::Unauthorized {
+            message: "Invalid username or password",
+            record_failure: true,
+        },
     }
-    // Basic-auth carries no role, so it can never satisfy an admin path: deny
-    // fail-closed (403 — authenticated but not authorized).
-    if is_admin {
-        return (StatusCode::FORBIDDEN, "Admin role required").into_response();
-    }
-    // Basic-auth identities are not namespace-scoped (#583 is OIDC-only).
-    request
-        .extensions_mut()
-        .insert(NamespaceAuthority::Unrestricted);
-    request
-        .extensions_mut()
-        .insert(AuthenticatedUser(username.to_string()));
-    request
-        .extensions_mut()
-        .insert(AuthenticatedRole(crate::tokens::Role::Write));
-    next.run(request).await
+}
+
+/// The methods a read-only identity may not use: exactly PUT, POST, DELETE and
+/// PATCH. Every other method is a read — HEAD included, which is how
+/// `docker pull` starts.
+fn is_write_method(method: &Method) -> bool {
+    [Method::PUT, Method::POST, Method::DELETE, Method::PATCH].contains(method)
 }
 
 /// Attempt to validate a Base64-encoded Basic auth credential against the
@@ -959,6 +1044,324 @@ mod tests {
             "third lockout should be ~4 sec, got {}",
             retry3
         );
+    }
+}
+
+/// #1094 — the Basic branch of `auth_middleware` as a table: every row runs
+/// `decide_basic_auth` on one input and compares the decision, plus whether the
+/// token store was read at all. The router and binary tests cover the wiring
+/// around it (`state.auth`/`state.tokens` into the verifiers, the decision into
+/// the response and the failure tracker).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod basic_decision_tests {
+    use super::{decide_basic_auth, BasicDecision};
+    use crate::tokens::Role::{Admin, Read, Write};
+    use crate::tokens::{Role, TokenError};
+    use axum::http::Method;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::cell::Cell;
+
+    /// The htpasswd users of the table. `svc`'s password is a live admin token
+    /// of another owner, `ops`'s one the token store fails to read: htpasswd
+    /// matching first must keep both away from the store.
+    const HTPASSWD: &[(&str, &str)] = &[
+        ("alice", "secret"),
+        ("svc", "nra_collides"),
+        ("ops", "nra_broken"),
+    ];
+
+    /// Owner of the table's tokens; no Basic username of the table is it.
+    const OWNER: &str = "ci-bot";
+
+    /// The token store of the table, by password.
+    fn token_store(password: &str) -> Result<(String, Role), TokenError> {
+        match password {
+            "nra_read" => Ok((OWNER.into(), Read)),
+            "nra_write" => Ok((OWNER.into(), Write)),
+            "nra_admin" => Ok((OWNER.into(), Admin)),
+            "nra_collides" => Ok(("token-owner".into(), Admin)),
+            "nra_broken" => Err(TokenError::Storage("torn token file".into())),
+            "nra_expired" => Err(TokenError::Expired),
+            p if p.starts_with("nra_") => Err(TokenError::NotFound),
+            _ => Err(TokenError::InvalidFormat),
+        }
+    }
+
+    /// Which credential stores the deployment has.
+    #[derive(Clone, Copy, Debug)]
+    enum Setup {
+        Both,
+        HtpasswdOnly,
+        TokensOnly,
+        Neither,
+    }
+    use Setup::{Both, HtpasswdOnly, Neither, TokensOnly};
+
+    /// The decision for one request, and whether the token store was read.
+    fn decide(
+        setup: Setup,
+        encoded: &str,
+        method: &Method,
+        is_admin: bool,
+    ) -> (BasicDecision, bool) {
+        let read = Cell::new(false);
+        let htpasswd = |user: &str, password: &str| HTPASSWD.contains(&(user, password));
+        let tokens = |password: &str| {
+            read.set(true);
+            token_store(password)
+        };
+        let (htpasswd, tokens) = match setup {
+            Both => (Some(htpasswd), Some(tokens)),
+            HtpasswdOnly => (Some(htpasswd), None),
+            TokensOnly => (None, Some(tokens)),
+            Neither => (None, None),
+        };
+        let decision = decide_basic_auth(encoded, htpasswd, tokens, method, is_admin);
+        (decision, read.get())
+    }
+
+    fn ok(user: &str, role: Role) -> BasicDecision {
+        BasicDecision::Authenticated {
+            user: user.into(),
+            role,
+        }
+    }
+
+    fn wrong() -> BasicDecision {
+        BasicDecision::Unauthorized {
+            message: "Invalid username or password",
+            record_failure: true,
+        }
+    }
+
+    fn malformed(message: &'static str) -> BasicDecision {
+        BasicDecision::Unauthorized {
+            message,
+            record_failure: false,
+        }
+    }
+
+    fn unavailable() -> BasicDecision {
+        BasicDecision::ServiceUnavailable("torn token file".into())
+    }
+
+    const READ_ONLY: BasicDecision = BasicDecision::Forbidden("Read-only token");
+    const NOT_ADMIN: BasicDecision = BasicDecision::Forbidden("Admin role required");
+    const GET: Method = Method::GET;
+    const PUT: Method = Method::PUT;
+    const POST: Method = Method::POST;
+    const DELETE: Method = Method::DELETE;
+
+    /// Every method the table sweeps: the standard ones and an extension one.
+    fn methods() -> Vec<Method> {
+        vec![
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::CONNECT,
+            Method::PUT,
+            Method::POST,
+            Method::DELETE,
+            Method::PATCH,
+            Method::from_bytes(b"PROPFIND").unwrap(),
+        ]
+    }
+
+    /// The invariant's write set, spelled out: exactly these four.
+    fn is_write(method: &Method) -> bool {
+        [Method::PUT, Method::POST, Method::DELETE, Method::PATCH].contains(method)
+    }
+
+    struct Row {
+        setup: Setup,
+        encoded: String,
+        method: Method,
+        is_admin: bool,
+        want: BasicDecision,
+        token_store_read: bool,
+    }
+
+    impl Row {
+        /// The same request on an admin path (`/api/v1/admin/*`).
+        fn admin(self) -> Self {
+            Row {
+                is_admin: true,
+                ..self
+            }
+        }
+    }
+
+    /// One row: the Basic credentials `user:password` sent with `method` to a
+    /// non-admin path; the decision wanted and whether the store is read.
+    fn row(
+        setup: Setup,
+        credentials: &str,
+        method: Method,
+        want: BasicDecision,
+        read: bool,
+    ) -> Row {
+        Row {
+            setup,
+            encoded: STANDARD.encode(credentials),
+            method,
+            is_admin: false,
+            want,
+            token_store_read: read,
+        }
+    }
+
+    fn rows() -> Vec<Row> {
+        let mut rows = vec![
+            // htpasswd matched → its identity (Write, never admin); the token
+            // store is not read, even for an `nra_` password that is a live
+            // admin token of someone else (H3/H4) or one the store fails on.
+            row(Both, "alice:secret", GET, ok("alice", Write), false),
+            row(Both, "alice:secret", PUT, ok("alice", Write), false),
+            row(Both, "alice:secret", GET, NOT_ADMIN, false).admin(),
+            row(
+                HtpasswdOnly,
+                "alice:secret",
+                DELETE,
+                ok("alice", Write),
+                false,
+            ),
+            row(Both, "svc:nra_collides", GET, ok("svc", Write), false),
+            row(Both, "svc:nra_collides", POST, ok("svc", Write), false),
+            row(Both, "svc:nra_collides", POST, NOT_ADMIN, false).admin(),
+            row(Both, "ops:nra_broken", GET, ok("ops", Write), false),
+            // htpasswd missed → the password may be a token (#736): identity and
+            // role are the token's, never the Basic username's (H3).
+            row(Both, "alice:nra_write", PUT, ok(OWNER, Write), true),
+            row(Both, "svc:nra_read", GET, ok(OWNER, Read), true),
+            row(Both, "alice:nra_read", PUT, READ_ONLY, true),
+            row(Both, "alice:nra_admin", POST, ok(OWNER, Admin), true).admin(),
+            row(Both, "alice:wrong", GET, wrong(), true),
+            row(Both, "alice:nra_broken", GET, unavailable(), true),
+            // No htpasswd (OIDC-only, #1094): the token is the credential.
+            row(TokensOnly, "docker:nra_write", GET, ok(OWNER, Write), true),
+            row(TokensOnly, "docker:nra_write", PUT, ok(OWNER, Write), true),
+            row(TokensOnly, ":nra_write", GET, ok(OWNER, Write), true),
+            row(TokensOnly, "alice:nra_admin", GET, ok(OWNER, Admin), true),
+            // Admin paths need an admin token; the write gate is checked first.
+            row(TokensOnly, "docker:nra_admin", POST, ok(OWNER, Admin), true).admin(),
+            row(TokensOnly, "docker:nra_write", POST, NOT_ADMIN, true).admin(),
+            row(TokensOnly, "docker:nra_write", GET, NOT_ADMIN, true).admin(),
+            row(TokensOnly, "docker:nra_read", GET, NOT_ADMIN, true).admin(),
+            row(TokensOnly, "docker:nra_read", POST, READ_ONLY, true).admin(),
+            // A wrong token is a credential verdict: 401, counted.
+            row(TokensOnly, "docker:nra_00000000", GET, wrong(), true),
+            row(TokensOnly, "docker:nra_expired", GET, wrong(), true),
+            row(TokensOnly, "docker:secret", GET, wrong(), true),
+            row(TokensOnly, "alice:secret", GET, wrong(), true),
+            row(TokensOnly, "docker:", GET, wrong(), true),
+            // A store failure is an outage: 503 before any role gate, uncounted.
+            row(TokensOnly, "docker:nra_broken", GET, unavailable(), true),
+            row(TokensOnly, "docker:nra_broken", PUT, unavailable(), true).admin(),
+            // htpasswd only: no token fallback to reach.
+            row(HtpasswdOnly, "alice:wrong", GET, wrong(), false),
+            row(HtpasswdOnly, "docker:nra_write", GET, wrong(), false),
+            row(
+                HtpasswdOnly,
+                "svc:nra_collides",
+                GET,
+                ok("svc", Write),
+                false,
+            ),
+        ];
+
+        // Write = exactly {PUT, POST, DELETE, PATCH} (H8): a read token passes
+        // every other method — HEAD is how `docker pull` starts — and is refused
+        // those four; a write token and an htpasswd user pass all of them.
+        for method in methods() {
+            for setup in [Both, TokensOnly] {
+                let read_want = if is_write(&method) {
+                    READ_ONLY
+                } else {
+                    ok(OWNER, Read)
+                };
+                rows.push(row(
+                    setup,
+                    "docker:nra_read",
+                    method.clone(),
+                    read_want,
+                    true,
+                ));
+                let write_want = ok(OWNER, Write);
+                rows.push(row(
+                    setup,
+                    "docker:nra_write",
+                    method.clone(),
+                    write_want,
+                    true,
+                ));
+            }
+            rows.push(row(Both, "alice:secret", method, ok("alice", Write), false));
+        }
+
+        // "Not configured" exactly when there is neither htpasswd nor a token
+        // store, both ways (H6/H7) — and it is decided before the header is
+        // parsed, so malformed credentials get it too.
+        let malformed_headers = [
+            ("!!!".to_string(), "Invalid credentials encoding"),
+            (
+                STANDARD.encode([0xff, 0xfe, b':']),
+                "Invalid credentials encoding",
+            ),
+            (STANDARD.encode("nra_write"), "Invalid credentials format"),
+        ];
+        for setup in [Both, HtpasswdOnly, TokensOnly, Neither] {
+            let has_tokens = matches!(setup, Both | TokensOnly);
+            let token_want = match setup {
+                Both | TokensOnly => ok(OWNER, Write),
+                HtpasswdOnly => wrong(),
+                Neither => BasicDecision::NotConfigured,
+            };
+            rows.push(row(setup, "docker:nra_write", GET, token_want, has_tokens));
+            for (encoded, message) in &malformed_headers {
+                let want = match setup {
+                    Neither => BasicDecision::NotConfigured,
+                    _ => malformed(message),
+                };
+                rows.push(Row {
+                    encoded: encoded.clone(),
+                    ..row(setup, "", GET, want, false)
+                });
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn basic_auth_decision_table() {
+        let rows = rows();
+        assert_eq!(rows.len(), 99);
+        for (i, row) in rows.iter().enumerate() {
+            let (got, read) = decide(row.setup, &row.encoded, &row.method, row.is_admin);
+            let credentials = STANDARD
+                .decode(&row.encoded)
+                .map(|d| String::from_utf8_lossy(&d).into_owned());
+            let context = format!(
+                "row {i}: {:?} {credentials:?} {} admin={}",
+                row.setup, row.method, row.is_admin
+            );
+            assert_eq!(got, row.want, "{context}");
+            assert_eq!(read, row.token_store_read, "token store read? {context}");
+        }
+    }
+
+    /// The table's verifiers answer as the rows assume — a control that a
+    /// green table is not a vacuous one.
+    #[test]
+    fn basic_auth_decision_table_verifiers() {
+        assert!(HTPASSWD.contains(&("svc", "nra_collides")));
+        assert!(token_store("nra_collides").unwrap().1.can_admin());
+        assert!(matches!(
+            token_store("nra_broken"),
+            Err(TokenError::Storage(_))
+        ));
+        assert_eq!(methods().iter().filter(|m| is_write(m)).count(), 4);
     }
 }
 
@@ -1340,6 +1743,560 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// htpasswd is verified BEFORE the token store: when both exist, a password
+    /// that merely *looks* like an API token (`nra_…`) authenticates against
+    /// htpasswd and never reaches token verification. The order has held since
+    /// #736 (htpasswd first, token on fallback), but no test pinned it — an
+    /// acceptance mutant that tried the token store first survived the #1094 net
+    /// (M12). Without the order a token-store blip would turn a valid htpasswd
+    /// login into a 503, and an htpasswd password that collided with a live token
+    /// would borrow the token's role and owner instead of the htpasswd identity.
+    /// Correct order: htpasswd matches, store never read → 200. Token-first: the
+    /// corrupt token file is read → Storage error → 503.
+    #[tokio::test]
+    async fn test_basic_auth_htpasswd_checked_before_token_store() {
+        // htpasswd user whose password is shaped like an `nra_` token, so a
+        // token-first order would try to verify it against the store.
+        let ctx = create_test_context_with_auth(&[("svc", "nra_witness")]);
+        assert!(ctx.state.auth.is_some(), "htpasswd provider present");
+        assert!(ctx.state.tokens.is_some(), "token store present");
+        // Corrupt the file the store would read for this password: reaching it at
+        // all yields a Storage error (→503). htpasswd-first never reads it.
+        std::fs::write(token_file_path(&ctx, "nra_witness"), "{\"token_ha").unwrap();
+
+        let header_val = basic_header("svc", "nra_witness");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        // htpasswd matched first → authenticated; the token store was never
+        // consulted, so the corrupt file never mattered.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Write a legacy token file (unsalted SHA-256 hash) for `token`: the first
+    /// time the store reads it, it rewrites the file with an Argon2 hash.
+    fn write_legacy_token(ctx: &crate::test_helpers::TestContext, token: &str, owner: &str) {
+        use sha2::Digest;
+        let info = serde_json::json!({
+            "token_hash": hex::encode(sha2::Sha256::digest(token.as_bytes())),
+            "user": owner,
+            "created_at": 0,
+            "expires_at": u64::MAX,
+            "last_used": null,
+            "description": null,
+            "role": "admin",
+        });
+        std::fs::write(token_file_path(ctx, token), info.to_string()).unwrap();
+    }
+
+    fn token_file_migrated(ctx: &crate::test_helpers::TestContext, token: &str) -> bool {
+        std::fs::read_to_string(token_file_path(ctx, token))
+            .unwrap()
+            .contains("$argon2")
+    }
+
+    /// htpasswd matched → the token store is not read at all, not even for a
+    /// result that is then thrown away (H4), and the identity is the htpasswd
+    /// user (H3). The password is a live admin token of another owner, kept as a
+    /// legacy file: any store read migrates it to Argon2, so a file still legacy
+    /// after the requests was never read. The control token proves the witness:
+    /// one store read migrates its file.
+    #[tokio::test]
+    async fn test_basic_auth_htpasswd_match_never_reads_token_store() {
+        let ctx = create_test_context_with_auth(&[("svc", "nra_witness")]);
+        write_legacy_token(&ctx, "nra_witness", "token-owner");
+        write_legacy_token(&ctx, "nra_control", "token-owner");
+        let store = ctx.state.tokens.as_ref().unwrap();
+        assert_eq!(store.verify_token("nra_control").unwrap().0, "token-owner");
+        assert!(token_file_migrated(&ctx, "nra_control"), "witness control");
+
+        let header_val = basic_header("svc", "nra_witness");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["username"], "svc");
+
+        // The token is admin; the htpasswd identity is not.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/v1/admin/tokens",
+            vec![
+                ("authorization", &header_val),
+                ("content-type", "application/json"),
+            ],
+            br#"{"username":"x","ttl_days":1,"role":"read"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        assert!(
+            !token_file_migrated(&ctx, "nra_witness"),
+            "htpasswd matched, yet the token store read the password's token file"
+        );
+    }
+
+    /// Auth enabled with no htpasswd file — the OIDC-only setup (#996). The
+    /// token store is there, as main.rs always creates it when auth is enabled.
+    fn create_test_context_without_htpasswd() -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_auth(&[]);
+        assert!(ctx.state.auth.is_none(), "no htpasswd provider");
+        assert!(ctx.state.tokens.is_some(), "token store present");
+        ctx
+    }
+
+    /// Owner of the tokens `mint` creates. The Basic username the tests send
+    /// (`docker`) differs, so a request attributed to the Basic username
+    /// instead of the token's owner shows.
+    const TOKEN_OWNER: &str = "ci-bot";
+
+    fn mint(ctx: &crate::test_helpers::TestContext, role: crate::tokens::Role) -> String {
+        ctx.state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token(TOKEN_OWNER, 30, None, role)
+            .unwrap()
+    }
+
+    fn basic_header(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    /// The test client's address (`send_with_headers` connects from it).
+    const CLIENT_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// Record failures for the test client up to one short of lockout: the
+    /// test tracker locks out at its 5th, so whether the next request counts
+    /// as a failure decides whether the client ends up blocked.
+    fn one_failure_from_lockout(tracker: &super::AuthFailureTracker) {
+        for _ in 0..4 {
+            tracker.record_failure(CLIENT_IP);
+        }
+        assert!(tracker.check_blocked(&CLIENT_IP).is_none());
+    }
+
+    /// #1094: without htpasswd, an API token sent as the Basic password is
+    /// still a credential — `docker login` (the `/v2/` ping) and a write with a
+    /// write token pass, as they do with htpasswd (#736).
+    #[tokio::test]
+    async fn test_basic_auth_api_token_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("docker", &token);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/test.txt",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.as_ref(), b"data");
+    }
+
+    /// #1094: a write identity may not mint an ADMIN token through the
+    /// UI create path, even over a Basic-token credential in OIDC-only — the
+    /// caller's role gates the request, not the form. Without the gate any write
+    /// token escalates to admin (GHSA-78cx-cfhm-rgmx class, the UI create path
+    /// had missed it).
+    #[tokio::test]
+    async fn test_ui_token_create_write_caller_cannot_mint_admin() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("victim-admin", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=admin".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a write identity minted an admin token via the UI"
+        );
+        // Nothing was minted: only the original write token remains.
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "a token was created despite the 403"
+        );
+    }
+
+    /// #1094: the UI create path owns the new token to the AUTHENTICATED
+    /// caller (the token owner), never to the forgeable Basic-header username (H3).
+    #[tokio::test]
+    async fn test_ui_token_create_owner_is_the_caller_not_the_basic_username() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("not-the-owner", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let owners: Vec<String> = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .into_iter()
+            .map(|t| t.user)
+            .collect();
+        assert!(
+            !owners.iter().any(|u| u == "not-the-owner"),
+            "the new token was owned by the forged Basic username: {owners:?}"
+        );
+    }
+
+    /// #1094: the new token is owned by EXACTLY the authenticated
+    /// token owner — not merely "not the forged Basic username" (F2). A mutant
+    /// that sets the owner to any other constant source (`"admin"`,
+    /// `x-remote-user`, a form field) passes F2 but fails here.
+    #[tokio::test]
+    async fn ui_token_create_owner_is_exactly_the_token_owner() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = mint(&ctx, crate::tokens::Role::Write);
+        let header_val = basic_header("not-the-owner", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let owners: Vec<String> = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .into_iter()
+            .map(|t| t.user)
+            .collect();
+        assert_eq!(
+            owners,
+            vec![TOKEN_OWNER.to_string(), TOKEN_OWNER.to_string()],
+            "the minted token's owner is not exactly the authenticated caller"
+        );
+    }
+
+    /// #1094: the admin gate is by ROLE, not by name. A write
+    /// identity whose name happens to be `admin` (an htpasswd user, an OIDC
+    /// subject, or a token owner called `admin`) still cannot mint an admin
+    /// token. A mutant that gates on `user != "admin"` passes F1 (which only
+    /// exercises the `ci-bot` caller) but fails here.
+    #[tokio::test]
+    async fn ui_token_create_admin_named_write_caller_cannot_mint_admin() {
+        let ctx = create_test_context_without_htpasswd();
+        let write_token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let header_val = basic_header("docker", &write_token);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &header_val),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=admin".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a write identity named 'admin' minted an admin token via the UI"
+        );
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "a token was created despite the 403"
+        );
+    }
+
+    /// #1094: the role gate holds on the htpasswd-less Basic path — a read
+    /// token reads but cannot write (403), as over Bearer and with htpasswd.
+    /// The 403 is about the request, not the credential: it clears the per-IP
+    /// failure count instead of adding to it, so a client with a valid read
+    /// token is never locked out for trying to write.
+    #[tokio::test]
+    async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let header_val = basic_header("docker", &token);
+        let tracker = &ctx.state.auth_failures;
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+            one_failure_from_lockout(tracker);
+            let response = send_with_headers(
+                &ctx.app,
+                method.clone(),
+                "/raw/test.txt",
+                vec![("authorization", &header_val)],
+                b"data".to_vec(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            assert!(
+                tracker.check_blocked(&CLIENT_IP).is_none(),
+                "{method}: a valid read token's 403 counted as a failure"
+            );
+        }
+    }
+
+    /// #1094: a token over Basic without htpasswd authenticates as the token's
+    /// owner with the token's role, not as the Basic username: npm whoami
+    /// names the owner, and the token list shows a write token only its
+    /// owner's tokens while an admin token sees every user's (GHSA-78cx).
+    #[tokio::test]
+    async fn test_basic_auth_token_identity_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let store = ctx.state.tokens.as_ref().unwrap();
+        store
+            .create_token(
+                "other",
+                30,
+                Some("theirs".into()),
+                crate::tokens::Role::Read,
+            )
+            .unwrap();
+        let write = basic_header("docker", &mint(&ctx, crate::tokens::Role::Write));
+        let admin = basic_header("docker", &mint(&ctx, crate::tokens::Role::Admin));
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &write)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["username"], TOKEN_OWNER);
+
+        for (header_val, sees_theirs) in [(&write, false), (&admin, true)] {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/api/ui/tokens/list",
+                vec![("authorization", header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+            assert!(body.contains(TOKEN_OWNER), "{body}");
+            assert_eq!(body.contains("theirs"), sees_theirs, "{body}");
+        }
+    }
+
+    /// #1094: the admin gate holds too — a write token over Basic cannot reach
+    /// /api/v1/admin/*, an admin token can (an OIDC-only admin mints tokens
+    /// there, #808, and hands them to Basic-only clients).
+    #[tokio::test]
+    async fn test_basic_auth_token_admin_gate_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let body = br#"{"username":"svc","ttl_days":1,"role":"read"}"#;
+        for (role, want) in [
+            (crate::tokens::Role::Write, StatusCode::FORBIDDEN),
+            (crate::tokens::Role::Admin, StatusCode::OK),
+        ] {
+            let header_val = basic_header("docker", &mint(&ctx, role.clone()));
+            let response = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/v1/admin/tokens",
+                vec![
+                    ("authorization", &header_val),
+                    ("content-type", "application/json"),
+                ],
+                body.to_vec(),
+            )
+            .await;
+            assert_eq!(response.status(), want, "{role:?}");
+        }
+    }
+
+    /// #1094: a token-store failure on the htpasswd-less Basic path is an
+    /// outage (503), not a credential verdict (401), and is not counted.
+    #[tokio::test]
+    async fn test_basic_auth_token_store_error_returns_503_without_htpasswd() {
+        let ctx = create_test_context_without_htpasswd();
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        std::fs::write(token_file_path(&ctx, &token), "{\"token_ha").unwrap();
+
+        one_failure_from_lockout(&ctx.state.auth_failures);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("docker", &token))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ctx.state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+    }
+
+    /// #1094: an unknown, malformed or expired token over Basic without
+    /// htpasswd answers 401 and counts toward the per-IP lockout; a valid
+    /// token clears the count, as on every other credential path.
+    #[tokio::test]
+    async fn test_basic_auth_bad_token_without_htpasswd_is_401_and_counted() {
+        let ctx = create_test_context_without_htpasswd();
+        let tracker = &ctx.state.auth_failures;
+        let expired = mint(&ctx, crate::tokens::Role::Write);
+        let path = token_file_path(&ctx, &expired);
+        let mut info: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        info["expires_at"] = 0.into();
+        std::fs::write(&path, info.to_string()).unwrap();
+
+        let bad = [
+            "nra_00000000000000000000000000000000".to_string(),
+            "secret".to_string(),
+            expired,
+        ];
+        for password in &bad {
+            one_failure_from_lockout(tracker);
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/v2/",
+                vec![("authorization", &basic_header("docker", password))],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password}");
+            assert!(response.headers().contains_key("www-authenticate"));
+            assert!(
+                tracker.check_blocked(&CLIENT_IP).is_some(),
+                "{password}: not counted as a failure"
+            );
+            tracker.record_success(&CLIENT_IP);
+        }
+
+        one_failure_from_lockout(tracker);
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("docker", &token))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tracker.record_failure(CLIENT_IP);
+        assert!(
+            tracker.check_blocked(&CLIENT_IP).is_none(),
+            "a valid token clears the count"
+        );
+    }
+
+    /// With neither htpasswd nor a token store, Basic has nothing to check
+    /// against: the answer stays 401 "Basic auth not configured", uncounted.
+    #[tokio::test]
+    async fn test_basic_auth_without_htpasswd_or_token_store_not_configured() {
+        let ctx = create_test_context_without_htpasswd();
+        let mut state = ctx.state.clone();
+        state.tokens = None;
+        let app = crate::request_layers(crate::registry::docker_routes(), &state)
+            .with_state(state.clone());
+
+        one_failure_from_lockout(&state.auth_failures);
+        let response = send_with_headers(
+            &app,
+            Method::GET,
+            "/v2/",
+            vec![(
+                "authorization",
+                &basic_header("docker", "nra_00000000000000000000000000000000"),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_bytes(response).await.as_ref(),
+            br#"{"error":"Basic auth not configured"}"#
+        );
+        assert!(state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+    }
+
     #[tokio::test]
     async fn test_auth_anonymous_read() {
         let ctx = create_test_context_with_anonymous_read(&[("admin", "secret")]);
@@ -1605,7 +2562,7 @@ mod integration_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod oidc_integration_tests {
+pub(crate) mod oidc_integration_tests {
     use crate::auth::oidc::OidcValidator;
     use crate::config::{OidcConfig, OidcProvider, OidcRoleRule};
     use crate::test_helpers::*;
@@ -1618,7 +2575,7 @@ mod oidc_integration_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Test RSA private key (2048-bit, for test JWT signing only)
-    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7657FVL7gwmjj
 PEfl4A+ajG3DFj6YHmS9gargHMChpdLMbt8ybqu1hHPUNKQyndUvFJ6q+xJFEds3
 eBtjB5GLLtlj9lScvGPsV7386rypeHq30IErgm2beQJyF9ldtrVHBBPbz7eAo4+i
@@ -1648,7 +2605,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
 -----END PRIVATE KEY-----"#;
 
     // Corresponding JWKS (public key in JWK format)
-    const TEST_JWKS_JSON: &str = r#"{"keys":[{"kty":"RSA","kid":"test-key-1","use":"sig","alg":"RS256","n":"u-uexVS-4MJo4zxH5eAPmoxtwxY-mB5kvYGq4BzAoaXSzG7fMm6rtYRz1DSkMp3VLxSeqvsSRRHbN3gbYweRiy7ZY_ZUnLxj7Fe9_Oq8qXh6t9CBK4Jtm3kCchfZXba1RwQT28-3gKOPosAif5uSLLqCwmGT0Kw1HaWsdHVBGv3j-m2nao2dq9K3nJx8NfsxsqM80hzbz7SvSD7CsAXGxo7eZ-fvZ1jd9tv5iEgLizcLb-5dy42vFO5tIsR9GS8BUoEy7cxHySErsfp4BkeJNjwVXqPsgzmbbmrcewIsWtRXqzsIqtsbKBjrNnYV2oMBRncG7PMfzLxI9OuzJtzqyw","e":"AQAB"}]}"#;
+    pub(crate) const TEST_JWKS_JSON: &str = r#"{"keys":[{"kty":"RSA","kid":"test-key-1","use":"sig","alg":"RS256","n":"u-uexVS-4MJo4zxH5eAPmoxtwxY-mB5kvYGq4BzAoaXSzG7fMm6rtYRz1DSkMp3VLxSeqvsSRRHbN3gbYweRiy7ZY_ZUnLxj7Fe9_Oq8qXh6t9CBK4Jtm3kCchfZXba1RwQT28-3gKOPosAif5uSLLqCwmGT0Kw1HaWsdHVBGv3j-m2nao2dq9K3nJx8NfsxsqM80hzbz7SvSD7CsAXGxo7eZ-fvZ1jd9tv5iEgLizcLb-5dy42vFO5tIsR9GS8BUoEy7cxHySErsfp4BkeJNjwVXqPsgzmbbmrcewIsWtRXqzsIqtsbKBjrNnYV2oMBRncG7PMfzLxI9OuzJtzqyw","e":"AQAB"}]}"#;
 
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -1706,6 +2663,22 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
                     enabled: true,
                     role_rules: vec![
+                        // Admin ROLE with a RESTRICTED scope, and admin role with
+                        // no rule scope (unrestricted under provider `["*"]`).
+                        // Distinct `admin-scoped`/`admin-free` segments so these
+                        // never match the `repo:myorg/app:*` subjects other OIDC
+                        // tests mint (first-match-wins). Used by the admin-mint
+                        // scope-escape test.
+                        OidcRoleRule {
+                            pattern: "repo:myorg/admin-scoped:*".to_string(),
+                            role: "admin".to_string(),
+                            namespace_scope: Some(vec!["ci-transport/**".to_string()]),
+                        },
+                        OidcRoleRule {
+                            pattern: "repo:myorg/admin-free:*".to_string(),
+                            role: "admin".to_string(),
+                            namespace_scope: None,
+                        },
                         OidcRoleRule {
                             pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
                             role: "write".to_string(),
@@ -1737,7 +2710,14 @@ Jd74nq6dNCjpWG4drIsyhqX+
             start_time: ctx.state.start_time,
             startup_duration_ms: ctx.state.startup_duration_ms,
             auth: ctx.state.auth.clone(),
-            tokens: ctx.state.tokens.clone(),
+            // Prod builds a token store whenever `auth.enabled` (main.rs:1782);
+            // the base builder keyed it off its `auth_enabled` arg (false here,
+            // the `enabled` tweak comes from `customize`), leaving OIDC
+            // identities' token operations untested. Mirror prod so the store is
+            // present for an OIDC caller that reaches a token handler.
+            tokens: Some(crate::tokens::TokenStore::new(
+                ctx._tempdir.path().join("tokens").as_path(),
+            )),
             metrics: Arc::new(crate::dashboard_metrics::DashboardMetrics::new()),
             activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
@@ -1763,6 +2743,9 @@ Jd74nq6dNCjpWG4drIsyhqX+
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            pull_stats: std::sync::Arc::new(
+                crate::registry::docker::PullStatsAccumulator::default(),
+            ),
         };
 
         // Rebuild router with new state
@@ -1780,6 +2763,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let app_routes = Router::new()
             .merge(crate::auth::token_routes())
             .merge(crate::ui::routes())
+            .merge(crate::admin::routes())
             .merge(registry_routes);
         let app = Router::new()
             .merge(public_routes)
@@ -1893,6 +2877,226 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::FORBIDDEN,
             "PR token must not write outside its rule scope"
+        );
+    }
+
+    /// #1094: a namespace-scoped OIDC identity must not escalate by
+    /// minting an unrestricted opaque token through the UI create path. The
+    /// write handlers enforce the scope (the control below), and the UI mint
+    /// now refuses a scoped caller (`decide_ui_token_mint`) instead of handing
+    /// it an `nra_` token that writes anywhere. Before the fix the mint returned
+    /// 200 and that token wrote to `prod/`; on `github/main` the UI path
+    /// required Basic auth and returned 400.
+    #[tokio::test]
+    async fn test_oidc_scoped_identity_cannot_mint_unrestricted_token_via_ui() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // pull_request rule: role=write, namespace_scope=["ci-transport/**"].
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:pull_request",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", jwt);
+
+        // Control: the identity cannot write to prod/ directly — scope enforced.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/prod/a.txt",
+            vec![("authorization", &bearer)],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "control: a ci-transport-scoped identity must not write to prod/"
+        );
+
+        // The UI mint refuses the scoped caller: nothing is handed out.
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=3650".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a namespace-scoped identity minted an unrestricted token via the UI"
+        );
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "a token was minted for a scoped caller despite the 403"
+        );
+    }
+
+    /// #1094 (admin sibling): the admin-gated mint route `POST
+    /// /api/v1/admin/tokens` is reachable by every identity the admin gate
+    /// admits — including an OIDC identity assigned the `admin` ROLE with a
+    /// RESTRICTED `namespace_scope`. Admin role is not admin authority: the
+    /// opaque token minted here is always namespace-unrestricted, so a scoped
+    /// admin must be refused (403, nothing minted) or it escalates past its own
+    /// `ci-transport/**` scope through the token. The non-vacuous pair: an
+    /// UNRESTRICTED admin (rule scope `None`, provider `["*"]`) is NOT refused —
+    /// the refusal keys on the caller's scope, not on the route.
+    #[tokio::test]
+    async fn test_oidc_scoped_admin_cannot_mint_unrestricted_token_via_admin_route() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+
+        // Scoped admin: role=admin WITH namespace_scope=["ci-transport/**"].
+        let scoped = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-scoped:deploy",
+            "nora",
+            now,
+            now + 600,
+        );
+        let scoped_bearer = format!("Bearer {}", scoped);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/v1/admin/tokens",
+            vec![
+                ("authorization", &scoped_bearer),
+                ("content-type", "application/json"),
+            ],
+            br#"{"username":"svc","role":"write","ttl_days":36500}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a namespace-scoped admin minted an unrestricted token via the admin route"
+        );
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "a token was minted for a scoped admin despite the 403"
+        );
+
+        // Non-vacuous pair: an unrestricted admin (rule scope None, provider
+        // ["*"]) IS allowed — the refusal keys on scope, not on the route.
+        let free = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-free:deploy",
+            "nora",
+            now,
+            now + 600,
+        );
+        let free_bearer = format!("Bearer {}", free);
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/v1/admin/tokens",
+            vec![
+                ("authorization", &free_bearer),
+                ("content-type", "application/json"),
+            ],
+            br#"{"username":"svc","role":"write","ttl_days":30}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unrestricted admin must still be able to mint via the admin route"
+        );
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1,
+            "exactly one token minted by the unrestricted admin"
+        );
+    }
+
+    /// #1094: a token minted by an OIDC identity through the UI must not outlive
+    /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
+    /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
+    /// scope-refused — but the 3650-day request is capped to the 1-day floor.
+    #[tokio::test]
+    async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // main-ref rule: role=write, no rule scope, provider scope ["*"] -> an
+        // UNRESTRICTED identity (not refused by the scope gate).
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {}", jwt);
+
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=3650".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unrestricted OIDC identity may mint a token"
+        );
+
+        let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(entries.len(), 1, "exactly one token minted");
+        let lifetime = entries[0].expires_at - entries[0].created_at;
+        assert_eq!(
+            lifetime, 86_400,
+            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 1 day)"
         );
     }
 
