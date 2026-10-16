@@ -151,7 +151,7 @@ curl -fsSL https://github.com/getnora-io/nora/releases/latest/download/nora-linu
 chmod +x nora && ./nora
 
 # Cargo
-cargo install nora-registry
+cargo install nora-registry --locked
 
 # From source
 git clone https://github.com/getnora-io/nora.git

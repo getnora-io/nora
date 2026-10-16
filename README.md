@@ -104,7 +104,7 @@ helm install nora nora/nora
 ### From Source
 
 ```bash
-cargo install nora-registry
+cargo install nora-registry --locked
 nora
 ```
 
