@@ -3560,13 +3560,14 @@ proxies = [
     }
 
     /// Every curation duration key: global, then each `[curation.<registry>]` section.
+    /// Raw and Hugging Face have none.
     fn curation_duration_keys() -> Vec<String> {
         let mut keys = vec![
             "curation.min_release_age".to_string(),
             "curation.quarantine_ttl".to_string(),
         ];
         for rt in RegistryType::all() {
-            if *rt != RegistryType::Raw {
+            if !matches!(rt, RegistryType::Raw | RegistryType::HuggingFace) {
                 keys.push(format!("curation.{rt}.min_release_age"));
                 keys.push(format!("curation.{rt}.quarantine_ttl"));
             }
@@ -3585,6 +3586,17 @@ proxies = [
         let (config, unknown) = parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
         assert!(unknown.is_empty(), "{content}: {unknown:?}");
         config
+    }
+
+    /// `[curation.hf]` is no section of the config: reported as an unknown key, as
+    /// `[curation.raw]` is, not read as a minimum age that holds nothing.
+    #[test]
+    fn curation_hf_is_an_unknown_section() {
+        for table in ["curation.hf", "curation.raw"] {
+            let content = format!("[{table}]\nmin_release_age = \"7d\"\n");
+            let (_, unknown) = parse_config(&content).unwrap();
+            assert_eq!(unknown, vec![table.to_string()], "{content}");
+        }
     }
 
     #[test]

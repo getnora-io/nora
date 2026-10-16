@@ -185,7 +185,8 @@ impl Default for CurationConfig {
 }
 
 impl CurationConfig {
-    /// The `[curation.<registry>]` section of `rt`; `None` for Raw, which has none.
+    /// The `[curation.<registry>]` section of `rt`; `None` for Raw and Hugging Face,
+    /// which have none.
     ///
     /// The `match` is exhaustive over [`RegistryType`], so a new registry is a
     /// compile error here until its section is declared — a hand-written list of
@@ -209,6 +210,7 @@ impl CurationConfig {
             RegistryType::Rpm => Some(&self.rpm),
             RegistryType::Deb => Some(&self.deb),
             RegistryType::Cpan => Some(&self.cpan),
+            RegistryType::HuggingFace => None,
         }
     }
 
