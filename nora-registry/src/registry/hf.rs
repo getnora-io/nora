@@ -3696,19 +3696,23 @@ mod tests {
         let first = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
         assert_eq!(body_bytes(first).await.to_vec(), weights());
         wait_stored(&ctx, &weights_key()).await;
+        // A second file of the same repository: one repository, two files.
+        let second = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(body_bytes(second).await.to_vec(), CONFIG);
+        wait_stored(&ctx, &config_key()).await;
+        let size = (weights().len() + CONFIG.len()) as u64;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let idx = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
-            if !idx.is_empty() {
+            if idx.first().is_some_and(|r| r.versions == 2) {
                 assert_eq!(idx.len(), 1, "{idx:?}");
                 assert_eq!(idx[0].name, "org/model");
-                assert_eq!(idx[0].versions, 1);
-                assert_eq!(idx[0].size, weights().len() as u64);
+                assert_eq!(idx[0].size, size);
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the index never saw the cached file"
+                "the index never saw both cached files: {idx:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -3716,13 +3720,22 @@ mod tests {
             &body_bytes(send(&ctx.app, Method::GET, "/api/ui/stats", "").await).await,
         )
         .unwrap();
+        // The stats count repositories, as for every registry; the dashboard card counts files.
         assert_eq!(stats["hf"], 1, "{stats}");
         let dash: Value = serde_json::from_slice(
             &body_bytes(send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await).await,
         )
         .unwrap();
+        let card = dash["registry_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "hf")
+            .unwrap_or_else(|| panic!("no hf card: {dash}"));
+        assert_eq!(card["artifact_count"], 2, "{card}");
+        assert_eq!(card["size_bytes"], size, "{card}");
         assert!(
-            dash["global_stats"]["storage_bytes"].as_u64().unwrap() >= weights().len() as u64,
+            dash["global_stats"]["storage_bytes"].as_u64().unwrap() >= size,
             "{dash}"
         );
     }
