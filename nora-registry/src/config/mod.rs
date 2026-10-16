@@ -322,6 +322,86 @@ pub struct Config {
     pub registries: Option<RegistriesSection>,
 }
 
+/// Whether a registry's downloads are checked against a release date at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseDateCheck {
+    /// Checked by name and release date.
+    Dated,
+    /// Not checked by name or release date: only the digest quarantine holds them (rpm, deb).
+    NoNameOrDate,
+    /// Checked by name, but no release date reaches the check (cpan, hf).
+    NoDate,
+}
+
+/// The release-date check of `rt`'s downloads, as each handler calls curation.
+pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
+    match rt {
+        RegistryType::Rpm | RegistryType::Deb => ReleaseDateCheck::NoNameOrDate,
+        // registry/cpan.rs passes no publish date; a Hub commit has none NORA reads.
+        RegistryType::Cpan | RegistryType::HuggingFace => ReleaseDateCheck::NoDate,
+        RegistryType::Docker
+        | RegistryType::Maven
+        | RegistryType::Npm
+        | RegistryType::Cargo
+        | RegistryType::PyPI
+        | RegistryType::Go
+        | RegistryType::Raw
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::Nuget
+        | RegistryType::PubDart
+        | RegistryType::Conan => ReleaseDateCheck::Dated,
+    }
+}
+
+/// What startup knows about one registry for its own `[curation.<registry>]
+/// min_release_age`, as plain facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegistryMinAgeFacts {
+    /// The registry's own `min_release_age` is set.
+    pub value_set: bool,
+    /// Whether its downloads are checked against a release date.
+    pub dated: ReleaseDateCheck,
+    /// The registry is enabled.
+    pub enabled: bool,
+    /// The registry is an enabled proxy: it has an upstream.
+    pub proxy: bool,
+    /// The registry's effective quarantine — its own or the global one — is on.
+    pub quarantined: bool,
+}
+
+/// What startup does with a registry's own `min_release_age`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryMinAgeVerdict {
+    /// No value set.
+    NotSet,
+    /// Applied to the registry's downloads: an active control.
+    Applies,
+    /// The registry is disabled: the value holds nothing (a warning, not a control).
+    Unused,
+    /// The value can never apply to these downloads (an error).
+    CannotApply,
+    /// An enabled proxy without a quarantine of its own (an error, #741): what the
+    /// filter cannot date, nothing would hold.
+    NeedsQuarantine,
+}
+
+/// The verdict on a registry's own `min_release_age`, from its facts alone (#1098).
+pub(crate) fn registry_min_age_verdict(facts: RegistryMinAgeFacts) -> RegistryMinAgeVerdict {
+    if !facts.value_set {
+        RegistryMinAgeVerdict::NotSet
+    } else if facts.dated != ReleaseDateCheck::Dated {
+        RegistryMinAgeVerdict::CannotApply
+    } else if !facts.enabled {
+        RegistryMinAgeVerdict::Unused
+    } else if facts.proxy && !facts.quarantined {
+        RegistryMinAgeVerdict::NeedsQuarantine
+    } else {
+        RegistryMinAgeVerdict::Applies
+    }
+}
+
 impl Config {
     /// Returns the set of enabled registry types.
     ///
@@ -558,6 +638,22 @@ impl Config {
         RegistryType::all()
             .iter()
             .any(|&rt| self.quarantine_mode_for(rt) != QuarantineMode::Off)
+    }
+
+    /// What startup knows about `rt` for its own `min_release_age`; the verdict is
+    /// [`registry_min_age_verdict`] of these facts (#1098).
+    fn registry_min_age_facts(&self, rt: RegistryType) -> RegistryMinAgeFacts {
+        RegistryMinAgeFacts {
+            value_set: self
+                .curation
+                .registry_override(rt)
+                .is_some_and(|o| o.min_release_age.is_some()),
+            dated: release_date_check(rt),
+            enabled: self.enabled_registries_legacy().contains(&rt),
+            proxy: self.is_enabled_proxy(rt),
+            quarantined: self.quarantine_mode_for(rt)
+                != crate::digest_quarantine::QuarantineMode::Off,
+        }
     }
 
     /// Warn if legacy NORA_*_ENABLED env vars are set while using the new
@@ -1006,11 +1102,11 @@ impl Config {
         // min-release-age, an active quarantine, namespace isolation, or integrity
         // checking each make enforce meaningful, so a deny-list-only / age-only /
         // quarantine-only policy is valid (#740).
-        // A per-registry min_release_age is a control on its own (#1098).
+        // A per-registry min_release_age is a control on its own when it applies
+        // (#1098): not on a disabled registry, nor where it is refused below.
         let any_registry_min_age = RegistryType::all().iter().any(|&rt| {
-            self.curation
-                .registry_override(rt)
-                .is_some_and(|o| o.min_release_age.is_some())
+            registry_min_age_verdict(self.registry_min_age_facts(rt))
+                == RegistryMinAgeVerdict::Applies
         });
         if self.curation.mode == CurationMode::Enforce {
             let any_control = self.curation.allowlist_path.is_some()
@@ -1072,11 +1168,13 @@ impl Config {
                     "curation.min_release_age is set with an enabled proxy registry but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine=\"observe\"|\"enforce\" (the unspoofable first-seen age control). server.trust_upstream_dates enhances min-release-age with real upstream dates where a registry caches one (e.g. npm) but is NOT a substitute for the quarantine. (#741)".to_string(),
                 );
             }
-            // The same rules for a registry's own value, which applies without a
-            // global one (#1098). It needs a quarantine of that registry — its own or
-            // the global one — when that registry is an enabled proxy: a quarantine on
-            // another registry does not hold its downloads. On rpm and deb it could
-            // never apply, since their downloads are not checked by name or release date.
+            // A registry's own value applies without a global one (#1098). What startup
+            // does with it is registry_min_age_verdict of the registry's facts: it needs
+            // a quarantine of that registry — its own or the global one — when that
+            // registry is an enabled proxy (a quarantine on another registry holds none
+            // of its downloads, and trusted upstream dates are no substitute, #741); it
+            // can never apply where the downloads carry no release date; on a disabled
+            // registry it holds nothing.
             for &rt in RegistryType::all() {
                 let Some(age) = self
                     .curation
@@ -1085,41 +1183,27 @@ impl Config {
                 else {
                     continue;
                 };
-                let cannot_apply = match rt {
-                    RegistryType::Rpm | RegistryType::Deb => Some(format!(
-                        "{rt} downloads are not checked by name or release date. Remove it; curation.{rt}.quarantine holds new {rt} packages"
+                match registry_min_age_verdict(self.registry_min_age_facts(rt)) {
+                    RegistryMinAgeVerdict::NotSet | RegistryMinAgeVerdict::Applies => {}
+                    RegistryMinAgeVerdict::CannotApply => {
+                        let why = match release_date_check(rt) {
+                            ReleaseDateCheck::NoNameOrDate => format!(
+                                "{rt} downloads are not checked by name or release date. Remove it; curation.{rt}.quarantine holds new {rt} packages"
+                            ),
+                            ReleaseDateCheck::NoDate | ReleaseDateCheck::Dated => format!(
+                                "{rt} downloads carry no release date to check. Remove it; a quarantine holds new {rt} packages"
+                            ),
+                        };
+                        errors.push(format!(
+                            "curation.{rt}.min_release_age=\"{age}\" cannot apply: {why}. (#1098)"
+                        ));
+                    }
+                    RegistryMinAgeVerdict::Unused => warnings.push(format!(
+                        "curation.{rt}.min_release_age=\"{age}\" is set but {rt} is not enabled: it holds nothing and is not an active control. (#1098)"
                     )),
-                    // There is no `[curation.hf]` section, so this is not reached; were one
-                    // added, a Hub commit would still have no release date (see below).
-                    RegistryType::HuggingFace => Some(format!(
-                        "a Hub commit has no publish date NORA reads, and {rt} has no quarantine path. Remove it"
-                    )),
-                    RegistryType::Docker
-                    | RegistryType::Maven
-                    | RegistryType::Npm
-                    | RegistryType::Cargo
-                    | RegistryType::PyPI
-                    | RegistryType::Go
-                    | RegistryType::Raw
-                    | RegistryType::Gems
-                    | RegistryType::Terraform
-                    | RegistryType::Ansible
-                    | RegistryType::Nuget
-                    | RegistryType::PubDart
-                    | RegistryType::Conan
-                    | RegistryType::Cpan => None,
-                };
-                if let Some(why) = cannot_apply {
-                    errors.push(format!(
-                        "curation.{rt}.min_release_age=\"{age}\" cannot apply: {why}. (#1098)"
-                    ));
-                } else if self.quarantine_mode_for(rt)
-                    == crate::digest_quarantine::QuarantineMode::Off
-                    && self.is_enabled_proxy(rt)
-                {
-                    errors.push(format!(
+                    RegistryMinAgeVerdict::NeedsQuarantine => errors.push(format!(
                         "curation.{rt}.min_release_age=\"{age}\" is set and {rt} is an enabled proxy registry, but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine of {rt} (one on another registry does not hold {rt} downloads). Enable curation.quarantine or curation.{rt}.quarantine=\"observe\"|\"enforce\". (#741, #1098)"
-                    ));
+                    )),
                 }
             }
         }
@@ -3730,131 +3814,304 @@ proxies = [
             .collect()
     }
 
+    /// #1098: the verdict on a registry's own min_release_age, row by row, from facts
+    /// alone (value set, release-date check, enabled, proxy, quarantine of that registry).
     #[test]
-    fn every_per_registry_min_release_age_is_an_active_control_in_enforce() {
-        let _lock = env_lock();
-        // Control: enforce with nothing configured has no active control.
-        let (config, _) = parse_config("[curation]\nmode = \"enforce\"\n").unwrap();
-        let (_, errors) = config.validate_with_config_path(None);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("no active control is configured")),
-            "{errors:?}"
-        );
-        // The value of any registry counts, wherever it stands in the list (#1098).
-        for rt in registries_with_a_curation_section() {
-            let config = curation_toml(&format!("curation.{rt}.min_release_age"), "3d", "enforce");
-            let (_, errors) = config.validate_with_config_path(None);
-            assert!(
-                !errors
-                    .iter()
-                    .any(|e| e.contains("no active control is configured")),
-                "{rt}: {errors:?}"
-            );
+    fn registry_min_age_verdict_is_decided_by_the_facts_alone() {
+        use RegistryMinAgeVerdict::{Applies, CannotApply, NeedsQuarantine, NotSet, Unused};
+        use ReleaseDateCheck::{Dated, NoDate, NoNameOrDate};
+        let facts = |value_set, dated, enabled, proxy, quarantined| RegistryMinAgeFacts {
+            value_set,
+            dated,
+            enabled,
+            proxy,
+            quarantined,
+        };
+        // (dated, enabled, proxy, quarantined) -> verdict, with the value set.
+        let rows = [
+            (Dated, true, true, true, Applies),
+            (Dated, true, true, false, NeedsQuarantine),
+            (Dated, true, false, true, Applies),
+            (Dated, true, false, false, Applies),
+            (Dated, false, true, true, Unused),
+            (Dated, false, true, false, Unused),
+            (Dated, false, false, true, Unused),
+            (Dated, false, false, false, Unused),
+            (NoDate, true, true, true, CannotApply),
+            (NoDate, true, true, false, CannotApply),
+            (NoDate, true, false, true, CannotApply),
+            (NoDate, true, false, false, CannotApply),
+            (NoDate, false, true, true, CannotApply),
+            (NoDate, false, true, false, CannotApply),
+            (NoDate, false, false, true, CannotApply),
+            (NoDate, false, false, false, CannotApply),
+            (NoNameOrDate, true, true, true, CannotApply),
+            (NoNameOrDate, true, true, false, CannotApply),
+            (NoNameOrDate, true, false, true, CannotApply),
+            (NoNameOrDate, true, false, false, CannotApply),
+            (NoNameOrDate, false, true, true, CannotApply),
+            (NoNameOrDate, false, true, false, CannotApply),
+            (NoNameOrDate, false, false, true, CannotApply),
+            (NoNameOrDate, false, false, false, CannotApply),
+        ];
+        for (dated, enabled, proxy, quarantined, verdict) in rows {
+            let f = facts(true, dated, enabled, proxy, quarantined);
+            assert_eq!(registry_min_age_verdict(f), verdict, "{f:?}");
+            // Without a value there is nothing to decide.
+            let f = facts(false, dated, enabled, proxy, quarantined);
+            assert_eq!(registry_min_age_verdict(f), NotSet, "{f:?}");
         }
     }
 
+    /// Whether each registry's downloads reach curation with a release date, as the
+    /// handlers call it: rpm and deb are not checked by name or date, cpan passes no date.
     #[test]
-    fn a_per_registry_min_release_age_needs_a_quarantine_where_that_registry_is_a_proxy() {
+    fn the_release_date_check_of_every_registry() {
+        use ReleaseDateCheck::{Dated, NoDate, NoNameOrDate};
+        let expected = [
+            (RegistryType::Docker, Dated),
+            (RegistryType::Maven, Dated),
+            (RegistryType::Npm, Dated),
+            (RegistryType::Cargo, Dated),
+            (RegistryType::PyPI, Dated),
+            (RegistryType::Go, Dated),
+            (RegistryType::Raw, Dated),
+            (RegistryType::Gems, Dated),
+            (RegistryType::Terraform, Dated),
+            (RegistryType::Ansible, Dated),
+            (RegistryType::Nuget, Dated),
+            (RegistryType::PubDart, Dated),
+            (RegistryType::Conan, Dated),
+            (RegistryType::Rpm, NoNameOrDate),
+            (RegistryType::Deb, NoNameOrDate),
+            (RegistryType::Cpan, NoDate),
+            (RegistryType::HuggingFace, NoDate),
+        ];
+        assert_eq!(expected.len(), RegistryType::all().len());
+        for (rt, check) in expected {
+            assert_eq!(release_date_check(rt), check, "{rt}");
+        }
+    }
+
+    /// Each registry made an enabled proxy in each form its config accepts, written out
+    /// per registry: the expectation is this table, not `is_enabled_proxy`.
+    fn proxy_forms() -> Vec<(RegistryType, &'static str, fn(&mut Config))> {
+        fn none(_: &mut Config) {}
+        vec![
+            (RegistryType::Docker, "[docker]\nenabled = true\n[[docker.upstreams]]\nurl = \"https://registry-1.docker.io\"\n", none),
+            (RegistryType::Maven, "[maven]\nenabled = true\nproxies = [\"https://repo1.maven.org/maven2\"]\n", none),
+            (RegistryType::Npm, "[npm]\nenabled = true\nproxy = \"https://registry.npmjs.org\"\n", |c| c.npm.proxies.clear()),
+            (RegistryType::Npm, "[npm]\nenabled = true\nproxies = [\"https://registry.npmjs.org\"]\n", |c| c.npm.proxy = None),
+            (RegistryType::Cargo, "[cargo]\nenabled = true\nproxy = \"https://index.crates.io\"\n", none),
+            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxy = \"https://pypi.org/simple/\"\n", |c| c.pypi.proxies.clear()),
+            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxies = [\"https://pypi.org/simple/\"]\n", |c| c.pypi.proxy = None),
+            (RegistryType::Go, "[go]\nenabled = true\nproxy = \"https://proxy.golang.org\"\n", none),
+            (RegistryType::Gems, "[gems]\nenabled = true\nproxy = \"https://rubygems.org\"\n", none),
+            (RegistryType::Terraform, "[terraform]\nenabled = true\nproxy = \"https://registry.terraform.io\"\n", none),
+            (RegistryType::Ansible, "[ansible]\nenabled = true\nproxy = \"https://galaxy.ansible.com\"\n", none),
+            (RegistryType::Nuget, "[nuget]\nenabled = true\nproxy = \"https://api.nuget.org/v3/index.json\"\n", none),
+            (RegistryType::PubDart, "[pub_dart]\nenabled = true\nproxy = \"https://pub.dev\"\n", none),
+            (RegistryType::Conan, "[conan]\nenabled = true\nproxy = \"https://center2.conan.io\"\n", none),
+            (RegistryType::Rpm, "[rpm]\nenabled = true\n[rpm.proxies]\nfedora = \"https://repo.example.com/fedora\"\n", none),
+            (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
+            (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
+        ]
+    }
+
+    /// Each registry enabled with no upstream at all, written out per registry.
+    fn make_hosted(rt: RegistryType, c: &mut Config) {
+        match rt {
+            RegistryType::Docker => (c.docker.enabled, c.docker.upstreams) = (true, vec![]),
+            RegistryType::Maven => (c.maven.enabled, c.maven.proxies) = (true, vec![]),
+            RegistryType::Npm => (c.npm.enabled, c.npm.proxy, c.npm.proxies) = (true, None, vec![]),
+            RegistryType::Cargo => (c.cargo.enabled, c.cargo.proxy) = (true, None),
+            RegistryType::PyPI => {
+                (c.pypi.enabled, c.pypi.proxy, c.pypi.proxies) = (true, None, vec![])
+            }
+            RegistryType::Go => (c.go.enabled, c.go.proxy) = (true, None),
+            RegistryType::Gems => (c.gems.enabled, c.gems.proxy) = (true, None),
+            RegistryType::Terraform => (c.terraform.enabled, c.terraform.proxy) = (true, None),
+            RegistryType::Ansible => (c.ansible.enabled, c.ansible.proxy) = (true, None),
+            RegistryType::Nuget => (c.nuget.enabled, c.nuget.proxy) = (true, None),
+            RegistryType::PubDart => (c.pub_dart.enabled, c.pub_dart.proxy) = (true, None),
+            RegistryType::Conan => (c.conan.enabled, c.conan.proxy) = (true, None),
+            RegistryType::Rpm => (c.rpm.enabled, c.rpm.proxies) = (true, Default::default()),
+            RegistryType::Deb => (c.deb.enabled, c.deb.proxies) = (true, Default::default()),
+            RegistryType::Cpan => (c.cpan.enabled, c.cpan.proxy) = (true, None),
+            RegistryType::Raw => c.raw.enabled = true,
+            RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
+        }
+    }
+
+    /// Each registry disabled, written out per registry.
+    fn make_disabled(rt: RegistryType, c: &mut Config) {
+        match rt {
+            RegistryType::Docker => c.docker.enabled = false,
+            RegistryType::Maven => c.maven.enabled = false,
+            RegistryType::Npm => c.npm.enabled = false,
+            RegistryType::Cargo => c.cargo.enabled = false,
+            RegistryType::PyPI => c.pypi.enabled = false,
+            RegistryType::Go => c.go.enabled = false,
+            RegistryType::Gems => c.gems.enabled = false,
+            RegistryType::Terraform => c.terraform.enabled = false,
+            RegistryType::Ansible => c.ansible.enabled = false,
+            RegistryType::Nuget => c.nuget.enabled = false,
+            RegistryType::PubDart => c.pub_dart.enabled = false,
+            RegistryType::Conan => c.conan.enabled = false,
+            RegistryType::Rpm => c.rpm.enabled = false,
+            RegistryType::Deb => c.deb.enabled = false,
+            RegistryType::Cpan => c.cpan.enabled = false,
+            RegistryType::Raw => c.raw.enabled = false,
+            RegistryType::HuggingFace => c.hf.enabled = false,
+        }
+    }
+
+    /// A config from `toml`, then `fixup`.
+    fn config_from(toml: &str, fixup: fn(&mut Config)) -> Config {
+        let (mut config, unknown) = parse_config(toml).unwrap_or_else(|e| panic!("{e}\n{toml}"));
+        assert!(unknown.is_empty(), "{toml}: {unknown:?}");
+        fixup(&mut config);
+        config
+    }
+
+    #[test]
+    fn every_proxy_form_of_every_registry_is_an_enabled_proxy() {
         let _lock = env_lock();
-        // The #741 rule reads the registry the value is set on, not npm and not any
-        // proxy: with npm on and off, the error names the key exactly when that
-        // registry is an enabled proxy.
-        let (mut proxies, mut hosted) = (0, 0);
+        let forms = proxy_forms();
+        // Every registry with a section has at least one form here.
         for rt in registries_with_a_curation_section() {
-            if matches!(rt, RegistryType::Rpm | RegistryType::Deb) {
-                continue; // refused outright, see below
-            }
-            for npm_enabled in [true, false] {
-                let key = format!("curation.{rt}.min_release_age");
-                let mut config = curation_toml(&key, "3d", "off");
-                if rt != RegistryType::Npm {
-                    config.npm.enabled = npm_enabled;
-                }
-                let expected = config.is_enabled_proxy(rt);
-                let (_, errors) = config.validate_with_config_path(None);
-                let named = errors
-                    .iter()
-                    .any(|e| e.contains(&key) && e.contains("no age control would be active"));
-                assert_eq!(named, expected, "{rt}, npm on: {npm_enabled}: {errors:?}");
-                if rt != RegistryType::Npm {
-                    if expected {
-                        proxies += 1;
-                    } else {
-                        hosted += 1;
-                    }
-                }
-            }
-        }
-        // Both sides were reached by registries other than npm.
-        assert!(
-            proxies > 0 && hosted > 0,
-            "proxies {proxies}, hosted {hosted}"
-        );
-        // Only a quarantine of that registry satisfies it: its own or the global one,
-        // not one on another registry.
-        let mut checked = 0;
-        for rt in registries_with_a_curation_section() {
-            if matches!(rt, RegistryType::Rpm | RegistryType::Deb) {
-                continue;
-            }
-            let other = if rt == RegistryType::Docker {
-                RegistryType::Npm
-            } else {
-                RegistryType::Docker
-            };
-            let key = format!("curation.{rt}.min_release_age");
-            for (quarantine, satisfied) in [
-                (
-                    format!("[curation.{other}]\nquarantine = \"enforce\"\n"),
-                    false,
-                ),
-                (format!("[curation.{rt}]\nquarantine = \"observe\"\n"), true),
-                ("[curation]\nquarantine = \"enforce\"\n".to_string(), true),
-            ] {
-                let content = format!(
-                    "[curation.{rt}]\nmin_release_age = \"3d\"\n{}",
-                    quarantine.replace(&format!("[curation.{rt}]\n"), "")
-                );
-                let (config, unknown) =
-                    parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
-                assert!(unknown.is_empty(), "{content}: {unknown:?}");
-                if !config.is_enabled_proxy(rt) {
-                    continue;
-                }
-                checked += 1;
-                let (_, errors) = config.validate_with_config_path(None);
-                let refused = errors
-                    .iter()
-                    .any(|e| e.contains(&key) && e.contains("no age control would be active"));
-                assert_eq!(refused, !satisfied, "{content}: {errors:?}");
-            }
-        }
-        assert!(
-            checked >= 6,
-            "only {checked} cases reached an enabled proxy"
-        );
-        // And by name: pypi and cpan as proxies, with npm off.
-        for (rt, key) in [
-            (RegistryType::PyPI, "curation.pypi.min_release_age"),
-            (RegistryType::Cpan, "curation.cpan.min_release_age"),
-        ] {
-            let mut config = curation_toml(key, "3d", "off");
-            config.npm.enabled = false;
-            config.pypi.enabled = true;
-            config.pypi.proxy = Some("https://pypi.org/simple/".to_string());
-            config.cpan.enabled = true;
-            config.cpan.proxy = Some("https://www.cpan.org".to_string());
-            assert!(config.is_enabled_proxy(rt));
-            let (_, errors) = config.validate_with_config_path(None);
             assert!(
-                errors
-                    .iter()
-                    .any(|e| e.contains(key) && e.contains("no age control would be active")),
-                "{rt}: {errors:?}"
+                forms.iter().any(|(r, _, _)| *r == rt),
+                "{rt} has no proxy form"
             );
         }
+        for (rt, toml, fixup) in forms {
+            let mut config = config_from(toml, fixup);
+            assert!(config.is_enabled_proxy(rt), "{rt}: {toml}");
+            let facts = config.registry_min_age_facts(rt);
+            assert!(facts.enabled && facts.proxy, "{rt}: {facts:?}");
+            make_hosted(rt, &mut config);
+            assert!(!config.is_enabled_proxy(rt), "{rt} hosted");
+            assert!(config.registry_min_age_facts(rt).enabled, "{rt} hosted");
+            make_disabled(rt, &mut config);
+            let facts = config.registry_min_age_facts(rt);
+            assert!(!facts.enabled && !facts.proxy, "{rt} disabled: {facts:?}");
+        }
+    }
+
+    /// Startup, end to end, for every registry with a section in every proxy form: the
+    /// verdict the facts call for, under the message that names its key. The
+    /// expectation comes from the scenario and the release-date table above.
+    #[test]
+    fn every_per_registry_min_release_age_gets_its_verdict_at_startup() {
+        let _lock = env_lock();
+        #[derive(Clone, Copy, Debug)]
+        enum Setup {
+            ProxyNoQuarantine,
+            ProxyNoQuarantineTrustedDates,
+            ProxyOwnQuarantine,
+            ProxyGlobalQuarantine,
+            ProxyOwnOffGlobalOn,
+            ProxyOtherRegistryQuarantine,
+            Hosted,
+            Disabled,
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (rt, toml, fixup) in proxy_forms() {
+            let dated = !matches!(
+                rt,
+                RegistryType::Rpm | RegistryType::Deb | RegistryType::Cpan
+            );
+            let other = if rt == RegistryType::Docker {
+                "npm"
+            } else {
+                "docker"
+            };
+            for setup in [
+                Setup::ProxyNoQuarantine,
+                Setup::ProxyNoQuarantineTrustedDates,
+                Setup::ProxyOwnQuarantine,
+                Setup::ProxyGlobalQuarantine,
+                Setup::ProxyOwnOffGlobalOn,
+                Setup::ProxyOtherRegistryQuarantine,
+                Setup::Hosted,
+                Setup::Disabled,
+            ] {
+                for mode in ["off", "enforce"] {
+                    let mut curation = format!("[curation]\nmode = \"{mode}\"\n");
+                    let mut own = format!("[curation.{rt}]\nmin_release_age = \"3d\"\n");
+                    match setup {
+                        Setup::ProxyOwnQuarantine => own.push_str("quarantine = \"observe\"\n"),
+                        Setup::ProxyGlobalQuarantine => {
+                            curation.push_str("quarantine = \"enforce\"\n")
+                        }
+                        Setup::ProxyOwnOffGlobalOn => {
+                            curation.push_str("quarantine = \"enforce\"\n");
+                            own.push_str("quarantine = \"off\"\n");
+                        }
+                        Setup::ProxyOtherRegistryQuarantine => {
+                            own.push_str(&format!("[curation.{other}]\nquarantine = \"enforce\"\n"))
+                        }
+                        _ => {}
+                    }
+                    let content = format!("{toml}{curation}{own}");
+                    let mut config = config_from(&content, fixup);
+                    match setup {
+                        Setup::ProxyNoQuarantineTrustedDates => {
+                            config.server.trust_upstream_dates = true
+                        }
+                        Setup::Hosted => make_hosted(rt, &mut config),
+                        Setup::Disabled => make_disabled(rt, &mut config),
+                        _ => {}
+                    }
+                    let key = format!("curation.{rt}.min_release_age=\"3d\"");
+                    let (warnings, errors) = config.validate_with_config_path(None);
+                    let named = |list: &[String], what: &str| {
+                        list.iter().any(|e| e.contains(&key) && e.contains(what))
+                    };
+                    let cannot = named(&errors, "cannot apply");
+                    let needs = named(&errors, "no age control would be active");
+                    let unused = named(&warnings, "is not enabled");
+                    let no_control = errors
+                        .iter()
+                        .any(|e| e.contains("no active control is configured"));
+                    let (e_cannot, e_needs, e_unused, applies) = if !dated {
+                        (true, false, false, false)
+                    } else {
+                        match setup {
+                            Setup::Disabled => (false, false, true, false),
+                            Setup::ProxyNoQuarantine
+                            | Setup::ProxyNoQuarantineTrustedDates
+                            | Setup::ProxyOwnOffGlobalOn
+                            | Setup::ProxyOtherRegistryQuarantine => (false, true, false, false),
+                            Setup::ProxyOwnQuarantine
+                            | Setup::ProxyGlobalQuarantine
+                            | Setup::Hosted => (false, false, false, true),
+                        }
+                    };
+                    let case = format!("{rt} {setup:?} {mode}: {content}\nwarnings {warnings:?}\nerrors {errors:?}");
+                    assert_eq!(
+                        (cannot, needs, unused),
+                        (e_cannot, e_needs, e_unused),
+                        "{case}"
+                    );
+                    // In enforce, the value is the only control unless a quarantine is
+                    // configured: it counts exactly when it applies.
+                    let quarantine_configured = matches!(
+                        setup,
+                        Setup::ProxyOwnQuarantine
+                            | Setup::ProxyGlobalQuarantine
+                            | Setup::ProxyOwnOffGlobalOn
+                            | Setup::ProxyOtherRegistryQuarantine
+                    );
+                    if mode == "enforce" && !quarantine_configured {
+                        assert_eq!(no_control, !applies, "{case}");
+                    }
+                    seen.insert(rt.to_string());
+                }
+            }
+        }
+        assert_eq!(seen.len(), registries_with_a_curation_section().len());
     }
 
     #[test]
@@ -3884,6 +4141,40 @@ proxies = [
                     .any(|e| e.contains(&key) && e.contains("no age control would be active")),
                 "{registry}: {errors:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_min_release_age_for_cpan_is_refused_its_downloads_carry_no_release_date() {
+        let _lock = env_lock();
+        // registry/cpan.rs asks curation with no publish date, so a cpan threshold is
+        // never compared: refused like rpm and deb, for its own reason, with or
+        // without a quarantine, enabled or not (#1098).
+        for quarantine in ["", "quarantine = \"enforce\"\n"] {
+            for enabled in [true, false] {
+                let content = format!(
+                    "[cpan]\nenabled = {enabled}\nproxy = \"https://www.cpan.org\"\n[curation.cpan]\nmin_release_age = \"3d\"\n{quarantine}"
+                );
+                let (config, unknown) = parse_config(&content).unwrap();
+                assert!(unknown.is_empty(), "{content}: {unknown:?}");
+                let (warnings, errors) = config.validate_with_config_path(None);
+                let key = "curation.cpan.min_release_age=\"3d\" cannot apply";
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains(key) && e.contains("carry no release date")),
+                    "{content}: {errors:?}"
+                );
+                assert!(
+                    !errors
+                        .iter()
+                        .chain(&warnings)
+                        .any(|e| e.contains("curation.cpan.min_release_age")
+                            && (e.contains("no age control would be active")
+                                || e.contains("is not enabled"))),
+                    "{content}: {warnings:?} {errors:?}"
+                );
+            }
         }
     }
 
@@ -3999,6 +4290,36 @@ proxies = [
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_summary_names_every_value_and_a_global_one_alone_keeps_its_old_line() {
+        use crate::curation::MinReleaseAgeFilter;
+        let _lock = env_lock();
+        let build = |global: Option<&str>, values: &[(&str, &str)]| {
+            let mut content = String::from("[curation]\n");
+            if let Some(g) = global {
+                content.push_str(&format!("min_release_age = \"{g}\"\n"));
+            }
+            for (rt, v) in values {
+                content.push_str(&format!("[curation.{rt}]\nmin_release_age = \"{v}\"\n"));
+            }
+            let (config, unknown) = parse_config(&content).unwrap();
+            assert!(unknown.is_empty(), "{content}: {unknown:?}");
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+            assert!(problems.is_empty(), "{problems:?}");
+            filter.unwrap()
+        };
+        let three = [("npm", "3d"), ("pypi", "2d"), ("gems", "1w")];
+        let f = build(None, &three);
+        assert_eq!(f.summary(), "npm: 3d, pypi: 2d, gems: 1w");
+        assert_eq!(f.global_only(), None);
+        let f = build(Some("7d"), &three);
+        assert_eq!(f.summary(), "7d (npm: 3d, pypi: 2d, gems: 1w)");
+        assert_eq!(f.global_only(), None);
+        let f = build(Some("7d"), &[]);
+        assert_eq!(f.summary(), "7d");
+        assert_eq!(f.global_only(), Some((7 * 86400, "7d")));
     }
 
     #[test]

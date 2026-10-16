@@ -1899,6 +1899,16 @@ impl MinReleaseAgeFilter {
         (filter, problems)
     }
 
+    /// The global threshold `(seconds, value)` when no registry has its own: the
+    /// configuration `curation explain` and the start-up log describe as before
+    /// per-registry values applied on their own (#1098).
+    pub fn global_only(&self) -> Option<(i64, &str)> {
+        match &self.default {
+            Some((secs, label)) if self.overrides.is_empty() => Some((*secs, label.as_str())),
+            _ => None,
+        }
+    }
+
     /// The thresholds for a log line: `"7d (npm: 3d)"`, or `"npm: 3d"` without a
     /// global value.
     pub fn summary(&self) -> String {

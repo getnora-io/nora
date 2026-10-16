@@ -1768,3 +1768,90 @@ mod upstream_failure_matrix {
         .await;
     }
 }
+
+/// Every handler names its own registry to curation: per-registry thresholds, quarantine
+/// and rules are looked up by that label, so a handler passing another registry's would
+/// apply another registry's settings (#1098). In the code of `registry/<format>.rs`
+/// (before its test module) the only `RegistryType::` variant is its own.
+#[cfg(test)]
+mod curation_label_whitelist {
+    use crate::registry_type::RegistryType;
+    use std::collections::BTreeSet;
+
+    const HANDLERS: &[(&str, RegistryType, &str)] = &[
+        (
+            "ansible.rs",
+            RegistryType::Ansible,
+            include_str!("ansible.rs"),
+        ),
+        (
+            "cargo_registry.rs",
+            RegistryType::Cargo,
+            include_str!("cargo_registry.rs"),
+        ),
+        ("conan.rs", RegistryType::Conan, include_str!("conan.rs")),
+        ("cpan.rs", RegistryType::Cpan, include_str!("cpan.rs")),
+        ("deb.rs", RegistryType::Deb, include_str!("deb.rs")),
+        ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
+        ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
+        ("go.rs", RegistryType::Go, include_str!("go.rs")),
+        ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
+        ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),
+        ("npm.rs", RegistryType::Npm, include_str!("npm.rs")),
+        ("nuget.rs", RegistryType::Nuget, include_str!("nuget.rs")),
+        (
+            "pub_dart.rs",
+            RegistryType::PubDart,
+            include_str!("pub_dart.rs"),
+        ),
+        ("pypi.rs", RegistryType::PyPI, include_str!("pypi.rs")),
+        ("raw.rs", RegistryType::Raw, include_str!("raw.rs")),
+        ("rpm.rs", RegistryType::Rpm, include_str!("rpm.rs")),
+        (
+            "terraform.rs",
+            RegistryType::Terraform,
+            include_str!("terraform.rs"),
+        ),
+    ];
+
+    /// The file up to its module-level `#[cfg(test)]`.
+    fn code(src: &str) -> &str {
+        src.split("\n#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    /// The variants named as `RegistryType::<Variant>` in `code`.
+    fn variants(code: &str) -> BTreeSet<String> {
+        code.split("RegistryType::")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_handler_names_only_its_own_registry() {
+        let owns: BTreeSet<String> = HANDLERS
+            .iter()
+            .map(|(_, rt, _)| format!("{rt:?}"))
+            .collect();
+        assert_eq!(
+            owns.len(),
+            RegistryType::all().len(),
+            "every registry has its handler here"
+        );
+        for (file, own, src) in HANDLERS {
+            let code = code(src);
+            for alias in ["RegistryType as", "RegistryType::{", "RegistryType::*"] {
+                assert!(!code.contains(alias), "{file}: `{alias}` hides the label");
+            }
+            assert_eq!(
+                variants(code),
+                BTreeSet::from([format!("{own:?}")]),
+                "{file} names another registry to curation"
+            );
+        }
+    }
+}

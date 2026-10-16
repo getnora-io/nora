@@ -1519,7 +1519,10 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     }
     match min_age {
         Some(filter) => {
-            println!("Min-release-age: {}", filter.summary());
+            match filter.global_only() {
+                Some((secs, value)) => println!("Min-release-age: {} ({}s)", value, secs),
+                None => println!("Min-release-age: {}", filter.summary()),
+            }
             engine.add_filter(Box::new(filter));
         }
         None if problems.is_empty() => println!("Min-release-age: not configured"),
@@ -2758,7 +2761,12 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
         error!(problem = %problem, "Invalid min_release_age");
     }
     if let Some(filter) = min_age {
-        info!(min_age = %filter.summary(), "Min-release-age filter loaded");
+        match filter.global_only() {
+            Some((secs, value)) => {
+                info!(min_age = %value, seconds = secs, "Min-release-age filter loaded")
+            }
+            None => info!(min_age = %filter.summary(), "Min-release-age filter loaded"),
+        }
         engine.add_filter(Box::new(filter));
     }
 
