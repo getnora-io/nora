@@ -15,6 +15,9 @@ pub struct HfConfig {
     pub enabled: bool,
     #[serde(default = "default_hf_proxy")]
     pub proxy: Option<String>,
+    /// Seconds for one metadata request to the upstream.
+    #[serde(default = "super::super::default_timeout")]
+    pub proxy_timeout: u64,
 }
 
 fn default_hf_proxy() -> Option<String> {
@@ -26,6 +29,7 @@ impl Default for HfConfig {
         Self {
             enabled: false,
             proxy: default_hf_proxy(),
+            proxy_timeout: 30,
         }
     }
 }
@@ -37,6 +41,9 @@ impl HfConfig {
         }
         if let Ok(val) = env::var("NORA_HF_PROXY") {
             self.proxy = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env::var("NORA_HF_PROXY_TIMEOUT") {
+            super::super::parse_env_warn("NORA_HF_PROXY_TIMEOUT", &val, &mut self.proxy_timeout);
         }
     }
 }

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The Hugging Face format is mounted by `nora serve` itself, not only by the test router:
-//! `NORA_HF_ENABLED=true` puts `/hf/` behind the skeleton's 501, and without it the routes
-//! do not exist.
+//! with `NORA_HF_ENABLED=true` the file route answers its 501 until the download path
+//! lands, and without it the routes do not exist.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

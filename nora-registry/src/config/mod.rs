@@ -710,7 +710,9 @@ impl Config {
             ("pub", self.pub_dart.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
             ("cpan", self.cpan.proxy.as_deref()),
-            ("hf", self.hf.proxy.as_deref()),
+            // Not hf: its metadata carries the Hub's host as content (a model card's
+            // `license_link`), so a body scan reports leaks that are not; the URLs NORA
+            // hands an hf client travel in headers, which the handler lists by name.
         ];
         for (name, url) in simple {
             if let Some(url) = url {
@@ -4034,9 +4036,16 @@ proxies = [
             config.hf.proxy.as_deref(),
             Some("https://hf-mirror.example")
         );
-        assert!(config
-            .upstream_hostnames()
-            .contains(&("hf".to_string(), "hf-mirror.example".to_string())));
+        // An `[hf]` section that does not name a timeout keeps the default: zero would
+        // time out every request.
+        assert_eq!(config.hf.proxy_timeout, 30);
+        assert!(
+            !config
+                .upstream_hostnames()
+                .iter()
+                .any(|(reg, _)| reg == "hf"),
+            "hf bodies are not scanned for the upstream host"
+        );
     }
 
     /// The keys of `[hf]`, held by the compiler: destructured without `..`, so adding a
@@ -4047,6 +4056,7 @@ proxies = [
         let HfConfig {
             enabled: _,
             proxy: _,
+            proxy_timeout: _,
         } = HfConfig::default();
     }
 
@@ -4062,12 +4072,15 @@ proxies = [
         let mut config = Config::default();
         std::env::set_var("NORA_HF_ENABLED", "true");
         std::env::set_var("NORA_HF_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("NORA_HF_PROXY_TIMEOUT", "7");
         let applied = config.apply_env_overrides();
         std::env::remove_var("NORA_HF_ENABLED");
         std::env::remove_var("NORA_HF_PROXY");
+        std::env::remove_var("NORA_HF_PROXY_TIMEOUT");
         applied.unwrap();
         assert!(config.hf.enabled);
         assert_eq!(config.hf.proxy.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(config.hf.proxy_timeout, 7);
     }
 
     /// The first release proxies public repositories only: a server-side Hub token would let
@@ -4247,7 +4260,12 @@ proxies = [
             hostnames.contains(&"proxy.golang.org"),
             "go default missing"
         );
-        assert!(hostnames.contains(&"huggingface.co"), "hf default missing");
+        // Hugging Face metadata carries the Hub's host as content (a model card's
+        // `license_link`), and its proxy URLs travel in headers, not bodies.
+        assert!(
+            !hostnames.contains(&"huggingface.co"),
+            "hf bodies are not scanned for the upstream host"
+        );
         // localhost should be excluded
         assert!(!hostnames.contains(&"localhost"));
         assert!(!hostnames.contains(&"127.0.0.1"));
