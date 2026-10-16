@@ -723,6 +723,39 @@ enum FileFetch {
 
 /// Scheme, host and port: a redirect within one origin is the Hub's own, one to another
 /// origin leaves it (the CDN).
+/// Whether a file request's walk may follow a redirect from the upstream `start` to `next`:
+/// the same origin, or a host of `cdn_hosts` — the entry itself or a name under it, an IP
+/// address only as written — over https, or over http when the upstream itself is http (a
+/// test or a LAN mirror), never as a downgrade. The Hub sends LFS files to its CDN; anything
+/// else a redirect names (another site, a metadata or loopback address) is not asked.
+fn hop_allowed(start: &reqwest::Url, next: &reqwest::Url, cdn_hosts: &[String]) -> bool {
+    if origin(next) == origin(start) {
+        return true;
+    }
+    let scheme_ok =
+        next.scheme() == "https" || (start.scheme() == "http" && next.scheme() == "http");
+    let Some(host) = next.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let listed = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        cdn_hosts
+            .iter()
+            .any(|h| h.parse::<std::net::IpAddr>().ok() == Some(ip))
+    } else {
+        cdn_hosts.iter().any(|h| {
+            host == *h
+                || host
+                    .strip_suffix(h.as_str())
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
+    };
+    scheme_ok && listed
+}
+
 fn origin(url: &reqwest::Url) -> (String, Option<String>, Option<u16>) {
     (
         url.scheme().to_string(),
@@ -762,6 +795,7 @@ where
         state.circuit_breaker.record_alive(&key, probe);
         return FileFetch::Failed("bad upstream url");
     };
+    let start = url.clone();
     let mut hops: Vec<HeaderMap> = Vec::new();
     let mut commit_checked = false;
     let mut looked_up = false;
@@ -850,6 +884,9 @@ where
                     body: None,
                 });
             }
+            if !hop_allowed(&start, &next, &state.config.hf.cdn_hosts) {
+                break Err("redirect to a host outside the upstream and its CDN");
+            }
             url = next;
             continue;
         }
@@ -885,7 +922,8 @@ where
     match outcome {
         Ok(FileFetch::UpstreamRefused { .. })
         | Err("too many redirects")
-        | Err("redirect without a usable location") => {
+        | Err("redirect without a usable location")
+        | Err("redirect to a host outside the upstream and its CDN") => {
             state.circuit_breaker.record_alive(&key, probe)
         }
         Ok(_) => state.circuit_breaker.record_success(&key, probe),
@@ -1555,7 +1593,7 @@ fn parse_file_request(rest: &str) -> Option<FileRequest<'_>> {
     let segments: Vec<&str> = rest.split('/').collect();
     for segment in &segments {
         let decoded = decode_segment(segment)?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
+        if !plain_segment(&decoded) {
             return None;
         }
     }
@@ -1593,7 +1631,7 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
     }
     for (i, segment) in rest.split('/').enumerate() {
         let decoded = decode_segment(segment).ok_or(Refusal::BadPath)?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
+        if !plain_segment(&decoded) {
             return Err(Refusal::BadPath);
         }
         if i > 0
@@ -1638,6 +1676,17 @@ fn escapes_are_whole(s: &str) -> bool {
 
 /// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
 /// percent-escape, or bytes that are not UTF-8.
+/// A decoded segment the upstream may be handed: not empty, and no `.` or `..` component
+/// once its encoded separators are read as separators. A revision travels as one segment
+/// (`refs%2Fpr%2F1`), but `main%2F..%2F..%2Fother-org%2Fother` decodes to a walk out of the
+/// repository, which a git ref name cannot be either; `\` counts as a separator too.
+fn plain_segment(decoded: &str) -> bool {
+    !decoded.is_empty()
+        && decoded
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 fn decode_segment(segment: &str) -> Option<String> {
     let bytes = segment.as_bytes();
     let mut i = 0;
@@ -1798,6 +1847,8 @@ mod tests {
         create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
         })
     }
 
@@ -2905,6 +2956,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.hf.proxy_timeout = 1;
         });
         let timed = |class: &str| {
@@ -3157,6 +3210,82 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "audit refused a download");
     }
 
+    /// A file redirect leaves the upstream only for its CDN: with the default `cdn_hosts`
+    /// the mock CDN (another port of 127.0.0.1) is not one, so the download is a 502 and the
+    /// mock never sees a request (a redirect to any http host used to be followed).
+    #[tokio::test]
+    async fn a_redirect_off_the_upstream_and_its_cdn_is_not_followed() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+        });
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            upstream_paths(&cdn).await.is_empty(),
+            "the unlisted host was asked"
+        );
+        // The same-origin walk of a regular file (the relative 307) is unchanged.
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+    }
+
+    #[test]
+    fn a_hop_is_allowed_to_the_upstream_origin_and_its_cdn_hosts_only() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let hub = url("https://huggingface.co/org/m/resolve/main/f");
+        let cdn = vec!["hf.co".to_string(), "huggingface.co".to_string()];
+        for (next, allowed) in [
+            ("https://huggingface.co/api/resolve-cache/x", true),
+            ("https://us.aws.cdn.hf.co/xet-bridge-us/x", true),
+            ("https://cas-bridge.xethub.hf.co/x", true),
+            ("https://hf.co/x", true),
+            ("https://US.AWS.CDN.HF.CO/x", true),
+            ("http://us.aws.cdn.hf.co/x", false),
+            ("https://evilhf.co/x", false),
+            ("https://hf.co.evil.example/x", false),
+            ("https://evil.example/x", false),
+            ("http://169.254.169.254/latest/meta-data/", false),
+            ("https://169.254.169.254/", false),
+            ("http://127.0.0.1:8080/secret", false),
+            ("https://[::1]/x", false),
+            ("http://huggingface.co/x", false),
+        ] {
+            assert_eq!(hop_allowed(&hub, &url(next), &cdn), allowed, "{next}");
+        }
+        // An http upstream (a test or a LAN mirror) may go to a listed http host; an IP
+        // address counts only as written.
+        let lan = url("http://127.0.0.1:7000/org/m/resolve/main/f");
+        let listed = vec!["127.0.0.1".to_string()];
+        assert!(hop_allowed(
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &listed
+        ));
+        assert!(!hop_allowed(
+            &lan,
+            &url("http://127.0.0.2:7001/cdn/f"),
+            &listed
+        ));
+        assert!(!hop_allowed(
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &cdn
+        ));
+        assert!(hop_allowed(&lan, &url("http://127.0.0.1:7000/other"), &[]));
+        // An address is no name: a listed `0.0.1` holds no `127.0.0.1` under it.
+        let suffix = vec!["0.0.1".to_string()];
+        assert!(!hop_allowed(
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &suffix
+        ));
+    }
+
     #[tokio::test]
     async fn the_clients_credentials_stay_with_nora_on_every_hop() {
         let cdn = cdn_with_weights().await;
@@ -3202,6 +3331,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.curation.mode = curation;
             if mode == "allow" {
                 cfg.curation.allowlist_path = Some(file);
@@ -3385,6 +3516,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.curation.internal_namespaces = vec!["openai-community/gpt2".to_string()];
         });
         assert!(!ctx.state.curation().curation_engine.is_active());
@@ -4660,9 +4793,41 @@ mod tests {
             "org/model/resolve/main/f%zz",
             "",
             "org/model/resolve/main/f g",
+            // A revision or file that decodes to a walk out of the repository.
+            "org/model/resolve/main%2F..%2F..%2F..%2Fother-org%2Fother/config.json",
+            "org/model/resolve/main%5C..%5C..%5Cother/config.json",
+            "org/model/resolve/refs%2F..%2Fx/f",
+            "org/model/resolve/main/a%2F..%2Fb",
+            "org/model/resolve/refs%2Fpr%2F/f",
+            "org/model/resolve/.%2Fmain/f",
         ] {
             assert_eq!(ok(bad), None, "{bad:?}");
         }
+        // Dots inside a name are no component of their own.
+        assert_eq!(
+            ok("org/model/resolve/v1.0..2/a..b.bin"),
+            Some(("org/model", "v1.0..2", "a..b.bin"))
+        );
+    }
+
+    #[test]
+    fn a_metadata_path_that_decodes_to_a_walk_is_not_forwarded() {
+        for bad in [
+            "org/model/tree/main/..%2F..%2F..%2Fother",
+            "org/model/tree/main%2F..%2Fx",
+            "org/model/revision/refs%2F..%2F..%2Fother",
+            "org/model/tree/main/%5C..%5Cother",
+        ] {
+            assert_eq!(
+                models_api_upstream("https://up", bad, None),
+                Err(Refusal::BadPath),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            models_api_upstream("https://up", "org/model/revision/refs%2Fpr%2F1", None),
+            Ok("https://up/api/models/org/model/revision/refs%2Fpr%2F1".to_string())
+        );
     }
 
     // ── the pure rules ─────────────────────────────────────────────────────────

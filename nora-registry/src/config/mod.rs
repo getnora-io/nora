@@ -1080,6 +1080,13 @@ impl Config {
             );
         }
 
+        // A redirect of a Hugging Face file request leaves the upstream only for these hosts.
+        for host in self.hf.invalid_cdn_hosts() {
+            errors.push(format!(
+                "hf.cdn_hosts entry {host:?} is not a host name or IP address (no scheme, port, path or wildcard): it names the hosts a file request's redirect may go to"
+            ));
+        }
+
         // 9. Docker upstream prefix validation
         {
             const RESERVED_PREFIXES: &[&str] =
@@ -4068,7 +4075,45 @@ proxies = [
             enabled: _,
             proxy: _,
             proxy_timeout: _,
+            // Host names a file redirect may go to, not a credential.
+            cdn_hosts: _,
         } = HfConfig::default();
+    }
+
+    #[test]
+    fn hf_cdn_hosts_come_from_the_env_and_a_malformed_one_is_refused() {
+        let _lock = env_lock();
+        assert_eq!(
+            HfConfig::default().cdn_hosts,
+            vec!["hf.co", "huggingface.co"]
+        );
+        std::env::set_var("NORA_HF_CDN_HOSTS", " CDN.Example.com, 10.0.0.5 ,");
+        let mut config = Config::default();
+        config.hf.apply_env_overrides();
+        std::env::remove_var("NORA_HF_CDN_HOSTS");
+        assert_eq!(config.hf.cdn_hosts, vec!["cdn.example.com", "10.0.0.5"]);
+        assert!(config.hf.invalid_cdn_hosts().is_empty());
+        for bad in [
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            "*.hf.co",
+            ".hf.co",
+            "",
+        ] {
+            let mut config = Config::default();
+            config.hf.cdn_hosts = vec![bad.to_string()];
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.iter().any(|e| e.contains("hf.cdn_hosts entry")),
+                "{bad:?}: {errors:?}"
+            );
+        }
+        let (_, errors) = Config::default().validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("hf.cdn_hosts")),
+            "{errors:?}"
+        );
     }
 
     /// A Hub commit has no publish date NORA reads and hf has no quarantine path, so a

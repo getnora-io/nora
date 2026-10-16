@@ -422,6 +422,13 @@ commit, every request through NORA.
 
 - NORA follows the Hub's redirects itself — the relative 307 to its resolve cache, the 302 to its
   CDN for an LFS file — so no `Location` reaches the client and every byte comes through NORA.
+  A redirect is followed only to the upstream's origin or, over https, to a CDN host: `[hf]
+  cdn_hosts` / `NORA_HF_CDN_HOSTS` (comma-separated), each entry and the names under it, default
+  `hf.co` and `huggingface.co` (the Hub's CDN, `us.aws.cdn.hf.co`, is one); an IP address counts
+  only as written, and a downgrade to http never. A redirect anywhere else is a 502 before that
+  host is asked.
+- A revision or path that decodes to a walk out of the repository — `main%2F..%2Fother`, `%5C..`
+  — is refused before the upstream is asked; `refs%2Fpr%2F1` still goes as one segment.
 - The Hub's resolve answer is asked on every download: it names the commit, which curation reads,
   and the file's digest. `main` therefore never goes stale, and the bytes come from the cache when
   NORA already holds that digest.
