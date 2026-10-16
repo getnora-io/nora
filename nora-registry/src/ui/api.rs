@@ -266,6 +266,7 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
                 RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
+                RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
             }
         } else {
             vec![]

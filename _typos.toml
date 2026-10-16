@@ -16,6 +16,8 @@ unparseable = "unparseable"
 mdoe = "mdoe"
 enabeld = "enabeld"
 unknwon = "unknwon"
+# intentional typo: an unknown registry name next to a real one in the enable-list tests (config/mod.rs)
+dokcer = "dokcer"
 
 [files]
 # nora-registry/testdata/**/*.tsv: corpora written by the formats' own tools (each file names the

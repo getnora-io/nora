@@ -298,6 +298,8 @@ pub struct Config {
     #[serde(default)]
     pub cpan: CpanConfig,
     #[serde(default)]
+    pub hf: HfConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -407,6 +409,7 @@ impl Config {
                 RegistryType::Rpm => self.rpm.enabled = on,
                 RegistryType::Deb => self.deb.enabled = on,
                 RegistryType::Cpan => self.cpan.enabled = on,
+                RegistryType::HuggingFace => self.hf.enabled = on,
             }
         }
     }
@@ -462,6 +465,9 @@ impl Config {
         if self.cpan.enabled {
             set.insert(RegistryType::Cpan);
         }
+        if self.hf.enabled {
+            set.insert(RegistryType::HuggingFace);
+        }
         if set.is_empty() {
             tracing::warn!("No registries enabled! All registries are disabled.");
         }
@@ -495,6 +501,7 @@ impl Config {
             RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
             RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
+            RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
         }
     }
 
@@ -531,6 +538,10 @@ impl Config {
             // its handlers (quarantine gates proxy downloads).
             RegistryType::Raw => return QuarantineMode::Off,
             RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
+            // Hugging Face serves no artifact bytes yet (every route answers 501), so
+            // nothing in it enforces quarantine; counting it would be the same phantom
+            // control as Raw. Its curation override arrives with the download path.
+            RegistryType::HuggingFace => return QuarantineMode::Off,
         };
         per.or(global).cloned().unwrap_or(QuarantineMode::Off)
     }
@@ -699,6 +710,7 @@ impl Config {
             ("pub", self.pub_dart.proxy.as_deref()),
             ("conan", self.conan.proxy.as_deref()),
             ("cpan", self.cpan.proxy.as_deref()),
+            ("hf", self.hf.proxy.as_deref()),
         ];
         for (name, url) in simple {
             if let Some(url) = url {
@@ -1273,6 +1285,7 @@ impl Config {
         self.rpm.apply_env_overrides();
         self.deb.apply_env_overrides();
         self.cpan.apply_env_overrides();
+        self.hf.apply_env_overrides();
 
         // Rate limit, GC, retention
         self.rate_limit.apply_env_overrides();
@@ -1491,6 +1504,7 @@ proxies = [
         assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
         assert_eq!(config.auth.token_storage, "data/tokens");
         assert!(!config.cpan.enabled, "CPAN defaults to disabled");
+        assert!(!config.hf.enabled, "Hugging Face defaults to disabled");
     }
 
     #[test]
@@ -2031,6 +2045,7 @@ proxies = [
         assert_serde_default_eq_default::<RpmConfig>("rpm");
         assert_serde_default_eq_default::<DebConfig>("deb");
         assert_serde_default_eq_default::<CpanConfig>("cpan");
+        assert_serde_default_eq_default::<HfConfig>("hf");
         assert_serde_default_eq_default::<SigningConfig>("signing");
 
         // Whole-Config fallback agrees with deserializing an empty file.
@@ -3545,13 +3560,14 @@ proxies = [
     }
 
     /// Every curation duration key: global, then each `[curation.<registry>]` section.
+    /// Raw and Hugging Face have none.
     fn curation_duration_keys() -> Vec<String> {
         let mut keys = vec![
             "curation.min_release_age".to_string(),
             "curation.quarantine_ttl".to_string(),
         ];
         for rt in RegistryType::all() {
-            if *rt != RegistryType::Raw {
+            if !matches!(rt, RegistryType::Raw | RegistryType::HuggingFace) {
                 keys.push(format!("curation.{rt}.min_release_age"));
                 keys.push(format!("curation.{rt}.quarantine_ttl"));
             }
@@ -3570,6 +3586,17 @@ proxies = [
         let (config, unknown) = parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
         assert!(unknown.is_empty(), "{content}: {unknown:?}");
         config
+    }
+
+    /// `[curation.hf]` is no section of the config: reported as an unknown key, as
+    /// `[curation.raw]` is, not read as a minimum age that holds nothing.
+    #[test]
+    fn curation_hf_is_an_unknown_section() {
+        for table in ["curation.hf", "curation.raw"] {
+            let content = format!("[{table}]\nmin_release_age = \"7d\"\n");
+            let (_, unknown) = parse_config(&content).unwrap();
+            assert_eq!(unknown, vec![table.to_string()], "{content}");
+        }
     }
 
     #[test]
@@ -3661,14 +3688,97 @@ proxies = [
     // EnableSpec + [registries] tests
     // ========================================================================
 
+    /// How many registries `all` switches on: every one except the opt-in ones.
+    fn in_all_count() -> usize {
+        RegistryType::all().iter().filter(|rt| rt.in_all()).count()
+    }
+
     #[test]
     fn test_enable_spec_single_all() {
         let spec = EnableSpec::Single("all".to_string());
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len());
         for rt in RegistryType::all() {
-            assert!(set.contains(rt), "missing {:?}", rt);
+            assert_eq!(set.contains(rt), rt.in_all(), "{:?}", rt);
         }
+    }
+
+    /// `EnableSpec::resolve` is the one place `all`, inclusions, exclusions and aliases
+    /// meet: every combination an operator writes, with the set or the refusal it gives.
+    #[test]
+    fn test_enable_spec_resolve_table() {
+        let in_all: HashSet<RegistryType> = RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|rt| rt.in_all())
+            .collect();
+        let plus = |extra: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all.iter().chain(extra).copied().collect()
+        };
+        let minus = |gone: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all
+                .iter()
+                .filter(|rt| !gone.contains(rt))
+                .copied()
+                .collect()
+        };
+        let set = |rts: &[RegistryType]| -> HashSet<RegistryType> { rts.iter().copied().collect() };
+        use RegistryType::{Docker, HuggingFace as Hf, Maven, Npm};
+        let ok: &[(&[&str], HashSet<RegistryType>)] = &[
+            (&["all"], in_all.clone()),
+            (&["all", "hf"], plus(&[Hf])),
+            (&["all", "huggingface"], plus(&[Hf])),
+            (&["all", "HF"], plus(&[Hf])),
+            (&["all", "-maven"], minus(&[Maven])),
+            (&["all", "-hf"], in_all.clone()),
+            (&["all", "hf", "-hf"], in_all.clone()),
+            (
+                &["all", "hf", "-maven"],
+                plus(&[Hf]).difference(&set(&[Maven])).copied().collect(),
+            ),
+            (&["hf"], set(&[Hf])),
+            (&["hf", "npm"], set(&[Hf, Npm])),
+            (&["docker"], set(&[Docker])),
+        ];
+        for (items, want) in ok {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            assert_eq!(spec.resolve().as_ref(), Ok(want), "{items:?}");
+        }
+        let refused: &[(&[&str], &str)] = &[
+            (&["all", "docker"], "cannot be combined"),
+            (&["all", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "npm"], "cannot be combined"),
+            (&["all", "-dokcer"], "unknown registry"),
+            (&["-hf"], "require \"all\""),
+            (&["dokcer"], "unknown registry"),
+            (&[], "must not be empty"),
+        ];
+        for (items, why) in refused {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            let err = spec
+                .resolve()
+                .expect_err(&format!("{items:?} must be refused"));
+            assert!(err.contains(why), "{items:?}: {err}");
+        }
+    }
+
+    /// An opt-in format is never switched on by `all`: an operator who wrote `all` before
+    /// it existed did not opt in. It is named beside `all` to have both.
+    #[test]
+    fn test_all_leaves_out_opt_in_formats_until_named() {
+        assert!(!RegistryType::HuggingFace.in_all());
+        let all = EnableSpec::Single("all".to_string()).resolve().unwrap();
+        assert!(!all.contains(&RegistryType::HuggingFace));
+        let with_hf = EnableSpec::List(vec!["all".to_string(), "hf".to_string()])
+            .resolve()
+            .unwrap();
+        assert!(with_hf.contains(&RegistryType::HuggingFace));
+        assert_eq!(with_hf.len(), all.len() + 1);
+        // A format `all` already covers still cannot be named beside it.
+        let err = EnableSpec::List(vec!["all".to_string(), "docker".to_string()])
+            .resolve()
+            .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {}", err);
     }
 
     #[test]
@@ -3697,7 +3807,7 @@ proxies = [
     fn test_enable_spec_all_minus() {
         let spec = EnableSpec::List(vec!["all".to_string(), "-maven".to_string()]);
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len() - 1);
+        assert_eq!(set.len(), in_all_count() - 1);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(set.contains(&RegistryType::Docker));
     }
@@ -3710,7 +3820,7 @@ proxies = [
             "-conan".to_string(),
         ]);
         let set = spec.resolve().unwrap();
-        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert_eq!(set.len(), in_all_count() - 2);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
     }
@@ -3864,7 +3974,110 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len());
+        let in_all = RegistryType::all().iter().filter(|rt| rt.in_all()).count();
+        assert_eq!(set.len(), in_all);
+    }
+
+    /// `enabled_registries_legacy` is a chain of `if` blocks, not a `match`: a format left
+    /// out of it is never enabled by its own `[x] enabled = true`, and nothing fails to
+    /// compile. Every flag switched on through the exhaustive `apply_enabled_registries`
+    /// has to come back as the full set.
+    #[test]
+    fn test_legacy_flags_cover_every_registry() {
+        let mut config = Config::default();
+        let all: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
+        config.apply_enabled_registries(&all);
+        assert_eq!(config.enabled_registries_legacy(), all);
+    }
+
+    /// Each `[x] enabled` flag switches on its own format and no other: a chain slot that
+    /// read a neighbour's flag would pass a test that switches every flag on at once.
+    #[test]
+    fn test_each_legacy_flag_enables_only_its_own_format() {
+        for rt in RegistryType::all() {
+            let mut config = Config::default();
+            let one: HashSet<RegistryType> = [*rt].into_iter().collect();
+            config.apply_enabled_registries(&one);
+            assert_eq!(config.enabled_registries_legacy(), one, "{:?}", rt);
+        }
+    }
+
+    #[test]
+    fn test_hf_enabled_only_by_true_or_one() {
+        let _lock = env_lock();
+        for (val, on) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+        ] {
+            let mut config = Config::default();
+            config.hf.enabled = !on;
+            std::env::set_var("NORA_HF_ENABLED", val);
+            let applied = config.apply_env_overrides();
+            std::env::remove_var("NORA_HF_ENABLED");
+            applied.unwrap();
+            assert_eq!(config.hf.enabled, on, "NORA_HF_ENABLED={val:?}");
+        }
+    }
+
+    #[test]
+    fn test_hf_proxy_from_toml_is_the_upstream() {
+        let config: Config =
+            toml::from_str("[hf]\nenabled = true\nproxy = \"https://hf-mirror.example\"\n")
+                .unwrap();
+        assert_eq!(
+            config.hf.proxy.as_deref(),
+            Some("https://hf-mirror.example")
+        );
+        assert!(config
+            .upstream_hostnames()
+            .contains(&("hf".to_string(), "hf-mirror.example".to_string())));
+    }
+
+    /// The keys of `[hf]`, held by the compiler: destructured without `..`, so adding a
+    /// field — a credential among them — does not build until this line names it. The first
+    /// release proxies public repositories only.
+    #[test]
+    fn test_hf_config_keys_are_exactly_these() {
+        let HfConfig {
+            enabled: _,
+            proxy: _,
+        } = HfConfig::default();
+    }
+
+    #[test]
+    fn test_hf_enabled_from_toml_and_env() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str("[hf]\nenabled = true\n").unwrap();
+        assert!(config
+            .enabled_registries()
+            .contains(&RegistryType::HuggingFace));
+        assert_eq!(config.hf.proxy.as_deref(), Some("https://huggingface.co"));
+
+        let mut config = Config::default();
+        std::env::set_var("NORA_HF_ENABLED", "true");
+        std::env::set_var("NORA_HF_PROXY", "http://127.0.0.1:9");
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_HF_ENABLED");
+        std::env::remove_var("NORA_HF_PROXY");
+        applied.unwrap();
+        assert!(config.hf.enabled);
+        assert_eq!(config.hf.proxy.as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    /// The first release proxies public repositories only: a server-side Hub token would let
+    /// the cache hand gated repositories to every NORA user. Until that is decided otherwise,
+    /// `[hf]` has no credential key, and a file that sets one is told so.
+    #[test]
+    fn test_hf_has_no_server_side_token() {
+        let (_, unknown) =
+            parse_config("[hf]\nenabled = true\nproxy_auth = \"user:token\"\n").unwrap();
+        assert_eq!(unknown, vec!["hf.proxy_auth".to_string()]);
     }
 
     #[test]
@@ -4009,7 +4222,7 @@ proxies = [
 
         let config: Config = toml::from_str(toml).unwrap();
         let set = config.enabled_registries();
-        assert_eq!(set.len(), RegistryType::all().len() - 2);
+        assert_eq!(set.len(), in_all_count() - 2);
         assert!(!set.contains(&RegistryType::Maven));
         assert!(!set.contains(&RegistryType::Conan));
         assert!(set.contains(&RegistryType::Docker));
@@ -4034,6 +4247,7 @@ proxies = [
             hostnames.contains(&"proxy.golang.org"),
             "go default missing"
         );
+        assert!(hostnames.contains(&"huggingface.co"), "hf default missing");
         // localhost should be excluded
         assert!(!hostnames.contains(&"localhost"));
         assert!(!hostnames.contains(&"127.0.0.1"));

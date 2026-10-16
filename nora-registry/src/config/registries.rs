@@ -64,9 +64,9 @@ impl EnableSpec {
     /// Resolve the spec into a concrete set of RegistryTypes.
     ///
     /// Rules:
-    /// - `"all"` → all 13 registries
+    /// - `"all"` → every registry except the opt-in ones ([`RegistryType::in_all`])
     /// - `"-name"` → exclusion (only valid when `"all"` is present)
-    /// - `"name"` → inclusion
+    /// - `"name"` → inclusion; beside `"all"` only for an opt-in registry
     /// - Unknown name → Err
     /// - Empty result → Err
     pub fn resolve(&self) -> Result<HashSet<RegistryType>, String> {
@@ -99,17 +99,32 @@ impl EnableSpec {
             ));
         }
 
-        // "all" with inclusions is ambiguous
-        if has_all && !inclusions.is_empty() {
+        // "all" with inclusions is ambiguous, except for an opt-in registry, which "all"
+        // leaves out and which is named to be added.
+        let covered: Vec<&str> = inclusions
+            .iter()
+            .copied()
+            .filter(|name| RegistryType::from_str_opt(name).is_none_or(|rt| rt.in_all()))
+            .collect();
+        if has_all && !covered.is_empty() {
             return Err(format!(
                 "\"all\" cannot be combined with inclusions ({}); use \"all\" with exclusions like \"-maven\"",
-                inclusions.join(", ")
+                covered.join(", ")
             ));
         }
 
         if has_all {
-            // Start with all, then remove exclusions
-            let mut set: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
+            // Start with all, add the named opt-in registries, then remove exclusions
+            let mut set: HashSet<RegistryType> = RegistryType::all()
+                .iter()
+                .copied()
+                .filter(|rt| rt.in_all())
+                .collect();
+            for name in &inclusions {
+                if let Some(rt) = RegistryType::from_str_opt(name) {
+                    set.insert(rt);
+                }
+            }
             for ex in &exclusions {
                 let name = &ex[1..]; // strip leading '-'
                 match RegistryType::from_str_opt(name) {

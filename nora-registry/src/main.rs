@@ -2159,6 +2159,13 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
+            RegistryType::HuggingFace => {
+                tracing::warn!(
+                    "Hugging Face proxy is enabled but not implemented in this build: \
+                     every /hf/ route answers 501"
+                );
+                registry_routes = registry_routes.merge(registry::hf_routes())
+            }
         }
     }
 

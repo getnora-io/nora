@@ -66,6 +66,7 @@ registry_types! {
     Rpm       => "rpm",       "/rpm/",       "RPM";
     Deb       => "deb",       "/deb/",       "Debian";
     Cpan      => "cpan",      "/cpan/",      "CPAN";
+    HuggingFace => "hf",      "/hf/",        "Hugging Face";
 }
 
 impl RegistryType {
@@ -80,6 +81,13 @@ impl RegistryType {
             Self::Go,
             Self::Raw,
         ]
+    }
+
+    /// Whether `all` in `[registries] enable` / `NORA_REGISTRIES_ENABLE` switches this
+    /// format on. An opt-in format is enabled only by name: an operator who wrote `all`
+    /// before it existed did not choose it.
+    pub fn in_all(&self) -> bool {
+        !matches!(self, Self::HuggingFace)
     }
 
     /// Parse from string (case-insensitive), accepting common aliases. Kept hand-written
@@ -103,6 +111,7 @@ impl RegistryType {
             "rpm" | "yum" | "dnf" => Some(Self::Rpm),
             "deb" | "apt" | "debian" => Some(Self::Deb),
             "cpan" => Some(Self::Cpan),
+            "hf" | "huggingface" => Some(Self::HuggingFace),
             _ => None,
         }
     }
