@@ -3707,6 +3707,249 @@ proxies = [
         }
     }
 
+    /// The registries with a `[curation.<registry>]` section: all but Raw and Hugging Face.
+    fn registries_with_a_curation_section() -> Vec<RegistryType> {
+        RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|rt| !matches!(rt, RegistryType::Raw | RegistryType::HuggingFace))
+            .collect()
+    }
+
+    #[test]
+    fn every_per_registry_min_release_age_is_an_active_control_in_enforce() {
+        let _lock = env_lock();
+        // Control: enforce with nothing configured has no active control.
+        let (config, _) = parse_config("[curation]\nmode = \"enforce\"\n").unwrap();
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "{errors:?}"
+        );
+        // The value of any registry counts, wherever it stands in the list (#1098).
+        for rt in registries_with_a_curation_section() {
+            let config = curation_toml(&format!("curation.{rt}.min_release_age"), "3d", "enforce");
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.contains("no active control is configured")),
+                "{rt}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_needs_a_quarantine_where_that_registry_is_a_proxy() {
+        let _lock = env_lock();
+        // The #741 rule reads the registry the value is set on, not npm and not any
+        // proxy: with npm on and off, the error names the key exactly when that
+        // registry is an enabled proxy.
+        let (mut proxies, mut hosted) = (0, 0);
+        for rt in registries_with_a_curation_section() {
+            if matches!(rt, RegistryType::Rpm | RegistryType::Deb) {
+                continue; // refused outright, see below
+            }
+            for npm_enabled in [true, false] {
+                let key = format!("curation.{rt}.min_release_age");
+                let mut config = curation_toml(&key, "3d", "off");
+                if rt != RegistryType::Npm {
+                    config.npm.enabled = npm_enabled;
+                }
+                let expected = config.is_enabled_proxy(rt);
+                let (_, errors) = config.validate_with_config_path(None);
+                let named = errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("no age control would be active"));
+                assert_eq!(named, expected, "{rt}, npm on: {npm_enabled}: {errors:?}");
+                if rt != RegistryType::Npm {
+                    if expected {
+                        proxies += 1;
+                    } else {
+                        hosted += 1;
+                    }
+                }
+            }
+        }
+        // Both sides were reached by registries other than npm.
+        assert!(
+            proxies > 0 && hosted > 0,
+            "proxies {proxies}, hosted {hosted}"
+        );
+        // And by name: pypi and cpan as proxies, with npm off.
+        for (rt, key) in [
+            (RegistryType::PyPI, "curation.pypi.min_release_age"),
+            (RegistryType::Cpan, "curation.cpan.min_release_age"),
+        ] {
+            let mut config = curation_toml(key, "3d", "off");
+            config.npm.enabled = false;
+            config.pypi.enabled = true;
+            config.pypi.proxy = Some("https://pypi.org/simple/".to_string());
+            config.cpan.enabled = true;
+            config.cpan.proxy = Some("https://www.cpan.org".to_string());
+            assert!(config.is_enabled_proxy(rt));
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(key) && e.contains("no age control would be active")),
+                "{rt}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_min_release_age_for_rpm_or_deb_is_refused_for_its_own_reason_without_a_quarantine() {
+        let _lock = env_lock();
+        // On an enabled rpm or deb proxy with no quarantine, the refusal still gives
+        // the reason the value can never apply, not the quarantine one.
+        for registry in ["rpm", "deb"] {
+            let content = format!(
+                "[{registry}]\nenabled = true\n[{registry}.proxies]\nupstream = \"https://repo.example.com/{registry}\"\n[curation.{registry}]\nmin_release_age = \"3d\"\n"
+            );
+            let (config, unknown) = parse_config(&content).unwrap();
+            assert!(unknown.is_empty(), "{content}: {unknown:?}");
+            let rt = RegistryType::from_str_opt(registry).unwrap();
+            assert!(config.is_enabled_proxy(rt), "{content}");
+            let (_, errors) = config.validate_with_config_path(None);
+            let key = format!("curation.{registry}.min_release_age");
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("not checked by name or release date")),
+                "{registry}: {errors:?}"
+            );
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("no age control would be active")),
+                "{registry}: {errors:?}"
+            );
+        }
+    }
+
+    /// The environment variable of each `[curation.<registry>]` section, as documented.
+    fn curation_env_name(rt: RegistryType) -> Option<&'static str> {
+        match rt {
+            RegistryType::Docker => Some("DOCKER"),
+            RegistryType::Maven => Some("MAVEN"),
+            RegistryType::Npm => Some("NPM"),
+            RegistryType::Cargo => Some("CARGO"),
+            RegistryType::PyPI => Some("PYPI"),
+            RegistryType::Go => Some("GO"),
+            RegistryType::Raw => None,
+            RegistryType::Gems => Some("GEMS"),
+            RegistryType::Terraform => Some("TERRAFORM"),
+            RegistryType::Ansible => Some("ANSIBLE"),
+            RegistryType::Nuget => Some("NUGET"),
+            RegistryType::PubDart => Some("PUB"),
+            RegistryType::Conan => Some("CONAN"),
+            RegistryType::Rpm => Some("RPM"),
+            RegistryType::Deb => Some("DEB"),
+            RegistryType::Cpan => Some("CPAN"),
+            RegistryType::HuggingFace => None,
+        }
+    }
+
+    #[test]
+    fn every_per_registry_min_release_age_is_read_from_its_environment_variable() {
+        let _lock = env_lock();
+        for rt in registries_with_a_curation_section() {
+            let var = format!(
+                "NORA_CURATION_{}_MIN_RELEASE_AGE",
+                curation_env_name(rt).unwrap()
+            );
+            let mut curation = CurationConfig::default();
+            std::env::set_var(&var, "3d");
+            let applied = curation.apply_env_overrides();
+            std::env::remove_var(&var);
+            applied.unwrap();
+            // Its own section has it, and no other does.
+            for &other in RegistryType::all() {
+                let value = curation
+                    .registry_override(other)
+                    .and_then(|o| o.min_release_age.as_deref());
+                assert_eq!(value, (other == rt).then_some("3d"), "{var}: {other}");
+            }
+        }
+    }
+
+    /// A request for `registry` published `publish_date`.
+    fn age_request(
+        registry: RegistryType,
+        publish_date: Option<i64>,
+    ) -> crate::curation::FilterRequest {
+        crate::curation::FilterRequest {
+            registry,
+            upstream: None,
+            name: "pkg".to_string(),
+            version: crate::curation::RequestVersion::Known("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date,
+        }
+    }
+
+    #[test]
+    fn every_per_registry_min_release_age_alone_holds_its_registry_and_names_it() {
+        use crate::curation::{Decision, MinReleaseAgeFilter, ProxyFilter};
+        let _lock = env_lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for rt in registries_with_a_curation_section() {
+            let config = curation_toml(&format!("curation.{rt}.min_release_age"), "3d", "off");
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+            assert!(problems.is_empty(), "{rt}: {problems:?}");
+            let filter = filter.unwrap_or_else(|| panic!("{rt}: no filter"));
+            // The log line and `curation explain` show it.
+            assert_eq!(filter.summary(), format!("{rt}: 3d"));
+            // A release an hour old is held in its registry and not filtered by age
+            // anywhere else.
+            for &other in RegistryType::all() {
+                let decision = filter.evaluate(&age_request(other, Some(now - 3600)));
+                if other == rt {
+                    assert!(
+                        matches!(&decision, Decision::Block { rule, .. } if rule == "min-release-age"),
+                        "{rt}: {decision:?}"
+                    );
+                } else {
+                    assert_eq!(decision, Decision::Skip, "{rt} set, {other} asked");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_publish_date_is_left_to_the_quarantine_whatever_value_applies() {
+        use crate::curation::{Decision, MinReleaseAgeFilter, ProxyFilter};
+        let _lock = env_lock();
+        // Without a date the filter has no opinion (the quarantine holds what is new),
+        // whether the threshold is npm's own, the global one, or both (#741, #1098).
+        for (global, npm) in [
+            (Some("3d"), None),
+            (None, Some("3d")),
+            (Some("3d"), Some("1h")),
+        ] {
+            let mut curation = CurationConfig::default();
+            curation.min_release_age = global.map(str::to_string);
+            curation.npm.min_release_age = npm.map(str::to_string);
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&curation);
+            assert!(problems.is_empty(), "{problems:?}");
+            let filter = filter.unwrap();
+            for rt in [RegistryType::Npm, RegistryType::PyPI] {
+                assert_eq!(
+                    filter.evaluate(&age_request(rt, None)),
+                    Decision::Skip,
+                    "global {global:?}, npm {npm:?}: {rt}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_validate_curation_enforce_missing_allowlist_file() {
         let _lock = env_lock();
