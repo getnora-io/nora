@@ -333,6 +333,29 @@ pub(crate) enum ReleaseDateCheck {
     NoDate,
 }
 
+/// The environment variable of `rt`'s own `enabled` flag.
+pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
+    match rt {
+        RegistryType::Docker => "NORA_DOCKER_ENABLED",
+        RegistryType::Maven => "NORA_MAVEN_ENABLED",
+        RegistryType::Npm => "NORA_NPM_ENABLED",
+        RegistryType::Cargo => "NORA_CARGO_ENABLED",
+        RegistryType::PyPI => "NORA_PYPI_ENABLED",
+        RegistryType::Go => "NORA_GO_ENABLED",
+        RegistryType::Raw => "NORA_RAW_ENABLED",
+        RegistryType::Gems => "NORA_GEMS_ENABLED",
+        RegistryType::Terraform => "NORA_TF_ENABLED",
+        RegistryType::Ansible => "NORA_ANSIBLE_ENABLED",
+        RegistryType::Nuget => "NORA_NUGET_ENABLED",
+        RegistryType::PubDart => "NORA_PUB_ENABLED",
+        RegistryType::Conan => "NORA_CONAN_ENABLED",
+        RegistryType::Rpm => "NORA_RPM_ENABLED",
+        RegistryType::Deb => "NORA_DEB_ENABLED",
+        RegistryType::Cpan => "NORA_CPAN_ENABLED",
+        RegistryType::HuggingFace => "NORA_HF_ENABLED",
+    }
+}
+
 /// The release-date check of `rt`'s downloads, as each handler calls curation.
 pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
     match rt {
@@ -410,21 +433,44 @@ impl Config {
     /// 2. `[registries].enable` from TOML config
     /// 3. Legacy per-registry `enabled` flags (backward compatible)
     pub fn enabled_registries(&self) -> HashSet<RegistryType> {
+        self.resolve_enabled_registries(env::var("NORA_REGISTRIES_ENABLE").ok(), true)
+    }
+
+    /// [`Self::enabled_registries`] without logging: `load` resolves it before validation,
+    /// and `main` logs the selection once at start.
+    fn enabled_registries_quiet(&self) -> HashSet<RegistryType> {
+        self.resolve_enabled_registries(env::var("NORA_REGISTRIES_ENABLE").ok(), false)
+    }
+
+    /// The enable-set from `NORA_REGISTRIES_ENABLE` (`env_spec`), else `[registries].enable`,
+    /// else the per-registry flags; the selection and a fallback are logged when `log`.
+    fn resolve_enabled_registries(
+        &self,
+        env_spec: Option<String>,
+        log: bool,
+    ) -> HashSet<RegistryType> {
         // Tier 1: NORA_REGISTRIES_ENABLE env var
-        if let Ok(val) = env::var("NORA_REGISTRIES_ENABLE") {
+        if let Some(val) = env_spec {
             if !val.is_empty() {
                 let spec = EnableSpec::from_env_str(&val);
                 match spec.resolve() {
                     Ok(set) => {
-                        Self::warn_legacy_env_vars_if_present();
-                        tracing::info!(
-                            registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-                            "Registry selection from NORA_REGISTRIES_ENABLE"
-                        );
+                        if log {
+                            Self::warn_legacy_env_vars_if_present();
+                            tracing::info!(
+                                registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "Registry selection from NORA_REGISTRIES_ENABLE"
+                            );
+                        }
                         return set;
                     }
                     Err(e) => {
-                        tracing::error!("NORA_REGISTRIES_ENABLE is invalid: {} — falling back", e);
+                        if log {
+                            tracing::error!(
+                                "NORA_REGISTRIES_ENABLE is invalid: {} — falling back",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -435,18 +481,22 @@ impl Config {
             if let Some(ref spec) = section.enable {
                 match spec.resolve() {
                     Ok(set) => {
-                        Self::warn_legacy_env_vars_if_present();
-                        tracing::info!(
-                            registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-                            "Registry selection from [registries].enable"
-                        );
+                        if log {
+                            Self::warn_legacy_env_vars_if_present();
+                            tracing::info!(
+                                registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "Registry selection from [registries].enable"
+                            );
+                        }
                         return set;
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "[registries].enable is invalid: {} — falling back to legacy",
-                            e
-                        );
+                        if log {
+                            tracing::error!(
+                                "[registries].enable is invalid: {} — falling back to legacy",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -660,21 +710,12 @@ impl Config {
     /// Warn if legacy NORA_*_ENABLED env vars are set while using the new
     /// `[registries].enable` or `NORA_REGISTRIES_ENABLE`.
     fn warn_legacy_env_vars_if_present() {
-        let legacy_vars = [
-            "NORA_DOCKER_ENABLED",
-            "NORA_MAVEN_ENABLED",
-            "NORA_NPM_ENABLED",
-            "NORA_CARGO_ENABLED",
-            "NORA_PYPI_ENABLED",
-            "NORA_GO_ENABLED",
-            "NORA_RAW_ENABLED",
-            "NORA_GEMS_ENABLED",
-            "NORA_TF_ENABLED",
-            "NORA_ANSIBLE_ENABLED",
-            "NORA_NUGET_ENABLED",
-            "NORA_PUB_ENABLED",
-            "NORA_CONAN_ENABLED",
-        ];
+        // Every registry's flag: the hand-written list left out rpm, deb, cpan and hf, so
+        // NORA_HF_ENABLED=true beside an enable-set was ignored without a word.
+        let legacy_vars: Vec<&str> = RegistryType::all()
+            .iter()
+            .map(|&rt| legacy_enable_var(rt))
+            .collect();
         let found: Vec<&str> = legacy_vars
             .iter()
             .filter(|v| env::var(v).is_ok())
@@ -1354,7 +1395,14 @@ impl Config {
             .apply_env_overrides()
             .map_err(ConfigLoadError::EnvOverride)?;
 
-        // 4. Validate configuration
+        // 4. The per-registry `enabled` flags follow the enable-set (NORA_REGISTRIES_ENABLE,
+        //    [registries].enable) before validation, so every rule that reads them or
+        //    is_enabled_proxy judges the registries the server mounts (#1098). main applies
+        //    the same set again at start; it is idempotent.
+        let set = config.enabled_registries_quiet();
+        config.apply_enabled_registries(&set);
+
+        // 5. Validate configuration
         Ok((config.checked()?, unknown_keys))
     }
 
@@ -1398,6 +1446,9 @@ impl Config {
             None => Config::default(),
         };
         config.apply_env_overrides()?;
+        // As in `load`: validation judges the registries the enable-set mounts (#1098).
+        let set = config.enabled_registries_quiet();
+        config.apply_enabled_registries(&set);
         let (_, errors) = config.validate();
         if !errors.is_empty() {
             return Err(format!("Validation errors: {}", errors.join("; ")));
@@ -4113,6 +4164,186 @@ proxies = [
             }
         }
         assert_eq!(seen.len(), registries_with_a_curation_section().len());
+    }
+
+    /// How a test enables (or disables) one registry.
+    #[derive(Clone, Copy, Debug)]
+    enum EnableWay {
+        /// `NORA_REGISTRIES_ENABLE`.
+        Env,
+        /// `[registries] enable` in the file.
+        Section,
+        /// The registry's own `enabled` flag.
+        Flag,
+    }
+
+    /// `Config::load_from` a file holding `toml`, with `NORA_REGISTRIES_ENABLE` set to
+    /// `env` for the call: the config, or the errors that refused it.
+    fn load_toml(toml: &str, env: Option<&str>) -> Result<Config, Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        match env {
+            Some(v) => std::env::set_var("NORA_REGISTRIES_ENABLE", v),
+            None => std::env::remove_var("NORA_REGISTRIES_ENABLE"),
+        }
+        let loaded = Config::load_from(
+            Some(path.to_string_lossy().into_owned()),
+            NO_FALLBACK,
+            false,
+        );
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+        match loaded {
+            Ok((config, _)) => Ok(config),
+            Err(ConfigLoadError::Invalid(errors)) => Err(errors),
+            Err(e) => panic!("{e}\n{toml}"),
+        }
+    }
+
+    /// The verdict on a registry's own value does not depend on how the registry is
+    /// enabled: NORA_REGISTRIES_ENABLE, [registries].enable and its own flag give the same
+    /// answer, for the registry on and off (the first two used to be judged by the flags'
+    /// defaults, before the enable-set was applied).
+    #[test]
+    fn a_per_registry_min_release_age_is_judged_by_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let mut seen = 0;
+        for (rt, form, _) in proxy_forms() {
+            if !matches!(release_date_check(rt), ReleaseDateCheck::Dated) {
+                continue;
+            }
+            // The upstream stays configured; only the way it is enabled changes.
+            let section: String = form
+                .lines()
+                .filter(|l| !l.starts_with("enabled = "))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let value = format!("[curation.{rt}]\nmin_release_age = \"3d\"\n");
+            let key = format!("curation.{rt}.min_release_age=\"3d\"");
+            let other = if rt == RegistryType::Raw {
+                "docker"
+            } else {
+                "raw"
+            };
+            for way in [EnableWay::Env, EnableWay::Section, EnableWay::Flag] {
+                for on in [true, false] {
+                    let flag = |v: bool| section.replacen("\n", &format!("\nenabled = {v}\n"), 1);
+                    let (toml, env) = match (way, on) {
+                        (EnableWay::Env, true) => {
+                            (format!("{section}{value}"), Some(rt.as_str().to_string()))
+                        }
+                        (EnableWay::Env, false) => {
+                            (format!("{section}{value}"), Some(other.to_string()))
+                        }
+                        (EnableWay::Section, true) => (
+                            format!("[registries]\nenable = [\"{rt}\"]\n{section}{value}"),
+                            None,
+                        ),
+                        (EnableWay::Section, false) => (
+                            format!("[registries]\nenable = [\"{other}\"]\n{section}{value}"),
+                            None,
+                        ),
+                        (EnableWay::Flag, true) => (format!("{}{value}", flag(true)), None),
+                        (EnableWay::Flag, false) => (format!("{}{value}", flag(false)), None),
+                    };
+                    let case = format!("{rt} {way:?} on={on}: {toml} env={env:?}");
+                    match load_toml(&toml, env.as_deref()) {
+                        Err(errors) => {
+                            assert!(on, "{case}: refused although {rt} is off: {errors:?}");
+                            assert!(
+                                errors.iter().any(|e| e.contains(&key)
+                                    && e.contains("no age control would be active")),
+                                "{case}: {errors:?}"
+                            );
+                        }
+                        Ok(config) => {
+                            assert!(
+                                !on,
+                                "{case}: started without a quarantine of an enabled proxy"
+                            );
+                            let (warnings, errors) = config.validate();
+                            assert!(errors.is_empty(), "{case}: {errors:?}");
+                            assert!(
+                                warnings
+                                    .iter()
+                                    .any(|w| w.contains(&key) && w.contains("is not enabled")),
+                                "{case}: {warnings:?}"
+                            );
+                        }
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen >= 60, "{seen} cases");
+    }
+
+    /// A reload (SIGHUP) judges the same registries as the start.
+    #[test]
+    fn a_reload_judges_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // docker is on by its flag's default and a proxy; the enable-set decides.
+        std::fs::write(&path, "[curation.docker]\nmin_release_age = \"3d\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &path);
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "raw");
+        let off = Config::try_load();
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "docker");
+        let on = Config::try_load();
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+        std::env::remove_var("NORA_CONFIG_PATH");
+        assert!(off.is_ok(), "docker is not mounted: {:?}", off.err());
+        let err = on.expect_err("docker is a mounted proxy without a quarantine");
+        assert!(err.contains("curation.docker.min_release_age"), "{err}");
+    }
+
+    /// The Hugging Face rule and the global #741 rule judge the mounted registries too.
+    #[test]
+    fn the_global_min_release_age_rules_judge_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let hf = "[hf]\nproxy = \"http://127.0.0.1:9\"\n[curation]\nmin_release_age = \"3d\"\nquarantine = \"enforce\"\n";
+        for (toml, env) in [
+            (hf.to_string(), Some("all,hf")),
+            (
+                format!("[registries]\nenable = [\"all\", \"hf\"]\n{hf}"),
+                None,
+            ),
+            (hf.replacen("[hf]\n", "[hf]\nenabled = true\n", 1), None),
+        ] {
+            let errors = load_toml(&toml, env).err().unwrap_or_else(|| {
+                panic!("hf with a global min_release_age started: {toml} {env:?}")
+            });
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("cannot hold the Hugging Face proxy")),
+                "{errors:?}"
+            );
+        }
+        // Control: hf off, the same global value starts.
+        assert!(load_toml(hf, Some("all")).is_ok());
+        // #741: every per-registry flag off in the file, NORA_REGISTRIES_ENABLE=all mounts
+        // the proxies, so a global value without a quarantine is refused.
+        let mut all_off = String::new();
+        for rt in RegistryType::all() {
+            let section = match rt {
+                RegistryType::PubDart => "pub_dart".to_string(),
+                _ => rt.as_str().to_string(),
+            };
+            all_off.push_str(&format!("[{section}]\nenabled = false\n"));
+        }
+        all_off.push_str("[curation]\nmin_release_age = \"3d\"\n");
+        let errors = load_toml(&all_off, Some("all")).expect_err("the proxies are mounted");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .starts_with("curation.min_release_age is set with an enabled proxy registry")),
+            "{errors:?}"
+        );
+        // And only raw mounted: no proxy is served, nothing to refuse.
+        assert!(load_toml("[curation]\nmin_release_age = \"3d\"\n", Some("raw")).is_ok());
     }
 
     #[test]
