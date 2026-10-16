@@ -1073,9 +1073,10 @@ impl Config {
                 );
             }
             // The same rules for a registry's own value, which applies without a
-            // global one (#1098). It needs a quarantine when that registry is an
-            // enabled proxy; on rpm and deb it could never apply, since their
-            // downloads are not checked by name or release date.
+            // global one (#1098). It needs a quarantine of that registry — its own or
+            // the global one — when that registry is an enabled proxy: a quarantine on
+            // another registry does not hold its downloads. On rpm and deb it could
+            // never apply, since their downloads are not checked by name or release date.
             for &rt in RegistryType::all() {
                 let Some(age) = self
                     .curation
@@ -1112,9 +1113,12 @@ impl Config {
                     errors.push(format!(
                         "curation.{rt}.min_release_age=\"{age}\" cannot apply: {why}. (#1098)"
                     ));
-                } else if !quarantine_active && self.is_enabled_proxy(rt) {
+                } else if self.quarantine_mode_for(rt)
+                    == crate::digest_quarantine::QuarantineMode::Off
+                    && self.is_enabled_proxy(rt)
+                {
                     errors.push(format!(
-                        "curation.{rt}.min_release_age=\"{age}\" is set and {rt} is an enabled proxy registry, but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine or curation.{rt}.quarantine=\"observe\"|\"enforce\". (#741, #1098)"
+                        "curation.{rt}.min_release_age=\"{age}\" is set and {rt} is an enabled proxy registry, but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine of {rt} (one on another registry does not hold {rt} downloads). Enable curation.quarantine or curation.{rt}.quarantine=\"observe\"|\"enforce\". (#741, #1098)"
                     ));
                 }
             }
@@ -3652,20 +3656,30 @@ proxies = [
                     && e.contains("no age control would be active")),
             "{errors:?}"
         );
-        // An active quarantine satisfies it as it satisfies the global value (#765):
-        // npm's own, the global one, or one on another registry.
-        for (npm, global, docker) in [
-            (Some(QuarantineMode::Observe), None, None),
-            (None, Some(QuarantineMode::Enforce), None),
-            (None, None, Some(QuarantineMode::Enforce)),
+        // A quarantine of npm satisfies it — npm's own or the global one. One on
+        // another registry does not: it holds none of npm's downloads.
+        for (npm, global, docker, satisfied) in [
+            (Some(QuarantineMode::Observe), None, None, true),
+            (None, Some(QuarantineMode::Enforce), None, true),
+            (None, None, Some(QuarantineMode::Enforce), false),
+            (
+                Some(QuarantineMode::Off),
+                Some(QuarantineMode::Enforce),
+                None,
+                false,
+            ),
         ] {
-            config.curation.npm.quarantine = npm;
-            config.curation.quarantine = global;
-            config.curation.docker.quarantine = docker;
+            config.curation.npm.quarantine = npm.clone();
+            config.curation.quarantine = global.clone();
+            config.curation.docker.quarantine = docker.clone();
             let (_, errors) = config.validate_with_config_path(None);
-            assert!(
-                !errors.iter().any(|e| e.contains("min_release_age")),
-                "{errors:?}"
+            let refused = errors.iter().any(|e| {
+                e.contains("curation.npm.min_release_age")
+                    && e.contains("no age control would be active")
+            });
+            assert_eq!(
+                refused, !satisfied,
+                "npm {npm:?}, global {global:?}, docker {docker:?}: {errors:?}"
             );
         }
     }
@@ -3777,6 +3791,49 @@ proxies = [
         assert!(
             proxies > 0 && hosted > 0,
             "proxies {proxies}, hosted {hosted}"
+        );
+        // Only a quarantine of that registry satisfies it: its own or the global one,
+        // not one on another registry.
+        let mut checked = 0;
+        for rt in registries_with_a_curation_section() {
+            if matches!(rt, RegistryType::Rpm | RegistryType::Deb) {
+                continue;
+            }
+            let other = if rt == RegistryType::Docker {
+                RegistryType::Npm
+            } else {
+                RegistryType::Docker
+            };
+            let key = format!("curation.{rt}.min_release_age");
+            for (quarantine, satisfied) in [
+                (
+                    format!("[curation.{other}]\nquarantine = \"enforce\"\n"),
+                    false,
+                ),
+                (format!("[curation.{rt}]\nquarantine = \"observe\"\n"), true),
+                ("[curation]\nquarantine = \"enforce\"\n".to_string(), true),
+            ] {
+                let content = format!(
+                    "[curation.{rt}]\nmin_release_age = \"3d\"\n{}",
+                    quarantine.replace(&format!("[curation.{rt}]\n"), "")
+                );
+                let (config, unknown) =
+                    parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
+                assert!(unknown.is_empty(), "{content}: {unknown:?}");
+                if !config.is_enabled_proxy(rt) {
+                    continue;
+                }
+                checked += 1;
+                let (_, errors) = config.validate_with_config_path(None);
+                let refused = errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("no age control would be active"));
+                assert_eq!(refused, !satisfied, "{content}: {errors:?}");
+            }
+        }
+        assert!(
+            checked >= 6,
+            "only {checked} cases reached an enabled proxy"
         );
         // And by name: pypi and cpan as proxies, with npm off.
         for (rt, key) in [
