@@ -3015,14 +3015,17 @@ mod curation_reload_tests {
     /// names the value, as an unparsable global one does — it is never dropped.
     #[test]
     fn enforce_rejects_an_unparsable_per_registry_min_release_age() {
-        let mut config = enforce();
-        config.curation.min_release_age = Some("7d".to_string());
-        config.curation.npm.min_release_age = Some("3x".to_string());
-        let err = build_curation_engine(&config)
-            .err()
-            .expect("an unparsable value must refuse the build");
-        assert!(err.contains("curation.npm.min_release_age"), "{err}");
-        assert!(err.contains("3x"), "{err}");
+        // With a global value and without one: the per-registry value is read either way.
+        for global in [Some("7d"), None] {
+            let mut config = enforce();
+            config.curation.min_release_age = global.map(str::to_string);
+            config.curation.npm.min_release_age = Some("3x".to_string());
+            let err = build_curation_engine(&config).err().unwrap_or_else(|| {
+                panic!("global {global:?}: an unparsable value must refuse the build")
+            });
+            assert!(err.contains("curation.npm.min_release_age"), "{err}");
+            assert!(err.contains("3x"), "{err}");
+        }
     }
 }
 

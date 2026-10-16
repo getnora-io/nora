@@ -3920,6 +3920,27 @@ proxies = [
                     assert_eq!(decision, Decision::Skip, "{rt} set, {other} asked");
                 }
             }
+            // Beside a global value, the registry's own wins in its registry, and the
+            // global one holds the others: a release two hours old, 3d against 1h.
+            let held = |d: &Decision| matches!(d, Decision::Block { rule, .. } if rule == "min-release-age");
+            for (own, global) in [("3d", "1h"), ("1h", "3d")] {
+                let mut config =
+                    curation_toml(&format!("curation.{rt}.min_release_age"), own, "off");
+                config.curation.min_release_age = Some(global.to_string());
+                let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+                assert!(problems.is_empty(), "{rt}: {problems:?}");
+                let filter = filter.unwrap();
+                assert_eq!(filter.summary(), format!("{global} ({rt}: {own})"));
+                for &other in RegistryType::all() {
+                    let decision = filter.evaluate(&age_request(other, Some(now - 2 * 3600)));
+                    let threshold = if other == rt { own } else { global };
+                    assert_eq!(
+                        held(&decision),
+                        threshold == "3d",
+                        "{rt} {own}, global {global}, {other} asked: {decision:?}"
+                    );
+                }
+            }
         }
     }
 
