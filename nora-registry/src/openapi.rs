@@ -1373,6 +1373,31 @@ mod tests {
     use super::ApiDoc;
     use utoipa::OpenApi;
 
+    /// Swagger UI comes from the `vendored` feature (a crates.io crate,
+    /// checksummed in Cargo.lock), not a build-time GitHub download. The page,
+    /// its bundle and the spec must still be served under /api-docs.
+    #[tokio::test]
+    async fn swagger_ui_is_served_from_the_vendored_bundle() {
+        use crate::test_helpers::{body_bytes, create_test_context, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context();
+        let app = super::routes().with_state(ctx.state.clone());
+        for (path, needle) in [
+            ("/api-docs/", "swagger-ui"),
+            ("/api-docs/swagger-ui-bundle.js", "SwaggerUIBundle"),
+            ("/api-docs/openapi.json", "\"openapi\""),
+        ] {
+            let resp = send(&app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = body_bytes(resp).await;
+            assert!(
+                String::from_utf8_lossy(&body).contains(needle),
+                "{path} lacks {needle}"
+            );
+        }
+    }
+
     /// #987 — the OpenAPI `/health` `registries` field must be documented as a
     /// string-keyed map, matching the runtime `HealthStatus.registries:
     /// HashMap<String, String>` of the *enabled* registries. The old

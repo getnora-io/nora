@@ -24,15 +24,15 @@ WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
-
-# Exclude fuzz workspace member (requires C++ libfuzzer, not needed for binary)
-RUN sed -i '/"fuzz"/d' Cargo.toml
+# The fuzz member's manifest and targets (not its corpus, see .dockerignore) keep
+# the workspace intact so --locked holds; `-p nora-registry` never builds them.
+COPY fuzz/ fuzz/
 
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p nora-registry $CARGO_FEATURES && \
+    cargo build --release --locked -p nora-registry $CARGO_FEATURES && \
     cp target/release/nora /nora && \
     strip /nora
 
@@ -57,13 +57,13 @@ RUN rustup target add aarch64-unknown-linux-musl
 
 COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
-RUN sed -i '/"fuzz"/d' Cargo.toml
+COPY fuzz/ fuzz/
 
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
+    cargo build --release --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
     cp target/aarch64-unknown-linux-musl/release/nora /nora && \
     aarch64-linux-musl-strip /nora
 

@@ -43,7 +43,7 @@ bcrypt = "0.19"
 base64 = "0.22"
 prometheus = "0.14"
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
 flate2 = "1.1"

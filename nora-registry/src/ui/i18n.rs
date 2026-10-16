@@ -51,6 +51,9 @@ pub struct Translations {
     pub dashboard_title: &'static str,
     pub dashboard_subtitle: &'static str,
     pub uptime: &'static str,
+    pub uptime_days: &'static str,
+    pub uptime_hours: &'static str,
+    pub uptime_mins: &'static str,
 
     // Stats
     pub stat_downloads: &'static str,
@@ -169,6 +172,9 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     dashboard_title: "Dashboard",
     dashboard_subtitle: "Overview of all registries",
     uptime: "Uptime",
+    uptime_days: "d",
+    uptime_hours: "h",
+    uptime_mins: "m",
 
     // Stats
     stat_downloads: "Downloads",
@@ -279,6 +285,9 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     dashboard_title: "Панель управления",
     dashboard_subtitle: "Обзор всех реестров",
     uptime: "Время работы",
+    uptime_days: "д",
+    uptime_hours: "ч",
+    uptime_mins: "м",
 
     // Stats
     stat_downloads: "Загрузки",
@@ -389,6 +398,9 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     dashboard_title: "仪表盘",
     dashboard_subtitle: "所有注册表概览",
     uptime: "运行时间",
+    uptime_days: "天",
+    uptime_hours: "小时",
+    uptime_mins: "分",
 
     // Stats
     stat_downloads: "下载量",
