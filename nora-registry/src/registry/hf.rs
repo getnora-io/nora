@@ -3436,7 +3436,7 @@ mod tests {
                 assert_eq!(host_listed(host, &entries), want, "{host} in {list:?}");
             }
         }
-        // The grid holds both answers; the look-alikes the review found are not listed.
+        // The grid holds both answers; the names the review slipped through are not listed.
         assert_eq!(listed, 24);
         assert!(!host_listed("cdn.evilhf.co", &["hf.co".to_string()]));
         assert!(!host_listed("169.254.169.254", &[]));
