@@ -100,10 +100,27 @@ fn config_strict_from_env() -> bool {
 /// such as `curation.mdoe` for a typo of `mode`.
 fn parse_config(content: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
     let mut unknown = Vec::new();
-    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
-        unknown.push(key_path(&path))
-    })?;
+    let mut config: Config =
+        serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+            unknown.push(key_path(&path))
+        })?;
+    // serde fills a missing `mode` with its default; whether it was written down is read from
+    // the file itself (#1135).
+    config.curation.mode_explicit = content
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| table.get("curation")?.get("mode").cloned())
+        .is_some();
     Ok((config, unknown))
+}
+
+/// What startup says about `curation.mode` while proxy registries are enabled (#1135).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CurationModeNotice {
+    /// `mode` is off only by default: from 1.5.0 such a configuration stops at startup.
+    Implicit(Vec<RegistryType>),
+    /// `mode = "off"` is written down: the operator accepts serving upstream packages unchecked.
+    ExplicitOff(Vec<RegistryType>),
 }
 
 /// `curation.mdoe`, `docker.upstreams.0.auht`: map keys and sequence indices joined by
@@ -639,6 +656,27 @@ impl Config {
     /// truth for "is this an enabled proxy?". Raw has no upstream and is always false.
     /// Per-registry shapes differ: most carry `proxy: Option<String>`, PyPI also has a
     /// multi-upstream `proxies` list, Maven uses `proxies`, Docker uses `upstreams`.
+    /// The startup notice on `curation.mode` (#1135): none when curation is on or no proxy
+    /// registry is enabled; otherwise which registries are served unchecked, and whether `off`
+    /// was the operator's choice or only the default.
+    pub fn curation_mode_notice(&self) -> Option<CurationModeNotice> {
+        if self.curation.mode != CurationMode::Off {
+            return None;
+        }
+        let proxies: Vec<RegistryType> = RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|&rt| self.is_enabled_proxy(rt))
+            .collect();
+        if proxies.is_empty() {
+            None
+        } else if self.curation.mode_explicit {
+            Some(CurationModeNotice::ExplicitOff(proxies))
+        } else {
+            Some(CurationModeNotice::Implicit(proxies))
+        }
+    }
+
     fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
         match rt {
             RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
@@ -1567,6 +1605,50 @@ mod tests {
     use crate::digest_quarantine::QuarantineMode;
     use crate::secrets::ProtectedString;
     use crate::test_env::env_lock;
+
+    /// #1135: whether `curation.mode` was written down is read from the file and from
+    /// `NORA_CURATION_MODE`; the startup notice follows it while proxy registries are enabled.
+    #[test]
+    fn curation_mode_notice_tells_the_default_from_the_operators_off() {
+        let _lock = env_lock();
+        let (written, _) = parse_config("[curation]\nmode = \"off\"\n").unwrap();
+        assert!(written.curation.mode_explicit);
+        let (other, _) = parse_config("[curation]\nmin_release_age = \"3d\"\n").unwrap();
+        assert!(!other.curation.mode_explicit);
+        let (empty, _) = parse_config("").unwrap();
+        assert!(!empty.curation.mode_explicit);
+
+        let mut from_env = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "off");
+        let applied = from_env.curation.apply_env_overrides();
+        std::env::remove_var("NORA_CURATION_MODE");
+        applied.unwrap();
+        assert!(from_env.curation.mode_explicit);
+
+        // The defaults proxy public registries: off by default is announced as implicit.
+        match Config::default().curation_mode_notice() {
+            Some(CurationModeNotice::Implicit(proxies)) => {
+                assert!(proxies.contains(&RegistryType::Npm), "{proxies:?}");
+                assert!(proxies.contains(&RegistryType::Docker), "{proxies:?}");
+            }
+            other => panic!("default config: {other:?}"),
+        }
+        let mut off = Config::default();
+        off.curation.mode_explicit = true;
+        assert!(matches!(
+            off.curation_mode_notice(),
+            Some(CurationModeNotice::ExplicitOff(_))
+        ));
+        for mode in [CurationMode::Audit, CurationMode::Enforce] {
+            let mut on = Config::default();
+            on.curation.mode = mode;
+            assert_eq!(on.curation_mode_notice(), None);
+        }
+        // Nothing proxied: nothing is served unchecked, and nothing is said.
+        let mut hosted = Config::default();
+        hosted.apply_enabled_registries(&std::collections::HashSet::from([RegistryType::Raw]));
+        assert_eq!(hosted.curation_mode_notice(), None, "only raw mounted");
+    }
 
     #[test]
     fn test_rate_limit_default() {

@@ -346,6 +346,17 @@ pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_BYTES metric at startup")
 });
 
+/// Configurations that rely on a default a later release turns into a startup error, by reason:
+/// 1 while the running configuration does (#1135), so an alert can see what a log line cannot.
+pub static CONFIG_DEPRECATED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "nora_config_deprecated",
+        "1 while the running configuration relies on a default that a later release refuses, by reason",
+        &["reason"]
+    )
+    .expect("failed to create CONFIG_DEPRECATED metric at startup")
+});
+
 /// Process uptime in seconds (gauge)
 pub static UPTIME_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("nora_uptime_seconds", "Process uptime in seconds")
