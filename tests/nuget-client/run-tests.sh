@@ -5,7 +5,7 @@ set -euo pipefail
 # Validates NuGet V3 protocol through real dotnet restore against Nora proxy.
 # Exit code 0 = all passed, non-zero = failures.
 #
-# ── What this polygon PROVES ─────────────────────────────────────────────
+# ── What this suite PROVES ───────────────────────────────────────────────
 #  [x] dotnet restore uses ONLY Nora as package source (<clear/> + single source)
 #  [x] Nora rewrites all URLs — no api.nuget.org in service index or registration
 #  [x] Full V3 protocol: registration, flatcontainer, nupkg download, transitive resolution
@@ -25,7 +25,7 @@ set -euo pipefail
 #  [x] All service index @id URLs point to Nora
 #  [x] Flatcontainer version normalization (lowercase)
 #
-# ── What this polygon does NOT prove ─────────────────────────────────────
+# ── What this suite does NOT prove ───────────────────────────────────────
 #  [ ] dotnet SDK telemetry/DNS: <clear/> removes NuGet sources but does NOT
 #      block SDK update checks, telemetry, or DNS resolution. dotnet may still
 #      phone home (set DOTNET_CLI_TELEMETRY_OPTOUT=1 and DOTNET_NOLOGO=1 to
@@ -38,7 +38,7 @@ set -euo pipefail
 #      --locked-mode (sha512 matches), but do NOT independently compute
 #      .nupkg sha512 and compare to upstream. Nora stores nupkg as-is, but
 #      a bit-flip or truncation in proxy would go undetected here.
-#  [ ] ETag/304 caching: Nora supports If-None-Match but this polygon does
+#  [ ] ETag/304 caching: Nora supports If-None-Match but this suite does
 #      not verify conditional request handling on repeat restores.
 #  [ ] Concurrent restore safety: projects run sequentially. Parallel
 #      dotnet restore against shared Nora is not tested.
@@ -49,7 +49,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NORA_BIN="${NORA_BIN:-$REPO_ROOT/target/release/nora}"
-DOTNET="${DOTNET:-/home/ubuntu/.dotnet/dotnet}"
+DOTNET="${DOTNET:-$HOME/.dotnet/dotnet}"
 PORT="${NORA_TEST_PORT:-14200}"
 BASE="http://localhost:${PORT}"
 STORAGE_DIR=$(mktemp -d)
@@ -61,7 +61,7 @@ SKIPPED=0
 
 # Suppress dotnet background traffic (telemetry, first-run experience, update checks).
 # NOTE: this reduces but does NOT eliminate all outbound traffic from dotnet SDK.
-# See "What this polygon does NOT prove" above.
+# See "What this suite does NOT prove" above.
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_NOLOGO=1
 export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1

@@ -10657,8 +10657,8 @@ mod manifest_before_metadata_one_lock_order {
 /// Only the metadata section builds a manifest metadata key: `manifest_meta_key` is called, and
 /// `.meta.json` written, in no other production function — so every write and delete of a
 /// manifest's metadata goes through the helpers that keep the order "manifest, then metadata,
-/// manifest lock before metadata lock". A white list, not a list of forbidden forms (the method's
-/// stop rule after two failed held-out rounds).
+/// manifest lock before metadata lock". A white list, not a list of forbidden forms, which
+/// would miss the next form.
 #[cfg(test)]
 mod only_the_metadata_section_builds_metadata_keys {
     /// The functions that may build a metadata key: its definition, the three helpers, and the

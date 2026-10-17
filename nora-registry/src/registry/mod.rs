@@ -21,7 +21,7 @@ pub(crate) mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;
 
-// Cross-registry regression suite for namespace isolation on metadata paths (contrib-kit#68).
+// Cross-registry regression suite for namespace isolation on metadata paths (#732).
 #[cfg(test)]
 mod ns_isolation_metadata_tests;
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Cross-registry regression suite for namespace isolation on METADATA paths
-//! (contrib-kit#68).
+//! (#732).
 //!
 //! Namespace isolation (`internal_namespaces`, the dependency-confusion defense,
 //! "always active" — issue #185) historically gated only the download/artifact
