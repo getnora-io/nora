@@ -1770,3 +1770,114 @@ mod upstream_failure_matrix {
         .await;
     }
 }
+
+/// Every handler names its own registry to curation: per-registry thresholds, quarantine
+/// and rules are looked up by that label, so a handler passing another registry's would
+/// apply another registry's settings (#1098). In the code of `registry/<format>.rs`
+/// (before its test module) the only `RegistryType::` variant is its own.
+#[cfg(test)]
+mod curation_label_whitelist {
+    use crate::registry_type::RegistryType;
+    use std::collections::BTreeSet;
+
+    const HANDLERS: &[(&str, RegistryType, &str)] = &[
+        (
+            "ansible.rs",
+            RegistryType::Ansible,
+            include_str!("ansible.rs"),
+        ),
+        (
+            "cargo_registry.rs",
+            RegistryType::Cargo,
+            include_str!("cargo_registry.rs"),
+        ),
+        ("conan.rs", RegistryType::Conan, include_str!("conan.rs")),
+        ("cpan.rs", RegistryType::Cpan, include_str!("cpan.rs")),
+        ("deb.rs", RegistryType::Deb, include_str!("deb.rs")),
+        ("docker.rs", RegistryType::Docker, include_str!("docker.rs")),
+        ("gems.rs", RegistryType::Gems, include_str!("gems.rs")),
+        ("go.rs", RegistryType::Go, include_str!("go.rs")),
+        ("hf.rs", RegistryType::HuggingFace, include_str!("hf.rs")),
+        ("maven.rs", RegistryType::Maven, include_str!("maven.rs")),
+        ("npm.rs", RegistryType::Npm, include_str!("npm.rs")),
+        ("nuget.rs", RegistryType::Nuget, include_str!("nuget.rs")),
+        (
+            "pub_dart.rs",
+            RegistryType::PubDart,
+            include_str!("pub_dart.rs"),
+        ),
+        ("pypi.rs", RegistryType::PyPI, include_str!("pypi.rs")),
+        ("raw.rs", RegistryType::Raw, include_str!("raw.rs")),
+        ("rpm.rs", RegistryType::Rpm, include_str!("rpm.rs")),
+        (
+            "terraform.rs",
+            RegistryType::Terraform,
+            include_str!("terraform.rs"),
+        ),
+    ];
+
+    /// The file up to its first test module: a module-level `#[cfg(test)]` whose item,
+    /// after any further attributes, is a `mod`. A `#[cfg(test)]` helper function between
+    /// production items (go.rs has one) does not end the production code.
+    fn code(src: &str) -> &str {
+        let mut at = 0;
+        while let Some(i) = src[at..].find("\n#[cfg(test)]") {
+            let start = at + i + 1;
+            let item = src[start..]
+                .lines()
+                .skip(1)
+                .find(|l| !l.trim_start().starts_with("#["))
+                .unwrap_or("");
+            if item.starts_with("mod ") || item.starts_with("pub mod ") {
+                return &src[..start];
+            }
+            at = start;
+        }
+        src
+    }
+
+    /// The variants named as `RegistryType::<Variant>` in `code`.
+    fn variants(code: &str) -> BTreeSet<String> {
+        code.split("RegistryType::")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_production_code_ends_at_the_first_test_module() {
+        let src = "fn a() {}\n#[cfg(test)]\nfn helper() {}\nfn b() { RegistryType::Go }\n#[cfg(test)]\n#[allow(x)]\nmod tests {\n    fn t() { RegistryType::Npm }\n}\n";
+        let code = code(src);
+        assert!(code.contains("fn b()"), "{code}");
+        assert!(!code.contains("mod tests"), "{code}");
+        assert_eq!(variants(code), BTreeSet::from(["Go".to_string()]));
+    }
+
+    #[test]
+    fn every_handler_names_only_its_own_registry() {
+        let owns: BTreeSet<String> = HANDLERS
+            .iter()
+            .map(|(_, rt, _)| format!("{rt:?}"))
+            .collect();
+        assert_eq!(
+            owns.len(),
+            RegistryType::all().len(),
+            "every registry has its handler here"
+        );
+        for (file, own, src) in HANDLERS {
+            let code = code(src);
+            for alias in ["RegistryType as", "RegistryType::{", "RegistryType::*"] {
+                assert!(!code.contains(alias), "{file}: `{alias}` hides the label");
+            }
+            assert_eq!(
+                variants(code),
+                BTreeSet::from([format!("{own:?}")]),
+                "{file} names another registry to curation"
+            );
+        }
+    }
+}
