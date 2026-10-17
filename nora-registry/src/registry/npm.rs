@@ -1044,6 +1044,13 @@ async fn record_first_seen(state: &AppState, key: &str, body: &[u8], cached_befo
             (cached_first_seen(&state.storage, key).await, false)
         }
         Err(crate::storage::StorageError::NotFound) => (FirstSeen::new(), false),
+        // The bytes do not match their pin: the ledger is known bad, not merely unread.
+        // Rewritten from now on, as an unparsable one: every release starts young again,
+        // which holds more, never less, and the ledger heals instead of staying unread.
+        Err(crate::storage::StorageError::IntegrityViolation) => {
+            tracing::warn!(key = %ledger_key, "npm: first-seen ledger failed its pin; rewritten");
+            (FirstSeen::new(), false)
+        }
         Err(e) => {
             // Not written over a ledger that may exist: a later refetch records the rest.
             tracing::warn!(key = %ledger_key, error = %e, "npm: first-seen ledger unreadable");
@@ -6244,6 +6251,37 @@ mod release_age_first_seen {
             let (status, body) = tarball(&ctx, "1.0.0").await;
             assert_eq!(status, StatusCode::OK, "{}: {body}", backend.name());
         }
+    }
+
+    /// A ledger whose bytes no longer match their pin is rewritten at the next refetch, so it
+    /// is read again and records new versions; its releases start young, which holds more.
+    #[tokio::test]
+    async fn a_ledger_that_fails_its_pin_is_rewritten() {
+        let backend = Backend::Local(tempfile::tempdir().unwrap());
+        let Backend::Local(dir) = &backend else {
+            unreachable!()
+        };
+        let storage = backend.storage();
+        let upstream = upstream(&["1.0.0", "2.0.0"], false).await;
+        seen_two_hours_ago(&backend, &storage, &upstream).await;
+        let on_disk = dir.path().join(first_seen_key(KEY));
+        let mut bytes = std::fs::read(&on_disk).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&on_disk, &bytes).unwrap();
+        assert!(storage.get(&first_seen_key(KEY)).await.is_err(), "tampered");
+        let ctx = context(&upstream, storage.clone());
+
+        refetch(&ctx, &storage).await;
+        let ledger: FirstSeen =
+            serde_json::from_slice(&storage.get(&first_seen_key(KEY)).await.unwrap()).unwrap();
+        assert!(
+            ledger.contains_key("1.0.0") && ledger.contains_key("2.0.0"),
+            "{ledger:?}"
+        );
+        assert!(
+            ledger.values().all(|t| now() - t < 60),
+            "started again: {ledger:?}"
+        );
     }
 
     #[tokio::test]
