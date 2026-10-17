@@ -226,6 +226,50 @@ enum CurationCommand {
 /// holding a `publish_lock` (handlers never touch `cleanup_lock`).
 pub type PublishLocks = Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
+/// One GC pass of the scheduler. A pass that removed anything marks every repository index
+/// stale, so the dashboard, `/api/ui/stats` and the artifact gauges show the store and not
+/// what it held before the pass; a write marks its own registry the same way.
+async fn gc_pass(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    repo_index: &RepoIndex,
+    dry_run: bool,
+    grace_secs: u64,
+    npm_is_proxy: bool,
+    proxy_cache_max_bytes: u64,
+) -> gc::GcResult {
+    let result = gc::run_gc(
+        storage,
+        publish_locks,
+        dry_run,
+        grace_secs,
+        npm_is_proxy,
+        proxy_cache_max_bytes,
+    )
+    .await;
+    if !dry_run && result.removed_anything() {
+        repo_index.invalidate_all();
+    }
+    result
+}
+
+/// One retention pass of the scheduler; a pass that deleted keys marks every repository
+/// index stale, as `gc_pass` does.
+async fn retention_pass(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    repo_index: &RepoIndex,
+    signer: Option<&signing::RepoSigner>,
+    rules: &[config::RetentionRule],
+    dry_run: bool,
+) -> retention::RetentionResult {
+    let result = retention::run_retention(storage, publish_locks, signer, rules, dry_run).await;
+    if !dry_run && result.deleted_keys > 0 {
+        repo_index.invalidate_all();
+    }
+    result
+}
+
 /// Get or create a per-key publish lock for TOCTOU protection.
 ///
 /// Used by both `AppState::publish_lock()` and GC metadata cleanup to ensure
@@ -2332,6 +2376,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let rules = state.config.retention.rules.clone();
         let dry_run = state.config.retention.dry_run;
         let audit = state.audit.clone();
+        let repo_index = state.repo_index.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "retention",
             interval: std::time::Duration::from_secs(state.config.retention.interval),
@@ -2341,14 +2386,16 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let signer = signer.clone();
                 let rules = rules.clone();
                 let audit = audit.clone();
+                let repo_index = repo_index.clone();
                 async move {
                     info!(
                         dry_run = dry_run,
                         "Retention scheduler: starting periodic run"
                     );
-                    let result = retention::run_retention(
+                    let result = retention_pass(
                         &storage,
                         &publish_locks,
+                        &repo_index,
                         signer.as_deref(),
                         &rules,
                         dry_run,
@@ -2390,15 +2437,17 @@ async fn run_server(mut config: Config, storage: Storage) {
         let grace_secs = state.config.gc.grace_secs;
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
+        let repo_index = state.repo_index.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
             run: Box::new(move || {
                 let storage = storage.clone();
                 let publish_locks = publish_locks.clone();
+                let repo_index = repo_index.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc::run_gc(&storage, &publish_locks, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes).await;
+                    let result = gc_pass(&storage, &publish_locks, &repo_index, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes).await;
                     info!(
                         "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
                         result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
@@ -3030,6 +3079,100 @@ mod middleware_stack_whitelist {
             code.matches(&[".layer", "("].concat()).count(),
             1,
             "only DefaultBodyLimit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_pass_tests {
+    //! A scheduled GC or retention pass that takes files out of the store marks the
+    //! repository indexes stale: the dashboard counts what is there after the pass.
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn locks() -> PublishLocks {
+        Arc::new(parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// `n` proxy-cached rpm files of 100 bytes, the first one the oldest.
+    async fn rpm_cache(data: &Path, n: u32) -> Storage {
+        let storage = Storage::new_local(data.to_str().unwrap());
+        for i in 0..n {
+            let key = format!("rpm/repo/Packages/{i}-1.0.rpm");
+            storage.put(&key, &[0u8; 100]).await.unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(data.join(&key))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000 + u64::from(i) * 1000))
+                .unwrap();
+        }
+        storage
+    }
+
+    async fn counted(index: &RepoIndex, storage: &Storage, registry: &str) -> usize {
+        index
+            .get(registry, storage)
+            .await
+            .iter()
+            .map(|r| r.versions)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_gc_pass_that_evicts_marks_the_index_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = rpm_cache(dir.path(), 5).await;
+        let index = RepoIndex::new();
+        assert_eq!(counted(&index, &storage, "rpm").await, 5);
+        let result = gc_pass(&storage, &locks(), &index, false, 0, false, 300).await;
+        assert_eq!(result.proxy_cache_eviction.evicted_files, 2);
+        assert_eq!(counted(&index, &storage, "rpm").await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_dry_gc_pass_leaves_the_store_and_its_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = rpm_cache(dir.path(), 5).await;
+        let index = RepoIndex::new();
+        assert_eq!(counted(&index, &storage, "rpm").await, 5);
+        let result = gc_pass(&storage, &locks(), &index, true, 0, false, 300).await;
+        assert_eq!(
+            result.proxy_cache_eviction.evicted_files, 2,
+            "what would go"
+        );
+        assert!(storage.get("rpm/repo/Packages/0-1.0.rpm").await.is_ok());
+        assert_eq!(counted(&index, &storage, "rpm").await, 5);
+    }
+
+    #[tokio::test]
+    async fn a_retention_pass_that_deletes_marks_the_index_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for ver in ["v1.0.0", "v2.0.0", "v3.0.0"] {
+            for ext in ["info", "mod", "zip"] {
+                let key = format!("go/github.com/user/repo/@v/{ver}.{ext}");
+                storage.put(&key, b"x").await.unwrap();
+            }
+        }
+        let rules = vec![config::RetentionRule {
+            registry: "go".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+        }];
+        let index = RepoIndex::new();
+        let before = counted(&index, &storage, "go").await;
+        assert!(before >= 3, "{before}");
+        let result = retention_pass(&storage, &locks(), &index, None, &rules, false).await;
+        assert_eq!(result.planned, 2);
+        let after = counted(&index, &storage, "go").await;
+        assert_eq!(
+            after,
+            before / 3,
+            "one version of three left: {before} -> {after}"
         );
     }
 }
