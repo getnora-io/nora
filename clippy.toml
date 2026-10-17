@@ -3,7 +3,28 @@ cognitive-complexity-threshold = 25
 too-many-arguments-threshold = 7
 type-complexity-threshold = 300
 
-
-
-
-
+# Module boundaries the compiler resolves. Each list is denied only where its module turns the
+# lint on (`#![cfg_attr(not(test), deny(...))]`), and allowed at the crate roots:
+#   * ui/ calls no Storage write: the methods of `impl Storage` that are not reads
+#     (get, get_verified, get_reader, get_range, list, list_internal, list_with_meta, stat,
+#     total_size, backend_name, pin). A new Storage method that writes goes on this list;
+#   * registry/ names no concrete backend: a handler reaches storage through Storage (ADR-3).
+# Paths, aliases (`use ... as`), `#[path]` modules and test code are resolved by the compiler,
+# which a text check of the source does not do.
+disallowed-methods = [
+  { path = "nora::storage::Storage::put", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::delete", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::copy", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::put_from_path", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::repin", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::prepare", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::health_check", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::refresh_total_size_cache", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::new_local", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::new_s3", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::new_gcs", reason = "the UI is read-only browse" },
+]
+disallowed-types = [
+  { path = "nora::storage::LocalStorage", reason = "a handler reaches storage through Storage (ADR-3)" },
+  { path = "nora::storage::ObjectStorage", reason = "a handler reaches storage through Storage (ADR-3)" },
+]

@@ -1,5 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
+// Production code only: tests may seed storage and build a backend. Handlers name no concrete storage backend (clippy.toml).
+#![cfg_attr(not(test), deny(clippy::disallowed_types))]
 
 pub(crate) mod ansible;
 mod cargo_registry;

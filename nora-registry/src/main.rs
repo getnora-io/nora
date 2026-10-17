@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
+// The storage boundary lists of clippy.toml are denied by ui/ and registry/ only.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 #![warn(clippy::large_stack_frames, clippy::large_futures)]
 // Test code is linted under `--all-targets` but is not held to the production
