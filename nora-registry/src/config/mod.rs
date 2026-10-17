@@ -1180,17 +1180,24 @@ impl Config {
             registry_min_age_verdict(self.registry_min_age_facts(rt))
                 == RegistryMinAgeVerdict::Applies
         });
+        // require_integrity asks for an integrity hash on every allowlist entry; the allowlist
+        // filter is its only reader. Without an allowlist it holds nothing, so it is refused
+        // instead of counted as a control (enforce with it alone used to start and block nothing).
+        if self.curation.require_integrity && self.curation.allowlist_path.is_none() {
+            errors.push(
+                "curation.require_integrity is set, but it applies only to allowlist entries (an integrity hash on each) and curation.allowlist_path is not set, so it would hold nothing. Set curation.allowlist_path, or unset require_integrity.".to_string(),
+            );
+        }
         if self.curation.mode == CurationMode::Enforce {
             let any_control = self.curation.allowlist_path.is_some()
                 || self.curation.blocklist_path.is_some()
                 || self.curation.min_release_age.is_some()
                 || any_registry_min_age
                 || quarantine_active
-                || !self.curation.internal_namespaces.is_empty()
-                || self.curation.require_integrity;
+                || !self.curation.internal_namespaces.is_empty();
             if !any_control {
                 errors.push(
-                    "curation.mode=enforce but no active control is configured — enforce would block nothing. Set at least one of: allowlist_path, blocklist_path, min_release_age, quarantine, internal_namespaces, or require_integrity.".to_string(),
+                    "curation.mode=enforce but no active control is configured — enforce would block nothing. Set at least one of: allowlist_path, blocklist_path, min_release_age, quarantine, or internal_namespaces.".to_string(),
                 );
             }
             if let Some(ref path) = self.curation.allowlist_path {
@@ -1661,6 +1668,44 @@ mod tests {
     fn test_basic_auth_header_empty() {
         let header = basic_auth_header("");
         assert!(header.starts_with("Basic "));
+    }
+
+    /// require_integrity is read only by the allowlist filter: alone it holds nothing, so it
+    /// stops startup in every mode and is not counted as enforce's active control.
+    #[test]
+    fn require_integrity_without_an_allowlist_is_refused() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let allowlist = dir.path().join("allow.json");
+        std::fs::write(&allowlist, r#"{"version":1,"rules":[]}"#).unwrap();
+        for mode in [
+            CurationMode::Off,
+            CurationMode::Audit,
+            CurationMode::Enforce,
+        ] {
+            let mut c = Config::default();
+            c.curation.mode = mode.clone();
+            c.curation.require_integrity = true;
+            let (_, errors) = c.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("curation.require_integrity is set")),
+                "{mode:?}: {errors:?}"
+            );
+            if mode == CurationMode::Enforce {
+                assert!(
+                    errors.iter().any(|e| e.contains("no active control")),
+                    "require_integrity alone is no control: {errors:?}"
+                );
+            }
+            c.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+            let (_, errors) = c.validate();
+            assert!(
+                !errors.iter().any(|e| e.contains("require_integrity")),
+                "{mode:?} with an allowlist: {errors:?}"
+            );
+        }
     }
 
     /// #579: a Hugging Face curation setting of its own holds nothing, so it stops startup
