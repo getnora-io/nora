@@ -886,6 +886,24 @@ where
                 break Err("redirect without a usable location");
             };
             hops.push(response.headers().clone());
+            // Before the HEAD stop below: a HEAD answers only for a walk a GET would follow, so
+            // the metadata request of a client is refused where its download would be. The log
+            // names hosts only: a CDN link carries a signature in its query.
+            if !hop_allowed(&start, &url, &next, &state.config.hf.cdn_hosts) {
+                tracing::debug!(
+                    registry = "hf",
+                    from = url.host_str().unwrap_or(""),
+                    to = next.host_str().unwrap_or(""),
+                    "hf redirect refused"
+                );
+                break Err("redirect to a host outside the upstream and its CDN");
+            }
+            tracing::debug!(
+                registry = "hf",
+                from = url.host_str().unwrap_or(""),
+                to = next.host_str().unwrap_or(""),
+                "hf redirect followed"
+            );
             if *method == Method::HEAD && origin(&next) != origin(&url) {
                 if !commit_checked {
                     if let Some(refused) = check_commit(None) {
@@ -897,9 +915,6 @@ where
                     meta: file_meta(&hops, None),
                     body: None,
                 });
-            }
-            if !hop_allowed(&start, &url, &next, &state.config.hf.cdn_hosts) {
-                break Err("redirect to a host outside the upstream and its CDN");
             }
             url = next;
             continue;
@@ -3357,15 +3372,24 @@ mod tests {
             cfg.hf.proxy = Some(uri);
             cfg.hf.cdn_hosts = vec!["cdn.example".to_string()];
         });
-        for (n, location) in forms.iter().enumerate() {
-            let resp = send(
-                &ctx.app,
-                Method::GET,
-                &format!("/hf/org/model/resolve/main/f{n}.bin"),
-                "",
-            )
-            .await;
-            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{location}");
+        // A HEAD stops at a redirect to another origin without asking it, but it answers only
+        // where a GET would go: the client's metadata request must not succeed for a file the
+        // download is refused.
+        for method in [Method::GET, Method::HEAD] {
+            for (n, location) in forms.iter().enumerate() {
+                let resp = send(
+                    &ctx.app,
+                    method.clone(),
+                    &format!("/hf/org/model/resolve/main/f{n}.bin"),
+                    "",
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "{method} {location}"
+                );
+            }
         }
         assert!(
             upstream_paths(&other).await.is_empty(),
