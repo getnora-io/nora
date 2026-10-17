@@ -2306,6 +2306,7 @@ dependencies = [
  "sha2 0.11.0",
  "socket2",
  "subtle",
+ "syn 2.0.119",
  "tar",
  "tempfile",
  "thiserror 2.0.20",

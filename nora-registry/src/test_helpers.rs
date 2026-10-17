@@ -308,12 +308,8 @@ fn build_context_with(
     // main.rs installs min-release-age too; without it every age test through this
     // context checked nothing (found by #1055: a positive control passed a release
     // dated today through a 7d gate).
-    if let Some(ref age_str) = config.curation.min_release_age {
-        if let Ok(secs) = crate::curation::parse_duration(age_str) {
-            let mut filter = crate::curation::MinReleaseAgeFilter::new(secs, age_str);
-            crate::load_registry_overrides(&mut filter, &config.curation);
-            curation_engine.add_filter(Box::new(filter));
-        }
+    if let (Some(filter), _) = crate::curation::MinReleaseAgeFilter::from_config(&config.curation) {
+        curation_engine.add_filter(Box::new(filter));
     }
 
     let enabled_registries = config.enabled_registries();
