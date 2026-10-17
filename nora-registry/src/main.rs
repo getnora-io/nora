@@ -1335,51 +1335,6 @@ fn build_signer(
     }
 }
 
-/// Load per-registry min_release_age overrides from CurationConfig into the filter.
-fn load_registry_overrides(
-    filter: &mut curation::MinReleaseAgeFilter,
-    curation_config: &config::CurationConfig,
-) {
-    let registry_overrides: &[(RegistryType, &config::RegistryCurationOverride)] = &[
-        (RegistryType::Npm, &curation_config.npm),
-        (RegistryType::PyPI, &curation_config.pypi),
-        (RegistryType::Cargo, &curation_config.cargo),
-        (RegistryType::Go, &curation_config.go),
-        (RegistryType::Docker, &curation_config.docker),
-        (RegistryType::Maven, &curation_config.maven),
-        (RegistryType::Gems, &curation_config.gems),
-        (RegistryType::Terraform, &curation_config.terraform),
-        (RegistryType::Ansible, &curation_config.ansible),
-        (RegistryType::Nuget, &curation_config.nuget),
-        (RegistryType::PubDart, &curation_config.pub_dart),
-        (RegistryType::Conan, &curation_config.conan),
-    ];
-
-    for (registry, override_cfg) in registry_overrides {
-        if let Some(ref age_str) = override_cfg.min_release_age {
-            match curation::parse_duration(age_str) {
-                Ok(secs) => {
-                    filter.add_override(*registry, secs, age_str.clone());
-                    tracing::info!(
-                        registry = %registry,
-                        min_age = %age_str,
-                        seconds = secs,
-                        "Per-registry min-release-age override loaded"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        registry = %registry,
-                        value = %age_str,
-                        error = %e,
-                        "Invalid per-registry min_release_age"
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn run_curation_validate(file: &Path) {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -1558,18 +1513,20 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         println!("Namespaces: not configured");
     }
 
-    if let Some(ref age_str) = config.curation.min_release_age {
-        match curation::parse_duration(age_str) {
-            Ok(secs) => {
-                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
-                load_registry_overrides(&mut filter, &config.curation);
-                println!("Min-release-age: {} ({}s)", age_str, secs);
-                engine.add_filter(Box::new(filter));
+    let (min_age, problems) = curation::MinReleaseAgeFilter::from_config(&config.curation);
+    for problem in &problems {
+        println!("Min-release-age: ERROR: {}", problem);
+    }
+    match min_age {
+        Some(filter) => {
+            match filter.global_only() {
+                Some((secs, value)) => println!("Min-release-age: {} ({}s)", value, secs),
+                None => println!("Min-release-age: {}", filter.summary()),
             }
-            Err(e) => println!("Min-release-age: {} (ERROR: {})", age_str, e),
+            engine.add_filter(Box::new(filter));
         }
-    } else {
-        println!("Min-release-age: not configured");
+        None if problems.is_empty() => println!("Min-release-age: not configured"),
+        None => {}
     }
 
     println!("Mode: {}", config.curation.mode);
@@ -2794,18 +2751,23 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
         info!(patterns = count, "Namespace isolation filter loaded");
     }
 
-    // Load min-release-age filter if configured
-    if let Some(ref age_str) = config.curation.min_release_age {
-        match curation::parse_duration(age_str) {
-            Ok(secs) => {
-                let mut filter = curation::MinReleaseAgeFilter::new(secs, age_str);
-                load_registry_overrides(&mut filter, &config.curation);
-                engine.add_filter(Box::new(filter));
-                info!(min_age = %age_str, seconds = secs, "Min-release-age filter loaded");
+    // Load the min-release-age filter if the global value or any per-registry one
+    // is set: a per-registry value applies on its own (#1098).
+    let (min_age, problems) = curation::MinReleaseAgeFilter::from_config(&config.curation);
+    if enforce && !problems.is_empty() {
+        return Err(format!("invalid min_release_age: {}", problems.join("; ")));
+    }
+    for problem in &problems {
+        error!(problem = %problem, "Invalid min_release_age");
+    }
+    if let Some(filter) = min_age {
+        match filter.global_only() {
+            Some((secs, value)) => {
+                info!(min_age = %value, seconds = secs, "Min-release-age filter loaded")
             }
-            Err(e) if enforce => return Err(format!("invalid min_release_age {age_str}: {e}")),
-            Err(e) => error!(value = %age_str, error = %e, "Invalid min_release_age"),
+            None => info!(min_age = %filter.summary(), "Min-release-age filter loaded"),
         }
+        engine.add_filter(Box::new(filter));
     }
 
     Ok(engine)
@@ -2985,6 +2947,93 @@ mod curation_reload_tests {
 
         let config = config_with_allowlist(CurationMode::Off, path.to_str().unwrap().into());
         assert!(build_curation_engine(&config).is_ok());
+    }
+
+    /// Ages given in seconds, keyed by registry: what the engine decides for a
+    /// release of that age.
+    fn blocked(config: &Config, registry: crate::curation::RegistryType, age_secs: i64) -> bool {
+        use crate::curation::{Decision, FilterRequest, RequestVersion};
+        let engine = build_curation_engine(config).expect("engine builds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let result = engine.evaluate(&FilterRequest {
+            registry,
+            upstream: None,
+            name: "pkg".to_string(),
+            version: RequestVersion::named(Some("1.0.0")),
+            integrity: None,
+            bypass: false,
+            publish_date: Some(now - age_secs),
+        });
+        match result.decision {
+            Decision::Block { rule, .. } => {
+                assert_eq!(rule, "min-release-age");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn enforce() -> Config {
+        Config {
+            curation: CurationConfig {
+                mode: CurationMode::Enforce,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// #1098: a per-registry minimum age without a global one is applied to its
+    /// registry, and only to it.
+    #[test]
+    fn a_per_registry_min_release_age_alone_is_applied_to_its_registry() {
+        use crate::curation::RegistryType;
+        let mut config = enforce();
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        assert!(blocked(&config, RegistryType::Npm, 3_600));
+        assert!(!blocked(&config, RegistryType::Npm, 4 * 86_400));
+        for other in [RegistryType::PyPI, RegistryType::Cargo, RegistryType::Raw] {
+            assert!(!blocked(&config, other, 3_600), "{other}");
+        }
+    }
+
+    /// With a global value, an override applies to its registry and the global
+    /// value to the others — every registry that has an override, cpan included.
+    #[test]
+    fn an_override_applies_to_its_registry_and_the_global_value_to_the_others() {
+        use crate::curation::RegistryType;
+        let mut config = enforce();
+        config.curation.min_release_age = Some("1h".to_string());
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        config.curation.cpan.min_release_age = Some("3d".to_string());
+        config.curation.pypi.min_release_age = Some("1d".to_string());
+        let two_hours = 2 * 3_600;
+        assert!(blocked(&config, RegistryType::Npm, two_hours));
+        assert!(blocked(&config, RegistryType::Cpan, two_hours));
+        assert!(blocked(&config, RegistryType::PyPI, two_hours));
+        assert!(!blocked(&config, RegistryType::PyPI, 2 * 86_400));
+        assert!(!blocked(&config, RegistryType::Cargo, two_hours));
+        assert!(blocked(&config, RegistryType::Cargo, 1_800));
+    }
+
+    /// In enforce mode an unparsable per-registry value refuses the build and
+    /// names the value, as an unparsable global one does — it is never dropped.
+    #[test]
+    fn enforce_rejects_an_unparsable_per_registry_min_release_age() {
+        // With a global value and without one: the per-registry value is read either way.
+        for global in [Some("7d"), None] {
+            let mut config = enforce();
+            config.curation.min_release_age = global.map(str::to_string);
+            config.curation.npm.min_release_age = Some("3x".to_string());
+            let err = build_curation_engine(&config).err().unwrap_or_else(|| {
+                panic!("global {global:?}: an unparsable value must refuse the build")
+            });
+            assert!(err.contains("curation.npm.min_release_age"), "{err}");
+            assert!(err.contains("3x"), "{err}");
+        }
     }
 }
 
