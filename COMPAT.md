@@ -424,9 +424,12 @@ commit, every request through NORA.
   CDN for an LFS file — so no `Location` reaches the client and every byte comes through NORA.
   A redirect is followed only to the upstream's origin or, over https, to a CDN host: `[hf]
   cdn_hosts` / `NORA_HF_CDN_HOSTS` (comma-separated), each entry and the names under it, default
-  `hf.co` and `huggingface.co` (the Hub's CDN, `us.aws.cdn.hf.co`, is one); an IP address counts
-  only as written, and a downgrade to http never. A redirect anywhere else is a 502 before that
-  host is asked.
+  `hf.co` and `huggingface.co` (the Hub's CDN, `us.aws.cdn.hf.co`, is one). An IP address
+  matches as an address (`::1` and `0:0:0:0:0:0:0:1` are one), never as a suffix. http to a CDN
+  host is followed only along a walk that has been http from an http upstream on (a test or a
+  LAN mirror), never down from an https hop. An entry admits every port of its host, so
+  `localhost` or an internal name does not belong in a production list. A redirect anywhere else
+  is a 502 before that host is asked, and does not count toward opening the circuit breaker.
 - A revision or path that decodes to a walk out of the repository — `main%2F..%2Fother`, `%5C..`
   — is refused before the upstream is asked; `refs%2Fpr%2F1` still goes as one segment.
 - The Hub's resolve answer is asked on every download: it names the commit, which curation reads,
