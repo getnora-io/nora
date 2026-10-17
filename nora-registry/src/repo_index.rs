@@ -306,13 +306,11 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
             // tag manifest (`manifests/<tag>.json`) and a content-addressed
             // `manifests/sha256:<digest>.json`; counting both double-counted
             // every image (#588). Count only the tag form.
-            if parts[boundary] == "manifests" && ends_with_ci(key, ".json") {
-                if let Some(reference) = parts.get(boundary + 1) {
-                    let reference = reference.trim_end_matches(".json");
-                    if !reference.starts_with("sha256:") {
-                        entry.0 += 1;
-                    }
-                }
+            if parts[boundary] == "manifests"
+                && parts.len() == boundary + 2
+                && crate::registry::docker::tag_from_manifest_file(parts[boundary + 1]).is_some()
+            {
+                entry.0 += 1;
             }
         }
     }
@@ -1202,6 +1200,20 @@ mod tests {
         let s = Storage::new_local(dir.path().to_str().unwrap());
         s.put("docker/img/manifests/v1.json", b"{}").await.unwrap();
         s.put("docker/img/manifests/v1.stats.json", b"{}")
+            .await
+            .unwrap();
+        let repos = build_docker_index(&s).await.expect("index built");
+        assert_eq!(repos[0].versions, 1);
+    }
+
+    /// only tags count as versions: a sha512 digest copy of a manifest is not one.
+    #[tokio::test]
+    async fn docker_index_counts_only_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::new_local(dir.path().to_str().unwrap());
+        s.put("docker/img/manifests/v1.json", b"{}").await.unwrap();
+        let digest = format!("sha512:{}", "a".repeat(128));
+        s.put(&format!("docker/img/manifests/{digest}.json"), b"{}")
             .await
             .unwrap();
         let repos = build_docker_index(&s).await.expect("index built");
