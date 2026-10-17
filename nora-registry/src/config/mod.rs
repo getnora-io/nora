@@ -132,6 +132,36 @@ fn key_path(path: &serde_ignored::Path<'_>) -> String {
     segments.join(".")
 }
 
+/// The per-registry curation variables a Hugging Face section would read if there were one.
+fn hf_curation_env_vars() -> [&'static str; 3] {
+    [
+        "NORA_CURATION_HF_MIN_RELEASE_AGE",
+        "NORA_CURATION_HF_QUARANTINE",
+        "NORA_CURATION_HF_QUARANTINE_TTL",
+    ]
+}
+
+/// Why a Hugging Face curation setting is refused: it would hold nothing.
+fn hf_curation_refusal(setting: &str) -> String {
+    format!(
+        "{setting} cannot apply: Hugging Face has no curation section of its own (a Hub commit has no publish date NORA reads, and hf has no quarantine path), so it would hold nothing. Remove it; the allowlist and blocklist hold Hugging Face models by repository id and commit. (#579)"
+    )
+}
+
+/// `[curation.hf]` in a config file: refused, not reported as an unknown key and ignored.
+fn refuse_hf_curation_keys(path: &str, unknown: &[String]) -> Result<(), ConfigLoadError> {
+    let refused: Vec<String> = unknown
+        .iter()
+        .filter(|k| *k == "curation.hf" || k.starts_with("curation.hf."))
+        .map(|k| format!("{path}: {}", hf_curation_refusal(k)))
+        .collect();
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigLoadError::Invalid(refused))
+    }
+}
+
 /// Reports the unknown keys of the config file at `path`: one warning listing them all,
 /// or, when `strict`, an error. Returns them for the caller.
 fn surface_unknown_keys(
@@ -1260,6 +1290,13 @@ impl Config {
                 "curation.min_release_age cannot hold the Hugging Face proxy: a Hub commit has no publish date NORA reads, and hf has no quarantine path. Unset curation.min_release_age, or disable [hf]. (#579)".to_string(),
             );
         }
+        // Hugging Face has no curation section of its own, so NORA_CURATION_HF_* is read by
+        // nothing: refused rather than ignored, as [curation.hf] is at load.
+        for var in hf_curation_env_vars() {
+            if env::var(var).is_ok() {
+                errors.push(hf_curation_refusal(var));
+            }
+        }
 
         // 9. Docker upstream prefix validation
         {
@@ -1370,6 +1407,7 @@ impl Config {
                     path: config_path.clone(),
                     source,
                 })?;
+            refuse_hf_curation_keys(&config_path, &unknown)?;
             unknown_keys = surface_unknown_keys(&config_path, unknown, strict)?;
             tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
             cfg
@@ -1377,6 +1415,7 @@ impl Config {
             match fs::read_to_string(fallback) {
                 Ok(content) => match parse_config(&content) {
                     Ok((cfg, unknown)) => {
+                        refuse_hf_curation_keys(fallback, &unknown)?;
                         unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
                         tracing::info!(path = %fallback, "Loaded config");
                         cfg
@@ -1622,6 +1661,72 @@ mod tests {
     fn test_basic_auth_header_empty() {
         let header = basic_auth_header("");
         assert!(header.starts_with("Basic "));
+    }
+
+    /// #579: a Hugging Face curation setting of its own holds nothing, so it stops startup
+    /// instead of being ignored — the env variables in validate, `[curation.hf]` at load.
+    #[test]
+    fn a_hugging_face_curation_setting_is_refused_not_ignored() {
+        let _lock = env_lock();
+        for var in hf_curation_env_vars() {
+            std::env::set_var(var, "3d");
+            let (_, errors) = Config::default().validate();
+            std::env::remove_var(var);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with(var) && e.contains("cannot apply")),
+                "{var}: {errors:?}"
+            );
+        }
+        assert!(
+            !Config::default()
+                .validate()
+                .1
+                .iter()
+                .any(|e| e.contains("NORA_CURATION_HF_")),
+            "nothing set, nothing refused"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, body, refused) in [
+            (
+                "age.toml",
+                "[curation.hf]\nmin_release_age = \"3d\"\n",
+                true,
+            ),
+            (
+                "quarantine.toml",
+                "[curation.hf]\nquarantine = \"enforce\"\n",
+                true,
+            ),
+            (
+                "npm.toml",
+                "[curation.npm]\nmin_release_age = \"3d\"\n[curation]\nquarantine = \"observe\"\n",
+                false,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let loaded = Config::load_from(
+                Some(path.to_string_lossy().into_owned()),
+                NO_FALLBACK,
+                false,
+            );
+            match (&loaded, refused) {
+                (Err(ConfigLoadError::Invalid(errors)), true) => assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("curation.hf cannot apply")),
+                    "{name}: {errors:?}"
+                ),
+                (Ok(_), false) => {}
+                _ => panic!(
+                    "{name}: refused={refused}, got {:?}",
+                    loaded.as_ref().map(|_| ())
+                ),
+            }
+        }
     }
 
     /// #1055: the npm `proxies` checks are part of `validate()`, private hosts feed the
