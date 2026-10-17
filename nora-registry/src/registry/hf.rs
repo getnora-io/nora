@@ -721,19 +721,23 @@ enum FileFetch {
     Failed(&'static str),
 }
 
-/// Scheme, host and port: a redirect within one origin is the Hub's own, one to another
-/// origin leaves it (the CDN).
-/// Whether a file request's walk may follow a redirect from the upstream `start` to `next`:
-/// the same origin, or a host of `cdn_hosts` — the entry itself or a name under it, an IP
-/// address only as written — over https, or over http when the upstream itself is http (a
-/// test or a LAN mirror), never as a downgrade. The Hub sends LFS files to its CDN; anything
-/// else a redirect names (another site, a metadata or loopback address) is not asked.
-fn hop_allowed(start: &reqwest::Url, next: &reqwest::Url, cdn_hosts: &[String]) -> bool {
+/// Whether a file request's walk, at `current` after starting at the upstream `start`, may
+/// follow a redirect to `next`: the upstream's own origin, or a host of `cdn_hosts` — the
+/// entry itself or a name under it, an IP address as that address — over https, or over http
+/// only along a walk that has been http from an http upstream on (a test or a LAN mirror):
+/// never down from an https hop. The Hub sends LFS files to its CDN; anything else a redirect
+/// names (another site, a metadata or loopback address) is not asked.
+fn hop_allowed(
+    start: &reqwest::Url,
+    current: &reqwest::Url,
+    next: &reqwest::Url,
+    cdn_hosts: &[String],
+) -> bool {
     if origin(next) == origin(start) {
         return true;
     }
-    let scheme_ok =
-        next.scheme() == "https" || (start.scheme() == "http" && next.scheme() == "http");
+    let scheme_ok = next.scheme() == "https"
+        || (next.scheme() == "http" && start.scheme() == "http" && current.scheme() == "http");
     let Some(host) = next.host_str() else {
         return false;
     };
@@ -756,6 +760,8 @@ fn hop_allowed(start: &reqwest::Url, next: &reqwest::Url, cdn_hosts: &[String]) 
     scheme_ok && listed
 }
 
+/// Scheme, host and port: a redirect within one origin is the Hub's own, one to another
+/// origin leaves it (the CDN).
 fn origin(url: &reqwest::Url) -> (String, Option<String>, Option<u16>) {
     (
         url.scheme().to_string(),
@@ -884,7 +890,7 @@ where
                     body: None,
                 });
             }
-            if !hop_allowed(&start, &next, &state.config.hf.cdn_hosts) {
+            if !hop_allowed(&start, &url, &next, &state.config.hf.cdn_hosts) {
                 break Err("redirect to a host outside the upstream and its CDN");
             }
             url = next;
@@ -3213,6 +3219,76 @@ mod tests {
     /// A file redirect leaves the upstream only for its CDN: with the default `cdn_hosts`
     /// the mock CDN (another port of 127.0.0.1) is not one, so the download is a 502 and the
     /// mock never sees a request (a redirect to any http host used to be followed).
+    /// A redirect NORA refuses is the upstream answering: it does not count toward opening
+    /// the breaker, which would shut every hf request out after a few refusals.
+    #[tokio::test]
+    async fn refused_redirects_do_not_open_the_breaker() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let uri = up.uri();
+        // The mock CDN is not listed: every LFS download is a refused redirect.
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        for _ in 0..4 {
+            let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the breaker opened on refusals"
+        );
+        assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+    }
+
+    /// The walk is judged against where it started: a CDN hop that sends the request back to
+    /// the upstream's own origin is followed, though the upstream's host is not a CDN host.
+    #[tokio::test]
+    async fn a_walk_back_to_the_upstream_origin_through_the_cdn_is_followed() {
+        let up = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        // The upstream as `localhost`, the CDN as `127.0.0.1`: only the CDN is listed.
+        let upstream = up.uri().replace("127.0.0.1", "localhost");
+        Mock::given(path("/org/model/resolve/main/f.bin"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/x", cdn.uri()).as_str()),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/x"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{upstream}/final").as_str()),
+            )
+            .mount(&cdn)
+            .await;
+        Mock::given(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .mount(&up)
+            .await;
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(upstream);
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/f.bin",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.to_vec(), b"ok".to_vec());
+    }
+
     #[tokio::test]
     async fn a_redirect_off_the_upstream_and_its_cdn_is_not_followed() {
         let cdn = cdn_with_weights().await;
@@ -3255,7 +3331,7 @@ mod tests {
             ("https://[::1]/x", false),
             ("http://huggingface.co/x", false),
         ] {
-            assert_eq!(hop_allowed(&hub, &url(next), &cdn), allowed, "{next}");
+            assert_eq!(hop_allowed(&hub, &hub, &url(next), &cdn), allowed, "{next}");
         }
         // An http upstream (a test or a LAN mirror) may go to a listed http host; an IP
         // address counts only as written.
@@ -3263,26 +3339,62 @@ mod tests {
         let listed = vec!["127.0.0.1".to_string()];
         assert!(hop_allowed(
             &lan,
+            &lan,
             &url("http://127.0.0.1:7001/cdn/f"),
             &listed
         ));
         assert!(!hop_allowed(
+            &lan,
             &lan,
             &url("http://127.0.0.2:7001/cdn/f"),
             &listed
         ));
         assert!(!hop_allowed(
             &lan,
+            &lan,
             &url("http://127.0.0.1:7001/cdn/f"),
             &cdn
         ));
-        assert!(hop_allowed(&lan, &url("http://127.0.0.1:7000/other"), &[]));
+        assert!(hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.1:7000/other"),
+            &[]
+        ));
         // An address is no name: a listed `0.0.1` holds no `127.0.0.1` under it.
         let suffix = vec!["0.0.1".to_string()];
         assert!(!hop_allowed(
             &lan,
+            &lan,
             &url("http://127.0.0.1:7001/cdn/f"),
             &suffix
+        ));
+        // An address is one address however it is written, and an IPv6 host is read without
+        // its brackets.
+        let v6 =
+            |listed: &str, next: &str| hop_allowed(&hub, &hub, &url(next), &[listed.to_string()]);
+        assert!(v6("::1", "https://[::1]/x"));
+        assert!(v6("0:0:0:0:0:0:0:1", "https://[::1]/x"));
+        assert!(v6("::1", "https://[0:0:0:0:0:0:0:1]/x"));
+        assert!(!v6("::1", "https://[::2]/x"));
+        // http to a CDN host only along an http walk: never down from an https hop, not even
+        // from an http upstream through an https CDN.
+        let https_hop = url("https://us.aws.cdn.hf.co/x");
+        let plain = url("http://lan.hf.co/x");
+        assert!(hop_allowed(&lan, &lan, &plain, &cdn));
+        assert!(!hop_allowed(&lan, &https_hop, &plain, &cdn));
+        assert!(hop_allowed(
+            &lan,
+            &https_hop,
+            &url("https://other.hf.co/x"),
+            &cdn
+        ));
+        // Back to the upstream's own origin is the upstream: allowed from any hop.
+        assert!(hop_allowed(
+            &lan,
+            &https_hop,
+            &url("http://127.0.0.1:7000/final"),
+            &[]
         ));
     }
 

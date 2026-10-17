@@ -4087,18 +4087,37 @@ proxies = [
             HfConfig::default().cdn_hosts,
             vec!["hf.co", "huggingface.co"]
         );
-        std::env::set_var("NORA_HF_CDN_HOSTS", " CDN.Example.com, 10.0.0.5 ,");
+        // Trimmed and lowercased, a blank item dropped wherever it is.
+        std::env::set_var("NORA_HF_CDN_HOSTS", " CDN.Example.com, ,10.0.0.5 ,");
         let mut config = Config::default();
         config.hf.apply_env_overrides();
         std::env::remove_var("NORA_HF_CDN_HOSTS");
         assert_eq!(config.hf.cdn_hosts, vec!["cdn.example.com", "10.0.0.5"]);
         assert!(config.hf.invalid_cdn_hosts().is_empty());
+        for good in [
+            "cdn-lfs.example",
+            "x1.hf.co",
+            "hf.co",
+            "127.0.0.1",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+        ] {
+            let mut config = Config::default();
+            config.hf.cdn_hosts = vec![good.to_string()];
+            assert!(config.hf.invalid_cdn_hosts().is_empty(), "{good:?}");
+        }
+        // A TOML entry is taken as written: a capital letter would match no host, a trailing
+        // dot neither, so both are errors rather than entries that silently hold nothing.
         for bad in [
             "https://cdn.example.com",
             "cdn.example.com:443",
             "cdn.example.com/x",
             "*.hf.co",
             ".hf.co",
+            "hf.co.",
+            "HF.co",
+            "[::1]",
+            "cdn example.com",
             "",
         ] {
             let mut config = Config::default();
