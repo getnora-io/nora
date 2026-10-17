@@ -741,23 +741,31 @@ fn hop_allowed(
     let Some(host) = next.host_str() else {
         return false;
     };
+    scheme_ok && host_listed(host, cdn_hosts)
+}
+
+/// Whether a URL's host is listed in `cdn_hosts`. An address — IPv6 read without its brackets —
+/// is listed when an entry is that address, however either is written; a name when its labels
+/// end with every label of an entry (`us.aws.cdn.hf.co` under `hf.co`, `cdn.evilhf.co` not).
+/// Labels, not string suffixes, so no form of a look-alike passes by where a dot falls.
+fn host_listed(host: &str, cdn_hosts: &[String]) -> bool {
     let host = host
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
-    let listed = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        cdn_hosts
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return cdn_hosts
             .iter()
-            .any(|h| h.parse::<std::net::IpAddr>().ok() == Some(ip))
-    } else {
-        cdn_hosts.iter().any(|h| {
-            host == *h
-                || host
-                    .strip_suffix(h.as_str())
-                    .is_some_and(|rest| rest.ends_with('.'))
+            .any(|entry| entry.parse::<std::net::IpAddr>().ok() == Some(ip));
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    cdn_hosts
+        .iter()
+        .filter(|entry| entry.parse::<std::net::IpAddr>().is_err())
+        .any(|entry| {
+            let tail: Vec<&str> = entry.split('.').collect();
+            labels.len() >= tail.len() && labels[labels.len() - tail.len()..] == tail[..]
         })
-    };
-    scheme_ok && listed
 }
 
 /// Scheme, host and port: a redirect within one origin is the Hub's own, one to another
@@ -3308,6 +3316,228 @@ mod tests {
         let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+    }
+
+    /// Every form a `Location` can name another host in is judged as the address it joins to:
+    /// absolute, without a scheme, with a backslash. Each is a 502 and the host is not asked.
+    #[tokio::test]
+    async fn every_form_of_a_redirect_to_an_unlisted_host_is_refused() {
+        let up = MockServer::start().await;
+        let other = MockServer::start().await;
+        let port = other.address().port();
+        let forms = [
+            format!("http://localhost:{port}/x"),
+            format!("//localhost:{port}/x"),
+            format!("/\\localhost:{port}/x"),
+            format!("\\\\localhost:{port}\\x"),
+            format!("http:\\\\localhost:{port}/x"),
+        ];
+        // Each form names the other host once joined to the hop it came from, as NORA joins it.
+        let hop =
+            reqwest::Url::parse(&format!("{}/org/model/resolve/main/f.bin", up.uri())).unwrap();
+        for location in &forms {
+            let next = hop.join(location).unwrap();
+            assert_eq!(
+                (next.host_str(), next.port()),
+                (Some("localhost"), Some(port)),
+                "{location}"
+            );
+        }
+        for (n, location) in forms.iter().enumerate() {
+            Mock::given(path(format!("/org/model/resolve/main/f{n}.bin")))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("location", location.as_str()),
+                )
+                .mount(&up)
+                .await;
+        }
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.hf.cdn_hosts = vec!["cdn.example".to_string()];
+        });
+        for (n, location) in forms.iter().enumerate() {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/hf/org/model/resolve/main/f{n}.bin"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{location}");
+        }
+        assert!(
+            upstream_paths(&other).await.is_empty(),
+            "the unlisted host was asked"
+        );
+    }
+
+    /// `host_listed` on a grid of hosts and lists, against the rule written another way: an
+    /// address is listed when a listed address equals it; a name when it is an entry, or ends
+    /// with a dot and the entry. The empty list lists nothing.
+    #[test]
+    fn host_listed_agrees_with_the_rule_on_every_host_and_list() {
+        fn rule(host: &str, list: &[&str]) -> bool {
+            let bare = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            match bare.parse::<std::net::IpAddr>() {
+                Ok(ip) => list.iter().any(|e| e.parse::<std::net::IpAddr>() == Ok(ip)),
+                Err(_) => list
+                    .iter()
+                    .filter(|e| e.parse::<std::net::IpAddr>().is_err())
+                    .any(|e| bare == *e || bare.ends_with(&format!(".{e}"))),
+            }
+        }
+        let lists: [&[&str]; 9] = [
+            &[],
+            &["hf.co"],
+            &["hf.co", "huggingface.co"],
+            &["co"],
+            &["a.b.c"],
+            &["127.0.0.1"],
+            &["::1"],
+            &["0:0:0:0:0:0:0:1"],
+            &["0.0.1", "1"],
+        ];
+        let hosts = [
+            "hf.co",
+            "HF.CO",
+            "us.aws.cdn.hf.co",
+            "cdn.evilhf.co",
+            "evilhf.co",
+            "xhf.co",
+            "hf.co.evil.example",
+            "hf.com",
+            "co",
+            "huggingface.co",
+            "cdn-lfs.huggingface.co",
+            "a.b.c",
+            "x.a.b.c",
+            "b.c",
+            "xa.b.c",
+            "127.0.0.1",
+            "127.0.0.2",
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]",
+            "[::2]",
+            "169.254.169.254",
+            "0.0.0.1",
+            "10.0.0.1",
+        ];
+        let mut listed = 0;
+        for list in lists {
+            let entries: Vec<String> = list.iter().map(|e| e.to_string()).collect();
+            for host in hosts {
+                let want = rule(host, list);
+                listed += usize::from(want);
+                assert_eq!(host_listed(host, &entries), want, "{host} in {list:?}");
+            }
+        }
+        // The grid holds both answers; the look-alikes the review found are not listed.
+        assert_eq!(listed, 24);
+        assert!(!host_listed("cdn.evilhf.co", &["hf.co".to_string()]));
+        assert!(!host_listed("169.254.169.254", &[]));
+    }
+
+    /// `hop_allowed` on every start, current hop and next address of a grid, against its rule:
+    /// the upstream's own origin from any hop; else a listed host, over https, or over http only
+    /// when neither the start nor the current hop is https.
+    #[test]
+    fn hop_allowed_follows_its_rule_on_every_walk() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let list = vec!["hf.co".to_string(), "127.0.0.5".to_string()];
+        let starts = [
+            "https://huggingface.co/o/m/resolve/main/f",
+            "http://127.0.0.1:7000/f",
+        ];
+        let currents = ["", "https://us.aws.cdn.hf.co/x", "http://lan.hf.co/x"];
+        let nexts = [
+            "https://huggingface.co/api/resolve-cache/x",
+            "http://huggingface.co/x",
+            "https://huggingface.co:8443/x",
+            "http://127.0.0.1:7000/final",
+            "http://127.0.0.1:7001/x",
+            "https://us.aws.cdn.hf.co/x",
+            "http://us.aws.cdn.hf.co/x",
+            "https://cdn.evilhf.co/x",
+            "http://evil.example/x",
+            "https://127.0.0.5/x",
+            "http://127.0.0.5:9000/x",
+            "https://169.254.169.254/x",
+        ];
+        let mut allowed = 0;
+        for start in starts.map(url) {
+            for current in currents {
+                let current = if current.is_empty() {
+                    start.clone()
+                } else {
+                    url(current)
+                };
+                for next in nexts.map(url) {
+                    let home = (next.scheme(), next.host_str(), next.port_or_known_default())
+                        == (
+                            start.scheme(),
+                            start.host_str(),
+                            start.port_or_known_default(),
+                        );
+                    let named = host_listed(next.host_str().unwrap(), &list);
+                    let plain_walk = start.scheme() == "http" && current.scheme() == "http";
+                    let want = home || (named && (next.scheme() == "https" || plain_walk));
+                    allowed += usize::from(want);
+                    assert_eq!(
+                        hop_allowed(&start, &current, &next, &list),
+                        want,
+                        "{start} via {current} to {next}"
+                    );
+                }
+            }
+        }
+        assert_eq!(allowed, 22);
+    }
+
+    /// `plain_segment` on every segment of up to four components, each joined by `/` or `\`,
+    /// against its rule: not empty, and no component empty, `.` or `..`.
+    #[test]
+    fn plain_segment_agrees_with_the_rule_on_every_segment() {
+        fn rule(segment: &str) -> bool {
+            let mut ok = !segment.is_empty();
+            let mut part = String::new();
+            for c in segment.chars().chain(std::iter::once('/')) {
+                if c == '/' || c == '\\' {
+                    ok &= !(part.is_empty() || part == "." || part == "..");
+                    part.clear();
+                } else {
+                    part.push(c);
+                }
+            }
+            ok
+        }
+        let parts = ["a", "", ".", "..", "x.y", "...", "a..b"];
+        // Every sequence of one to four parts, each gap a `/` or a `\`.
+        let mut segments: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+        let mut last = segments.clone();
+        for _ in 1..4 {
+            last = last
+                .iter()
+                .flat_map(|base| {
+                    parts
+                        .iter()
+                        .flat_map(move |p| [format!("{base}/{p}"), format!("{base}\\{p}")])
+                })
+                .collect();
+            segments.extend(last.iter().cloned());
+        }
+        let mut plain = 0;
+        for segment in &segments {
+            let want = rule(segment);
+            plain += usize::from(want);
+            assert_eq!(plain_segment(segment), want, "{segment:?}");
+        }
+        assert_eq!(segments.len(), 7 + 98 + 1372 + 19208);
+        assert!(plain > 0 && plain < segments.len());
     }
 
     #[test]
