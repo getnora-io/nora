@@ -230,6 +230,17 @@ pub static NAMESPACE_SCOPE_DECISIONS: LazyLock<IntCounterVec> = LazyLock::new(||
 });
 
 /// Current number of artifacts by registry (gauge — rises and falls with GC)
+/// Configurations that rely on a default a later release turns into a startup error, by reason:
+/// 1 while the running configuration does (#1135), so an alert can see what a log line cannot.
+pub static CONFIG_DEPRECATED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "nora_config_deprecated",
+        "1 while the running configuration relies on a default that a later release refuses, by reason",
+        &["reason"]
+    )
+    .expect("failed to create CONFIG_DEPRECATED metric at startup")
+});
+
 pub static ARTIFACTS_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_artifacts_total",
