@@ -261,7 +261,23 @@ fn the_served_hub_client_walks_redirects_itself() {
         "a".repeat(64)
     ));
     let proxy = format!("http://127.0.0.1:{}", hub.port);
-    let server = serve(&[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", &proxy)]);
+    // Without its CDN listed the walk is refused, for a HEAD as for a GET (#1128), and the
+    // CDN is never asked; listed, the HEAD stops at the 302 and answers from it.
+    let refusing = serve(&[("NORA_HF_ENABLED", "true"), ("NORA_HF_PROXY", &proxy)]);
+    let refused = head_of(
+        refusing.port,
+        "HEAD",
+        "/hf/org/model/resolve/main/model.safetensors",
+    )
+    .to_lowercase();
+    assert!(refused.starts_with("http/1.1 502"), "{refused}");
+    drop(refusing);
+    hub.seen.lock().unwrap().clear();
+    let server = serve(&[
+        ("NORA_HF_ENABLED", "true"),
+        ("NORA_HF_PROXY", &proxy),
+        ("NORA_HF_CDN_HOSTS", "127.0.0.1"),
+    ]);
     let head = head_of(
         server.port,
         "HEAD",
