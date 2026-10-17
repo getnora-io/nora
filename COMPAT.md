@@ -422,6 +422,17 @@ commit, every request through NORA.
 
 - NORA follows the Hub's redirects itself — the relative 307 to its resolve cache, the 302 to its
   CDN for an LFS file — so no `Location` reaches the client and every byte comes through NORA.
+  A redirect is followed only to the upstream's origin or, over https, to a CDN host: `[hf]
+  cdn_hosts` / `NORA_HF_CDN_HOSTS` (comma-separated), each entry and the names under it, default
+  `hf.co` and `huggingface.co` (the Hub's CDN, `us.aws.cdn.hf.co`, is one). An IP address
+  matches as an address (`::1` and `0:0:0:0:0:0:0:1` are one), never as a suffix. http to a CDN
+  host is followed only along a walk that has been http from an http upstream on (a test or a
+  LAN mirror), never down from an https hop. An entry admits every port of its host, so
+  `localhost` or an internal name does not belong in a production list. A redirect anywhere else
+  is a 502 before that host is asked, for a HEAD as for a GET, and does not count toward opening
+  the circuit breaker.
+- A revision or path that decodes to a walk out of the repository — `main%2F..%2Fother`, `%5C..`
+  — is refused before the upstream is asked; `refs%2Fpr%2F1` still goes as one segment.
 - The Hub's resolve answer is asked on every download: it names the commit, which curation reads,
   and the file's digest. `main` therefore never goes stale, and the bytes come from the cache when
   NORA already holds that digest.
@@ -429,7 +440,9 @@ commit, every request through NORA.
   an LFS file, the git blob sha1 of a regular one), under `hf/models/{repo}/blobs/{digest}`. A weight
   file that does not change across commits is downloaded once.
 - On the way in, a file is checked against that digest with its last chunk held back until it
-  matches: a corrupt file ends one chunk short and is not stored. A file read back from the cache
+  matches: a corrupt file ends one chunk short and is not stored. The client sees the transfer end
+  before the file is complete (for a file of one chunk, before any header): a streamed answer cannot
+  change its status once it has begun, so there is no `502`. A file read back from the cache
   is checked against its pin the same way, and a copy that fails is dropped, so the next download
   fetches it again; a range read from the cache is not checked (a part cannot be rehashed), as for
   every format.
