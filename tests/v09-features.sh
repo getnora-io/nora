@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NORA v0.9.0 Feature Polygon
+# NORA v0.9.0 Feature Suite
 # Tests all 7 new features from v0.9.0 release with edge cases.
 # Exit code 0 = all passed, non-zero = failures.
 
@@ -99,7 +99,7 @@ start_nora_with_config() {
     return 1
 }
 
-echo "=== NORA v0.9.0 Feature Polygon ==="
+echo "=== NORA v0.9.0 Feature Suite ==="
 echo "Binary:  $NORA_BIN"
 echo "Port:    $PORT"
 echo "Storage: $STORAGE_DIR"

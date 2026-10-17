@@ -5344,7 +5344,7 @@ mod multi_upstream_tests {
     /// Once a scope has an owner, a copy cached from anywhere else — a squatter on
     /// the public registry, a cache from before the scope was owned, or bytes that
     /// replaced the owner's copy under its record (an older release after a
-    /// rollback, polygon U9) — is never served: not as a cache hit, not via Range,
+    /// rollback) — is never served: not as a cache hit, not via Range,
     /// not as a stale fallback. The owner's copy replaces it.
     #[tokio::test]
     async fn a_foreign_cached_copy_of_an_owned_scope_is_never_served() {
