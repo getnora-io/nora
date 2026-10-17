@@ -253,8 +253,28 @@ async fn gc_pass(
     result
 }
 
+/// The line the GC scheduler logs when a pass ends. Files evicted by
+/// `[gc] proxy_cache_max_bytes` are counted apart from the orphans: they are neither in
+/// `deleted` nor in its `bytes_freed`.
+fn gc_done_line(result: &gc::GcResult) -> String {
+    let eviction = &result.proxy_cache_eviction;
+    format!(
+        "GC scheduler: done in {:.1}s — {} orphans ({} deleted, {} bytes freed), {} evicted from the proxy cache ({} bytes freed), {} metadata phantoms, {} skipped (grace)",
+        result.duration_secs,
+        result.orphaned,
+        result.deleted,
+        result.bytes_freed,
+        eviction.evicted_files,
+        eviction.bytes_freed,
+        result.metadata_phantoms_removed,
+        result.skipped_recent
+    )
+}
+
 /// One retention pass of the scheduler; a pass that deleted keys marks every repository
-/// index stale, as `gc_pass` does.
+/// index stale, as `gc_pass` does. A pass that found versions to delete leaves one audit
+/// entry: `retention-apply` when it deleted them, `retention-dry-run` when `dry_run` only
+/// planned it, so the trail never records a deletion that did not happen.
 async fn retention_pass(
     storage: &Storage,
     publish_locks: &PublishLocks,
@@ -262,12 +282,54 @@ async fn retention_pass(
     signer: Option<&signing::RepoSigner>,
     rules: &[config::RetentionRule],
     dry_run: bool,
+    audit: &AuditLog,
 ) -> retention::RetentionResult {
     let result = retention::run_retention(storage, publish_locks, signer, rules, dry_run).await;
     if !dry_run && result.deleted_keys > 0 {
         repo_index.invalidate_all();
     }
+    if result.planned > 0 {
+        audit.log(audit::AuditEntry::new(
+            if dry_run {
+                "retention-dry-run"
+            } else {
+                "retention-apply"
+            },
+            "scheduler",
+            &format!("{} versions", result.planned),
+            "*",
+            &format!(
+                "keys={} bytes_freed={} duration={:.1}s",
+                result.deleted_keys, result.bytes_freed, result.duration_secs
+            ),
+        ));
+    }
     result
+}
+
+/// Set `nora_artifacts_total` and the per-registry `nora_storage_bytes` from the
+/// repository index, first rebuilding each enabled registry's index that a restart, a
+/// write or a cleanup pass marked stale — the read `/api/ui/stats` does. An index nothing
+/// touched since its last rebuild is served from memory without a storage round-trip; a
+/// stale one costs one listing of its registry, at most once per call.
+async fn refresh_artifact_gauges(
+    repo_index: &RepoIndex,
+    storage: &Storage,
+    enabled: &HashSet<RegistryType>,
+) {
+    for rt in enabled {
+        let _ = repo_index.get(rt.as_str(), storage).await;
+    }
+    for (rt, count) in repo_index.counts() {
+        metrics::ARTIFACTS_TOTAL
+            .with_label_values(&[rt.as_str()])
+            .set(count as i64);
+    }
+    for (rt, bytes) in repo_index.sizes() {
+        metrics::STORAGE_BYTES
+            .with_label_values(&[rt.as_str()])
+            .set(bytes as i64);
+    }
 }
 
 /// Get or create a per-key publish lock for TOCTOU protection.
@@ -2399,25 +2461,13 @@ async fn run_server(mut config: Config, storage: Storage) {
                         signer.as_deref(),
                         &rules,
                         dry_run,
+                        &audit,
                     )
                     .await;
                     info!(
                         "Retention scheduler: done in {:.1}s — {} versions, {} keys, {} bytes freed",
                         result.duration_secs, result.planned, result.deleted_keys, result.bytes_freed
                     );
-
-                    if result.planned > 0 {
-                        audit.log(audit::AuditEntry::new(
-                            "retention-apply",
-                            "scheduler",
-                            &format!("{} versions", result.planned),
-                            "*",
-                            &format!(
-                                "keys={} bytes_freed={} duration={:.1}s",
-                                result.deleted_keys, result.bytes_freed, result.duration_secs
-                            ),
-                        ));
-                    }
                 }
                 .boxed()
             }),
@@ -2447,12 +2497,17 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let repo_index = repo_index.clone();
                 async move {
                     info!("GC scheduler: starting periodic run");
-                    let result = gc_pass(&storage, &publish_locks, &repo_index, dry_run, grace_secs, npm_is_proxy, proxy_cache_max_bytes).await;
-                    info!(
-                        "GC scheduler: done in {:.1}s — {} orphans, {} deleted, {} bytes freed, {} metadata phantoms, {} skipped (grace)",
-                        result.duration_secs, result.orphaned, result.deleted, result.bytes_freed,
-                        result.metadata_phantoms_removed, result.skipped_recent
-                    );
+                    let result = gc_pass(
+                        &storage,
+                        &publish_locks,
+                        &repo_index,
+                        dry_run,
+                        grace_secs,
+                        npm_is_proxy,
+                        proxy_cache_max_bytes,
+                    )
+                    .await;
+                    info!("{}", gc_done_line(&result));
                 }
                 .boxed()
             }),
@@ -2581,18 +2636,20 @@ async fn run_server(mut config: Config, storage: Storage) {
                 metrics::STORAGE_BYTES
                     .with_label_values(&["total"])
                     .set(metrics_state.storage.total_size().await as i64);
-                // Per-registry artifact counts + logical bytes from the cached index,
-                // plus process uptime (#446). The "total" storage_bytes label above is
-                // the full physical footprint; per-registry is summed artifact size.
-                for (rt, count) in metrics_state.repo_index.counts() {
-                    metrics::ARTIFACTS_TOTAL
-                        .with_label_values(&[rt.as_str()])
-                        .set(count as i64);
-                }
-                for (rt, bytes) in metrics_state.repo_index.sizes() {
-                    metrics::STORAGE_BYTES
-                        .with_label_values(&[rt.as_str()])
-                        .set(bytes as i64);
+                // Per-registry artifact counts + logical bytes from the index, plus
+                // process uptime (#446). The "total" storage_bytes label above is the
+                // full physical footprint; per-registry is summed artifact size.
+                // A panic in an index builder must not end this loop: it also flushes
+                // tokens and expires upload sessions.
+                let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
+                    &metrics_state.repo_index,
+                    &metrics_state.storage,
+                    &metrics_state.enabled_registries,
+                ))
+                .catch_unwind()
+                .await;
+                if let Err(e) = gauges {
+                    tracing::error!(panic = ?e, "artifact gauge refresh panicked");
                 }
                 metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
             }
@@ -3148,7 +3205,24 @@ mod cleanup_pass_tests {
     #[tokio::test]
     async fn a_retention_pass_that_deletes_marks_the_index_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let (storage, rules) = go_versions(dir.path()).await;
+        let index = RepoIndex::new();
+        let before = counted(&index, &storage, "go").await;
+        assert!(before >= 3, "{before}");
+        let audit = AuditLog::new(dir.path().to_str().unwrap(), audit::AuditMode::Off);
+        let result = retention_pass(&storage, &locks(), &index, None, &rules, false, &audit).await;
+        assert_eq!(result.planned, 2);
+        let after = counted(&index, &storage, "go").await;
+        assert_eq!(
+            after,
+            before / 3,
+            "one version of three left: {before} -> {after}"
+        );
+    }
+
+    /// Three go module versions and a `keep_last = 1` rule: a pass finds two to delete.
+    async fn go_versions(data: &Path) -> (Storage, Vec<config::RetentionRule>) {
+        let storage = Storage::new_local(data.to_str().unwrap());
         for ver in ["v1.0.0", "v2.0.0", "v3.0.0"] {
             for ext in ["info", "mod", "zip"] {
                 let key = format!("go/github.com/user/repo/@v/{ver}.{ext}");
@@ -3163,16 +3237,179 @@ mod cleanup_pass_tests {
             include_tags: Vec::new(),
             exclude_tags: Vec::new(),
         }];
-        let index = RepoIndex::new();
-        let before = counted(&index, &storage, "go").await;
-        assert!(before >= 3, "{before}");
-        let result = retention_pass(&storage, &locks(), &index, None, &rules, false).await;
-        assert_eq!(result.planned, 2);
-        let after = counted(&index, &storage, "go").await;
-        assert_eq!(
-            after,
-            before / 3,
-            "one version of three left: {before} -> {after}"
+        (storage, rules)
+    }
+
+    /// The actions a retention pass wrote to `audit.jsonl` under `audit_dir`.
+    async fn audited_actions(
+        storage: &Storage,
+        rules: &[config::RetentionRule],
+        dry_run: bool,
+        audit_dir: &Path,
+    ) -> Vec<String> {
+        let audit = AuditLog::new(audit_dir.to_str().unwrap(), audit::AuditMode::File);
+        let result = retention_pass(
+            storage,
+            &locks(),
+            &RepoIndex::new(),
+            None,
+            rules,
+            dry_run,
+            &audit,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "two of three versions are due");
+        let path = audit.path().clone();
+        audit.shutdown().await;
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                entry["action"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_dry_retention_pass_is_not_audited_as_applied() {
+        let data = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (storage, rules) = go_versions(data.path()).await;
+        let actions = audited_actions(&storage, &rules, true, audit_dir.path()).await;
+        assert_eq!(actions, ["retention-dry-run"], "{actions:?}");
+        assert!(
+            storage
+                .get("go/github.com/user/repo/@v/v1.0.0.zip")
+                .await
+                .is_ok(),
+            "a dry run deletes nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn an_applied_retention_pass_is_audited_as_applied() {
+        let data = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (storage, rules) = go_versions(data.path()).await;
+        let actions = audited_actions(&storage, &rules, false, audit_dir.path()).await;
+        assert_eq!(actions, ["retention-apply"], "{actions:?}");
+        assert!(storage
+            .get("go/github.com/user/repo/@v/v1.0.0.zip")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn the_gc_done_line_names_the_proxy_cache_evictions_apart_from_the_orphans() {
+        let result = gc::GcResult {
+            total_candidates: 10,
+            orphaned: 3,
+            deleted: 2,
+            bytes_freed: 700,
+            orphan_keys: Vec::new(),
+            duration_secs: 0.5,
+            uncovered: Vec::new(),
+            metadata_phantoms_removed: 1,
+            skipped_recent: 1,
+            stat_failures: 0,
+            docker_mark_failed: false,
+            proxy_cache_eviction: gc::ProxyCacheEviction {
+                total_bytes: 9_000,
+                evicted_files: 5,
+                bytes_freed: 4_096,
+            },
+        };
+        let line = gc_done_line(&result);
+        assert!(
+            line.contains("3 orphans (2 deleted, 700 bytes freed)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("5 evicted from the proxy cache (4096 bytes freed)"),
+            "{line}"
+        );
+    }
+
+    fn artifacts_gauge(rt: RegistryType) -> i64 {
+        metrics::ARTIFACTS_TOTAL
+            .with_label_values(&[rt.as_str()])
+            .get()
+    }
+
+    fn bytes_gauge(rt: RegistryType) -> i64 {
+        metrics::STORAGE_BYTES
+            .with_label_values(&[rt.as_str()])
+            .get()
+    }
+
+    /// The only test that sets the per-registry gauges: they are process-wide.
+    #[tokio::test]
+    async fn the_artifact_gauges_follow_the_store_without_a_read_of_the_ui() {
+        let (storage, ops) = test_helpers::op_counting_storage();
+        // Five proxy-cached rpm repositories of one 100-byte file each, and go data
+        // of a registry that is not enabled.
+        for i in 0..5 {
+            storage
+                .put(&format!("rpm/repo{i}/Packages/{i}-1.0.rpm"), &[0u8; 100])
+                .await
+                .unwrap();
+        }
+        storage
+            .put("go/github.com/user/repo/@v/v1.0.0.zip", b"x")
+            .await
+            .unwrap();
+        let enabled: HashSet<RegistryType> = [RegistryType::Rpm].into_iter().collect();
+        // A fresh process: nothing has read the index yet.
+        let index = RepoIndex::new();
+
+        ops.reset();
+        refresh_artifact_gauges(&index, &storage, &enabled).await;
+        assert_eq!(
+            artifacts_gauge(RegistryType::Rpm),
+            5,
+            "first tick after a restart"
+        );
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 500);
+        assert_eq!(
+            ops.snapshot(),
+            [("list_with_meta", 1)].into_iter().collect(),
+            "one listing, of the enabled registry only"
+        );
+
+        ops.reset();
+        refresh_artifact_gauges(&index, &storage, &enabled).await;
+        assert_eq!(
+            ops.total(),
+            0,
+            "nothing changed: no storage round-trip, {:?}",
+            ops.snapshot()
+        );
+        assert_eq!(artifacts_gauge(RegistryType::Rpm), 5);
+
+        // A write marks its registry stale, as every handler does.
+        storage
+            .put("rpm/repo5/Packages/5-1.0.rpm", &[0u8; 100])
+            .await
+            .unwrap();
+        index.invalidate("rpm");
+        refresh_artifact_gauges(&index, &storage, &enabled).await;
+        assert_eq!(
+            artifacts_gauge(RegistryType::Rpm),
+            6,
+            "the tick after a write"
+        );
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 600);
+
+        // A GC pass evicts the proxy cache down to 300 bytes.
+        let result = gc_pass(&storage, &locks(), &index, false, 0, false, 300).await;
+        assert_eq!(result.proxy_cache_eviction.evicted_files, 3);
+        refresh_artifact_gauges(&index, &storage, &enabled).await;
+        assert_eq!(
+            artifacts_gauge(RegistryType::Rpm),
+            3,
+            "the tick after a GC pass"
+        );
+        assert_eq!(bytes_gauge(RegistryType::Rpm), 300);
     }
 }
