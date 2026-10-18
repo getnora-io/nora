@@ -1,5 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
+// Production code only: tests may seed storage and build a backend. Handlers name no concrete storage backend (clippy.toml).
+#![cfg_attr(not(test), deny(clippy::disallowed_types))]
 
 pub(crate) mod ansible;
 mod cargo_registry;
@@ -21,7 +23,7 @@ pub(crate) mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;
 
-// Cross-registry regression suite for namespace isolation on metadata paths (contrib-kit#68).
+// Cross-registry regression suite for namespace isolation on metadata paths (#732).
 #[cfg(test)]
 mod ns_isolation_metadata_tests;
 

@@ -498,6 +498,21 @@ async fn handle_request(
             crate::curation::RegistryType::Npm,
             &package_name,
         ) {
+            // Without trusted dates a release is as old as NORA's first sight of it in a
+            // packument: the cache mtime above restarts at every refetch, so a client that
+            // asks more often than the minimum age never saw its release mature. The
+            // quarantine keeps `publish_date`: a version listed long ago says nothing about
+            // bytes first fetched now. A version the ledger lacks keeps the mtime date.
+            let mut release_date = publish_date;
+            if let Some(ver) = tarball_version
+                .as_deref()
+                .filter(|_| first_seen_tracked(&state))
+            {
+                let meta_key = format!("npm/{}/metadata.json", package_name);
+                release_date = first_seen_date(&state.storage, &meta_key, ver)
+                    .await
+                    .or(publish_date);
+            }
             if let Some(response) = crate::curation::check_download(
                 &state.curation().curation_engine,
                 state.bypass_token().as_deref(),
@@ -505,7 +520,7 @@ async fn handle_request(
                 crate::curation::RegistryType::Npm,
                 &package_name,
                 crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
-                publish_date,
+                release_date,
             ) {
                 return response;
             }
@@ -924,6 +939,7 @@ async fn handle_request(
                 if is_tarball {
                     return with_content_type(true, data_to_serve.into()).into_response();
                 }
+                record_first_seen(&state, &key, &data_to_serve, false).await;
                 return packument_response(&headers, data_to_serve.into());
             }
             Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
@@ -960,6 +976,133 @@ pub(crate) fn origin_primary(sidecar: &str) -> Option<&str> {
     sidecar
         .strip_prefix(ORIGINS_PREFIX)
         .filter(|key| key.starts_with("npm/"))
+}
+
+/// Internal prefix holding when NORA first saw each npm version listed upstream.
+pub(crate) const FIRST_SEEN_PREFIX: &str = ".nora-first-seen/";
+
+/// First-seen ledger of the package whose packument is cached at `metadata_key`:
+/// `.nora-first-seen/npm/<name>/metadata.json`. Internal like [`origin_key`], so no
+/// request, listing, retention or GC walk of the npm key space reaches it.
+pub(crate) fn first_seen_key(metadata_key: &str) -> String {
+    format!("{FIRST_SEEN_PREFIX}{metadata_key}")
+}
+
+/// Version → Unix time NORA first saw it listed in an upstream packument.
+type FirstSeen = std::collections::BTreeMap<String, i64>;
+
+/// The internal state carried by backup and migrate along with what `list()` shows.
+pub(crate) const INTERNAL_PREFIXES: &[&str] = &[ORIGINS_PREFIX, FIRST_SEEN_PREFIX];
+
+/// Whether release ages come from the first-seen ledger: upstream dates are not trusted
+/// and curation runs. Otherwise nothing reads it, and nothing is written.
+fn first_seen_tracked(state: &AppState) -> bool {
+    !state.config.server.trust_upstream_dates && state.curation().curation_engine.is_active()
+}
+
+/// The versions a packument lists, without building their manifests.
+fn packument_versions(body: &[u8]) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Listing {
+        #[serde(default)]
+        versions: std::collections::HashMap<String, serde::de::IgnoredAny>,
+    }
+    let listing: Listing = serde_json::from_slice(body).ok()?;
+    Some(listing.versions.into_keys().collect())
+}
+
+/// Record when NORA first saw each version `body` lists — the upstream packument about to
+/// be served for `key`. A version keeps the time it was first recorded, so no refetch, 200
+/// or 304, makes a release younger; a version the upstream adds later starts now.
+///
+/// `cached_before`: the copy at `key` is NORA's own earlier one. A cache from before the
+/// ledger existed starts the versions it lists at its file time, when NORA last wrote it —
+/// never earlier than NORA saw them. Awaited before the packument is served, so a client
+/// cannot ask for a version the ledger does not hold yet.
+async fn record_first_seen(state: &AppState, key: &str, body: &[u8], cached_before: bool) {
+    if !first_seen_tracked(state) {
+        return;
+    }
+    let Some(versions) = packument_versions(body) else {
+        return;
+    };
+    let ledger_key = first_seen_key(key);
+    // LOCK-SAFE: tokio mutex, the one the publish path takes for this packument; it
+    // serializes the read-modify-write of the ledger. Nothing else is locked under it.
+    let lock = state.publish_lock(key);
+    let _guard = lock.lock().await;
+    let (mut ledger, existed) = match state.storage.get(&ledger_key).await {
+        Ok(bytes) => match serde_json::from_slice::<FirstSeen>(&bytes) {
+            Ok(ledger) => (ledger, true),
+            Err(e) => {
+                // Rewritten from now on: an unreadable time can only make a release younger.
+                tracing::warn!(key = %ledger_key, error = %e, "npm: unreadable first-seen ledger");
+                (FirstSeen::new(), false)
+            }
+        },
+        Err(crate::storage::StorageError::NotFound) if cached_before => {
+            (cached_first_seen(&state.storage, key).await, false)
+        }
+        Err(crate::storage::StorageError::NotFound) => (FirstSeen::new(), false),
+        // The bytes do not match their pin: the ledger is known bad, not merely unread.
+        // Rewritten from now on, as an unparsable one: every release starts young again,
+        // which holds more, never less, and the ledger heals instead of staying unread.
+        Err(crate::storage::StorageError::IntegrityViolation) => {
+            tracing::warn!(key = %ledger_key, "npm: first-seen ledger failed its pin; rewritten");
+            (FirstSeen::new(), false)
+        }
+        Err(e) => {
+            // Not written over a ledger that may exist: a later refetch records the rest.
+            tracing::warn!(key = %ledger_key, error = %e, "npm: first-seen ledger unreadable");
+            return;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    let known = ledger.len();
+    for version in versions {
+        ledger.entry(version).or_insert(now);
+    }
+    if existed && ledger.len() == known {
+        return;
+    }
+    match serde_json::to_vec(&ledger) {
+        Ok(bytes) => {
+            if let Err(e) = state.storage.put(&ledger_key, &bytes).await {
+                tracing::warn!(key = %ledger_key, error = ?e, "npm: failed to record first-seen times");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(key = %ledger_key, error = %e, "npm: first-seen ledger not encoded")
+        }
+    }
+}
+
+/// First-seen times of a packument cached before the ledger: every version it lists at its
+/// file time. The body is read before the time, so a write landing in between can only make
+/// the time later.
+async fn cached_first_seen(storage: &crate::Storage, key: &str) -> FirstSeen {
+    let Ok(body) = storage.get(key).await else {
+        return FirstSeen::new();
+    };
+    let Some(written) = storage.stat(key).await.map(|m| m.modified as i64) else {
+        return FirstSeen::new();
+    };
+    packument_versions(&body)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|version| (version, written))
+        .collect()
+}
+
+/// When NORA first saw `version` listed in the packument at `metadata_key`.
+async fn first_seen_date(
+    storage: &crate::Storage,
+    metadata_key: &str,
+    version: &str,
+) -> Option<i64> {
+    let bytes = storage.get(&first_seen_key(metadata_key)).await.ok()?;
+    let ledger: FirstSeen = serde_json::from_slice(&bytes).ok()?;
+    ledger.get(version).copied()
 }
 
 /// The identity recorded in the sidecar — the breaker's canonical upstream key, so
@@ -1090,7 +1233,9 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                         .with_label_values(&["npm"])
                         .inc_by(cached.len() as u64);
                     // Re-put bumps the file mtime (the freshness source) without an
-                    // upstream download.
+                    // upstream download. The release ages are not in it: before the re-put,
+                    // the ledger takes over a cache from before it existed.
+                    record_first_seen(state, key, &cached, true).await;
                     let storage = state.storage.clone();
                     let key_clone = key.to_string();
                     let body = cached.clone();
@@ -1128,6 +1273,8 @@ async fn refetch_metadata(state: &AppState, path: &str, key: &str) -> Option<Vec
                     replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
                 });
 
+            // Before the cached copy is replaced: it may be the one a ledger starts from.
+            record_first_seen(state, key, &rewritten, true).await;
             let storage = state.storage.clone();
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
@@ -1511,6 +1658,129 @@ pub(crate) async fn regenerate_packument(
         .put(&format!("npm/{}/metadata.json", package_name), &bytes)
         .await
         .map_err(|_| ())
+}
+
+/// Why retention could not bring a packument back in line with storage.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PackumentReconcileError {
+    #[error("storage: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+    #[error("cached packument is not JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("cached packument is not a JSON object")]
+    NotAnObject,
+    #[error("regenerating the packument from published versions failed")]
+    Regenerate,
+}
+
+/// Bring a package's packument back in line with storage after retention removed the
+/// tarballs of `retired` versions. Runs under the package's packument `publish_lock`.
+///
+/// A package with published versions owns its packument (#975): it is reassembled from
+/// `versions/`, as publish does. A proxied package has no `versions/` keys — its
+/// packument is the cached upstream document, so it is edited instead of rebuilt:
+/// regenerating it from `versions/` emptied it, and with the upstream unreachable the
+/// surviving version could not be installed.
+pub(crate) async fn reconcile_packument_after_retention(
+    storage: &crate::storage::Storage,
+    package_name: &str,
+    retired: &std::collections::BTreeSet<String>,
+) -> Result<(), PackumentReconcileError> {
+    let published = storage
+        .list(&format!("npm/{}/versions/", package_name))
+        .await?;
+    if published.is_empty() {
+        prune_cached_packument(storage, package_name, retired).await
+    } else {
+        regenerate_packument(storage, package_name)
+            .await
+            .or(Err(PackumentReconcileError::Regenerate))
+    }
+}
+
+/// Remove from a cached upstream packument the `retired` versions whose tarball is gone,
+/// keeping every other version document as the upstream sent it.
+///
+/// Only what retention removed leaves the document: a version that was never fetched
+/// through the proxy has no tarball here either, and that is a normal proxy cache, not
+/// a retired version. A dist-tag left pointing at a removed version is dropped, and a
+/// dropped `latest` is re-pointed at the highest version still advertised.
+///
+/// The upstream validators of the old document are cleared before it is replaced, so a
+/// 304 cannot re-serve the edited copy as the upstream's. The provenance record is
+/// carried over to the new bytes only when it vouched for the old ones.
+async fn prune_cached_packument(
+    storage: &crate::storage::Storage,
+    package_name: &str,
+    retired: &std::collections::BTreeSet<String>,
+) -> Result<(), PackumentReconcileError> {
+    let key = format!("npm/{}/metadata.json", package_name);
+    let old = match storage.get(&key).await {
+        Ok(old) => old,
+        // Nothing cached: the next read fetches the packument from the upstream.
+        Err(crate::storage::StorageError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let tarballs = storage
+        .list(&format!("npm/{}/tarballs/", package_name))
+        .await?;
+    let on_disk: std::collections::BTreeSet<String> = tarballs
+        .iter()
+        .filter_map(|key| key.rsplit('/').next())
+        .filter_map(|file| crate::curation::parse_npm_tarball_version(package_name, file))
+        .collect();
+
+    let mut packument: serde_json::Value = serde_json::from_slice(&old)?;
+    let obj = packument
+        .as_object_mut()
+        .ok_or(PackumentReconcileError::NotAnObject)?;
+    let Some(versions) = obj.get_mut("versions").and_then(|v| v.as_object_mut()) else {
+        return Ok(());
+    };
+    let before = versions.len();
+    versions.retain(|version, _| !retired.contains(version) || on_disk.contains(version));
+    if versions.len() == before {
+        return Ok(());
+    }
+    let remaining: Vec<String> = versions.keys().cloned().collect();
+    if let Some(tags) = obj.get_mut("dist-tags").and_then(|t| t.as_object_mut()) {
+        tags.retain(|_, version| {
+            version
+                .as_str()
+                .is_some_and(|v| remaining.iter().any(|r| r == v))
+        });
+        if !tags.contains_key("latest") {
+            if let Some(latest) = max_semver(remaining.iter()) {
+                tags.insert("latest".to_string(), serde_json::Value::String(latest));
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&packument)?;
+
+    let validators = super::validators_key(&key);
+    match storage.delete(&validators).await {
+        Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
+    storage.put(&key, &bytes).await?;
+
+    let record_key = origin_key(&key);
+    if let Ok(record) = storage.get(&record_key).await {
+        let vouched_origin = std::str::from_utf8(&record)
+            .ok()
+            .and_then(|record| record.split_once('\n'))
+            .filter(|(_, digest)| *digest == hex::encode(sha2::Sha256::digest(&old)))
+            .map(|(origin, _)| origin.to_string());
+        if let Some(origin) = vouched_origin {
+            if let Err(e) = storage
+                .put(&record_key, provenance_record(&origin, &bytes).as_bytes())
+                .await
+            {
+                tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Seed per-version keys from an old embedded packument (versions inside `metadata.json`, no
@@ -5344,7 +5614,7 @@ mod multi_upstream_tests {
     /// Once a scope has an owner, a copy cached from anywhere else — a squatter on
     /// the public registry, a cache from before the scope was owned, or bytes that
     /// replaced the owner's copy under its record (an older release after a
-    /// rollback, polygon U9) — is never served: not as a cache hit, not via Range,
+    /// rollback) — is never served: not as a cache hit, not via Range,
     /// not as a stale fallback. The owner's copy replaces it.
     #[tokio::test]
     async fn a_foreign_cached_copy_of_an_owned_scope_is_never_served() {
@@ -5916,5 +6186,429 @@ mod npm_version_curation {
             .unwrap();
         let resp = send(&ctx.app, Method::GET, path, "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+/// Without trusted upstream dates a release is as old as NORA's first sight of it in an
+/// upstream packument. A packument refetch — 200 or 304 — does not make it younger, a
+/// version the upstream adds later starts at zero, and the ages are read back from storage
+/// after a restart; the same on the local backend and on the object store.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_age_first_seen {
+    use super::{first_seen_key, FirstSeen};
+    use crate::registry::{write_validators, Validators};
+    use crate::storage::Storage;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::time::{Duration, SystemTime};
+    use wiremock::matchers::{header_exists, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const KEY: &str = "npm/agepkg/metadata.json";
+    const HOUR: i64 = 3600;
+
+    /// Where a test keeps its packages: a directory whose file times it can set, or an
+    /// in-process object store (the S3 code path), whose times it cannot.
+    enum Backend {
+        Local(tempfile::TempDir),
+        Object,
+    }
+
+    impl Backend {
+        fn both() -> [Backend; 2] {
+            [
+                Backend::Local(tempfile::tempdir().unwrap()),
+                Backend::Object,
+            ]
+        }
+
+        fn storage(&self) -> Storage {
+            match self {
+                Backend::Local(dir) => Storage::new_local(dir.path().to_str().unwrap()),
+                Backend::Object => Storage::from_backend(std::sync::Arc::new(
+                    crate::storage::ObjectStorage::in_memory(),
+                )),
+            }
+        }
+
+        /// The storage as a restarted process opens it: the directory anew, or the same bucket.
+        fn reopen(&self, storage: &Storage) -> Storage {
+            match self {
+                Backend::Local(_) => self.storage(),
+                Backend::Object => storage.clone(),
+            }
+        }
+
+        /// Set the packument's file time `secs` into the past (local backend only).
+        fn age_packument(&self, secs: i64) {
+            if let Backend::Local(dir) = self {
+                std::fs::File::options()
+                    .write(true)
+                    .open(dir.path().join(KEY))
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(secs as u64))
+                    .unwrap();
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Backend::Local(_) => "local",
+                Backend::Object => "object store",
+            }
+        }
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn packument(upstream: &str, versions: &[&str]) -> String {
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                let tarball = format!("{upstream}/agepkg/-/agepkg-{v}.tgz");
+                (
+                    v.to_string(),
+                    serde_json::json!({ "name": "agepkg", "version": v, "dist": { "tarball": tarball } }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "name": "agepkg", "versions": versions }).to_string()
+    }
+
+    /// The upstream lists `versions`; with `not_modified` it answers only a conditional
+    /// request, with 304 — a full fetch finds nothing, so the 304 path is the one taken.
+    async fn upstream(versions: &[&str], not_modified: bool) -> MockServer {
+        let server = MockServer::start().await;
+        let listing = if not_modified {
+            Mock::given(method("GET"))
+                .and(path("/agepkg"))
+                .and(header_exists("if-none-match"))
+                .respond_with(ResponseTemplate::new(304))
+        } else {
+            Mock::given(method("GET"))
+                .and(path("/agepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"v2\"")
+                        .set_body_string(packument(&server.uri(), versions)),
+                )
+        };
+        listing.mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/agepkg/-/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The field configuration: 3 days globally and 1 hour for npm, the quarantine
+    /// observing, upstream dates not trusted. TTL 0 makes every packument request a refetch.
+    fn context(upstream: &MockServer, storage: Storage) -> TestContext {
+        let uri = upstream.uri();
+        create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("3d".to_string());
+            cfg.curation.npm.min_release_age = Some("1h".to_string());
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        })
+    }
+
+    /// The cache as NORA left it two hours ago: the packument listing 1.0.0 with its
+    /// validators, and 1.0.0 first seen then.
+    async fn seen_two_hours_ago(backend: &Backend, storage: &Storage, upstream: &MockServer) {
+        storage
+            .put(KEY, packument(&upstream.uri(), &["1.0.0"]).as_bytes())
+            .await
+            .unwrap();
+        write_validators(
+            storage,
+            KEY,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let ledger: FirstSeen = [("1.0.0".to_string(), now() - 2 * HOUR)].into();
+        storage
+            .put(&first_seen_key(KEY), &serde_json::to_vec(&ledger).unwrap())
+            .await
+            .unwrap();
+        backend.age_packument(2 * HOUR);
+    }
+
+    /// Ask for the packument and wait until the refetch has rewritten it — the write that
+    /// used to reset the age.
+    async fn refetch(ctx: &TestContext, storage: &Storage) {
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while storage
+            .stat(KEY)
+            .await
+            .is_none_or(|m| now() - (m.modified as i64) >= 60)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refetch never rewrote the packument"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn tarball(ctx: &TestContext, version: &str) -> (StatusCode, String) {
+        let uri = format!("/npm/agepkg/-/agepkg-{version}.tgz");
+        let resp = send(&ctx.app, Method::GET, &uri, "").await;
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        (status, body)
+    }
+
+    async fn a_refetch_keeps_the_age(not_modified: bool) {
+        for backend in Backend::both() {
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0"], not_modified).await;
+            seen_two_hours_ago(&backend, &storage, &upstream).await;
+            let ctx = context(&upstream, storage.clone());
+
+            refetch(&ctx, &storage).await;
+
+            let (status, body) = tarball(&ctx, "1.0.0").await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}: seen 2h ago, minimum 1h — {body}",
+                backend.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_200_refetch_does_not_make_a_release_younger() {
+        a_refetch_keeps_the_age(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_304_refetch_does_not_make_a_release_younger() {
+        a_refetch_keeps_the_age(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_version_the_refetch_adds_starts_at_zero() {
+        for backend in Backend::both() {
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0", "2.0.0"], false).await;
+            seen_two_hours_ago(&backend, &storage, &upstream).await;
+            let ctx = context(&upstream, storage.clone());
+
+            refetch(&ctx, &storage).await;
+            // Its age is its own, not the packument file's: an old file time changes nothing.
+            backend.age_packument(3 * HOUR);
+
+            let (status, body) = tarball(&ctx, "2.0.0").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", backend.name());
+            assert!(body.contains("0h old"), "{}: {body}", backend.name());
+            let (status, body) = tarball(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{}: {body}", backend.name());
+        }
+    }
+
+    /// A ledger whose bytes no longer match their pin is rewritten at the next refetch, so it
+    /// is read again and records new versions; its releases start young, which holds more.
+    #[tokio::test]
+    async fn a_ledger_that_fails_its_pin_is_rewritten() {
+        let backend = Backend::Local(tempfile::tempdir().unwrap());
+        let Backend::Local(dir) = &backend else {
+            unreachable!()
+        };
+        let storage = backend.storage();
+        let upstream = upstream(&["1.0.0", "2.0.0"], false).await;
+        seen_two_hours_ago(&backend, &storage, &upstream).await;
+        let on_disk = dir.path().join(first_seen_key(KEY));
+        let mut bytes = std::fs::read(&on_disk).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&on_disk, &bytes).unwrap();
+        assert!(storage.get(&first_seen_key(KEY)).await.is_err(), "tampered");
+        let ctx = context(&upstream, storage.clone());
+
+        refetch(&ctx, &storage).await;
+        let ledger: FirstSeen =
+            serde_json::from_slice(&storage.get(&first_seen_key(KEY)).await.unwrap()).unwrap();
+        assert!(
+            ledger.contains_key("1.0.0") && ledger.contains_key("2.0.0"),
+            "{ledger:?}"
+        );
+        assert!(
+            ledger.values().all(|t| now() - t < 60),
+            "started again: {ledger:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_age_survives_a_restart() {
+        for backend in Backend::both() {
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0", "2.0.0"], false).await;
+            seen_two_hours_ago(&backend, &storage, &upstream).await;
+            let first = context(&upstream, storage.clone());
+            refetch(&first, &storage).await;
+            drop(first);
+
+            // A new process over the same storage; the packument was just rewritten.
+            let ctx = context(&upstream, backend.reopen(&storage));
+            let (status, body) = tarball(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{}: {body}", backend.name());
+            let (status, body) = tarball(&ctx, "2.0.0").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", backend.name());
+        }
+    }
+
+    /// A version no packument NORA fetched has listed has no first-seen time, and the
+    /// ledger does not make it older than the cached packument it is missing from.
+    #[tokio::test]
+    async fn an_unlisted_version_is_no_older_than_the_cache() {
+        for backend in Backend::both() {
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0"], false).await;
+            seen_two_hours_ago(&backend, &storage, &upstream).await;
+            let ctx = context(&upstream, storage.clone());
+
+            refetch(&ctx, &storage).await;
+
+            let (status, body) = tarball(&ctx, "3.0.0").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", backend.name());
+            assert!(body.contains("0h old"), "{}: {body}", backend.name());
+        }
+    }
+
+    /// A packument cached before NORA kept first-seen times: the versions it already
+    /// listed start at its file time — when NORA last wrote it — and a version only the
+    /// refetch brings starts at zero.
+    async fn a_cache_from_before_the_ledger(not_modified: bool) {
+        let backend = Backend::Local(tempfile::tempdir().unwrap());
+        let storage = backend.storage();
+        let upstream = upstream(&["1.0.0", "2.0.0"], not_modified).await;
+        storage
+            .put(KEY, packument(&upstream.uri(), &["1.0.0"]).as_bytes())
+            .await
+            .unwrap();
+        write_validators(
+            &storage,
+            KEY,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        backend.age_packument(2 * HOUR);
+        let ctx = context(&upstream, storage.clone());
+
+        refetch(&ctx, &storage).await;
+
+        let (status, body) = tarball(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if !not_modified {
+            let (status, body) = tarball(&ctx, "2.0.0").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cache_from_before_the_ledger_keeps_its_age_on_200() {
+        a_cache_from_before_the_ledger(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_cache_from_before_the_ledger_keeps_its_age_on_304() {
+        a_cache_from_before_the_ledger(true).await;
+    }
+
+    /// The first fetch of a packument starts every version it lists now, and the ledger
+    /// stays outside the npm key space that listings, retention and GC walk.
+    #[tokio::test]
+    async fn a_first_fetch_starts_every_version_at_zero() {
+        for backend in Backend::both() {
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0"], false).await;
+            let ctx = context(&upstream, storage.clone());
+
+            refetch(&ctx, &storage).await;
+            backend.age_packument(3 * HOUR);
+
+            let (status, body) = tarball(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", backend.name());
+            assert!(body.contains("0h old"), "{}: {body}", backend.name());
+            assert_eq!(
+                storage
+                    .list_internal(super::FIRST_SEEN_PREFIX)
+                    .await
+                    .unwrap(),
+                vec![first_seen_key(KEY)],
+                "{}",
+                backend.name()
+            );
+            assert!(first_seen_key(KEY).starts_with(".nora-"));
+        }
+    }
+
+    /// Concurrent fetches of one packument each add what they saw: the read-modify-write
+    /// of the ledger is serialized, so no version is lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_records_lose_no_version() {
+        let backend = Backend::Local(tempfile::tempdir().unwrap());
+        let storage = backend.storage();
+        let upstream = upstream(&[], false).await;
+        let ctx = context(&upstream, storage.clone());
+        let mut records = tokio::task::JoinSet::new();
+        for i in 0..16 {
+            let state = ctx.state.clone();
+            let body = packument(&upstream.uri(), &[format!("1.0.{i}").as_str()]);
+            records.spawn(async move {
+                super::record_first_seen(&state, KEY, body.as_bytes(), false).await;
+            });
+        }
+        while let Some(done) = records.join_next().await {
+            done.unwrap();
+        }
+        let ledger: FirstSeen =
+            serde_json::from_slice(&storage.get(&first_seen_key(KEY)).await.unwrap()).unwrap();
+        assert_eq!(ledger.len(), 16, "{ledger:?}");
+    }
+
+    /// Nothing is kept where nothing reads it: with curation off, or with trusted
+    /// upstream dates, a packument fetch writes no first-seen ledger.
+    #[tokio::test]
+    async fn no_ledger_without_untrusted_curation() {
+        for (curation, trust) in [(false, false), (true, true)] {
+            let backend = Backend::Object;
+            let storage = backend.storage();
+            let upstream = upstream(&["1.0.0"], false).await;
+            let uri = upstream.uri();
+            let ctx = create_test_context_with_storage_and_config(storage.clone(), move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.server.trust_upstream_dates = trust;
+                if curation {
+                    cfg.curation.mode = crate::config::CurationMode::Enforce;
+                    cfg.curation.min_release_age = Some("1h".to_string());
+                }
+            });
+            let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                storage.get(&first_seen_key(KEY)).await.is_err(),
+                "curation {curation}, trust {trust}"
+            );
+        }
     }
 }

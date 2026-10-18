@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 #![deny(clippy::unwrap_used)]
+// The storage boundary lists of clippy.toml are denied by ui/ and registry/ only.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 #![warn(clippy::large_stack_frames, clippy::large_futures)]
 // Test code is linted under `--all-targets` but is not held to the production
@@ -2225,6 +2227,32 @@ async fn run_server(mut config: Config, storage: Storage) {
     // NORA_REGISTRIES_ENABLE / [registries].enable mounts the routes but leaves
     // the flags at their defaults, so rpm/deb 404. (#856)
     config.apply_enabled_registries(&enabled_registries);
+
+    // An open proxy is announced on every start (#1135): written down, it is the operator's
+    // decision; left at the default, 1.5.0 refuses to start with it, and the gauge lets an alert
+    // see that before the upgrade does.
+    let curation_mode_implicit = match config.curation_mode_notice() {
+        Some(config::CurationModeNotice::Implicit(proxies)) => {
+            let names: Vec<&str> = proxies.iter().map(|rt| rt.as_str()).collect();
+            warn!(
+                registries = %names.join(", "),
+                "curation.mode is not set and proxy registries are enabled: upstream packages are served unchecked. From 1.5.0 NORA will not start without curation.mode; set it (NORA_CURATION_MODE or [curation] mode) to \"off\" to keep this behaviour, or to \"audit\" or \"enforce\""
+            );
+            true
+        }
+        Some(config::CurationModeNotice::ExplicitOff(proxies)) => {
+            let names: Vec<&str> = proxies.iter().map(|rt| rt.as_str()).collect();
+            warn!(
+                registries = %names.join(", "),
+                "curation.mode=off is set: upstream packages are served unchecked"
+            );
+            false
+        }
+        None => false,
+    };
+    metrics::CONFIG_DEPRECATED
+        .with_label_values(&["curation_mode_implicit"])
+        .set(i64::from(curation_mode_implicit));
 
     // Make the enabled set available to the UI sidebar so its nav lists exactly
     // the enabled registries (matching the dashboard body). Set once, immutable.

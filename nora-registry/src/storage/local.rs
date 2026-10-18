@@ -665,6 +665,10 @@ impl StorageBackend for LocalStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
+        // Body and pin leave as one critical section, as they arrive (#1041, see commit_lock):
+        // a write of this key between the two steps would lose the pin it just recorded.
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
 
         if let Err(e) = fs::remove_file(&path).await {
             // A directory is not an object; unlink(2) refuses it with EISDIR on Linux and
@@ -1205,6 +1209,48 @@ mod tests {
     /// was found: one key out of 4039 during `nora migrate`). The guarantee is
     /// structural (the per-key commit lock in the backend); this hammers the pair and
     /// checks after every round that the recorded pin describes the stored body.
+    /// A delete removes the body and then its pin. A write of the same key that lands between the
+    /// two would lose the pin it just recorded: the stored copy is then unpinned, so a reader that
+    /// needs a pin fetches it again, and a reader that does not serves it unchecked. The delete
+    /// therefore holds the key's commit lock across both steps, as a write does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_holds_the_commit_lock_across_body_and_pin() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let key = "hf/models/org/model/blobs/aaaa";
+        put(&storage, key, b"first").await.unwrap();
+
+        let lock = storage.commit_lock(key);
+        let held = lock.lock().await;
+        let deleting = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move { storage.delete(key).await }
+        });
+        // CANCEL-SAFETY: the timeout only stops waiting for the spawned delete; the task itself
+        // keeps running and is awaited below.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            while storage.stat(key).await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            early.is_err(),
+            "the delete removed the body while a write held the key"
+        );
+        drop(held);
+        deleting.await.unwrap().unwrap();
+        assert!(storage.stat(key).await.is_none());
+        assert_eq!(storage.pins.get(key), None, "the pin outlived its body");
+
+        // A write after the delete keeps its pin.
+        put(&storage, key, b"second").await.unwrap();
+        assert_eq!(
+            storage.pins.get(key).as_deref(),
+            Some(hex::encode(Sha256::digest(b"second")).as_str())
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writers_never_split_body_from_pin() {
         let dir = TempDir::new().unwrap();
