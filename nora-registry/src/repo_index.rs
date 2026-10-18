@@ -201,9 +201,7 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Cpan => build_cpan_index(storage).await,
-                // Nothing is cached under hf/ until the download path lands; the slice
-                // that fixes the storage layout builds this index.
-                RegistryType::HuggingFace => Some(Vec::new()),
+                RegistryType::HuggingFace => build_hf_index(storage).await,
             };
             match data {
                 Some(data) => {
@@ -597,6 +595,32 @@ fn cpan_package_of(rel: &str) -> Option<String> {
     Some(format!("{author_path}/{distribution}"))
 }
 
+/// Hugging Face index: cached files under `hf/models/{repo}/blobs/{digest}`, one entry per
+/// repository id (one or two segments), counting its cached files.
+async fn build_hf_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "hf/models/").await?;
+    let mut repos: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in &keys {
+        let Some(repo) = key.strip_prefix("hf/models/").and_then(hf_repo_of) else {
+            continue;
+        };
+        let entry = repos.entry(repo.to_string()).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
+        }
+    }
+    Some(to_sorted_vec(repos))
+}
+
+/// The repository id of a key under `hf/models/`: `{repo}/blobs/{digest}`, a digest with no
+/// `/`, or none for anything else under the prefix.
+fn hf_repo_of(rel: &str) -> Option<&str> {
+    let (repo, digest) = rel.rsplit_once("/blobs/")?;
+    (!repo.is_empty() && !digest.is_empty() && !digest.contains('/')).then_some(repo)
+}
+
 /// Conan index: keys like conan/{name}/{ver}/{user}/{chan}/revisions/{rev}/files/{file}
 async fn build_conan_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "conan/").await?;
@@ -869,22 +893,38 @@ mod tests {
         }
     }
 
-    /// Nothing is cached under `hf/` yet: its index builds empty and settles, rather than
-    /// staying dirty and rebuilding (with a storage-failure warning) on every read.
+    /// The Hugging Face index counts the files cached per repository id, one or two segments,
+    /// and nothing else under `hf/` or outside it; an empty cache builds empty and settles.
     #[tokio::test]
-    async fn hf_index_builds_empty_and_settles() {
+    async fn hf_index_counts_cached_files_per_repository() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new_local(dir.path().to_str().unwrap());
-        // Other formats' data must not leak into it either.
-        storage
-            .put("cpan/authors/id/F/FO/FOO/Foo-Bar-1.0.tar.gz", b"tgz")
-            .await
-            .unwrap();
-        storage.put("raw/some/file.bin", b"raw").await.unwrap();
         let idx = RepoIndex::new();
         assert!(idx.get("hf", &storage).await.is_empty());
         assert!(!idx.indexes[&RegistryType::HuggingFace].is_dirty());
-        assert!(!idx.get("cpan", &storage).await.is_empty(), "control");
+        for (key, body) in [
+            ("hf/models/org/model/blobs/aaaa", &b"12345"[..]),
+            ("hf/models/org/model/blobs/bbbb", b"123"),
+            ("hf/models/gpt2/blobs/cccc", b"1"),
+            ("hf/models/org/model/other", b"x"),
+            ("hf/models/org/model/blobs/dd/ee", b"x"),
+            ("cpan/authors/id/F/FO/FOO/Foo-Bar-1.0.tar.gz", b"tgz"),
+            ("raw/some/file.bin", b"raw"),
+        ] {
+            storage.put(key, body).await.unwrap();
+        }
+        idx.invalidate("hf");
+        let mut got: Vec<(String, usize, u64)> = idx
+            .get("hf", &storage)
+            .await
+            .iter()
+            .map(|r| (r.name.clone(), r.versions, r.size))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("gpt2".to_string(), 1, 1), ("org/model".to_string(), 2, 8)]
+        );
     }
 
     #[test]

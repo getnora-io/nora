@@ -11,8 +11,8 @@
 #
 # The scripts run here against a stub `systemctl` (plus stubs for the user and
 # ownership steps) and the test asserts WHICH verbs were invoked. No systemd, no
-# container, no root, so this belongs in the ordinary CI job rather than a polygon
-# suite. Point DIST_DIR at another copy of the scripts to check this test still has
+# container, no root, so this belongs in the ordinary CI job rather than an
+# integration suite. Point DIST_DIR at another copy of the scripts to check this test still has
 # teeth: against the pre-#1035 versions every upgrade case must fail.
 set -u
 
