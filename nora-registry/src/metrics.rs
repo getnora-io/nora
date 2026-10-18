@@ -229,11 +229,11 @@ pub static NAMESPACE_SCOPE_DECISIONS: LazyLock<IntCounterVec> = LazyLock::new(||
     .expect("failed to create NAMESPACE_SCOPE_DECISIONS metric at startup")
 });
 
-/// Current number of artifacts by registry (gauge — rises and falls with GC)
+/// Repositories with stored files, by registry (gauge — rises and falls with GC and retention)
 pub static ARTIFACTS_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_artifacts_total",
-        "Current number of artifacts by registry",
+        "Repositories with stored files, by registry (the count /api/ui/stats shows); a gauge, set every 60s from the dashboard index",
         &["registry"]
     )
     .expect("failed to create ARTIFACTS_TOTAL metric at startup")

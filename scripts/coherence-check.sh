@@ -134,7 +134,7 @@ while IFS=: read -r file lineno _content; do
     fi
 done < <(grep -rn 'tokio::select!' "$SRC" --include='*.rs' | grep -v '//.*select!' | grep -v '_test\|#\[test\|#\[cfg(test' || true)
 
-# Check tokio::time::timeout (same requirement per CLAUDE.md)
+# Check tokio::time::timeout (the same CANCEL-SAFETY requirement)
 while IFS=: read -r file lineno _content; do
     start=$((lineno > 5 ? lineno - 5 : 1))
     if ! sed -n "${start},${lineno}p" "$file" | grep -q 'CANCEL-SAFETY'; then

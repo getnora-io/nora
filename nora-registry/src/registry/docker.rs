@@ -65,6 +65,21 @@ fn manifest_meta_key(namespace: Option<&str>, name: &str, reference: &str) -> St
     }
 }
 
+/// Stems of the sidecars stored beside a manifest `<reference>.json`: `<reference>.meta.json`
+/// (push metadata) and `<reference>.stats.json` (pull counts, #1114).
+const MANIFEST_SIDECAR_STEMS: [&str; 2] = [".meta", ".stats"];
+
+/// The tag a file under `…/manifests/` stores, or `None` if it stores no tag: a digest copy
+/// (`sha256:….json`), a sidecar (`<tag>.meta.json`, `<tag>.stats.json`) or any name that is not
+/// a valid tag. Every listing of tags (tags/list, delete by digest, retention, the UI, the
+/// repository index) asks this one function.
+pub(crate) fn tag_from_manifest_file(file_name: &str) -> Option<&str> {
+    let tag = file_name.strip_suffix(".json")?;
+    let is_tag = validate_docker_reference(tag).is_ok() && !tag.contains(':');
+    let is_sidecar = MANIFEST_SIDECAR_STEMS.iter().any(|s| ends_with_ci(tag, s));
+    (is_tag && !is_sidecar).then_some(tag)
+}
+
 /// Build a namespaced storage key prefix for listing manifests.
 fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
     match namespace {
@@ -2667,14 +2682,8 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
         .filter_map(|k| {
             k.strip_prefix(&prefix)
                 .or_else(|| k.strip_prefix(&legacy_prefix))
-                .and_then(|t| t.strip_suffix(".json"))
+                .and_then(tag_from_manifest_file)
                 .map(String::from)
-        })
-        .filter(|t| {
-            !t.starts_with("sha256:")
-                && !t.starts_with("sha512:")
-                && !ends_with_ci(t, ".meta")
-                && !t.contains(".meta.")
         })
         .collect();
     (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
@@ -2778,16 +2787,15 @@ async fn delete_tags_for_digest(state: &AppState, ns: Option<&str>, name: &str, 
             keys.extend(legacy);
         }
     }
-    // Distinct tag references only — skip digest files and `.meta` sidecars.
+    // Distinct tag references only — skip digest files and sidecars.
     let mut tags: Vec<String> = keys
         .iter()
         .filter_map(|k| {
             k.strip_prefix(&prefix)
                 .or_else(|| k.strip_prefix(&legacy_prefix))
-                .and_then(|t| t.strip_suffix(".json"))
+                .and_then(tag_from_manifest_file)
                 .map(String::from)
         })
-        .filter(|t| !t.starts_with("sha256:") && !ends_with_ci(t, ".meta") && !t.contains(".meta."))
         .collect();
     tags.sort();
     tags.dedup();
@@ -4404,6 +4412,38 @@ pub(crate) async fn flush_pull_stats(state: &AppState) {
 mod tests {
     use super::*;
 
+    /// A file under `manifests/` stores a tag only if its name is a valid tag and not a sidecar.
+    #[test]
+    fn tag_from_manifest_file_accepts_only_tags() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let long = "a".repeat(129);
+        let longest = "a".repeat(128);
+        let cases: Vec<(String, Option<&str>)> = vec![
+            ("1.0.0.json".into(), Some("1.0.0")),
+            ("latest.json".into(), Some("latest")),
+            ("v1.2.3-rc.1.json".into(), Some("v1.2.3-rc.1")),
+            ("a.meta.b.json".into(), Some("a.meta.b")),
+            (format!("{longest}.json"), Some(longest.as_str())),
+            ("1.0.0.stats.json".into(), None),
+            ("1.0.0.STATS.json".into(), None),
+            ("1.0.0.meta.json".into(), None),
+            ("x.meta.json".into(), None),
+            (format!("{digest}.json"), None),
+            (format!("{digest}.meta.json"), None),
+            (format!("{digest}.stats.json"), None),
+            (".json".into(), None),
+            ("".into(), None),
+            (format!("{long}.json"), None),
+            ("latest".into(), None),
+            ("-dash.json".into(), None),
+            ("a..b.json".into(), None),
+            ("a b.json".into(), None),
+        ];
+        for (file, want) in &cases {
+            assert_eq!(tag_from_manifest_file(file), *want, "{file:?}");
+        }
+    }
+
     #[tokio::test]
     async fn verifying_reader_passes_match_and_aborts_mismatch() {
         use sha2::Digest as _;
@@ -5825,6 +5865,57 @@ mod integration_tests {
         assert_eq!(json["name"], "alpine");
         let tags = json["tags"].as_array().unwrap();
         assert!(tags.contains(&serde_json::json!("latest")));
+    }
+
+    /// A pull's statistics land in a `.stats.json` sidecar beside the tag's manifest (#1114).
+    /// After the flush, tags/list and the UI must still show only the real tag — the sidecar is
+    /// not a tag — and the pull count must still be read from it.
+    #[tokio::test]
+    async fn tags_list_hides_the_pull_stats_sidecar() {
+        let ctx = create_test_context();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        });
+        seed_zero_config(&ctx.state, "alpine").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/alpine/manifests/1.0.0",
+            Body::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let pull = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/alpine/manifests/1.0.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(pull.status(), StatusCode::OK);
+        super::flush_pull_stats(&ctx.state).await;
+        let stats_key = "docker/alpine/manifests/1.0.0.stats.json";
+        assert!(
+            ctx.state.storage.stat(stats_key).await.is_some(),
+            "control: the flush wrote the pull-stats sidecar"
+        );
+
+        let resp = send(&ctx.app, Method::GET, "/v2/alpine/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["tags"], serde_json::json!(["1.0.0"]), "{json}");
+
+        let detail = crate::ui::api::get_docker_detail(&ctx.state, "alpine").await;
+        let names: Vec<_> = detail.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["1.0.0"]);
+        assert_eq!(detail.tags[0].downloads, 1, "the pull count is kept");
     }
 
     /// #932: tags/list must not include digest references (sha256:…).
@@ -10657,8 +10748,8 @@ mod manifest_before_metadata_one_lock_order {
 /// Only the metadata section builds a manifest metadata key: `manifest_meta_key` is called, and
 /// `.meta.json` written, in no other production function — so every write and delete of a
 /// manifest's metadata goes through the helpers that keep the order "manifest, then metadata,
-/// manifest lock before metadata lock". A white list, not a list of forbidden forms (the method's
-/// stop rule after two failed held-out rounds).
+/// manifest lock before metadata lock". A white list, not a list of forbidden forms, which
+/// would miss the next form.
 #[cfg(test)]
 mod only_the_metadata_section_builds_metadata_keys {
     /// The functions that may build a metadata key: its definition, the three helpers, and the

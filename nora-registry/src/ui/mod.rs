@@ -1,5 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
+// Production code only: tests may seed storage and build a backend. The UI calls no Storage write (clippy.toml).
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 pub(crate) mod api;
 pub mod components;

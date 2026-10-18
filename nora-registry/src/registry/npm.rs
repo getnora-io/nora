@@ -5344,7 +5344,7 @@ mod multi_upstream_tests {
     /// Once a scope has an owner, a copy cached from anywhere else — a squatter on
     /// the public registry, a cache from before the scope was owned, or bytes that
     /// replaced the owner's copy under its record (an older release after a
-    /// rollback, polygon U9) — is never served: not as a cache hit, not via Range,
+    /// rollback) — is never served: not as a cache hit, not via Range,
     /// not as a stale fallback. The owner's copy replaces it.
     #[tokio::test]
     async fn a_foreign_cached_copy_of_an_owned_scope_is_never_served() {
@@ -5869,5 +5869,52 @@ mod npm_version_curation {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #1098: `[curation.npm] min_release_age` without a global value holds a
+    /// tarball younger than it, and serves it once it is older.
+    #[tokio::test]
+    async fn a_per_registry_minimum_age_alone_holds_a_young_tarball() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = None;
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.npm.min_release_age = Some("3d".to_string());
+        });
+        let packument = br#"{"name": "left-pad", "versions": {"1.3.0": {}}}"#;
+        ctx.state
+            .storage
+            .put("npm/left-pad/metadata.json", packument)
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("npm/left-pad/tarballs/left-pad-1.3.0.tgz", b"TGZ")
+            .await
+            .unwrap();
+        let path = "/npm/left-pad/-/left-pad-1.3.0.tgz";
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("min-release-age"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Without trusted upstream dates the release date is NORA's own: when it
+        // first stored the packument. Four days later the tarball is served.
+        let four_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(ctx._tempdir.path().join("npm/left-pad/metadata.json"))
+            .unwrap()
+            .set_modified(four_days_ago)
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
