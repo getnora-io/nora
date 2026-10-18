@@ -54,13 +54,16 @@ pub async fn migrate(
         .list("")
         .await
         .map_err(|e| format!("failed to list source: {e}"))?;
-    // npm cache provenance (#1055) sits under an internal prefix that list() hides;
-    // without it the destination refetches every owned-scope object from its owner.
-    keys.extend(
-        from.list_internal(crate::registry::npm::ORIGINS_PREFIX)
-            .await
-            .map_err(|e| format!("failed to list source: {e}"))?,
-    );
+    // npm cache provenance (#1055) and first-seen times sit under internal prefixes that
+    // list() hides; without them the destination refetches every owned-scope object from
+    // its owner, and every npm release age starts over.
+    for prefix in crate::registry::npm::INTERNAL_PREFIXES {
+        keys.extend(
+            from.list_internal(prefix)
+                .await
+                .map_err(|e| format!("failed to list source: {e}"))?,
+        );
+    }
 
     if keys.is_empty() {
         println!("No artifacts found in source storage.");
@@ -202,6 +205,31 @@ mod tests {
             b"npm:https://owner.example\nrecord"
         );
         assert_eq!(dst.pin(key).await, src.pin(key).await);
+    }
+
+    /// npm first-seen times are hidden from list() too, and migrate with the packument.
+    #[tokio::test]
+    async fn test_migrate_carries_npm_first_seen() {
+        use crate::registry::npm::first_seen_key;
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().to_str().unwrap());
+        let dst = Storage::new_local(dst_dir.path().to_str().unwrap());
+        let key = "npm/a/metadata.json";
+        src.put(key, b"{}").await.unwrap();
+        src.put(&first_seen_key(key), br#"{"1.0.0":1700000000}"#)
+            .await
+            .unwrap();
+
+        let stats = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.migrated, 2);
+        assert_eq!(
+            &dst.get(&first_seen_key(key)).await.unwrap()[..],
+            br#"{"1.0.0":1700000000}"#
+        );
     }
 
     #[tokio::test]
