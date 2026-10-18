@@ -463,8 +463,12 @@ struct FileCuration<'a> {
 }
 
 impl FileCuration<'_> {
-    /// Checks a commit under every name; one let through is noted in `admitted`.
+    /// Checks a commit under every name; one let through is noted in `admitted`. A commit
+    /// already let through is not decided again (a walk repeated past an unreadable copy).
     fn check(&self, commit: Option<&str>, admitted: &mut Vec<Option<String>>) -> Option<Response> {
+        if admitted.iter().any(|done| done.as_deref() == commit) {
+            return None;
+        }
         let version = commit_version(commit);
         let refused = self
             .names
@@ -486,9 +490,6 @@ impl FileCuration<'_> {
             _ => return None,
         };
         let commit = meta.commit.as_ref().and_then(|c| c.to_str().ok());
-        if admitted.iter().any(|done| done.as_deref() == commit) {
-            return None;
-        }
         self.check(commit, admitted)
     }
 }
@@ -3156,8 +3157,44 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
             let _ = body_bytes(resp).await;
             assert_eq!(allowed() - before, 2, "round {round}: {uri}");
-            settle().await;
+            let key = if uri == WEIGHTS_PATH {
+                weights_key()
+            } else {
+                config_key()
+            };
+            wait_stored(&ctx, &key).await;
         }
+    }
+
+    /// A copy whose pin is not yet recorded (a fill between its rename and its pin) is fetched
+    /// again; the commit the first walk let through is not decided a second time.
+    #[tokio::test]
+    async fn a_download_refetched_past_an_unpinned_copy_decides_its_commit_once() {
+        let unrelated = r#"{"version": 1, "rules": [{"registry": "hf", "name": "other/x", "version": "*", "reason": "r"}]}"#;
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let (ctx, _dir) = curated(&up, unrelated, "block");
+        let unpinned = std::path::Path::new(&ctx.state.config.storage.path).join(config_key());
+        std::fs::create_dir_all(unpinned.parent().unwrap()).unwrap();
+        std::fs::write(&unpinned, b"{}").unwrap();
+        let allowed = || {
+            ctx.state
+                .curation()
+                .curation_engine
+                .metrics()
+                .allowed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = allowed();
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_bytes(resp).await;
+        assert_eq!(
+            allowed() - before,
+            2,
+            "the repository, then the commit, once each"
+        );
+        wait_stored(&ctx, &config_key()).await;
     }
 
     /// Our reason for a refusal that names none tells its kind by the status.
