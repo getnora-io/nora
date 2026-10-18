@@ -38,6 +38,7 @@ pub struct RegistryStats {
     pub rpm: usize,
     pub deb: usize,
     pub cpan: usize,
+    pub hf: usize,
 }
 
 #[derive(Serialize)]
@@ -180,6 +181,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
         cpan: get(RegistryType::Cpan),
+        hf: get(RegistryType::HuggingFace),
     })
 }
 
@@ -421,17 +423,13 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
 
     let mut tags = Vec::new();
     for key in &keys {
-        // Skip the .meta.json / .stats.json sidecars (not tags)
-        if ends_with_ci(key, ".meta.json") || ends_with_ci(key, ".stats.json") {
-            continue;
-        }
-
         // The tag is the segment after `/manifests/`, whatever the namespace
-        // prefix (docker/{name}/... or docker/{ns}/{name}/...).
+        // prefix (docker/{name}/... or docker/{ns}/{name}/...); sidecars and
+        // digest copies are not tags.
         let tag_name = key
             .find("/manifests/")
             .map(|idx| &key[idx + "/manifests/".len()..])
-            .and_then(|s| s.strip_suffix(".json"));
+            .and_then(crate::registry::docker::tag_from_manifest_file);
 
         if let Some(tag_name) = tag_name {
             // Load metadata from .meta.json file
@@ -2404,5 +2402,29 @@ mod docker_detail_tests {
         let names: Vec<_> = d.tags.iter().map(|t| t.name.clone()).collect();
         assert_eq!(names, vec!["v1".to_string()]);
         assert_eq!(d.tags[0].downloads, 4);
+    }
+}
+
+/// `/api/ui/stats` has a count for every registry, under the name the API uses for it: its
+/// fields are written out by hand, and Hugging Face was missing from them.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod registry_stats_cover_every_registry {
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::Method;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn the_stats_name_every_registry() {
+        let ctx = create_test_context();
+        let resp = send(&ctx.app, Method::GET, "/api/ui/stats", "").await;
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let keys: BTreeSet<String> = v.as_object().unwrap().keys().cloned().collect();
+        let names: BTreeSet<String> = RegistryType::all()
+            .iter()
+            .map(|rt| rt.as_str().to_string())
+            .collect();
+        assert_eq!(keys, names);
     }
 }

@@ -702,7 +702,7 @@ mod tests {
     use super::*;
 
     /// A streamed upload orphaned by a crash is reaped once idle past the bound; a
-    /// file still being written is kept (#1055 polygon: SIGKILL mid-PUT left them
+    /// file still being written is kept (#1055: a SIGKILL mid-PUT left them
     /// forever).
     #[test]
     fn test_cleanup_upload_temp_dir_reaps_only_idle_files() {
