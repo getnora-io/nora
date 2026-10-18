@@ -129,6 +129,17 @@ pub struct GcResult {
     pub proxy_cache_eviction: ProxyCacheEviction,
 }
 
+impl GcResult {
+    /// Whether the pass took anything out of the store: orphans, metadata phantoms or
+    /// proxy-cache files. In a dry run the counters are what would go, so the caller asks
+    /// only of a pass that applied.
+    pub fn removed_anything(&self) -> bool {
+        self.deleted > 0
+            || self.metadata_phantoms_removed > 0
+            || self.proxy_cache_eviction.evicted_files > 0
+    }
+}
+
 // ============================================================================
 // Main GC entry point
 // ============================================================================

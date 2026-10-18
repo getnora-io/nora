@@ -722,6 +722,53 @@ enum FileFetch {
     Failed(&'static str),
 }
 
+/// Whether a file request's walk, at `current` after starting at the upstream `start`, may
+/// follow a redirect to `next`: the upstream's own origin, or a host of `cdn_hosts` — the
+/// entry itself or a name under it, an IP address as that address — over https, or over http
+/// only along a walk that has been http from an http upstream on (a test or a LAN mirror):
+/// never down from an https hop. The Hub sends LFS files to its CDN; anything else a redirect
+/// names (another site, a metadata or loopback address) is not asked.
+fn hop_allowed(
+    start: &reqwest::Url,
+    current: &reqwest::Url,
+    next: &reqwest::Url,
+    cdn_hosts: &[String],
+) -> bool {
+    if origin(next) == origin(start) {
+        return true;
+    }
+    let scheme_ok = next.scheme() == "https"
+        || (next.scheme() == "http" && start.scheme() == "http" && current.scheme() == "http");
+    let Some(host) = next.host_str() else {
+        return false;
+    };
+    scheme_ok && host_listed(host, cdn_hosts)
+}
+
+/// Whether a URL's host is listed in `cdn_hosts`. An address — IPv6 read without its brackets —
+/// is listed when an entry is that address, however either is written; a name when its labels
+/// end with every label of an entry (`us.aws.cdn.hf.co` under `hf.co`, `cdn.evilhf.co` not).
+/// Labels, not string suffixes, so no form of a look-alike passes by where a dot falls.
+fn host_listed(host: &str, cdn_hosts: &[String]) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return cdn_hosts
+            .iter()
+            .any(|entry| entry.parse::<std::net::IpAddr>().ok() == Some(ip));
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    cdn_hosts
+        .iter()
+        .filter(|entry| entry.parse::<std::net::IpAddr>().is_err())
+        .any(|entry| {
+            let tail: Vec<&str> = entry.split('.').collect();
+            labels.len() >= tail.len() && labels[labels.len() - tail.len()..] == tail[..]
+        })
+}
+
 /// Scheme, host and port: a redirect within one origin is the Hub's own, one to another
 /// origin leaves it (the CDN).
 fn origin(url: &reqwest::Url) -> (String, Option<String>, Option<u16>) {
@@ -763,6 +810,7 @@ where
         state.circuit_breaker.record_alive(&key, probe);
         return FileFetch::Failed("bad upstream url");
     };
+    let start = url.clone();
     let mut hops: Vec<HeaderMap> = Vec::new();
     let mut commit_checked = false;
     let mut looked_up = false;
@@ -839,6 +887,24 @@ where
                 break Err("redirect without a usable location");
             };
             hops.push(response.headers().clone());
+            // Before the HEAD stop below: a HEAD answers only for a walk a GET would follow, so
+            // the metadata request of a client is refused where its download would be. The log
+            // names hosts only: a CDN link carries a signature in its query.
+            if !hop_allowed(&start, &url, &next, &state.config.hf.cdn_hosts) {
+                tracing::debug!(
+                    registry = "hf",
+                    from = url.host_str().unwrap_or(""),
+                    to = next.host_str().unwrap_or(""),
+                    "hf redirect refused"
+                );
+                break Err("redirect to a host outside the upstream and its CDN");
+            }
+            tracing::debug!(
+                registry = "hf",
+                from = url.host_str().unwrap_or(""),
+                to = next.host_str().unwrap_or(""),
+                "hf redirect followed"
+            );
             if *method == Method::HEAD && origin(&next) != origin(&url) {
                 if !commit_checked {
                     if let Some(refused) = check_commit(None) {
@@ -886,7 +952,8 @@ where
     match outcome {
         Ok(FileFetch::UpstreamRefused { .. })
         | Err("too many redirects")
-        | Err("redirect without a usable location") => {
+        | Err("redirect without a usable location")
+        | Err("redirect to a host outside the upstream and its CDN") => {
             state.circuit_breaker.record_alive(&key, probe)
         }
         Ok(_) => state.circuit_breaker.record_success(&key, probe),
@@ -1070,6 +1137,8 @@ struct Fill {
 
 struct FillStore {
     storage: Storage,
+    /// Marked stale once the fill is committed, so the dashboard counts the new file.
+    index: std::sync::Arc<crate::repo_index::RepoIndex>,
     key: String,
     file: tokio::fs::File,
     path: PathBuf,
@@ -1127,6 +1196,7 @@ async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
     match created {
         Ok(file) => Some(FillStore {
             storage: state.storage.clone(),
+            index: std::sync::Arc::clone(&state.repo_index),
             key,
             file,
             guard: TempFileGuard::new(path.clone()),
@@ -1218,17 +1288,22 @@ mod checked {
     /// check and drops nothing. Built only by [`healing`].
     pub(super) struct Healing {
         inner: VerifyingStream,
-        drop_on_mismatch: Option<(crate::storage::Storage, String)>,
+        drop_on_mismatch: Option<(
+            crate::storage::Storage,
+            std::sync::Arc<crate::repo_index::RepoIndex>,
+            String,
+        )>,
     }
 
     pub(super) fn healing(
         inner: VerifyingStream,
         storage: crate::storage::Storage,
+        index: std::sync::Arc<crate::repo_index::RepoIndex>,
         key: String,
     ) -> Healing {
         Healing {
             inner,
-            drop_on_mismatch: Some((storage, key)),
+            drop_on_mismatch: Some((storage, index, key)),
         }
     }
 
@@ -1239,8 +1314,8 @@ mod checked {
             let next = Pin::new(&mut self.inner).poll_next(cx);
             if let Poll::Ready(Some(Err(e))) = &next {
                 if e.kind() == std::io::ErrorKind::InvalidData {
-                    if let Some((storage, key)) = self.drop_on_mismatch.take() {
-                        super::drop_bad_copy(storage, key);
+                    if let Some((storage, index, key)) = self.drop_on_mismatch.take() {
+                        super::drop_bad_copy(storage, index, key);
                     }
                 }
             }
@@ -1302,11 +1377,16 @@ mod checked {
 }
 
 /// Deletes a cached copy that failed its pin, in a task of its own.
-fn drop_bad_copy(storage: Storage, key: String) {
+fn drop_bad_copy(
+    storage: Storage,
+    index: std::sync::Arc<crate::repo_index::RepoIndex>,
+    key: String,
+) {
     use std::panic::AssertUnwindSafe;
     let task = async move {
         match storage.delete(&key).await {
             Ok(()) => {
+                index.invalidate("hf");
                 tracing::warn!(registry = "hf", key = %key, "cached copy failed its pin; dropped")
             }
             Err(e) => {
@@ -1329,13 +1409,17 @@ fn commit_fill(store: FillStore, sha256: String) {
     let task = async move {
         let FillStore {
             storage,
+            index,
             key,
             file,
             path,
             mut guard,
         } = store;
         match sync_and_commit(&storage, &key, file, &path, &sha256).await {
-            Ok(()) => guard.disarm(),
+            Ok(()) => {
+                guard.disarm();
+                index.invalidate("hf");
+            }
             Err(e) => {
                 tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
             }
@@ -1453,6 +1537,7 @@ async fn cached_response(
         .body(stream_body(checked::healing(
             verified,
             state.storage.clone(),
+            std::sync::Arc::clone(&state.repo_index),
             key.to_string(),
         )))
         .ok()
@@ -1556,7 +1641,7 @@ fn parse_file_request(rest: &str) -> Option<FileRequest<'_>> {
     let segments: Vec<&str> = rest.split('/').collect();
     for segment in &segments {
         let decoded = decode_segment(segment)?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
+        if !plain_segment(&decoded) {
             return None;
         }
     }
@@ -1594,7 +1679,7 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
     }
     for (i, segment) in rest.split('/').enumerate() {
         let decoded = decode_segment(segment).ok_or(Refusal::BadPath)?;
-        if decoded.is_empty() || decoded == "." || decoded == ".." {
+        if !plain_segment(&decoded) {
             return Err(Refusal::BadPath);
         }
         if i > 0
@@ -1635,6 +1720,17 @@ fn escapes_are_whole(s: &str) -> bool {
                 .get(i + 1..i + 3)
                 .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
     })
+}
+
+/// A decoded segment the upstream may be handed: not empty, and no `.` or `..` component
+/// once its encoded separators are read as separators. A revision travels as one segment
+/// (`refs%2Fpr%2F1`), but `main%2F..%2F..%2Fother-org%2Fother` decodes to a walk out of the
+/// repository, which a git ref name cannot be either; `\` counts as a separator too.
+fn plain_segment(decoded: &str) -> bool {
+    !decoded.is_empty()
+        && decoded
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
@@ -1799,6 +1895,8 @@ mod tests {
         create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
         })
     }
 
@@ -2906,6 +3004,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.hf.proxy_timeout = 1;
         });
         let timed = |class: &str| {
@@ -3194,6 +3294,419 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "audit refused a download");
     }
 
+    /// A file redirect leaves the upstream only for its CDN: with the default `cdn_hosts`
+    /// the mock CDN (another port of 127.0.0.1) is not one, so the download is a 502 and the
+    /// mock never sees a request (a redirect to any http host used to be followed).
+    /// A redirect NORA refuses is the upstream answering: it does not count toward opening
+    /// the breaker, which would shut every hf request out after a few refusals.
+    #[tokio::test]
+    async fn refused_redirects_do_not_open_the_breaker() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let uri = up.uri();
+        // The mock CDN is not listed: every LFS download is a refused redirect.
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 2;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        for _ in 0..4 {
+            let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the breaker opened on refusals"
+        );
+        assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+    }
+
+    /// The walk is judged against where it started: a CDN hop that sends the request back to
+    /// the upstream's own origin is followed, though the upstream's host is not a CDN host.
+    #[tokio::test]
+    async fn a_walk_back_to_the_upstream_origin_through_the_cdn_is_followed() {
+        let up = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        // The upstream as `localhost`, the CDN as `127.0.0.1`: only the CDN is listed.
+        let upstream = up.uri().replace("127.0.0.1", "localhost");
+        Mock::given(path("/org/model/resolve/main/f.bin"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/x", cdn.uri()).as_str()),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(path("/x"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{upstream}/final").as_str()),
+            )
+            .mount(&cdn)
+            .await;
+        Mock::given(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .mount(&up)
+            .await;
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(upstream);
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/org/model/resolve/main/f.bin",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.to_vec(), b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_upstream_and_its_cdn_is_not_followed() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+        });
+        let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            upstream_paths(&cdn).await.is_empty(),
+            "the unlisted host was asked"
+        );
+        // The same-origin walk of a regular file (the relative 307) is unchanged.
+        let resp = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.to_vec(), CONFIG);
+    }
+
+    /// Every form a `Location` can name another host in is judged as the address it joins to:
+    /// absolute, without a scheme, with a backslash. Each is a 502 and the host is not asked.
+    #[tokio::test]
+    async fn every_form_of_a_redirect_to_an_unlisted_host_is_refused() {
+        let up = MockServer::start().await;
+        let other = MockServer::start().await;
+        let port = other.address().port();
+        let forms = [
+            format!("http://localhost:{port}/x"),
+            format!("//localhost:{port}/x"),
+            format!("/\\localhost:{port}/x"),
+            format!("\\\\localhost:{port}\\x"),
+            format!("http:\\\\localhost:{port}/x"),
+        ];
+        // Each form names the other host once joined to the hop it came from, as NORA joins it.
+        let hop =
+            reqwest::Url::parse(&format!("{}/org/model/resolve/main/f.bin", up.uri())).unwrap();
+        for location in &forms {
+            let next = hop.join(location).unwrap();
+            assert_eq!(
+                (next.host_str(), next.port()),
+                (Some("localhost"), Some(port)),
+                "{location}"
+            );
+        }
+        for (n, location) in forms.iter().enumerate() {
+            Mock::given(path(format!("/org/model/resolve/main/f{n}.bin")))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("location", location.as_str()),
+                )
+                .mount(&up)
+                .await;
+        }
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(uri);
+            cfg.hf.cdn_hosts = vec!["cdn.example".to_string()];
+        });
+        // A HEAD stops at a redirect to another origin without asking it, but it answers only
+        // where a GET would go: the client's metadata request must not succeed for a file the
+        // download is refused.
+        for method in [Method::GET, Method::HEAD] {
+            for (n, location) in forms.iter().enumerate() {
+                let resp = send(
+                    &ctx.app,
+                    method.clone(),
+                    &format!("/hf/org/model/resolve/main/f{n}.bin"),
+                    "",
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "{method} {location}"
+                );
+            }
+        }
+        assert!(
+            upstream_paths(&other).await.is_empty(),
+            "the unlisted host was asked"
+        );
+    }
+
+    /// `host_listed` on a grid of hosts and lists, against the rule written another way: an
+    /// address is listed when a listed address equals it; a name when it is an entry, or ends
+    /// with a dot and the entry. The empty list lists nothing.
+    #[test]
+    fn host_listed_agrees_with_the_rule_on_every_host_and_list() {
+        fn rule(host: &str, list: &[&str]) -> bool {
+            let bare = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            match bare.parse::<std::net::IpAddr>() {
+                Ok(ip) => list.iter().any(|e| e.parse::<std::net::IpAddr>() == Ok(ip)),
+                Err(_) => list
+                    .iter()
+                    .filter(|e| e.parse::<std::net::IpAddr>().is_err())
+                    .any(|e| bare == *e || bare.ends_with(&format!(".{e}"))),
+            }
+        }
+        let lists: [&[&str]; 9] = [
+            &[],
+            &["hf.co"],
+            &["hf.co", "huggingface.co"],
+            &["co"],
+            &["a.b.c"],
+            &["127.0.0.1"],
+            &["::1"],
+            &["0:0:0:0:0:0:0:1"],
+            &["0.0.1", "1"],
+        ];
+        let hosts = [
+            "hf.co",
+            "HF.CO",
+            "us.aws.cdn.hf.co",
+            "cdn.evilhf.co",
+            "evilhf.co",
+            "xhf.co",
+            "hf.co.evil.example",
+            "hf.com",
+            "co",
+            "huggingface.co",
+            "cdn-lfs.huggingface.co",
+            "a.b.c",
+            "x.a.b.c",
+            "b.c",
+            "xa.b.c",
+            "127.0.0.1",
+            "127.0.0.2",
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]",
+            "[::2]",
+            "169.254.169.254",
+            "0.0.0.1",
+            "10.0.0.1",
+        ];
+        let mut listed = 0;
+        for list in lists {
+            let entries: Vec<String> = list.iter().map(|e| e.to_string()).collect();
+            for host in hosts {
+                let want = rule(host, list);
+                listed += usize::from(want);
+                assert_eq!(host_listed(host, &entries), want, "{host} in {list:?}");
+            }
+        }
+        // The grid holds both answers, and names that only resemble a listed one are not listed.
+        assert_eq!(listed, 24);
+        assert!(!host_listed("cdn.evilhf.co", &["hf.co".to_string()]));
+        assert!(!host_listed("169.254.169.254", &[]));
+    }
+
+    /// `hop_allowed` on every start, current hop and next address of a grid, against its rule:
+    /// the upstream's own origin from any hop; else a listed host, over https, or over http only
+    /// when neither the start nor the current hop is https.
+    #[test]
+    fn hop_allowed_follows_its_rule_on_every_walk() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let list = vec!["hf.co".to_string(), "127.0.0.5".to_string()];
+        let starts = [
+            "https://huggingface.co/o/m/resolve/main/f",
+            "http://127.0.0.1:7000/f",
+        ];
+        let currents = ["", "https://us.aws.cdn.hf.co/x", "http://lan.hf.co/x"];
+        let nexts = [
+            "https://huggingface.co/api/resolve-cache/x",
+            "http://huggingface.co/x",
+            "https://huggingface.co:8443/x",
+            "http://127.0.0.1:7000/final",
+            "http://127.0.0.1:7001/x",
+            "https://us.aws.cdn.hf.co/x",
+            "http://us.aws.cdn.hf.co/x",
+            "https://cdn.evilhf.co/x",
+            "http://evil.example/x",
+            "https://127.0.0.5/x",
+            "http://127.0.0.5:9000/x",
+            "https://169.254.169.254/x",
+        ];
+        let mut allowed = 0;
+        for start in starts.map(url) {
+            for current in currents {
+                let current = if current.is_empty() {
+                    start.clone()
+                } else {
+                    url(current)
+                };
+                for next in nexts.map(url) {
+                    let home = (next.scheme(), next.host_str(), next.port_or_known_default())
+                        == (
+                            start.scheme(),
+                            start.host_str(),
+                            start.port_or_known_default(),
+                        );
+                    let named = host_listed(next.host_str().unwrap(), &list);
+                    let plain_walk = start.scheme() == "http" && current.scheme() == "http";
+                    let want = home || (named && (next.scheme() == "https" || plain_walk));
+                    allowed += usize::from(want);
+                    assert_eq!(
+                        hop_allowed(&start, &current, &next, &list),
+                        want,
+                        "{start} via {current} to {next}"
+                    );
+                }
+            }
+        }
+        assert_eq!(allowed, 22);
+    }
+
+    /// `plain_segment` on every segment of up to four components, each joined by `/` or `\`,
+    /// against its rule: not empty, and no component empty, `.` or `..`.
+    #[test]
+    fn plain_segment_agrees_with_the_rule_on_every_segment() {
+        fn rule(segment: &str) -> bool {
+            let mut ok = !segment.is_empty();
+            let mut part = String::new();
+            for c in segment.chars().chain(std::iter::once('/')) {
+                if c == '/' || c == '\\' {
+                    ok &= !(part.is_empty() || part == "." || part == "..");
+                    part.clear();
+                } else {
+                    part.push(c);
+                }
+            }
+            ok
+        }
+        let parts = ["a", "", ".", "..", "x.y", "...", "a..b"];
+        // Every sequence of one to four parts, each gap a `/` or a `\`.
+        let mut segments: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+        let mut last = segments.clone();
+        for _ in 1..4 {
+            last = last
+                .iter()
+                .flat_map(|base| {
+                    parts
+                        .iter()
+                        .flat_map(move |p| [format!("{base}/{p}"), format!("{base}\\{p}")])
+                })
+                .collect();
+            segments.extend(last.iter().cloned());
+        }
+        let mut plain = 0;
+        for segment in &segments {
+            let want = rule(segment);
+            plain += usize::from(want);
+            assert_eq!(plain_segment(segment), want, "{segment:?}");
+        }
+        assert_eq!(segments.len(), 7 + 98 + 1372 + 19208);
+        assert!(plain > 0 && plain < segments.len());
+    }
+
+    #[test]
+    fn a_hop_is_allowed_to_the_upstream_origin_and_its_cdn_hosts_only() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let hub = url("https://huggingface.co/org/m/resolve/main/f");
+        let cdn = vec!["hf.co".to_string(), "huggingface.co".to_string()];
+        for (next, allowed) in [
+            ("https://huggingface.co/api/resolve-cache/x", true),
+            ("https://us.aws.cdn.hf.co/xet-bridge-us/x", true),
+            ("https://cas-bridge.xethub.hf.co/x", true),
+            ("https://hf.co/x", true),
+            ("https://US.AWS.CDN.HF.CO/x", true),
+            ("http://us.aws.cdn.hf.co/x", false),
+            ("https://evilhf.co/x", false),
+            ("https://hf.co.evil.example/x", false),
+            ("https://evil.example/x", false),
+            ("http://169.254.169.254/latest/meta-data/", false),
+            ("https://169.254.169.254/", false),
+            ("http://127.0.0.1:8080/secret", false),
+            ("https://[::1]/x", false),
+            ("http://huggingface.co/x", false),
+        ] {
+            assert_eq!(hop_allowed(&hub, &hub, &url(next), &cdn), allowed, "{next}");
+        }
+        // An http upstream (a test or a LAN mirror) may go to a listed http host; an IP
+        // address counts only as written.
+        let lan = url("http://127.0.0.1:7000/org/m/resolve/main/f");
+        let listed = vec!["127.0.0.1".to_string()];
+        assert!(hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &listed
+        ));
+        assert!(!hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.2:7001/cdn/f"),
+            &listed
+        ));
+        assert!(!hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &cdn
+        ));
+        assert!(hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.1:7000/other"),
+            &[]
+        ));
+        // An address is no name: a listed `0.0.1` holds no `127.0.0.1` under it.
+        let suffix = vec!["0.0.1".to_string()];
+        assert!(!hop_allowed(
+            &lan,
+            &lan,
+            &url("http://127.0.0.1:7001/cdn/f"),
+            &suffix
+        ));
+        // An address is one address however it is written, and an IPv6 host is read without
+        // its brackets.
+        let v6 =
+            |listed: &str, next: &str| hop_allowed(&hub, &hub, &url(next), &[listed.to_string()]);
+        assert!(v6("::1", "https://[::1]/x"));
+        assert!(v6("0:0:0:0:0:0:0:1", "https://[::1]/x"));
+        assert!(v6("::1", "https://[0:0:0:0:0:0:0:1]/x"));
+        assert!(!v6("::1", "https://[::2]/x"));
+        // http to a CDN host only along an http walk: never down from an https hop, not even
+        // from an http upstream through an https CDN.
+        let https_hop = url("https://us.aws.cdn.hf.co/x");
+        let plain = url("http://lan.hf.co/x");
+        assert!(hop_allowed(&lan, &lan, &plain, &cdn));
+        assert!(!hop_allowed(&lan, &https_hop, &plain, &cdn));
+        assert!(hop_allowed(
+            &lan,
+            &https_hop,
+            &url("https://other.hf.co/x"),
+            &cdn
+        ));
+        // Back to the upstream's own origin is the upstream: allowed from any hop.
+        assert!(hop_allowed(
+            &lan,
+            &https_hop,
+            &url("http://127.0.0.1:7000/final"),
+            &[]
+        ));
+    }
+
     #[tokio::test]
     async fn the_clients_credentials_stay_with_nora_on_every_hop() {
         let cdn = cdn_with_weights().await;
@@ -3239,6 +3752,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.curation.mode = curation;
             if mode == "allow" {
                 cfg.curation.allowlist_path = Some(file);
@@ -3422,6 +3937,8 @@ mod tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.hf.enabled = true;
             cfg.hf.proxy = Some(uri);
+            // The mock CDN listens on another port of the same address.
+            cfg.hf.cdn_hosts = vec!["127.0.0.1".to_string()];
             cfg.curation.internal_namespaces = vec!["openai-community/gpt2".to_string()];
         });
         assert!(!ctx.state.curation().curation_engine.is_active());
@@ -3701,6 +4218,64 @@ mod tests {
         assert_eq!(fill_temps(&ctx), 0);
     }
 
+    /// A cached file shows on the dashboard: the index counts it per repository, and the UI
+    /// stats and the dashboard's storage total include it (hf used to be missing from all
+    /// three: the index was a placeholder and a fill never marked it stale).
+    #[tokio::test]
+    async fn a_cached_file_is_counted_on_the_dashboard() {
+        let cdn = cdn_with_weights().await;
+        let up = live_hub(&cdn).await;
+        let ctx = hf_with_upstream(&up);
+        // Built, empty, before the download: only the fill's invalidation can show the file.
+        let before = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
+        assert!(before.is_empty(), "{before:?}");
+        let first = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
+        assert_eq!(body_bytes(first).await.to_vec(), weights());
+        wait_stored(&ctx, &weights_key()).await;
+        // A second file of the same repository: one repository, two files.
+        let second = send(&ctx.app, Method::GET, CONFIG_PATH, "").await;
+        assert_eq!(body_bytes(second).await.to_vec(), CONFIG);
+        wait_stored(&ctx, &config_key()).await;
+        let size = (weights().len() + CONFIG.len()) as u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let idx = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
+            if idx.first().is_some_and(|r| r.versions == 2) {
+                assert_eq!(idx.len(), 1, "{idx:?}");
+                assert_eq!(idx[0].name, "org/model");
+                assert_eq!(idx[0].size, size);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the index never saw both cached files: {idx:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stats: Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, "/api/ui/stats", "").await).await,
+        )
+        .unwrap();
+        // The stats count repositories, as for every registry; the dashboard card counts files.
+        assert_eq!(stats["hf"], 1, "{stats}");
+        let dash: Value = serde_json::from_slice(
+            &body_bytes(send(&ctx.app, Method::GET, "/api/ui/dashboard", "").await).await,
+        )
+        .unwrap();
+        let card = dash["registry_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "hf")
+            .unwrap_or_else(|| panic!("no hf card: {dash}"));
+        assert_eq!(card["artifact_count"], 2, "{card}");
+        assert_eq!(card["size_bytes"], size, "{card}");
+        assert!(
+            dash["global_stats"]["storage_bytes"].as_u64().unwrap() >= size,
+            "{dash}"
+        );
+    }
+
     #[tokio::test]
     async fn a_second_download_of_a_regular_file_comes_from_the_cache() {
         let cdn = cdn_with_weights().await;
@@ -3962,6 +4537,7 @@ mod tests {
             git: None,
             store: Some(FillStore {
                 storage: ctx.state.storage.clone(),
+                index: std::sync::Arc::clone(&ctx.state.repo_index),
                 key: key.to_string(),
                 file,
                 guard: TempFileGuard::new(path.clone()),
@@ -4697,9 +5273,41 @@ mod tests {
             "org/model/resolve/main/f%zz",
             "",
             "org/model/resolve/main/f g",
+            // A revision or file that decodes to a walk out of the repository.
+            "org/model/resolve/main%2F..%2F..%2F..%2Fother-org%2Fother/config.json",
+            "org/model/resolve/main%5C..%5C..%5Cother/config.json",
+            "org/model/resolve/refs%2F..%2Fx/f",
+            "org/model/resolve/main/a%2F..%2Fb",
+            "org/model/resolve/refs%2Fpr%2F/f",
+            "org/model/resolve/.%2Fmain/f",
         ] {
             assert_eq!(ok(bad), None, "{bad:?}");
         }
+        // Dots inside a name are no component of their own.
+        assert_eq!(
+            ok("org/model/resolve/v1.0..2/a..b.bin"),
+            Some(("org/model", "v1.0..2", "a..b.bin"))
+        );
+    }
+
+    #[test]
+    fn a_metadata_path_that_decodes_to_a_walk_is_not_forwarded() {
+        for bad in [
+            "org/model/tree/main/..%2F..%2F..%2Fother",
+            "org/model/tree/main%2F..%2Fx",
+            "org/model/revision/refs%2F..%2F..%2Fother",
+            "org/model/tree/main/%5C..%5Cother",
+        ] {
+            assert_eq!(
+                models_api_upstream("https://up", bad, None),
+                Err(Refusal::BadPath),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            models_api_upstream("https://up", "org/model/revision/refs%2Fpr%2F1", None),
+            Ok("https://up/api/models/org/model/revision/refs%2Fpr%2F1".to_string())
+        );
     }
 
     // ── the pure rules ─────────────────────────────────────────────────────────

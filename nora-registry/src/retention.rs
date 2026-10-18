@@ -543,17 +543,9 @@ async fn collect_docker_versions(storage: &Storage) -> Vec<(String, Vec<VersionE
             if let Some(idx) = rest.find("/manifests/") {
                 let repo = &rest[..idx];
                 let tag_file = &rest[idx + "/manifests/".len()..];
-                if ends_with_ci(tag_file, ".json")
-                    && !ends_with_ci(tag_file, ".meta.json")
-                    && !ends_with_ci(tag_file, ".stats.json")
-                {
-                    let tag = tag_file.strip_suffix(".json").unwrap_or(tag_file);
-                    // Skip digest references (sha256:…, sha512:…) — they are
-                    // stored alongside the tag file by put_manifest and must not
-                    // consume keep_last budget (#932).
-                    if tag.starts_with("sha256:") || tag.starts_with("sha512:") {
-                        continue;
-                    }
+                // Digest copies (sha256:…), stored beside the tag by put_manifest, must not
+                // consume keep_last budget (#932); sidecars are not tags either.
+                if let Some(tag) = crate::registry::docker::tag_from_manifest_file(tag_file) {
                     repos
                         .entry(repo.to_string())
                         .or_default()
