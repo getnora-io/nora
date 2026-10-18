@@ -1513,6 +1513,129 @@ pub(crate) async fn regenerate_packument(
         .map_err(|_| ())
 }
 
+/// Why retention could not bring a packument back in line with storage.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PackumentReconcileError {
+    #[error("storage: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+    #[error("cached packument is not JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("cached packument is not a JSON object")]
+    NotAnObject,
+    #[error("regenerating the packument from published versions failed")]
+    Regenerate,
+}
+
+/// Bring a package's packument back in line with storage after retention removed the
+/// tarballs of `retired` versions. Runs under the package's packument `publish_lock`.
+///
+/// A package with published versions owns its packument (#975): it is reassembled from
+/// `versions/`, as publish does. A proxied package has no `versions/` keys — its
+/// packument is the cached upstream document, so it is edited instead of rebuilt:
+/// regenerating it from `versions/` emptied it, and with the upstream unreachable the
+/// surviving version could not be installed.
+pub(crate) async fn reconcile_packument_after_retention(
+    storage: &crate::storage::Storage,
+    package_name: &str,
+    retired: &std::collections::BTreeSet<String>,
+) -> Result<(), PackumentReconcileError> {
+    let published = storage
+        .list(&format!("npm/{}/versions/", package_name))
+        .await?;
+    if published.is_empty() {
+        prune_cached_packument(storage, package_name, retired).await
+    } else {
+        regenerate_packument(storage, package_name)
+            .await
+            .or(Err(PackumentReconcileError::Regenerate))
+    }
+}
+
+/// Remove from a cached upstream packument the `retired` versions whose tarball is gone,
+/// keeping every other version document as the upstream sent it.
+///
+/// Only what retention removed leaves the document: a version that was never fetched
+/// through the proxy has no tarball here either, and that is a normal proxy cache, not
+/// a retired version. A dist-tag left pointing at a removed version is dropped, and a
+/// dropped `latest` is re-pointed at the highest version still advertised.
+///
+/// The upstream validators of the old document are cleared before it is replaced, so a
+/// 304 cannot re-serve the edited copy as the upstream's. The provenance record is
+/// carried over to the new bytes only when it vouched for the old ones.
+async fn prune_cached_packument(
+    storage: &crate::storage::Storage,
+    package_name: &str,
+    retired: &std::collections::BTreeSet<String>,
+) -> Result<(), PackumentReconcileError> {
+    let key = format!("npm/{}/metadata.json", package_name);
+    let old = match storage.get(&key).await {
+        Ok(old) => old,
+        // Nothing cached: the next read fetches the packument from the upstream.
+        Err(crate::storage::StorageError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let tarballs = storage
+        .list(&format!("npm/{}/tarballs/", package_name))
+        .await?;
+    let on_disk: std::collections::BTreeSet<String> = tarballs
+        .iter()
+        .filter_map(|key| key.rsplit('/').next())
+        .filter_map(|file| crate::curation::parse_npm_tarball_version(package_name, file))
+        .collect();
+
+    let mut packument: serde_json::Value = serde_json::from_slice(&old)?;
+    let obj = packument
+        .as_object_mut()
+        .ok_or(PackumentReconcileError::NotAnObject)?;
+    let Some(versions) = obj.get_mut("versions").and_then(|v| v.as_object_mut()) else {
+        return Ok(());
+    };
+    let before = versions.len();
+    versions.retain(|version, _| !retired.contains(version) || on_disk.contains(version));
+    if versions.len() == before {
+        return Ok(());
+    }
+    let remaining: Vec<String> = versions.keys().cloned().collect();
+    if let Some(tags) = obj.get_mut("dist-tags").and_then(|t| t.as_object_mut()) {
+        tags.retain(|_, version| {
+            version
+                .as_str()
+                .is_some_and(|v| remaining.iter().any(|r| r == v))
+        });
+        if !tags.contains_key("latest") {
+            if let Some(latest) = max_semver(remaining.iter()) {
+                tags.insert("latest".to_string(), serde_json::Value::String(latest));
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&packument)?;
+
+    let validators = super::validators_key(&key);
+    match storage.delete(&validators).await {
+        Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
+    storage.put(&key, &bytes).await?;
+
+    let record_key = origin_key(&key);
+    if let Ok(record) = storage.get(&record_key).await {
+        let vouched_origin = std::str::from_utf8(&record)
+            .ok()
+            .and_then(|record| record.split_once('\n'))
+            .filter(|(_, digest)| *digest == hex::encode(sha2::Sha256::digest(&old)))
+            .map(|(origin, _)| origin.to_string());
+        if let Some(origin) = vouched_origin {
+            if let Err(e) = storage
+                .put(&record_key, provenance_record(&origin, &bytes).as_bytes())
+                .await
+            {
+                tracing::warn!(key = %key, error = ?e, "npm: failed to record cache provenance");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Seed per-version keys from an old embedded packument (versions inside `metadata.json`, no
 /// per-version keys) so the scan-regenerate path does not drop them. Idempotent; a no-op once the
 /// package has per-version keys. Runs BEFORE the new version is written.
