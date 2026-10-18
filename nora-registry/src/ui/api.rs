@@ -423,17 +423,13 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
 
     let mut tags = Vec::new();
     for key in &keys {
-        // Skip the .meta.json / .stats.json sidecars (not tags)
-        if ends_with_ci(key, ".meta.json") || ends_with_ci(key, ".stats.json") {
-            continue;
-        }
-
         // The tag is the segment after `/manifests/`, whatever the namespace
-        // prefix (docker/{name}/... or docker/{ns}/{name}/...).
+        // prefix (docker/{name}/... or docker/{ns}/{name}/...); sidecars and
+        // digest copies are not tags.
         let tag_name = key
             .find("/manifests/")
             .map(|idx| &key[idx + "/manifests/".len()..])
-            .and_then(|s| s.strip_suffix(".json"));
+            .and_then(crate::registry::docker::tag_from_manifest_file);
 
         if let Some(tag_name) = tag_name {
             // Load metadata from .meta.json file
