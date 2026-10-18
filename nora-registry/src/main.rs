@@ -258,8 +258,21 @@ async fn gc_pass(
 /// The line the GC scheduler logs when a pass ends. Files evicted by
 /// `[gc] proxy_cache_max_bytes` are counted apart from the orphans: they are neither in
 /// `deleted` nor in its `bytes_freed`.
-fn gc_done_line(result: &gc::GcResult) -> String {
+fn gc_done_line(result: &gc::GcResult, dry_run: bool) -> String {
     let eviction = &result.proxy_cache_eviction;
+    if dry_run {
+        // A dry pass deletes nothing: its counts are what a real pass would take.
+        return format!(
+            "GC scheduler: dry run in {:.1}s — {} orphans ({} bytes would be freed), {} would be evicted from the proxy cache ({} bytes), {} metadata phantoms, {} skipped (grace)",
+            result.duration_secs,
+            result.orphaned,
+            result.bytes_freed,
+            eviction.evicted_files,
+            eviction.bytes_freed,
+            result.metadata_phantoms_removed,
+            result.skipped_recent
+        );
+    }
     format!(
         "GC scheduler: done in {:.1}s — {} orphans ({} deleted, {} bytes freed), {} evicted from the proxy cache ({} bytes freed), {} metadata phantoms, {} skipped (grace)",
         result.duration_secs,
@@ -300,10 +313,18 @@ async fn retention_pass(
             "scheduler",
             &format!("{} versions", result.planned),
             "*",
-            &format!(
-                "keys={} bytes_freed={} duration={:.1}s",
-                result.deleted_keys, result.bytes_freed, result.duration_secs
-            ),
+            &if dry_run {
+                // Nothing was deleted: the bytes are what an applied pass would free.
+                format!(
+                    "would_free_bytes={} duration={:.1}s",
+                    result.bytes_freed, result.duration_secs
+                )
+            } else {
+                format!(
+                    "keys={} bytes_freed={} duration={:.1}s",
+                    result.deleted_keys, result.bytes_freed, result.duration_secs
+                )
+            },
         ));
     }
     result
@@ -2492,7 +2513,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                         proxy_cache_max_bytes,
                     )
                     .await;
-                    info!("{}", gc_done_line(&result));
+                    info!("{}", gc_done_line(&result, dry_run));
                 }
                 .boxed()
             }),
@@ -3343,7 +3364,11 @@ mod cleanup_pass_tests {
             .lines()
             .map(|line| {
                 let entry: serde_json::Value = serde_json::from_str(line).unwrap();
-                entry["action"].as_str().unwrap().to_string()
+                format!(
+                    "{} {}",
+                    entry["action"].as_str().unwrap(),
+                    entry["detail"].as_str().unwrap()
+                )
             })
             .collect()
     }
@@ -3354,7 +3379,15 @@ mod cleanup_pass_tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let (storage, rules) = go_versions(data.path()).await;
         let actions = audited_actions(&storage, &rules, true, audit_dir.path()).await;
-        assert_eq!(actions, ["retention-dry-run"], "{actions:?}");
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            actions[0].starts_with("retention-dry-run would_free_bytes="),
+            "{actions:?}"
+        );
+        assert!(
+            !actions[0].contains("bytes_freed") && !actions[0].contains("keys="),
+            "{actions:?}"
+        );
         assert!(
             storage
                 .get("go/github.com/user/repo/@v/v1.0.0.zip")
@@ -3370,7 +3403,11 @@ mod cleanup_pass_tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let (storage, rules) = go_versions(data.path()).await;
         let actions = audited_actions(&storage, &rules, false, audit_dir.path()).await;
-        assert_eq!(actions, ["retention-apply"], "{actions:?}");
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            actions[0].starts_with("retention-apply keys=6 bytes_freed="),
+            "{actions:?}"
+        );
         assert!(storage
             .get("go/github.com/user/repo/@v/v1.0.0.zip")
             .await
@@ -3397,7 +3434,7 @@ mod cleanup_pass_tests {
                 bytes_freed: 4_096,
             },
         };
-        let line = gc_done_line(&result);
+        let line = gc_done_line(&result, false);
         assert!(
             line.contains("3 orphans (2 deleted, 700 bytes freed)"),
             "{line}"
@@ -3405,6 +3442,18 @@ mod cleanup_pass_tests {
         assert!(
             line.contains("5 evicted from the proxy cache (4096 bytes freed)"),
             "{line}"
+        );
+        // A dry pass freed nothing: the line says what an applied pass would.
+        let dry = gc_done_line(&result, true);
+        assert!(dry.contains("dry run"), "{dry}");
+        assert!(dry.contains("700 bytes would be freed"), "{dry}");
+        assert!(
+            dry.contains("5 would be evicted from the proxy cache (4096 bytes)"),
+            "{dry}"
+        );
+        assert!(
+            !dry.contains("deleted") && !dry.contains("bytes freed"),
+            "{dry}"
         );
     }
 
