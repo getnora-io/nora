@@ -40,7 +40,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nora_artifacts_total` | counter | registry | Total artifacts stored |
+| `nora_artifacts_total` | gauge | registry | Repositories with stored files, the count `/api/ui/stats` shows (not files or versions). Set every 60 s from the dashboard index, which a read of the dashboard or the stats rebuilds after a change |
 | `nora_downloads_total` | counter | registry | Total artifact downloads |
 | `nora_uploads_total` | counter | registry | Total artifact uploads |
 
