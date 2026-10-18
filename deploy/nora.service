@@ -11,6 +11,8 @@ Group=nora
 ExecStart=/usr/local/bin/nora serve
 Restart=on-failure
 RestartSec=5
+# A configuration error (EX_CONFIG) stops the service instead of restarting into it
+RestartPreventExitStatus=78
 
 # Environment
 Environment=RUST_LOG=info
