@@ -90,6 +90,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
+# Reads `impl Storage` for the list test of the UI storage boundary (already in the lock).
+syn = { version = "2", default-features = false, features = ["full", "parsing"] }
 
 [[bench]]
 name = "parsing"

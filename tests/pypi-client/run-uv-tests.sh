@@ -4,7 +4,7 @@ set -euo pipefail
 # PyPI client fixture: uv against a NORA proxy whose upstream publishes no hashes.
 # Exit code 0 = all passed, non-zero = failures.
 #
-# ── What this polygon PROVES ─────────────────────────────────────────────
+# ── What this suite PROVES ───────────────────────────────────────────────
 #  [x] uv resolves and installs through NORA when the upstream PEP 503 index has
 #      links without #sha256= (#1100: uv refused NORA's PEP 691 JSON with
 #      "missing field `hashes`")
@@ -12,7 +12,7 @@ set -euo pipefail
 #  [x] uv talks only to NORA (single --default-index, no user config) and NORA
 #      fetched the wheel from the fixture
 #
-# ── What this polygon does NOT prove ─────────────────────────────────────
+# ── What this suite does NOT prove ───────────────────────────────────────
 #  [ ] behaviour against pypi.org itself (its links always carry #sha256=)
 #  [ ] other uv versions than the one on PATH
 #
