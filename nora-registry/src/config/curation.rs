@@ -78,6 +78,10 @@ pub enum CurationOnFailure {
 pub struct CurationConfig {
     #[serde(default)]
     pub mode: CurationMode,
+    /// Whether `mode` was written down (the config file or `NORA_CURATION_MODE`), rather than
+    /// left at its default. An open proxy is the operator's decision only when it is (#1135).
+    #[serde(skip)]
+    pub mode_explicit: bool,
     #[serde(default)]
     pub on_failure: CurationOnFailure,
     #[serde(default)]
@@ -156,6 +160,7 @@ impl Default for CurationConfig {
     fn default() -> Self {
         Self {
             mode: CurationMode::Off,
+            mode_explicit: false,
             on_failure: CurationOnFailure::Closed,
             allowlist_path: None,
             blocklist_path: None,
@@ -220,6 +225,7 @@ impl CurationConfig {
             self.mode = val
                 .parse::<CurationMode>()
                 .map_err(|e| format!("NORA_CURATION_MODE={:?}: {}", val, e))?;
+            self.mode_explicit = true;
         }
         if let Ok(val) = env::var("NORA_CURATION_ON_FAILURE") {
             self.on_failure = match val.to_lowercase().as_str() {
