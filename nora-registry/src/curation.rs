@@ -1303,7 +1303,7 @@ impl IntoResponse for BlockedResponse {
             version: self.version.clone(),
         };
         let version_str = self.version.as_deref().unwrap_or("*");
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": "blocked_by_policy",
             "error_version": "v1",
             "context": {
@@ -1319,6 +1319,16 @@ impl IntoResponse for BlockedResponse {
             ),
             "docs": CURATION_DOCS_URL
         });
+        // Docker clients read only the OCI distribution error format (`errors`); without it they
+        // report "no error details found" and the reason is lost. The refusal adds it beside the
+        // fields above, which stay where scripts read them.
+        if self.registry == RegistryType::Docker {
+            body["errors"] = serde_json::json!([{
+                "code": "DENIED",
+                "message": format!("blocked by policy: {}", self.reason),
+                "detail": body["context"].clone(),
+            }]);
+        }
 
         let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
         let headers = response.headers_mut();
@@ -2439,6 +2449,49 @@ mod tests {
             response.headers().get("x-nora-reason").unwrap(),
             "known-vulnerable"
         );
+    }
+
+    /// A docker refusal carries the OCI distribution error a docker client prints (#1149), and keeps
+    /// every field of the refusal body where scripts read them; other registries' bodies are as
+    /// they were, without `errors`.
+    #[tokio::test]
+    async fn a_docker_refusal_is_also_an_oci_error() {
+        let docker = refusal_body(BlockedResponse {
+            rule: "min-release-age".to_string(),
+            reason: "package is 0h old (minimum: 7d)".to_string(),
+            registry: RegistryType::Docker,
+            package: "corp/app".to_string(),
+            version: Some("1.0".to_string()),
+        })
+        .await;
+        assert_eq!(docker["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            docker["errors"][0]["message"],
+            "blocked by policy: package is 0h old (minimum: 7d)"
+        );
+        assert_eq!(docker["errors"][0]["detail"]["package"], "corp/app");
+        assert_eq!(docker["error"], "blocked_by_policy");
+        assert_eq!(docker["error_version"], "v1");
+        assert_eq!(
+            docker["context"]["reason"],
+            "package is 0h old (minimum: 7d)"
+        );
+        assert!(docker["hint"]
+            .as_str()
+            .unwrap()
+            .contains("docker:corp/app@1.0"));
+        for registry in [
+            RegistryType::Npm,
+            RegistryType::PyPI,
+            RegistryType::Maven,
+            RegistryType::Cargo,
+            RegistryType::Go,
+            RegistryType::Raw,
+        ] {
+            let body = refusal_body(refusal(registry, "p", Some("1"))).await;
+            assert!(body.get("errors").is_none(), "{registry}: {body}");
+            assert_eq!(body["error"], "blocked_by_policy", "{registry}");
+        }
     }
 
     /// The JSON body of a refusal, as a client reads it.
