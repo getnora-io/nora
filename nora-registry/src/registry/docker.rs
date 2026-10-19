@@ -2230,7 +2230,7 @@ fn consults_push_record(ns: Option<&str>, name: &str, reference: &str) -> bool {
 /// The stored copy that answers a manifest reference, and whether it is hosted (pushed or bare)
 /// rather than proxied — one resolution for every reader: GET and HEAD, and the deletes that
 /// follow a tag. A tag whose push record names the digest of the bare manifest answers with it
-/// (docker-tag-spec, variant A); otherwise the namespaced (proxied) copy, then the bare one.
+/// (a push answers its tag); otherwise the namespaced (proxied) copy, then the bare one.
 /// Digest references are content-addressed and skip the record. A storage error other than
 /// NotFound is the answer: a failed read never hands the reference to another copy.
 async fn resolve_manifest(
@@ -2301,7 +2301,7 @@ async fn pushed_tag(
 }
 
 /// The push record in a tag's bare metadata: the metadata, when it names a pushed digest
-/// (`sha256:` or `sha512:`). A tag with one is the push's (docker-tag-spec, variant A): the bare
+/// (`sha256:` or `sha512:`). A tag with one is the push's: the bare
 /// manifest answers it and curation dates it by the push. Pure: the whole test is this function.
 pub(crate) fn push_record(meta: &[u8]) -> Option<ImageMetadata> {
     serde_json::from_slice::<ImageMetadata>(meta)
@@ -5805,7 +5805,7 @@ mod integration_tests {
         );
     }
 
-    /// Decision table for a pushed tag (docker-tag-spec, variant A): helpers.
+    /// Decision table for a pushed tag: helpers.
     fn table_manifest(config_digest: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
