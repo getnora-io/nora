@@ -504,8 +504,8 @@ async fn download(
         // the metadata here (synchronously, so the date is readable on this same
         // request) — gated on trust, namespace-safe, best-effort. Mirrors PyPI's
         // ensure_pypi_dates_cached.
-        // A name with a canon record is NORA's (published now or before): an upstream's dates for
-        // that name belong to another crate, and asking for them gives the name away.
+        // A name whose canon record was read here (one with `-` or `_`) is NORA's, published now
+        // or before: an upstream's dates for it belong to another crate, and asking gives it away.
         if state.config.server.trust_upstream_dates && record.is_none() {
             ensure_cargo_metadata_cached(&state, &crate_name).await;
         }
@@ -553,6 +553,24 @@ async fn download(
     // silently. (Typestate rollout — see `crate::verified`, raw.rs is the PoC.)
     if let Ok(outcome) = state.storage.get_verified(&key).await {
         use nora_registry::verified::{verified_body, GateOutcome};
+        // A stored copy of a version that is not published, under a name with a canon record: of a
+        // published crate it is an upstream's bytes or a removed version and is never served; under a
+        // stale record, another published spelling of the name refuses it.
+        if record.is_some() {
+            let entry = format!(
+                "cargo/index-entries/{}/{}/{}.json",
+                crate_index_prefix(&crate_name),
+                crate_name,
+                version
+            );
+            if state.storage.stat(&entry).await.is_none() {
+                if let Some(response) =
+                    unpublished_version_refusal(&state, &crate_name, record.as_deref()).await
+                {
+                    return response;
+                }
+            }
+        }
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
             GateOutcome::Unpinned(blob) => blob.into_inner(),
@@ -641,22 +659,13 @@ async fn download(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // Before an upstream is asked: a stale record naming this spelling (it is not published) while
-    // another spelling of the canon is refuses as well.
-    match another_published_spelling(
-        &state.storage,
-        &crate_name,
-        record.as_deref(),
-        OwnSpelling::Read,
-    )
-    .await
+    // Before an upstream is asked: a version of a published crate that is not stored is not one of
+    // its versions (404; nothing is fetched or stored, so an upstream's bytes never sit beside the
+    // published ones), and a stale record of this spelling while another is published refuses too.
+    if let Some(response) =
+        unpublished_version_refusal(&state, &crate_name, record.as_deref()).await
     {
-        Ok(Some(published)) => return another_spelling_response(&crate_name, &published),
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(registry = "cargo", crate_name = %crate_name, error = %e, "cargo: reading the crate's name record failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+        return response;
     }
 
     // Proxy fetch from upstream
@@ -1506,6 +1515,31 @@ async fn published_spelling_by_scan(
         }
     }
     Ok(None)
+}
+
+/// The answer for a version of `name` that is not published, or None to go on: 404 when the crate
+/// is published (an unpublished version of it is never an upstream's), the refusal naming another
+/// published spelling when the canon's record is stale, 503 when what decides cannot be read.
+async fn unpublished_version_refusal(
+    state: &AppState,
+    name: &str,
+    record: Option<&str>,
+) -> Option<Response> {
+    let failed = |e: crate::storage::StorageError| {
+        tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo: reading whether the crate is published failed");
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    };
+    match is_published(&state.storage, name).await {
+        Ok(true) => return Some(StatusCode::NOT_FOUND.into_response()),
+        Ok(false) => {}
+        Err(e) => return Some(failed(e)),
+    }
+    match another_published_spelling(&state.storage, name, record, OwnSpelling::Known(false)).await
+    {
+        Ok(Some(published)) => Some(another_spelling_response(name, &published)),
+        Ok(None) => None,
+        Err(e) => Some(failed(e)),
+    }
 }
 
 /// After a successful publish, under the canon's lock: the record names this spelling, unless it
@@ -5120,7 +5154,90 @@ mod crate_name_one_canon {
             assert_eq!(status, StatusCode::OK, "{name}");
             lists.push(ops.snapshot().get("list").copied().unwrap_or(0));
         }
-        assert_eq!(lists[0], lists[1], "{lists:?}");
+        assert_eq!(lists, [0, 0], "{lists:?}");
+    }
+
+    /// N-f, N-b: a version of a published crate that is not published is not one of its versions:
+    /// without a stored copy it is 404, the upstream is not asked and nothing is stored (an upstream's
+    /// bytes beside the published ones would be taken for a version, and retention could drop the
+    /// published one for them); a copy stored beside the published crate is not served either. Its
+    /// published version is served.
+    #[tokio::test]
+    async fn an_unpublished_version_of_a_published_crate_is_never_an_upstreams() {
+        for name in ["rc-lv", "rclv"] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            assert_eq!(publish(&ctx.app, name, "0.1.0").await.0, StatusCode::OK);
+            let (status, _) = get(
+                &ctx.app,
+                &format!("/cargo/api/v1/crates/{name}/9.9.9/download"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+            assert!(ctx
+                .state
+                .storage
+                .stat(&format!("cargo/{name}/9.9.9/{name}-9.9.9.crate"))
+                .await
+                .is_none());
+            let downloads = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/download"))
+                .count();
+            assert_eq!(downloads, 0, "{name}");
+            let (status, _) = get(
+                &ctx.app,
+                &format!("/cargo/api/v1/crates/{name}/0.1.0/download"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+        }
+        // A copy stored beside a published crate with a record (here cached before this release).
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        assert_eq!(publish(&ctx.app, "rc-lv", "0.1.0").await.0, StatusCode::OK);
+        ctx.state
+            .storage
+            .put("cargo/rc-lv/9.9.9/rc-lv-9.9.9.crate", b"SQUAT")
+            .await
+            .unwrap();
+        let (status, _) = get(&ctx.app, "/cargo/api/v1/crates/rc-lv/9.9.9/download").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// N-c, N-d: a stored copy under a stale record of this spelling: with another spelling
+    /// published it is refused naming that one; with none, it is served as the cached copy it is.
+    #[tokio::test]
+    async fn a_stored_copy_under_a_stale_record_follows_the_record_rule() {
+        for other_published in [true, false] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            ctx.state
+                .storage
+                .put("cargo/_names/zz-q", b"zz_q")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("cargo/zz_q/9.9.9/zz_q-9.9.9.crate", b"CACHED")
+                .await
+                .unwrap();
+            if other_published {
+                seed_entries(&ctx.state.storage, &["zz-q"]).await;
+            }
+            let (status, body) = get(&ctx.app, "/cargo/api/v1/crates/zz_q/9.9.9/download").await;
+            if other_published {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(body.contains("`zz-q`"), "{body}");
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, "CACHED");
+            }
+            assert_eq!(asked(&server).await, 0);
+        }
     }
 
     /// S1, C7: a store from an older release (`my-crate` published, no record) gets its records at
