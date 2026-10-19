@@ -17,6 +17,8 @@
 //!    - If a namespaced equivalent already exists → delete legacy (dedup)
 //!    - If no namespaced equivalent → copy data to namespaced key, verify, delete legacy (migrate)
 //! 4. Already-namespaced keys are skipped
+//! 5. A repository with a tag pushed here (its bare `.meta.json` records the push) is hosted, not
+//!    a flat proxy cache: none of its keys are moved or deleted
 
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
@@ -91,6 +93,10 @@ pub async fn migrate_docker_keys(
         ..Default::default()
     };
 
+    let pushed = pushed_repositories(storage, &all_keys)
+        .await
+        .map_err(|e| format!("Failed to read a push record: {e}"))?;
+
     for key in &all_keys {
         let Some(rest) = key.strip_prefix("docker/") else {
             stats.skipped += 1;
@@ -98,28 +104,24 @@ pub async fn migrate_docker_keys(
             continue;
         };
 
-        // Extract repository name: everything before /manifests/ or /blobs/
-        let repo_name = if let Some(idx) = rest.find("/manifests/") {
-            &rest[..idx]
-        } else if let Some(idx) = rest.find("/blobs/") {
-            &rest[..idx]
-        } else {
+        let Some(repo_name) = repository_of(rest) else {
             // Not a manifest or blob key — skip (e.g., metadata or unknown)
             stats.skipped += 1;
             pb.inc(1);
             continue;
         };
 
-        if repo_name.is_empty() {
+        // Classify: if strip_docker_namespace changes the name, it's already namespaced
+        let canonical = strip_docker_namespace(repo_name);
+        if canonical != repo_name {
+            // Already namespaced — no action needed
             stats.skipped += 1;
             pb.inc(1);
             continue;
         }
 
-        // Classify: if strip_docker_namespace changes the name, it's already namespaced
-        let canonical = strip_docker_namespace(repo_name);
-        if canonical != repo_name {
-            // Already namespaced — no action needed
+        // A repository pushed here keeps its bare keys: they are the pushed images.
+        if pushed.contains(repo_name) {
             stats.skipped += 1;
             pb.inc(1);
             continue;
@@ -266,11 +268,238 @@ pub async fn migrate_docker_keys(
     Ok(stats)
 }
 
+/// The repository a key under `docker/` belongs to: everything before its last `/manifests/` or
+/// `/blobs/`, read from the right as a request path is, so `a/manifests/b` is one repository and
+/// both loops of the migration see the same name. None for any other key.
+fn repository_of(rest: &str) -> Option<&str> {
+    let at = [rest.rfind("/manifests/"), rest.rfind("/blobs/")]
+        .into_iter()
+        .flatten()
+        .max()?;
+    Some(&rest[..at]).filter(|repo| !repo.is_empty())
+}
+
+/// The bare repositories with at least one tag whose `.meta.json` records a push. A record that
+/// cannot be read fails the migration: guessing would move or delete a pushed image.
+async fn pushed_repositories(
+    storage: &Storage,
+    keys: &[String],
+) -> crate::storage::Result<std::collections::HashSet<String>> {
+    let mut pushed = std::collections::HashSet::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix("docker/") else {
+            continue;
+        };
+        let Some(repo) = repository_of(rest) else {
+            continue;
+        };
+        let file = &rest[repo.len()..];
+        if !file.starts_with("/manifests/")
+            || !file.ends_with(".meta.json")
+            || strip_docker_namespace(repo) != repo
+        {
+            continue;
+        }
+        let meta = storage.get(key).await.inspect_err(|e| {
+            warn!(key = %key, error = %e, "push record unreadable");
+        })?;
+        // The resolver's own test of a push record: one predicate decides what is a push.
+        if crate::registry::docker::push_record(&meta).is_some() {
+            pushed.insert(repo.to_string());
+        }
+    }
+    Ok(pushed)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A tag pushed here records the push in its bare `.meta.json`: its repository is hosted and
+    /// keeps every bare key — with or without a proxied copy of the same tag. A repository without
+    /// a record is migrated as before.
+    #[tokio::test]
+    async fn a_pushed_repository_keeps_its_bare_keys() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let pushed = [
+            ("docker/corp/app/manifests/1.0.json", &b"pushed"[..]),
+            (
+                "docker/corp/app/manifests/1.0.meta.json",
+                &br#"{"push_timestamp":1,"last_pulled":0,"downloads":0,"size_bytes":0,"os":"","arch":"","layers":[],"pushed_digest":"sha256:00"}"#[..],
+            ),
+            ("docker/corp/app/manifests/sha256:00.json", &b"pushed"[..]),
+            ("docker/corp/app/blobs/sha256:11", &b"layer"[..]),
+        ];
+        for (key, data) in pushed {
+            storage.put(key, data).await.unwrap();
+        }
+        storage
+            .put("docker/docker.io/corp/app/manifests/1.0.json", b"proxied")
+            .await
+            .unwrap();
+        storage
+            .put("docker/library/nginx/manifests/latest.json", b"flat cache")
+            .await
+            .unwrap();
+
+        let stats = migrate_docker_keys(
+            &storage,
+            "docker.io",
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        for (key, data) in pushed {
+            assert_eq!(&*storage.get(key).await.unwrap(), data, "{key}");
+        }
+        assert!(storage
+            .get("docker/docker.io/library/nginx/manifests/latest.json")
+            .await
+            .is_ok());
+        assert_eq!(stats.migrated, 1);
+        assert_eq!(stats.deduped, 0);
+    }
+
+    #[test]
+    fn a_repository_is_read_from_the_right() {
+        for (key, repo) in [
+            ("corp/app/manifests/1.0.json", Some("corp/app")),
+            ("corp/app/blobs/sha256:11", Some("corp/app")),
+            (
+                "corp/manifests/app/manifests/1.0.json",
+                Some("corp/manifests/app"),
+            ),
+            (
+                "corp/manifests/app/blobs/sha256:11",
+                Some("corp/manifests/app"),
+            ),
+            ("x/blobs/y/manifests/1.0.meta.json", Some("x/blobs/y")),
+            ("app/manifests/1.0.json", Some("app")),
+            ("/manifests/1.0.json", None),
+            ("corp/app/1.0.json", None),
+        ] {
+            assert_eq!(repository_of(key), repo, "{key}");
+        }
+    }
+
+    /// Every pushed repository keeps its keys — several of them, and one whose name has a
+    /// `manifests` component (a repository name is read from the right, as a request is).
+    #[tokio::test]
+    async fn every_pushed_repository_keeps_its_keys() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let record = br#"{"push_timestamp":1,"last_pulled":0,"downloads":0,"size_bytes":0,"os":"","arch":"","layers":[],"pushed_digest":"sha256:00"}"#;
+        let mut kept = Vec::new();
+        for repo in ["corp/a", "corp/b", "corp/manifests/app"] {
+            for (file, data) in [
+                ("manifests/1.0.json", &b"pushed"[..]),
+                ("manifests/1.0.meta.json", &record[..]),
+                ("blobs/sha256:11", &b"layer"[..]),
+            ] {
+                let key = format!("docker/{repo}/{file}");
+                storage.put(&key, data).await.unwrap();
+                kept.push((key, data));
+            }
+        }
+        migrate_docker_keys(
+            &storage,
+            "docker.io",
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+        for (key, data) in kept {
+            assert_eq!(&*storage.get(&key).await.unwrap(), data, "{key}");
+        }
+    }
+
+    /// A metadata file whose `pushed_digest` names no digest is not a push record — for the migration
+    /// as for the resolver (one predicate): its flat repository is moved like any proxied cache.
+    #[tokio::test]
+    async fn a_record_naming_no_digest_is_not_a_push() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let not_a_record = br#"{"push_timestamp":1,"last_pulled":0,"downloads":0,"size_bytes":0,"os":"","arch":"","layers":[],"pushed_digest":"md5:00"}"#;
+        storage
+            .put("docker/corp/app/manifests/1.0.meta.json", not_a_record)
+            .await
+            .unwrap();
+        storage
+            .put("docker/corp/app/manifests/1.0.json", b"flat cache")
+            .await
+            .unwrap();
+        migrate_docker_keys(
+            &storage,
+            "docker.io",
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+        assert!(storage
+            .stat("docker/corp/app/manifests/1.0.json")
+            .await
+            .is_none());
+        assert_eq!(
+            &*storage
+                .get("docker/docker.io/corp/app/manifests/1.0.json")
+                .await
+                .unwrap(),
+            b"flat cache"
+        );
+    }
+
+    /// A push record that cannot be read stops the migration before anything moves: guessing
+    /// "not pushed" would move or delete a pushed image.
+    #[tokio::test]
+    async fn an_unreadable_push_record_stops_the_migration() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put(
+                "docker/corp/app/manifests/1.0.meta.json",
+                br#"{"push_timestamp":1,"last_pulled":0,"downloads":0,"size_bytes":0,"os":"","arch":"","layers":[],"pushed_digest":"sha256:00"}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put("docker/corp/app/manifests/1.0.json", b"pushed")
+            .await
+            .unwrap();
+        storage
+            .put("docker/library/nginx/manifests/latest.json", b"flat cache")
+            .await
+            .unwrap();
+        // The record's bytes change under its stored digest: the read fails closed.
+        std::fs::write(
+            dir.path().join("docker/corp/app/manifests/1.0.meta.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert!(storage
+            .get("docker/corp/app/manifests/1.0.meta.json")
+            .await
+            .is_err());
+
+        let result = migrate_docker_keys(
+            &storage,
+            "docker.io",
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(storage
+            .get("docker/corp/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/library/nginx/manifests/latest.json")
+            .await
+            .is_ok());
+    }
 
     #[tokio::test]
     async fn test_migrate_legacy_to_namespaced() {

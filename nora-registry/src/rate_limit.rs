@@ -288,6 +288,35 @@ mod tests {
         );
     }
 
+    // Behind a reverse proxy that appends to X-Forwarded-For, a client that varies the header it
+    // sends still lands in its own bucket: the address the proxy appended decides it.
+    #[tokio::test]
+    async fn edge_limiters_key_a_client_by_the_address_its_proxy_appended() {
+        let quota = Quota {
+            interval: Duration::from_secs(3600),
+            burst: 1,
+        };
+        type Make = fn(Quota, TrustedProxies) -> (Limiter<TrustedProxyKeyExtractor>, Quota);
+        for make in [upload_rate_limiter as Make, general_rate_limiter as Make] {
+            let (layer, _) = make(quota, TrustedProxies::default_loopback());
+            let proxy = [127, 0, 0, 1];
+            assert_eq!(
+                status_through(&layer, proxy, "1.1.1.1, 203.0.113.9").await,
+                axum::http::StatusCode::OK
+            );
+            assert_eq!(
+                status_through(&layer, proxy, "9.9.9.9, 203.0.113.9").await,
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a different client-written part must not mint a fresh bucket"
+            );
+            assert_eq!(
+                status_through(&layer, proxy, "1.1.1.1, 198.51.100.7").await,
+                axum::http::StatusCode::OK,
+                "another client behind the proxy keeps its own bucket"
+            );
+        }
+    }
+
     #[test]
     fn test_custom_config() {
         let config = RateLimitConfig {

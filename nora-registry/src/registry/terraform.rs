@@ -43,8 +43,6 @@ use axum::{
 };
 use std::time::Duration;
 
-const UPSTREAM_DEFAULT: &str = "https://registry.terraform.io";
-
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("terraform/", ".zip");
 
@@ -227,7 +225,13 @@ async fn provider_versions(
         return tf_isolation_refusal(&state, &provider);
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return match cached_data {
+            Some(data) => with_json(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!(
         "{}/v1/providers/{}/{}/versions",
         proxy_url.trim_end_matches('/'),
@@ -338,7 +342,13 @@ async fn provider_download_meta(
         return tf_isolation_refusal(&state, &provider);
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return match cached_data {
+            Some(data) => with_json(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!(
         "{}/v1/providers/{}/{}/{}/download/{}/{}",
         proxy_url.trim_end_matches('/'),
@@ -482,6 +492,12 @@ async fn provider_download_binary(
         return tf_isolation_refusal(&state, &provider);
     }
 
+    // No upstream when the operator switched it off: a provider file not stored is not fetched
+    // from anywhere, the release host its metadata names included.
+    if upstream_url(&state).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // Try upstream — resolve the real upstream URL from cached provider metadata.
     // The metadata JSON (cached by provider_download_meta) stores the
     // original download_url in `_nora_upstream_url`.
@@ -594,7 +610,13 @@ async fn module_versions(
         return tf_isolation_refusal(&state, &module);
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return match cached_data {
+            Some(data) => with_json(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!(
         "{}/v1/modules/{}/{}/{}/versions",
         proxy_url.trim_end_matches('/'),
@@ -686,7 +708,10 @@ async fn module_download(
         return tf_isolation_refusal(&state, &module);
     }
 
-    let proxy_url = upstream_url(&state);
+    // No upstream when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/v1/modules/{}/{}/{}/{}/download",
         proxy_url.trim_end_matches('/'),
@@ -830,6 +855,11 @@ async fn module_source_download(
 
     if internal {
         return tf_isolation_refusal(&state, &module);
+    }
+    // With the upstream switched off, a source URL stored while it was on is not followed: the
+    // archive is served from storage or not at all.
+    if upstream_url(&state).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // Resolve original upstream URL from cached metadata
@@ -1092,7 +1122,13 @@ async fn mirror_fetch_versions(
         )));
     }
 
-    let proxy_url = upstream_url(state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(state) else {
+        return match cached_data {
+            Some(ref data) => parse_json(data),
+            None => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        };
+    };
     let url = format!(
         "{}/v1/providers/{}/{}/versions",
         proxy_url.trim_end_matches('/'),
@@ -1160,7 +1196,10 @@ async fn mirror_fetch_archive(
         Some(data) => String::from_utf8_lossy(&data).to_string(),
         None if internal => return Ok(None),
         None => {
-            let proxy_url = upstream_url(state);
+            // No upstream when the operator switched it off: the archive is not listed.
+            let Some(proxy_url) = upstream_url(state) else {
+                return Ok(None);
+            };
             let url = format!(
                 "{}/v1/providers/{}/{}/{}/download/{}/{}",
                 proxy_url.trim_end_matches('/'),
@@ -1255,7 +1294,7 @@ fn url_is_official_terraform(u: &str) -> bool {
 }
 
 fn terraform_upstream_is_official(state: &AppState) -> bool {
-    url_is_official_terraform(&upstream_url(state))
+    upstream_url(state).is_some_and(|u| url_is_official_terraform(&u))
 }
 
 /// Best-effort release date for a Terraform provider version via the
@@ -1315,7 +1354,7 @@ async fn extract_terraform_publish_date(
     // Proxy mode: only the official registry has a per-version date, and only when
     // we're configured to trust upstream-provided dates (#513 — an attacker on a
     // custom mirror could spoof it).
-    if state.config.terraform.proxy.is_some() {
+    if upstream_url(state).is_some() {
         // #68/#733 dependency-confusion: an internal-namespace provider's coordinates
         // must never be sent to the hardcoded public registry.terraform.io/v2 — that
         // would leak them upstream. Block the date query for internal namespaces.
@@ -1429,13 +1468,10 @@ fn parse_os_arch_from_filename(filename: &str) -> Option<(&str, &str)> {
     Some((os, arch))
 }
 
-fn upstream_url(state: &AppState) -> String {
-    state
-        .config
-        .terraform
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_TF_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.terraform.proxy).map(str::to_string)
 }
 
 use crate::cache_ttl::is_within_ttl;

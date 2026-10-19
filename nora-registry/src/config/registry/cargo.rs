@@ -17,6 +17,13 @@ pub struct CargoConfig {
     pub proxy_timeout: u64,
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Crates whose stored sparse index, found with no per-version entries beside it, may be
+    /// imported as published versions at the next publish. Empty by default: such an index may as
+    /// well be an upstream crate an older release cached, and a publish over it is refused until
+    /// the operator decides.
+    /// ENV: NORA_CARGO_IMPORT_EMBEDDED (comma-separated names).
+    #[serde(default)]
+    pub import_embedded: Vec<String>,
 }
 
 fn default_cargo_proxy() -> Option<String> {
@@ -31,6 +38,7 @@ impl Default for CargoConfig {
             proxy_auth: None,
             proxy_timeout: 30,
             metadata_ttl: 300,
+            import_embedded: Vec::new(),
         }
     }
 }
@@ -55,6 +63,14 @@ impl CargoConfig {
         }
         if let Ok(val) = env::var("NORA_CARGO_METADATA_TTL") {
             super::super::parse_env_warn("NORA_CARGO_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_CARGO_IMPORT_EMBEDDED") {
+            self.import_embedded = val
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_lowercase)
+                .collect();
         }
     }
 }

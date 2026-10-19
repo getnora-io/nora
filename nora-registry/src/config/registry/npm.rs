@@ -32,6 +32,13 @@ pub struct NpmConfig {
     /// error falls back to a full fetch.
     #[serde(default = "super::super::default_true")]
     pub revalidate: bool,
+    /// Packages whose `metadata.json` holds versions with no record of where they came from
+    /// (a package published to NORA 0.9.3 or older) and may be imported as published at their
+    /// next publish. Empty by default: such a document may as well be an upstream package NORA
+    /// 1.3.3 or older cached, and a publish over it is refused until the operator decides.
+    /// ENV: NORA_NPM_IMPORT_EMBEDDED (comma-separated names).
+    #[serde(default)]
+    pub import_embedded: Vec<String>,
 }
 
 /// One npm upstream: a bare URL, or a table with scopes and a credential.
@@ -159,6 +166,7 @@ impl Default for NpmConfig {
             metadata_ttl: 300,
             serve_stale: true,
             revalidate: true,
+            import_embedded: Vec::new(),
         }
     }
 }
@@ -302,6 +310,14 @@ impl NpmConfig {
         }
         if let Ok(val) = env::var("NORA_NPM_REVALIDATE") {
             self.revalidate = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_NPM_IMPORT_EMBEDDED") {
+            self.import_embedded = val
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
         }
         // Bearer tokens are read once, here; validation rejects a missing one.
         for entry in &mut self.proxies {

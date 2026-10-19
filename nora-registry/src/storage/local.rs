@@ -138,6 +138,17 @@ fn open_staging(_root: &Path) -> std::io::Result<Staging> {
     ))
 }
 
+/// The directory a listing names must be readable: a listing that silently skipped it would
+/// answer "nothing here" for files that are there (a published npm package would read as
+/// unpublished). A directory deeper down that cannot be read is still skipped, as before.
+fn readable_listing_root(root: &Path) -> std::result::Result<(), StorageError> {
+    match std::fs::read_dir(root) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
 /// Remove the staging directories of dead instances: those whose lock can be taken,
 /// those without a lock file, and `.new-*` ones abandoned half-created. A directory
 /// whose lock is held belongs to a live instance and is left alone, and so is any
@@ -708,13 +719,14 @@ impl StorageBackend for LocalStorage {
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
             if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+                readable_listing_root(&root)?;
                 Self::list_files_sync(&root, &base, &prefix, &mut results);
             }
             results.sort();
-            results
+            Ok(results)
         })
         .await
-        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))?
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
@@ -724,13 +736,14 @@ impl StorageBackend for LocalStorage {
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
             if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
+                readable_listing_root(&root)?;
                 Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
-            results
+            Ok(results)
         })
         .await
-        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))?
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -1249,6 +1262,41 @@ mod tests {
             storage.pins.get(key).as_deref(),
             Some(hex::encode(Sha256::digest(b"second")).as_str())
         );
+    }
+
+    /// A listing whose own directory cannot be read is an error, not "nothing here"; a directory
+    /// deeper down that cannot be read is still skipped. (Root reads anything: then it is moot.)
+    #[tokio::test]
+    async fn an_unreadable_listing_directory_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(&storage, "npm/pkg/versions/1.0.0.json", b"{}")
+            .await
+            .unwrap();
+        put(&storage, "npm/pkg/tarballs/pkg-1.0.0.tgz", b"tgz")
+            .await
+            .unwrap();
+        let versions = dir.path().join("npm/pkg/versions");
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&versions).is_err();
+        let own = storage.list("npm/pkg/versions/").await;
+        let meta = storage.list_with_meta("npm/pkg/versions/").await;
+        let wider = storage.list("npm/pkg/").await;
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            assert!(own.is_err(), "{own:?}");
+            assert!(meta.is_err());
+            assert_eq!(
+                wider.unwrap(),
+                vec!["npm/pkg/tarballs/pkg-1.0.0.tgz".to_string()]
+            );
+        }
+        assert!(storage
+            .list("npm/absent/versions/")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

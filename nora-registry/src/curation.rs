@@ -220,13 +220,16 @@ impl CurationEngine {
         result
     }
 
-    fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
+    /// The chain's decision for a request — namespace isolation, the mode, a bypass token, then
+    /// the filters in order (the first that does not skip decides) — with nothing counted or
+    /// logged. `evaluate` counts it; `integrity_applies` asks it about hashes it does not have, so
+    /// both read one chain.
+    fn decide(&self, request: &FilterRequest) -> EvaluationResult {
         // Namespace isolation: ALWAYS active, even in Off mode.
         // Prevents dependency confusion regardless of curation config.
         if let Some(ref ns_filter) = self.namespace_filter {
             let decision = ns_filter.evaluate(request);
             if let Decision::Block { .. } = &decision {
-                self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
                 return EvaluationResult {
                     decision,
                     decided_by: Some(ns_filter.name().to_string()),
@@ -234,7 +237,6 @@ impl CurationEngine {
                 };
             }
         }
-
         // Mode=Off: no-op
         if self.config.mode == CurationMode::Off {
             return EvaluationResult {
@@ -243,35 +245,19 @@ impl CurationEngine {
                 audited: false,
             };
         }
-
         // Bypass token
         if request.bypass {
-            self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                registry = %request.registry,
-                package = %request.name,
-                "[SECURITY] Curation bypassed via token"
-            );
             return EvaluationResult {
                 decision: Decision::Allow,
                 decided_by: Some("bypass".to_string()),
                 audited: false,
             };
         }
-
-        // Track integrity presence
-        if request.integrity.is_none() {
-            self.metrics
-                .without_integrity
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
         // Run filter chain
         for filter in &self.filters {
             let decision = filter.evaluate(request);
             match &decision {
                 Decision::Allow => {
-                    self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
                     return EvaluationResult {
                         decision,
                         decided_by: Some(filter.name().to_string()),
@@ -279,29 +265,52 @@ impl CurationEngine {
                     };
                 }
                 Decision::Block { .. } => {
-                    let audited = self.config.mode == CurationMode::Audit;
-                    if audited {
-                        self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
-                    }
                     return EvaluationResult {
                         decision,
                         decided_by: Some(filter.name().to_string()),
-                        audited,
+                        audited: self.config.mode == CurationMode::Audit,
                     };
                 }
                 Decision::Skip => continue,
             }
         }
-
         // All filters skipped → Allow
-        self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
         EvaluationResult {
             decision: Decision::Allow,
             decided_by: None,
             audited: false,
         }
+    }
+
+    fn evaluate_inner(&self, request: &FilterRequest) -> EvaluationResult {
+        let result = self.decide(request);
+        let namespace_block = matches!(result.decision, Decision::Block { .. })
+            && self.namespace_filter.as_ref().map(|f| f.name()) == result.decided_by.as_deref();
+        if namespace_block {
+            self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+        } else if self.config.mode == CurationMode::Off {
+            // nothing counted
+        } else if request.bypass {
+            self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                registry = %request.registry,
+                package = %request.name,
+                "[SECURITY] Curation bypassed via token"
+            );
+        } else {
+            // Track integrity presence
+            if request.integrity.is_none() {
+                self.metrics
+                    .without_integrity
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(result.decision, Decision::Block { .. }) && !result.audited {
+                self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.allowed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 }
 
@@ -502,6 +511,43 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     }
 
     None
+}
+
+/// Whether a check of this artifact's bytes could refuse them: in enforce mode, the filter chain
+/// (the same one `verify_integrity` reads, first non-skip decides) blocks it on integrity for a
+/// hash other than its own. A serve that cannot hash what it sends (a range
+/// of a stored file) stands down for such an artifact and reads the whole file first. Nothing is
+/// counted or logged.
+pub fn integrity_applies(
+    engine: &CurationEngine,
+    registry: RegistryType,
+    name: &str,
+    version: Option<&str>,
+) -> bool {
+    if engine.config.mode != CurationMode::Enforce {
+        return false;
+    }
+    // Two hashes no file can both have: a pin matches at most one, so one of them is refused.
+    [
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    ]
+    .iter()
+    .any(|probe| {
+        let request = FilterRequest {
+            registry,
+            upstream: None,
+            name: name.to_string(),
+            version: RequestVersion::named(version),
+            integrity: Some((*probe).to_string()),
+            bypass: false,
+            publish_date: None,
+        };
+        // The chain `verify_integrity` reads, asked about a hash this file cannot have.
+        let result = engine.decide(&request);
+        !result.audited
+            && matches!(&result.decision, Decision::Block { rule, .. } if rule.contains("integrity"))
+    })
 }
 
 /// Verify artifact integrity after download (post-download phase, issue #189).

@@ -108,7 +108,8 @@ async fn api_discovery() -> Response {
 // ── Collection list ────────────────────────────────────────────────────
 
 async fn collection_list(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
-    let proxy_url = upstream_url(&state);
+    // proxy_json answers from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let base = format!("{}{}/", proxy_url.trim_end_matches('/'), API_PREFIX);
     let url = append_query(&base, raw_query.as_deref());
 
@@ -130,7 +131,8 @@ async fn collection_detail(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let proxy_url = upstream_url(&state);
+    // proxy_json answers from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}{}/{}/{}/",
         proxy_url.trim_end_matches('/'),
@@ -161,7 +163,8 @@ async fn version_list(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let proxy_url = upstream_url(&state);
+    // proxy_json answers from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let base = format!(
         "{}{}/{}/{}/versions/",
         proxy_url.trim_end_matches('/'),
@@ -220,7 +223,8 @@ async fn version_detail(
         }
     }
 
-    let proxy_url = upstream_url(&state);
+    // proxy_json answers from storage alone when the upstream is switched off.
+    let proxy_url = upstream_url(&state).unwrap_or_default();
     let url = format!(
         "{}{}/{}/{}/versions/{}/",
         proxy_url.trim_end_matches('/'),
@@ -315,7 +319,7 @@ async fn download_tarball(
     // Release date for the digest-quarantine first-seen clock (#748/#750): the
     // Galaxy versions metadata (cached by version_list) carries per-version
     // created_at. Hosted-only uses mtime.
-    let publish_date = if state.config.ansible.proxy.is_none() {
+    let publish_date = if upstream_url(&state).is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
     } else if state.config.server.trust_upstream_dates {
         extract_ansible_publish_date(&state.storage, ns, name, ver).await
@@ -430,8 +434,10 @@ async fn download_tarball(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // Fetch from upstream
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/download/{}-{}-{}.tar.gz",
         proxy_url.trim_end_matches('/'),
@@ -451,6 +457,17 @@ async fn download_tarball(
     .await
     {
         Ok(bytes) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Ansible,
+                &format!("{}.{}", ns, name),
+                Some(ver),
+                &bytes,
+            ) {
+                return response;
+            }
             state.metrics.record_download("ansible");
             state.metrics.record_cache_miss("ansible");
             state.activity.push(ActivityEntry::new(
@@ -514,7 +531,9 @@ async fn proxy_json(
     package_name: Option<&str>,
 ) -> Response {
     let base_url = nora_base_url(state);
-    let upstream = upstream_url(state);
+    // The host stored bodies are rewritten from: the configured upstream, else the default one a
+    // cached body may still name.
+    let upstream = upstream_url(state).unwrap_or_else(|| UPSTREAM_DEFAULT.to_string());
 
     // Read cache eagerly so stale data is available on upstream failure.
     let cached_data = state.storage.get(cache_key).await.ok();
@@ -556,6 +575,17 @@ async fn proxy_json(
             )
             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
         }
+    }
+
+    // No upstream when the operator switched it off: what is stored is all there is.
+    if upstream_url(state).is_none() {
+        return match cached_data {
+            Some(data) => {
+                let text = String::from_utf8_lossy(&data);
+                with_json(rewrite_ansible_urls(&text, &upstream, &base_url).into_bytes())
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
     }
 
     // Cache miss or stale — revalidate with a conditional request when enabled
@@ -801,13 +831,10 @@ fn extract_page_param(raw_query: Option<&str>) -> Option<String> {
     None
 }
 
-fn upstream_url(state: &AppState) -> String {
-    state
-        .config
-        .ansible
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_ANSIBLE_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.ansible.proxy).map(str::to_string)
 }
 
 fn with_json(data: Vec<u8>) -> Response {

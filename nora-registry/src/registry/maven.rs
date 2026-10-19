@@ -428,10 +428,21 @@ async fn download(
     // the full read below. Release artifacts only — maven-metadata.xml and SNAPSHOT
     // paths are mutable and need the freshness check. A partial read cannot be hashed,
     // so neither the quarantine gate nor the curation integrity check can run on it:
-    // the range serve stands down while quarantine holds artifacts, and integrity is
-    // the client's own checksum, as docker does.
+    // the range serve stands down while quarantine holds artifacts or an integrity rule
+    // applies to the artifact.
+    let integrity_applies = curation_coords
+        .as_ref()
+        .is_some_and(|(maven_name, maven_version)| {
+            crate::curation::integrity_applies(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Maven,
+                maven_name,
+                Some(maven_version),
+            )
+        });
     if !is_mutable_maven_path(&path)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+        && !integrity_applies
     {
         if let Some(meta) = cached_meta.as_ref() {
             if let Some(response) = crate::registry::range::range_response(
@@ -616,6 +627,19 @@ async fn download(
         .await
         {
             Ok(data) => {
+                // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+                // the cache-hit branch checks the same rule.
+                if let Some((ref maven_name, ref maven_version)) = curation_coords {
+                    if let Some(response) = crate::curation::verify_integrity(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Maven,
+                        maven_name,
+                        Some(maven_version),
+                        &data,
+                    ) {
+                        return response;
+                    }
+                }
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_miss("maven");
                 state.activity.push(ActivityEntry::new(
@@ -697,6 +721,19 @@ async fn download(
         // a held SNAPSHOT must not be released just because the upstream went down
         // (mutable SNAPSHOT artifacts reach this path; immutable releases serve from
         // the fresh-cache branch above, which is already gated).
+        // The allowlist's pinned integrity holds on a stale copy too: the verified read above did
+        // not serve it.
+        if let Some((ref maven_name, ref maven_version)) = curation_coords {
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Maven,
+                maven_name,
+                Some(maven_version),
+                data,
+            ) {
+                return response;
+            }
+        }
         if curation_coords.is_some() {
             let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
                 state.config.curation.maven.quarantine.as_ref().or(state

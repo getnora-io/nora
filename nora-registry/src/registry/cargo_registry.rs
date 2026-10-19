@@ -138,64 +138,125 @@ async fn sparse_index(
 
     let index_key = format!("cargo/index/{}/{}", expected_prefix, crate_name);
 
-    // Read the cached index eagerly — kept for the freshness check and the stale-on-error fallback.
-    let cached = state.storage.get(&index_key).await.ok();
+    // A crate published here is served only from its own entries: no upstream is asked, and
+    // nothing an upstream answers is written over its index.
+    let published = published_state(&state.storage, &expected_prefix, &crate_name).await;
+    if let Published::Yes(ref entries) = published {
+        return published_index_response(&state, &headers, &expected_prefix, &crate_name, entries)
+            .await;
+    }
 
-    // The sparse index is MUTABLE (new versions append and `yanked` flips at any time), so a
-    // proxied index must be revalidated against upstream before it is served — otherwise newly
-    // published versions / yanks never appear. A hosted index (no upstream) is locally
-    // authoritative, and a positive `metadata_ttl` re-introduces a bounded staleness window.
-    if let Some(ref data) = cached {
-        let modified = state.storage.stat(&index_key).await.map(|m| m.modified);
-        if crate::cache_ttl::mutable_ref_fresh(
-            state.config.cargo.proxy.is_some(),
-            state.config.cargo.metadata_ttl,
-            modified,
-        ) {
-            state.metrics.record_download("cargo");
-            state.metrics.record_cache_hit("cargo");
-            state.activity.push(ActivityEntry::new(
-                ActionType::CacheHit,
-                crate_name.to_string(),
-                crate::registry_type::RegistryType::Cargo,
-                "CACHE",
-            ));
-            return sparse_index_conditional(data.to_vec(), &headers);
+    // Another spelling of a published crate (`-` and `_` name one crate, as on crates.io) is
+    // refused, never asked of an upstream: the upstream's crate of that name is not this one.
+    match published_as_another_spelling(&state.storage, &crate_name).await {
+        Ok(Some(published)) => return another_spelling_response(&crate_name, &published),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(registry = "cargo", crate_name = %crate_name, error = %e, "cargo: reading the crate's name record failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     }
 
-    // #68 namespace isolation: an internal-namespace crate must never be revalidated
-    // or fetched upstream (dependency confusion). Serve any local index (hosted or
-    // cached) without contacting upstream; block only when nothing is published
-    // locally. The fresh-cache fast path above already returned a fresh copy.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Cargo,
-        &crate_name,
-    ) {
-        if let Some(ref data) = cached {
-            state.metrics.record_cache_hit("cargo");
-            return sparse_index_conditional(data.to_vec(), &headers);
+    // An unpublished crate, or one whose listing failed: what is stored is read first, and one
+    // pure decision (`index_answer`, the decision table in cargo-index-spec) says what answers.
+    let assembled = assembled_index(&state.storage, &expected_prefix, &crate_name).await;
+    // What an older release left at the crate's index: its upstream cache, or a crate published
+    // before per-version entries.
+    let stored_index = state.storage.get(&index_key).await.ok();
+    // NORA's copy of an upstream's index lives at its own key, never at the crate's index, so a
+    // first publish never finds an upstream crate where its index goes.
+    let copy_key = upstream_copy_key(&expected_prefix, &crate_name);
+    let upstream_copy = state.storage.get(&copy_key).await.ok();
+    // The sparse index is MUTABLE (new versions append and `yanked` flips at any time), so a
+    // proxied copy is revalidated unless a positive `metadata_ttl` keeps it fresh; without an
+    // upstream the copy is all there is. Only NORA's upstream copy has a TTL.
+    let copy_fresh = match upstream_copy {
+        Some(_) => {
+            let modified = state.storage.stat(&copy_key).await.map(|m| m.modified);
+            crate::cache_ttl::mutable_ref_fresh(
+                state.config.cargo.proxy.is_some(),
+                state.config.cargo.metadata_ttl,
+                modified,
+            )
         }
-        return crate::curation::check_namespace_isolation(
+        None => false,
+    };
+    let facts = UnpublishedFacts {
+        listing_failed: matches!(published, Published::Unknown),
+        assembled: match &assembled {
+            Ok(Some(_)) => Stored::Present,
+            Ok(None) => Stored::Absent,
+            Err(_) => Stored::Unreadable,
+        },
+        stored_index: stored_index.is_some(),
+        embedded: is_import_embedded(&state, &crate_name),
+        upstream_copy: match (&upstream_copy, copy_fresh) {
+            (None, _) => CopyState::Absent,
+            (Some(_), true) => CopyState::Fresh,
+            (Some(_), false) => CopyState::Stale,
+        },
+        internal: crate::curation::is_internal_namespace(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Cargo,
             &crate_name,
-        )
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
-    }
-
-    // Revalidate / fetch from upstream (no cache, or the cached index is stale).
-    let proxy_url = match &state.config.cargo.proxy {
-        Some(url) => url.clone(),
-        None => {
-            // Hosted (no upstream): a cached index is locally authoritative.
-            if let Some(ref data) = cached {
+        ),
+        upstream: state.config.cargo.proxy.is_some(),
+    };
+    let fetch = match index_answer(facts) {
+        IndexAnswer::Assembled => {
+            if let Ok(Some(data)) = assembled {
+                tracing::warn!(registry = "cargo", crate_name = %crate_name, "cargo: no entries listed beside an assembled index");
                 state.metrics.record_cache_hit("cargo");
                 return sparse_index_conditional(data.to_vec(), &headers);
             }
-            return StatusCode::NOT_FOUND.into_response();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        IndexAnswer::Unavailable => {
+            if let Err(e) = assembled {
+                tracing::error!(registry = "cargo", crate_name = %crate_name, error = %e, "cargo: reading the assembled index failed");
+            }
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        IndexAnswer::StoredIndex => {
+            return match stored_index {
+                Some(data) => {
+                    state.metrics.record_cache_hit("cargo");
+                    sparse_index_conditional(data.to_vec(), &headers)
+                }
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
+        IndexAnswer::UpstreamCopy => {
+            return match upstream_copy {
+                Some(data) => {
+                    state.metrics.record_download("cargo");
+                    state.metrics.record_cache_hit("cargo");
+                    state.activity.push(ActivityEntry::new(
+                        ActionType::CacheHit,
+                        crate_name.to_string(),
+                        crate::registry_type::RegistryType::Cargo,
+                        "CACHE",
+                    ));
+                    sparse_index_conditional(data.to_vec(), &headers)
+                }
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
+        // #68 namespace isolation: an internal-namespace crate is never fetched upstream.
+        IndexAnswer::Refuse => {
+            return crate::curation::check_namespace_isolation(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Cargo,
+                &crate_name,
+            )
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+        }
+        IndexAnswer::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        IndexAnswer::Fetch { cache, fallback } => (cache, fallback),
+    };
+    let (cache, fallback) = fetch;
+    let Some(proxy_url) = state.config.cargo.proxy.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     // crates.io sparse index lives at index.crates.io
@@ -233,15 +294,21 @@ async fn sparse_index(
             state
                 .audit
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "cargo", ""));
-
-            // Cache in background
-            state.spawn_cache("cargo", index_key, Bytes::from(data.clone()));
-
+            // Cached only for a crate known not to be published here, and only at NORA's
+            // upstream copy.
+            if cache {
+                state.spawn_cache("cargo", copy_key, Bytes::from(data.clone()));
+            }
             sparse_index_conditional(data, &headers)
         }
         Err(e) => {
-            // Upstream unreachable — serve the stale cached index if we have one (graceful).
-            if let Some(ref data) = cached {
+            // Upstream unreachable — serve the stored copy if there is one (graceful).
+            let stale = match fallback {
+                Fallback::UpstreamCopy => upstream_copy,
+                Fallback::StoredIndex => stored_index,
+                Fallback::None => None,
+            };
+            if let Some(data) = stale {
                 tracing::warn!(
                     crate_name,
                     "Cargo upstream failed, serving stale cached index"
@@ -390,6 +457,17 @@ async fn download(
     // isolation, publish date, integrity — sees only the lowercase name.
     let upstream_path = format!("api/v1/crates/{}/{}/download", crate_name, version);
     let crate_name = crate_name.to_lowercase();
+
+    // Another spelling of a published crate is refused here too: neither an upstream nor a copy
+    // cached from one answers for it.
+    match published_as_another_spelling(&state.storage, &crate_name).await {
+        Ok(Some(published)) => return another_spelling_response(&crate_name, &published),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(registry = "cargo", crate_name = %crate_name, error = %e, "cargo: reading the crate's name record failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
 
     // Extract publish date from cached Cargo metadata
     let publish_date = {
@@ -555,6 +633,17 @@ async fn download(
     .await
     {
         Ok(data) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Cargo,
+                &crate_name,
+                Some(&version),
+                &data,
+            ) {
+                return response;
+            }
             state.spawn_cache("cargo", key.clone(), Bytes::from(data.clone()));
             state.metrics.record_download("cargo");
             state.metrics.record_cache_miss("cargo");
@@ -685,6 +774,47 @@ async fn publish(
         return (StatusCode::FORBIDDEN, "Outside namespace scope").into_response();
     }
 
+    // One crate per canon (`-` and `_` name one crate, as on crates.io). The canon's record is read
+    // under its own lock, taken before the crate's and held to the end, so two spellings published
+    // at once cannot both pass. A first publish writes the record once it has succeeded: a refused
+    // or failed publish leaves none (a crash in between is healed by the rebuild at startup).
+    let name_key = crate_name_record_key(&name);
+    let name_lock = state.publish_lock(&name_key);
+    let _name_guard = name_lock.lock().await;
+    let mut record_missing = false;
+    match state.storage.get(&name_key).await {
+        Ok(data) => {
+            let published = String::from_utf8_lossy(&data).trim().to_string();
+            // This spelling may be published itself (both were, before records existed): it goes on.
+            if published != name
+                && !matches!(
+                    published_state(&state.storage, &crate_index_prefix(&name), &name).await,
+                    Published::Yes(_)
+                )
+            {
+                let err = serde_json::json!({
+                    "errors": [{"detail": format!(
+                        "crate `{name}` is published here as `{published}`: `-` and `_` name the same crate"
+                    )}]
+                });
+                return (
+                    StatusCode::CONFLICT,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    )],
+                    serde_json::to_vec(&err).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        }
+        Err(crate::storage::StorageError::NotFound) => record_missing = true,
+        Err(e) => {
+            tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: reading the crate's name record failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+
     // TOCTOU protection: lock per crate (not per version!) to serialize
     // index read-modify-write. The index file is shared across all versions
     // of the same crate, so concurrent publishes of different versions
@@ -769,13 +899,21 @@ async fn publish(
 
     // Store the .crate tarball FIRST (immutable, per-version). If the index write fails after,
     // re-publish is possible (immutability checks the .crate, not the index).
+    // Decided before anything is written, so a refusal leaves the store as it was.
+    let migrate_from = match migration_source(&state, &prefix, &name).await {
+        Ok(source) => source,
+        Err(refusal) => return refusal,
+    };
+
     if state.storage.put(&crate_key, crate_data).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Migrate an old single-file sparse index to per-version entries BEFORE writing the new one,
     // so the regenerate below lists both the migrated and the new versions (no loss).
-    migrate_cargo_index(&state, &prefix, &name).await;
+    if let Some(index) = migrate_from {
+        migrate_cargo_index(&state, &prefix, &name, &index).await;
+    }
 
     // Write this version's index line as its OWN immutable key. Concurrent publishes of DIFFERENT
     // versions write distinct keys, so none is lost — the #39 fix (vs the old read-modify-write of
@@ -817,6 +955,12 @@ async fn publish(
     ));
     state.repo_index.invalidate("cargo");
 
+    if record_missing {
+        if let Err(e) = state.storage.put(&name_key, name.as_bytes()).await {
+            tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: writing the crate's name record failed; the rebuild at the next start writes it");
+        }
+    }
+
     // Cargo expects a JSON response with warnings array
     let response = serde_json::json!({
         "warnings": {
@@ -846,45 +990,346 @@ async fn publish(
 /// write distinct entry keys, so no version line is lost (vs the old read-modify-write of the
 /// shared index file). Mirrors maven scan-regenerate.
 async fn regenerate_cargo_index(storage: &Storage, prefix: &str, name: &str) -> Result<(), ()> {
-    let entries_prefix = format!("cargo/index-entries/{}/{}/", prefix, name);
+    let index = assemble_cargo_index(storage, prefix, name)
+        .await
+        .ok_or(())?;
+    store_assembled_index(storage, prefix, name, &index)
+        .await
+        .map_err(|_| ())
+}
+
+/// The per-version entries of a crate published here: the only source of its index.
+fn entries_prefix(prefix: &str, name: &str) -> String {
+    format!("cargo/index-entries/{prefix}/{name}/")
+}
+
+/// Where NORA keeps the index it assembled from a published crate's entries. Written in one put,
+/// so finding it is proof the crate is NORA's: `cargo/index/<prefix>/<name>` is only a copy of it
+/// for older releases, and anything else there (an older release's upstream cache, a crate
+/// published before per-version entries) is not. No request reaches this key: no route builds
+/// the prefix.
+fn assembled_index_key(prefix: &str, name: &str) -> String {
+    format!("cargo/index-assembled/{prefix}/{name}")
+}
+
+/// What an index request for a crate with no listed entries found, read before anything is
+/// decided.
+#[derive(Debug, Clone, Copy)]
+struct UnpublishedFacts {
+    /// The entries listing failed (the crate may be published) rather than finding none.
+    listing_failed: bool,
+    /// The index NORA assembled from entries (`cargo/index-assembled/…`).
+    assembled: Stored,
+    /// Something is stored at `cargo/index/…` (an older release's cache, or a crate published
+    /// before per-version entries).
+    stored_index: bool,
+    /// The operator named the crate in `cargo.import_embedded`.
+    embedded: bool,
+    /// NORA's upstream copy (`cargo/index-upstream/…`) and whether it is fresh.
+    upstream_copy: CopyState,
+    /// The name is in an internal namespace.
+    internal: bool,
+    /// An upstream is configured.
+    upstream: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stored {
+    Absent,
+    Present,
+    /// A storage error other than NotFound.
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CopyState {
+    Absent,
+    Stale,
+    Fresh,
+}
+
+/// What answers an index request for a crate with no listed entries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IndexAnswer {
+    /// The index NORA assembled.
+    Assembled,
+    /// 503: the assembled index cannot be read, so the crate may be NORA's.
+    Unavailable,
+    /// What is stored at `cargo/index/…`.
+    StoredIndex,
+    /// NORA's upstream copy.
+    UpstreamCopy,
+    /// Namespace isolation refuses (internal name, nothing stored).
+    Refuse,
+    NotFound,
+    /// Ask the upstream; cache its answer at the upstream copy only when `cache`; when it fails,
+    /// serve `fallback`.
+    Fetch {
+        cache: bool,
+        fallback: Fallback,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Fallback {
+    UpstreamCopy,
+    StoredIndex,
+    None,
+}
+
+/// The decision table (cargo-index-spec v2, rows 5–13) for a crate with no listed entries, as a
+/// pure function: an assembled index is the crate's own (and an unreadable one may be); an index
+/// the operator named its own is served as it is; a fresh upstream copy answers; otherwise an
+/// internal name or a missing upstream is served from the stored copy (the upstream copy, else
+/// `cargo/index/…`) or refused / not found, and anything else asks the upstream — caching its
+/// answer only when the listing found nothing rather than failed.
+fn index_answer(f: UnpublishedFacts) -> IndexAnswer {
+    match f.assembled {
+        Stored::Present => return IndexAnswer::Assembled,
+        Stored::Unreadable => return IndexAnswer::Unavailable,
+        Stored::Absent => {}
+    }
+    if f.embedded && f.stored_index {
+        return IndexAnswer::StoredIndex;
+    }
+    if f.upstream_copy == CopyState::Fresh {
+        return IndexAnswer::UpstreamCopy;
+    }
+    let stored = if f.upstream_copy != CopyState::Absent {
+        Fallback::UpstreamCopy
+    } else if f.stored_index {
+        Fallback::StoredIndex
+    } else {
+        Fallback::None
+    };
+    let served = |none: IndexAnswer| match stored {
+        Fallback::UpstreamCopy => IndexAnswer::UpstreamCopy,
+        Fallback::StoredIndex => IndexAnswer::StoredIndex,
+        Fallback::None => none,
+    };
+    if f.internal {
+        return served(IndexAnswer::Refuse);
+    }
+    if !f.upstream {
+        return served(IndexAnswer::NotFound);
+    }
+    IndexAnswer::Fetch {
+        cache: !f.listing_failed,
+        fallback: stored,
+    }
+}
+
+/// Where NORA keeps its copy of an upstream's index for a crate not published here. No request
+/// reaches this key (no route builds the prefix) and a publish never reads it: an upstream's
+/// versions are never imported as published ones.
+fn upstream_copy_key(prefix: &str, name: &str) -> String {
+    format!("cargo/index-upstream/{prefix}/{name}")
+}
+
+/// Whether the operator named the crate in `cargo.import_embedded`: its stored index, found with no
+/// entries beside it, is its own (published before per-version entries).
+fn is_import_embedded(state: &AppState, name: &str) -> bool {
+    state
+        .config
+        .cargo
+        .import_embedded
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Whether a crate has versions published here, read from its entries.
+enum Published {
+    /// The entry keys listed.
+    Yes(Vec<String>),
+    No,
+    /// The listing failed: the crate may be published, and nothing about it is written.
+    Unknown,
+}
+
+async fn published_state(storage: &Storage, prefix: &str, name: &str) -> Published {
+    match storage.list(&entries_prefix(prefix, name)).await {
+        Ok(keys) if keys.is_empty() => Published::No,
+        Ok(keys) => Published::Yes(keys),
+        Err(e) => {
+            tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo: listing published entries failed");
+            Published::Unknown
+        }
+    }
+}
+
+/// The index NORA assembled for the crate, if any. Err on a storage error other than NotFound: the
+/// crate may be NORA's, and the caller must not treat it as an upstream's.
+async fn assembled_index(
+    storage: &Storage,
+    prefix: &str,
+    name: &str,
+) -> crate::storage::Result<Option<Bytes>> {
+    match storage.get(&assembled_index_key(prefix, name)).await {
+        Ok(index) => Ok(Some(index)),
+        Err(crate::storage::StorageError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The versions the entry keys of a crate name (`<entries prefix><version>.json`).
+fn entry_versions(prefix: &str, name: &str, keys: &[String]) -> std::collections::BTreeSet<String> {
+    let entries = entries_prefix(prefix, name);
+    keys.iter()
+        .filter_map(|key| key.strip_prefix(&entries)?.strip_suffix(".json"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The versions a sparse index lists, one per line; None when a line is not an index line.
+fn index_versions(index: &[u8]) -> Option<std::collections::BTreeSet<String>> {
+    index
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<serde_json::Value>(line)
+                .ok()?
+                .get("vers")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The index of a published crate, one line per entry in a deterministic order (cargo accepts any
+/// line order). None when the listing or an entry cannot be read.
+async fn assemble_cargo_index(storage: &Storage, prefix: &str, name: &str) -> Option<Vec<u8>> {
     // All-or-fail: a transient list/read error must NOT silently produce a
     // truncated (or empty) index and publish it as authoritative — that would
     // drop versions a client already saw as published. Abort instead; the caller
     // returns 500 and the existing index stays intact until a clean rebuild. An
     // empty list is a legitimate empty crate, not an error, and is preserved.
-    let mut keys = storage.list(&entries_prefix).await.map_err(|_| ())?;
-    keys.sort(); // deterministic order (cargo accepts any line order)
+    let mut keys = storage.list(&entries_prefix(prefix, name)).await.ok()?;
+    keys.sort();
     let mut index: Vec<u8> = Vec::new();
     for key in &keys {
-        let line = storage.get(key).await.map_err(|_| ())?;
+        let line = storage.get(key).await.ok()?;
         index.extend_from_slice(&line);
         if !line.ends_with(b"\n") {
             index.push(b'\n');
         }
     }
-    let index_key = format!("cargo/index/{}/{}", prefix, name);
-    storage.put(&index_key, &index).await.map_err(|_| ())
+    Some(index)
 }
 
-/// Seed per-version entry keys from an old single-file sparse index (one JSON line per version, no
-/// per-version keys). Idempotent; a no-op once the crate has per-version entries. Runs BEFORE the
-/// new version is written.
-async fn migrate_cargo_index(state: &AppState, prefix: &str, name: &str) {
-    let entries_prefix = format!("cargo/index-entries/{}/{}/", prefix, name);
-    if !state
-        .storage
-        .list(&entries_prefix)
+/// Store an assembled index: first at its own key (one put — from then on the crate is NORA's),
+/// then the copy at `cargo/index/<prefix>/<name>` that older releases read. A failed copy is
+/// logged; this release never reads it.
+async fn store_assembled_index(
+    storage: &Storage,
+    prefix: &str,
+    name: &str,
+    index: &[u8],
+) -> Result<(), crate::storage::StorageError> {
+    storage
+        .put(&assembled_index_key(prefix, name), index)
+        .await?;
+    if let Err(e) = storage
+        .put(&format!("cargo/index/{prefix}/{name}"), index)
         .await
-        .unwrap_or_default()
-        .is_empty()
     {
-        return; // already migrated
+        tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo: copy of the assembled index for older releases not stored");
     }
-    let index_key = format!("cargo/index/{}/{}", prefix, name);
-    let Ok(data) = state.storage.get(&index_key).await else {
-        return;
+    Ok(())
+}
+
+/// The sparse index of a crate published here: the index NORA assembled when it lists exactly the
+/// versions the entries name, else one rebuilt from the entries under the publish lock (a version
+/// published by an older release, or a publish that stopped before its rebuild). No upstream is
+/// asked. Rebuilt bytes are served even when they cannot be stored; 503 only when they cannot be
+/// assembled.
+async fn published_index_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    prefix: &str,
+    name: &str,
+    entries: &[String],
+) -> Response {
+    let index_key = format!("cargo/index/{prefix}/{name}");
+    let listed = entry_versions(prefix, name, entries);
+    if let Ok(Some(data)) = assembled_index(&state.storage, prefix, name).await {
+        if index_versions(&data).as_ref() == Some(&listed) {
+            state.metrics.record_download("cargo");
+            state.metrics.record_cache_hit("cargo");
+            return sparse_index_conditional(data.to_vec(), headers);
+        }
+    }
+    // LOCK-SAFE: tokio mutex, the one publish holds while it writes this crate's index; a reader
+    // that finds no current index NORA assembled rebuilds it once. Nothing else is locked under it.
+    let lock = state.publish_lock(&index_key);
+    let _guard = lock.lock().await;
+    if let Ok(Some(data)) = assembled_index(&state.storage, prefix, name).await {
+        if index_versions(&data).as_ref() == Some(&listed) {
+            return sparse_index_conditional(data.to_vec(), headers);
+        }
+    }
+    let Some(index) = assemble_cargo_index(&state.storage, prefix, name).await else {
+        tracing::error!(registry = "cargo", crate_name = %name, "cargo: a published entry cannot be read; not serving a partial index");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    for line in data.split(|&b| b == b'\n') {
+    if let Err(e) = store_assembled_index(&state.storage, prefix, name, &index).await {
+        tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo: rebuilt index not stored; served anyway");
+    }
+    state.metrics.record_download("cargo");
+    sparse_index_conditional(index, headers)
+}
+
+/// The index a first publish imports as published versions, if any: the one NORA assembled (its
+/// entries are gone), or the stored index of a crate the operator named in `cargo.import_embedded`. Otherwise it may be an upstream crate an older
+/// release cached at the same key (this release keeps upstream answers at `upstream_copy_key`,
+/// which a publish never reads), and importing it would publish the upstream's versions: the
+/// publish is refused with 409 and the operator decides.
+async fn migration_source(
+    state: &AppState,
+    prefix: &str,
+    name: &str,
+) -> Result<Option<Bytes>, Response> {
+    match state.storage.list(&entries_prefix(prefix, name)).await {
+        Ok(keys) if !keys.is_empty() => return Ok(None), // already migrated
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: listing published entries failed");
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "storage listing failed").into_response());
+        }
+    }
+    match assembled_index(&state.storage, prefix, name).await {
+        Ok(Some(index)) => return Ok(Some(index)),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: reading the assembled index failed");
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "storage read failed").into_response());
+        }
+    }
+    let index_key = format!("cargo/index/{prefix}/{name}");
+    let Ok(index) = state.storage.get(&index_key).await else {
+        return Ok(None);
+    };
+    if is_import_embedded(state, name) {
+        return Ok(Some(index));
+    }
+    tracing::warn!(registry = "cargo", crate_name = %name, "cargo publish refused: stored index of unknown origin");
+    let detail = format!(
+        "{index_key} holds a sparse index with no record of where it came from: an upstream crate cached by an older NORA release, or a crate published to NORA before per-version entries. Publishing over it would import its versions as published ones. If it is a cache, delete {index_key} and publish again; if it is your own crate, set NORA_CARGO_IMPORT_EMBEDDED={name} and publish again."
+    );
+    Err((
+        StatusCode::CONFLICT,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::to_vec(&serde_json::json!({ "errors": [{ "detail": detail }] }))
+            .unwrap_or_default(),
+    )
+        .into_response())
+}
+
+/// Import a stored single-file index as per-version entries (see `migration_source`).
+async fn migrate_cargo_index(state: &AppState, prefix: &str, name: &str, index: &[u8]) {
+    for line in index.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
         }
@@ -898,6 +1343,141 @@ async fn migrate_cargo_index(state: &AppState, prefix: &str, name: &str) {
 }
 
 /// Compute sparse index prefix for a crate name (RFC 2789).
+/// The name crates.io treats a crate as: lowercase, `_` written as `-`. Spellings with one canon
+/// (`my-crate`, `my_crate`, `My_Crate`) are one crate. Pure.
+pub(crate) fn canonical_crate_name(name: &str) -> String {
+    name.to_lowercase().replace('_', "-")
+}
+
+/// Where NORA records the spelling a crate was published under, by its canon.
+fn crate_name_record_key(name: &str) -> String {
+    format!("cargo/_names/{}", canonical_crate_name(name))
+}
+
+/// The spelling, other than `name`, that `name`'s canon was published under. Ok(None) when the canon
+/// has no record, the record names this spelling, or this spelling is published itself (both were
+/// published before records existed: each serves its own); Err on a storage error other than
+/// NotFound. A name without `-` or `_` has no other spelling, so nothing is read for it.
+async fn published_as_another_spelling(
+    storage: &Storage,
+    name: &str,
+) -> crate::storage::Result<Option<String>> {
+    if !name.contains(['-', '_']) {
+        return Ok(None);
+    }
+    let published = match storage.get(&crate_name_record_key(name)).await {
+        Ok(data) => String::from_utf8_lossy(&data).trim().to_string(),
+        Err(crate::storage::StorageError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if published.is_empty() || published == name {
+        return Ok(None);
+    }
+    match published_state(storage, &crate_index_prefix(name), name).await {
+        Published::Yes(_) => Ok(None),
+        Published::No => Ok(Some(published)),
+        Published::Unknown => Err(crate::storage::StorageError::Network(format!(
+            "listing the entries of {name} failed"
+        ))),
+    }
+}
+
+/// The refusal of another spelling of a published crate: 404, naming the published spelling.
+fn another_spelling_response(name: &str, published: &str) -> Response {
+    let err = serde_json::json!({
+        "errors": [{"detail": format!(
+            "crate `{name}` is published here as `{published}`: `-` and `_` name the same crate"
+        )}]
+    });
+    (
+        StatusCode::NOT_FOUND,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::to_vec(&err).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// How many name records the startup rebuild writes at once.
+const NAME_RECORD_WRITE_CONCURRENCY: usize = 16;
+
+/// Writes the name record of every crate published before records existed (a store from an older
+/// release, or crates published while rolled back to one), from its per-version entries. Runs at
+/// startup, before the server listens; a publish writes its own record. What is recorded is read
+/// with one listing, so a start with every record in place reads no record; the missing ones are
+/// written a few at a time. Where two spellings of one canon were both published, the first in key
+/// order is recorded, and each spelling still serves its own crate (a published spelling is
+/// answered before the record is read). If the records cannot be listed, each is read before it is
+/// written, so a record is never overwritten.
+pub async fn rebuild_crate_name_records(storage: &Storage) {
+    use futures::StreamExt;
+    let keys = match storage.list("cargo/index-entries/").await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(registry = "cargo", error = %e, "cargo: listing published crates for their name records failed");
+            return;
+        }
+    };
+    let names: std::collections::BTreeSet<String> = keys
+        .iter()
+        .filter_map(|key| key.strip_prefix("cargo/index-entries/"))
+        .filter_map(|rest| rest.rsplit('/').nth(1))
+        .filter(|name| is_valid_crate_name(name))
+        .map(str::to_string)
+        .collect();
+    let recorded: Option<std::collections::HashSet<String>> = match storage
+        .list("cargo/_names/")
+        .await
+    {
+        Ok(keys) => Some(
+            keys.iter()
+                .filter_map(|key| key.strip_prefix("cargo/_names/"))
+                .map(str::to_string)
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!(registry = "cargo", error = %e, "cargo: listing name records failed; each is read before it is written");
+            None
+        }
+    };
+    // The first spelling in key order of every canon without a record.
+    let mut missing: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for name in names {
+        let canon = canonical_crate_name(&name);
+        if recorded.as_ref().is_some_and(|r| r.contains(&canon)) {
+            continue;
+        }
+        missing.entry(canon).or_insert(name);
+    }
+    let read_first = recorded.is_none();
+    let written: usize = futures::stream::iter(missing.into_values())
+        .map(|name| async move {
+            let key = crate_name_record_key(&name);
+            if read_first && !matches!(storage.get(&key).await, Err(crate::storage::StorageError::NotFound)) {
+                return 0;
+            }
+            match storage.put(&key, name.as_bytes()).await {
+                Ok(()) => 1,
+                Err(e) => {
+                    tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo: writing a crate's name record failed");
+                    0
+                }
+            }
+        })
+        .buffer_unordered(NAME_RECORD_WRITE_CONCURRENCY)
+        .fold(0, |sum, n| async move { sum + n })
+        .await;
+    if written > 0 {
+        tracing::info!(
+            registry = "cargo",
+            written,
+            "cargo: name records written for crates published before them"
+        );
+    }
+}
+
 fn crate_index_prefix(name: &str) -> String {
     let lower = name.to_lowercase();
     match lower.len() {
@@ -1757,8 +2337,12 @@ mod integration_tests {
     #[tokio::test]
     async fn test_cargo_publish_migrates_single_file_index() {
         // An old single-file sparse index (one line per version, no per-version entry keys) is
-        // lazily migrated on the next publish, preserving the old version (#39).
-        let ctx = create_test_context();
+        // migrated on the next publish, preserving the old version (#39), once the operator has
+        // named the crate in cargo.import_embedded: without a record NORA cannot tell it from an
+        // upstream crate an older release cached at the same key.
+        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+            cfg.cargo.import_embedded = vec!["legacy-crate".to_string()];
+        });
         let old_line = serde_json::json!({
             "name": "legacy-crate", "vers": "1.0.0", "deps": [], "cksum": "a",
             "features": {}, "yanked": false
@@ -1800,6 +2384,42 @@ mod integration_tests {
         let s = String::from_utf8_lossy(&index);
         assert!(s.contains("\"vers\":\"1.0.0\""), "migrated v1 lost");
         assert!(s.contains("\"vers\":\"2.0.0\""), "new v2 lost");
+    }
+
+    #[tokio::test]
+    async fn a_publish_over_an_index_of_unknown_origin_waits_for_the_operator() {
+        let ctx = create_test_context();
+        let cached = r#"{"name":"legacy-crate","vers":"9.9.9","deps":[],"cksum":"a","features":{},"yanked":false}"#;
+        ctx.state
+            .storage
+            .put(
+                "cargo/index/le/ga/legacy-crate",
+                format!("{cached}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let m = serde_json::json!({"name": "legacy-crate", "vers": "2.0.0", "deps": [], "features": {}});
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            Body::from(build_publish_payload(&m, b"crate2")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let detail = body["errors"][0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("NORA_CARGO_IMPORT_EMBEDDED=legacy-crate"),
+            "{detail}"
+        );
+        for key in [
+            "cargo/legacy-crate/2.0.0/legacy-crate-2.0.0.crate",
+            "cargo/index-entries/le/ga/legacy-crate/2.0.0.json",
+            "cargo/index-entries/le/ga/legacy-crate/9.9.9.json",
+        ] {
+            assert!(ctx.state.storage.stat(key).await.is_none(), "{key} written");
+        }
     }
 
     #[tokio::test]
@@ -2387,6 +3007,1118 @@ mod crate_name_case_tests {
     }
 }
 
+/// A crate published to NORA keeps its own index: an upstream crate of the same name never
+/// replaces it, whatever the age of the stored index.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod published_index_ownership {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn payload(name: &str, vers: &str) -> Vec<u8> {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": name, "vers": vers, "deps": [], "features": {}
+        }))
+        .unwrap();
+        let krate = b"internal-crate";
+        let mut out = Vec::new();
+        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(&meta);
+        out.extend_from_slice(&(krate.len() as u32).to_le_bytes());
+        out.extend_from_slice(krate);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_upstream_crate_of_the_same_name_never_replaces_a_published_index() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index/co/rp/corp-lib"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"name":"corp-lib","vers":"9.9.9","deps":[],"cksum":"00","features":{},"yanked":false}"#,
+            ))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 0;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            Body::from(payload("corp-lib", "0.1.0")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/co/rp/corp-lib", "").await;
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let stored = ctx
+            .state
+            .storage
+            .get("cargo/index/co/rp/corp-lib")
+            .await
+            .unwrap();
+        let stored = String::from_utf8_lossy(&stored).into_owned();
+        assert!(
+            stored.contains("\"0.1.0\"") && !stored.contains("9.9.9"),
+            "stored: {stored}"
+        );
+        assert!(
+            served.contains("\"0.1.0\"") && !served.contains("9.9.9"),
+            "served: {served}"
+        );
+    }
+}
+
+/// `index_answer` over every combination of what a request can find, held to the decision table
+/// written as properties (each one a row or a guarantee of cargo-index-spec v2), plus the table's
+/// rows as examples.
+#[cfg(test)]
+mod index_answer_grid {
+    use super::{index_answer, CopyState, Fallback, IndexAnswer, Stored, UnpublishedFacts};
+
+    fn every_case() -> Vec<UnpublishedFacts> {
+        let mut cases = Vec::new();
+        for listing_failed in [false, true] {
+            for assembled in [Stored::Absent, Stored::Present, Stored::Unreadable] {
+                for stored_index in [false, true] {
+                    for embedded in [false, true] {
+                        for upstream_copy in [CopyState::Absent, CopyState::Stale, CopyState::Fresh]
+                        {
+                            for internal in [false, true] {
+                                for upstream in [false, true] {
+                                    cases.push(UnpublishedFacts {
+                                        listing_failed,
+                                        assembled,
+                                        stored_index,
+                                        embedded,
+                                        upstream_copy,
+                                        internal,
+                                        upstream,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn every_case_follows_the_table() {
+        let cases = every_case();
+        assert_eq!(cases.len(), 288);
+        for f in cases {
+            let answer = index_answer(f);
+            let copy = f.upstream_copy != CopyState::Absent;
+            // Rows 5 and 10: an assembled index is the crate's own; unreadable, it may be.
+            match f.assembled {
+                Stored::Present => assert_eq!(answer, IndexAnswer::Assembled, "{f:?}"),
+                Stored::Unreadable => assert_eq!(answer, IndexAnswer::Unavailable, "{f:?}"),
+                Stored::Absent => assert!(
+                    !matches!(answer, IndexAnswer::Assembled | IndexAnswer::Unavailable),
+                    "{f:?}"
+                ),
+            }
+            if f.assembled != Stored::Absent {
+                continue;
+            }
+            // Row 5e: the operator's word wins over every copy.
+            if f.embedded && f.stored_index {
+                assert_eq!(answer, IndexAnswer::StoredIndex, "{f:?}");
+                continue;
+            }
+            // Row 6: a fresh upstream copy answers without asking.
+            if f.upstream_copy == CopyState::Fresh {
+                assert_eq!(answer, IndexAnswer::UpstreamCopy, "{f:?}");
+                continue;
+            }
+            // Rows 8, 9, 12: no upstream is asked for an internal name or without an upstream.
+            if f.internal || !f.upstream {
+                assert!(!matches!(answer, IndexAnswer::Fetch { .. }), "{f:?}");
+            }
+            // The stored copy is the upstream copy, else the crate's index; never one not there.
+            let expected_copy = if copy {
+                Some(IndexAnswer::UpstreamCopy)
+            } else if f.stored_index {
+                Some(IndexAnswer::StoredIndex)
+            } else {
+                None
+            };
+            match answer {
+                IndexAnswer::UpstreamCopy => assert!(copy, "{f:?}"),
+                IndexAnswer::StoredIndex => assert!(f.stored_index && !copy, "{f:?}"),
+                IndexAnswer::Refuse => assert!(f.internal && expected_copy.is_none(), "{f:?}"),
+                IndexAnswer::NotFound => {
+                    assert!(
+                        !f.internal && !f.upstream && expected_copy.is_none(),
+                        "{f:?}"
+                    )
+                }
+                IndexAnswer::Fetch { cache, fallback } => {
+                    // Rows 7, 11, 13: asked only with an upstream and a non-internal name;
+                    // cached only when the listing found nothing (row 11: failed → no write).
+                    assert!(f.upstream && !f.internal, "{f:?}");
+                    assert_eq!(cache, !f.listing_failed, "{f:?}");
+                    let want = match expected_copy {
+                        Some(IndexAnswer::UpstreamCopy) => Fallback::UpstreamCopy,
+                        Some(IndexAnswer::StoredIndex) => Fallback::StoredIndex,
+                        _ => Fallback::None,
+                    };
+                    assert_eq!(fallback, want, "{f:?}");
+                }
+                other => panic!("{f:?} answered {other:?}"),
+            }
+            // With nothing asked, the stored copy answers when there is one.
+            if (f.internal || !f.upstream) && expected_copy.is_some() {
+                assert_eq!(Some(answer), expected_copy, "{f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_table_rows() {
+        let base = UnpublishedFacts {
+            listing_failed: false,
+            assembled: Stored::Absent,
+            stored_index: false,
+            embedded: false,
+            upstream_copy: CopyState::Absent,
+            internal: false,
+            upstream: true,
+        };
+        let row = |f: UnpublishedFacts| index_answer(f);
+        // 7: nothing stored, upstream on → ask, cache at the upstream copy.
+        assert_eq!(
+            row(base),
+            IndexAnswer::Fetch {
+                cache: true,
+                fallback: Fallback::None
+            }
+        );
+        // 11: the listing failed → ask, write nothing.
+        let failed = UnpublishedFacts {
+            listing_failed: true,
+            ..base
+        };
+        assert_eq!(
+            row(failed),
+            IndexAnswer::Fetch {
+                cache: false,
+                fallback: Fallback::None
+            }
+        );
+        // 13: a stale copy is the fallback, the older release's index only without one.
+        let stale = UnpublishedFacts {
+            upstream_copy: CopyState::Stale,
+            stored_index: true,
+            ..base
+        };
+        assert_eq!(
+            row(stale),
+            IndexAnswer::Fetch {
+                cache: true,
+                fallback: Fallback::UpstreamCopy
+            }
+        );
+        let old = UnpublishedFacts {
+            stored_index: true,
+            ..base
+        };
+        assert_eq!(
+            row(old),
+            IndexAnswer::Fetch {
+                cache: true,
+                fallback: Fallback::StoredIndex
+            }
+        );
+        // 5e: named own, even beside a fresh copy.
+        let own = UnpublishedFacts {
+            stored_index: true,
+            embedded: true,
+            upstream_copy: CopyState::Fresh,
+            ..base
+        };
+        assert_eq!(row(own), IndexAnswer::StoredIndex);
+        // 8: internal, nothing stored → refused; 9: no upstream → 404.
+        assert_eq!(
+            row(UnpublishedFacts {
+                internal: true,
+                ..base
+            }),
+            IndexAnswer::Refuse
+        );
+        assert_eq!(
+            row(UnpublishedFacts {
+                upstream: false,
+                ..base
+            }),
+            IndexAnswer::NotFound
+        );
+    }
+}
+
+/// The rows of the decision table for a published crate's sparse index (cargo-index-spec):
+/// what the entries listing answers × what the stored index is × what an upstream says.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod published_index_table {
+    use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        send,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Listing {
+        Normal,
+        Empty,
+        Fails,
+        /// The first listing of entries succeeds, every later one fails.
+        FailsAfterFirst,
+    }
+
+    /// An object store whose entries listing, index writes or entry reads misbehave on demand.
+    struct Faulty {
+        inner: ObjectStorage,
+        listing: Listing,
+        index_put_fails: bool,
+        entry_get_fails: bool,
+        assembled_get_fails: bool,
+        entries_listed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Faulty {
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            if self.entry_get_fails && k.starts_with("cargo/index-entries/") {
+                return Err(crate::storage::StorageError::Network("read failed".into()));
+            }
+            if self.assembled_get_fails && k.starts_with("cargo/index-assembled/") {
+                return Err(crate::storage::StorageError::Network("read failed".into()));
+            }
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            if self.index_put_fails
+                && (k.starts_with("cargo/index/") || k.starts_with("cargo/index-assembled/"))
+            {
+                return Err(crate::storage::StorageError::Network("put failed".into()));
+            }
+            self.inner.put(k, d, sha256).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            if prefix.starts_with("cargo/index-entries/") {
+                let earlier = self
+                    .entries_listed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match self.listing {
+                    Listing::Empty => return Ok(Vec::new()),
+                    Listing::Fails => {
+                        return Err(crate::storage::StorageError::Network(
+                            "listing failed".into(),
+                        ))
+                    }
+                    Listing::FailsAfterFirst if earlier > 0 => {
+                        return Err(crate::storage::StorageError::Network(
+                            "listing failed".into(),
+                        ))
+                    }
+                    Listing::Normal | Listing::FailsAfterFirst => {}
+                }
+            }
+            self.inner.list(prefix).await
+        }
+        async fn list_with_meta(&self, p: &str) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+            self.inner.list_with_meta(p).await
+        }
+        async fn stat(&self, k: &str) -> Option<FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "faulty-test-store"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha256).await
+        }
+        async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(s, d, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    fn faulty(listing: Listing, index_put_fails: bool, entry_get_fails: bool) -> Storage {
+        Storage::from_backend(std::sync::Arc::new(Faulty {
+            inner: ObjectStorage::in_memory(),
+            listing,
+            index_put_fails,
+            entry_get_fails,
+            assembled_get_fails: false,
+            entries_listed: Default::default(),
+        }))
+    }
+
+    const OWN: &str =
+        r#"{"name":"corp-lib","vers":"0.1.0","deps":[],"cksum":"aa","features":{},"yanked":false}"#;
+    const UPSTREAM: &str =
+        r#"{"name":"corp-lib","vers":"9.9.9","deps":[],"cksum":"00","features":{},"yanked":false}"#;
+    const INDEX: &str = "cargo/index/co/rp/corp-lib";
+    const ASSEMBLED: &str = "cargo/index-assembled/co/rp/corp-lib";
+
+    /// An upstream that serves corp-lib 9.9.9 to anyone who asks: a squatter on a published name.
+    async fn squatter() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index/co/rp/corp-lib"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn asked(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    /// corp-lib 0.1.0 as a publish leaves it: the entry and, unless `assembled` is false, the
+    /// index NORA assembles with its record.
+    async fn seed(storage: &Storage, assembled: bool) {
+        storage
+            .put(
+                "cargo/index-entries/co/rp/corp-lib/0.1.0.json",
+                OWN.as_bytes(),
+            )
+            .await
+            .unwrap();
+        if assembled {
+            let index = format!("{OWN}\n");
+            super::store_assembled_index(storage, "co/rp", "corp-lib", index.as_bytes())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn get_index(app: &axum::Router) -> (StatusCode, String) {
+        let resp = send(app, Method::GET, "/cargo/index/co/rp/corp-lib", "").await;
+        let status = resp.status();
+        (
+            status,
+            String::from_utf8_lossy(&body_bytes(resp).await).into_owned(),
+        )
+    }
+
+    fn proxied(storage: Storage, server: &MockServer) -> crate::test_helpers::TestContext {
+        let uri = server.uri();
+        create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 0;
+        })
+    }
+
+    /// Row 1: published, the stored index is NORA's → served as it is, no upstream.
+    #[tokio::test]
+    async fn row1_an_assembled_index_is_served_without_an_upstream() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 2: published, an upstream copy an older release cached over the index (here with the
+    /// same version and a dependency of its own) and no assembled index → rebuilt from the
+    /// entries, stored at its own key and copied for older releases.
+    #[tokio::test]
+    async fn row2_an_old_copy_over_a_published_index_is_rebuilt() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        seed(&ctx.state.storage, false).await;
+        let copy = r#"{"name":"corp-lib","vers":"0.1.0","deps":[{"name":"evil-dep","req":"*"}],"cksum":"bb","features":{},"yanked":false}"#;
+        ctx.state
+            .storage
+            .put(INDEX, format!("{copy}\n").as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("evil-dep") && body.contains("0.1.0"),
+            "{body}"
+        );
+        assert_eq!(asked(&server).await, 0);
+        let stored = ctx.state.storage.get(INDEX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("evil-dep"));
+        let assembled = ctx.state.storage.get(ASSEMBLED).await.unwrap();
+        assert_eq!(
+            assembled, stored,
+            "the copy for older releases is the assembled index"
+        );
+    }
+
+    /// Row 3: published, the rebuilt index cannot be stored → served anyway.
+    #[tokio::test]
+    async fn row3_a_rebuilt_index_is_served_when_it_cannot_be_stored() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, true, false), &server);
+        seed(&ctx.state.storage, false).await;
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 4: published, an entry cannot be read → 503, never a partial index or the upstream's.
+    #[tokio::test]
+    async fn row4_an_unreadable_entry_is_a_503() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, true), &server);
+        seed(&ctx.state.storage, false).await;
+        let (status, _) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 5: the listing answers "nothing here" beside NORA's index → served, no upstream.
+    #[tokio::test]
+    async fn row5_an_empty_listing_beside_an_assembled_index_stays_local() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Empty, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 10: the listing fails beside NORA's index → served, no upstream.
+    #[tokio::test]
+    async fn row10_a_failed_listing_beside_an_assembled_index_stays_local() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Fails, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 11: the listing fails and no index of NORA's is stored → the upstream answers this
+    /// request, and nothing is written.
+    #[tokio::test]
+    async fn row11_a_failed_listing_without_an_own_index_caches_nothing() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Fails, false, false), &server);
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("9.9.9"), "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            ctx.state.storage.stat(INDEX).await.is_none(),
+            "upstream answer cached"
+        );
+        assert!(
+            ctx.state.storage.stat(COPY).await.is_none(),
+            "upstream answer kept as the upstream copy"
+        );
+    }
+
+    const COPY: &str = "cargo/index-upstream/co/rp/corp-lib";
+
+    async fn publish(app: &axum::Router, vers: &str) -> StatusCode {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "corp-lib", "vers": vers, "deps": [], "features": {}
+        }))
+        .unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"crt");
+        send(
+            app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            axum::body::Body::from(payload),
+        )
+        .await
+        .status()
+    }
+
+    /// The upstream copy is written off the request path: wait for it.
+    async fn wait_for(storage: &Storage, key: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while storage.stat(key).await.is_none() {
+            assert!(std::time::Instant::now() < deadline, "{key} never written");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Row P3: cargo asks for its crate's index before it publishes. The upstream's answer is kept
+    /// as NORA's upstream copy, not at the crate's index, so the first publish of a name the
+    /// upstream also has goes through, and the index holds the published version only.
+    #[tokio::test]
+    async fn p3_a_first_publish_after_cargo_asked_the_upstream_goes_through() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("9.9.9"), "{body}");
+        wait_for(&ctx.state.storage, COPY).await;
+        assert!(
+            ctx.state.storage.stat(INDEX).await.is_none(),
+            "upstream answer stored at the crate's index"
+        );
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
+        let before = asked(&server).await;
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("\"0.1.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+        assert_eq!(
+            asked(&server).await,
+            before,
+            "a published crate asked upstream"
+        );
+    }
+
+    /// Row 7: an unpublished crate's upstream answer goes to the upstream copy; whatever an older
+    /// release left at the crate's index stays as it was.
+    #[tokio::test]
+    async fn row7_an_upstream_answer_is_kept_beside_the_index_not_over_it() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let old = format!("{OWN}\n");
+        ctx.state.storage.put(INDEX, old.as_bytes()).await.unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("9.9.9"), "{body}");
+        wait_for(&ctx.state.storage, COPY).await;
+        assert_eq!(
+            ctx.state.storage.get(INDEX).await.unwrap().as_ref(),
+            old.as_bytes()
+        );
+        assert_eq!(
+            ctx.state.storage.get(COPY).await.unwrap().as_ref(),
+            UPSTREAM.as_bytes()
+        );
+    }
+
+    fn proxied_ttl(storage: Storage, server: &MockServer) -> crate::test_helpers::TestContext {
+        let uri = server.uri();
+        create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 300;
+        })
+    }
+
+    /// Row 6: a fresh upstream copy is served without asking; what an older release left at the
+    /// crate's index is no cache with a TTL, however recent it is.
+    #[tokio::test]
+    async fn row6_only_the_upstream_copy_is_fresh() {
+        let server = squatter().await;
+        let ctx = proxied_ttl(faulty(Listing::Normal, false, false), &server);
+        ctx.state
+            .storage
+            .put(COPY, UPSTREAM.as_bytes())
+            .await
+            .unwrap();
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+
+        let server = squatter().await;
+        let ctx = proxied_ttl(faulty(Listing::Normal, false, false), &server);
+        ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 1);
+    }
+
+    /// Row 13: the upstream fails → the stored copy is served stale: the upstream copy first, else
+    /// what an older release left at the crate's index.
+    #[tokio::test]
+    async fn row13_a_failed_upstream_serves_the_stored_copy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        ctx.state
+            .storage
+            .put(COPY, UPSTREAM.as_bytes())
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/co/rp/corp-lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("x-nora-stale"));
+        assert_eq!(body_bytes(resp).await.as_ref(), UPSTREAM.as_bytes());
+
+        ctx.state.storage.delete(COPY).await.unwrap();
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/co/rp/corp-lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), OWN.as_bytes());
+    }
+
+    /// Row 5e: the operator named the crate's stored index its own (published before per-version
+    /// entries): it is served as it is, no upstream is asked and no upstream copy is written.
+    #[tokio::test]
+    async fn row5e_an_index_the_operator_named_own_stays_local() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            move |cfg| {
+                cfg.cargo.proxy = Some(uri);
+                cfg.cargo.metadata_ttl = 0;
+                cfg.cargo.import_embedded = vec!["Corp-Lib".to_string()];
+            },
+        );
+        ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, OWN);
+        assert_eq!(asked(&server).await, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(ctx.state.storage.stat(COPY).await.is_none());
+    }
+
+    /// Row 9: no upstream configured → the stored copy is served: the upstream copy kept from when
+    /// one was configured, else the crate's index.
+    #[tokio::test]
+    async fn row9_without_an_upstream_the_stored_copy_answers() {
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            |cfg| cfg.cargo.proxy = None,
+        );
+        ctx.state
+            .storage
+            .put(COPY, UPSTREAM.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, UPSTREAM);
+    }
+
+    /// Row 5, a crash between the two writes of an assembly: the assembled index is stored, its copy
+    /// for older releases is not, and the listing answers "nothing here" → the assembled index.
+    #[tokio::test]
+    async fn row5_an_assembled_index_without_its_copy_stays_local() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Empty, false, false), &server);
+        ctx.state
+            .storage
+            .put(ASSEMBLED, format!("{OWN}\n").as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// The path in any case, a published crate whose stored index an older release cached from the
+    /// upstream: its own index, rebuilt from the entries, and no upstream.
+    #[tokio::test]
+    async fn a_published_crate_in_any_case_of_the_path_stays_local() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        seed(&ctx.state.storage, false).await;
+        ctx.state
+            .storage
+            .put(INDEX, UPSTREAM.as_bytes())
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, "/cargo/index/CO/RP/Corp-Lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+        assert_eq!(asked(&server).await, 0);
+        let stored = ctx.state.storage.get(INDEX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("9.9.9"));
+    }
+
+    /// Two published crates whose names share a prefix: each index holds its own entries only.
+    #[tokio::test]
+    async fn a_crate_index_never_holds_another_crates_entries() {
+        let ctx = create_test_context_with_config(|cfg| cfg.cargo.proxy = None);
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "corp-lib-extra", "vers": "0.5.0", "deps": [], "features": {}
+        }))
+        .unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"crt");
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            axum::body::Body::from(payload),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(
+            body.contains("\"corp-lib\"") && !body.contains("corp-lib-extra"),
+            "{body}"
+        );
+    }
+
+    /// A publish of a further version over a stored index of unknown origin (the crate already has
+    /// entries): nothing of that index is imported.
+    #[tokio::test]
+    async fn a_further_publish_never_imports_a_stored_index() {
+        let ctx = create_test_context_with_config(|cfg| cfg.cargo.proxy = None);
+        seed(&ctx.state.storage, false).await;
+        let foreign = r#"{"name":"corp-lib","vers":"8.8.8","deps":[],"cksum":"88","features":{},"yanked":false}"#;
+        ctx.state
+            .storage
+            .put(INDEX, format!("{foreign}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(publish(&ctx.app, "0.2.0").await, StatusCode::OK);
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(
+            body.contains("\"0.1.0\"") && body.contains("\"0.2.0\"") && !body.contains("8.8.8"),
+            "{body}"
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat("cargo/index-entries/co/rp/corp-lib/8.8.8.json")
+            .await
+            .is_none());
+    }
+
+    /// `import_embedded` names crates exactly: a name it does not list is neither imported at publish
+    /// nor read as the crate's own.
+    #[tokio::test]
+    async fn import_embedded_names_crates_exactly() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            move |cfg| {
+                cfg.cargo.proxy = Some(uri);
+                cfg.cargo.metadata_ttl = 0;
+                cfg.cargo.import_embedded = vec!["corp".to_string(), "corp-lib-x".to_string()];
+            },
+        );
+        ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(body.contains("9.9.9"), "{body}");
+        assert_eq!(publish(&ctx.app, "0.2.0").await, StatusCode::CONFLICT);
+    }
+
+    /// The assembled index cannot be read (a storage error, not "absent"): the crate may be NORA's,
+    /// so no upstream answers for it, and a publish is not decided on a guess.
+    #[tokio::test]
+    async fn an_unreadable_assembled_index_is_a_503_not_the_upstream() {
+        let server = squatter().await;
+        let unreadable = Storage::from_backend(std::sync::Arc::new(Faulty {
+            inner: ObjectStorage::in_memory(),
+            listing: Listing::Empty,
+            index_put_fails: false,
+            entry_get_fails: false,
+            assembled_get_fails: true,
+            entries_listed: Default::default(),
+        }));
+        let ctx = proxied(unreadable, &server);
+        ctx.state
+            .storage
+            .put(ASSEMBLED, OWN.as_bytes())
+            .await
+            .unwrap();
+        let (status, _) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server).await, 0);
+        assert_eq!(
+            publish(&ctx.app, "0.2.0").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// GET and a first publish race: the upstream's answer to the GET arrives after the publish. It
+    /// lands at the upstream copy, never at the crate's index, and the crate answers as published.
+    #[tokio::test]
+    async fn a_late_upstream_answer_never_lands_on_a_published_index() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index/co/rp/corp-lib"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(UPSTREAM)
+                    .set_delay(std::time::Duration::from_millis(800)),
+            )
+            .mount(&server)
+            .await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let app = ctx.app.clone();
+        let get = tokio::spawn(async move { get_index(&app).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(publish(&ctx.app, "0.1.0").await, StatusCode::OK);
+        let _ = get.await.unwrap();
+        wait_for(&ctx.state.storage, COPY).await;
+        let stored = ctx.state.storage.get(INDEX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("9.9.9"));
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(body.contains("0.1.0") && !body.contains("9.9.9"), "{body}");
+    }
+
+    #[test]
+    fn index_and_entry_versions_compare_as_sets() {
+        let keys = [
+            "cargo/index-entries/co/rp/corp-lib/0.1.0.json".to_string(),
+            "cargo/index-entries/co/rp/corp-lib/0.2.0.json".to_string(),
+        ];
+        let listed = super::entry_versions("co/rp", "corp-lib", &keys);
+        let two = format!("{OWN}\n{}\n", OWN.replace("0.1.0", "0.2.0"));
+        assert_eq!(super::index_versions(two.as_bytes()), Some(listed.clone()));
+        assert_ne!(
+            super::index_versions(format!("{OWN}\n").as_bytes()),
+            Some(listed.clone())
+        );
+        assert_eq!(super::index_versions(b"not an index line\n"), None);
+        assert!(super::entry_versions("co/rp", "corp", &keys).is_empty());
+    }
+
+    /// A version published while an older release ran (it rewrote only the copy at the crate's
+    /// index) is served: the assembled index that does not list it is rebuilt from the entries.
+    #[tokio::test]
+    async fn an_assembled_index_missing_a_listed_version_is_rebuilt() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        ctx.state
+            .storage
+            .put(
+                "cargo/index-entries/co/rp/corp-lib/0.2.0.json",
+                OWN.replace("0.1.0", "0.2.0").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("\"0.1.0\"") && body.contains("\"0.2.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+        assert_eq!(asked(&server).await, 0);
+        let assembled = ctx.state.storage.get(ASSEMBLED).await.unwrap();
+        assert!(String::from_utf8_lossy(&assembled).contains("0.2.0"));
+    }
+
+    /// The entries listed once, then their listing fails inside the rebuild: 503, never an empty
+    /// index, and the assembled index is left as it was.
+    #[tokio::test]
+    async fn a_listing_that_fails_inside_the_rebuild_is_a_503_not_an_empty_index() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::FailsAfterFirst, false, false), &server);
+        seed(&ctx.state.storage, true).await;
+        ctx.state
+            .storage
+            .put(
+                "cargo/index-entries/co/rp/corp-lib/0.2.0.json",
+                OWN.replace("0.1.0", "0.2.0").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let assembled = ctx.state.storage.get(ASSEMBLED).await.unwrap();
+        assert_eq!(assembled.as_ref(), format!("{OWN}\n").as_bytes());
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// A publish names the crate in any case: it is stored under the lowercase name, so its index
+    /// answers as published and no upstream is asked.
+    #[tokio::test]
+    async fn a_publish_in_any_case_is_published_under_the_lowercase_name() {
+        let server = squatter().await;
+        let ctx = proxied(faulty(Listing::Normal, false, false), &server);
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "Corp-Lib", "vers": "0.1.0", "deps": [], "features": {}
+        }))
+        .unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"crt");
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            axum::body::Body::from(payload),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("\"0.1.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Row 5e with a fresh upstream copy beside it (cached before the operator named the crate):
+    /// the operator's word wins, the copy is not served.
+    #[tokio::test]
+    async fn row5e_a_fresh_upstream_copy_does_not_shadow_an_index_named_own() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            move |cfg| {
+                cfg.cargo.proxy = Some(uri);
+                cfg.cargo.metadata_ttl = 300;
+                cfg.cargo.import_embedded = vec!["corp-lib".to_string()];
+            },
+        );
+        ctx.state.storage.put(INDEX, OWN.as_bytes()).await.unwrap();
+        ctx.state
+            .storage
+            .put(COPY, UPSTREAM.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, OWN);
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// The assembled index fails its integrity check (its bytes changed under the stored digest):
+    /// the crate may be NORA's, so 503 — not "absent", and never the upstream's answer.
+    #[tokio::test]
+    async fn a_corrupted_assembled_index_is_a_503_not_the_upstream() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 0;
+        });
+        let index = format!("{OWN}\n");
+        super::store_assembled_index(&ctx.state.storage, "co/rp", "corp-lib", index.as_bytes())
+            .await
+            .unwrap();
+        std::fs::write(ctx._tempdir.path().join(ASSEMBLED), b"changed on disk\n").unwrap();
+        assert!(matches!(
+            ctx.state.storage.get(ASSEMBLED).await,
+            Err(crate::storage::StorageError::IntegrityViolation)
+        ));
+        let (status, _) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Rows 8 and 12: an internal name is never asked of the upstream — refused with nothing
+    /// stored, answered from the stored copy (even a stale one) otherwise.
+    #[tokio::test]
+    async fn an_internal_crate_index_never_reaches_the_upstream() {
+        let server = squatter().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_storage_and_config(
+            faulty(Listing::Normal, false, false),
+            move |cfg| {
+                cfg.cargo.proxy = Some(uri);
+                cfg.cargo.metadata_ttl = 0;
+                cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+            },
+        );
+        let (status, body) = get_index(&ctx.app).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("9.9.9"), "{body}");
+        ctx.state.storage.put(COPY, OWN.as_bytes()).await.unwrap();
+        let (status, body) = get_index(&ctx.app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, OWN);
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// A first publish over NORA's own index whose entries are gone imports it (no refusal).
+    #[tokio::test]
+    async fn a_publish_over_an_assembled_index_without_entries_imports_it() {
+        let ctx = create_test_context_with_config(|_| {});
+        let index = format!("{OWN}\n");
+        super::store_assembled_index(&ctx.state.storage, "co/rp", "corp-lib", index.as_bytes())
+            .await
+            .unwrap();
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "corp-lib", "vers": "0.2.0", "deps": [], "features": {}
+        }))
+        .unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"crt");
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            axum::body::Body::from(payload),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = get_index(&ctx.app).await;
+        assert!(
+            body.contains("\"0.1.0\"") && body.contains("\"0.2.0\""),
+            "{body}"
+        );
+    }
+}
+
 /// The request's spelling reaches upstream as sent, while every local
 /// decision (curation, integrity, isolation, publish date) is taken on the lowercase name.
 #[cfg(test)]
@@ -2797,5 +4529,419 @@ mod crate_name_canonical_curation {
             .map(|r| r.url.path().to_string())
             .collect();
         assert!(asked.is_empty(), "internal names sent upstream: {asked:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod crate_name_one_canon {
+    //! `-` and `_` name one crate, as on crates.io (spec-141 rows C1–C7, D1, publish, S1): another
+    //! spelling of a published crate is refused and never asked of an upstream.
+    use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+    use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An object store whose reads of name records can be made to fail, or to take a while.
+    struct Records {
+        inner: ObjectStorage,
+        record_get_fails: bool,
+        record_get_delay: Option<std::time::Duration>,
+        records_list_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Records {
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            if self.record_get_fails && k.starts_with("cargo/_names/") {
+                return Err(crate::storage::StorageError::Network("read failed".into()));
+            }
+            if let Some(delay) = self
+                .record_get_delay
+                .filter(|_| k.starts_with("cargo/_names/"))
+            {
+                tokio::time::sleep(delay).await;
+            }
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            if self.records_list_fails && prefix.starts_with("cargo/_names/") {
+                return Err(crate::storage::StorageError::Network(
+                    "listing failed".into(),
+                ));
+            }
+            self.inner.list(prefix).await
+        }
+        async fn list_with_meta(&self, p: &str) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+            self.inner.list_with_meta(p).await
+        }
+        async fn stat(&self, k: &str) -> Option<FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "records-test-store"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha256).await
+        }
+        async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(s, d, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    fn store(record_get_fails: bool) -> Storage {
+        Storage::from_backend(std::sync::Arc::new(Records {
+            inner: ObjectStorage::in_memory(),
+            record_get_fails,
+            record_get_delay: None,
+            records_list_fails: false,
+        }))
+    }
+
+    /// An upstream that answers every request: a squatter on every spelling.
+    async fn squatter() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"name":"my_crate","vers":"9.9.9","deps":[],"cksum":"00","features":{},"yanked":false}"#,
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn asked(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    fn proxied(storage: Storage, server: &MockServer) -> crate::test_helpers::TestContext {
+        let uri = server.uri();
+        create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.cargo.metadata_ttl = 0;
+        })
+    }
+
+    async fn publish(app: &axum::Router, name: &str, vers: &str) -> (StatusCode, String) {
+        let meta = serde_json::to_vec(
+            &serde_json::json!({"name": name, "vers": vers, "deps": [], "features": {}}),
+        )
+        .unwrap();
+        let data = b"crate-data";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(data);
+        let resp = send(
+            app,
+            Method::PUT,
+            "/cargo/api/v1/crates/new",
+            Body::from(payload),
+        )
+        .await;
+        let status = resp.status();
+        (
+            status,
+            String::from_utf8_lossy(&body_bytes(resp).await).into_owned(),
+        )
+    }
+
+    async fn get(app: &axum::Router, uri: &str) -> (StatusCode, String) {
+        let resp = send(app, Method::GET, uri, "").await;
+        let status = resp.status();
+        (
+            status,
+            String::from_utf8_lossy(&body_bytes(resp).await).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_canon_is_lowercase_with_hyphens() {
+        for spelling in ["my-crate", "my_crate", "My_Crate", "MY-CRATE"] {
+            assert_eq!(super::canonical_crate_name(spelling), "my-crate");
+        }
+        assert_eq!(super::canonical_crate_name("serde"), "serde");
+        assert_eq!(super::canonical_crate_name("a_b-c_d"), "a-b-c-d");
+    }
+
+    /// C1, C2, C5, D1: with `my-crate` published, its own index answers; the index and downloads of
+    /// `my_crate` (any case) are refused with the published spelling, and the upstream is never asked.
+    #[tokio::test]
+    async fn another_spelling_of_a_published_crate_is_refused() {
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        assert_eq!(
+            publish(&ctx.app, "my-crate", "0.1.0").await.0,
+            StatusCode::OK
+        );
+        let (status, body) = get(&ctx.app, "/cargo/index/my/-c/my-crate").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0.1.0"), "{body}");
+        for uri in [
+            "/cargo/index/my/_c/my_crate",
+            "/cargo/index/My/_C/My_Crate",
+            "/cargo/api/v1/crates/my_crate/9.9.9/download",
+        ] {
+            let (status, body) = get(&ctx.app, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert!(body.contains("`my-crate`"), "{uri}: {body}");
+        }
+        assert_eq!(asked(&server).await, 0);
+    }
+
+    /// Publish: `my_crate` with `my-crate` published is a conflict naming it and stores nothing;
+    /// another version of `my-crate` publishes as before.
+    #[tokio::test]
+    async fn a_publish_of_another_spelling_is_a_conflict() {
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        assert_eq!(
+            publish(&ctx.app, "my-crate", "0.1.0").await.0,
+            StatusCode::OK
+        );
+        let (status, body) = publish(&ctx.app, "my_crate", "0.2.0").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("`my-crate`"), "{body}");
+        assert!(ctx
+            .state
+            .storage
+            .stat("cargo/my_crate/0.2.0/my_crate-0.2.0.crate")
+            .await
+            .is_none());
+        assert_eq!(
+            publish(&ctx.app, "my-crate", "0.2.0").await.0,
+            StatusCode::OK
+        );
+    }
+
+    /// A refused publish leaves no record: `my_crate` 0.1.0 over a copy cached at its key is a
+    /// conflict, writes no name record, and `my-crate` then publishes.
+    #[tokio::test]
+    async fn a_refused_publish_leaves_no_record() {
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        ctx.state
+            .storage
+            .put("cargo/my_crate/0.1.0/my_crate-0.1.0.crate", b"cached")
+            .await
+            .unwrap();
+        assert_eq!(
+            publish(&ctx.app, "my_crate", "0.1.0").await.0,
+            StatusCode::CONFLICT
+        );
+        assert!(ctx
+            .state
+            .storage
+            .stat("cargo/_names/my-crate")
+            .await
+            .is_none());
+        assert_eq!(
+            publish(&ctx.app, "my-crate", "0.1.0").await.0,
+            StatusCode::OK
+        );
+    }
+
+    /// Two spellings published at once: the canon's lock lets one through and the other finds its
+    /// record — one 200, one 409 — even when reading the record takes long enough for both to start.
+    #[tokio::test]
+    async fn two_spellings_published_at_once_do_not_both_pass() {
+        let server = squatter().await;
+        let ctx = proxied(
+            Storage::from_backend(std::sync::Arc::new(Records {
+                inner: ObjectStorage::in_memory(),
+                record_get_fails: false,
+                record_get_delay: Some(std::time::Duration::from_millis(200)),
+                records_list_fails: false,
+            })),
+            &server,
+        );
+        let (a, b) = tokio::join!(
+            publish(&ctx.app, "race-x", "0.1.0"),
+            publish(&ctx.app, "race_x", "0.1.0")
+        );
+        let mut statuses = [a.0, b.0];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::CONFLICT],
+            "{a:?} {b:?}"
+        );
+    }
+
+    /// C6: a name record that cannot be read refuses (503) without asking the upstream; a name
+    /// without `-` or `_` has no other spelling, reads no record and goes on as before.
+    #[tokio::test]
+    async fn an_unreadable_record_refuses_and_a_plain_name_reads_none() {
+        let server = squatter().await;
+        let ctx = proxied(store(true), &server);
+        let (status, _) = get(&ctx.app, "/cargo/index/my/_c/my_crate").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server).await, 0);
+        let (status, _) = get(&ctx.app, "/cargo/index/se/rd/serde").await;
+        assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server).await, 1);
+    }
+
+    async fn seed_entries(storage: &Storage, names: &[&str]) {
+        for name in names {
+            let key = format!(
+                "cargo/index-entries/{}/{name}/0.1.0.json",
+                super::crate_index_prefix(name)
+            );
+            let entry = format!(
+                r#"{{"name":"{name}","vers":"0.1.0","deps":[],"cksum":"aa","features":{{}},"yanked":false}}"#
+            );
+            storage.put(&key, entry.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// A start with every record in place reads no record and writes none: what is recorded is one
+    /// listing, not a read per crate.
+    #[tokio::test]
+    async fn a_rebuild_with_every_record_in_place_reads_no_record() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        seed_entries(&storage, &["aa-x", "bb_y", "ccz"]).await;
+        super::rebuild_crate_name_records(&storage).await;
+        ops.reset();
+        super::rebuild_crate_name_records(&storage).await;
+        let snapshot = ops.snapshot();
+        assert!(
+            snapshot.get("get").is_none() && snapshot.get("put").is_none(),
+            "{snapshot:?}"
+        );
+    }
+
+    /// Only the missing records are written, and a record already there — here naming the other
+    /// spelling — is never overwritten; with the records unlistable, each is read before it is
+    /// written, so none is overwritten either.
+    #[tokio::test]
+    async fn a_rebuild_writes_only_missing_records_and_overwrites_none() {
+        for records_list_fails in [false, true] {
+            let storage = Storage::from_backend(std::sync::Arc::new(Records {
+                inner: ObjectStorage::in_memory(),
+                record_get_fails: false,
+                record_get_delay: None,
+                records_list_fails,
+            }));
+            seed_entries(&storage, &["aa-x", "bb_y"]).await;
+            storage.put("cargo/_names/aa-x", b"aa_x").await.unwrap();
+            super::rebuild_crate_name_records(&storage).await;
+            assert_eq!(&*storage.get("cargo/_names/aa-x").await.unwrap(), b"aa_x");
+            assert_eq!(&*storage.get("cargo/_names/bb-y").await.unwrap(), b"bb_y");
+        }
+    }
+
+    /// S1, C7: a store from an older release (`my-crate` published, no record) gets its records at
+    /// startup, and `my_crate` is refused from then on; where both spellings were published, each
+    /// still serves its own index.
+    #[tokio::test]
+    async fn records_are_rebuilt_for_crates_published_before_them() {
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        let own = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"0.1.0","deps":[],"cksum":"aa","features":{{}},"yanked":false}}"#
+            )
+        };
+        for (key, name) in [
+            ("cargo/index-entries/my/-c/my-crate/0.1.0.json", "my-crate"),
+            (
+                "cargo/index-entries/bo/th/both-ways/0.1.0.json",
+                "both-ways",
+            ),
+            (
+                "cargo/index-entries/bo/th/both_ways/0.1.0.json",
+                "both_ways",
+            ),
+        ] {
+            ctx.state
+                .storage
+                .put(key, own(name).as_bytes())
+                .await
+                .unwrap();
+        }
+        super::rebuild_crate_name_records(&ctx.state.storage).await;
+        let (status, body) = get(&ctx.app, "/cargo/index/my/_c/my_crate").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("`my-crate`"), "{body}");
+        for (uri, name) in [
+            ("/cargo/index/bo/th/both-ways", "both-ways"),
+            ("/cargo/index/bo/th/both_ways", "both_ways"),
+        ] {
+            let (status, body) = get(&ctx.app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains(name), "{uri}: {body}");
+        }
+        // Each published spelling also downloads its own crate and takes a new version.
+        for name in ["both-ways", "both_ways"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("cargo/{name}/0.1.0/{name}-0.1.0.crate"),
+                    name.as_bytes(),
+                )
+                .await
+                .unwrap();
+            let uri = format!("/cargo/api/v1/crates/{name}/0.1.0/download");
+            let (status, body) = get(&ctx.app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(body, name);
+            assert_eq!(
+                publish(&ctx.app, name, "0.2.0").await.0,
+                StatusCode::OK,
+                "{name}"
+            );
+        }
+        // No index or crate is asked of the upstream (a download may still read the upstream's
+        // release dates under `trust_upstream_dates`, as before).
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.contains("/index/") && !p.ends_with("/download")),
+            "{paths:?}"
+        );
     }
 }

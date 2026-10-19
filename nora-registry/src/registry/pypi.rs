@@ -350,23 +350,12 @@ async fn download_file(
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
 
-    // Extract the upstream release date for this file (PEP 700 `upload-time` from
-    // the PEP 691 simple JSON, cached as dates.json). Seeds the digest-quarantine
-    // first-seen clock so a provably-old release is not held as "new to this
-    // mirror" (#748/#750). Only consulted when upstream dates are trusted.
-    let dates_key = format!("pypi/{}/dates.json", normalized);
-    if state.config.server.trust_upstream_dates {
-        // The map is re-read from storage by `extract_pypi_publish_date` below (which
-        // also handles the untrusted-dates branch); only the caching side effect matters here.
-        let _ = ensure_pypi_dates_cached(&state, &normalized).await;
-    }
-    let publish_date = extract_pypi_publish_date(
-        &state.storage,
-        &dates_key,
-        &filename,
-        state.config.server.trust_upstream_dates,
-    )
-    .await;
+    let key = format!("pypi/{}/{}", normalized, filename);
+
+    // The release date of this file, for min-release-age and to seed the digest-quarantine
+    // first-seen clock so a provably-old release is not held as "new to this mirror"
+    // (#748/#750). Obtained here whatever index the client read.
+    let publish_date = pypi_publish_date(&state, &normalized, &filename, &key).await;
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -389,8 +378,6 @@ async fn download_file(
         }
     }
 
-    let key = format!("pypi/{}/{}", normalized, filename);
-
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
     // Docker-only wiring). Resolved once; applied at each serve point below.
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -412,10 +399,15 @@ async fn download_file(
     // the full read below. Package files only — the simple index is generated, never
     // ranged. A partial read cannot be hashed, so neither the quarantine gate nor the
     // curation integrity check can run on it: the range serve stands down while
-    // quarantine holds artifacts, and integrity is the client's own hash (the PEP 691
-    // `hashes` field), as docker does.
+    // quarantine holds artifacts or an integrity rule applies to the file.
     if headers.contains_key(header::RANGE)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
+        && !crate::curation::integrity_applies(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PyPI,
+            &normalized,
+            version.as_deref(),
+        )
     {
         if let Some(meta) = state.storage.stat(&key).await {
             if let Some(response) = crate::registry::range::range_response(
@@ -543,17 +535,35 @@ async fn download_file(
             continue;
         };
 
+        // The upstream's credential goes to the upstream's own origin only: an index may name its
+        // files on another host, which must not receive it (pip scopes a credential the same way).
+        let file_auth = if same_origin(&file_url, up.url()) {
+            up.auth().map(UpstreamAuth::Basic)
+        } else {
+            None
+        };
         match proxy_fetch(
             &state.http_client,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth().map(UpstreamAuth::Basic),
+            file_auth,
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::PyPI, up.url()),
         )
         .await
         {
             Ok(data) => {
+                // The allowlist's pinned integrity holds on the first download too, before anything
+                // is cached: the cache-hit branch checks the same rule.
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::PyPI,
+                    &normalized,
+                    version.as_deref(),
+                    &data,
+                ) {
+                    return response;
+                }
                 state.metrics.record_download("pypi");
                 state.metrics.record_cache_miss("pypi");
                 state.activity.push(ActivityEntry::new(
@@ -957,38 +967,67 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 // Helpers
 // ============================================================================
 
-/// Extract a file's upstream upload-time from the cached `dates.json`
-/// (filename → PEP 700 `upload-time`, populated by [`ensure_pypi_dates_cached`]).
-async fn extract_pypi_publish_date(
-    storage: &crate::storage::Storage,
-    dates_key: &str,
+/// A file's release date from the cached `dates.json` listing, which is cached by whichever
+/// request reaches the package first — the PEP 691 index (#896) or a download — so a client
+/// that only reads the PEP 503 HTML index gets the date a JSON client gets.
+///
+/// Trusted dates: the file's upstream `upload-time`. Untrusted (#513): the time NORA cached
+/// the listing — never the (spoofable) upstream upload-time — and only for a file the listing
+/// names. A file released after it was not seen by NORA at that time, so it gets no date
+/// rather than an older one; min-release-age then defers to the quarantine, which records
+/// it as first seen now.
+///
+/// With untrusted dates a missing listing is fetched on a cold miss only: that request goes
+/// upstream anyway, while a cache hit (a hosted package above all) must not start asking an
+/// upstream on every download.
+/// Whether a release-age rule reads a PyPI download's date: curation is on and
+/// `min_release_age` is set globally or for PyPI.
+fn release_age_applies(state: &AppState) -> bool {
+    let curation = &state.config.curation;
+    state.curation().curation_engine.is_active()
+        && (curation.min_release_age.is_some() || curation.pypi.min_release_age.is_some())
+}
+
+async fn pypi_publish_date(
+    state: &AppState,
+    normalized: &str,
     filename: &str,
-    trust_upstream: bool,
+    artifact_key: &str,
 ) -> Option<i64> {
-    // #513: untrusted upstream dates → use NORA's own cache mtime, never the
-    // (spoofable) upstream upload-time.
-    if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, dates_key).await;
+    let trust = state.config.server.trust_upstream_dates;
+    let dates_key = format!("pypi/{}/dates.json", normalized);
+    let dates = match state.storage.get(&dates_key).await {
+        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+        Err(_) if trust => ensure_pypi_dates_cached(state, normalized).await,
+        // Without trusted dates the listing is asked for only when a release-age rule reads
+        // the date: otherwise nothing uses it, and the download asks the upstream nothing more.
+        Err(_)
+            if release_age_applies(state) && state.storage.stat(artifact_key).await.is_none() =>
+        {
+            ensure_pypi_dates_cached(state, normalized).await
+        }
+        Err(_) => return None,
+    };
+    let entry = dates.get(filename)?;
+    if trust {
+        crate::curation::parse_iso8601_to_unix(entry.as_str()?)
+    } else {
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &dates_key).await
     }
-    let data = storage.get(dates_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get(filename)?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
 }
 
 /// Cache a `filename → upload-time` map (`pypi/{name}/dates.json`) from the
-/// upstream PEP 691 simple JSON (PEP 700 `upload-time`) and return it. No-op if
-/// already cached or no upstream supplies a date. Best-effort: any failure leaves no
+/// upstream PEP 691 simple JSON (PEP 700 `upload-time`, null for a file listed without
+/// one) and return it. No-op if already cached. Best-effort: any failure leaves no
 /// dates and the quarantine clock falls back to NORA's own time. The PEP 503 HTML
 /// index NORA fetches for the file *listing* carries no dates, hence this JSON fetch.
 ///
 /// #969: an upstream that answers but emits no `upload-time` (any pre-PEP-700 index —
 /// devpi, Artifactory, an older NORA) used to leave nothing cached, so every single
 /// `/simple/{name}/` JSON request re-downloaded the whole upstream JSON index. An
-/// answered-but-dateless upstream is now recorded as an empty map, which reads back
-/// identically for the quarantine clock (no entry for the file either way) and stops
-/// the refetch. A failed/open-breaker fetch still caches nothing, so a transient
-/// outage stays retryable.
+/// answered-but-dateless upstream is now recorded once, its files with null dates,
+/// and the refetch stops. A failed/open-breaker fetch still caches nothing, so a
+/// transient outage stays retryable.
 async fn ensure_pypi_dates_cached(
     state: &AppState,
     normalized: &str,
@@ -1023,27 +1062,39 @@ async fn ensure_pypi_dates_cached(
             continue;
         };
         upstream_answered = true;
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if let Some(files) = json.get("files").and_then(|f| f.as_array()) {
-            for fe in files {
-                if let (Some(fname), Some(ut)) = (
-                    fe.get("filename").and_then(|v| v.as_str()),
-                    fe.get("upload-time").and_then(|v| v.as_str()),
-                ) {
-                    map.entry(fname.to_string())
-                        .or_insert_with(|| serde_json::Value::String(ut.to_string()));
-                }
+        // Every listed file gets an entry — null when the upstream gives no `upload-time` —
+        // because the entry is what dates the file when upstream dates are untrusted. An
+        // upstream without PEP 691 answers with its HTML index, which still lists the files.
+        let listed: Vec<(String, Option<String>)> =
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(json) => json
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|fe| {
+                        let fname = fe.get("filename")?.as_str()?;
+                        let ut = fe.get("upload-time").and_then(|v| v.as_str());
+                        Some((fname.to_string(), ut.map(str::to_string)))
+                    })
+                    .collect(),
+                Err(_) => parse_upstream_files(&text)
+                    .into_iter()
+                    .map(|f| (f.filename, None))
+                    .collect(),
+            };
+        for (fname, ut) in listed {
+            let entry = map.entry(fname).or_insert(serde_json::Value::Null);
+            if let (true, Some(ut)) = (entry.is_null(), ut) {
+                *entry = serde_json::Value::String(ut);
             }
         }
-        if !map.is_empty() {
+        if map.values().any(serde_json::Value::is_string) {
             break; // first upstream that listed dated files wins
         }
     }
-    // An empty map is still worth persisting once an upstream has actually answered:
-    // it marks "this index carries no upload-time" and spares every later request the
-    // full upstream JSON download (#969).
+    // A map without dates is still worth persisting once an upstream has actually
+    // answered: it spares every later request the full upstream JSON download (#969).
     if !map.is_empty() || upstream_answered {
         // Serialize from a reference — the map is returned to the caller and can hold
         // tens of thousands of entries for a large project, so do not clone it.
@@ -1241,6 +1292,18 @@ fn merge_file_lists(upstream: Vec<FileEntry>, local: &[FileEntry]) -> Vec<FileEn
 ///
 /// `page_url` is the simple-index page URL used to resolve relative hrefs
 /// returned by some mirrors (Tsinghua, USTC, Aliyun) (#877).
+/// True when both URLs have the same scheme, host and port.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<String> {
     let mut remaining = html;
 
@@ -1341,6 +1404,53 @@ mod tests {
     fn test_normalize_name_lowercase() {
         assert_eq!(normalize_name("Flask"), "flask");
         assert_eq!(normalize_name("REQUESTS"), "requests");
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        assert!(super::same_origin(
+            "https://pypi.corp/files/a.whl",
+            "https://pypi.corp/simple/"
+        ));
+        assert!(super::same_origin(
+            "https://pypi.corp:443/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "https://files.example/x",
+            "https://pypi.corp/"
+        ));
+        // A host is compared whole: a name ending in the upstream's, or extending it, is another.
+        assert!(!super::same_origin(
+            "https://evilpypi.corp/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "https://pypi.corp.evil/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin("https://a.corp/x", "https://b.corp/"));
+        assert!(!super::same_origin(
+            "https://cdn.pypi.corp/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "https://pypi.corp/x",
+            "https://cdn.pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "http://pypi.corp/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "https://pypi.corp:8443/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin(
+            "https://pypi.corp.evil/x",
+            "https://pypi.corp/"
+        ));
+        assert!(!super::same_origin("not a url", "https://pypi.corp/"));
     }
 
     #[test]
@@ -2586,16 +2696,16 @@ mod integration_tests {
             json_fetches, 1,
             "#969: a dateless upstream JSON index must be fetched once, not per request"
         );
-        // The empty map is what got cached — it reads back like "no date for this file",
-        // exactly as an absent dates.json did for the quarantine clock.
+        // The listing is what got cached, without a date: no upload-time for the file,
+        // as for an absent dates.json, while the entry still records that it was listed.
         assert_eq!(
             &ctx.state
                 .storage
                 .get("pypi/flask/dates.json")
                 .await
                 .unwrap()[..],
-            b"{}",
-            "an answered-but-dateless upstream is recorded as an empty map"
+            br#"{"flask-2.0.tar.gz":null}"#,
+            "an answered-but-dateless upstream is recorded without dates"
         );
     }
 
@@ -4062,5 +4172,299 @@ mod pep440_version_curation {
             let resp = send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "").await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
         }
+    }
+}
+
+/// Release age reaches a PEP 503 (HTML) client: pip before 22.2 never asks for the PEP 691
+/// JSON index, which used to be the only request that cached `dates.json`, so its downloads
+/// carried no date and min-release-age let every one of them through. A file is dated by the
+/// listing NORA cached, and only if that listing names it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod release_age_without_the_json_index {
+    use super::PEP691_JSON;
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::test_helpers::TestContext;
+    use crate::test_helpers::{create_test_context_with_config, send, send_with_headers};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// What pip 22.0 sends for the index.
+    const PIP_HTML: &str = "text/html";
+
+    /// An upstream index for `foo` listing `files` (filename, upload-time); `json` is the
+    /// body its PEP 691 request gets, `None` for an upstream that answers it with HTML.
+    async fn upstream(files: &[(&str, Option<&str>)], json: bool) -> MockServer {
+        let up = MockServer::start().await;
+        let uri = up.uri();
+        let links: String = files
+            .iter()
+            .map(|(f, _)| format!(r#"<a href="{uri}/files/{f}">{f}</a>"#))
+            .collect();
+        let html = format!("<html><body>{links}</body></html>");
+        if json {
+            let entries: Vec<serde_json::Value> = files
+                .iter()
+                .map(|(f, ut)| match ut {
+                    Some(ut) => serde_json::json!({"filename": f, "url": format!("{uri}/files/{f}"), "hashes": {}, "upload-time": ut}),
+                    None => serde_json::json!({"filename": f, "url": format!("{uri}/files/{f}"), "hashes": {}}),
+                })
+                .collect();
+            let body = serde_json::json!({"meta": {"api-version": "1.1"}, "name": "foo", "files": entries});
+            Mock::given(method("GET"))
+                .and(path("/foo/"))
+                .and(header("accept", PEP691_JSON))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+                .mount(&up)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/foo/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(&up)
+            .await;
+        for (f, _) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/files/{f}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(format!("BYTES {f}")))
+                .mount(&up)
+                .await;
+        }
+        up
+    }
+
+    fn context(
+        up: &MockServer,
+        trust: bool,
+        customize: impl FnOnce(&mut crate::config::Config),
+    ) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            customize(cfg);
+        })
+    }
+
+    fn min_age(cfg: &mut crate::config::Config) {
+        cfg.curation.min_release_age = Some("3d".to_string());
+    }
+
+    /// The index the client reads, then the download it makes from it.
+    async fn index_then_download(ctx: &TestContext, accept: &str, file: &str) -> StatusCode {
+        let index = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/foo/",
+            vec![("Accept", accept)],
+            "",
+        )
+        .await;
+        assert_eq!(index.status(), StatusCode::OK);
+        send(&ctx.app, Method::GET, &format!("/simple/foo/{file}"), "")
+            .await
+            .status()
+    }
+
+    /// `dates.json` as an earlier request cached it `days` ago.
+    async fn cached_listing(ctx: &TestContext, body: &str, days: u64) {
+        ctx.state
+            .storage
+            .put("pypi/foo/dates.json", body.as_bytes())
+            .await
+            .unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(std::path::Path::new(&ctx.state.config.storage.path).join("pypi/foo/dates.json"))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    fn hour_ago() -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+    }
+
+    #[tokio::test]
+    async fn an_html_client_is_held_like_a_json_client() {
+        for accept in [PIP_HTML, PEP691_JSON] {
+            let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+            let ctx = context(&up, false, min_age);
+            assert_eq!(
+                index_then_download(&ctx, accept, "foo-1.0.tar.gz").await,
+                StatusCode::FORBIDDEN,
+                "{accept}: a file NORA first saw just now is younger than 3d on its own clock"
+            );
+        }
+    }
+
+    /// Requests the upstream got for the JSON listing, which NORA asks for the dates.
+    async fn json_listings(up: &MockServer) -> usize {
+        up.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/foo/"
+                    && r.headers.get("accept").and_then(|v| v.to_str().ok()) == Some(PEP691_JSON)
+            })
+            .count()
+    }
+
+    /// The listing is asked for on a download only when a release-age rule reads the date:
+    /// with none, or with curation off, the download asks the upstream nothing more.
+    #[tokio::test]
+    async fn a_download_asks_for_the_dates_only_when_a_release_age_rule_reads_them() {
+        type Setup = fn(&mut crate::config::Config);
+        let cases: [(&str, Setup, usize); 4] = [
+            ("enforce, no rule", |_| {}, 0),
+            (
+                "off, rule set",
+                |cfg| {
+                    cfg.curation.mode = crate::config::CurationMode::Off;
+                    cfg.curation.min_release_age = Some("3d".to_string());
+                },
+                0,
+            ),
+            ("enforce, global rule", min_age, 1),
+            (
+                "enforce, pypi rule",
+                |cfg| {
+                    cfg.curation.pypi.min_release_age = Some("3d".to_string());
+                },
+                1,
+            ),
+        ];
+        for (name, setup, want) in cases {
+            let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+            let ctx = context(&up, false, setup);
+            let index = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/foo/",
+                vec![("Accept", PIP_HTML)],
+                "",
+            )
+            .await;
+            assert_eq!(index.status(), StatusCode::OK);
+            let before = json_listings(&up).await;
+            let _ = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
+            assert_eq!(json_listings(&up).await - before, want, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_html_client_gets_a_file_nora_listed_long_ago() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, false, min_age);
+        cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_client_gets_the_upstream_date_when_dates_are_trusted() {
+        let fresh = hour_ago();
+        let up = upstream(
+            &[
+                ("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z")),
+                ("foo-2.0.tar.gz", Some(fresh.as_str())),
+            ],
+            true,
+        )
+        .await;
+        let ctx = context(&up, true, min_age);
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+            StatusCode::OK
+        );
+    }
+
+    /// The cached listing dates only the files it names. A release that came after it was
+    /// never seen by NORA at that time: dating it by the listing's age would let the
+    /// quarantine record it as first seen a month ago.
+    #[tokio::test]
+    async fn a_release_after_the_cached_listing_is_not_dated_by_it() {
+        let up = upstream(
+            &[
+                ("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z")),
+                ("foo-2.0.tar.gz", Some("2019-01-02T00:00:00Z")),
+            ],
+            true,
+        )
+        .await;
+        let ctx = context(&up, false, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
+        cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz").await,
+            StatusCode::FORBIDDEN,
+            "a file first seen now is held for 7d"
+        );
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+            StatusCode::OK,
+            "a file NORA saw listed 30 days ago has matured"
+        );
+    }
+
+    /// An upstream index without PEP 700 dates (devpi, Artifactory) or without PEP 691 at
+    /// all (it answers the JSON request with its HTML) still lists the file.
+    #[tokio::test]
+    async fn an_upstream_without_dates_still_lists_the_file() {
+        for json in [true, false] {
+            let up = upstream(&[("foo-1.0.tar.gz", None)], json).await;
+            let ctx = context(&up, false, min_age);
+            assert_eq!(
+                index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+                StatusCode::FORBIDDEN,
+                "json={json}"
+            );
+        }
+    }
+
+    /// An upstream that lists the file without a date does not stop the search: the
+    /// date comes from the next upstream that has one, as when the first listed nothing.
+    #[tokio::test]
+    async fn a_listing_without_dates_does_not_hide_a_later_upstreams_date() {
+        let fresh = hour_ago();
+        let undated = upstream(&[("foo-1.0.tar.gz", None)], true).await;
+        let dated = upstream(&[("foo-1.0.tar.gz", Some(fresh.as_str()))], true).await;
+        let urls = vec![undated.uri(), dated.uri()];
+        let ctx = context(&undated, true, move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!(urls)).unwrap();
+            min_age(cfg);
+        });
+        assert_eq!(
+            index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A cache hit with no listing cached (a hosted package, or a file cached by an earlier
+    /// version) must not start asking an upstream on every download.
+    #[tokio::test]
+    async fn a_cache_hit_does_not_fetch_the_listing() {
+        let up = upstream(&[("foo-1.0.tar.gz", None)], true).await;
+        let ctx = context(&up, false, min_age);
+        ctx.state
+            .storage
+            .put("pypi/foo/foo-1.0.tar.gz", b"LOCAL")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(up.received_requests().await.unwrap().is_empty());
     }
 }

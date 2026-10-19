@@ -729,17 +729,12 @@ async fn collect_cargo_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     > = std::collections::HashMap::new();
 
     for key in &all_keys {
-        // cargo/{crate}/{version}/{crate}-{version}.crate
-        // Also: cargo/{crate}/metadata.json, cargo/index/...
+        // A version is exactly cargo/{crate}/{version}/{crate}-{version}.crate. Every other cargo
+        // key — the sparse index, its per-version entries and the records beside it, metadata.json —
+        // is not a version of a crate, whatever its path looks like.
         if let Some(rest) = key.strip_prefix("cargo/") {
-            if rest.starts_with("index/") {
-                continue; // Skip sparse index
-            }
-            let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 3 {
-                let crate_name = parts[0];
-                let version = parts[1];
-                if crate_name != "index" && version != "metadata.json" {
+            if let [crate_name, version, file] = rest.split('/').collect::<Vec<_>>()[..] {
+                if file == format!("{crate_name}-{version}.crate") {
                     crates
                         .entry(crate_name.to_string())
                         .or_default()
@@ -971,7 +966,7 @@ pub async fn run_retention(
     // read heals it (a read rebuilds a *missing* packument, #956); the
     // deletions themselves are already durable.
     for (package, retired) in &npm_regen {
-        let lock_key = format!("npm/{package}/metadata.json");
+        let lock_key = crate::registry::npm::published_packument_key(package);
         let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
         let _guard = lock.lock().await;
 
@@ -1983,6 +1978,57 @@ mod tests {
             .is_ok());
     }
 
+    /// The cargo keys that are not crate files — per-version index entries, the sparse index and
+    /// the records beside it — are not versions of a crate: no rule prunes them.
+    #[tokio::test]
+    async fn cargo_index_keys_are_not_crate_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let service = [
+            "cargo/index-entries/se/rd/serde/1.0.0.json",
+            "cargo/index-entries/to/ki/tokio/1.0.0.json",
+            "cargo/index-entries/3/a/abc/0.1.0.json",
+            "cargo/index/se/rd/serde",
+            "cargo/index/to/ki/tokio",
+            "cargo/index-assembled/se/rd/serde",
+            "cargo/index-assembled/to/ki/tokio",
+            // One- and two-letter names: three segments, the shape of a crate file. Two of each
+            // prefix, so a rule that took them for versions would prune one.
+            "cargo/index/1/a",
+            "cargo/index/2/ab",
+            "cargo/index-assembled/1/a",
+            "cargo/index-assembled/2/ab",
+            "cargo/index-upstream/1/a",
+            "cargo/index-upstream/2/ab",
+            "cargo/index-entries/1/a/0.1.0.json",
+        ];
+        for key in service {
+            storage.put(key, b"x").await.unwrap();
+        }
+        for key in [
+            "cargo/serde/1.0.0/serde-1.0.0.crate",
+            "cargo/tokio/1.0.0/tokio-1.0.0.crate",
+            "cargo/abc/0.1.0/abc-0.1.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+        ] {
+            storage.put(key, b"crate").await.unwrap();
+        }
+        let rules = vec![RetentionRule {
+            registry: "cargo".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: vec![],
+        }];
+        let result = run_retention(&storage, &test_publish_locks(), None, &rules, false).await;
+        for key in service {
+            assert!(storage.get(key).await.is_ok(), "{key} pruned");
+        }
+        assert_eq!(result.planned, 0, "one version per crate: nothing to prune");
+    }
+
     #[tokio::test]
     async fn test_retention_dry_run_preserves() {
         let dir = tempfile::tempdir().unwrap();
@@ -2648,7 +2694,7 @@ mod format_retention_tests {
     }
 
     /// A proxied package as the cache leaves it: the upstream packument at
-    /// `metadata.json` (no `versions/` keys), and the tarballs a client happened to
+    /// `upstream/packument.json` (no `versions/` keys), and the tarballs a client happened to
     /// fetch, each with its hash sidecar and an explicit modification time in the
     /// past (`days_ago`), so `keep_last` ordering does not depend on the clock.
     async fn seed_proxied_npm(
@@ -2672,7 +2718,7 @@ mod format_retention_tests {
         let storage = &ctx.state.storage;
         storage
             .put(
-                &format!("npm/{package}/metadata.json"),
+                &format!("npm/{package}/upstream/packument.json"),
                 &serde_json::to_vec(&packument).unwrap(),
             )
             .await
@@ -2706,6 +2752,53 @@ mod format_retention_tests {
     /// `versions/` — where only published versions live — emptied it, and with
     /// the upstream unreachable `npm install` of the surviving version failed
     /// with ENOVERSIONS.
+    /// A packument an older release cached at `metadata.json` is never written by retention:
+    /// a rollback reads it as it was. Only 1.4.0's own cache is pruned.
+    #[tokio::test]
+    async fn test_npm_retention_leaves_an_older_releases_cache_alone() {
+        let ctx = create_test_context();
+        seed_proxied_npm(
+            &ctx,
+            "oldcache",
+            &["6.0.0", "7.0.0"],
+            serde_json::json!({ "latest": "7.0.0" }),
+            &[("6.0.0", 20), ("7.0.0", 10)],
+        )
+        .await;
+        let storage = &ctx.state.storage;
+        let cached = storage
+            .get("npm/oldcache/upstream/packument.json")
+            .await
+            .unwrap();
+        storage
+            .put("npm/oldcache/metadata.json", &cached)
+            .await
+            .unwrap();
+        storage
+            .delete("npm/oldcache/upstream/packument.json")
+            .await
+            .unwrap();
+
+        let rules = vec![rule("npm", None, Some(1), None)];
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            ctx.state.signer.as_deref(),
+            &rules,
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert_eq!(
+            storage.get("npm/oldcache/metadata.json").await.unwrap(),
+            cached
+        );
+        assert!(storage
+            .get("npm/oldcache/upstream/packument.json")
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn test_npm_retention_keeps_surviving_proxied_versions_in_packument() {
         let ctx = create_test_context();
@@ -2809,7 +2902,7 @@ mod format_retention_tests {
         )
         .await;
         let storage = &ctx.state.storage;
-        let meta_key = "npm/etagged/metadata.json";
+        let meta_key = "npm/etagged/upstream/packument.json";
         crate::registry::write_validators(
             storage,
             meta_key,
@@ -2852,7 +2945,7 @@ mod format_retention_tests {
                 &[("1.0.0", 30), ("2.0.0", 5)],
             )
             .await;
-            let key = format!("npm/{package}/metadata.json");
+            let key = format!("npm/{package}/upstream/packument.json");
             let old = storage.get(&key).await.unwrap();
             let digest = if vouches {
                 hex::encode(sha2::Sha256::digest(&old))
@@ -2872,7 +2965,7 @@ mod format_retention_tests {
         run_retention(storage, &ctx.state.publish_locks, None, &rules, false).await;
 
         for (package, vouches) in [("trusted", true), ("foreign", false)] {
-            let key = format!("npm/{package}/metadata.json");
+            let key = format!("npm/{package}/upstream/packument.json");
             let new = storage.get(&key).await.unwrap();
             assert!(
                 cached_packument_json(&new)["versions"]
@@ -2922,7 +3015,7 @@ mod format_retention_tests {
         let json = cached_packument_json(
             &ctx.state
                 .storage
-                .get("npm/refetched/metadata.json")
+                .get("npm/refetched/upstream/packument.json")
                 .await
                 .unwrap(),
         );

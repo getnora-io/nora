@@ -9,7 +9,10 @@ use std::env;
 pub struct NugetConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_nuget_proxy")]
+    #[serde(
+        default = "default_nuget_proxy",
+        deserialize_with = "super::super::deserialize_upstream"
+    )]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
     pub proxy_auth: Option<ProtectedString>,
@@ -73,7 +76,7 @@ impl NugetConfig {
             self.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_NUGET_PROXY") {
-            self.proxy = if val.is_empty() { None } else { Some(val) };
+            self.proxy = super::super::upstream_setting(val);
         }
         if let Ok(val) = env::var("NORA_NUGET_PROXY_AUTH") {
             self.proxy_auth = if val.is_empty() {

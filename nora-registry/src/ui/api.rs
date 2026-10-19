@@ -625,7 +625,7 @@ pub async fn get_npm_detail(
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    let metadata_key = format!("npm/{}/metadata.json", name);
+    let metadata_key = crate::registry::npm::packument_key_for_reading(storage, name).await;
 
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;

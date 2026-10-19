@@ -26,7 +26,6 @@ use crate::activity_log::ActivityLog;
 use crate::audit::AuditLog;
 use crate::auth::HtpasswdAuth;
 use crate::config::*;
-use crate::curation::CurationEngine;
 use crate::dashboard_metrics::DashboardMetrics;
 use crate::registry;
 use crate::repo_index::RepoIndex;
@@ -119,12 +118,39 @@ fn build_context(
     build_context_with(auth_enabled, users, anonymous_read, customize, None)
 }
 
+/// A context whose outbound HTTP clients send every request through the forward proxy at
+/// `egress_proxy` (an [`EgressRecorder`]): whatever host a handler asks, the proxy sees it.
+pub fn create_test_context_with_egress_proxy(
+    egress_proxy: &str,
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context_full(false, &[], false, customize, None, Some(egress_proxy))
+}
+
 fn build_context_with(
     auth_enabled: bool,
     users: &[(&str, &str)],
     anonymous_read: bool,
     customize: impl FnOnce(&mut Config),
     storage: Option<Storage>,
+) -> TestContext {
+    build_context_full(
+        auth_enabled,
+        users,
+        anonymous_read,
+        customize,
+        storage,
+        None,
+    )
+}
+
+fn build_context_full(
+    auth_enabled: bool,
+    users: &[(&str, &str)],
+    anonymous_read: bool,
+    customize: impl FnOnce(&mut Config),
+    storage: Option<Storage>,
+    egress_proxy: Option<&str>,
 ) -> TestContext {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let storage_path = tempdir.path().to_str().unwrap().to_string();
@@ -171,6 +197,7 @@ fn build_context_with(
             metadata_ttl: -1,
             serve_stale: true,
             revalidate: true,
+            import_embedded: Vec::new(),
         },
         pypi: PypiConfig {
             enabled: true,
@@ -194,6 +221,7 @@ fn build_context_with(
             proxy_auth: None,
             proxy_timeout: 5,
             metadata_ttl: 300,
+            import_embedded: Vec::new(),
         },
         docker: DockerConfig {
             enabled: true,
@@ -285,32 +313,20 @@ fn build_context_with(
     let docker_auth =
         registry::DockerAuth::new(reqwest::Client::new(), config.docker.proxy_timeout);
 
-    // Build curation engine before consuming config (mirroring main.rs)
-    let mut curation_engine = CurationEngine::new(config.curation.clone());
-    // A list that does not parse fails the test: main.rs refuses it in enforce mode, and a
-    // test that silently runs without its list checks nothing.
+    // The curation engine is the one the server builds (main.rs `build_curation_engine`), so a
+    // test sees exactly the filters production installs. A list that does not parse fails the
+    // test in every mode: main.rs refuses it only in enforce, and a test that silently runs
+    // without its list checks nothing.
     if let Some(ref path) = config.curation.blocklist_path {
-        let filter = crate::curation::BlocklistFilter::from_file(path)
+        crate::curation::BlocklistFilter::from_file(path)
             .unwrap_or_else(|e| panic!("test blocklist {path}: {e}"));
-        curation_engine.add_filter(Box::new(filter));
     }
     if let Some(ref path) = config.curation.allowlist_path {
-        let filter =
-            crate::curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
-                .unwrap_or_else(|e| panic!("test allowlist {path}: {e}"));
-        curation_engine.add_filter(Box::new(filter));
+        crate::curation::AllowlistFilter::from_file(path, config.curation.require_integrity)
+            .unwrap_or_else(|e| panic!("test allowlist {path}: {e}"));
     }
-    if !config.curation.internal_namespaces.is_empty() {
-        let ns_filter =
-            crate::curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
-        curation_engine.set_namespace_filter(Box::new(ns_filter));
-    }
-    // main.rs installs min-release-age too; without it every age test through this
-    // context checked nothing (found by #1055: a positive control passed a release
-    // dated today through a 7d gate).
-    if let (Some(filter), _) = crate::curation::MinReleaseAgeFilter::from_config(&config.curation) {
-        curation_engine.add_filter(Box::new(filter));
-    }
+    let curation_engine = crate::build_curation_engine(&config)
+        .unwrap_or_else(|e| panic!("test curation engine: {e}"));
 
     let enabled_registries = config.enabled_registries();
     let cb_config = config.circuit_breaker.clone();
@@ -334,7 +350,29 @@ fn build_context_with(
     } else {
         None
     };
-    let http_client_no_redirect = crate::build_no_redirect_client(&config.tls);
+    let (http_client, http_client_no_redirect) = match egress_proxy {
+        Some(url) => {
+            let proxy = || reqwest::Proxy::all(url).expect("egress proxy url");
+            (
+                // No idle connections: every request opens its own, so the recorder sees each one.
+                reqwest::Client::builder()
+                    .proxy(proxy())
+                    .pool_max_idle_per_host(0)
+                    .build()
+                    .expect("egress client"),
+                reqwest::Client::builder()
+                    .proxy(proxy())
+                    .pool_max_idle_per_host(0)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("egress client"),
+            )
+        }
+        None => (
+            reqwest::Client::new(),
+            crate::build_no_redirect_client(&config.tls),
+        ),
+    };
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -348,7 +386,7 @@ fn build_context_with(
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
-        http_client: reqwest::Client::new(),
+        http_client,
         http_client_no_redirect,
         hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -370,62 +408,8 @@ fn build_context_with(
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
     // Dynamic route merging based on enabled registries
-    let mut registry_routes = Router::new();
-    for reg in enabled_registries.iter() {
-        match reg {
-            crate::registry_type::RegistryType::Docker => {
-                registry_routes = registry_routes.merge(registry::docker_routes());
-            }
-            crate::registry_type::RegistryType::Maven => {
-                registry_routes = registry_routes.merge(registry::maven_routes());
-            }
-            crate::registry_type::RegistryType::Npm => {
-                registry_routes = registry_routes.merge(registry::npm_routes());
-            }
-            crate::registry_type::RegistryType::Cargo => {
-                registry_routes = registry_routes.merge(registry::cargo_routes());
-            }
-            crate::registry_type::RegistryType::PyPI => {
-                registry_routes = registry_routes.merge(registry::pypi_routes());
-            }
-            crate::registry_type::RegistryType::Raw => {
-                registry_routes = registry_routes.merge(registry::raw_routes());
-            }
-            crate::registry_type::RegistryType::Go => {
-                registry_routes = registry_routes.merge(registry::go_routes());
-            }
-            crate::registry_type::RegistryType::Gems => {
-                registry_routes = registry_routes.merge(registry::gems_routes());
-            }
-            crate::registry_type::RegistryType::Terraform => {
-                registry_routes = registry_routes.merge(registry::terraform_routes());
-            }
-            crate::registry_type::RegistryType::Ansible => {
-                registry_routes = registry_routes.merge(registry::ansible_routes());
-            }
-            crate::registry_type::RegistryType::Nuget => {
-                registry_routes = registry_routes.merge(registry::nuget_routes());
-            }
-            crate::registry_type::RegistryType::PubDart => {
-                registry_routes = registry_routes.merge(registry::pub_dart_routes());
-            }
-            crate::registry_type::RegistryType::Conan => {
-                registry_routes = registry_routes.merge(registry::conan_routes());
-            }
-            crate::registry_type::RegistryType::Rpm => {
-                registry_routes = registry_routes.merge(registry::rpm_routes());
-            }
-            crate::registry_type::RegistryType::Deb => {
-                registry_routes = registry_routes.merge(registry::deb_routes());
-            }
-            crate::registry_type::RegistryType::Cpan => {
-                registry_routes = registry_routes.merge(registry::cpan_routes());
-            }
-            crate::registry_type::RegistryType::HuggingFace => {
-                registry_routes = registry_routes.merge(registry::hf_routes());
-            }
-        }
-    }
+    // The server's own assembly of the registry routes (main.rs `registry_routes`).
+    let registry_routes = crate::registry_routes(&enabled_registries);
 
     let public_routes = Router::new()
         .merge(crate::health::routes())
@@ -820,5 +804,73 @@ pub mod source_reader {
         found.sort();
         found.dedup();
         found
+    }
+}
+
+/// A forward proxy that answers every request 403 and records its first line — `CONNECT host:443`
+/// for https, the absolute URL for http. A context built with
+/// [`create_test_context_with_egress_proxy`] sends all its outbound requests here, so an empty
+/// record proves nothing left NORA, whatever host a handler meant to ask. Connections are answered
+/// one at a time; the accepting task ends when the recorder is dropped.
+pub struct EgressRecorder {
+    pub url: String,
+    seen: Arc<tokio::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EgressRecorder {
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind egress recorder");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("recorder address")
+        );
+        let seen: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let line = Self::answer(socket).await;
+                record.lock().await.push(line);
+            }
+        });
+        Self { url, seen, task }
+    }
+
+    /// Read a request head (up to 2 s), answer 403, and return its first line.
+    async fn answer(mut socket: tokio::net::TcpStream) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        let read = async {
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16384 {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+        };
+        // CANCEL-SAFETY: on timeout the partial head is still recorded; the socket is dropped.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), read).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+            .await;
+        String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The first line of every request the recorder received so far.
+    pub async fn seen(&self) -> Vec<String> {
+        self.seen.lock().await.clone()
+    }
+}
+
+impl Drop for EgressRecorder {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }

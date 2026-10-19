@@ -1607,15 +1607,11 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         }
     };
 
-    // Build engine with configured filters
-    let mut engine = curation::CurationEngine::new(config.curation.clone());
-
+    // What is configured, for the reader. The decision below comes from the engine the server
+    // builds (`build_curation_engine`), so explain answers what the server would decide.
     if let Some(ref path) = config.curation.blocklist_path {
         match curation::BlocklistFilter::from_file(path) {
-            Ok(filter) => {
-                println!("Blocklist: {} ({} rules)", path, filter.rule_count());
-                engine.add_filter(Box::new(filter));
-            }
+            Ok(filter) => println!("Blocklist: {} ({} rules)", path, filter.rule_count()),
             Err(e) => println!("Blocklist: {} (ERROR: {})", path, e),
         }
     } else {
@@ -1624,22 +1620,20 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
 
     if let Some(ref path) = config.curation.allowlist_path {
         match curation::AllowlistFilter::from_file(path, config.curation.require_integrity) {
-            Ok(filter) => {
-                println!("Allowlist: {} ({} entries)", path, filter.entry_count());
-                engine.add_filter(Box::new(filter));
-            }
+            Ok(filter) => println!("Allowlist: {} ({} entries)", path, filter.entry_count()),
             Err(e) => println!("Allowlist: {} (ERROR: {})", path, e),
         }
     } else {
         println!("Allowlist: not configured");
     }
 
-    if !config.curation.internal_namespaces.is_empty() {
-        let ns_filter = curation::NamespaceFilter::new(config.curation.internal_namespaces.clone());
-        println!("Namespaces: {} patterns", ns_filter.pattern_count());
-        engine.set_namespace_filter(Box::new(ns_filter));
-    } else {
+    if config.curation.internal_namespaces.is_empty() {
         println!("Namespaces: not configured");
+    } else {
+        println!(
+            "Namespaces: {} patterns",
+            config.curation.internal_namespaces.len()
+        );
     }
 
     let (min_age, problems) = curation::MinReleaseAgeFilter::from_config(&config.curation);
@@ -1647,16 +1641,22 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         println!("Min-release-age: ERROR: {}", problem);
     }
     match min_age {
-        Some(filter) => {
-            match filter.global_only() {
-                Some((secs, value)) => println!("Min-release-age: {} ({}s)", value, secs),
-                None => println!("Min-release-age: {}", filter.summary()),
-            }
-            engine.add_filter(Box::new(filter));
-        }
+        Some(filter) => match filter.global_only() {
+            Some((secs, value)) => println!("Min-release-age: {} ({}s)", value, secs),
+            None => println!("Min-release-age: {}", filter.summary()),
+        },
         None if problems.is_empty() => println!("Min-release-age: not configured"),
         None => {}
     }
+
+    let engine = match build_curation_engine(config) {
+        Ok(engine) => engine,
+        Err(e) => {
+            println!("Mode: {}", config.curation.mode);
+            println!("Decision: the server refuses this configuration and does not start: {e}");
+            std::process::exit(78);
+        }
+    };
 
     println!("Mode: {}", config.curation.mode);
     println!("---");
@@ -2259,52 +2259,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     ui::components::set_enabled_registries(enabled_registries.clone());
 
     // Registry routes — only merge enabled registries
-    let mut registry_routes = Router::new();
-    for reg in &enabled_registries {
-        match reg {
-            RegistryType::Docker => {
-                registry_routes = registry_routes.merge(registry::docker_routes())
-            }
-            RegistryType::Maven => {
-                registry_routes = registry_routes.merge(registry::maven_routes())
-            }
-            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
-            RegistryType::Cargo => {
-                registry_routes = registry_routes.merge(registry::cargo_routes())
-            }
-            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
-            RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
-            RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
-            RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
-            RegistryType::Terraform => {
-                registry_routes = registry_routes.merge(registry::terraform_routes())
-            }
-            RegistryType::Ansible => {
-                registry_routes = registry_routes.merge(registry::ansible_routes())
-            }
-            RegistryType::Nuget => {
-                registry_routes = registry_routes
-                    .merge(registry::nuget_routes())
-                    .merge(registry::nuget_alias_routes())
-            }
-            RegistryType::PubDart => {
-                registry_routes = registry_routes.merge(registry::pub_dart_routes())
-            }
-            RegistryType::Conan => {
-                registry_routes = registry_routes.merge(registry::conan_routes())
-            }
-            RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
-            RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
-            RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
-            RegistryType::HuggingFace => {
-                tracing::info!(
-                    "Hugging Face proxy enabled: public models only (datasets answer 501), \
-                     files over plain HTTP (Xet is never proxied)"
-                );
-                registry_routes = registry_routes.merge(registry::hf_routes())
-            }
-        }
-    }
+    let registry_routes = registry_routes(&enabled_registries);
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
@@ -2579,6 +2534,24 @@ async fn run_server(mut config: Config, storage: Storage) {
     // ...and Hugging Face cache fills a crash cut off mid-file.
     if state.config.hf.enabled {
         registry::hf::cleanup_fill_temp_dir(&state.config.storage.path);
+    }
+
+    // Cargo: the name record of every crate published before records existed (`-` and `_` name one
+    // crate), before the first request: until then another spelling of such a crate would reach the
+    // upstream, and a publish of it would pass. A panic there must not take the server down.
+    if state.enabled_registries.contains(&RegistryType::Cargo) {
+        let started = std::time::Instant::now();
+        let rebuilt =
+            std::panic::AssertUnwindSafe(registry::rebuild_cargo_name_records(&state.storage))
+                .catch_unwind()
+                .await;
+        match rebuilt {
+            Ok(()) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "cargo name records checked"
+            ),
+            Err(e) => tracing::error!(panic = ?e, "cargo name-record rebuild panicked"),
+        }
     }
 
     let listener = bind_listener(&state.config.server.host, state.config.server.port)
@@ -2926,6 +2899,58 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
     }
 
     Ok(engine)
+}
+
+/// The routes of the enabled registries — one assembly for the server and the tests, so a test
+/// reaches every route a client does (the NuGet aliases included).
+fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
+    let mut registry_routes = Router::new();
+    for reg in enabled {
+        match reg {
+            RegistryType::Docker => {
+                registry_routes = registry_routes.merge(registry::docker_routes())
+            }
+            RegistryType::Maven => {
+                registry_routes = registry_routes.merge(registry::maven_routes())
+            }
+            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
+            RegistryType::Cargo => {
+                registry_routes = registry_routes.merge(registry::cargo_routes())
+            }
+            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
+            RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
+            RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
+            RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
+            RegistryType::Terraform => {
+                registry_routes = registry_routes.merge(registry::terraform_routes())
+            }
+            RegistryType::Ansible => {
+                registry_routes = registry_routes.merge(registry::ansible_routes())
+            }
+            RegistryType::Nuget => {
+                registry_routes = registry_routes
+                    .merge(registry::nuget_routes())
+                    .merge(registry::nuget_alias_routes())
+            }
+            RegistryType::PubDart => {
+                registry_routes = registry_routes.merge(registry::pub_dart_routes())
+            }
+            RegistryType::Conan => {
+                registry_routes = registry_routes.merge(registry::conan_routes())
+            }
+            RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
+            RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
+            RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
+            RegistryType::HuggingFace => {
+                tracing::info!(
+                    "Hugging Face proxy enabled: public models only (datasets answer 501), \
+                     files over plain HTTP (Xet is never proxied)"
+                );
+                registry_routes = registry_routes.merge(registry::hf_routes())
+            }
+        }
+    }
+    registry_routes
 }
 
 /// Print note about registries that have data but no retention rules configured.
@@ -3537,5 +3562,55 @@ mod cleanup_pass_tests {
             "the tick after a GC pass"
         );
         assert_eq!(bytes_gauge(RegistryType::Rpm), 300);
+    }
+}
+
+/// The cargo name records (`-` and `_` name one crate) of a store from an older release are written
+/// before the server listens: a request before them would reach the upstream for another spelling of
+/// a published crate, and a publish of it would pass. Needles are built at run time so this text
+/// does not match.
+#[cfg(test)]
+mod cargo_name_records_before_listening {
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// Whether `run_server` rebuilds the records, awaited, before it binds the listener.
+    fn rebuilt_before_binding(code: &str) -> bool {
+        let code = squash(code);
+        let Some(start) = code.find(&["async", "fnrun_server("].concat()) else {
+            return false;
+        };
+        let body = &code[start..];
+        let rebuild =
+            body.find(&["registry::rebuild_cargo_name_records", "(&state.storage))"].concat());
+        let bind = body.find(&["letlistener=bind_listener", "(&state.config.server.host"].concat());
+        matches!((rebuild, bind), (Some(r), Some(b)) if r < b)
+    }
+
+    #[test]
+    fn the_records_are_rebuilt_before_the_listener_binds() {
+        assert!(rebuilt_before_binding(include_str!("main.rs")));
+    }
+
+    // Controls: without the call, or with it after the bind, the check refuses.
+    #[test]
+    fn the_check_refuses_a_missing_or_late_rebuild() {
+        let src = include_str!("main.rs");
+        let call = ["registry::rebuild_cargo_name_records", "(&state.storage)"].concat();
+        let missing = src.replace(&call, "std::future::ready(())");
+        assert!(!rebuilt_before_binding(&missing));
+        let bound = [".expect(\"Failed to", " bind\");"].concat();
+        let at = missing.find(&bound).unwrap() + bound.len();
+        let late = format!(
+            "{}\n    let _ = {call});\n{}",
+            &missing[..at],
+            &missing[at..]
+        );
+        assert!(!rebuilt_before_binding(&late));
     }
 }

@@ -34,8 +34,6 @@ use axum::{
 };
 use std::time::Duration;
 
-const UPSTREAM_DEFAULT: &str = "https://rubygems.org";
-
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Index files (mutable)
@@ -87,8 +85,13 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         }
     }
 
-    // Fetch from upstream
-    let proxy_url = upstream_url(state);
+    // Fetch from upstream — none when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(state) else {
+        return match cached_data {
+            Some(data) => with_binary(data.to_vec(), "application/gzip"),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), filename);
 
     match proxy_fetch(
@@ -223,7 +226,12 @@ async fn compact_index(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    let proxy_url = upstream_url(&state);
+    let Some(proxy_url) = upstream_url(&state) else {
+        return match cached_data {
+            Some(data) => with_text(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!("{}/info/{}", proxy_url.trim_end_matches('/'), name);
 
     // Revalidate stale metadata with a conditional request when enabled (a cheap
@@ -431,8 +439,16 @@ async fn download_gem(
     // the full read below. .gem files only — the specs/compact indexes are mutable. A
     // partial read cannot be hashed, so neither the quarantine gate nor the curation
     // integrity check can run on it: the range serve stands down while quarantine holds
-    // artifacts, and integrity is the client's own checksum, as docker does.
-    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) {
+    // artifacts or an integrity rule applies to any identity of the file.
+    let integrity_applies = identities.iter().any(|identity| {
+        crate::curation::integrity_applies(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Gems,
+            &identity.name,
+            Some(&identity.version),
+        )
+    });
+    if matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off) && !integrity_applies {
         if let Some(meta) = cached_meta.as_ref() {
             if let Some(response) = crate::registry::range::range_response(
                 &state.storage,
@@ -513,8 +529,10 @@ async fn download_gem(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // Fetch from upstream
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!("{}/gems/{}.gem", proxy_url.trim_end_matches('/'), artifact);
 
     match proxy_fetch(
@@ -528,6 +546,19 @@ async fn download_gem(
     .await
     {
         Ok(bytes) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            for identity in &identities {
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Gems,
+                    &identity.name,
+                    Some(&identity.version),
+                    &bytes,
+                ) {
+                    return response;
+                }
+            }
             state.metrics.record_download("gems");
             state.metrics.record_cache_miss("gems");
             state.activity.push(ActivityEntry::new(
@@ -644,7 +675,9 @@ async fn download_gemspec(
         return response;
     }
 
-    let proxy_url = upstream_url(&state);
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/quick/Marshal.4.8/{}.gemspec.rz",
         proxy_url.trim_end_matches('/'),
@@ -713,13 +746,10 @@ async fn download_gemspec(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn upstream_url(state: &AppState) -> String {
-    state
-        .config
-        .gems
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_GEMS_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.gems.proxy).map(str::to_string)
 }
 
 fn with_binary(data: Vec<u8>, content_type: &'static str) -> Response {
@@ -1288,7 +1318,7 @@ async fn gem_file_gate(
     // #748/#750: release dates for the quarantine clock. #754: asked only on a cache miss — a
     // cached file's digest is already recorded. Hosted only: when the file was stored.
     let already_cached = state.storage.stat(storage_key).await.is_some();
-    let dated = if state.config.gems.proxy.is_none() {
+    let dated = if upstream_url(state).is_none() {
         let stored =
             crate::curation::extract_mtime_as_publish_date(&state.storage, storage_key).await;
         identities
