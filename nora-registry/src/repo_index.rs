@@ -1176,17 +1176,23 @@ mod tests {
                     .cloned()
                     .collect())
             }
-            async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+            async fn put(
+                &self,
+                _k: &str,
+                _d: &[u8],
+                _sha256: &str,
+                _annotations: &nora_registry::annotations::Annotations,
+            ) -> crate::storage::Result<()> {
                 Ok(())
             }
             async fn get(
                 &self,
                 _k: &str,
-            ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
                 Err(crate::storage::StorageError::NotFound)
             }
-            async fn pin(&self, _k: &str) -> Option<String> {
-                None
+            async fn recorded(&self, _k: &str) -> crate::storage::Recorded {
+                crate::storage::Recorded::default()
             }
             async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
                 Ok(())
@@ -1205,6 +1211,7 @@ mod tests {
                 _k: &str,
                 _s: &std::path::Path,
                 _sha256: Option<&str>,
+                _annotations: &nora_registry::annotations::Annotations,
             ) -> crate::storage::Result<()> {
                 Ok(())
             }
@@ -1213,7 +1220,7 @@ mod tests {
                 _k: &str,
             ) -> crate::storage::Result<(
                 u64,
-                Option<String>,
+                crate::storage::Recorded,
                 std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
             )> {
                 Err(crate::storage::StorageError::NotFound)

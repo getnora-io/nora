@@ -46,6 +46,7 @@ use axum::{
     Json, Router,
 };
 use futures::{FutureExt, StreamExt};
+use nora_registry::annotations::Annotations;
 use nora_registry::verified::{stream_body, verify_while_streaming};
 use serde_json::Value;
 use sha2::Digest as _;
@@ -1464,7 +1465,7 @@ async fn sync_and_commit(
     file.sync_all().await.map_err(CommitFailed::Sync)?;
     drop(file);
     storage
-        .put_from_path(key, path, Some(sha256))
+        .put_from_path(key, path, Some(sha256), &Annotations::default())
         .await
         .map_err(CommitFailed::Store)
 }
@@ -1513,14 +1514,14 @@ async fn cached_response(
             return Some(response);
         }
     }
-    let (len, pin, reader) = match state.storage.get_reader(key).await {
+    let (len, recorded, reader) = match state.storage.get_reader(key).await {
         Ok(stored) => stored,
         Err(e) => {
             tracing::warn!(registry = "hf", key = %key, error = %e, "cached file unreadable; fetching it again");
             return None;
         }
     };
-    let Some(pin) = pin else {
+    let Some(pin) = recorded.sha256 else {
         tracing::warn!(registry = "hf", key = %key, "cached file has no pin; fetching it again");
         return None;
     };
@@ -4121,7 +4122,17 @@ mod tests {
     /// a copy without a pin is not served.
     async fn wait_stored(ctx: &TestContext, key: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !matches!(ctx.state.storage.get_reader(key).await, Ok((_, Some(_), _))) {
+        while !matches!(
+            ctx.state.storage.get_reader(key).await,
+            Ok((
+                _,
+                crate::storage::Recorded {
+                    sha256: Some(_),
+                    ..
+                },
+                _
+            ))
+        ) {
             assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -4845,7 +4856,12 @@ mod tests {
         std::fs::write(&staged, weights()).unwrap();
         ctx.state
             .storage
-            .put_from_path(&weights_key(), &staged, Some(SHA256))
+            .put_from_path(
+                &weights_key(),
+                &staged,
+                Some(SHA256),
+                &Annotations::default(),
+            )
             .await
             .unwrap();
         let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
@@ -4864,7 +4880,12 @@ mod tests {
             async move {
                 std::fs::write(&path, weights()).unwrap();
                 storage
-                    .put_from_path(&weights_key(), &path, pinned.then_some(SHA256))
+                    .put_from_path(
+                        &weights_key(),
+                        &path,
+                        pinned.then_some(SHA256),
+                        &Annotations::default(),
+                    )
                     .await
                     .unwrap();
             }
@@ -4974,15 +4995,15 @@ mod tests {
         std::fs::write(&staged, b"unpinned, unchecked").unwrap();
         ctx.state
             .storage
-            .put_from_path(&weights_key(), &staged, None)
+            .put_from_path(&weights_key(), &staged, None, &Annotations::default())
             .await
             .unwrap();
         let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
         assert_eq!(received(resp).await, (weights(), true));
         assert_eq!(upstream_paths(&cdn).await.len(), 1);
         wait_stored(&ctx, &weights_key()).await;
-        let (_, pin, _) = ctx.state.storage.get_reader(&weights_key()).await.unwrap();
-        assert_eq!(pin.as_deref(), Some(SHA256));
+        let (_, recorded, _) = ctx.state.storage.get_reader(&weights_key()).await.unwrap();
+        assert_eq!(recorded.sha256.as_deref(), Some(SHA256));
     }
 
     /// The lookup settles on the first hop that names an etag, the one the response reports:
@@ -5020,6 +5041,7 @@ mod tests {
                 &config_key(),
                 &staged,
                 Some(&hex::encode(sha2::Sha256::digest(other))),
+                &Annotations::default(),
             )
             .await
             .unwrap();
@@ -5065,6 +5087,7 @@ mod tests {
                 &format!("hf/models/org/model/blobs/{other_digest}"),
                 &staged,
                 Some(&other_digest),
+                &Annotations::default(),
             )
             .await
             .unwrap();

@@ -1843,15 +1843,21 @@ mod tests {
                     "cargo/index-entries/fa/il/failcrate/0.2.0.json".to_string(),
                 ])
             }
-            async fn get(&self, _key: &str) -> StorageResult<(Bytes, Option<String>)> {
+            async fn get(&self, _key: &str) -> StorageResult<(Bytes, crate::storage::Recorded)> {
                 Err(StorageError::Io(std::io::Error::other(
                     "injected transient read error",
                 )))
             }
-            async fn pin(&self, _key: &str) -> Option<String> {
-                None
+            async fn recorded(&self, _key: &str) -> crate::storage::Recorded {
+                crate::storage::Recorded::default()
             }
-            async fn put(&self, _key: &str, _data: &[u8], _sha256: &str) -> StorageResult<()> {
+            async fn put(
+                &self,
+                _key: &str,
+                _data: &[u8],
+                _sha256: &str,
+                _annotations: &nora_registry::annotations::Annotations,
+            ) -> StorageResult<()> {
                 panic!("regenerate must abort before writing a truncated index");
             }
             async fn delete(&self, _key: &str) -> StorageResult<()> {
@@ -1874,14 +1880,18 @@ mod tests {
                 _key: &str,
                 _src: &Path,
                 _sha256: Option<&str>,
+                _annotations: &nora_registry::annotations::Annotations,
             ) -> StorageResult<()> {
                 Ok(())
             }
             async fn get_reader(
                 &self,
                 _key: &str,
-            ) -> StorageResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
-            {
+            ) -> StorageResult<(
+                u64,
+                crate::storage::Recorded,
+                Pin<Box<dyn AsyncRead + Send + Unpin>>,
+            )> {
                 Err(StorageError::NotFound)
             }
             async fn copy(
@@ -3489,7 +3499,7 @@ mod published_index_table {
         async fn get(
             &self,
             k: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
             if self.entry_get_fails && k.starts_with("cargo/index-entries/") {
                 return Err(crate::storage::StorageError::Network("read failed".into()));
             }
@@ -3498,16 +3508,22 @@ mod published_index_table {
             }
             self.inner.get(k).await
         }
-        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+        async fn put(
+            &self,
+            k: &str,
+            d: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> crate::storage::Result<()> {
             if self.index_put_fails
                 && (k.starts_with("cargo/index/") || k.starts_with("cargo/index-assembled/"))
             {
                 return Err(crate::storage::StorageError::Network("put failed".into()));
             }
-            self.inner.put(k, d, sha256).await
+            self.inner.put(k, d, sha256, annotations).await
         }
-        async fn pin(&self, k: &str) -> Option<String> {
-            self.inner.pin(k).await
+        async fn recorded(&self, k: &str) -> crate::storage::Recorded {
+            self.inner.recorded(k).await
         }
         async fn delete(&self, k: &str) -> crate::storage::Result<()> {
             self.inner.delete(k).await
@@ -3554,8 +3570,9 @@ mod published_index_table {
             k: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(k, src, sha256).await
+            self.inner.put_from_path(k, src, sha256, annotations).await
         }
         async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
             self.inner.copy(s, d, sha256).await
@@ -3565,7 +3582,7 @@ mod published_index_table {
             k: &str,
         ) -> crate::storage::Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(k).await
@@ -4741,7 +4758,7 @@ mod crate_name_one_canon {
         async fn get(
             &self,
             k: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
             if self.record_get_fails && k.starts_with("cargo/_names/") {
                 return Err(crate::storage::StorageError::Network("read failed".into()));
             }
@@ -4753,11 +4770,17 @@ mod crate_name_one_canon {
             }
             self.inner.get(k).await
         }
-        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
-            self.inner.put(k, d, sha256).await
+        async fn put(
+            &self,
+            k: &str,
+            d: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256, annotations).await
         }
-        async fn pin(&self, k: &str) -> Option<String> {
-            self.inner.pin(k).await
+        async fn recorded(&self, k: &str) -> crate::storage::Recorded {
+            self.inner.recorded(k).await
         }
         async fn delete(&self, k: &str) -> crate::storage::Result<()> {
             self.inner.delete(k).await
@@ -4790,8 +4813,9 @@ mod crate_name_one_canon {
             k: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(k, src, sha256).await
+            self.inner.put_from_path(k, src, sha256, annotations).await
         }
         async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
             self.inner.copy(s, d, sha256).await
@@ -4801,7 +4825,7 @@ mod crate_name_one_canon {
             k: &str,
         ) -> crate::storage::Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(k).await

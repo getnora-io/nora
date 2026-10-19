@@ -15,6 +15,7 @@ use axum::{
     response::Json,
     Extension,
 };
+use nora_registry::annotations::Annotations;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -65,6 +66,8 @@ pub struct VersionInfo {
     pub size: u64,
     pub published: String,
     pub cached: bool,
+    #[serde(skip_serializing_if = "Annotations::is_empty")]
+    pub annotations: Annotations,
 }
 
 #[derive(Serialize, Default)]
@@ -682,6 +685,7 @@ pub async fn get_npm_detail(
                         size,
                         published,
                         cached,
+                        annotations: Annotations::default(),
                     });
                 }
             }
@@ -708,6 +712,7 @@ pub async fn get_npm_detail(
                 size: meta.size,
                 published: format_timestamp(meta.modified),
                 cached: true,
+                annotations: Annotations::default(),
             });
         }
     }
@@ -821,6 +826,7 @@ pub async fn get_cargo_detail(
                     size,
                     published,
                     cached: true,
+                    annotations: Annotations::default(),
                 });
             }
         }
@@ -914,6 +920,7 @@ pub async fn get_pypi_detail(
                     size,
                     published,
                     cached: true,
+                    annotations: Annotations::default(),
                 });
             }
         }
@@ -1123,6 +1130,7 @@ pub async fn get_go_detail(
             size,
             published,
             cached,
+            annotations: Annotations::default(),
         });
     }
 
@@ -1237,6 +1245,7 @@ async fn get_nuget_detail(
                         size,
                         published,
                         cached,
+                        annotations: Annotations::default(),
                     });
                 }
 
@@ -1406,6 +1415,7 @@ async fn get_conan_detail(
             size,
             published: format_timestamp(modified),
             cached: has_content,
+            annotations: Annotations::default(),
         })
         .collect();
     versions.sort_by(|a, b| b.version.cmp(&a.version));
@@ -1455,6 +1465,7 @@ async fn get_rpm_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
                 .unwrap_or(0),
             published: format_timestamp(rec.get("file_time").and_then(|v| v.as_u64()).unwrap_or(0)),
             cached: true,
+            annotations: Annotations::default(),
         });
     }
 
@@ -1503,6 +1514,7 @@ async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
             size: rec.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
             published,
             cached: true,
+            annotations: Annotations::default(),
         });
     }
 
@@ -1561,6 +1573,7 @@ async fn get_gems_detail(
                     size,
                     published,
                     cached,
+                    annotations: Annotations::default(),
                 });
             }
         }
@@ -1606,6 +1619,7 @@ async fn get_pub_detail(
                     size,
                     published,
                     cached: true,
+                    annotations: Annotations::default(),
                 });
             }
         }
@@ -1663,6 +1677,7 @@ async fn get_ansible_detail(
                         size,
                         published,
                         cached: true,
+                        annotations: Annotations::default(),
                     });
                 }
             }
@@ -1810,6 +1825,7 @@ pub async fn get_cpan_detail(
             size,
             published: format_timestamp(modified),
             cached: true,
+            annotations: Annotations::default(),
         })
         .collect();
     versions.sort_by(|a, b| b.version.cmp(&a.version));
@@ -1853,6 +1869,7 @@ async fn get_storage_scan_detail(
                     size,
                     published,
                     cached: true,
+                    annotations: Annotations::default(),
                 });
             }
         }
@@ -2039,6 +2056,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
                 size: meta.size,
                 published: format_timestamp(meta.modified),
                 cached: true,
+                annotations: storage.recorded(&direct_key).await.annotations,
             });
             return PackageDetail {
                 versions,
@@ -2061,6 +2079,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
                 size,
                 published,
                 cached: true,
+                annotations: storage.recorded(key).await.annotations,
             });
         }
     }
@@ -2127,6 +2146,37 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
 
     (result, true)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod raw_detail_tests {
+    use super::get_raw_detail;
+    use crate::Storage;
+    use nora_registry::annotations::Annotations;
+    use sha2::Digest;
+
+    #[tokio::test]
+    async fn a_raw_file_lists_its_annotations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("s").to_str().unwrap());
+        let tags =
+            Annotations::try_from_pairs([("commit".to_string(), "abc".to_string())]).unwrap();
+        for key in ["raw/dir/f.bin", "raw/root.bin"] {
+            let staged = dir.path().join("staged");
+            std::fs::write(&staged, b"x").unwrap();
+            let sha = hex::encode(sha2::Sha256::digest(b"x"));
+            storage
+                .put_from_path(key, &staged, Some(&sha), &tags)
+                .await
+                .unwrap();
+        }
+        for group in ["dir", "root.bin"] {
+            let detail = get_raw_detail(&storage, group).await;
+            assert_eq!(detail.versions.len(), 1, "{group}");
+            assert_eq!(detail.versions[0].annotations, tags, "{group}");
+        }
+    }
 }
 
 #[cfg(test)]

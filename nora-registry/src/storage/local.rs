@@ -9,8 +9,9 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use super::{FileMeta, Result, StorageBackend, StorageError};
+use super::{FileMeta, Recorded, Result, StorageBackend, StorageError};
 use crate::hash_pin_store::HashPinStore;
+use nora_registry::annotations::Annotations;
 
 /// The hash-pin sidecar is backend bookkeeping, not a stored artifact: it is
 /// held out of listings and the size gauge, like the `tmp/` staging directory.
@@ -445,11 +446,12 @@ impl LocalStorage {
     /// On an immutable registry the client's retry hits the 409 guard and never
     /// re-runs this, so the orphaned body stays unpinned until an operator
     /// `repin`s it — still strictly better than a silent success.
-    async fn record_pin(&self, key: &str, sha256: &str) -> Result<()> {
+    async fn record(&self, key: &str, sha256: &str, annotations: &Annotations) -> Result<()> {
         let pins = Arc::clone(&self.pins);
         let key_owned = key.to_string();
         let hash = sha256.to_ascii_lowercase();
-        tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
+        let annotations = annotations.clone();
+        tokio::task::spawn_blocking(move || pins.record(&key_owned, &hash, &annotations))
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
             .map_err(|e| {
@@ -458,6 +460,15 @@ impl LocalStorage {
                     "hash-pin record failed: {e}"
                 )))
             })
+    }
+
+    async fn forget(&self, key: &str) -> Result<()> {
+        let pins = Arc::clone(&self.pins);
+        let key_owned = key.to_string();
+        tokio::task::spawn_blocking(move || pins.remove(&key_owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+            .map_err(StorageError::Io)
     }
 
     /// Create a new temp file for a write of `dest`, in this instance's staging
@@ -619,7 +630,13 @@ impl LocalStorage {
 
 #[async_trait]
 impl StorageBackend for LocalStorage {
-    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+    async fn put(
+        &self,
+        key: &str,
+        data: &[u8],
+        sha256: &str,
+        annotations: &Annotations,
+    ) -> Result<()> {
         let path = self.key_to_path(key);
 
         // Create parent directories
@@ -656,10 +673,10 @@ impl StorageBackend for LocalStorage {
         tmp.published();
         // Durability: make the rename's directory entry survive power-loss.
         sync_parent_dir(&path).await?;
-        self.record_pin(key, sha256).await
+        self.record(key, sha256, annotations).await
     }
 
-    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    async fn get(&self, key: &str) -> Result<(Bytes, Recorded)> {
         let path = self.key_to_path(key);
 
         let (mut file, _) = open_object(&path).await?;
@@ -670,7 +687,7 @@ impl StorageBackend for LocalStorage {
         Ok((Bytes::from(buffer), self.pins.get(key)))
     }
 
-    async fn pin(&self, key: &str) -> Option<String> {
+    async fn recorded(&self, key: &str) -> Recorded {
         self.pins.get(key)
     }
 
@@ -695,12 +712,7 @@ impl StorageBackend for LocalStorage {
         // A lost tombstone is fail-safe — a stale pin at worst yields a future
         // IntegrityViolation, healable via `repin` — so the delete still
         // reports success: the authoritative action (byte removal) is done.
-        let pins = Arc::clone(&self.pins);
-        let key_owned = key.to_string();
-        if let Err(e) = tokio::task::spawn_blocking(move || pins.remove(&key_owned))
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-        {
+        if let Err(e) = self.forget(key).await {
             tracing::warn!(
                 error = %e,
                 key = %key,
@@ -837,7 +849,13 @@ impl StorageBackend for LocalStorage {
         }
     }
 
-    async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &Path,
+        sha256: Option<&str>,
+        annotations: &Annotations,
+    ) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
             if let Err(e) = fs::create_dir_all(parent).await {
@@ -881,7 +899,7 @@ impl StorageBackend for LocalStorage {
             Err(e) => return Err(write_failure(&self.base_path, &dest, e).await),
         }
         match sha256 {
-            Some(hash) => self.record_pin(key, hash).await,
+            Some(hash) => self.record(key, hash, annotations).await,
             None => Ok(()),
         }
     }
@@ -894,16 +912,26 @@ impl StorageBackend for LocalStorage {
             return Err(StorageError::NotFound);
         }
         if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent).await?;
+            if let Err(e) = fs::create_dir_all(parent).await {
+                return Err(write_failure(&self.base_path, &dst_path, e).await);
+            }
         }
         // Body and pin are published as one critical section (#1041, see commit_lock).
-        let lock = self.commit_lock(dst);
-        let _commit = lock.lock().await;
+        let (first, second) = if src < dst { (src, dst) } else { (dst, src) };
+        let first_lock = self.commit_lock(first);
+        let _first = first_lock.lock().await;
+        let _second = if first == second {
+            None
+        } else {
+            Some(self.commit_lock(second).lock_owned().await)
+        };
         // Hard link: the two keys share one inode, so a mounted blob costs no
         // extra bytes and cannot drift from its source.
         let linked = match fs::hard_link(&src_path, &dst_path).await {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&dst_path).await?;
+                if let Err(e) = fs::remove_file(&dst_path).await {
+                    return Err(write_failure(&self.base_path, &dst_path, e).await);
+                }
                 fs::hard_link(&src_path, &dst_path).await
             }
             other => other,
@@ -945,19 +973,17 @@ impl StorageBackend for LocalStorage {
                 sync_parent_dir(&dst_path).await?;
             }
         }
-        match sha256
-            .map(str::to_ascii_lowercase)
-            .or_else(|| self.pins.get(src))
-        {
-            Some(hash) => self.record_pin(dst, &hash).await,
-            None => Ok(()),
+        let source = self.pins.get(src);
+        match sha256.map(str::to_ascii_lowercase).or(source.sha256) {
+            Some(hash) => self.record(dst, &hash, &source.annotations).await,
+            None => self.forget(dst).await,
         }
     }
 
     async fn get_reader(
         &self,
         key: &str,
-    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let path = self.key_to_path(key);
         let (file, meta) = open_object(&path).await?;
         Ok((meta.len(), self.pins.get(key), Box::pin(file)))
@@ -1021,7 +1047,10 @@ mod tests {
         ] {
             use sha2::Digest as _;
             let sha = hex::encode(sha2::Sha256::digest(b"x"));
-            storage.put(key, b"x", &sha).await.unwrap();
+            storage
+                .put(key, b"x", &sha, &Annotations::default())
+                .await
+                .unwrap();
         }
         std::fs::create_dir_all(dir.path().join(crate::validation::STAGING_DIR).join("i")).unwrap();
         std::fs::write(
@@ -1083,21 +1112,30 @@ mod tests {
         let storage = LocalStorage::new(dir.path().to_str().unwrap());
         let sha = hex::encode(Sha256::digest(b"x"));
         for key in ["raw/dir/f.txt", "raw/file.txt"] {
-            storage.put(key, b"x", &sha).await.unwrap();
+            storage
+                .put(key, b"x", &sha, &Annotations::default())
+                .await
+                .unwrap();
         }
         for key in ["raw/dir", "raw/file.txt/x", "raw/file.txt/a/b"] {
-            let err = storage.put(key, b"x", &sha).await.unwrap_err();
+            let err = storage
+                .put(key, b"x", &sha, &Annotations::default())
+                .await
+                .unwrap_err();
             assert!(is_marked(&err), "put {key}: {err}");
             let src = dir.path().join("upload.tmp");
             std::fs::write(&src, b"x").unwrap();
             let err = storage
-                .put_from_path(key, &src, Some(&sha))
+                .put_from_path(key, &src, Some(&sha), &Annotations::default())
                 .await
                 .unwrap_err();
             assert!(is_marked(&err), "put_from_path {key}: {err}");
         }
         // A fresh name is written, unmarked.
-        storage.put("raw/new/f.txt", b"x", &sha).await.unwrap();
+        storage
+            .put("raw/new/f.txt", b"x", &sha, &Annotations::default())
+            .await
+            .unwrap();
     }
 
     /// A name is taken by a directory at it — with files under it or emptied by a delete —
@@ -1110,7 +1148,10 @@ mod tests {
         let storage = LocalStorage::new(base.to_str().unwrap());
         for key in ["raw/dir/f.txt", "raw/file.txt", "raw/e/f.txt"] {
             let sha = hex::encode(Sha256::digest(b"x"));
-            storage.put(key, b"x", &sha).await.unwrap();
+            storage
+                .put(key, b"x", &sha, &Annotations::default())
+                .await
+                .unwrap();
         }
         storage.delete("raw/e/f.txt").await.unwrap();
         for (key, taken) in [
@@ -1207,7 +1248,12 @@ mod tests {
     /// of its own bytes.
     async fn put(storage: &LocalStorage, key: &str, data: &[u8]) -> Result<()> {
         storage
-            .put(key, data, &hex::encode(Sha256::digest(data)))
+            .put(
+                key,
+                data,
+                &hex::encode(Sha256::digest(data)),
+                &Annotations::default(),
+            )
             .await
     }
 
@@ -1254,12 +1300,16 @@ mod tests {
         drop(held);
         deleting.await.unwrap().unwrap();
         assert!(storage.stat(key).await.is_none());
-        assert_eq!(storage.pins.get(key), None, "the pin outlived its body");
+        assert_eq!(
+            storage.pins.get(key).sha256,
+            None,
+            "the pin outlived its body"
+        );
 
         // A write after the delete keeps its pin.
         put(&storage, key, b"second").await.unwrap();
         assert_eq!(
-            storage.pins.get(key).as_deref(),
+            storage.pins.get(key).sha256.as_deref(),
             Some(hex::encode(Sha256::digest(b"second")).as_str())
         );
     }
@@ -1315,10 +1365,10 @@ mod tests {
             wa.await.unwrap().unwrap();
             wb.await.unwrap().unwrap();
 
-            let (body, pin) = storage.get(key).await.unwrap();
+            let (body, recorded) = storage.get(key).await.unwrap();
             let stored = hex::encode(Sha256::digest(&body));
             assert_eq!(
-                pin.as_deref(),
+                recorded.sha256.as_deref(),
                 Some(stored.as_str()),
                 "round {round}: the recorded pin does not describe the stored body — \
                  a reader would see INTEGRITY VIOLATION on untampered bytes"
@@ -1370,7 +1420,11 @@ mod tests {
             let src = src_dir.path().join(format!("spool-{i}"));
             std::fs::write(&src, data.as_slice()).unwrap();
             let storage = Arc::clone(&storage);
-            let handle = tokio::spawn(async move { storage.put_from_path(key, &src, None).await });
+            let handle = tokio::spawn(async move {
+                storage
+                    .put_from_path(key, &src, None, &Annotations::default())
+                    .await
+            });
             writers.push(handle);
         }
         for writer in writers {
@@ -1816,7 +1870,12 @@ mod tests {
         std::fs::write(&spool, &data).unwrap();
 
         storage
-            .put_from_path("docker/blobs/sha256-ab", &spool, None)
+            .put_from_path(
+                "docker/blobs/sha256-ab",
+                &spool,
+                None,
+                &Annotations::default(),
+            )
             .await
             .unwrap();
 
@@ -2175,7 +2234,10 @@ mod tests {
     async fn put_key(storage: &LocalStorage, key: &str) {
         use sha2::Digest as _;
         let sha = hex::encode(sha2::Sha256::digest(b"x"));
-        storage.put(key, b"x", &sha).await.unwrap();
+        storage
+            .put(key, b"x", &sha, &Annotations::default())
+            .await
+            .unwrap();
     }
 
     /// Keys of `list` and `list_with_meta` for `prefix`, or `None` if either has not
@@ -2331,5 +2393,49 @@ mod tests {
                 .collect();
             assert_eq!(meta, full, "list_with_meta {prefix:?}");
         }
+    }
+
+    fn tags() -> Annotations {
+        Annotations::try_from_pairs([("commit".to_string(), "abc".to_string())]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_copy_carries_the_annotations_and_a_delete_drops_them() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let sha = hex::encode(Sha256::digest(b"x"));
+        storage.put("raw/a", b"x", &sha, &tags()).await.unwrap();
+        storage.copy("raw/a", "raw/b", None).await.unwrap();
+        let expected = Recorded {
+            sha256: Some(sha),
+            annotations: tags(),
+        };
+        assert_eq!(storage.recorded("raw/b").await, expected);
+        assert_eq!(storage.get("raw/b").await.unwrap().1, expected);
+        assert_eq!(storage.get_reader("raw/b").await.unwrap().1, expected);
+
+        storage.delete("raw/b").await.unwrap();
+        assert_eq!(storage.recorded("raw/b").await, Recorded::default());
+        let reloaded = LocalStorage::new(dir.path().to_str().unwrap());
+        assert_eq!(reloaded.recorded("raw/b").await, Recorded::default());
+        assert_eq!(reloaded.recorded("raw/a").await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_an_unrecorded_source_leaves_no_record_on_the_destination() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().join("s").to_str().unwrap());
+        let sha = hex::encode(Sha256::digest(b"old"));
+        storage.put("raw/dst", b"old", &sha, &tags()).await.unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"new").unwrap();
+        storage
+            .put_from_path("raw/src", &src, None, &Annotations::default())
+            .await
+            .unwrap();
+
+        storage.copy("raw/src", "raw/dst", None).await.unwrap();
+        assert_eq!(storage.recorded("raw/dst").await, Recorded::default());
+        assert_eq!(&storage.get("raw/dst").await.unwrap().0[..], b"new");
     }
 }

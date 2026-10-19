@@ -27,6 +27,7 @@ use axum::{
     Extension, Json, Router,
 };
 use futures::StreamExt;
+use nora_registry::annotations::Annotations;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1982,7 +1983,11 @@ async fn upload_blob(
 
     // Move temp file into storage — no RAM copy of the blob
     let key = format!("docker/{}/blobs/{}", name, digest);
-    match state.storage.put_from_path(&key, &temp_path, None).await {
+    match state
+        .storage
+        .put_from_path(&key, &temp_path, None, &Annotations::default())
+        .await
+    {
         Ok(()) => {
             guard.disarm(); // temp moved into storage — nothing left to clean up
             state.metrics.record_upload("docker");
@@ -3682,7 +3687,12 @@ fn spawn_blob_spool(
         let sha_for_pin = fetched.sha256.clone();
         match state
             .storage
-            .put_from_path(&key, &fetched.path, Some(&sha_for_pin))
+            .put_from_path(
+                &key,
+                &fetched.path,
+                Some(&sha_for_pin),
+                &Annotations::default(),
+            )
             .await
         {
             Ok(()) => {
@@ -6127,25 +6137,39 @@ mod integration_tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for WriteOnReadBackend {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
-            self.inner.put(key, data, sha256).await
+        async fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256, annotations).await
         }
         async fn get(
             &self,
             key: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
             if key == self.trigger {
                 let pending = self.writes.lock().unwrap().take();
                 for (k, v) in pending.unwrap_or_default() {
                     use sha2::Digest;
                     let sha = hex::encode(sha2::Sha256::digest(&v));
-                    self.inner.put(&k, &v, &sha).await.unwrap();
+                    self.inner
+                        .put(
+                            &k,
+                            &v,
+                            &sha,
+                            &nora_registry::annotations::Annotations::default(),
+                        )
+                        .await
+                        .unwrap();
                 }
             }
             self.inner.get(key).await
         }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
+        async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+            self.inner.recorded(key).await
         }
         async fn delete(&self, key: &str) -> crate::storage::Result<()> {
             self.inner.delete(key).await
@@ -6175,15 +6199,18 @@ mod integration_tests {
             key: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
+            self.inner
+                .put_from_path(key, src, sha256, annotations)
+                .await
         }
         async fn get_reader(
             &self,
             key: &str,
         ) -> crate::storage::Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(key).await
@@ -9297,20 +9324,26 @@ mod integration_tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for FailingPrefixBackend {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
-            self.inner.put(key, data, sha256).await
+        async fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256, annotations).await
         }
         async fn get(
             &self,
             key: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
             if key.starts_with(&self.fail_prefix) {
                 return Err(crate::storage::StorageError::Network("injected".into()));
             }
             self.inner.get(key).await
         }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
+        async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+            self.inner.recorded(key).await
         }
         async fn delete(&self, key: &str) -> crate::storage::Result<()> {
             self.inner.delete(key).await
@@ -9346,15 +9379,18 @@ mod integration_tests {
             key: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
+            self.inner
+                .put_from_path(key, src, sha256, annotations)
+                .await
         }
         async fn get_reader(
             &self,
             key: &str,
         ) -> crate::storage::Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             if key.starts_with(&self.fail_prefix) {
@@ -11295,18 +11331,24 @@ mod hosted_pull_stats_and_re_push {
 
     #[async_trait::async_trait]
     impl StorageBackend for HeldPut {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+        async fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> Result<()> {
             if key == self.key && self.armed.swap(false, Ordering::SeqCst) {
                 self.reached.notify_one();
                 self.release.notified().await;
             }
-            self.inner.put(key, data, sha256).await
+            self.inner.put(key, data, sha256, annotations).await
         }
-        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        async fn get(&self, key: &str) -> Result<(Bytes, crate::storage::Recorded)> {
             self.inner.get(key).await
         }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
+        async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+            self.inner.recorded(key).await
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.inner.delete(key).await
@@ -11331,8 +11373,11 @@ mod hosted_pull_stats_and_re_push {
             key: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
+            self.inner
+                .put_from_path(key, src, sha256, annotations)
+                .await
         }
         async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
             self.inner.copy(src, dst, sha256).await
@@ -11342,7 +11387,7 @@ mod hosted_pull_stats_and_re_push {
             key: &str,
         ) -> Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(key).await
@@ -11587,18 +11632,24 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
 
     #[async_trait::async_trait]
     impl StorageBackend for Held {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+        async fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> Result<()> {
             if key == self.key && self.hold_put.swap(false, Ordering::SeqCst) {
                 self.put_reached.notify_one();
                 self.put_release.notified().await;
             }
-            self.inner.put(key, data, sha256).await
+            self.inner.put(key, data, sha256, annotations).await
         }
-        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        async fn get(&self, key: &str) -> Result<(Bytes, crate::storage::Recorded)> {
             self.inner.get(key).await
         }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
+        async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+            self.inner.recorded(key).await
         }
         async fn delete(&self, key: &str) -> Result<()> {
             if key == self.key && self.hold_delete.swap(false, Ordering::SeqCst) {
@@ -11627,8 +11678,11 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             key: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
+            self.inner
+                .put_from_path(key, src, sha256, annotations)
+                .await
         }
         async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
             self.inner.copy(src, dst, sha256).await
@@ -11638,7 +11692,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             key: &str,
         ) -> Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(key).await
@@ -12055,15 +12109,21 @@ mod manifest_before_metadata_one_lock_order {
 
     #[async_trait::async_trait]
     impl StorageBackend for Held {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+        async fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> Result<()> {
             self.gate(PUT, key).await;
-            self.inner.put(key, data, sha256).await
+            self.inner.put(key, data, sha256, annotations).await
         }
-        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        async fn get(&self, key: &str) -> Result<(Bytes, crate::storage::Recorded)> {
             self.inner.get(key).await
         }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
+        async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+            self.inner.recorded(key).await
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.gate(DELETE, key).await;
@@ -12092,8 +12152,11 @@ mod manifest_before_metadata_one_lock_order {
             key: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
+            self.inner
+                .put_from_path(key, src, sha256, annotations)
+                .await
         }
         async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
             self.inner.copy(src, dst, sha256).await
@@ -12103,7 +12166,7 @@ mod manifest_before_metadata_one_lock_order {
             key: &str,
         ) -> Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(key).await

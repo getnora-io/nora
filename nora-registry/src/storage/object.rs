@@ -14,7 +14,8 @@ use object_store::{
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{FileMeta, Result, StorageBackend, StorageError};
+use super::{FileMeta, Recorded, Result, StorageBackend, StorageError};
+use nora_registry::annotations::Annotations;
 
 /// Downloads stream store -> server -> client under backpressure, so a slow
 /// download client paces the store read. object_store's request timeout covers
@@ -232,23 +233,35 @@ fn decode_object_key(key: &str) -> String {
 /// travels with the bytes (`x-amz-meta-sha256` / `x-goog-meta-sha256`).
 const PIN_METADATA_KEY: &str = "sha256";
 
-fn pin_attribute() -> Attribute {
-    Attribute::Metadata(PIN_METADATA_KEY.into())
+fn attributes(sha256: Option<&str>, annotations: &Annotations) -> Attributes {
+    sha256
+        .map(|hash| (PIN_METADATA_KEY.to_string(), hash.to_ascii_lowercase()))
+        .into_iter()
+        .chain(
+            annotations
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
+        .map(|(key, value)| (Attribute::Metadata(key.into()), AttributeValue::from(value)))
+        .collect()
 }
 
-fn pin_attributes(sha256: &str) -> Attributes {
-    [(
-        pin_attribute(),
-        AttributeValue::from(sha256.to_ascii_lowercase()),
-    )]
-    .into_iter()
-    .collect()
-}
-
-fn read_pin(attributes: &Attributes) -> Option<String> {
-    attributes
-        .get(&pin_attribute())
-        .map(|v| v.as_ref().to_string())
+fn read_recorded(attributes: &Attributes) -> Recorded {
+    let mut sha256 = None;
+    let mut stored = Vec::new();
+    for (attribute, value) in attributes {
+        match attribute {
+            Attribute::Metadata(key) if key == PIN_METADATA_KEY => {
+                sha256 = Some(value.as_ref().to_string())
+            }
+            Attribute::Metadata(key) => stored.push((key.to_string(), value.as_ref().to_string())),
+            _ => {}
+        }
+    }
+    Recorded {
+        sha256,
+        annotations: Annotations::from_stored(stored),
+    }
 }
 
 /// Map object_store errors to StorageError.
@@ -261,12 +274,18 @@ fn map_err(e: object_store::Error) -> StorageError {
 
 #[async_trait]
 impl StorageBackend for ObjectStorage {
-    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+    async fn put(
+        &self,
+        key: &str,
+        data: &[u8],
+        sha256: &str,
+        annotations: &Annotations,
+    ) -> Result<()> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
         let opts = PutOptions {
-            attributes: pin_attributes(sha256),
+            attributes: attributes(Some(sha256), annotations),
             ..Default::default()
         };
         self.store
@@ -276,7 +295,7 @@ impl StorageBackend for ObjectStorage {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    async fn get(&self, key: &str) -> Result<(Bytes, Recorded)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let result = match self.store.get(&path).await {
@@ -289,12 +308,12 @@ impl StorageBackend for ObjectStorage {
             }
             Err(e) => return Err(map_err(e)),
         };
-        let pin = read_pin(&result.attributes);
+        let recorded = read_recorded(&result.attributes);
         let bytes = result.bytes().await.map_err(map_err)?;
-        Ok((bytes, pin))
+        Ok((bytes, recorded))
     }
 
-    async fn pin(&self, key: &str) -> Option<String> {
+    async fn recorded(&self, key: &str) -> Recorded {
         let head = || GetOptions {
             head: true,
             ..Default::default()
@@ -305,11 +324,14 @@ impl StorageBackend for ObjectStorage {
             Err(_) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data.
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.get_opts(&legacy_path, head()).await.ok()?
+                match self.store.get_opts(&legacy_path, head()).await {
+                    Ok(r) => r,
+                    Err(_) => return Recorded::default(),
+                }
             }
-            Err(_) => return None,
+            Err(_) => return Recorded::default(),
         };
-        read_pin(&result.attributes)
+        read_recorded(&result.attributes)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -461,6 +483,7 @@ impl StorageBackend for ObjectStorage {
         key: &str,
         src: &std::path::Path,
         sha256: Option<&str>,
+        annotations: &Annotations,
     ) -> Result<()> {
         let encoded = encode_object_key(key);
         let s3_path = Path::from(encoded);
@@ -479,7 +502,7 @@ impl StorageBackend for ObjectStorage {
         // The pin rides on the multipart init, so it lands with the object or
         // not at all — no window where the bytes exist unpinned.
         let opts = PutMultipartOptions {
-            attributes: sha256.map(pin_attributes).unwrap_or_default(),
+            attributes: attributes(sha256, annotations),
             ..Default::default()
         };
         let upload = self
@@ -515,7 +538,7 @@ impl StorageBackend for ObjectStorage {
     async fn get_reader(
         &self,
         key: &str,
-    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let result = match self.store.get(&path).await {
@@ -527,10 +550,10 @@ impl StorageBackend for ObjectStorage {
             Err(e) => return Err(map_err(e)),
         };
         let size = result.meta.size;
-        let pin = read_pin(&result.attributes);
+        let recorded = read_recorded(&result.attributes);
         let stream = result.into_stream().map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
-        Ok((size as u64, pin, Box::pin(reader)))
+        Ok((size as u64, recorded, Box::pin(reader)))
     }
 
     async fn get_range(
@@ -587,7 +610,10 @@ mod tests {
             );
             let data = b"bytes";
             let sha = hex::encode(sha2::Sha256::digest(data));
-            backend.put("raw/present.bin", data, &sha).await.unwrap();
+            backend
+                .put("raw/present.bin", data, &sha, &Annotations::default())
+                .await
+                .unwrap();
             backend.delete("raw/present.bin").await.unwrap();
             assert!(
                 backend.stat("raw/present.bin").await.is_none(),
@@ -699,11 +725,17 @@ mod tests {
         let body = br#"{"version":"1.0.0"}"#;
         let hash = hex::encode(sha2::Sha256::digest(body));
         let key = "npm/@scope/pkg/versions/1.0.0.json";
-        storage.put(key, body, &hash).await.unwrap();
+        storage
+            .put(key, body, &hash, &Annotations::default())
+            .await
+            .unwrap();
 
         // Control: a non-scoped key (no `@`, no `%`) is unaffected.
         let plain = "npm/plainpkg/versions/1.0.0.json";
-        storage.put(plain, body, &hash).await.unwrap();
+        storage
+            .put(plain, body, &hash, &Annotations::default())
+            .await
+            .unwrap();
 
         // list() must return the ORIGINAL logical key (with `@`), not the `%2540` form.
         let listed = storage.list("npm/@scope/pkg/versions/").await.unwrap();
@@ -715,12 +747,12 @@ mod tests {
 
         // The listed key must be directly get-able — the exact scan-regenerate step that
         // silently dropped scoped versions before the fix.
-        let (got, pin) = storage
+        let (got, recorded) = storage
             .get(&listed[0])
             .await
             .expect("get on the listed key must succeed");
         assert_eq!(&got[..], body);
-        assert_eq!(pin.as_deref(), Some(hash.as_str()));
+        assert_eq!(recorded.sha256.as_deref(), Some(hash.as_str()));
 
         let listed_plain = storage.list("npm/plainpkg/versions/").await.unwrap();
         assert_eq!(listed_plain, vec![plain.to_string()]);

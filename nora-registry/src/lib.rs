@@ -21,6 +21,7 @@
 )]
 //! NORA Registry — library interface for fuzzing and testing
 
+pub mod annotations;
 pub mod pypi_files;
 pub mod validation;
 pub mod verified;

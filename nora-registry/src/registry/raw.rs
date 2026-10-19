@@ -8,17 +8,21 @@ use crate::registry::{
     content_length, method_not_allowed, sha256_of_file, stream_body_to_file, StreamOutcome,
     TempFileGuard,
 };
+use crate::storage::{Recorded, StorageError};
 use crate::validation::validate_storage_key;
 use crate::AppState;
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Router,
 };
+use nora_registry::annotations::Annotations;
 use nora_registry::verified::verify_while_streaming;
+
+const COPY_SOURCE: &str = "x-nora-copy-source";
 
 /// Build the storage key for a Raw artifact at request-relative `path`.
 ///
@@ -65,28 +69,8 @@ async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // mtime fallback — Raw is always hosted (no proxy)
-    let publish_date = crate::curation::extract_mtime_as_publish_date(&state.storage, &key).await;
-
-    // Curation check — raw files are treated as name=path, no version. #733: raw is hosted-only
-    // (no upstream), so an internal-namespace file is operator-owned — skip curation and serve the
-    // local copy below; a missing one 404s naturally (nothing is ever proxied).
-    if !crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Raw,
-        &path,
-    ) {
-        if let Some(response) = crate::curation::check_download(
-            &state.curation().curation_engine,
-            state.bypass_token().as_deref(),
-            &headers,
-            crate::curation::RegistryType::Raw,
-            &path,
-            crate::curation::RequestVersion::Unspecified,
-            publish_date,
-        ) {
-            return response;
-        }
+    if let Some(response) = curation_refusal(&state, &headers, &path).await {
+        return response;
     }
 
     // Streamed serve with STREAMING integrity verification. The buffered
@@ -101,13 +85,13 @@ async fn download(
     // The pin comes back with the reader, so bytes and pin are one object
     // version and one backend round-trip.
     match state.storage.get_reader(&key).await {
-        Ok((len, pin, reader)) => {
+        Ok((len, recorded, reader)) => {
             // Conditional GET — If-None-Match
             if let (Some(inm), Some(stored_hash)) = (
                 headers
                     .get(header::IF_NONE_MATCH)
                     .and_then(|v| v.to_str().ok()),
-                pin.as_deref(),
+                recorded.sha256.as_deref(),
             ) {
                 let etag_val = format!("\"{}\"", stored_hash);
                 if inm.trim() == etag_val || inm.trim() == "*" {
@@ -116,7 +100,7 @@ async fn download(
             }
 
             let content_type = guess_content_type(&key);
-            let etag = pin.as_ref().map(|h| format!("\"{}\"", h));
+            let etag = recorded.sha256.as_ref().map(|h| format!("\"{}\"", h));
 
             // Range request: 206 Partial Content, or 416 when the client asks past
             // the end. A partial body cannot be hashed, so a ranged serve skips the
@@ -142,6 +126,12 @@ async fn download(
                 if let Some(tag) = etag {
                     extra.push((header::ETAG, tag));
                 }
+                extra.extend(
+                    recorded
+                        .annotations
+                        .response_headers()
+                        .map(|(name, value)| (name.clone(), value.to_string())),
+                );
                 if let Some(response) = crate::registry::range::range_response(
                     &state.storage,
                     &[&key],
@@ -179,22 +169,46 @@ async fn download(
             for (name, value) in download_safety_headers() {
                 builder = builder.header(name, value);
             }
-            if let Some(ref hash) = pin {
+            if let Some(ref hash) = recorded.sha256 {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
+            }
+            for (name, value) in recorded.annotations.response_headers() {
+                builder = builder.header(name, value);
             }
             builder
                 .body(nora_registry::verified::stream_body(
-                    verify_while_streaming(reader, pin, key.clone()),
+                    verify_while_streaming(reader, recorded.sha256, key.clone()),
                 ))
                 .expect("valid response")
                 .into_response()
         }
-        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, key = %key, "Failed to read raw artifact");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn curation_refusal(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Response> {
+    if crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Raw,
+        path,
+    ) {
+        return None;
+    }
+    let publish_date =
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key(path)).await;
+    crate::curation::check_download(
+        &state.curation().curation_engine,
+        state.bypass_token().as_deref(),
+        headers,
+        crate::curation::RegistryType::Raw,
+        path,
+        crate::curation::RequestVersion::Unspecified,
+        publish_date,
+    )
 }
 
 /// Verify an RFC 9530 `Repr-Digest` header against the server-computed sha-256.
@@ -277,6 +291,23 @@ async fn upload(
             .into_response();
     }
 
+    let annotations = match Annotations::from_headers(&headers) {
+        Ok(annotations) => annotations,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    if let Some(source) = headers.get(COPY_SOURCE) {
+        if !annotations.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "a copy inherits its source's annotations",
+            )
+                .into_response();
+        }
+        let actor = crate::auth::audit_actor(&user);
+        return copy(&state, &key, &path, source, &headers, body, actor).await;
+    }
+
     let too_large = || {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -333,120 +364,28 @@ async fn upload(
         return resp;
     }
 
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string());
-    let if_match = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string());
-
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
-    let file_exists = state.storage.stat(&key).await.is_some();
-
-    match (file_exists, if_none_match.as_deref(), if_match.as_deref()) {
-        // No conditional headers, file exists → idempotent success if the
-        // uploaded bytes match what's stored (#1036: object-storage clients
-        // retry uploads after a partial transfer, and a retry of identical
-        // bytes must not be a hard failure); 409 otherwise (backward compat,
-        // immutability preserved for genuinely different content).
-        (true, None, None) => {
-            if let Some(hash) = state.storage.pin(&key).await {
-                if hash == sha256 {
-                    return do_overwrite(
-                        &state,
-                        &key,
-                        &path,
-                        &temp_path,
-                        &sha256,
-                        &mut temp_guard,
-                        crate::auth::audit_actor(&user),
-                    )
-                    .await;
-                }
-            }
-            return (
-                StatusCode::CONFLICT,
-                format!("File already exists: {}", path),
-            )
-                .into_response();
-        }
-
-        // No conditional headers, file doesn't exist → create
-        (false, None, None) => {
-            // fall through to create
-        }
-
-        // If-None-Match: * → create only if not exists
-        (true, Some("*"), _) => {
-            return (StatusCode::PRECONDITION_FAILED, "Resource already exists").into_response();
-        }
-        (false, Some("*"), _) => {
-            // fall through to create
-        }
-
-        // If-None-Match with a specific ETag value (not useful for PUT, but handle gracefully)
-        (_, Some(_), None) => {
-            // Non-* If-None-Match on PUT: not meaningful per RFC 9110, reject
-            return (
-                StatusCode::BAD_REQUEST,
-                "If-None-Match on PUT only supports * value",
-            )
-                .into_response();
-        }
-
-        // If-Match: * → update only if resource exists
-        (true, _, Some("*")) => {
+    let incoming = Recorded {
+        sha256: Some(sha256),
+        annotations,
+    };
+    match decide(&state, &key, &path, &headers, &incoming).await {
+        Decision::Create => {}
+        Decision::Overwrite => {
             return do_overwrite(
                 &state,
                 &key,
                 &path,
                 &temp_path,
-                &sha256,
+                &incoming,
                 &mut temp_guard,
                 crate::auth::audit_actor(&user),
             )
             .await;
         }
-        (false, _, Some("*")) => {
-            return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
-        }
-
-        // If-Match: "<etag>" → update only if ETag matches
-        (true, _, Some(etag)) => {
-            match state.storage.pin(&key).await {
-                Some(hash) => {
-                    let expected = format!("\"{}\"", hash);
-                    if etag == expected {
-                        return do_overwrite(
-                            &state,
-                            &key,
-                            &path,
-                            &temp_path,
-                            &sha256,
-                            &mut temp_guard,
-                            crate::auth::audit_actor(&user),
-                        )
-                        .await;
-                    }
-                    return (StatusCode::PRECONDITION_FAILED, "ETag mismatch").into_response();
-                }
-                None => {
-                    // Stored before pins existed — nothing to compare against.
-                    return (
-                        StatusCode::PRECONDITION_FAILED,
-                        "ETag not available for this resource",
-                    )
-                        .into_response();
-                }
-            }
-        }
-        (false, _, Some(_)) => {
-            return (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response();
-        }
+        Decision::Refuse(response) => return response,
     }
 
     // Create new file — commit the streamed temp (rename on the local backend).
@@ -459,7 +398,12 @@ async fn upload(
     // what such a client expects and simpler to document.
     match state
         .storage
-        .put_from_path(&key, &temp_path, Some(&sha256))
+        .put_from_path(
+            &key,
+            &temp_path,
+            incoming.sha256.as_deref(),
+            &incoming.annotations,
+        )
         .await
     {
         Ok(()) => {
@@ -504,13 +448,179 @@ fn name_taken(err: &crate::storage::StorageError) -> bool {
         if e.get_ref().is_some_and(|inner| inner.is::<crate::storage::NameTaken>()))
 }
 
+enum Decision {
+    Create,
+    Overwrite,
+    Refuse(Response),
+}
+
+async fn decide(
+    state: &AppState,
+    key: &str,
+    path: &str,
+    headers: &HeaderMap,
+    incoming: &Recorded,
+) -> Decision {
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let if_match = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+
+    let file_exists = state.storage.stat(key).await.is_some();
+
+    match (file_exists, if_none_match, if_match) {
+        // No conditional headers, file exists → idempotent success if the
+        // uploaded bytes match what's stored (#1036: object-storage clients
+        // retry uploads after a partial transfer, and a retry of identical
+        // bytes must not be a hard failure); 409 otherwise (backward compat,
+        // immutability preserved for genuinely different content).
+        (true, None, None) => {
+            if incoming.sha256.is_some() && state.storage.recorded(key).await == *incoming {
+                Decision::Overwrite
+            } else {
+                Decision::Refuse(
+                    (
+                        StatusCode::CONFLICT,
+                        format!("File already exists: {}", path),
+                    )
+                        .into_response(),
+                )
+            }
+        }
+
+        // No conditional headers, file doesn't exist → create
+        (false, None, None) => Decision::Create,
+
+        // If-None-Match: * → create only if not exists
+        (true, Some("*"), _) => Decision::Refuse(
+            (StatusCode::PRECONDITION_FAILED, "Resource already exists").into_response(),
+        ),
+        (false, Some("*"), _) => Decision::Create,
+
+        // If-None-Match with a specific ETag value (not useful for PUT, but handle gracefully)
+        // Non-* If-None-Match on PUT: not meaningful per RFC 9110, reject
+        (_, Some(_), None) => Decision::Refuse(
+            (
+                StatusCode::BAD_REQUEST,
+                "If-None-Match on PUT only supports * value",
+            )
+                .into_response(),
+        ),
+
+        // If-Match: * → update only if resource exists
+        (true, _, Some("*")) => Decision::Overwrite,
+        (false, _, Some("*")) => Decision::Refuse(
+            (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response(),
+        ),
+
+        // If-Match: "<etag>" → update only if ETag matches
+        (true, _, Some(etag)) => match state.storage.recorded(key).await.sha256 {
+            Some(hash) if etag == format!("\"{}\"", hash) => Decision::Overwrite,
+            Some(_) => {
+                Decision::Refuse((StatusCode::PRECONDITION_FAILED, "ETag mismatch").into_response())
+            }
+            // Stored before pins existed — nothing to compare against.
+            None => Decision::Refuse(
+                (
+                    StatusCode::PRECONDITION_FAILED,
+                    "ETag not available for this resource",
+                )
+                    .into_response(),
+            ),
+        },
+        (false, _, Some(_)) => Decision::Refuse(
+            (StatusCode::PRECONDITION_FAILED, "Resource does not exist").into_response(),
+        ),
+    }
+}
+
+async fn copy(
+    state: &AppState,
+    key: &str,
+    path: &str,
+    source: &HeaderValue,
+    headers: &HeaderMap,
+    body: Body,
+    actor: &str,
+) -> Response {
+    let Some(source) = source
+        .to_str()
+        .ok()
+        .filter(|source| validate_storage_key(&storage_key(source)).is_ok())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "X-Nora-Copy-Source must name a raw file by its ASCII path",
+        )
+            .into_response();
+    };
+    let source_key = storage_key(source);
+    if source_key == key {
+        return (
+            StatusCode::BAD_REQUEST,
+            "X-Nora-Copy-Source must name another file",
+        )
+            .into_response();
+    }
+    if axum::body::to_bytes(body, 0).await.is_err() {
+        return (StatusCode::BAD_REQUEST, "a copy carries no body").into_response();
+    }
+    if let Some(response) = curation_refusal(state, headers, source).await {
+        return response;
+    }
+
+    let lock = state.publish_lock(key);
+    let _guard = lock.lock().await;
+
+    let incoming = state.storage.recorded(&source_key).await;
+    if let Decision::Refuse(response) = decide(state, key, path, headers, &incoming).await {
+        return response;
+    }
+    match state.storage.copy(&source_key, key, None).await {
+        Ok(()) => {}
+        Err(StorageError::NotFound) => {
+            return (StatusCode::NOT_FOUND, "source not found").into_response()
+        }
+        Err(e) if name_taken(&e) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("Other files already use the name {path}"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, source = %source_key, "Failed to copy raw artifact");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    state.metrics.record_upload("raw");
+    state
+        .audit
+        .log(AuditEntry::new("copy", actor, path, "raw", source));
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        path.to_string(),
+        crate::registry_type::RegistryType::Raw,
+        "LOCAL",
+    ));
+    state.repo_index.invalidate("raw");
+    match state.storage.recorded(key).await.sha256 {
+        Some(hash) => (StatusCode::OK, [(header::ETAG, format!("\"{hash}\""))]).into_response(),
+        None => StatusCode::OK.into_response(),
+    }
+}
+
 /// Overwrite an existing file (conditional PUT with `If-Match`).
 async fn do_overwrite(
     state: &AppState,
     key: &str,
     path: &str,
     temp_path: &std::path::Path,
-    sha256: &str,
+    record: &Recorded,
     temp_guard: &mut TempFileGuard,
     actor: &str,
 ) -> Response {
@@ -518,7 +628,12 @@ async fn do_overwrite(
     // window that delete-then-put created for concurrent readers.
     match state
         .storage
-        .put_from_path(key, temp_path, Some(sha256))
+        .put_from_path(
+            key,
+            temp_path,
+            record.sha256.as_deref(),
+            &record.annotations,
+        )
         .await
     {
         Ok(()) => {
@@ -574,7 +689,7 @@ async fn delete_file(
             state.repo_index.invalidate("raw");
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(crate::storage::StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, key = %key, "Failed to delete raw artifact");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -598,8 +713,12 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
                 .header(header::CONTENT_TYPE, guess_content_type(&key))
                 .header(header::CACHE_CONTROL, &state.config.raw.cache_control);
-            if let Some(hash) = state.storage.pin(&key).await {
+            let recorded = state.storage.recorded(&key).await;
+            if let Some(hash) = &recorded.sha256 {
                 builder = builder.header(header::ETAG, format!("\"{}\"", hash));
+            }
+            for (name, value) in recorded.annotations.response_headers() {
+                builder = builder.header(name, value);
             }
             if meta.modified > 0 {
                 builder = builder.header(header::LAST_MODIFIED, format_http_date(meta.modified));
@@ -1216,6 +1335,18 @@ mod integration_tests {
         assert_eq!(put2.status(), StatusCode::OK);
         let get2 = send(&ctx.app, Method::GET, "/raw/public.txt", "").await;
         assert_eq!(get2.status(), StatusCode::OK);
+
+        let copy = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/public-copy.txt",
+            vec![("x-nora-copy-source", "secret.txt")],
+            "",
+        )
+        .await;
+        assert_eq!(copy.status(), StatusCode::FORBIDDEN);
+        let leaked = send(&ctx.app, Method::GET, "/raw/public-copy.txt", "").await;
+        assert_eq!(leaked.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1736,14 +1867,20 @@ mod integration_tests {
         struct FailsUnder(ObjectStorage);
         #[async_trait::async_trait]
         impl StorageBackend for FailsUnder {
-            async fn put(&self, k: &str, d: &[u8], s: &str) -> SResult<()> {
-                self.0.put(k, d, s).await
+            async fn put(
+                &self,
+                k: &str,
+                d: &[u8],
+                s: &str,
+                annotations: &nora_registry::annotations::Annotations,
+            ) -> SResult<()> {
+                self.0.put(k, d, s, annotations).await
             }
-            async fn get(&self, k: &str) -> SResult<(Bytes, Option<String>)> {
+            async fn get(&self, k: &str) -> SResult<(Bytes, crate::storage::Recorded)> {
                 self.0.get(k).await
             }
-            async fn pin(&self, k: &str) -> Option<String> {
-                self.0.pin(k).await
+            async fn recorded(&self, k: &str) -> crate::storage::Recorded {
+                self.0.recorded(k).await
             }
             async fn delete(&self, k: &str) -> SResult<()> {
                 self.0.delete(k).await
@@ -1763,11 +1900,17 @@ mod integration_tests {
             fn backend_name(&self) -> &'static str {
                 "s3"
             }
-            async fn put_from_path(&self, k: &str, src: &Path, s: Option<&str>) -> SResult<()> {
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &Path,
+                s: Option<&str>,
+                annotations: &nora_registry::annotations::Annotations,
+            ) -> SResult<()> {
                 if k.ends_with("/x") {
                     return Err(StorageError::Io(std::io::Error::other("upstream 503")));
                 }
-                self.0.put_from_path(k, src, s).await
+                self.0.put_from_path(k, src, s, annotations).await
             }
             async fn copy(&self, a: &str, b: &str, s: Option<&str>) -> SResult<()> {
                 self.0.copy(a, b, s).await
@@ -1775,8 +1918,11 @@ mod integration_tests {
             async fn get_reader(
                 &self,
                 k: &str,
-            ) -> SResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
-            {
+            ) -> SResult<(
+                u64,
+                crate::storage::Recorded,
+                Pin<Box<dyn AsyncRead + Send + Unpin>>,
+            )> {
                 self.0.get_reader(k).await
             }
         }
@@ -2092,5 +2238,291 @@ mod integration_tests {
             resp.status()
         );
         assert!(ctx.state.storage.get("raw/releases/x.bin").await.is_err());
+    }
+
+    fn object_context() -> crate::test_helpers::TestContext {
+        crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+        ))
+    }
+
+    fn annotation_headers(resp: &axum::http::Response<axum::body::Body>) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter(|(name, _)| name.as_str().starts_with("x-nora-meta-"))
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn header<'a>(resp: &'a axum::http::Response<axum::body::Body>, name: &str) -> &'a str {
+        resp.headers().get(name).unwrap().to_str().unwrap()
+    }
+
+    const TAGS: [(&str, &str); 2] = [
+        ("X-Nora-Meta-Commit", "abc123"),
+        ("x-nora-meta-build-id", "42"),
+    ];
+
+    fn tags() -> Vec<(String, String)> {
+        vec![
+            ("x-nora-meta-build-id".to_string(), "42".to_string()),
+            ("x-nora-meta-commit".to_string(), "abc123".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn annotations_come_back_on_head_get_and_a_range_but_not_on_a_304() {
+        for (backend, ctx) in [
+            ("local", create_test_context()),
+            ("object", object_context()),
+        ] {
+            let put = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/raw/a/2026.bin",
+                TAGS.to_vec(),
+                b"0123456789".to_vec(),
+            )
+            .await;
+            assert_eq!(put.status(), StatusCode::OK, "{backend}");
+
+            let head = send(&ctx.app, Method::HEAD, "/raw/a/2026.bin", "").await;
+            assert_eq!(annotation_headers(&head), tags(), "{backend} HEAD");
+            let etag = header(&head, "etag").to_string();
+
+            let get = send(&ctx.app, Method::GET, "/raw/a/2026.bin", "").await;
+            assert_eq!(annotation_headers(&get), tags(), "{backend} GET");
+            assert_eq!(&body_bytes(get).await[..], b"0123456789");
+
+            let ranged = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/raw/a/2026.bin",
+                vec![("range", "bytes=2-5")],
+                "",
+            )
+            .await;
+            assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT, "{backend}");
+            assert_eq!(annotation_headers(&ranged), tags(), "{backend} range");
+
+            let cached = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/raw/a/2026.bin",
+                vec![("if-none-match", &etag)],
+                "",
+            )
+            .await;
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED, "{backend}");
+            assert!(annotation_headers(&cached).is_empty(), "{backend} 304");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_annotation_is_refused_and_nothing_is_stored() {
+        let ctx = create_test_context();
+        let many: Vec<(String, String)> = (0..33)
+            .map(|i| (format!("x-nora-meta-k{i}"), "v".to_string()))
+            .collect();
+        let large: Vec<(String, String)> = (0..3)
+            .map(|i| (format!("x-nora-meta-k{i}"), "v".repeat(1000)))
+            .collect();
+        let one = |name: &str, value: &str| vec![(name.to_string(), value.to_string())];
+        let cases = [
+            (one("X-Nora-Meta-Bad_Key", "v"), "\"bad_key\""),
+            (one("x-nora-meta-sha256", "v"), "reserved"),
+            (one("x-nora-meta-k", "caf\u{e9}"), "printable ASCII"),
+            (many, "at most 32 annotations"),
+            (large, "at most 1978 bytes"),
+        ];
+        for (i, (headers, problem)) in cases.iter().enumerate() {
+            let uri = format!("/raw/bad/{i}.bin");
+            let headers = headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let resp = send_with_headers(&ctx.app, Method::PUT, &uri, headers, b"x".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{problem}");
+            let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+            assert!(body.contains(problem), "{problem}: {body}");
+            assert!(
+                ctx.state.storage.stat(&uri[1..]).await.is_none(),
+                "{problem}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reput_is_idempotent_only_with_the_same_annotations() {
+        let ctx = create_test_context();
+        let put = |headers: Vec<(&'static str, &'static str)>| {
+            send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/raw/re.bin",
+                headers,
+                b"same".to_vec(),
+            )
+        };
+        let commit = |value: &'static str| ("x-nora-meta-commit", value);
+        assert_eq!(put(vec![commit("abc")]).await.status(), StatusCode::OK);
+        assert_eq!(put(vec![commit("abc")]).await.status(), StatusCode::OK);
+        assert_eq!(
+            put(vec![commit("def")]).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(put(vec![]).await.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            put(vec![("if-match", "*"), commit("def")]).await.status(),
+            StatusCode::OK
+        );
+        let head = send(&ctx.app, Method::HEAD, "/raw/re.bin", "").await;
+        assert_eq!(
+            annotation_headers(&head),
+            vec![("x-nora-meta-commit".to_string(), "def".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_serves_the_source_bytes_etag_and_annotations() {
+        for (backend, ctx) in [
+            ("local", create_test_context()),
+            ("object", object_context()),
+        ] {
+            let put = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/raw/a/2026.bin",
+                TAGS.to_vec(),
+                b"release".to_vec(),
+            )
+            .await;
+            assert_eq!(put.status(), StatusCode::OK, "{backend}");
+            let source = send(&ctx.app, Method::HEAD, "/raw/a/2026.bin", "").await;
+            let etag = header(&source, "etag").to_string();
+
+            let copy = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                "/raw/a/latest.bin",
+                vec![("x-nora-copy-source", "a/2026.bin")],
+                "",
+            )
+            .await;
+            assert_eq!(copy.status(), StatusCode::OK, "{backend}");
+            assert_eq!(header(&copy, "etag"), etag, "{backend}");
+
+            let get = send(&ctx.app, Method::GET, "/raw/a/latest.bin", "").await;
+            assert_eq!(get.status(), StatusCode::OK, "{backend}");
+            assert_eq!(header(&get, "etag"), etag, "{backend}");
+            assert_eq!(annotation_headers(&get), tags(), "{backend}");
+            assert_eq!(&body_bytes(get).await[..], b"release", "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_copy_is_refused_and_writes_nothing() {
+        let ctx = create_test_context();
+        let put = send(&ctx.app, Method::PUT, "/raw/src.bin", b"source".to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+        let copy = |headers: Vec<(&'static str, &'static str)>, body: &'static [u8]| {
+            send_with_headers(&ctx.app, Method::PUT, "/raw/dst.bin", headers, body)
+        };
+        let source = |path: &'static str| ("x-nora-copy-source", path);
+        for (headers, body, status) in [
+            (vec![source("missing.bin")], &b""[..], StatusCode::NOT_FOUND),
+            (vec![source("src.bin")], &b"x"[..], StatusCode::BAD_REQUEST),
+            (
+                vec![source("src.bin"), ("x-nora-meta-commit", "abc")],
+                &b""[..],
+                StatusCode::BAD_REQUEST,
+            ),
+            (vec![source("/src.bin")], &b""[..], StatusCode::BAD_REQUEST),
+            (
+                vec![source("../src.bin")],
+                &b""[..],
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let resp = copy(headers.clone(), body).await;
+            assert_eq!(resp.status(), status, "{headers:?}");
+        }
+        assert!(ctx.state.storage.stat("raw/dst.bin").await.is_none());
+
+        let onto_itself = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/src.bin",
+            vec![source("src.bin"), ("if-match", "*")],
+            "",
+        )
+        .await;
+        assert_eq!(onto_itself.status(), StatusCode::BAD_REQUEST);
+        let get = send(&ctx.app, Method::GET, "/raw/src.bin", "").await;
+        assert_eq!(&body_bytes(get).await[..], b"source");
+    }
+
+    #[tokio::test]
+    async fn the_conditional_headers_apply_to_the_copy_destination() {
+        let ctx = create_test_context();
+        for (uri, body) in [("/raw/src.bin", "new"), ("/raw/dst.bin", "old")] {
+            let put = send(&ctx.app, Method::PUT, uri, body.as_bytes().to_vec()).await;
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        let copy = |conditional: Vec<(&'static str, &'static str)>| {
+            let mut headers = vec![("x-nora-copy-source", "src.bin")];
+            headers.extend(conditional);
+            send_with_headers(&ctx.app, Method::PUT, "/raw/dst.bin", headers, "")
+        };
+        let stored =
+            || async { body_bytes(send(&ctx.app, Method::GET, "/raw/dst.bin", "").await).await };
+
+        assert_eq!(copy(vec![]).await.status(), StatusCode::CONFLICT);
+        assert_eq!(&stored().await[..], b"old");
+        assert_eq!(
+            copy(vec![("if-none-match", "*")]).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            copy(vec![(
+                "if-match",
+                "\"0000000000000000000000000000000000000000000000000000000000000000\""
+            )])
+            .await
+            .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(&stored().await[..], b"old");
+        assert_eq!(copy(vec![("if-match", "*")]).await.status(), StatusCode::OK);
+        assert_eq!(&stored().await[..], b"new");
+        assert_eq!(copy(vec![]).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_copy_onto_a_taken_name_of_the_local_store_is_409() {
+        let ctx = create_test_context();
+        for uri in ["/raw/src.bin", "/raw/dir/f.txt"] {
+            let put = send(&ctx.app, Method::PUT, uri, b"x".to_vec()).await;
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        for dst in ["/raw/dir", "/raw/dir/f.txt/x"] {
+            let copy = send_with_headers(
+                &ctx.app,
+                Method::PUT,
+                dst,
+                vec![("x-nora-copy-source", "src.bin")],
+                "",
+            )
+            .await;
+            assert_eq!(copy.status(), StatusCode::CONFLICT, "{dst}");
+        }
     }
 }

@@ -501,7 +501,7 @@ pub async fn body_bytes(response: axum::http::Response<Body>) -> axum::body::Byt
 const COUNTED_METHODS: [&str; 11] = [
     "put",
     "get",
-    "pin",
+    "recorded",
     "delete",
     "list",
     "stat",
@@ -585,19 +585,28 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
 
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OpCountingBackend {
-    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+    async fn put(
+        &self,
+        key: &str,
+        data: &[u8],
+        sha256: &str,
+        annotations: &nora_registry::annotations::Annotations,
+    ) -> crate::storage::Result<()> {
         self.counts.hit("put");
-        self.inner.put(key, data, sha256).await
+        self.inner.put(key, data, sha256, annotations).await
     }
 
-    async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
         self.counts.hit("get");
         self.inner.get(key).await
     }
 
-    async fn pin(&self, key: &str) -> Option<String> {
-        self.counts.hit("pin");
-        self.inner.pin(key).await
+    async fn recorded(&self, key: &str) -> crate::storage::Recorded {
+        self.counts.hit("recorded");
+        self.inner.recorded(key).await
     }
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
@@ -644,9 +653,12 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         key: &str,
         src: &std::path::Path,
         sha256: Option<&str>,
+        annotations: &nora_registry::annotations::Annotations,
     ) -> crate::storage::Result<()> {
         self.counts.hit("put_from_path");
-        self.inner.put_from_path(key, src, sha256).await
+        self.inner
+            .put_from_path(key, src, sha256, annotations)
+            .await
     }
 
     async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
@@ -659,7 +671,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         key: &str,
     ) -> crate::storage::Result<(
         u64,
-        Option<String>,
+        crate::storage::Recorded,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
         self.counts.hit("get_reader");

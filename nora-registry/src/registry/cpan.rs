@@ -1469,17 +1469,23 @@ mod cpan_fallback_holds_the_pin {
         async fn get(
             &self,
             k: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        ) -> crate::storage::Result<(axum::body::Bytes, crate::storage::Recorded)> {
             if k == KEY && self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
                 return Err(crate::storage::StorageError::Network("read failed".into()));
             }
             self.inner.get(k).await
         }
-        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
-            self.inner.put(k, d, sha256).await
+        async fn put(
+            &self,
+            k: &str,
+            d: &[u8],
+            sha256: &str,
+            annotations: &nora_registry::annotations::Annotations,
+        ) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256, annotations).await
         }
-        async fn pin(&self, k: &str) -> Option<String> {
-            self.inner.pin(k).await
+        async fn recorded(&self, k: &str) -> crate::storage::Recorded {
+            self.inner.recorded(k).await
         }
         async fn delete(&self, k: &str) -> crate::storage::Result<()> {
             self.inner.delete(k).await
@@ -1507,8 +1513,9 @@ mod cpan_fallback_holds_the_pin {
             k: &str,
             src: &std::path::Path,
             sha256: Option<&str>,
+            annotations: &nora_registry::annotations::Annotations,
         ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(k, src, sha256).await
+            self.inner.put_from_path(k, src, sha256, annotations).await
         }
         async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
             self.inner.copy(s, d, sha256).await
@@ -1518,7 +1525,7 @@ mod cpan_fallback_holds_the_pin {
             k: &str,
         ) -> crate::storage::Result<(
             u64,
-            Option<String>,
+            crate::storage::Recorded,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
             self.inner.get_reader(k).await

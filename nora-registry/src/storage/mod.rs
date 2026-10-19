@@ -12,6 +12,7 @@ use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURAT
 use crate::validation::{listing_key, validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
+use nora_registry::annotations::Annotations;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::pin::Pin;
@@ -40,6 +41,12 @@ pub(crate) fn is_reserved_signing_key(key: &str) -> bool {
 pub struct FileMeta {
     pub size: u64,
     pub modified: u64, // Unix timestamp
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub sha256: Option<String>,
+    pub annotations: Annotations,
 }
 
 #[derive(Debug, Error)]
@@ -111,12 +118,15 @@ pub enum RepinOutcome {
 pub trait StorageBackend: Send + Sync {
     /// Store `data` under `key`, pinned to `sha256`. Fails closed: a body whose
     /// pin cannot be recorded is reported as a failed write (#582/#604).
-    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()>;
-    /// Bytes plus the recorded pin, from ONE backend round-trip. `None` means
-    /// the object carries no pin (open-world).
-    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)>;
-    /// The recorded pin for `key` without reading the bytes.
-    async fn pin(&self, key: &str) -> Option<String>;
+    async fn put(
+        &self,
+        key: &str,
+        data: &[u8],
+        sha256: &str,
+        annotations: &Annotations,
+    ) -> Result<()>;
+    async fn get(&self, key: &str) -> Result<(Bytes, Recorded)>;
+    async fn recorded(&self, key: &str) -> Recorded;
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
@@ -155,7 +165,13 @@ pub trait StorageBackend: Send + Sync {
     /// Local backend: atomic `rename`, with streaming copy fallback on EXDEV.
     /// Object store: multipart upload from file.
     /// The caller is responsible for deleting `src` on error.
-    async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()>;
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &Path,
+        sha256: Option<&str>,
+        annotations: &Annotations,
+    ) -> Result<()>;
 
     /// Server-side copy of `src` to `dst` inside the backend — the bytes never
     /// transit this process. `sha256` is the digest of the copied bytes when the
@@ -176,7 +192,7 @@ pub trait StorageBackend: Send + Sync {
     async fn get_reader(
         &self,
         key: &str,
-    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
+    ) -> Result<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
 
     /// Stream the inclusive byte range `[start, end]` of an object, returning the object's
     /// total size and a reader over exactly those bytes. The default reads from the start and
@@ -263,6 +279,15 @@ impl Storage {
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.put_annotated(key, data, &Annotations::default()).await
+    }
+
+    pub(crate) async fn put_annotated(
+        &self,
+        key: &str,
+        data: &[u8],
+        annotations: &Annotations,
+    ) -> Result<()> {
         validate_storage_key(key)?;
         // A buffered body can be large; hashing it inline would stall the tokio
         // worker for the hash duration, so the digest is computed on the
@@ -281,7 +306,7 @@ impl Storage {
                 ))));
             }
         };
-        match self.inner.put(key, data, &hash).await {
+        match self.inner.put(key, data, &hash, annotations).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 Ok(())
@@ -297,9 +322,9 @@ impl Storage {
 
     /// Buffered read through the fail-closed integrity gate, returning the bytes
     /// and the pin they were checked against (`None` = open-world key).
-    async fn get_pinned(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    pub(crate) async fn get_pinned(&self, key: &str) -> Result<(Bytes, Recorded)> {
         validate_storage_key(key)?;
-        let (data, pin) = match self.inner.get(key).await {
+        let (data, recorded) = match self.inner.get(key).await {
             Ok(v) => v,
             Err(e) => {
                 STORAGE_OPERATIONS
@@ -314,8 +339,8 @@ impl Storage {
             .with_label_values(&[label])
             .observe(data.len() as f64);
 
-        let Some(expected) = pin else {
-            return Ok((data, None));
+        let Some(expected) = recorded.sha256.as_deref() else {
+            return Ok((data, recorded));
         };
 
         // SHA-256 verification — offloaded from the tokio worker for the same
@@ -335,7 +360,7 @@ impl Storage {
             .with_label_values(&[label])
             .observe(verify_start.elapsed().as_secs_f64());
         match outcome {
-            Ok(actual) if actual == expected => Ok((data, Some(expected))),
+            Ok(actual) if actual == expected => Ok((data, recorded)),
             // Genuine hash mismatch — tampering or at-rest corruption.
             // Fail-closed: never serve the tampered bytes (#582).
             Ok(actual) => {
@@ -406,8 +431,8 @@ impl Storage {
         use nora_registry::verified::{Blob, GateOutcome};
         // Reuse the fail-closed gate: it returns Ok only after a digest match or
         // on the open-world / no-pin branch.
-        let (data, pin) = self.get_pinned(key).await?;
-        match pin {
+        let (data, recorded) = self.get_pinned(key).await?;
+        match recorded.sha256 {
             Some(pin) => match Blob::verify(data, &pin) {
                 Ok(blob) => Ok(GateOutcome::Verified(blob)),
                 // The gate already verified these bytes against the same pin, so
@@ -544,16 +569,23 @@ impl Storage {
     /// The recorded SHA-256 pin for a storage key, or `None` when the object
     /// carries no pin (written before pins, or stored without a digest).
     pub async fn pin(&self, key: &str) -> Option<String> {
+        self.recorded(key).await.sha256
+    }
+
+    pub async fn recorded(&self, key: &str) -> Recorded {
         if validate_storage_key(key).is_err() {
-            return None;
+            return Recorded::default();
         }
-        let pin = self.inner.pin(key).await;
+        let recorded = self.inner.recorded(key).await;
         // `miss` is the open-world case (no pin recorded) as well as an absent key —
         // the backend cannot tell them apart, and neither is an error.
-        STORAGE_OPERATIONS
-            .with_label_values(&["pin", if pin.is_some() { "ok" } else { "miss" }])
-            .inc();
-        pin
+        let status = if recorded.sha256.is_some() {
+            "ok"
+        } else {
+            "miss"
+        };
+        STORAGE_OPERATIONS.with_label_values(&["pin", status]).inc();
+        recorded
     }
 
     /// Operator recovery for an artifact whose hash pin no longer matches its
@@ -590,14 +622,22 @@ impl Storage {
             // genuine corruption/tampering. Re-pin must NOT bless them.
             return Ok(RepinOutcome::DiskMismatch { disk, expected });
         }
-        if old.as_deref() == Some(expected.as_str()) {
+        if old.sha256.as_deref() == Some(expected.as_str()) {
             return Ok(RepinOutcome::AlreadyPinned { hash: expected });
         }
         if !apply {
-            return Ok(RepinOutcome::WouldUpdate { old, new: expected });
+            return Ok(RepinOutcome::WouldUpdate {
+                old: old.sha256,
+                new: expected,
+            });
         }
-        self.inner.put(key, &data, &expected).await?;
-        Ok(RepinOutcome::Updated { old, new: expected })
+        self.inner
+            .put(key, &data, &expected, &old.annotations)
+            .await?;
+        Ok(RepinOutcome::Updated {
+            old: old.sha256,
+            new: expected,
+        })
     }
 
     /// Refresh cached total_size. No-op for local storage, computes for S3.
@@ -612,10 +652,20 @@ impl Storage {
     /// computed incrementally (#580). When it is `None` the object is stored
     /// unpinned (legacy behaviour for callers that verified integrity
     /// separately).
-    pub async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
+    pub async fn put_from_path(
+        &self,
+        key: &str,
+        src: &Path,
+        sha256: Option<&str>,
+        annotations: &Annotations,
+    ) -> Result<()> {
         validate_storage_key(key)?;
         let sha256 = sha256.map(str::to_ascii_lowercase);
-        match self.inner.put_from_path(key, src, sha256.as_deref()).await {
+        match self
+            .inner
+            .put_from_path(key, src, sha256.as_deref(), annotations)
+            .await
+        {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
                 Ok(())
@@ -653,6 +703,13 @@ impl Storage {
         }
     }
 
+    pub async fn transfer(&self, key: &str, to: &Storage) -> Result<u64> {
+        validate_storage_key(key)?;
+        let (data, recorded) = self.get_pinned(key).await?;
+        to.put_annotated(key, &data, &recorded.annotations).await?;
+        Ok(data.len() as u64)
+    }
+
     /// Open an artifact for streaming read without loading it into memory (#580).
     ///
     /// Returns `(size_bytes, pin, reader)`. The bytes are NOT verified here —
@@ -662,7 +719,7 @@ impl Storage {
     pub async fn get_reader(
         &self,
         key: &str,
-    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
         match self.inner.get_reader(key).await {
             Ok(reader) => {
@@ -962,7 +1019,10 @@ mod tests {
         let sha = hex::encode(Sha256::digest(b"streamed-bytes"));
 
         let key = "docker/x/blobs/sha256:abc";
-        storage.put_from_path(key, &src, Some(&sha)).await.unwrap();
+        storage
+            .put_from_path(key, &src, Some(&sha), &Annotations::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             storage.pin(key).await.as_deref(),
@@ -1085,14 +1145,20 @@ mod tests {
             async fn list_with_meta(&self, _prefix: &str) -> Result<Vec<(String, FileMeta)>> {
                 Err(StorageError::Network("listing refused".into()))
             }
-            async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> Result<()> {
+            async fn put(
+                &self,
+                _k: &str,
+                _d: &[u8],
+                _sha256: &str,
+                _annotations: &nora_registry::annotations::Annotations,
+            ) -> Result<()> {
                 Err(StorageError::NotFound)
             }
-            async fn get(&self, _k: &str) -> Result<(Bytes, Option<String>)> {
+            async fn get(&self, _k: &str) -> Result<(Bytes, crate::storage::Recorded)> {
                 Err(StorageError::NotFound)
             }
-            async fn pin(&self, _k: &str) -> Option<String> {
-                None
+            async fn recorded(&self, _k: &str) -> crate::storage::Recorded {
+                crate::storage::Recorded::default()
             }
             async fn delete(&self, _k: &str) -> Result<()> {
                 Err(StorageError::NotFound)
@@ -1114,6 +1180,7 @@ mod tests {
                 _k: &str,
                 _src: &Path,
                 _sha256: Option<&str>,
+                _annotations: &nora_registry::annotations::Annotations,
             ) -> Result<()> {
                 Err(StorageError::NotFound)
             }
@@ -1123,7 +1190,11 @@ mod tests {
             async fn get_reader(
                 &self,
                 _k: &str,
-            ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+            ) -> Result<(
+                u64,
+                crate::storage::Recorded,
+                Pin<Box<dyn AsyncRead + Send + Unpin>>,
+            )> {
                 Err(StorageError::NotFound)
             }
         }
@@ -1315,7 +1386,10 @@ mod tests {
         // Stage the post-failure state: body on disk, no pin recorded.
         let src = dir.path().join("incoming.bin");
         std::fs::write(&src, b"orphan-bytes").unwrap();
-        storage.put_from_path(key, &src, None).await.unwrap();
+        storage
+            .put_from_path(key, &src, None, &Annotations::default())
+            .await
+            .unwrap();
         assert_eq!(
             storage.pin(key).await,
             None,
@@ -1371,7 +1445,12 @@ mod tests {
         std::fs::write(&src, b"streamed").unwrap();
         let sha = sha_hex(b"streamed");
         storage
-            .put_from_path("raw/obj/pinned.bin", &src, Some(&sha))
+            .put_from_path(
+                "raw/obj/pinned.bin",
+                &src,
+                Some(&sha),
+                &Annotations::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1382,7 +1461,7 @@ mod tests {
         let src = dir.path().join("unpinned.bin");
         std::fs::write(&src, b"streamed").unwrap();
         storage
-            .put_from_path("raw/obj/unpinned.bin", &src, None)
+            .put_from_path("raw/obj/unpinned.bin", &src, None, &Annotations::default())
             .await
             .unwrap();
         assert_eq!(storage.pin("raw/obj/unpinned.bin").await, None);
@@ -1424,7 +1503,12 @@ mod tests {
 
         storage.put(key, b"genuine-bytes").await.unwrap();
         backend
-            .put(key, b"TAMPERED", &sha_hex(b"genuine-bytes"))
+            .put(
+                key,
+                b"TAMPERED",
+                &sha_hex(b"genuine-bytes"),
+                &Annotations::default(),
+            )
             .await
             .unwrap();
 
@@ -1467,7 +1551,10 @@ mod tests {
         // orphan case.
         let src = dir.path().join("orphan.bin");
         std::fs::write(&src, b"orphan-bytes").unwrap();
-        storage.put_from_path(key, &src, None).await.unwrap();
+        storage
+            .put_from_path(key, &src, None, &Annotations::default())
+            .await
+            .unwrap();
 
         let wrong = sha_hex(b"something-else");
         assert_eq!(
@@ -1566,11 +1653,165 @@ mod tests {
         }
     }
 
+    fn annotations(pairs: &[(&str, &str)]) -> Annotations {
+        Annotations::try_from_pairs(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_in_memory_object_store_round_trips_any_user_metadata_key() {
+        use object_store::{
+            path::Path as ObjectPath, Attribute, AttributeValue, Attributes, ObjectStore,
+            ObjectStoreExt, PutOptions, PutPayload,
+        };
+        let store = object_store::memory::InMemory::new();
+        let attributes: Attributes = [
+            (
+                Attribute::Metadata("sha256".into()),
+                AttributeValue::from("abc"),
+            ),
+            (
+                Attribute::Metadata("build-id".into()),
+                AttributeValue::from("42"),
+            ),
+            (
+                Attribute::Metadata("Odd Key".into()),
+                AttributeValue::from("x"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let path = ObjectPath::from("raw/a");
+        let opts = PutOptions {
+            attributes: attributes.clone(),
+            ..Default::default()
+        };
+        store
+            .put_opts(&path, PutPayload::from_static(b"x"), opts)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&path).await.unwrap().attributes, attributes);
+    }
+
+    #[tokio::test]
+    async fn an_object_store_keeps_the_annotations_with_the_bytes() {
+        let (backend, storage) = object_storage();
+        let tags = annotations(&[("commit", "abc"), ("build-id", "42")]);
+        let sha = sha_hex(b"v1");
+        backend.put("raw/a", b"v1", &sha, &tags).await.unwrap();
+        let expected = Recorded {
+            sha256: Some(sha.clone()),
+            annotations: tags.clone(),
+        };
+        assert_eq!(storage.recorded("raw/a").await, expected);
+        assert_eq!(backend.get("raw/a").await.unwrap().1, expected);
+        assert_eq!(storage.get_reader("raw/a").await.unwrap().1, expected);
+
+        storage.copy("raw/a", "raw/b", None).await.unwrap();
+        assert_eq!(storage.recorded("raw/b").await, expected);
+
+        let other = annotations(&[("commit", "def")]);
+        backend.put("raw/a", b"v1", &sha, &other).await.unwrap();
+        assert_eq!(storage.recorded("raw/a").await.annotations, other);
+
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("unpinned");
+        std::fs::write(&src, b"x").unwrap();
+        storage
+            .put_from_path("raw/c", &src, None, &tags)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.recorded("raw/c").await,
+            Recorded {
+                sha256: None,
+                annotations: tags,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn object_metadata_that_is_no_annotation_is_skipped_on_read() {
+        use object_store::{path::Path as ObjectPath, Attribute, AttributeValue, PutOptions};
+        let (backend, storage) = object_storage();
+        let sha = sha_hex(b"x");
+        let attributes = [
+            ("sha256", sha.as_str()),
+            ("commit", "abc"),
+            ("Odd Key", "x"),
+            ("empty", ""),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                Attribute::Metadata(key.to_string().into()),
+                AttributeValue::from(value.to_string()),
+            )
+        })
+        .collect();
+        let opts = PutOptions {
+            attributes,
+            ..Default::default()
+        };
+        backend
+            .store()
+            .put_opts(&ObjectPath::from("raw/odd"), b"x".to_vec().into(), opts)
+            .await
+            .unwrap();
+        let expected = Recorded {
+            sha256: Some(sha),
+            annotations: annotations(&[("commit", "abc")]),
+        };
+        assert_eq!(storage.recorded("raw/odd").await, expected);
+        assert_eq!(storage.get_reader("raw/odd").await.unwrap().1, expected);
+        assert_eq!(&storage.get("raw/odd").await.unwrap()[..], b"x");
+    }
+
+    #[tokio::test]
+    async fn repin_keeps_the_annotations() {
+        let dir = TempDir::new().unwrap();
+        let local: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let object: Arc<dyn StorageBackend> = Arc::new(ObjectStorage::in_memory());
+        let tags = annotations(&[("commit", "abc")]);
+        for (name, backend) in [("local", local), ("object", object)] {
+            let storage = Storage::from_backend(backend.clone());
+            backend
+                .put("raw/r", b"bytes", &sha_hex(b"stale"), &tags)
+                .await
+                .unwrap();
+            assert_eq!(
+                storage
+                    .repin("raw/r", &sha_hex(b"bytes"), true)
+                    .await
+                    .unwrap(),
+                RepinOutcome::Updated {
+                    old: Some(sha_hex(b"stale")),
+                    new: sha_hex(b"bytes"),
+                },
+                "{name}"
+            );
+            assert_eq!(
+                storage.recorded("raw/r").await,
+                Recorded {
+                    sha256: Some(sha_hex(b"bytes")),
+                    annotations: tags.clone(),
+                },
+                "{name}"
+            );
+        }
+    }
+
     /// Every method of `impl Storage` that takes a key or a listing prefix.
     const KEY_METHODS: &[&str] = &[
         "copy",
         "delete",
         "get",
+        "get_pinned",
         "get_range",
         "get_reader",
         "get_verified",
@@ -1579,9 +1820,12 @@ mod tests {
         "list_with_meta",
         "pin",
         "put",
+        "put_annotated",
         "put_from_path",
+        "recorded",
         "repin",
         "stat",
+        "transfer",
     ];
 
     /// Every key- or prefix-taking wrapper method refuses an empty segment on both backends
@@ -1610,7 +1854,12 @@ mod tests {
                 let copy_from = refused(&s.copy(key, "raw/c", None).await);
                 let checks = [
                     ("put", refused(&s.put(key, b"x").await)),
+                    (
+                        "put_annotated",
+                        refused(&s.put_annotated(key, b"x", &Annotations::default()).await),
+                    ),
                     ("get", refused(&s.get(key).await)),
+                    ("get_pinned", refused(&s.get_pinned(key).await)),
                     ("get_verified", refused(&s.get_verified(key).await)),
                     ("get_reader", refused(&s.get_reader(key).await)),
                     ("get_range", refused(&s.get_range(key, 0, 0).await)),
@@ -1618,11 +1867,16 @@ mod tests {
                     ("repin", refused(&s.repin(key, "00", false).await)),
                     (
                         "put_from_path",
-                        refused(&s.put_from_path(key, &src_file, None).await),
+                        refused(
+                            &s.put_from_path(key, &src_file, None, &Annotations::default())
+                                .await,
+                        ),
                     ),
                     ("copy", copy_to && copy_from),
                     ("stat", s.stat(key).await.is_none()),
                     ("pin", s.pin(key).await.is_none()),
+                    ("recorded", s.recorded(key).await == Recorded::default()),
+                    ("transfer", refused(&s.transfer(key, s).await)),
                 ];
                 for (method, ok) in checks {
                     assert!(ok, "{b} {method} {key}");

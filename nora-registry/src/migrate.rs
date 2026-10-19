@@ -105,23 +105,13 @@ pub async fn migrate(
             continue;
         }
 
-        // Fetch from source
-        match from.get(key).await {
-            Ok(data) => {
-                // Write to destination
-                match to.put(key, &data).await {
-                    Ok(()) => {
-                        stats.migrated += 1;
-                        stats.total_bytes += data.len() as u64;
-                    }
-                    Err(e) => {
-                        warn!("Failed to write {}: {}", key, e);
-                        stats.failed += 1;
-                    }
-                }
+        match from.transfer(key, to).await {
+            Ok(bytes) => {
+                stats.migrated += 1;
+                stats.total_bytes += bytes;
             }
             Err(e) => {
-                warn!("Failed to read {}: {}", key, e);
+                warn!("Failed to migrate {}: {}", key, e);
                 stats.failed += 1;
             }
         }
@@ -230,6 +220,37 @@ mod tests {
             &dst.get(&first_seen_key(key)).await.unwrap()[..],
             br#"{"1.0.0":1700000000}"#
         );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_carries_annotations() {
+        use nora_registry::annotations::Annotations;
+        use sha2::Digest;
+        let src_dir = TempDir::new().unwrap();
+        let src = Storage::new_local(src_dir.path().join("s").to_str().unwrap());
+        let dst = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let tags =
+            Annotations::try_from_pairs([("commit".to_string(), "abc".to_string())]).unwrap();
+        let staged = src_dir.path().join("staged");
+        std::fs::write(&staged, b"release").unwrap();
+        let sha = hex::encode(sha2::Sha256::digest(b"release"));
+        src.put_from_path("raw/a/2026.bin", &staged, Some(&sha), &tags)
+            .await
+            .unwrap();
+
+        let stats = migrate(&src, &dst, MigrateOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.migrated, 1);
+        assert_eq!(stats.total_bytes, 7);
+        assert_eq!(
+            dst.recorded("raw/a/2026.bin").await,
+            src.recorded("raw/a/2026.bin").await
+        );
+        assert_eq!(dst.recorded("raw/a/2026.bin").await.annotations, tags);
     }
 
     #[tokio::test]
