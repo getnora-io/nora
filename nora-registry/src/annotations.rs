@@ -246,7 +246,7 @@ mod tests {
         let mut map = HeaderMap::new();
         map.insert(
             "x-nora-meta-k",
-            HeaderValue::from_bytes("caf\u{e9}".as_bytes()).unwrap(),
+            HeaderValue::from_bytes("café".as_bytes()).unwrap(),
         );
         assert_eq!(
             Annotations::from_headers(&map),

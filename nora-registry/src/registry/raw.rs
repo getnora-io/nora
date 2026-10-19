@@ -2339,7 +2339,7 @@ mod integration_tests {
         let cases = [
             (one("X-Nora-Meta-Bad_Key", "v"), "\"bad_key\""),
             (one("x-nora-meta-sha256", "v"), "reserved"),
-            (one("x-nora-meta-k", "caf\u{e9}"), "printable ASCII"),
+            (one("x-nora-meta-k", "café"), "printable ASCII"),
             (many, "at most 32 annotations"),
             (large, "at most 1978 bytes"),
         ];
