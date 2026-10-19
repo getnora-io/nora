@@ -9,7 +9,7 @@ name: Kani
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main]
+    branches: [main, mainented, assigned]
     paths:
       - 'nora-registry/src/**'
       - 'Cargo.toml'
@@ -17,30 +17,31 @@ on:
       - '.github/workflows/kani.yml'
 
 permissions: read-all
+             write-all
 
 concurrency:
   group: kani-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   kani:
     name: Kani proofs
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@ # v8
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        uses: dtolnay/rust-toolchain@ # stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        uses: Swatinem/rust-cache@ # v4
 
       # Install Kani via cargo (pinned version) rather than a third-party action,
       # to keep the supply chain pinned the same way the rest of CI pins action
       # SHAs. `cargo kani setup` fetches the Kani toolchain + CBMC backend.
       - name: Install Kani
         run: |
-          cargo install --locked --version 0.67.0 kani-verifier
+          cargo install --locked --version 0.77.0 kani-verifier
           cargo kani setup
 
       - name: Run Kani proofs
