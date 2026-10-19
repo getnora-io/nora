@@ -148,7 +148,17 @@ async fn sparse_index(
 
     // Another spelling of a published crate (`-` and `_` name one crate, as on crates.io) is
     // refused, never asked of an upstream: the upstream's crate of that name is not this one.
-    match published_as_another_spelling(&state.storage, &crate_name).await {
+    let own = match published {
+        Published::No => OwnSpelling::Known(false),
+        _ => OwnSpelling::Read,
+    };
+    let refusal = match canon_record(&state.storage, &crate_name).await {
+        Ok(record) => {
+            another_published_spelling(&state.storage, &crate_name, record.as_deref(), own).await
+        }
+        Err(e) => Err(e),
+    };
+    match refusal {
         Ok(Some(published)) => return another_spelling_response(&crate_name, &published),
         Ok(None) => {}
         Err(e) => {
@@ -158,7 +168,7 @@ async fn sparse_index(
     }
 
     // An unpublished crate, or one whose listing failed: what is stored is read first, and one
-    // pure decision (`index_answer`, the decision table in cargo-index-spec) says what answers.
+    // pure decision (`index_answer`, a decision table) says what answers.
     let assembled = assembled_index(&state.storage, &expected_prefix, &crate_name).await;
     // What an older release left at the crate's index: its upstream cache, or a crate published
     // before per-version entries.
@@ -459,8 +469,23 @@ async fn download(
     let crate_name = crate_name.to_lowercase();
 
     // Another spelling of a published crate is refused here too: neither an upstream nor a copy
-    // cached from one answers for it.
-    match published_as_another_spelling(&state.storage, &crate_name).await {
+    // cached from one answers for it. A record naming this spelling is weighed before an upstream is
+    // asked (below), so a download of a published crate lists nothing. The record is read once.
+    let record = match canon_record(&state.storage, &crate_name).await {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::error!(registry = "cargo", crate_name = %crate_name, error = %e, "cargo: reading the crate's name record failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    match another_published_spelling(
+        &state.storage,
+        &crate_name,
+        record.as_deref(),
+        OwnSpelling::Defer,
+    )
+    .await
+    {
         Ok(Some(published)) => return another_spelling_response(&crate_name, &published),
         Ok(None) => {}
         Err(e) => {
@@ -479,7 +504,9 @@ async fn download(
         // the metadata here (synchronously, so the date is readable on this same
         // request) — gated on trust, namespace-safe, best-effort. Mirrors PyPI's
         // ensure_pypi_dates_cached.
-        if state.config.server.trust_upstream_dates {
+        // A name whose canon record was read here (one with `-` or `_`) is NORA's, published now
+        // or before: an upstream's dates for it belong to another crate, and asking gives it away.
+        if state.config.server.trust_upstream_dates && record.is_none() {
             ensure_cargo_metadata_cached(&state, &crate_name).await;
         }
         extract_cargo_publish_date(
@@ -526,6 +553,24 @@ async fn download(
     // silently. (Typestate rollout — see `crate::verified`, raw.rs is the PoC.)
     if let Ok(outcome) = state.storage.get_verified(&key).await {
         use nora_registry::verified::{verified_body, GateOutcome};
+        // A stored copy of a version that is not published, under a name with a canon record: of a
+        // published crate it is an upstream's bytes or a removed version and is never served; under a
+        // stale record, another published spelling of the name refuses it.
+        if record.is_some() {
+            let entry = format!(
+                "cargo/index-entries/{}/{}/{}.json",
+                crate_index_prefix(&crate_name),
+                crate_name,
+                version
+            );
+            if state.storage.stat(&entry).await.is_none() {
+                if let Some(response) =
+                    unpublished_version_refusal(&state, &crate_name, record.as_deref()).await
+                {
+                    return response;
+                }
+            }
+        }
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
             GateOutcome::Unpinned(blob) => blob.into_inner(),
@@ -612,6 +657,15 @@ async fn download(
             &crate_name,
         )
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
+    // Before an upstream is asked: a version of a published crate that is not stored is not one of
+    // its versions (404; nothing is fetched or stored, so an upstream's bytes never sit beside the
+    // published ones), and a stale record of this spelling while another is published refuses too.
+    if let Some(response) =
+        unpublished_version_refusal(&state, &crate_name, record.as_deref()).await
+    {
+        return response;
     }
 
     // Proxy fetch from upstream
@@ -781,34 +835,31 @@ async fn publish(
     let name_key = crate_name_record_key(&name);
     let name_lock = state.publish_lock(&name_key);
     let _name_guard = name_lock.lock().await;
-    let mut record_missing = false;
-    match state.storage.get(&name_key).await {
-        Ok(data) => {
-            let published = String::from_utf8_lossy(&data).trim().to_string();
-            // This spelling may be published itself (both were, before records existed): it goes on.
-            if published != name
-                && !matches!(
-                    published_state(&state.storage, &crate_index_prefix(&name), &name).await,
-                    Published::Yes(_)
-                )
-            {
-                let err = serde_json::json!({
-                    "errors": [{"detail": format!(
-                        "crate `{name}` is published here as `{published}`: `-` and `_` name the same crate"
-                    )}]
-                });
-                return (
-                    StatusCode::CONFLICT,
-                    [(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    serde_json::to_vec(&err).unwrap_or_default(),
-                )
-                    .into_response();
-            }
+    let refusal = match canon_record(&state.storage, &name).await {
+        Ok(record) => {
+            another_published_spelling(&state.storage, &name, record.as_deref(), OwnSpelling::Read)
+                .await
         }
-        Err(crate::storage::StorageError::NotFound) => record_missing = true,
+        Err(e) => Err(e),
+    };
+    match refusal {
+        Ok(Some(published)) => {
+            let err = serde_json::json!({
+                "errors": [{"detail": format!(
+                    "crate `{name}` is published here as `{published}`: `-` and `_` name the same crate"
+                )}]
+            });
+            return (
+                StatusCode::CONFLICT,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                serde_json::to_vec(&err).unwrap_or_default(),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
         Err(e) => {
             tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: reading the crate's name record failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -955,11 +1006,7 @@ async fn publish(
     ));
     state.repo_index.invalidate("cargo");
 
-    if record_missing {
-        if let Err(e) = state.storage.put(&name_key, name.as_bytes()).await {
-            tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: writing the crate's name record failed; the rebuild at the next start writes it");
-        }
-    }
+    settle_name_record(&state.storage, &name).await;
 
     // Cargo expects a JSON response with warnings array
     let response = serde_json::json!({
@@ -1077,7 +1124,7 @@ enum Fallback {
     None,
 }
 
-/// The decision table (cargo-index-spec v2, rows 5–13) for a crate with no listed entries, as a
+/// The decision table for a crate with no listed entries, as a
 /// pure function: an assembled index is the crate's own (and an unreadable one may be); an index
 /// the operator named its own is served as it is; a fresh upstream copy answers; otherwise an
 /// internal name or a missing upstream is served from the stored copy (the upstream copy, else
@@ -1354,31 +1401,168 @@ fn crate_name_record_key(name: &str) -> String {
     format!("cargo/_names/{}", canonical_crate_name(name))
 }
 
-/// The spelling, other than `name`, that `name`'s canon was published under. Ok(None) when the canon
-/// has no record, the record names this spelling, or this spelling is published itself (both were
-/// published before records existed: each serves its own); Err on a storage error other than
-/// NotFound. A name without `-` or `_` has no other spelling, so nothing is read for it.
-async fn published_as_another_spelling(
+/// When a request for one spelling reads whether that spelling is published.
+#[derive(Clone, Copy)]
+enum OwnSpelling {
+    /// The caller knows.
+    Known(bool),
+    /// Read where the answer depends on it.
+    Read,
+    /// A record naming this spelling decides nothing yet: the download asks again before an upstream.
+    Defer,
+}
+
+/// Another published spelling of `name`'s canon that a request for `name` is refused for, or None
+/// to go on, given the canon's record ([`canon_record`]). The record
+/// names the spelling published first; a spelling published itself always goes on. A record naming
+/// a spelling with no published entries (this one or another) is stale and decides nothing: the
+/// entries are scanned for a published spelling of the canon instead. Err on a storage error other
+/// than NotFound.
+async fn another_published_spelling(
     storage: &Storage,
     name: &str,
+    record: Option<&str>,
+    own: OwnSpelling,
 ) -> crate::storage::Result<Option<String>> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let own_published = match own {
+        OwnSpelling::Known(published) => published,
+        OwnSpelling::Defer if record == name => return Ok(None),
+        OwnSpelling::Defer | OwnSpelling::Read => is_published(storage, name).await?,
+    };
+    if own_published {
+        return Ok(None);
+    }
+    if record != name && is_published(storage, record).await? {
+        return Ok(Some(record.to_string()));
+    }
+    published_spelling_by_scan(storage, name).await
+}
+
+/// The spelling the record of `name`'s canon names, or None: no record, or a name without `-` or
+/// `_`, which has no other spelling and reads none. Err on a storage error other than NotFound.
+async fn canon_record(storage: &Storage, name: &str) -> crate::storage::Result<Option<String>> {
     if !name.contains(['-', '_']) {
         return Ok(None);
     }
-    let published = match storage.get(&crate_name_record_key(name)).await {
-        Ok(data) => String::from_utf8_lossy(&data).trim().to_string(),
-        Err(crate::storage::StorageError::NotFound) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if published.is_empty() || published == name {
-        return Ok(None);
+    match storage.get(&crate_name_record_key(name)).await {
+        Ok(data) => {
+            let record = String::from_utf8_lossy(&data).trim().to_string();
+            Ok((!record.is_empty()).then_some(record))
+        }
+        Err(crate::storage::StorageError::NotFound) => Ok(None),
+        Err(e) => Err(e),
     }
+}
+
+/// Whether `name` has published entries. Err when they cannot be listed: the caller must not guess.
+async fn is_published(storage: &Storage, name: &str) -> crate::storage::Result<bool> {
     match published_state(storage, &crate_index_prefix(name), name).await {
-        Published::Yes(_) => Ok(None),
-        Published::No => Ok(Some(published)),
+        Published::Yes(_) => Ok(true),
+        Published::No => Ok(false),
         Published::Unknown => Err(crate::storage::StorageError::Network(format!(
             "listing the entries of {name} failed"
         ))),
+    }
+}
+
+/// The spellings of `name` that differ in the first four characters, where `-` and `_` are swapped:
+/// the index directory depends on those characters, so these are every directory a spelling of the
+/// canon can fall in. Pure.
+fn spelling_heads(name: &str) -> Vec<String> {
+    let lower = name.to_lowercase();
+    let head: Vec<char> = lower.chars().take(4).collect();
+    let rest: String = lower.chars().skip(4).collect();
+    let seps: Vec<usize> = (0..head.len())
+        .filter(|&i| head[i] == '-' || head[i] == '_')
+        .collect();
+    (0..1usize << seps.len())
+        .map(|mask| {
+            let mut h = head.clone();
+            for (bit, &i) in seps.iter().enumerate() {
+                h[i] = if mask & (1 << bit) != 0 { '_' } else { '-' };
+            }
+            h.into_iter().collect::<String>() + &rest
+        })
+        .collect()
+}
+
+/// Another spelling of `name`'s canon with published entries, found by listing the entries in each
+/// index directory a spelling of the canon can fall in. Read only when the canon's record is stale.
+async fn published_spelling_by_scan(
+    storage: &Storage,
+    name: &str,
+) -> crate::storage::Result<Option<String>> {
+    let canon = canonical_crate_name(name);
+    let prefixes: std::collections::BTreeSet<String> = spelling_heads(name)
+        .iter()
+        .map(|spelling| crate_index_prefix(spelling))
+        .collect();
+    for prefix in prefixes {
+        let dir = format!("cargo/index-entries/{prefix}/");
+        for key in storage.list(&dir).await? {
+            let Some(spelling) = key
+                .strip_prefix(&dir)
+                .and_then(|rest| rest.split('/').next())
+            else {
+                continue;
+            };
+            if spelling != name && canonical_crate_name(spelling) == canon {
+                return Ok(Some(spelling.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The answer for a version of `name` that is not published, or None to go on: 404 when the crate
+/// is published (an unpublished version of it is never an upstream's), the refusal naming another
+/// published spelling when the canon's record is stale, 503 when what decides cannot be read.
+async fn unpublished_version_refusal(
+    state: &AppState,
+    name: &str,
+    record: Option<&str>,
+) -> Option<Response> {
+    let failed = |e: crate::storage::StorageError| {
+        tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo: reading whether the crate is published failed");
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    };
+    match is_published(&state.storage, name).await {
+        Ok(true) => return Some(StatusCode::NOT_FOUND.into_response()),
+        Ok(false) => {}
+        Err(e) => return Some(failed(e)),
+    }
+    match another_published_spelling(&state.storage, name, record, OwnSpelling::Known(false)).await
+    {
+        Ok(Some(published)) => Some(another_spelling_response(name, &published)),
+        Ok(None) => None,
+        Err(e) => Some(failed(e)),
+    }
+}
+
+/// After a successful publish, under the canon's lock: the record names this spelling, unless it
+/// names another spelling that is published itself (both were, before records existed). A record
+/// that cannot be read is left as it is; the rebuild at the next start writes a missing one.
+async fn settle_name_record(storage: &Storage, name: &str) {
+    let key = crate_name_record_key(name);
+    let keep = match storage.get(&key).await {
+        Ok(data) => {
+            let record = String::from_utf8_lossy(&data).trim().to_string();
+            record == name
+                || (!record.is_empty() && is_published(storage, &record).await.unwrap_or(true))
+        }
+        Err(crate::storage::StorageError::NotFound) => false,
+        Err(e) => {
+            tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: reading the crate's name record failed; left as it is");
+            true
+        }
+    };
+    if !keep {
+        if let Err(e) = storage.put(&key, name.as_bytes()).await {
+            tracing::error!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: writing the crate's name record failed; the rebuild at the next start writes it");
+        }
     }
 }
 
@@ -3078,7 +3262,7 @@ mod published_index_ownership {
 }
 
 /// `index_answer` over every combination of what a request can find, held to the decision table
-/// written as properties (each one a row or a guarantee of cargo-index-spec v2), plus the table's
+/// written as properties (each one a row of the table or a guarantee), plus the table's
 /// rows as examples.
 #[cfg(test)]
 mod index_answer_grid {
@@ -3267,7 +3451,7 @@ mod index_answer_grid {
     }
 }
 
-/// The rows of the decision table for a published crate's sparse index (cargo-index-spec):
+/// The rows of the decision table for a published crate's sparse index:
 /// what the entries listing answers × what the stored index is × what an upstream says.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -4535,7 +4719,7 @@ mod crate_name_canonical_curation {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod crate_name_one_canon {
-    //! `-` and `_` name one crate, as on crates.io (spec-141 rows C1–C7, D1, publish, S1): another
+    //! `-` and `_` name one crate, as on crates.io: another
     //! spelling of a published crate is refused and never asked of an upstream.
     use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
     use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
@@ -4867,6 +5051,195 @@ mod crate_name_one_canon {
         }
     }
 
+    #[test]
+    fn spelling_heads_cover_every_index_directory() {
+        let mut heads = super::spelling_heads("ab-cd");
+        heads.sort();
+        assert_eq!(heads, ["ab-cd", "ab_cd"]);
+        let mut heads = super::spelling_heads("A-b-cdef");
+        heads.sort();
+        assert_eq!(heads, ["a-b-cdef", "a-b_cdef", "a_b-cdef", "a_b_cdef"]);
+        assert_eq!(super::spelling_heads("abcd-e"), ["abcd-e"]);
+    }
+
+    /// F1c, F1d: a record naming the asked spelling while it is not published is stale. With another
+    /// spelling published, the asked one is refused (index, download, publish) naming it and the
+    /// upstream is not asked; with none published, the request goes on and a publish takes the name.
+    #[tokio::test]
+    async fn a_stale_record_naming_this_spelling_decides_nothing() {
+        for other_published in [true, false] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            ctx.state
+                .storage
+                .put("cargo/_names/zz-q", b"zz_q")
+                .await
+                .unwrap();
+            if other_published {
+                seed_entries(&ctx.state.storage, &["zz-q"]).await;
+                for uri in [
+                    "/cargo/index/zz/_q/zz_q",
+                    "/cargo/api/v1/crates/zz_q/9.9.9/download",
+                ] {
+                    let (status, body) = get(&ctx.app, uri).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+                    assert!(body.contains("`zz-q`"), "{uri}: {body}");
+                }
+                assert_eq!(asked(&server).await, 0);
+                let (status, body) = publish(&ctx.app, "zz_q", "0.1.0").await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(body.contains("`zz-q`"), "{body}");
+            } else {
+                let (status, _) = get(&ctx.app, "/cargo/index/zz/_q/zz_q").await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(asked(&server).await, 1);
+                assert_eq!(publish(&ctx.app, "zz_q", "0.1.0").await.0, StatusCode::OK);
+                assert_eq!(
+                    &*ctx.state.storage.get("cargo/_names/zz-q").await.unwrap(),
+                    b"zz_q"
+                );
+            }
+        }
+    }
+
+    /// F1g, F1h: a record naming another spelling that is not published is stale too. With a third
+    /// spelling published, the asked one is refused naming that one; with none, the request goes on,
+    /// and a publish takes the name and rewrites the record.
+    #[tokio::test]
+    async fn a_stale_record_naming_another_spelling_decides_nothing() {
+        for third_published in [true, false] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            ctx.state
+                .storage
+                .put("cargo/_names/a-b-c", b"a_b-c")
+                .await
+                .unwrap();
+            if third_published {
+                seed_entries(&ctx.state.storage, &["a-b_c"]).await;
+                let (status, body) = get(&ctx.app, "/cargo/index/a-/b-/a-b-c").await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(body.contains("`a-b_c`"), "{body}");
+                assert_eq!(asked(&server).await, 0);
+                let (status, body) = publish(&ctx.app, "a-b-c", "0.1.0").await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(body.contains("`a-b_c`"), "{body}");
+            } else {
+                let (status, _) = get(&ctx.app, "/cargo/index/a-/b-/a-b-c").await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(publish(&ctx.app, "a-b-c", "0.1.0").await.0, StatusCode::OK);
+                assert_eq!(
+                    &*ctx.state.storage.get("cargo/_names/a-b-c").await.unwrap(),
+                    b"a-b-c"
+                );
+            }
+        }
+    }
+
+    /// A download of a published crate whose name has `-` lists no more than one without: the record
+    /// naming its own spelling is weighed only before an upstream would be asked.
+    #[tokio::test]
+    async fn a_download_of_a_published_crate_lists_nothing_more() {
+        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let ctx = crate::test_helpers::create_test_context_with_storage(storage);
+        let mut lists = Vec::new();
+        for name in ["my-crate", "mycrate"] {
+            assert_eq!(publish(&ctx.app, name, "0.1.0").await.0, StatusCode::OK);
+            ops.reset();
+            let (status, _) = get(
+                &ctx.app,
+                &format!("/cargo/api/v1/crates/{name}/0.1.0/download"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            lists.push(ops.snapshot().get("list").copied().unwrap_or(0));
+        }
+        assert_eq!(lists, [0, 0], "{lists:?}");
+    }
+
+    /// N-f, N-b: a version of a published crate that is not published is not one of its versions:
+    /// without a stored copy it is 404, the upstream is not asked and nothing is stored (an upstream's
+    /// bytes beside the published ones would be taken for a version, and retention could drop the
+    /// published one for them); a copy stored beside the published crate is not served either. Its
+    /// published version is served.
+    #[tokio::test]
+    async fn an_unpublished_version_of_a_published_crate_is_never_an_upstreams() {
+        for name in ["rc-lv", "rclv"] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            assert_eq!(publish(&ctx.app, name, "0.1.0").await.0, StatusCode::OK);
+            let (status, _) = get(
+                &ctx.app,
+                &format!("/cargo/api/v1/crates/{name}/9.9.9/download"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+            assert!(ctx
+                .state
+                .storage
+                .stat(&format!("cargo/{name}/9.9.9/{name}-9.9.9.crate"))
+                .await
+                .is_none());
+            let downloads = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/download"))
+                .count();
+            assert_eq!(downloads, 0, "{name}");
+            let (status, _) = get(
+                &ctx.app,
+                &format!("/cargo/api/v1/crates/{name}/0.1.0/download"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+        }
+        // A copy stored beside a published crate with a record (here cached before this release).
+        let server = squatter().await;
+        let ctx = proxied(store(false), &server);
+        assert_eq!(publish(&ctx.app, "rc-lv", "0.1.0").await.0, StatusCode::OK);
+        ctx.state
+            .storage
+            .put("cargo/rc-lv/9.9.9/rc-lv-9.9.9.crate", b"SQUAT")
+            .await
+            .unwrap();
+        let (status, _) = get(&ctx.app, "/cargo/api/v1/crates/rc-lv/9.9.9/download").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// N-c, N-d: a stored copy under a stale record of this spelling: with another spelling
+    /// published it is refused naming that one; with none, it is served as the cached copy it is.
+    #[tokio::test]
+    async fn a_stored_copy_under_a_stale_record_follows_the_record_rule() {
+        for other_published in [true, false] {
+            let server = squatter().await;
+            let ctx = proxied(store(false), &server);
+            ctx.state
+                .storage
+                .put("cargo/_names/zz-q", b"zz_q")
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("cargo/zz_q/9.9.9/zz_q-9.9.9.crate", b"CACHED")
+                .await
+                .unwrap();
+            if other_published {
+                seed_entries(&ctx.state.storage, &["zz-q"]).await;
+            }
+            let (status, body) = get(&ctx.app, "/cargo/api/v1/crates/zz_q/9.9.9/download").await;
+            if other_published {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(body.contains("`zz-q`"), "{body}");
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, "CACHED");
+            }
+            assert_eq!(asked(&server).await, 0);
+        }
+    }
+
     /// S1, C7: a store from an older release (`my-crate` published, no record) gets its records at
     /// startup, and `my_crate` is refused from then on; where both spellings were published, each
     /// still serves its own index.
@@ -4928,20 +5301,6 @@ mod crate_name_one_canon {
                 "{name}"
             );
         }
-        // No index or crate is asked of the upstream (a download may still read the upstream's
-        // release dates under `trust_upstream_dates`, as before).
-        let paths: Vec<String> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.url.path().to_string())
-            .collect();
-        assert!(
-            paths
-                .iter()
-                .all(|p| !p.contains("/index/") && !p.ends_with("/download")),
-            "{paths:?}"
-        );
+        assert_eq!(asked(&server).await, 0);
     }
 }
